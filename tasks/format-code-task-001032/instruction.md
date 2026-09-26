@@ -1,0 +1,7 @@
+The Ninja backend exposes pool controls so projects can keep expensive build classes from overwhelming the machine, but the current implementation emits invalid pool depths for odd job counts and loses per-builder overrides on compound actions. Make pool scheduling reliable while preserving the existing API boundary.
+
+When the Ninja tool is enabled and NINJA_MAX_JOBS is set to a positive integer, the generated build.ninja must declare local_pool with exactly that integer capacity. install_pool must use an integer capacity equal to the lower half of NINJA_MAX_JOBS, but never less than 1, so odd and single-job configurations remain valid Ninja files. Every emitted pool depth must be a positive integer that the installed Ninja parser accepts.
+
+NinjaPool(name, size) remains the public way to declare a custom pool. Its declaration must be emitted and, when NINJA_MAX_JOBS is set, its effective capacity must not exceed that global limit while retaining the requested capacity when it is below the limit. A pool selected with the per-builder NINJA_POOL override must be attached to that build even when the action is a list/compound action. An NINJA_POOL value placed directly in the environment must continue to be ignored for builders that do not receive a per-builder override, preserving the documented opt-in behavior.
+
+The generated file must remain usable by invoking Ninja in dry-run mode; this check must not require executing the build commands. Existing generation and command translation behavior outside these pool decisions must remain unchanged.

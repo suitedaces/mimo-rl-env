@@ -1,0 +1,391 @@
+diff --git a/tests/cases/py_client/download_transaction_test.py b/tests/cases/py_client/download_transaction_test.py
+new file mode 100644
+--- /dev/null
++++ b/tests/cases/py_client/download_transaction_test.py
+@@ -0,0 +1,377 @@
++import hashlib
++import os
++import shutil
++import sys
++import tempfile
++import unittest
++
++try:
++    from unittest import mock
++except ImportError:  # pragma: no cover
++    import mock
++
++
++REPO_ROOT = os.path.abspath(os.path.join(
++    os.path.dirname(__file__), '..', '..', '..'))
++sys.path.insert(0, os.path.join(REPO_ROOT, 'clients', 'python'))
++
++import girder_client
++
++
++class _VerifierResponse(object):
++    def __init__(self, chunks=(), status=200, text='', url='http://example/file'):
++        self._chunks = chunks
++        self.status_code = status
++        self.text = text
++        self.url = url
++        self.iterated = False
++        self.closed = False
++
++    def iter_content(self, chunk_size=65536, **kwargs):
++        self.iterated = True
++        for chunk in self._chunks:
++            if isinstance(chunk, Exception):
++                raise chunk
++            if callable(chunk):
++                chunk = chunk()
++            yield chunk
++
++    def close(self):
++        self.closed = True
++
++    def __enter__(self):
++        return self
++
++    def __exit__(self, exc_type, exc_value, traceback):
++        self.close()
++
++
++class DownloadTransactionContractTest(unittest.TestCase):
++    def setUp(self):
++        self.directory = tempfile.mkdtemp(prefix='girder-download-contract-')
++        self.client = girder_client.GirderClient(apiUrl='http://example/api/v1')
++
++    def tearDown(self):
++        shutil.rmtree(self.directory)
++
++    def _path(self, name='result.bin'):
++        return os.path.join(self.directory, name)
++
++    def _write(self, path, content):
++        with open(path, 'wb') as stream:
++            stream.write(content)
++
++    def _read(self, path):
++        with open(path, 'rb') as stream:
++            return stream.read()
++
++    def _download(self, *args, **kwargs):
++        try:
++            return self.client.downloadFile(*args, **kwargs)
++        except TypeError as exc:
++            if kwargs and 'unexpected keyword argument' in str(exc):
++                self.fail('downloadFile does not expose the requested public options: %s' % exc)
++            raise
++
++    def _assert_only_target_remains(self, target):
++        self.assertEqual(os.listdir(self.directory), [os.path.basename(target)])
++
++    def test_successful_download_is_atomic_and_reports_progress(self):
++        target = self._path()
++        self._write(target, b'old contents')
++        payload = b'new payload'
++        observations = []
++
++        def observed(chunk):
++            def produce():
++                observations.append(self._read(target))
++                return chunk
++            return produce
++
++        response = _VerifierResponse([
++            observed(b'new '), b'', observed(b'payload')
++        ])
++        progress = []
++        digest = hashlib.sha512(payload).hexdigest().upper()
++        with mock.patch.object(girder_client.requests, 'get', return_value=response):
++            self._download(
++                'file-id', target, size=len(payload), sha512=digest,
++                progressCallback=progress.append)
++
++        self.assertEqual(observations, [b'old contents', b'old contents'])
++        self.assertEqual(self._read(target), payload)
++        self.assertEqual(progress, [
++            {'current': 4, 'total': len(payload)},
++            {'current': len(payload), 'total': len(payload)}
++        ])
++        self._assert_only_target_remains(target)
++
++    def test_http_error_preserves_destination(self):
++        target = self._path()
++        self._write(target, b'keep me')
++        response = _VerifierResponse(
++            [b'proxy error'], status=503, text='unavailable',
++            url='http://example/download')
++
++        with mock.patch.object(girder_client.requests, 'get', return_value=response):
++            with self.assertRaises(girder_client.HttpError) as raised:
++                self.client.downloadFile('file-id', target)
++
++        self.assertEqual(raised.exception.status, 503)
++        self.assertEqual(raised.exception.responseText, 'unavailable')
++        self.assertEqual(raised.exception.url, 'http://example/download')
++        self.assertEqual(raised.exception.method, 'GET')
++        self.assertFalse(response.iterated)
++        self.assertEqual(self._read(target), b'keep me')
++        self._assert_only_target_remains(target)
++
++        os.remove(target)
++        response.iterated = False
++        with mock.patch.object(girder_client.requests, 'get', return_value=response):
++            with self.assertRaises(girder_client.HttpError):
++                self.client.downloadFile('file-id', target)
++        self.assertFalse(response.iterated)
++        self.assertFalse(os.path.exists(target))
++        self.assertEqual(os.listdir(self.directory), [])
++
++    def test_stream_failure_removes_partial_output(self):
++        target = self._path()
++        self._write(target, b'original')
++        response = _VerifierResponse([b'partial', IOError('connection lost')])
++
++        with mock.patch.object(girder_client.requests, 'get', return_value=response):
++            with self.assertRaises(IOError):
++                self.client.downloadFile('file-id', target)
++
++        self.assertEqual(self._read(target), b'original')
++        self._assert_only_target_remains(target)
++
++    def _assert_length_rejected(self, payload, expected):
++        error_class = getattr(girder_client, 'IncorrectDownloadLengthError', None)
++        self.assertIsNotNone(error_class)
++        target = self._path()
++        self._write(target, b'original')
++        response = _VerifierResponse([payload])
++        with mock.patch.object(girder_client.requests, 'get', return_value=response):
++            with self.assertRaises(error_class) as raised:
++                self._download('file-id', target, size=expected)
++        self.assertEqual(raised.exception.expected, expected)
++        self.assertEqual(raised.exception.actual, len(payload))
++        self.assertEqual(self._read(target), b'original')
++        self._assert_only_target_remains(target)
++
++    def test_declared_length_rejects_short_body(self):
++        self._assert_length_rejected(b'ab', 3)
++
++    def test_declared_length_rejects_long_body(self):
++        self._assert_length_rejected(b'abcd', 3)
++
++    def test_zero_length_accepts_empty_body(self):
++        target = self._path()
++        with mock.patch.object(
++                girder_client.requests, 'get',
++                return_value=_VerifierResponse([])):
++            self._download('empty', target, size=0)
++        self.assertEqual(self._read(target), b'')
++        self._assert_only_target_remains(target)
++
++    def test_zero_length_rejects_nonempty_body(self):
++        error_class = getattr(girder_client, 'IncorrectDownloadLengthError', None)
++        self.assertIsNotNone(error_class)
++        target = self._path()
++        self._write(target, b'original')
++        with mock.patch.object(
++                girder_client.requests, 'get',
++                return_value=_VerifierResponse([b'x'])):
++            with self.assertRaises(error_class):
++                self._download('not-empty', target, size=0)
++        self.assertEqual(self._read(target), b'original')
++        self._assert_only_target_remains(target)
++
++    def test_checksum_mismatch_preserves_destination_and_reports_digests(self):
++        error_class = getattr(girder_client, 'IncorrectDownloadChecksumError', None)
++        self.assertIsNotNone(error_class)
++        target = self._path()
++        self._write(target, b'original')
++        payload = b'tampered data'
++        expected = hashlib.sha512(b'expected data').hexdigest()
++        actual = hashlib.sha512(payload).hexdigest()
++
++        with mock.patch.object(
++                girder_client.requests, 'get',
++                return_value=_VerifierResponse([payload])):
++            with self.assertRaises(error_class) as raised:
++                self._download('file-id', target, sha512=expected.upper())
++
++        self.assertEqual(raised.exception.expected, expected.upper())
++        self.assertEqual(raised.exception.actual, actual)
++        self.assertEqual(self._read(target), b'original')
++        self._assert_only_target_remains(target)
++
++    def test_progress_callback_failure_aborts_commit(self):
++        target = self._path()
++        self._write(target, b'original')
++
++        def fail_progress(info):
++            raise RuntimeError('progress consumer stopped')
++
++        with mock.patch.object(
++                girder_client.requests, 'get',
++                return_value=_VerifierResponse([b'replacement'])):
++            with self.assertRaisesRegex(RuntimeError, 'progress consumer stopped'):
++                self._download(
++                    'file-id', target, progressCallback=fail_progress)
++
++        self.assertEqual(self._read(target), b'original')
++        self._assert_only_target_remains(target)
++
++    def test_progress_without_expected_size_uses_unknown_total(self):
++        target = self._path()
++        progress = []
++        with mock.patch.object(
++                girder_client.requests, 'get',
++                return_value=_VerifierResponse([b'ab', b'c'])):
++            self._download(
++                'file-id', target, progressCallback=progress.append)
++
++        self.assertEqual(progress, [
++            {'current': 2, 'total': None},
++            {'current': 3, 'total': None}
++        ])
++        self.assertEqual(self._read(target), b'abc')
++        self._assert_only_target_remains(target)
++
++    def test_download_item_enforces_server_file_metadata(self):
++        item_directory = self._path('bundle')
++        os.makedirs(item_directory)
++        target = os.path.join(item_directory, 'item.bin')
++        self._write(target, b'original')
++        payload = b'tampered'
++        expected = hashlib.sha512(b'expected').hexdigest()
++        file_doc = {
++            '_id': 'child-file', 'name': 'item.bin',
++            'size': len(payload), 'sha512': expected
++        }
++
++        second_doc = {
++            '_id': 'second-file', 'name': 'other.bin', 'size': 0
++        }
++
++        with mock.patch.object(
++                self.client, 'get', return_value=[file_doc, second_doc]), \
++                mock.patch.object(
++                    girder_client.requests, 'get',
++                    return_value=_VerifierResponse([payload])):
++            error_class = getattr(
++                girder_client, 'IncorrectDownloadChecksumError', None)
++            self.assertIsNotNone(error_class)
++            with self.assertRaises(error_class):
++                self.client.downloadItem('item-id', self.directory, name='bundle')
++
++        self.assertEqual(self._read(target), b'original')
++        self.assertEqual(os.listdir(self.directory), ['bundle'])
++        self.assertEqual(os.listdir(item_directory), ['item.bin'])
++
++    def test_download_item_single_file_enforces_checksum_metadata(self):
++        target = self._path('single.bin')
++        self._write(target, b'original')
++        payload = b'tampered'
++        file_doc = {
++            '_id': 'single-file', 'name': 'single.bin',
++            'size': len(payload),
++            'sha512': hashlib.sha512(b'expected').hexdigest()
++        }
++
++        with mock.patch.object(self.client, 'get', return_value=[file_doc]), \
++                mock.patch.object(
++                    girder_client.requests, 'get',
++                    return_value=_VerifierResponse([payload])):
++            error_class = getattr(
++                girder_client, 'IncorrectDownloadChecksumError', None)
++            self.assertIsNotNone(error_class)
++            with self.assertRaises(error_class):
++                self.client.downloadItem(
++                    'item-id', self.directory, name='single.bin')
++
++        self.assertEqual(self._read(target), b'original')
++        self._assert_only_target_remains(target)
++
++    def test_download_item_supports_hashless_file_metadata(self):
++        payload = b'legacy assetstore bytes'
++        file_doc = {
++            '_id': 'legacy-file', 'name': 'legacy.bin', 'size': len(payload)
++        }
++
++        with mock.patch.object(self.client, 'get', return_value=[file_doc]), \
++                mock.patch.object(
++                    girder_client.requests, 'get',
++                    return_value=_VerifierResponse([payload])):
++            self.client.downloadItem(
++                'item-id', self.directory, name='legacy.bin')
++
++        target = self._path('legacy.bin')
++        self.assertEqual(self._read(target), payload)
++        self._assert_only_target_remains(target)
++
++    def test_download_item_enforces_server_size_metadata(self):
++        target = self._path('sized.bin')
++        self._write(target, b'original')
++        file_doc = {
++            '_id': 'sized-file', 'name': 'sized.bin', 'size': 20
++        }
++
++        with mock.patch.object(self.client, 'get', return_value=[file_doc]), \
++                mock.patch.object(
++                    girder_client.requests, 'get',
++                    return_value=_VerifierResponse([b'too short'])):
++            error_class = getattr(
++                girder_client, 'IncorrectDownloadLengthError', None)
++            self.assertIsNotNone(error_class)
++            with self.assertRaises(error_class):
++                self.client.downloadItem(
++                    'item-id', self.directory, name='sized.bin')
++
++        self.assertEqual(self._read(target), b'original')
++        self._assert_only_target_remains(target)
++
++    def test_download_item_multifile_enforces_size_metadata(self):
++        item_directory = self._path('sized-bundle')
++        os.makedirs(item_directory)
++        target = os.path.join(item_directory, 'sized.bin')
++        self._write(target, b'original')
++        file_doc = {
++            '_id': 'sized-child', 'name': 'sized.bin', 'size': 20
++        }
++        second_doc = {
++            '_id': 'second-sized-child', 'name': 'other.bin', 'size': 0
++        }
++
++        with mock.patch.object(
++                self.client, 'get', return_value=[file_doc, second_doc]), \
++                mock.patch.object(
++                    girder_client.requests, 'get',
++                    return_value=_VerifierResponse([b'too short'])):
++            error_class = getattr(
++                girder_client, 'IncorrectDownloadLengthError', None)
++            self.assertIsNotNone(error_class)
++            with self.assertRaises(error_class):
++                self.client.downloadItem(
++                    'item-id', self.directory, name='sized-bundle')
++
++        self.assertEqual(self._read(target), b'original')
++        self.assertEqual(os.listdir(self.directory), ['sized-bundle'])
++        self.assertEqual(os.listdir(item_directory), ['sized.bin'])
++
++    def test_legacy_two_argument_download_stays_supported(self):
++        target = self._path()
++        payload = b'legacy caller data'
++        with mock.patch.object(
++                girder_client.requests, 'get',
++                return_value=_VerifierResponse([payload])):
++            self.client.downloadFile('file-id', target)
++        self.assertEqual(self._read(target), payload)
++        self._assert_only_target_remains(target)
++
++
++if __name__ == '__main__':
++    unittest.main()
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,4 @@
++#!/bin/bash
++set -euo pipefail
++
++python -m unittest tests.cases.py_client.download_transaction_test

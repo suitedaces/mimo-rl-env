@@ -1,0 +1,113 @@
+diff --git a/tests/test_robust_topology_contract.py b/tests/test_robust_topology_contract.py
+new file mode 100644
+index 0000000..d1d80c8
+--- /dev/null
++++ b/tests/test_robust_topology_contract.py
+@@ -0,0 +1,97 @@
++import unittest
++from copy import deepcopy
++from types import SimpleNamespace as NS
++
++from aio_pika.robust_exchange import RobustExchange
++from aio_pika.robust_queue import RobustQueue
++
++
++class Raw:
++    def __init__(self):
++        self.events = []
++        self.fail = set()
++
++    async def exchange_declare(self, name, **kw):
++        self.events.append(("exchange_declare", name)); return NS()
++    async def exchange_bind(self, *, source, destination, routing_key, arguments):
++        self.events.append(("exchange_bind", source, destination, routing_key, deepcopy(arguments))); return NS()
++    async def exchange_unbind(self, *, source, destination, routing_key, arguments):
++        if "exchange_unbind" in self.fail: self.fail.remove("exchange_unbind"); raise RuntimeError("unbind")
++        self.events.append(("exchange_unbind", source, destination, routing_key, deepcopy(arguments))); return NS()
++    async def queue_declare(self, *, queue, **kw):
++        self.events.append(("queue_declare", queue)); return NS(queue=queue)
++    async def queue_bind(self, queue, *, exchange, routing_key, arguments):
++        self.events.append(("queue_bind", queue, exchange, routing_key, deepcopy(arguments))); return NS()
++    async def queue_unbind(self, *, queue, exchange, routing_key, arguments):
++        if "queue_unbind" in self.fail: self.fail.remove("queue_unbind"); raise RuntimeError("unbind")
++        self.events.append(("queue_unbind", queue, exchange, routing_key, deepcopy(arguments))); return NS()
++    async def basic_consume(self, *, consumer_tag, **kw):
++        tag = consumer_tag or "generated"; self.events.append(("basic_consume", kw["queue"], tag)); return NS(consumer_tag=tag)
++    async def basic_cancel(self, consumer_tag, *, nowait):
++        if "basic_cancel" in self.fail: self.fail.remove("basic_cancel"); raise RuntimeError("cancel")
++        self.events.append(("basic_cancel", consumer_tag)); return NS()
++
++
++class RobustTopologyContractTest(unittest.IsolatedAsyncioTestCase):
++    def conn(self): return NS(loop=self._asyncioTestLoop)
++    def ex(self, raw):
++        return RobustExchange(self.conn(), raw, "destination", auto_delete=False,
++                              durable=True, internal=False, passive=False, arguments=None)
++    def q(self, raw):
++        return RobustQueue(self.conn(), raw, "jobs", durable=True, exclusive=False,
++                           auto_delete=False, arguments=None, passive=False)
++    async def replay(self, obj, raw): await obj.on_reconnect(NS(_channel=raw))
++
++    async def test_exchange_replay_preserves_distinct_snapshots_once(self):
++        raw, ex, args = Raw(), None, {"version": 1}; ex = self.ex(raw)
++        await ex.bind("source", routing_key="red", arguments=args); args["version"] = 99
++        await ex.bind("source", routing_key="blue", arguments={"version": 2})
++        await ex.bind("source", routing_key="blue", arguments={"version": 2})
++        replay = Raw(); await self.replay(ex, replay)
++        self.assertEqual(replay.events, [("exchange_declare", "destination"),
++            ("exchange_bind", "source", "destination", "red", {"version": 1}),
++            ("exchange_bind", "source", "destination", "blue", {"version": 2})])
++        again = Raw(); await self.replay(ex, again); self.assertEqual(again.events, replay.events)
++
++    async def test_exchange_unbind_removes_only_exact_binding(self):
++        ex = self.ex(Raw()); await ex.bind("source", routing_key="same", arguments={"slot": 1}); await ex.bind("source", routing_key="same", arguments={"slot": 2})
++        await ex.unbind("source", routing_key="same", arguments={"slot": 1}); replay = Raw(); await self.replay(ex, replay)
++        self.assertEqual([e for e in replay.events if e[0] == "exchange_bind"], [("exchange_bind", "source", "destination", "same", {"slot": 2})])
++
++    async def test_failed_exchange_unbind_keeps_binding(self):
++        raw, ex = Raw(), None; ex = self.ex(raw); await ex.bind("source", routing_key="kept", arguments={"slot": 1}); raw.fail.add("exchange_unbind")
++        with self.assertRaises(RuntimeError): await ex.unbind("source", routing_key="kept", arguments={"slot": 1})
++        replay = Raw(); await self.replay(ex, replay); self.assertIn(("exchange_bind", "source", "destination", "kept", {"slot": 1}), replay.events)
++
++    async def test_robust_false_exchange_binding_is_not_replayed(self):
++        ex = self.ex(Raw()); await ex.bind("source", routing_key="temporary", robust=False); replay = Raw(); await self.replay(ex, replay)
++        self.assertEqual(replay.events, [("exchange_declare", "destination")])
++
++    async def test_queue_replay_orders_distinct_bindings_before_consumers(self):
++        raw, q, args = Raw(), None, {"version": 1}; q = self.q(raw)
++        await q.bind("events", routing_key="work", arguments=args); args["version"] = 99
++        await q.bind("events", routing_key="work", arguments={"version": 2}); await q.bind("events", routing_key="work", arguments={"version": 2})
++        async def durable(message): return message
++        async def temporary(message): return message
++        await q.consume(durable, consumer_tag="durable"); await q.consume(temporary, consumer_tag="temporary", robust=False)
++        replay = Raw(); await self.replay(q, replay)
++        self.assertEqual(replay.events, [("queue_declare", "jobs"), ("queue_bind", "jobs", "events", "work", {"version": 1}), ("queue_bind", "jobs", "events", "work", {"version": 2}), ("basic_consume", "jobs", "durable")])
++        again = Raw(); await self.replay(q, again); self.assertEqual(again.events, replay.events)
++
++    async def test_queue_unbind_removes_only_exact_binding(self):
++        q = self.q(Raw()); await q.bind("events", routing_key="same", arguments={"slot": 1}); await q.bind("events", routing_key="same", arguments={"slot": 2})
++        await q.unbind("events", routing_key="same", arguments={"slot": 1}); replay = Raw(); await self.replay(q, replay)
++        self.assertEqual([e for e in replay.events if e[0] == "queue_bind"], [("queue_bind", "jobs", "events", "same", {"slot": 2})])
++
++    async def test_failed_queue_unbind_keeps_binding(self):
++        raw, q = Raw(), None; q = self.q(raw); await q.bind("events", routing_key="kept", arguments={"slot": 1}); raw.fail.add("queue_unbind")
++        with self.assertRaises(RuntimeError): await q.unbind("events", routing_key="kept", arguments={"slot": 1})
++        replay = Raw(); await self.replay(q, replay); self.assertIn(("queue_bind", "jobs", "events", "kept", {"slot": 1}), replay.events)
++
++    async def test_cancel_updates_replay_only_after_success(self):
++        raw, q = Raw(), None; q = self.q(raw)
++        async def consumer(message): return message
++        await q.consume(consumer, consumer_tag="removed"); await q.consume(consumer, consumer_tag="kept"); await q.cancel("removed"); raw.fail.add("basic_cancel")
++        with self.assertRaises(RuntimeError): await q.cancel("kept")
++        replay = Raw(); await self.replay(q, replay); self.assertEqual([e for e in replay.events if e[0] == "basic_consume"], [("basic_consume", "jobs", "kept")])
++
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,5 @@
++#!/bin/bash
++set -euo pipefail
++
++
++./.venv/bin/pytest -q tests/test_robust_topology_contract.py

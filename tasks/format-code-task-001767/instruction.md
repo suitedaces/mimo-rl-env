@@ -1,0 +1,7 @@
+I want the `ledis` package to expose full-database dump and import methods on an opened `*Ledis` instance: `Dump(w io.Writer) error`, `DumpFile(path string) error`, `LoadDump(r io.Reader) (*DumpHead, error)`, and `LoadDumpFile(path string) (*DumpHead, error)`. `DumpHead` should contain the dump stream commit id as `CommitID uint64`.
+
+When I create a `*Ledis` with `ledis.Open(cfg)`, write keys into one database, and call `DumpFile("/tmp/ledis.dump")`, the method should create the file and write a complete snapshot of the current store. If I then open a separate empty `*Ledis` and call `LoadDumpFile("/tmp/ledis.dump")`, all raw key/value records from the dumped store should be present in the target with the same bytes as the source.
+
+`Dump(w)` should write to any `io.Writer` without requiring a filesystem path, and `LoadDump(r)` should read the same stream from any `io.Reader`. The stream format should begin with a big-endian uint64 commit id, followed by repeated records where each key is Snappy-compressed and prefixed with a big-endian uint16 length, and each value is Snappy-compressed and prefixed with a big-endian uint32 length; end of file marks the end of records.
+
+The dump operation should be point-in-time consistent even if other writes happen after it starts. The load operation should clear the target database before applying the dump stream, return a `DumpHead` containing the stream commit id, and return an error for unreadable files, malformed headers, truncated records, or invalid Snappy data.

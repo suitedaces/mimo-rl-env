@@ -1,0 +1,169 @@
+diff --git a/internal/stackql/sqldialect/view_catalog_contract_test.go b/internal/stackql/sqldialect/view_catalog_contract_test.go
+new file mode 100644
+index 0000000..1f7f552
+--- /dev/null
++++ b/internal/stackql/sqldialect/view_catalog_contract_test.go
+@@ -0,0 +1,153 @@
++package sqldialect_test
++
++import (
++	"testing"
++
++	"github.com/stackql/stackql/internal/stackql/constants"
++	"github.com/stackql/stackql/internal/stackql/dto"
++	"github.com/stackql/stackql/internal/stackql/sqlcontrol"
++	"github.com/stackql/stackql/internal/stackql/sqldialect"
++	"github.com/stackql/stackql/internal/stackql/sqlengine"
++)
++
++func newViewCatalogDialect(t *testing.T) (sqldialect.SQLDialect, sqlengine.SQLEngine) {
++	t.Helper()
++	cfg := dto.SQLBackendCfg{
++		DbEngine:   constants.DbEngineSQLite3Embedded,
++		DSN:        "file:view-catalog-contract?mode=memory&cache=shared",
++		SQLDialect: constants.SQLDialectSQLite3,
++	}
++	eng, err := sqlengine.NewSQLEngine(cfg, sqlcontrol.GetControlAttributes("standard"))
++	if err != nil {
++		t.Fatalf("create SQL engine: %v", err)
++	}
++	dialect, err := sqldialect.NewSQLDialect(eng, "", sqlcontrol.GetControlAttributes("standard"), cfg)
++	if err != nil {
++		t.Fatalf("create SQL dialect: %v", err)
++	}
++	return dialect, eng
++}
++
++func catalogCount(t *testing.T, eng sqlengine.SQLEngine, name string) int {
++	t.Helper()
++	row := eng.QueryRow(`SELECT count(*) FROM "__iql__.views" WHERE view_name = ? AND deleted_dttm IS NULL`, name)
++	var count int
++	if err := row.Scan(&count); err != nil {
++		t.Fatalf("count active view rows: %v", err)
++	}
++	return count
++}
++
++func catalogTranslatedDDL(t *testing.T, eng sqlengine.SQLEngine, name string) string {
++	t.Helper()
++	row := eng.QueryRow(`SELECT view_stackql_ddl FROM "__iql__.views" WHERE view_name = ? AND deleted_dttm IS NULL`, name)
++	var ddl string
++	if err := row.Scan(&ddl); err != nil {
++		t.Fatalf("read translated view DDL: %v", err)
++	}
++	return ddl
++}
++
++func catalogVersionCounts(t *testing.T, eng sqlengine.SQLEngine, name string) (int, int) {
++	t.Helper()
++	row := eng.QueryRow(`SELECT count(*), sum(CASE WHEN deleted_dttm IS NOT NULL THEN 1 ELSE 0 END) FROM "__iql__.views" WHERE view_name = ?`, name)
++	var total, deleted int
++	if err := row.Scan(&total, &deleted); err != nil {
++		t.Fatalf("read view history: %v", err)
++	}
++	return total, deleted
++}
++
++func TestViewCatalogPersistsDefinitionAndLookup(t *testing.T) {
++	dialect, eng := newViewCatalogDialect(t)
++	raw := "select 1 as value"
++	translated := "select 1 as \"value\""
++
++	if err := dialect.CreateView("contract_view", raw, translated); err != nil {
++		t.Fatalf("create view: %v", err)
++	}
++	view, ok := dialect.GetViewByName("contract_view")
++	if !ok || view == nil {
++		t.Fatal("created view was not discoverable")
++	}
++	if view.GetName() != "contract_view" {
++		t.Fatalf("view name = %q, want contract_view", view.GetName())
++	}
++	if view.GetRawQuery() != raw {
++		t.Fatalf("raw query = %q, want %q", view.GetRawQuery(), raw)
++	}
++	if got := catalogTranslatedDDL(t, eng, "contract_view"); got != translated {
++		t.Fatalf("translated DDL = %q, want %q", got, translated)
++	}
++	if got := catalogCount(t, eng, "contract_view"); got != 1 {
++		t.Fatalf("active catalog rows = %d, want 1", got)
++	}
++}
++
++func TestViewCatalogReplacementIsIdempotent(t *testing.T) {
++	dialect, eng := newViewCatalogDialect(t)
++	if err := dialect.CreateView("replace_view", "select 1", "select 1"); err != nil {
++		t.Fatalf("create initial view: %v", err)
++	}
++	updatedRaw := "select 2 as value"
++	updatedTranslated := "select 2 as \"value\""
++	if err := dialect.CreateView("replace_view", updatedRaw, updatedTranslated); err != nil {
++		t.Fatalf("replace view: %v", err)
++	}
++	view, ok := dialect.GetViewByName("replace_view")
++	if !ok || view == nil {
++		t.Fatal("replacement view was not discoverable")
++	}
++	if view.GetRawQuery() != updatedRaw {
++		t.Fatalf("raw query after replacement = %q, want %q", view.GetRawQuery(), updatedRaw)
++	}
++	if got := catalogTranslatedDDL(t, eng, "replace_view"); got != updatedTranslated {
++		t.Fatalf("translated DDL after replacement = %q, want %q", got, updatedTranslated)
++	}
++	if got := catalogCount(t, eng, "replace_view"); got != 1 {
++		t.Fatalf("active catalog rows after replacement = %d, want 1", got)
++	}
++	if total, deleted := catalogVersionCounts(t, eng, "replace_view"); total != 2 || deleted != 1 {
++		t.Fatalf("view history = total %d, deleted %d, want total 2 with one tombstone", total, deleted)
++	}
++}
++
++func TestViewCatalogAcceptsUnionBody(t *testing.T) {
++	dialect, eng := newViewCatalogDialect(t)
++	raw := "select 1 as value union all select 2 as value"
++	if err := dialect.CreateView("union_view", raw, raw); err != nil {
++		t.Fatalf("create union view: %v", err)
++	}
++	view, ok := dialect.GetViewByName("union_view")
++	if !ok || view == nil || view.GetRawQuery() != raw {
++		t.Fatal("union view did not round-trip through the catalog")
++	}
++	if got := catalogCount(t, eng, "union_view"); got != 1 {
++		t.Fatalf("active catalog rows = %d, want 1", got)
++	}
++}
++
++func TestViewCatalogRejectsInvalidDefinitionsWithoutPersisting(t *testing.T) {
++	dialect, eng := newViewCatalogDialect(t)
++	for _, tc := range []struct {
++		name       string
++		raw        string
++		translated string
++		want       string
++	}{
++		{name: "", raw: "select 1", translated: "select 1", want: "empty view name"},
++		{name: "missing_query", raw: "", translated: "select 1", want: "empty raw definition"},
++		{name: "missing_translated", raw: "select 1", translated: "", want: "empty translated definition"},
++		{name: "malformed", raw: "select from", translated: "select from", want: "malformed query"},
++		{name: "write_statement", raw: "delete from widgets", translated: "delete from widgets", want: "non-select statement"},
++	} {
++		t.Run(tc.want, func(t *testing.T) {
++			if err := dialect.CreateView(tc.name, tc.raw, tc.translated); err == nil {
++				t.Fatalf("CreateView(%q, %q) succeeded, want validation error", tc.name, tc.raw)
++			}
++			if tc.name != "" && catalogCount(t, eng, tc.name) != 0 {
++				t.Fatalf("invalid definition for %q was persisted", tc.name)
++			}
++		})
++	}
++}
+
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,4 @@
++#!/bin/bash
++set -euo pipefail
++
++go test ./internal/stackql/sqldialect -run 'TestViewCatalog' -count=1

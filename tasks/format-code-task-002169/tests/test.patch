@@ -1,0 +1,339 @@
+diff --git a/backend/tests/unit/graphql/test_graphql_query.py b/backend/tests/unit/graphql/test_graphql_query.py
+index e840f030b..9c61b045a 100644
+--- a/backend/tests/unit/graphql/test_graphql_query.py
++++ b/backend/tests/unit/graphql/test_graphql_query.py
+@@ -5,6 +5,7 @@ from graphql import graphql
+ from infrahub.core import registry
+ from infrahub.core.branch import Branch
+ from infrahub.core.constants import BranchSupportType
++from infrahub.core.initialization import create_branch
+ from infrahub.core.manager import NodeManager
+ from infrahub.core.node import Node
+ from infrahub.core.schema import NodeSchema
+@@ -527,6 +528,257 @@ async def test_display_label_nested_query(db, session, default_branch: Branch, c
+     assert DeepDiff(result.data["TestPerson"]["edges"][0]["node"], expected_result, ignore_order=True).to_dict() == {}
+ 
+ 
++async def _execute_diff_summary(
++    db,
++    session,
++    branch: Branch,
++    branch_only: bool | None = None,
++    time_from: str | None = None,
++    time_to: str | None = None,
++) -> list[dict]:
++    arguments = []
++    variables = {}
++    variable_definitions = []
++
++    if branch_only is not None:
++        arguments.append("branch_only: $branch_only")
++        variables["branch_only"] = branch_only
++        variable_definitions.append("$branch_only: Boolean")
++    if time_from is not None:
++        arguments.append("time_from: $time_from")
++        variables["time_from"] = time_from
++        variable_definitions.append("$time_from: String")
++    if time_to is not None:
++        arguments.append("time_to: $time_to")
++        variables["time_to"] = time_to
++        variable_definitions.append("$time_to: String")
++
++    arguments_source = f"({', '.join(arguments)})" if arguments else ""
++    variables_source = f"({', '.join(variable_definitions)})" if variable_definitions else ""
++
++    query = f"""
++    query {variables_source} {{
++        DiffSummary{arguments_source} {{
++            branch
++            node
++            kind
++            actions
++        }}
++    }}
++    """
++
++    result = await graphql(
++        await generate_graphql_schema(
++            session=session, branch=branch, include_mutation=False, include_subscription=False
++        ),
++        source=query,
++        context_value={"infrahub_session": session, "infrahub_database": db, "infrahub_branch": branch},
++        root_value=None,
++        variable_values=variables,
++    )
++
++    assert result.errors is None
++    assert result.data
++    return result.data["DiffSummary"]
++
++
++def _summary_by_branch_and_node(diff_summary: list[dict]) -> dict[tuple[str, str], dict]:
++    return {(entry["branch"], entry["node"]): entry for entry in diff_summary}
++
++
++def _assert_summary_entry(
++    diff_summary: list[dict],
++    *,
++    branch: str,
++    node: str,
++    kind: str,
++    action: str,
++) -> None:
++    entries = _summary_by_branch_and_node(diff_summary)
++    assert (branch, node) in entries
++    entry = entries[(branch, node)]
++    assert entry["branch"] == branch
++    assert entry["node"] == node
++    assert entry["kind"] == kind
++    assert action in entry["actions"]
++
++
++async def test_query_diffsummary_returns_node_level_entries(db, session, default_branch: Branch, car_person_schema):
++    car = registry.get_schema(name="TestCar")
++    person = registry.get_schema(name="TestPerson")
++
++    p1_main = await Node.init(session=session, schema=person)
++    await p1_main.new(session=session, name="Summary Person One", height=180)
++    await p1_main.save(session=session)
++    p2_main = await Node.init(session=session, schema=person)
++    await p2_main.new(session=session, name="Summary Person Two", height=170)
++    await p2_main.save(session=session)
++
++    c1_main = await Node.init(session=session, schema=car)
++    await c1_main.new(session=session, name="summary-car-removed", nbr_seats=4, is_electric=True, owner=p1_main)
++    await c1_main.save(session=session)
++    c2_main = await Node.init(session=session, schema=car)
++    await c2_main.new(session=session, name="summary-car-updated", nbr_seats=4, is_electric=True, owner=p1_main)
++    await c2_main.save(session=session)
++
++    branch2 = await create_branch(branch_name="diffsummary-node-level", session=session)
++
++    await c1_main.delete(session=session)
++
++    p1_branch2 = await NodeManager.get_one_by_id_or_default_filter(
++        id=p1_main.id, session=session, schema_name="TestPerson", branch=branch2
++    )
++    p1_branch2.name.value = "Summary Person One Branch"
++    await p1_branch2.save(session=session)
++
++    c2_main.name.value = "summary-car-updated-main"
++    await c2_main.save(session=session)
++
++    diff_summary = await _execute_diff_summary(db=db, session=session, branch=branch2)
++
++    _assert_summary_entry(
++        diff_summary,
++        branch="main",
++        node=c1_main.id,
++        kind="TestCar",
++        action="removed",
++    )
++    _assert_summary_entry(
++        diff_summary,
++        branch="main",
++        node=c2_main.id,
++        kind="TestCar",
++        action="updated",
++    )
++    _assert_summary_entry(
++        diff_summary,
++        branch="diffsummary-node-level",
++        node=p1_branch2.id,
++        kind="TestPerson",
++        action="updated",
++    )
++
++
++async def test_query_diffsummary_honors_branch_only(db, session, default_branch: Branch, car_person_schema):
++    car = registry.get_schema(name="TestCar")
++    person = registry.get_schema(name="TestPerson")
++
++    p_main = await Node.init(session=session, schema=person)
++    await p_main.new(session=session, name="Branch Only Person", height=181)
++    await p_main.save(session=session)
++    c_main = await Node.init(session=session, schema=car)
++    await c_main.new(session=session, name="branch-only-car", nbr_seats=2, is_electric=False, owner=p_main)
++    await c_main.save(session=session)
++
++    branch2 = await create_branch(branch_name="diffsummary-branch-only", session=session)
++
++    p_branch2 = await NodeManager.get_one_by_id_or_default_filter(
++        id=p_main.id, session=session, schema_name="TestPerson", branch=branch2
++    )
++    p_branch2.name.value = "Branch Only Person Updated On Branch"
++    await p_branch2.save(session=session)
++
++    c_main.name.value = "branch-only-car-updated-on-main"
++    await c_main.save(session=session)
++
++    default_summary = await _execute_diff_summary(db=db, session=session, branch=branch2)
++    branch_only_summary = await _execute_diff_summary(db=db, session=session, branch=branch2, branch_only=True)
++
++    default_entries = _summary_by_branch_and_node(default_summary)
++    branch_only_entries = _summary_by_branch_and_node(branch_only_summary)
++
++    assert ("main", c_main.id) in default_entries
++    assert ("diffsummary-branch-only", p_branch2.id) in default_entries
++
++    assert ("diffsummary-branch-only", p_branch2.id) in branch_only_entries
++    assert all(entry["branch"] == "diffsummary-branch-only" for entry in branch_only_summary)
++    assert ("main", c_main.id) not in branch_only_entries
++
++
++async def test_query_diffsummary_honors_time_window(db, session, default_branch: Branch, car_person_schema):
++    person = registry.get_schema(name="TestPerson")
++
++    p_main = await Node.init(session=session, schema=person)
++    await p_main.new(session=session, name="Time Window Person", height=165)
++    await p_main.save(session=session)
++
++    branch2 = await create_branch(branch_name="diffsummary-time-window", session=session)
++
++    p_branch2 = await NodeManager.get_one_by_id_or_default_filter(
++        id=p_main.id, session=session, schema_name="TestPerson", branch=branch2
++    )
++    p_branch2.height.value = 166
++    await p_branch2.save(session=session)
++
++    default_summary = await _execute_diff_summary(db=db, session=session, branch=branch2, branch_only=True)
++    _assert_summary_entry(
++        default_summary,
++        branch="diffsummary-time-window",
++        node=p_branch2.id,
++        kind="TestPerson",
++        action="updated",
++    )
++
++    future_window_summary = await _execute_diff_summary(
++        db=db,
++        session=session,
++        branch=branch2,
++        branch_only=True,
++        time_from="2100-01-01T00:00:00Z",
++        time_to="2100-01-02T00:00:00Z",
++    )
++    past_window_summary = await _execute_diff_summary(
++        db=db,
++        session=session,
++        branch=branch2,
++        branch_only=True,
++        time_from="1970-01-01T00:00:00Z",
++        time_to="1970-01-02T00:00:00Z",
++    )
++
++    assert ("diffsummary-time-window", p_branch2.id) not in _summary_by_branch_and_node(future_window_summary)
++    assert ("diffsummary-time-window", p_branch2.id) not in _summary_by_branch_and_node(past_window_summary)
++
++
++async def test_query_diffsummary_includes_relationship_only_node_as_updated(
++    db, session, default_branch: Branch, car_person_schema
++):
++    car = registry.get_schema(name="TestCar")
++    person = registry.get_schema(name="TestPerson")
++
++    p1_main = await Node.init(session=session, schema=person)
++    await p1_main.new(session=session, name="Relationship Owner One", height=180)
++    await p1_main.save(session=session)
++    p2_main = await Node.init(session=session, schema=person)
++    await p2_main.new(session=session, name="Relationship Owner Two", height=170)
++    await p2_main.save(session=session)
++
++    c_main = await Node.init(session=session, schema=car)
++    await c_main.new(session=session, name="relationship-only-car", nbr_seats=4, is_electric=True, owner=p1_main)
++    await c_main.save(session=session)
++
++    branch2 = await create_branch(branch_name="diffsummary-relationship-only", session=session)
++    c_branch2 = await NodeManager.get_one_by_id_or_default_filter(
++        id=c_main.id, session=session, schema_name="TestCar", branch=branch2
++    )
++    p2_branch2 = await NodeManager.get_one_by_id_or_default_filter(
++        id=p2_main.id, session=session, schema_name="TestPerson", branch=branch2
++    )
++
++    await c_branch2.owner.update(data=p2_branch2.id, session=session)
++    await c_branch2.save(session=session)
++
++    diff_summary = await _execute_diff_summary(db=db, session=session, branch=branch2, branch_only=True)
++
++    _assert_summary_entry(
++        diff_summary,
++        branch="diffsummary-relationship-only",
++        node=c_branch2.id,
++        kind="TestCar",
++        action="updated",
++    )
++
++
+ async def test_query_typename(db, session, default_branch: Branch, car_person_schema):
+     car = registry.get_schema(name="TestCar")
+     person = registry.get_schema(name="TestPerson")
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,64 @@
++#!/bin/bash
++set -uo pipefail
++cd /testbed
++
++
++
++if ! neo4j status >/dev/null 2>&1; then
++    neo4j start
++    sleep 8
++fi
++
++
++export INFRAHUB_DB_TYPE=neo4j
++
++
++neo4j_bolt_ready() {
++    python3 - <<'PY'
++import socket
++with socket.socket() as sock:
++    sock.settimeout(1)
++    sock.connect(("127.0.0.1", 7687))
++PY
++}
++
++if ! neo4j_bolt_ready >/dev/null 2>&1; then
++    neo4j stop >/dev/null 2>&1 || true
++    pid_file="/var/lib/neo4j/run/neo4j.pid"
++    if [ -f "$pid_file" ]; then
++        pid="$(cat "$pid_file" 2>/dev/null || true)"
++        if [ -n "$pid" ] && ps -p "$pid" >/dev/null 2>&1; then
++            kill "$pid" >/dev/null 2>&1 || true
++            sleep 2
++        fi
++        rm -f "$pid_file"
++    fi
++    neo4j start
++fi
++
++for _ in $(seq 1 60); do
++    if neo4j_bolt_ready >/dev/null 2>&1; then
++        break
++    fi
++    sleep 1
++done
++
++if ! neo4j_bolt_ready >/dev/null 2>&1; then
++    echo "Neo4j Bolt port 7687 did not become ready" >&2
++    exit 1
++fi
++
++DIFFSUMMARY_TESTS="test_query_diffsummary_returns_node_level_entries or test_query_diffsummary_honors_branch_only or test_query_diffsummary_honors_time_window or test_query_diffsummary_includes_relationship_only_node_as_updated"
++
++case "${1:-}" in
++    base)
++        python3 -m pytest backend/tests/unit/graphql/test_graphql_query.py -v -k "not (${DIFFSUMMARY_TESTS})"
++        ;;
++    new)
++        python3 -m pytest backend/tests/unit/graphql/test_graphql_query.py -v -k "(${DIFFSUMMARY_TESTS})"
++        ;;
++    *)
++        echo "usage: $0 base|new"
++        exit 2
++        ;;
++esac

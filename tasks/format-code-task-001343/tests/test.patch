@@ -1,0 +1,210 @@
+diff --git a/tests/docs_update_test.py b/tests/docs_update_test.py
+new file mode 100644
+index 00000000..2cc3c88c
+--- /dev/null
++++ b/tests/docs_update_test.py
+@@ -0,0 +1,99 @@
++import ast
++import pathlib
++
++from absl.testing import absltest
++
++
++class DocsUpdateTest(absltest.TestCase):
++
++  def _read_doc(self, relative_path):
++    repo_root = pathlib.Path(__file__).resolve().parents[1]
++    return (repo_root / relative_path).read_text(encoding='utf-8')
++
++  def _rst_code_blocks(self, text, directives=('.. testcode::',)):
++    lines = text.splitlines()
++    blocks = []
++    i = 0
++    while i < len(lines):
++      if lines[i].strip() not in directives:
++        i += 1
++        continue
++      i += 1
++      while i < len(lines) and not lines[i].strip():
++        i += 1
++      block = []
++      while i < len(lines) and (not lines[i].strip() or lines[i].startswith('  ')):
++        block.append(lines[i][2:] if lines[i].startswith('  ') else '')
++        i += 1
++      blocks.append('\n'.join(block))
++    return blocks
++
++  def _call_names(self, code):
++    names = set()
++    for node in ast.walk(ast.parse(code)):
++      if not isinstance(node, ast.Call):
++        continue
++      func = node.func
++      if isinstance(func, ast.Attribute):
++        if isinstance(func.value, ast.Name):
++          names.add('%s.%s' % (func.value.id, func.attr))
++        names.add(func.attr)
++      elif isinstance(func, ast.Name):
++        names.add(func.id)
++    return names
++
++  def test_model_surgery_uses_separator_traversal(self):
++    blocks = self._rst_code_blocks(self._read_doc('docs/howtos/model_surgery.rst'))
++    separator_calls = []
++    manual_path_conversions = []
++    for block in blocks:
++      tree = ast.parse(block)
++      for node in ast.walk(tree):
++        if not isinstance(node, ast.Call):
++          continue
++        func = node.func
++        attr = func.attr if isinstance(func, ast.Attribute) else ''
++        if attr in ('flatten_dict', 'unflatten_dict'):
++          if any(keyword.arg == 'sep' for keyword in node.keywords):
++            separator_calls.append(attr)
++        if attr in ('join', 'split'):
++          manual_path_conversions.append(attr)
++
++    self.assertIn('flatten_dict', separator_calls)
++    self.assertIn('unflatten_dict', separator_calls)
++    self.assertEmpty(manual_path_conversions)
++
++  def test_optimizer_docs_use_optax_not_flax_optim_recommendation(self):
++    for doc_path in ('docs/howtos/model_surgery.rst',
++                     'docs/howtos/state_params.rst'):
++      with self.subTest(doc_path=doc_path):
++        doc = self._read_doc(doc_path)
++        blocks = self._rst_code_blocks(
++            doc, directives=('.. testsetup::', '.. testcode::'))
++        imported_modules = set()
++        imported_from_flax = set()
++        calls = set()
++        for block in blocks:
++          tree = ast.parse(block)
++          calls.update(self._call_names(block))
++          for node in ast.walk(tree):
++            if isinstance(node, ast.Import):
++              imported_modules.update(alias.name for alias in node.names)
++            elif isinstance(node, ast.ImportFrom) and node.module == 'flax':
++              imported_from_flax.update(alias.name for alias in node.names)
++
++        self.assertIn('optax', imported_modules)
++        self.assertIn('init', calls)
++        self.assertNotIn('optim', imported_from_flax)
++        self.assertNotIn('apply_gradient', calls)
++        self.assertNotIn('create', calls)
++
++    for doc_path in ('README.md', 'docs/overview.md'):
++      with self.subTest(doc_path=doc_path):
++        for line in self._read_doc(doc_path).splitlines():
++          if '**Optimizers**' in line:
++            self.assertNotIn('flax.optim', line)
++
++
++if __name__ == '__main__':
++  absltest.main()
+diff --git a/tests/traverse_util_test.py b/tests/traverse_util_test.py
+index 8ac2b57d..5ea33e72 100644
+--- a/tests/traverse_util_test.py
++++ b/tests/traverse_util_test.py
+@@ -151,6 +151,53 @@ class TraversalTest(absltest.TestCase):
+         ('bar', 'a'): 2,
+     })
+ 
++  def test_flatten_dict_sep_string_keys(self):
++    cases = (
++        (('left',), 1, '/'),
++        (('outer', 'inner'), 2, '.'),
++        (('root', 'branch', 'leaf'), 3, ':'),
++    )
++    for path, value, sep in cases:
++      with self.subTest(path=path, sep=sep):
++        nested = value
++        for key in reversed(path):
++          nested = {key: nested}
++
++        flat = traverse_util.flatten_dict(nested, sep=sep)
++
++        self.assertLen(flat, 1)
++        flat_key, flat_value = next(iter(flat.items()))
++        self.assertEqual(flat_value, value)
++        self.assertIsInstance(flat_key, str)
++        self.assertEqual(flat_key.split(sep), list(path))
++
++    nested = {'left': {'right': 4}}
++    tuple_key, = traverse_util.flatten_dict(nested).keys()
++    self.assertEqual(tuple_key, ('left', 'right'))
++
++  def test_unflatten_dict_sep_string_keys(self):
++    cases = (
++        (('left',), 1, '/'),
++        (('outer', 'inner'), 2, '.'),
++        (('root', 'branch', 'leaf'), 3, ':'),
++    )
++    for path, value, sep in cases:
++      with self.subTest(path=path, sep=sep):
++        flat_key = sep.join(path)
++        unflattened = traverse_util.unflatten_dict({flat_key: value}, sep=sep)
++        cursor = unflattened
++        for key in path[:-1]:
++          self.assertIsInstance(cursor, dict)
++          cursor = cursor[key]
++        self.assertEqual(cursor[path[-1]], value)
++
++        round_trip = traverse_util.flatten_dict(unflattened, sep=sep)
++        self.assertEqual(round_trip, {flat_key: value})
++
++    self.assertEqual(
++        traverse_util.unflatten_dict({('left', 'right'): 4}),
++        {'left': {'right': 4}})
++
+   def test_unflatten_dict(self):
+     flat_xs = {
+         ('foo',): 1,
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,42 @@
++#!/bin/bash
++set -uo pipefail
++cd /testbed
++
++
++set +u
++source /testbed/.build_env/.venv/bin/activate
++set -u
++
++pip install -e /testbed --no-deps -q 2>/dev/null || true
++
++LAXNUMPY=$(python -c "import jax._src.numpy.lax_numpy as m; print(m.__file__)")
++if ! grep -q "from jax._src.numpy.setops import isin" "$LAXNUMPY"; then
++  echo '
++# Compatibility shim: isin was moved to jax._src.numpy.setops
++from jax._src.numpy.setops import isin
++' >> "$LAXNUMPY"
++fi
++
++
++case "${1:-}" in
++  base)
++    python -m pytest \
++      tests/traverse_util_test.py::TraversalTest::test_flatten_dict \
++      tests/traverse_util_test.py::TraversalTest::test_unflatten_dict \
++      tests/traverse_util_test.py::TraversalTest::test_flatten_dict_keep_empty \
++      tests/traverse_util_test.py::TraversalTest::test_flatten_dict_is_leaf \
++      tests/traverse_util_test.py::ModelParamTraversalTest \
++      -v -o "filterwarnings="
++    ;;
++  new)
++    python -m pytest \
++      tests/traverse_util_test.py::TraversalTest::test_flatten_dict_sep_string_keys \
++      tests/traverse_util_test.py::TraversalTest::test_unflatten_dict_sep_string_keys \
++      tests/docs_update_test.py \
++      -v -o "filterwarnings="
++    ;;
++  *)
++    echo "usage: $0 base|new"
++    exit 2
++    ;;
++esac

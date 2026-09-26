@@ -1,0 +1,336 @@
+diff --git a/tests/pgo_nsys_converter_cli_test.py b/tests/pgo_nsys_converter_cli_test.py
+new file mode 100644
+index 000000000..663fe16ea
+--- /dev/null
++++ b/tests/pgo_nsys_converter_cli_test.py
+@@ -0,0 +1,320 @@
++#!/usr/bin/env python3
++
++import ast
++import csv
++import os
++from pathlib import Path
++import re
++import subprocess
++import sys
++import tempfile
++import unittest
++
++
++REPO_ROOT = Path(__file__).resolve().parents[1]
++CONVERTER = REPO_ROOT / "jax" / "tools" / "pgo_nsys_converter.py"
++ENTRY_RE = re.compile(
++    r'costs\s*\{\s*name:\s*"((?:\\.|[^"\\])*)"\s*'
++    r'cost_us:\s*([-+0-9.eE]+)\s*\}',
++    re.DOTALL,
++)
++
++
++def write_csv(path, rows, fieldnames=("NVTX Range", "Avg (ns)")):
++  with path.open("w", newline="") as csv_file:
++    writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
++    writer.writeheader()
++    writer.writerows(rows)
++
++
++def read_entries(path):
++  text = path.read_text()
++  matches = list(ENTRY_RE.finditer(text))
++  remainder = ENTRY_RE.sub("", text).strip()
++  if remainder:
++    raise AssertionError(f"unexpected pbtxt content: {remainder!r}")
++  return [
++      (ast.literal_eval(f'"{match.group(1)}"'), float(match.group(2)))
++      for match in matches
++  ]
++
++
++class PgoNsysConverterCliTest(unittest.TestCase):
++
++  def setUp(self):
++    self.temp_dir = tempfile.TemporaryDirectory()
++    self.addCleanup(self.temp_dir.cleanup)
++    self.root = Path(self.temp_dir.name)
++
++  def run_converter(self, *args, env=None):
++    child_env = os.environ.copy()
++    if env:
++      child_env.update(env)
++    return subprocess.run(
++        [sys.executable, "-S", str(CONVERTER), *map(str, args)],
++        cwd=REPO_ROOT,
++        env=child_env,
++        text=True,
++        stdout=subprocess.PIPE,
++        stderr=subprocess.PIPE,
++        check=False,
++    )
++
++  def make_fake_nsys(self):
++    bin_dir = self.root / "bin"
++    bin_dir.mkdir()
++    fake = bin_dir / "nsys"
++    fake.write_text(
++        """#!/usr/bin/python3
++import csv
++import os
++from pathlib import Path
++import sys
++
++args = sys.argv[1:]
++expected_profile = os.environ["FAKE_NSYS_EXPECT_PROFILE"]
++if expected_profile not in args:
++  print("profile argument was not forwarded", file=sys.stderr)
++  raise SystemExit(21)
++if "stats" not in args or "nvtxkernsum" not in args:
++  print("missing nsys stats nvtxkernsum selection", file=sys.stderr)
++  raise SystemExit(23)
++if os.environ.get("FAKE_NSYS_EXIT"):
++  print("synthetic nsys failure", file=sys.stderr)
++  raise SystemExit(int(os.environ["FAKE_NSYS_EXIT"]))
++try:
++  if "-o" in args:
++    output_prefix = Path(args[args.index("-o") + 1])
++  elif "--output" in args:
++    output_prefix = Path(args[args.index("--output") + 1])
++  else:
++    output_prefix = Path(next(arg.split("=", 1)[1] for arg in args
++                              if arg.startswith("--output=")))
++except (ValueError, IndexError, StopIteration):
++  print("missing nsys output prefix", file=sys.stderr)
++  raise SystemExit(22)
++
++report = Path(str(output_prefix) + "_nvtxkernsum.csv")
++database = Path(str(output_prefix) + ".sqlite")
++report.parent.mkdir(parents=True, exist_ok=True)
++with report.open("w", newline="") as report_file:
++  writer = csv.DictWriter(report_file, fieldnames=("NVTX Range", "Avg (ns)"))
++  writer.writeheader()
++  writer.writerow({"NVTX Range": "kernel hlo_op=profile.op#details", "Avg (ns)": "3250"})
++database.write_text("generated database")
++Path(os.environ["FAKE_NSYS_MANIFEST"]).write_text(f"{report}\\n{database}\\n")
++"""
++    )
++    fake.chmod(0o755)
++    return bin_dir
++
++  def fake_nsys_env(self, profile, manifest, bin_dir, **extra):
++    return {
++        "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
++        "FAKE_NSYS_EXPECT_PROFILE": str(profile),
++        "FAKE_NSYS_MANIFEST": str(manifest),
++        **extra,
++    }
++
++  def test_direct_csv_conversion_preserves_rows_and_escapes_names(self):
++    source = self.root / "profile.csv"
++    output = self.root / "costs.pbtxt"
++    write_csv(source, [
++        {"NVTX Range": "not an HLO annotation", "Avg (ns)": "not-a-number"},
++        {"NVTX Range": "prefix hlo_op=fusion.add#suffix", "Avg (ns)": "1500"},
++        {
++            "NVTX Range": 'prefix hlo_op=quote"and\\slash#suffix',
++            "Avg (ns)": "2250",
++        },
++    ])
++
++    result = self.run_converter(
++        "--csv_profile",
++        source,
++        "--pgle_output_path",
++        output,
++        env={"PATH": str(self.root / "no-external-tools")},
++    )
++
++    self.assertEqual(result.returncode, 0, result.stderr)
++    self.assertEqual(
++        read_entries(output),
++        [("fusion.add", 1.5), ('quote"and\\slash', 2.25)],
++    )
++
++  def test_post_process_controls_duplicate_aggregation(self):
++    source = self.root / "duplicates.csv"
++    raw_output = self.root / "raw.pbtxt"
++    compact_output = self.root / "compact.pbtxt"
++    write_csv(source, [
++        {"NVTX Range": "hlo_op=alpha#", "Avg (ns)": "5000"},
++        {"NVTX Range": "hlo_op=beta#", "Avg (ns)": "4000"},
++        {"NVTX Range": "hlo_op=alpha#", "Avg (ns)": "2000"},
++        {"NVTX Range": "hlo_op=beta#", "Avg (ns)": "6000"},
++    ])
++
++    raw = self.run_converter(
++        "--csv_profile", source, "--pgle_output_path", raw_output
++    )
++    compact = self.run_converter(
++        "--csv_profile",
++        source,
++        "--pgle_output_path",
++        compact_output,
++        "--post_process",
++    )
++
++    self.assertEqual(raw.returncode, 0, raw.stderr)
++    self.assertEqual(compact.returncode, 0, compact.stderr)
++    self.assertEqual(
++        read_entries(raw_output),
++        [("alpha", 5.0), ("beta", 4.0), ("alpha", 2.0), ("beta", 6.0)],
++    )
++    self.assertEqual(
++        read_entries(compact_output), [("alpha", 2.0), ("beta", 4.0)]
++    )
++
++  def test_input_modes_are_mutually_exclusive_and_required(self):
++    source = self.root / "profile.csv"
++    profile = self.root / "profile.nsys-rep"
++    output = self.root / "costs.pbtxt"
++    write_csv(source, [])
++    profile.write_text("profile")
++
++    neither = self.run_converter("--pgle_output_path", output)
++    both = self.run_converter(
++        "--profile_path",
++        profile,
++        "--csv_profile",
++        source,
++        "--pgle_output_path",
++        output,
++    )
++
++    for result in (neither, both):
++      self.assertNotEqual(result.returncode, 0)
++      self.assertIn("--profile_path", result.stderr)
++      self.assertIn("--csv_profile", result.stderr)
++
++  def test_csv_validation_reports_context_and_preserves_output(self):
++    invalid_values = ("not-a-number", "nan", "inf", "-1")
++    for index, invalid_value in enumerate(invalid_values):
++      with self.subTest(value=invalid_value):
++        source = self.root / f"invalid-{index}.csv"
++        output = self.root / f"invalid-{index}.pbtxt"
++        write_csv(source, [
++            {"NVTX Range": "hlo_op=bad#", "Avg (ns)": invalid_value}
++        ])
++        output.write_text("existing output")
++
++        result = self.run_converter(
++            "--csv_profile", source, "--pgle_output_path", output
++        )
++
++        self.assertNotEqual(result.returncode, 0)
++        self.assertIn("Avg (ns)", result.stderr)
++        self.assertRegex(result.stderr.lower(), r"(?:row|line)\s+2")
++        self.assertEqual(output.read_text(), "existing output")
++
++    for missing_field in ("NVTX Range", "Avg (ns)"):
++      with self.subTest(missing_field=missing_field):
++        fields = tuple(
++            field for field in ("NVTX Range", "Avg (ns)") if field != missing_field
++        )
++        source = self.root / f"missing-{missing_field.replace(' ', '_')}.csv"
++        output = self.root / f"missing-{missing_field.replace(' ', '_')}.pbtxt"
++        row = {field: "1" for field in fields}
++        write_csv(source, [row], fieldnames=fields)
++        output.write_text("existing output")
++
++        result = self.run_converter(
++            "--csv_profile", source, "--pgle_output_path", output
++        )
++
++        self.assertNotEqual(result.returncode, 0)
++        self.assertIn(missing_field, result.stderr)
++        self.assertEqual(output.read_text(), "existing output")
++
++  def test_profile_conversion_cleans_only_generated_intermediates(self):
++    profile = self.root / "input" / "profile.nsys-rep"
++    output = self.root / "output" / "costs.pbtxt"
++    profile.parent.mkdir()
++    output.parent.mkdir()
++    profile.write_text("profile")
++    unrelated_csv = output.parent / "keep.csv"
++    unrelated_sqlite = profile.parent / "keep.sqlite"
++    unrelated_csv.write_text("unrelated csv")
++    unrelated_sqlite.write_text("unrelated sqlite")
++    manifest = self.root / "manifest.txt"
++    bin_dir = self.make_fake_nsys()
++
++    result = self.run_converter(
++        "--profile_path",
++        profile,
++        "--pgle_output_path",
++        output,
++        env=self.fake_nsys_env(profile, manifest, bin_dir),
++    )
++
++    self.assertEqual(result.returncode, 0, result.stderr)
++    self.assertEqual(read_entries(output), [("profile.op", 3.25)])
++    self.assertTrue(unrelated_csv.exists())
++    self.assertTrue(unrelated_sqlite.exists())
++    generated = [Path(line) for line in manifest.read_text().splitlines()]
++    self.assertTrue(generated)
++    self.assertTrue(all(not path.exists() for path in generated))
++
++  def test_keep_intermediates_retains_generated_profile_artifacts(self):
++    profile = self.root / "profile.nsys-rep"
++    output = self.root / "costs.pbtxt"
++    manifest = self.root / "manifest.txt"
++    profile.write_text("profile")
++    bin_dir = self.make_fake_nsys()
++
++    result = self.run_converter(
++        "--profile_path",
++        profile,
++        "--pgle_output_path",
++        output,
++        "--keep_intermediates",
++        env=self.fake_nsys_env(profile, manifest, bin_dir),
++    )
++
++    self.assertEqual(result.returncode, 0, result.stderr)
++    generated = [Path(line) for line in manifest.read_text().splitlines()]
++    self.assertTrue(generated)
++    self.assertTrue(all(path.exists() for path in generated))
++
++  def test_nsys_failures_are_nonzero_and_do_not_replace_output(self):
++    profile = self.root / "profile.nsys-rep"
++    output = self.root / "costs.pbtxt"
++    manifest = self.root / "manifest.txt"
++    profile.write_text("profile")
++    output.write_text("existing output")
++    bin_dir = self.make_fake_nsys()
++
++    failed_process = self.run_converter(
++        "--profile_path",
++        profile,
++        "--pgle_output_path",
++        output,
++        env=self.fake_nsys_env(
++            profile, manifest, bin_dir, FAKE_NSYS_EXIT="7"
++        ),
++    )
++    missing_tool = self.run_converter(
++        "--profile_path",
++        profile,
++        "--pgle_output_path",
++        output,
++        env={"PATH": str(self.root / "empty-path")},
++    )
++
++    for result in (failed_process, missing_tool):
++      self.assertNotEqual(result.returncode, 0)
++      self.assertIn("nsys", result.stderr.lower())
++    self.assertEqual(output.read_text(), "existing output")
++
++
++if __name__ == "__main__":
++  unittest.main()
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,5 @@
++#!/bin/bash
++set -euo pipefail
++
++
++python3.12 -S tests/pgo_nsys_converter_cli_test.py

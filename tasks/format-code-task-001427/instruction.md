@@ -1,0 +1,1 @@
+This is causing https://github.com/ember-cli/ember-cli/issues/7371, where people are using `npm` to install `handlebars` as a transitive dependency but apparently `npm` is not installing the optional `uglify-js` dependency (anymore?) which makes the import fail.

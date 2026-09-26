@@ -1,0 +1,170 @@
+diff --git a/posthog/api/test/test_cohort.py b/posthog/api/test/test_cohort.py
+index 535466a10e2..cb0825e0bac 100644
+--- a/posthog/api/test/test_cohort.py
++++ b/posthog/api/test/test_cohort.py
+@@ -32,3 +32,18 @@ class TestCohort(BaseTest):
+         self.assertEqual(response.status_code, 200, response.content)
+         self.assertEqual(response.json()["name"], "whatever2")
+         self.assertEqual(patch_calculate_cohort.call_count, 2)
++
++    def test_cohort_api_includes_errors_calculating(self):
++        cohort = Cohort.objects.create(
++            team=self.team,
++            groups=[{"action_id": 999999999}],
++            name="cohort1",
++        )
++        cohort.calculate_people()
++        cohort.refresh_from_db()
++        cohort.calculate_people()
++        cohort.refresh_from_db()
++
++        response = self.client.get("/api/cohort/%s/" % cohort.pk)
++        self.assertEqual(response.status_code, 200)
++        self.assertEqual(response.json()["errors_calculating"], 2)
+diff --git a/posthog/tasks/test/test_calculate_cohort.py b/posthog/tasks/test/test_calculate_cohort.py
+new file mode 100644
+index 00000000000..9e3ccb79f0b
+--- /dev/null
++++ b/posthog/tasks/test/test_calculate_cohort.py
+@@ -0,0 +1,39 @@
++from unittest.mock import patch
++
++from dateutil.relativedelta import relativedelta
++from django.utils import timezone
++
++from posthog.models import Cohort
++from posthog.tasks.calculate_cohort import calculate_cohorts
++from posthog.test.base import BaseTest
++
++
++class TestCalculateCohort(BaseTest):
++    def _stale_cohort_with_failures(self, failures):
++        cohort = Cohort.objects.create(
++            team=self.team,
++            groups=[{"properties": {"$some_prop": "nomatchihope"}}],
++            name="cohort-%s" % failures,
++            last_calculation=timezone.now() - relativedelta(hours=2),
++        )
++        cohort.groups = [{"action_id": 999999999}]
++        cohort.save()
++        for _ in range(failures):
++            cohort.calculate_people()
++            cohort.refresh_from_db()
++        cohort.is_calculating = False
++        cohort.last_calculation = timezone.now() - relativedelta(hours=2)
++        cohort.save()
++        return cohort
++
++    def test_periodic_recalculation_skips_cohorts_after_three_failures(self):
++        no_failures = self._stale_cohort_with_failures(0)
++        two_failures = self._stale_cohort_with_failures(2)
++        three_failures = self._stale_cohort_with_failures(3)
++        four_failures = self._stale_cohort_with_failures(4)
++
++        with patch("posthog.tasks.calculate_cohort.calculate_cohort.delay") as delay:
++            calculate_cohorts()
++
++        enqueued_ids = {call.args[0] if call.args else call.kwargs["cohort_id"] for call in delay.call_args_list}
++        self.assertEqual(enqueued_ids, {no_failures.pk, two_failures.pk})
+diff --git a/posthog/test/test_cohort_model.py b/posthog/test/test_cohort_model.py
+index 49dd0dbacc6..eb1b6193bdb 100644
+--- a/posthog/test/test_cohort_model.py
++++ b/posthog/test/test_cohort_model.py
+@@ -8,6 +8,8 @@ from posthog.test.base import BaseTest
+ 
+ 
+ class TestCohort(BaseTest):
++    TESTS_API = True
++
+     def test_postgres_get_distinct_ids_from_cohort(self):
+         person1 = Person.objects.create(distinct_ids=["person_1"], team=self.team)
+         event1 = Event.objects.create(event="user signed up", team=self.team, distinct_id="person_1")
+@@ -76,3 +78,50 @@ class TestCohort(BaseTest):
+ 
+         cohort2.calculate_people()
+         self.assertFalse(Cohort.objects.get().is_calculating)
++
++    def _cohort_response(self, cohort):
++        response = self.client.get("/api/cohort/%s/" % cohort.pk)
++        self.assertEqual(response.status_code, 200)
++        return response.json()
++
++    def _fail_cohort_calculation(self, cohort):
++        cohort.groups = [{"action_id": 999999999}]
++        cohort.save()
++        cohort.calculate_people()
++        cohort.refresh_from_db()
++        return cohort
++
++    def test_failed_calculation_clears_calculating_and_increments_error_count(self):
++        cohort = Cohort.objects.create(
++            team=self.team,
++            groups=[{"properties": {"$some_prop": "nomatchihope"}}],
++            name="cohort1",
++        )
++
++        cohort = self._fail_cohort_calculation(cohort)
++        cohort = self._fail_cohort_calculation(cohort)
++        self.assertEqual(self._cohort_response(cohort)["errors_calculating"], 2)
++
++        cohort.is_calculating = True
++        cohort.save()
++        cohort = self._fail_cohort_calculation(cohort)
++
++        self.assertFalse(cohort.is_calculating)
++        self.assertEqual(self._cohort_response(cohort)["errors_calculating"], 3)
++
++    def test_successful_calculation_clears_prior_error_count(self):
++        cohort = Cohort.objects.create(
++            team=self.team,
++            groups=[{"properties": {"$some_prop": "nomatchihope"}}],
++            name="cohort1",
++        )
++        cohort = self._fail_cohort_calculation(cohort)
++        cohort = self._fail_cohort_calculation(cohort)
++
++        cohort.groups = [{"properties": {"$some_prop": "nomatchihope"}}]
++        cohort.save()
++        cohort.calculate_people()
++        cohort.refresh_from_db()
++        self.assertEqual(self._cohort_response(cohort)["errors_calculating"], 0)
++        self.assertFalse(cohort.is_calculating)
++        self.assertIsNotNone(cohort.last_calculation)
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,33 @@
++#!/bin/bash
++set -uo pipefail
++cd /testbed
++
++
++pg_isready -q 2>/dev/null || pg_ctlcluster 16 main start 2>/dev/null
++
++
++redis-cli ping >/dev/null 2>&1 || redis-server --daemonize yes 2>/dev/null
++
++export DATABASE_URL="postgres://postgres:postgres@localhost:5432/posthog"
++export REDIS_URL="redis://localhost/"
++export TEST="true"
++export DJANGO_SETTINGS_MODULE="posthog.settings"
++
++case "${1:-}" in
++  base)
++    python3 -m pytest posthog/test/test_cohort_model.py -x -v \
++      -k "not test_failed_calculation_clears_calculating_and_increments_error_count and not test_successful_calculation_clears_prior_error_count" 2>&1
++    ;;
++  new)
++    python3 -m pytest \
++      posthog/api/test/test_cohort.py::TestCohort::test_cohort_api_includes_errors_calculating \
++      posthog/test/test_cohort_model.py::TestCohort::test_failed_calculation_clears_calculating_and_increments_error_count \
++      posthog/test/test_cohort_model.py::TestCohort::test_successful_calculation_clears_prior_error_count \
++      posthog/tasks/test/test_calculate_cohort.py::TestCalculateCohort::test_periodic_recalculation_skips_cohorts_after_three_failures \
++      -x -v 2>&1
++    ;;
++  *)
++    echo "usage: $0 base|new"
++    exit 2
++    ;;
++esac

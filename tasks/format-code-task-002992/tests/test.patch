@@ -1,0 +1,412 @@
+diff --git a/usercase-test-coderl/test_voc_to_coco.py b/usercase-test-coderl/test_voc_to_coco.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/test_voc_to_coco.py
+@@ -0,0 +1,386 @@
++
++
++
++
++
++
++
++import copy
++import json
++import pathlib
++import socket
++import subprocess
++import sys
++
++import pytest
++
++from weedcoco.importers.voc import voc_to_coco
++
++
++def _object_xml(name, bbox=None):
++    if bbox is None:
++        return f"<object><name>{name}</name></object>"
++    xmin, ymin, xmax, ymax = bbox
++    return (
++        f"<object><name>{name}</name><bndbox>"
++        f"<xmin>{xmin}</xmin><ymin>{ymin}</ymin>"
++        f"<xmax>{xmax}</xmax><ymax>{ymax}</ymax>"
++        f"</bndbox></object>"
++    )
++
++
++def _write_annotation(xml_dir, filename, image_name, width, height, objects):
++    xml_dir.joinpath(filename).write_text(
++        "<annotation>"
++        f"<filename>{image_name}</filename>"
++        f"<size><width>{width}</width><height>{height}</height></size>"
++        f"{''.join(objects)}"
++        "</annotation>"
++    )
++
++
++def _snapshot_tree(root):
++    snapshot = {}
++    for path in sorted(root.rglob("*")):
++        rel = path.relative_to(root).as_posix()
++        if path.is_file():
++            snapshot[rel] = path.read_bytes()
++        elif path.is_dir():
++            snapshot[rel + "/"] = None
++    return snapshot
++
++
++def test_single_xml_default_category_and_inclusive_bbox(tmp_path):
++
++
++
++    xml_dir = tmp_path / "xml"
++    xml_dir.mkdir()
++    _write_annotation(
++        xml_dir,
++        "img1.xml",
++        "img1.jpg",
++        100,
++        80,
++        [_object_xml("Ryegrass", (10, 20, 14, 25))],
++    )
++
++    actual = voc_to_coco(xml_dir)
++
++    assert actual == {
++        "images": [{"id": 0, "file_name": "img1.jpg", "width": 100, "height": 80}],
++        "annotations": [
++            {
++                "id": 0,
++                "image_id": 0,
++                "category_id": 0,
++                "bbox": [10, 20, 5, 6],
++            }
++        ],
++        "info": {},
++        "categories": [{"id": 0, "name": "Ryegrass"}],
++    }
++
++
++def test_sorted_files_sequential_ids_and_first_seen_categories(tmp_path):
++
++
++
++    xml_dir = tmp_path / "xml"
++    xml_dir.mkdir()
++    _write_annotation(
++        xml_dir,
++        "b_img.xml",
++        "b.jpg",
++        200,
++        100,
++        [_object_xml("Turnip", (1, 2, 3, 6))],
++    )
++    _write_annotation(
++        xml_dir,
++        "a_img.xml",
++        "a.jpg",
++        50,
++        40,
++        [
++            _object_xml("Ryegrass", (10, 20, 14, 25)),
++            _object_xml("Turnip", (0, 0, 0, 0)),
++        ],
++    )
++
++    actual = voc_to_coco(xml_dir)
++
++    assert actual == {
++        "images": [
++            {"id": 0, "file_name": "a.jpg", "width": 50, "height": 40},
++            {"id": 1, "file_name": "b.jpg", "width": 200, "height": 100},
++        ],
++        "annotations": [
++            {
++                "id": 0,
++                "image_id": 0,
++                "category_id": 0,
++                "bbox": [10, 20, 5, 6],
++            },
++            {"id": 1, "image_id": 0, "category_id": 1, "bbox": [0, 0, 1, 1]},
++            {"id": 2, "image_id": 1, "category_id": 1, "bbox": [1, 2, 3, 5]},
++        ],
++        "info": {},
++        "categories": [{"id": 0, "name": "Ryegrass"}, {"id": 1, "name": "Turnip"}],
++    }
++
++
++def test_glob_pattern_filters_and_orders_matching_xml_paths(tmp_path):
++
++
++
++    xml_dir = tmp_path / "xml"
++    xml_dir.mkdir()
++    _write_annotation(
++        xml_dir,
++        "-skip.xml",
++        "skip.jpg",
++        999,
++        999,
++        [_object_xml("Skipped", (1, 1, 2, 2))],
++    )
++    _write_annotation(
++        xml_dir,
++        "A.xml",
++        "upper.jpg",
++        21,
++        22,
++        [_object_xml("Alpha", (2, 4, 2, 5))],
++    )
++    _write_annotation(
++        xml_dir,
++        "sample.voc.xml",
++        "dotted.jpg",
++        31,
++        32,
++        [_object_xml("Beta", (7, 8, 10, 8))],
++    )
++    xml_dir.joinpath("notes.txt").write_text("not xml")
++
++    actual = voc_to_coco(xml_dir)
++
++    assert actual == {
++        "images": [
++            {"id": 0, "file_name": "upper.jpg", "width": 21, "height": 22},
++            {"id": 1, "file_name": "dotted.jpg", "width": 31, "height": 32},
++        ],
++        "annotations": [
++            {"id": 0, "image_id": 0, "category_id": 0, "bbox": [2, 4, 1, 2]},
++            {"id": 1, "image_id": 1, "category_id": 1, "bbox": [7, 8, 4, 1]},
++        ],
++        "info": {},
++        "categories": [{"id": 0, "name": "Alpha"}, {"id": 1, "name": "Beta"}],
++    }
++
++
++def test_category_mapping_uses_given_ids_and_omits_categories(tmp_path):
++
++
++
++    xml_dir = tmp_path / "xml"
++    xml_dir.mkdir()
++    _write_annotation(
++        xml_dir,
++        "mapped.xml",
++        "mapped.jpg",
++        33,
++        44,
++        [
++            _object_xml("Ryegrass", (5, 6, 8, 9)),
++            _object_xml("Turnip", (1, 1, 1, 3)),
++        ],
++    )
++
++    actual = voc_to_coco(xml_dir, category_mapping={"Ryegrass": 7, "Turnip": 9})
++
++    assert actual == {
++        "images": [{"id": 0, "file_name": "mapped.jpg", "width": 33, "height": 44}],
++        "annotations": [
++            {"id": 0, "image_id": 0, "category_id": 7, "bbox": [5, 6, 4, 4]},
++            {"id": 1, "image_id": 0, "category_id": 9, "bbox": [1, 1, 1, 3]},
++        ],
++        "info": {},
++    }
++
++
++def test_object_without_bndbox_omits_bbox(tmp_path):
++
++
++
++    xml_dir = tmp_path / "xml"
++    xml_dir.mkdir()
++    _write_annotation(
++        xml_dir,
++        "nobox.xml",
++        "nobox.jpg",
++        11,
++        12,
++        [_object_xml("Ryegrass")],
++    )
++
++    actual = voc_to_coco(xml_dir)
++
++    assert actual == {
++        "images": [{"id": 0, "file_name": "nobox.jpg", "width": 11, "height": 12}],
++        "annotations": [{"id": 0, "image_id": 0, "category_id": 0}],
++        "info": {},
++        "categories": [{"id": 0, "name": "Ryegrass"}],
++    }
++
++
++def test_image_dir_argument_is_accepted_without_changing_result(tmp_path):
++
++
++
++    xml_dir = tmp_path / "xml"
++    image_dir = tmp_path / "images"
++    xml_dir.mkdir()
++    image_dir.mkdir()
++    _write_annotation(
++        xml_dir,
++        "image_dir.xml",
++        "with_image_dir.jpg",
++        13,
++        14,
++        [_object_xml("Ryegrass", (2, 3, 5, 7))],
++    )
++    expected = {
++        "images": [
++            {"id": 0, "file_name": "with_image_dir.jpg", "width": 13, "height": 14}
++        ],
++        "annotations": [
++            {"id": 0, "image_id": 0, "category_id": 0, "bbox": [2, 3, 4, 5]}
++        ],
++        "info": {},
++        "categories": [{"id": 0, "name": "Ryegrass"}],
++    }
++
++    assert voc_to_coco(xml_dir, image_dir=image_dir) == expected
++    assert voc_to_coco(xml_dir) == expected
++
++
++def test_invalid_document_root_raises_assertion_error(tmp_path):
++
++
++
++    xml_dir = tmp_path / "xml"
++    xml_dir.mkdir()
++    xml_dir.joinpath("bad.xml").write_text("<not_annotation></not_annotation>")
++
++    with pytest.raises(AssertionError):
++        voc_to_coco(xml_dir)
++
++
++def test_referential_transparency_same_input_same_value(tmp_path):
++    xml_dir = tmp_path / "xml"
++    xml_dir.mkdir()
++    _write_annotation(
++        xml_dir,
++        "repeat.xml",
++        "repeat.jpg",
++        41,
++        42,
++        [_object_xml("Ryegrass", (3, 4, 8, 10))],
++    )
++    mapping = {"Ryegrass": 7}
++
++    assert voc_to_coco(xml_dir, category_mapping=mapping) == voc_to_coco(
++        xml_dir, category_mapping=mapping
++    )
++
++
++def test_does_not_mutate_caller_mapping(tmp_path):
++    xml_dir = tmp_path / "xml"
++    xml_dir.mkdir()
++    _write_annotation(
++        xml_dir,
++        "mapping.xml",
++        "mapping.jpg",
++        51,
++        52,
++        [_object_xml("Ryegrass", (1, 2, 4, 6))],
++    )
++    mapping = {"Ryegrass": 7, "Turnip": 9}
++    before = copy.deepcopy(mapping)
++
++    voc_to_coco(xml_dir, category_mapping=mapping)
++
++    assert mapping == before
++
++
++def test_no_global_state_fresh_process_matches_in_process(tmp_path):
++    xml_dir = tmp_path / "xml"
++    xml_dir.mkdir()
++    _write_annotation(
++        xml_dir,
++        "fresh.xml",
++        "fresh.jpg",
++        61,
++        62,
++        [
++            _object_xml("Ryegrass", (1, 1, 2, 3)),
++            _object_xml("Turnip", (4, 5, 7, 9)),
++        ],
++    )
++    mapping = {"Ryegrass": 7, "Turnip": 9}
++    in_process = voc_to_coco(xml_dir, category_mapping=mapping)
++
++    script = f"""
++import json
++import pathlib
++import sys
++sys.path.insert(0, "/workspace/repo")
++from weedcoco.importers.voc import voc_to_coco
++out = voc_to_coco(
++    pathlib.Path({str(xml_dir)!r}),
++    category_mapping={{"Ryegrass": 7, "Turnip": 9}},
++)
++sys.stdout.write(json.dumps(out, sort_keys=True))
++"""
++    completed = subprocess.run(
++        [sys.executable, "-c", script],
++        check=True,
++        text=True,
++        capture_output=True,
++    )
++
++    assert json.loads(completed.stdout) == in_process
++
++
++def test_no_undeclared_file_or_network_side_effects(tmp_path, monkeypatch):
++    workspace = tmp_path / "workspace"
++    xml_dir = workspace / "xml"
++    workspace.mkdir()
++    xml_dir.mkdir()
++    _write_annotation(
++        xml_dir,
++        "pure.xml",
++        "pure.jpg",
++        71,
++        72,
++        [_object_xml("Ryegrass", (2, 3, 4, 5))],
++    )
++    before = _snapshot_tree(workspace)
++
++    def blocked_socket(*args, **kwargs):
++        raise AssertionError("voc_to_coco must not open network sockets")
++
++    monkeypatch.setattr(socket, "socket", blocked_socket)
++    monkeypatch.chdir(workspace)
++
++    actual = voc_to_coco(pathlib.Path("xml"))
++
++    assert actual == {
++        "images": [{"id": 0, "file_name": "pure.jpg", "width": 71, "height": 72}],
++        "annotations": [
++            {"id": 0, "image_id": 0, "category_id": 0, "bbox": [2, 3, 3, 3]}
++        ],
++        "info": {},
++        "categories": [{"id": 0, "name": "Ryegrass"}],
++    }
++    assert _snapshot_tree(workspace) == before
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,16 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++cd /workspace/repo
++export PYTHONPATH="/workspace/repo${PYTHONPATH:+:${PYTHONPATH}}"
++export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
++exec python -m pytest /workspace/repo/usercase-test-coderl/test_voc_to_coco.py -v

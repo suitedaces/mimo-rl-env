@@ -1,0 +1,290 @@
+diff --git a/internal/cmd/config/sanitized_contract_test.go b/internal/cmd/config/sanitized_contract_test.go
+new file mode 100644
+index 000000000..3880632ab
+--- /dev/null
++++ b/internal/cmd/config/sanitized_contract_test.go
+@@ -0,0 +1,274 @@
++package config
++
++import (
++	"encoding/json"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/require"
++)
++
++const sanitizedContractHCL = `
++disable_mlock = true
++default_max_request_duration = "7s"
++log_level = "debug"
++log_format = "json"
++pid_file = "/tmp/boundary.pid"
++cluster_name = "cluster-a"
++
++listener "tcp" {
++	purpose = "api"
++	address = "127.0.0.1:9200"
++	tls_disable = true
++}
++
++controller {
++	name = "controller-a"
++	description = "controller description"
++	public_cluster_addr = "127.0.0.1:9201"
++	auth_token_time_to_live = "10m"
++	auth_token_time_to_stale = "2m"
++	database {
++		url = "postgresql://boundary:database-secret@db.example/boundary"
++		migration_url = "postgresql://boundary:migration-secret@db.example/boundary"
++		max_open_connections = 12
++	}
++}
++
++worker {
++	name = "worker-a"
++	description = "worker description"
++	controllers = ["127.0.0.1:9201"]
++	public_addr = "worker.example:9202"
++	tags {
++	region = ["us-east"]
++	}
++}
++
++plugins {
++	execution_dir = "/var/lib/boundary/plugins"
++}
++
++events {
++	audit_enabled = true
++	observations_enabled = true
++	sysevents_enabled = true
++	sink "stderr" {
++		format = "cloudevents-json"
++		name = "audit-sink"
++		event_types = ["audit"]
++	}
++	sink "file" {
++		name = "observation-sink"
++		description = "local observation archive"
++		event_types = ["observation", "system"]
++		event_source_url = "https://boundary.example/events"
++		allow_filters = ["source contains boundary"]
++		deny_filters = ["data contains private"]
++		format = "cloudevents-json"
++		file {
++			path = "/var/log/boundary"
++			file_name = "events.log"
++			rotate_bytes = 4096
++			rotate_duration = "3m"
++			rotate_max_files = 5
++		}
++	}
++}
++
++kms "aead" {
++	purpose = "root"
++	aead_type = "aes-gcm"
++	key = "do-not-leak-this-key"
++	key_id = "root-key"
++}
++`
++
++func TestSanitizedContractPreservesBoundaryConfiguration(t *testing.T) {
++	c, err := Parse(sanitizedContractHCL)
++	require.NoError(t, err)
++	c.DevController = true
++	c.DevUiPassthroughDir = "/tmp/boundary-ui"
++	c.DevControllerKey = "controller-secret"
++	c.DevWorkerAuthKey = "worker-secret"
++	c.DevRecoveryKey = "recovery-secret"
++
++	got := c.Sanitized()
++	require.Equal(t, true, got["disable_mlock"])
++	require.Equal(t, "debug", got["log_level"])
++	require.Equal(t, "json", got["log_format"])
++	require.Equal(t, "cluster-a", got["cluster_name"])
++	controller, ok := got["controller"].(map[string]interface{})
++	require.True(t, ok, "controller must be a map")
++	require.Equal(t, "controller-a", controller["name"])
++	require.Equal(t, "controller description", controller["description"])
++	require.Equal(t, "127.0.0.1:9201", controller["public_cluster_addr"])
++	require.Equal(t, 10*time.Minute, controller["auth_token_time_to_live"])
++	require.Equal(t, 2*time.Minute, controller["auth_token_time_to_stale"])
++	database, ok := controller["database"].(map[string]interface{})
++	require.True(t, ok, "controller database must be a map")
++	require.Equal(t, 12, database["max_open_connections"])
++	require.NotContains(t, database, "url")
++	require.NotContains(t, database, "migration_url")
++
++	worker, ok := got["worker"].(map[string]interface{})
++	require.True(t, ok, "worker must be a map")
++	require.Equal(t, "worker-a", worker["name"])
++	require.Equal(t, "worker description", worker["description"])
++	require.Equal(t, []string{"127.0.0.1:9201"}, worker["controllers"])
++	require.Equal(t, "worker.example:9202", worker["public_addr"])
++	require.Equal(t, map[string][]string{"region": {"us-east"}}, worker["tags"])
++
++	plugins, ok := got["plugins"].(map[string]interface{})
++	require.True(t, ok, "plugins must be a map")
++	require.Equal(t, "/var/lib/boundary/plugins", plugins["execution_dir"])
++	require.Equal(t, true, got["dev_controller"])
++	require.Equal(t, "/tmp/boundary-ui", got["dev_ui_passthrough_dir"])
++
++	events, ok := got["events"].(map[string]interface{})
++	require.True(t, ok, "events must be a map")
++	require.Equal(t, true, events["audit_enabled"])
++	require.Equal(t, true, events["observations_enabled"])
++	require.Equal(t, true, events["sysevents_enabled"])
++	sinks, ok := events["sinks"].([]interface{})
++	require.True(t, ok, "event sinks must be a slice")
++	require.Len(t, sinks, 2)
++	sink, ok := sinks[0].(map[string]interface{})
++	require.True(t, ok, "each event sink must be a map")
++	require.Equal(t, "audit-sink", sink["name"])
++	require.Equal(t, "stderr", sink["type"])
++	require.Equal(t, "cloudevents-json", sink["format"])
++	require.Equal(t, []string{"audit"}, sink["event_types"])
++	require.Equal(t, map[string]interface{}{}, sink["stderr"])
++
++	fileSink, ok := sinks[1].(map[string]interface{})
++	require.True(t, ok, "each event sink must be a map")
++	require.Equal(t, "observation-sink", fileSink["name"])
++	require.Equal(t, "local observation archive", fileSink["description"])
++	require.Equal(t, []string{"observation", "system"}, fileSink["event_types"])
++	require.Equal(t, "https://boundary.example/events", fileSink["event_source_url"])
++	require.Equal(t, []string{"source contains boundary"}, fileSink["allow_filters"])
++	require.Equal(t, []string{"data contains private"}, fileSink["deny_filters"])
++	require.Equal(t, "file", fileSink["type"])
++	fileConfig, ok := fileSink["file"].(map[string]interface{})
++	require.True(t, ok, "file sink configuration must be a map")
++	require.Equal(t, "/var/log/boundary", fileConfig["path"])
++	require.Equal(t, "events.log", fileConfig["file_name"])
++	require.Equal(t, 4096, fileConfig["rotate_bytes"])
++	require.Equal(t, 3*time.Minute, fileConfig["rotate_duration"])
++	require.Equal(t, 5, fileConfig["rotate_max_files"])
++
++	seals := got["seals"].([]interface{})
++	require.Len(t, seals, 1)
++	require.NotContains(t, seals[0].(map[string]interface{}), "config")
++	require.NotContains(t, got, "dev_controller_key")
++	require.NotContains(t, got, "dev_worker_auth_key")
++	require.NotContains(t, got, "dev_recovery_key")
++	require.NotContains(t, got, "worker_tags_raw")
++	requireNoRawKeys(t, got)
++
++	encoded, err := json.Marshal(got)
++	require.NoError(t, err)
++	require.NotContains(t, string(encoded), "do-not-leak-this-key")
++	require.NotContains(t, string(encoded), "controller-secret")
++	require.NotContains(t, string(encoded), "worker-secret")
++	require.NotContains(t, string(encoded), "recovery-secret")
++	require.NotContains(t, string(encoded), "database-secret")
++	require.NotContains(t, string(encoded), "migration-secret")
++}
++
++func TestSanitizedContractReturnsIndependentCopy(t *testing.T) {
++	c, err := Parse(sanitizedContractHCL)
++	require.NoError(t, err)
++
++	got := c.Sanitized()
++	controller, ok := got["controller"].(map[string]interface{})
++	require.True(t, ok, "controller must be a map")
++	worker, ok := got["worker"].(map[string]interface{})
++	require.True(t, ok, "worker must be a map")
++	events, ok := got["events"].(map[string]interface{})
++	require.True(t, ok, "events must be a map")
++
++	controller["name"] = "changed"
++	worker["controllers"].([]string)[0] = "changed"
++	worker["tags"].(map[string][]string)["region"][0] = "changed"
++	events["sinks"].([]interface{})[0].(map[string]interface{})["name"] = "changed"
++	events["sinks"].([]interface{})[1].(map[string]interface{})["allow_filters"].([]string)[0] = "changed"
++	events["sinks"].([]interface{})[1].(map[string]interface{})["file"].(map[string]interface{})["path"] = "changed"
++	got["listeners"].([]interface{})[0].(map[string]interface{})["config"].(map[string]interface{})["address"] = "changed"
++
++	require.Equal(t, "controller-a", c.Controller.Name)
++	require.Equal(t, "127.0.0.1:9201", c.Worker.Controllers[0])
++	require.Equal(t, "us-east", c.Worker.Tags["region"][0])
++	require.Equal(t, "audit-sink", c.Eventing.Sinks[0].Name)
++	require.Equal(t, "source contains boundary", c.Eventing.Sinks[1].AllowFilters[0])
++	require.Equal(t, "/var/log/boundary", c.Eventing.Sinks[1].FileConfig.Path)
++	require.NotEqual(t, "changed", c.Listeners[0].RawConfig["address"])
++}
++
++func TestSanitizedContractReflectsCurrentConfiguration(t *testing.T) {
++	c, err := Parse(`
++	controller {
++		name = "controller-b"
++		description = "second controller"
++	}
++	worker {
++		name = "worker-b"
++		controllers = ["10.0.0.2:9201", "10.0.0.3:9201"]
++		tags { tier = "edge" }
++	}
++	plugins { execution_dir = "/opt/plugins-b" }
++	`)
++	require.NoError(t, err)
++
++	got := c.Sanitized()
++	controller, ok := got["controller"].(map[string]interface{})
++	require.True(t, ok, "controller must be a map")
++	worker, ok := got["worker"].(map[string]interface{})
++	require.True(t, ok, "worker must be a map")
++	plugins, ok := got["plugins"].(map[string]interface{})
++	require.True(t, ok, "plugins must be a map")
++
++	require.Equal(t, "controller-b", controller["name"])
++	require.Equal(t, "second controller", controller["description"])
++	require.Equal(t, "worker-b", worker["name"])
++	require.Equal(t, []string{"10.0.0.2:9201", "10.0.0.3:9201"}, worker["controllers"])
++	require.Equal(t, map[string][]string{"tier": {"edge"}}, worker["tags"])
++	require.Equal(t, "/opt/plugins-b", plugins["execution_dir"])
++}
++
++func TestSanitizedContractDoesNotInitializeSharedConfig(t *testing.T) {
++	c := &Config{}
++	require.Nil(t, c.SharedConfig)
++	require.NotPanics(t, func() { require.NotNil(t, c.Sanitized()) })
++	require.Nil(t, c.SharedConfig)
++
++	var nilConfig *Config
++	require.Nil(t, nilConfig.Sanitized())
++}
++
++func TestSanitizedContractOmitsAbsentBoundarySections(t *testing.T) {
++	c := &Config{}
++	got := c.Sanitized()
++	require.NotContains(t, got, "controller")
++	require.NotContains(t, got, "worker")
++	require.NotContains(t, got, "plugins")
++	require.NotContains(t, got, "events")
++	require.NotContains(t, got, "dev_controller")
++	require.NotContains(t, got, "dev_ui_passthrough_dir")
++}
++
++func requireNoRawKeys(t *testing.T, value interface{}) {
++	t.Helper()
++	switch value := value.(type) {
++	case map[string]interface{}:
++		for key, nested := range value {
++			require.NotRegexp(t, `(?i)_?raw$`, key)
++			requireNoRawKeys(t, nested)
++		}
++	case []interface{}:
++		for _, nested := range value {
++			requireNoRawKeys(t, nested)
++		}
++	}
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,5 @@
++#!/bin/bash
++set -euo pipefail
++
++
++GOPROXY=off go test ./internal/cmd/config -run '^TestSanitizedContract' -count=1

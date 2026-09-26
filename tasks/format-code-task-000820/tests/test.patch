@@ -1,0 +1,312 @@
+diff --git a/usercase-test-coderl/fixtures/broken_query_db.sql b/usercase-test-coderl/fixtures/broken_query_db.sql
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/fixtures/broken_query_db.sql
+@@ -0,0 +1,7 @@
++CREATE TABLE books(uuid text PRIMARY KEY,label text NOT NULL);
++CREATE TABLE notes(uuid text NOT NULL,book_uuid text NOT NULL,body text NOT NULL,added_on integer NOT NULL);
++CREATE TABLE system(key string NOT NULL,value text NOT NULL);
++
++INSERT INTO system(key,value) VALUES ('schema','14'),('remote_schema','1');
++INSERT INTO books(uuid,label) VALUES ('book-redis','redis');
++INSERT INTO notes(rowid,uuid,book_uuid,body,added_on) VALUES (1,'note-broken','book-redis','rpoplpush',1);
+diff --git a/usercase-test-coderl/fixtures/valid_search_db.sql b/usercase-test-coderl/fixtures/valid_search_db.sql
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/fixtures/valid_search_db.sql
+@@ -0,0 +1,49 @@
++CREATE TABLE books
++		(
++			uuid text PRIMARY KEY,
++			label text NOT NULL
++		, dirty bool DEFAULT false, usn int DEFAULT 0 NOT NULL, deleted bool DEFAULT false);
++CREATE TABLE system
++		(
++			key string NOT NULL,
++			value text NOT NULL
++		);
++CREATE UNIQUE INDEX idx_books_label ON books(label);
++CREATE UNIQUE INDEX idx_books_uuid ON books(uuid);
++CREATE TABLE "notes"
++		(
++			uuid text NOT NULL,
++			book_uuid text NOT NULL,
++			body text NOT NULL,
++			added_on integer NOT NULL,
++			edited_on integer DEFAULT 0,
++			dirty bool DEFAULT false,
++			usn int DEFAULT 0 NOT NULL,
++			deleted bool DEFAULT false
++		);
++CREATE VIRTUAL TABLE note_fts USING fts5(content=notes, body, tokenize="porter unicode61 categories 'L* N* Co Ps Pe'");
++CREATE TRIGGER notes_after_insert AFTER INSERT ON notes BEGIN
++				INSERT INTO note_fts(rowid, body) VALUES (new.rowid, new.body);
++			END;
++CREATE TRIGGER notes_after_delete AFTER DELETE ON notes BEGIN
++				INSERT INTO note_fts(note_fts, rowid, body) VALUES ('delete', old.rowid, old.body);
++			END;
++CREATE TRIGGER notes_after_update AFTER UPDATE ON notes BEGIN
++				INSERT INTO note_fts(note_fts, rowid, body) VALUES ('delete', old.rowid, old.body);
++				INSERT INTO note_fts(rowid, body) VALUES (new.rowid, new.body);
++			END;
++
++INSERT INTO system (key, value) VALUES ('schema', 14);
++INSERT INTO system (key, value) VALUES ('remote_schema', 1);
++
++INSERT INTO books(uuid,label) VALUES
++  ('book-redis','redis'),
++  ('book-alg','algorithm'),
++  ('book-proj','project');
++
++INSERT INTO notes(rowid,uuid,book_uuid,body,added_on) VALUES
++  (12,'note-redis','book-redis','use RPOPLPUSH for reliable queues' || char(10) || 'then acknowledge jobs',100),
++  (21,'note-heap','book-alg','building a heap starts by pushing each item upward',101),
++  (22,'note-merge-alg','book-alg','merge sort divides lists, then merge sort combines them',102),
++  (23,'note-merge-proj','book-proj','merge sort notes belong in another book',103),
++  (24,'note-redis2','book-redis','RPOPLPUSH can move work between Redis lists',104);
+diff --git a/usercase-test-coderl/usecase.sh b/usercase-test-coderl/usecase.sh
+new file mode 100755
+--- /dev/null
++++ b/usercase-test-coderl/usecase.sh
+@@ -0,0 +1,217 @@
++#!/usr/bin/env bash
++
++set -u
++export LANG=C.UTF-8 LC_ALL=C.UTF-8 TZ=UTC
++export NO_COLOR=1 TERM=dumb
++
++export GOTOOLCHAIN=local
++export GOPROXY=off
++export GOSUMDB=off
++export GOMODCACHE=/go/pkg/mod
++export GOCACHE=/go/build-cache
++export GOFLAGS="${GOFLAGS:-} -mod=readonly"
++
++fail() { echo "FAIL: $*" >&2; exit 1; }
++
++TMP=$(mktemp -d)
++trap 'rm -rf "$TMP"' EXIT
++
++BIN="$TMP/bin/dnote"
++mkdir -p "$TMP/bin"
++( cd /workspace/repo && go build -tags fts5 -ldflags '-X main.apiEndpoint=http://localhost:3001/api -X main.versionTag=acceptance' -o "$BIN" ./pkg/cli ) \
++    || fail "build"
++
++command -v sqlite3 >/dev/null 2>&1 || fail "sqlite3 is required"
++
++VALID_DB="$TMP/find.db"
++BROKEN_DB="$TMP/broken.db"
++sqlite3 "$VALID_DB" < /workspace/repo/usercase-test-coderl/fixtures/valid_search_db.sql \
++    || fail "creating valid fixture database"
++sqlite3 "$BROKEN_DB" < /workspace/repo/usercase-test-coderl/fixtures/broken_query_db.sql \
++    || fail "creating broken fixture database"
++
++mkdir -p "$TMP/home" "$TMP/config" "$TMP/data" "$TMP/cache"
++
++run_dnote() {
++  local db="$1"
++  shift
++  env HOME="$TMP/home" XDG_CONFIG_HOME="$TMP/config" XDG_DATA_HOME="$TMP/data" XDG_CACHE_HOME="$TMP/cache" \
++    "$BIN" --dbPath "$db" "$@" >out 2>err
++}
++
++assert_file_eq() {
++  local expected="$1"
++  local actual="$2"
++  local label="$3"
++  printf '%s' "$expected" >expected
++  cmp -s expected "$actual" || fail "$label mismatch; got: $(sed -n l "$actual" | tr '\n' ' ')"
++}
++
++assert_line_count() {
++  local actual="$1"
++  local expected="$2"
++  local label="$3"
++  local count
++  count=$(wc -l < "$actual" | tr -d ' ')
++  [ "$count" -eq "$expected" ] || fail "$label line count $count; want $expected; got: $(sed -n l "$actual" | tr '\n' ' ')"
++}
++
++assert_line_re() {
++  local actual="$1"
++  local pattern="$2"
++  local label="$3"
++  grep -Eq "$pattern" "$actual" || fail "$label missing pattern $pattern; got: $(sed -n l "$actual" | tr '\n' ' ')"
++}
++
++assert_file_contains() {
++  local actual="$1"
++  local needle="$2"
++  local label="$3"
++  grep -Fq -- "$needle" "$actual" || fail "$label missing '$needle'; got: $(sed -n l "$actual" | tr '\n' ' ')"
++}
++
++assert_output_contains() {
++  local needle="$1"
++  local label="$2"
++  grep -Fq -- "$needle" out || grep -Fq -- "$needle" err || fail "$label missing '$needle'; stdout: $(sed -n l out | tr '\n' ' ') stderr: $(sed -n l err | tr '\n' ' ')"
++}
++
++assert_yellow_term() {
++  local actual="$1"
++  local term="$2"
++  local label="$3"
++  perl -0ne 'BEGIN { $term = shift @ARGV; } while (/\e\[[0-9;]*33m(.*?)\e\[[0-9;]*m/sg) { exit 0 if $1 =~ /(^|[^[:alnum:]_])\Q$term\E($|[^[:alnum:]_])/; } exit 1' "$term" "$actual" \
++    || fail "$label did not highlight '$term' in yellow; got: $(sed -n l "$actual" | tr '\n' ' ')"
++}
++
++cd "$TMP"
++
++
++
++
++run_dnote "$VALID_DB" find rpoplpush; ec=$?
++[ "$ec" -eq 0 ] || fail "F1 exit $ec; want 0"
++
++assert_line_count out 2 "F1 stdout"
++assert_line_re out '^  \(redis\) \(12\) .*RPOPLPUSH.*then acknowledge jobs$' "F1 row 12"
++assert_line_re out '^  \(redis\) \(24\) .*RPOPLPUSH.*$' "F1 row 24"
++[ ! -s err ] || fail "F1 unexpected stderr: $(cat err)"
++
++
++
++
++run_dnote "$VALID_DB" f rpoplpush; ec=$?
++[ "$ec" -eq 0 ] || fail "F2 exit $ec; want 0"
++
++assert_line_count out 2 "F2 stdout"
++assert_line_re out '^  \(redis\) \(12\) .*RPOPLPUSH.*then acknowledge jobs$' "F2 row 12"
++assert_line_re out '^  \(redis\) \(24\) .*RPOPLPUSH.*$' "F2 row 24"
++[ ! -s err ] || fail "F2 unexpected stderr: $(cat err)"
++
++
++
++
++run_dnote "$VALID_DB" find "building a heap"; ec=$?
++[ "$ec" -eq 0 ] || fail "F3 exit $ec; want 0"
++
++assert_line_count out 1 "F3 stdout"
++assert_line_re out '^  \(algorithm\) \(21\) .*building.*a.*heap.*$' "F3 quoted phrase match"
++[ ! -s err ] || fail "F3 unexpected stderr: $(cat err)"
++
++
++
++
++command -v script >/dev/null 2>&1 || fail "script is required for the tty highlight fixture"
++PTY_OUT="$TMP/pty.out"
++script -qfec "env -u NO_COLOR HOME=$TMP/home XDG_CONFIG_HOME=$TMP/config XDG_DATA_HOME=$TMP/data XDG_CACHE_HOME=$TMP/cache TERM=xterm-256color '$BIN' --dbPath '$VALID_DB' find 'building a heap'" "$PTY_OUT" >/dev/null
++ec=$?
++awk '/^  / { sub(/\r$/, ""); print; exit }' "$PTY_OUT" >out
++[ "$ec" -eq 0 ] || fail "F4 exit $ec; want 0"
++
++assert_line_count out 1 "F4 tty stdout"
++assert_file_contains out "(algorithm)" "F4 book label"
++assert_file_contains out "(21)" "F4 row id"
++assert_yellow_term out "building" "F4"
++assert_yellow_term out "a" "F4"
++assert_yellow_term out "heap" "F4"
++
++
++
++
++run_dnote "$VALID_DB" find "merge sort" --book algorithm; ec=$?
++[ "$ec" -eq 0 ] || fail "F5 exit $ec; want 0"
++
++assert_line_count out 1 "F5 stdout"
++assert_line_re out '^  \(algorithm\) \(22\) .*merge.*sort.*$' "F5 algorithm match"
++[ ! -s err ] || fail "F5 unexpected stderr: $(cat err)"
++
++
++
++
++run_dnote "$VALID_DB" find "merge sort" -b algorithm; ec=$?
++[ "$ec" -eq 0 ] || fail "F6 exit $ec; want 0"
++
++assert_line_count out 1 "F6 stdout"
++assert_line_re out '^  \(algorithm\) \(22\) .*merge.*sort.*$' "F6 algorithm match"
++[ ! -s err ] || fail "F6 unexpected stderr: $(cat err)"
++
++
++
++
++run_dnote "$VALID_DB" find zzznomatch; ec=$?
++[ "$ec" -eq 0 ] || fail "F7 exit $ec; want 0"
++[ ! -s out ] || fail "F7 stdout should be empty: $(cat out)"
++[ ! -s err ] || fail "F7 unexpected stderr: $(cat err)"
++
++
++
++
++run_dnote "$VALID_DB" find "merge sort" --book redis; ec=$?
++[ "$ec" -eq 0 ] || fail "F8 exit $ec; want 0"
++[ ! -s out ] || fail "F8 stdout should be empty: $(cat out)"
++[ ! -s err ] || fail "F8 unexpected stderr: $(cat err)"
++
++
++
++
++run_dnote "$VALID_DB" find; ec=$?
++[ "$ec" -eq 1 ] || fail "F9 exit $ec; want 1"
++
++assert_output_contains "Incorrect number of argument" "F9 argument error"
++
++
++
++
++run_dnote "$VALID_DB" find one two; ec=$?
++[ "$ec" -eq 1 ] || fail "F10 exit $ec; want 1"
++
++assert_output_contains "Incorrect number of argument" "F10 argument error"
++
++
++
++
++run_dnote "$BROKEN_DB" find rpoplpush; ec=$?
++[ "$ec" -ne 0 ] || fail "F11 exit $ec; want non-zero"
++
++assert_output_contains "querying notes" "F11 query operation error"
++
++
++
++
++run_dnote "$VALID_DB" find --help; ec=$?
++[ "$ec" -eq 0 ] || fail "F12 exit $ec; want 0"
++
++grep -Eiq 'find(ing)? notes.*keywords' out || fail "F12 missing description"
++grep -Eq '(^|[[:space:]])find($|[[:space:]])' out || fail "F12 missing command name"
++grep -Eiq 'alias(es)?' out || fail "F12 missing alias section"
++grep -Eq '(^|[ ,[:space:]])f($|[,[:space:]])' out || fail "F12 missing alias f"
++grep -Eq 'dnote[[:space:]]+find[[:space:]]+[^" -][^[:space:]]*' out || fail "F12 missing single-keyword example"
++grep -Eq 'dnote[[:space:]]+find[[:space:]]+"[^"]+[[:space:]][^"]+"' out || fail "F12 missing quoted phrase example"
++grep -Eq 'dnote[[:space:]]+find[[:space:]].*-b[[:space:]]+[^[:space:]]+' out || fail "F12 missing book-constrained example"
++grep -Fq -- "--book" out || fail "F12 missing --book flag"
++grep -Fq -- "-b" out || fail "F12 missing -b flag"
++grep -Eiq 'book (name|within|to search|search)' out || fail "F12 missing book flag meaning"
++[ ! -s err ] || fail "F12 unexpected stderr: $(cat err)"
++
++echo "PASS"
++exit 0
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,19 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++
++export GOTOOLCHAIN=local
++export GOPROXY=off
++export GOSUMDB=off
++export GOMODCACHE=/go/pkg/mod
++export GOCACHE=/go/build-cache
++export GOFLAGS="${GOFLAGS:-} -mod=readonly"
++set -e
++cd /workspace/repo
++exec bash /workspace/repo/usercase-test-coderl/usecase.sh

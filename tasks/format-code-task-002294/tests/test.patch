@@ -1,0 +1,283 @@
+diff --git a/server/tests/subscription/test_recurring_interval.py b/server/tests/subscription/test_recurring_interval.py
+new file mode 100644
+index 000000000..9f48dcfb5
+--- /dev/null
++++ b/server/tests/subscription/test_recurring_interval.py
+@@ -0,0 +1,232 @@
++import uuid
++from types import SimpleNamespace
++from unittest.mock import AsyncMock, MagicMock
++
++import pytest
++from httpx import AsyncClient
++from pydantic import ValidationError
++from pytest_mock import MockerFixture
++
++from polar.authz.service import Authz
++from polar.models import Organization, SubscriptionBenefit, UserOrganization
++from polar.postgres import AsyncSession
++from polar.subscription.schemas import SubscriptionTierCreate
++from polar.subscription.service.subscription_tier import (
++    subscription_tier as subscription_tier_service,
++)
++
++
++@pytest.fixture
++def authz(session: AsyncSession) -> Authz:
++    return Authz(session)
++
++
++@pytest.fixture
++def enqueue_job_mock(mocker: MockerFixture) -> AsyncMock:
++    return mocker.patch("polar.subscription.service.subscription_tier.enqueue_job")
++
++
++def _stub_stripe_product(stripe_service_mock: MagicMock) -> None:
++    create_product_with_price_mock: MagicMock = (
++        stripe_service_mock.create_product_with_price
++    )
++    create_product_with_price_mock.return_value = SimpleNamespace(
++        id="PRODUCT_ID", default_price="PRICE_ID"
++    )
++
++
++class TestRecurringIntervalSchema:
++    def test_default_is_month(self) -> None:
++        create_schema = SubscriptionTierCreate(
++            type="individual",
++            name="Tier",
++            price_amount=1000,
++            organization_id=uuid.uuid4(),
++        )
++        assert create_schema.recurring_interval == "month"
++
++    def test_explicit_year(self) -> None:
++        create_schema = SubscriptionTierCreate(
++            type="individual",
++            name="Tier",
++            price_amount=1000,
++            recurring_interval="year",
++            organization_id=uuid.uuid4(),
++        )
++        assert create_schema.recurring_interval == "year"
++
++    def test_invalid_value_rejected(self) -> None:
++        with pytest.raises(ValidationError):
++            SubscriptionTierCreate(
++                type="individual",
++                name="Tier",
++                price_amount=1000,
++                recurring_interval="weekly",
++                organization_id=uuid.uuid4(),
++            )
++
++
++@pytest.mark.asyncio
++class TestCreateFreeTier:
++    async def test_free_tier_is_monthly(
++        self,
++        session: AsyncSession,
++        organization: Organization,
++        subscription_benefits: list[SubscriptionBenefit],
++        enqueue_job_mock: AsyncMock,
++    ) -> None:
++        session.expunge_all()
++
++        free_tier = await subscription_tier_service.create_free(
++            session, benefits=subscription_benefits, organization=organization
++        )
++        assert free_tier.recurring_interval == "month"
++
++
++@pytest.mark.asyncio
++@pytest.mark.http_auto_expunge
++class TestCreateSubscriptionTierEndpoint:
++    @pytest.mark.authenticated
++    async def test_default_month(
++        self,
++        client: AsyncClient,
++        organization: Organization,
++        user_organization_admin: UserOrganization,
++        stripe_service_mock: MagicMock,
++        session: AsyncSession,
++    ) -> None:
++        _stub_stripe_product(stripe_service_mock)
++        session.expunge_all()
++
++        response = await client.post(
++            "/api/v1/subscriptions/tiers/",
++            json={
++                "type": "individual",
++                "name": "Subscription Tier",
++                "price_amount": 1000,
++                "organization_id": str(organization.id),
++            },
++        )
++
++        assert response.status_code == 201
++        assert response.json()["recurring_interval"] == "month"
++
++    @pytest.mark.authenticated
++    async def test_explicit_year(
++        self,
++        client: AsyncClient,
++        organization: Organization,
++        user_organization_admin: UserOrganization,
++        stripe_service_mock: MagicMock,
++        session: AsyncSession,
++    ) -> None:
++        _stub_stripe_product(stripe_service_mock)
++        session.expunge_all()
++
++        response = await client.post(
++            "/api/v1/subscriptions/tiers/",
++            json={
++                "type": "individual",
++                "name": "Subscription Tier",
++                "price_amount": 1000,
++                "recurring_interval": "year",
++                "organization_id": str(organization.id),
++            },
++        )
++
++        assert response.status_code == 201
++        assert response.json()["recurring_interval"] == "year"
++
++    @pytest.mark.authenticated
++    async def test_invalid_interval(
++        self,
++        client: AsyncClient,
++        organization: Organization,
++        user_organization_admin: UserOrganization,
++        stripe_service_mock: MagicMock,
++        session: AsyncSession,
++    ) -> None:
++        _stub_stripe_product(stripe_service_mock)
++        session.expunge_all()
++
++        response = await client.post(
++            "/api/v1/subscriptions/tiers/",
++            json={
++                "type": "individual",
++                "name": "Subscription Tier",
++                "price_amount": 1000,
++                "recurring_interval": "weekly",
++                "organization_id": str(organization.id),
++            },
++        )
++
++        assert response.status_code == 422
++
++
++@pytest.mark.asyncio
++class TestSearchFilterByRecurringInterval:
++    @pytest.mark.authenticated
++    async def test_filter(
++        self,
++        client: AsyncClient,
++        organization: Organization,
++        user_organization_admin: UserOrganization,
++        stripe_service_mock: MagicMock,
++        session: AsyncSession,
++    ) -> None:
++        _stub_stripe_product(stripe_service_mock)
++        session.expunge_all()
++
++        async def create_tier(name: str, interval: str | None) -> None:
++            payload = {
++                "type": "individual",
++                "name": name,
++                "price_amount": 1000,
++                "organization_id": str(organization.id),
++            }
++            if interval is not None:
++                payload["recurring_interval"] = interval
++            response = await client.post(
++                "/api/v1/subscriptions/tiers/", json=payload
++            )
++            assert response.status_code == 201
++
++        await create_tier("Monthly A", None)
++        await create_tier("Monthly B", "month")
++        await create_tier("Yearly A", "year")
++
++        base_params = {
++            "platform": organization.platform.value,
++            "organization_name": organization.name,
++        }
++
++
++        response = await client.get(
++            "/api/v1/subscriptions/tiers/search", params=base_params
++        )
++        assert response.status_code == 200
++        assert response.json()["pagination"]["total_count"] == 3
++
++
++        response = await client.get(
++            "/api/v1/subscriptions/tiers/search",
++            params={**base_params, "recurring_interval": "year"},
++        )
++        assert response.status_code == 200
++        json = response.json()
++        assert json["pagination"]["total_count"] == 1
++        assert all(
++            item["recurring_interval"] == "year" for item in json["items"]
++        )
++
++
++        response = await client.get(
++            "/api/v1/subscriptions/tiers/search",
++            params={**base_params, "recurring_interval": "month"},
++        )
++        assert response.status_code == 200
++        json = response.json()
++        assert json["pagination"]["total_count"] == 2
++        assert all(
++            item["recurring_interval"] == "month" for item in json["items"]
++        )
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,40 @@
++#!/usr/bin/env bash
++
++
++
++set -euo pipefail
++HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++cd /testbed
++
++
++
++
++
++source /opt/venv/bin/activate
++
++pg_ctlcluster 16 main start >/dev/null 2>&1 || true
++
++for _ in $(seq 1 30); do
++    if pg_isready -h 127.0.0.1 -p 5432 >/dev/null 2>&1; then
++        break
++    fi
++    sleep 1
++done
++
++
++
++sudo -u postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='polar'" 2>/dev/null | grep -q 1 \
++    || sudo -u postgres psql -c "CREATE ROLE polar WITH LOGIN PASSWORD 'polar' SUPERUSER;" >/dev/null 2>&1
++sudo -u postgres psql -tAc "SELECT 1 FROM pg_database WHERE datname='polar_test'" 2>/dev/null | grep -q 1 \
++    || sudo -u postgres psql -c "CREATE DATABASE polar_test OWNER polar;" >/dev/null 2>&1
++PGPASSWORD=polar psql -h 127.0.0.1 -U polar -d polar_test \
++    -c "DROP SCHEMA public CASCADE; CREATE SCHEMA public;" >/dev/null 2>&1 || true
++
++cd /testbed/server
++
++
++pytest tests/subscription/test_endpoints.py \
++       tests/subscription/service/test_subscription_tier.py -q
++
++
++pytest tests/subscription/test_recurring_interval.py -q

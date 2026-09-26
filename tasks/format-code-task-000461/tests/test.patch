@@ -1,0 +1,539 @@
+diff --git a/usercase-test-coderl/field_projection_live_queries.test.js b/usercase-test-coderl/field_projection_live_queries.test.js
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/field_projection_live_queries.test.js
+@@ -0,0 +1,514 @@
++const assert = require("assert");
++const fs = require("fs");
++const path = require("path");
++const test = require("node:test");
++const vm = require("vm");
++const { createRequire } = require("module");
++const { EventEmitter } = require("events");
++
++
++
++
++
++
++
++
++
++const REPO = "/workspace/repo";
++const repoRequire = createRequire(path.join(REPO, "package.js"));
++const underscore = repoRequire("underscore");
++
++function clone(value) {
++  return value === undefined ? undefined : JSON.parse(JSON.stringify(value));
++}
++
++function plain(value) {
++  return clone(value);
++}
++
++function makeSelectorMatcher(selector) {
++  selector = selector || {};
++  return function matches(doc) {
++    return Object.keys(selector).every((key) => underscore.isEqual(doc[key], selector[key]));
++  };
++}
++
++function setDotted(obj, dotted, value) {
++  const parts = dotted.split(".");
++  let current = obj;
++  for (let i = 0; i < parts.length - 1; i += 1) {
++    if (!current[parts[i]]) current[parts[i]] = {};
++    current = current[parts[i]];
++  }
++  current[parts[parts.length - 1]] = value;
++}
++
++function unsetDotted(obj, dotted) {
++  const parts = dotted.split(".");
++  let current = obj;
++  for (let i = 0; i < parts.length - 1; i += 1) {
++    if (!current[parts[i]]) return;
++    current = current[parts[i]];
++  }
++  delete current[parts[parts.length - 1]];
++}
++
++function makeMemoryDb() {
++  const stores = Object.create(null);
++
++  return {
++    collection(name) {
++      const docs = stores[name] || (stores[name] = Object.create(null));
++
++      return {
++        find(selector) {
++          const matches = Object.values(docs)
++            .filter((doc) => makeSelectorMatcher(selector)(doc))
++            .map(clone);
++
++          return {
++            each(callback) {
++              matches.forEach((doc) => callback(null, doc));
++              callback(null, null);
++            },
++            toArray(callback) {
++              callback(null, matches.map(clone));
++            },
++            count(callback) {
++              callback(null, matches.length);
++            },
++          };
++        },
++
++        findOne(selector, callback) {
++          const doc = Object.values(docs).find((candidate) => makeSelectorMatcher(selector)(candidate));
++          callback(null, clone(doc));
++        },
++
++        insert(doc, callback) {
++          docs[doc._id] = clone(doc);
++          if (callback) callback(null, doc._id);
++        },
++
++        update(selector, modifier, options, callback) {
++          if (typeof options === "function") {
++            callback = options;
++          }
++
++          let updated = 0;
++          Object.values(docs).forEach((doc) => {
++            if (!makeSelectorMatcher(selector)(doc)) return;
++            updated += 1;
++
++            if (modifier.$set || modifier.$unset) {
++              Object.keys(modifier.$set || {}).forEach((key) => setDotted(doc, key, modifier.$set[key]));
++              Object.keys(modifier.$unset || {}).forEach((key) => unsetDotted(doc, key));
++            } else {
++              Object.keys(doc).forEach((key) => delete doc[key]);
++              Object.assign(doc, clone(modifier));
++            }
++          });
++
++          if (callback) callback(null, updated);
++        },
++
++        remove(selector, callback) {
++          let removed = 0;
++          Object.keys(docs).forEach((id) => {
++            if (makeSelectorMatcher(selector)(docs[id])) {
++              delete docs[id];
++              removed += 1;
++            }
++          });
++          if (callback) callback(null, removed);
++        },
++
++        ensureIndex() {},
++        dropIndex() {},
++      };
++    },
++  };
++}
++
++function createHarness() {
++  const fakeDb = makeMemoryDb();
++  const sandbox = {
++    console,
++    setTimeout,
++    clearTimeout,
++    process: {
++      env: {
++        MONGO_URL: "mongodb://localhost/smart_collection_acceptance",
++      },
++    },
++    _: underscore,
++    EJSON: { equals: underscore.isEqual },
++    check() {},
++    Match: { Any: "Match.Any" },
++    Random: {
++      next: 0,
++      id() {
++        this.next += 1;
++        return `rid${this.next}`;
++      },
++    },
++    DDPServer: {
++      _CurrentWriteFence: {
++        get() {
++          return null;
++        },
++      },
++    },
++    Package: {
++      autopublish: null,
++      insecure: true,
++      describe() {},
++      on_use(callback) {
++        callback(this._api);
++      },
++    },
++    Npm: {
++      depends() {},
++      require(name) {
++        if (name === "fibers") return { current: null };
++        if (name === "fibers/future") {
++          return function Future() {
++            this.resolver = () => {};
++            this.wait = () => {};
++          };
++        }
++        if (name === "mongodb") {
++          return {
++            MongoClient: {
++              connect(_url, _options, callback) {
++                callback(null, fakeDb);
++              },
++            },
++          };
++        }
++        return repoRequire(name);
++      },
++    },
++  };
++
++  sandbox.Meteor = new EventEmitter();
++  Object.assign(sandbox.Meteor, {
++    Collection: { insecure: true },
++    default_server: { onAutopublish: null, publish() {} },
++    server: { publish() {} },
++    methods() {},
++    bindEnvironment(fn) {
++      return fn;
++    },
++    _debug() {},
++    publish(name, handler) {
++      this._published = this._published || {};
++      this._published[name] = handler;
++    },
++  });
++
++  sandbox.LocalCollection = {
++    _compileSelector: makeSelectorMatcher,
++    _compileSort() {
++      return (a, b) => String(a._id).localeCompare(String(b._id));
++    },
++    _binarySearch(_comparator, list) {
++      return list.length;
++    },
++    _insertInSortedList(comparator, list, doc) {
++      list.push(doc);
++      list.sort(comparator);
++    },
++  };
++
++  const serverFiles = [];
++  sandbox.Package._api = {
++    use() {},
++    add_files(files, where) {
++      const targetsServer = where === "server" || (Array.isArray(where) && where.includes("server"));
++      if (!where || targetsServer) {
++        serverFiles.push(...(Array.isArray(files) ? files : [files]));
++      }
++    },
++  };
++
++  const context = vm.createContext(sandbox);
++  vm.runInContext(fs.readFileSync(path.join(REPO, "package.js"), "utf8"), context, {
++    filename: "package.js",
++  });
++
++  serverFiles.forEach((relativePath) => {
++    vm.runInContext(fs.readFileSync(path.join(REPO, relativePath), "utf8"), context, {
++      filename: relativePath,
++    });
++  });
++
++  return { Meteor: context.Meteor };
++}
++
++const { Meteor } = createHarness();
++let nextName = 0;
++
++function collection(prefix) {
++  nextName += 1;
++  return new Meteor.SmartCollection(`${prefix}_${nextName}`);
++}
++
++function insert(coll, doc) {
++  return new Promise((resolve, reject) => {
++    coll.insert(doc, (err, id) => (err ? reject(err) : resolve(id)));
++  });
++}
++
++function update(coll, selector, modifier) {
++  return new Promise((resolve, reject) => {
++    coll.update(selector, modifier, {}, (err) => {
++      if (err) {
++        reject(err);
++      } else {
++        setTimeout(resolve, 10);
++      }
++    });
++  });
++}
++
++function observe(cursor, callbacks) {
++  return new Promise((resolve, reject) => {
++    cursor.observeChanges(callbacks, (err, handler) => (err ? reject(err) : resolve(handler)));
++  });
++}
++
++async function publishCursor(name, context) {
++  const cursor = Meteor._published[name].call(context || {});
++  const events = [];
++  const subscription = {
++    added(collectionName, id, doc) {
++      events.push(["added", collectionName, id, plain(doc)]);
++    },
++    changed(collectionName, id, fields) {
++      events.push(["changed", collectionName, id, plain(fields)]);
++    },
++    removed(collectionName, id) {
++      events.push(["removed", collectionName, id]);
++    },
++    onStop(callback) {
++      this.stop = callback;
++    },
++  };
++
++  await new Promise((resolve, reject) => {
++    cursor._publishCursor(subscription, (err) => (err ? reject(err) : resolve()));
++  });
++
++  return { events, stop: subscription.stop };
++}
++
++test("inclusion projections filter nested added documents and later change maps", async () => {
++
++
++
++
++  const coll = collection("inclusion_projection");
++  await insert(coll, { _id: "aa", aa: 10, bb: { c: 10, k: 12 }, cc: 20 });
++
++  const added = [];
++  const changed = [];
++  const handler = await observe(coll.find({}, { fields: { aa: 1, "bb.c": 1 } }), {
++    added: (id, doc) => added.push([id, doc]),
++    changed: (id, fields) => changed.push([id, plain(fields)]),
++  });
++
++  assert.deepStrictEqual(plain(added), [["aa", { aa: 10, bb: { c: 10 }, _id: "aa" }]]);
++
++  await update(coll, { _id: "aa" }, { $set: { aa: 50, bb: 30 } });
++  assert.deepStrictEqual(changed, [["aa", { aa: 50 }]]);
++
++  handler.stop();
++});
++
++test("inclusion projections can exclude _id from delivered fields", async () => {
++
++
++
++
++  const coll = collection("inclusion_without_id");
++  await insert(coll, { _id: "aa", aa: 10, bb: { c: 10, k: 12 }, cc: 20 });
++
++  const added = [];
++  const handler = await observe(coll.find({}, { fields: { aa: 1, _id: 0 } }), {
++    added: (_id, doc) => added.push(plain(doc)),
++  });
++
++  assert.deepStrictEqual(added, [{ aa: 10 }]);
++
++  handler.stop();
++});
++
++test("exclusion projections remove top-level and nested fields from added documents", async () => {
++
++
++
++
++  const coll = collection("exclusion_projection");
++  await insert(coll, { _id: "aa", aa: 50, bb: { c: 45, k: 12 }, cc: 20 });
++
++  const added = [];
++  const handler = await observe(coll.find({}, { fields: { aa: 0, "bb.c": 0 } }), {
++    added: (id, doc) => added.push([id, plain(doc)]),
++  });
++
++  assert.deepStrictEqual(added, [["aa", { _id: "aa", bb: { k: 12 }, cc: 20 }]]);
++
++  handler.stop();
++});
++
++test("published cursors deliver projected added and changed payloads", async () => {
++
++
++
++
++  const coll = collection("published_projection");
++  await insert(coll, { _id: "aa", aa: 10, bb: { c: 10, k: 12 }, cc: 20 });
++
++  const publicationName = `projected_pub_${nextName}`;
++  Meteor.publish(publicationName, function publishProjectedCursor() {
++    return coll.find({}, { fields: { aa: 1, "bb.c": 1 } });
++  });
++
++  const published = await publishCursor(publicationName);
++
++  assert.deepStrictEqual(published.events, [
++    ["added", coll.name, "aa", { aa: 10, bb: { c: 10 }, _id: "aa" }],
++  ]);
++
++  await update(coll, { _id: "aa" }, { $set: { aa: 11, bb: 31 } });
++  assert.deepStrictEqual(published.events, [
++    ["added", coll.name, "aa", { aa: 10, bb: { c: 10 }, _id: "aa" }],
++    ["changed", coll.name, "aa", { aa: 11 }],
++  ]);
++
++  published.stop();
++});
++
++test("projection validator rejects unsupported field specs with Error", () => {
++
++
++
++
++
++  assert.throws(
++    () => collection("bad_dollar").find({}, { fields: { "array.$": 1 } }),
++    { name: "Error" },
++  );
++
++
++  assert.throws(
++    () => collection("bad_object_value").find({}, { fields: { field: { $slice: -5 } } }),
++    { name: "Error" },
++  );
++
++
++  assert.throws(
++    () => collection("bad_string_value").find({}, { fields: { aa: "1" } }),
++    { name: "Error" },
++  );
++
++
++  assert.throws(
++    () => collection("bad_mixed").find({}, { fields: { aa: 1, bb: 0 } }),
++    { name: "Error" },
++  );
++
++  assert.doesNotThrow(() => collection("allowed_id_exclusion").find({}, { fields: { aa: 1, _id: 0 } }));
++});
++
++test("projected change maps update the live-query cache only for projected fields", async () => {
++
++
++
++
++  const coll = collection("cache_projection");
++  await insert(coll, { _id: "aa", aa: 10, bb: 20 });
++
++  const firstAdded = [];
++  const changed = [];
++  const handler = await observe(coll.find({}, { fields: { aa: 1 } }), {
++    added: (id, doc) => firstAdded.push([id, plain(doc)]),
++    changed: (id, fields) => changed.push([id, plain(fields)]),
++  });
++
++  assert.deepStrictEqual(firstAdded, [["aa", { aa: 10, _id: "aa" }]]);
++
++  await update(coll, { _id: "aa" }, { $set: { aa: 20, bb: 30 } });
++  assert.deepStrictEqual(changed, [["aa", { aa: 20 }]]);
++
++  const secondAdded = [];
++  const secondHandler = await observe(coll.find({}, { fields: { aa: 1 } }), {
++    added: (id, doc) => secondAdded.push([id, plain(doc)]),
++  });
++
++
++  assert.deepStrictEqual(secondAdded, [["aa", { aa: 20, _id: "aa" }]]);
++
++  handler.stop();
++  secondHandler.stop();
++});
++
++test("two SmartCollection instances keep independent projection state", async () => {
++
++
++
++
++  const a = collection("instance_a");
++  const b = collection("instance_b");
++  await insert(a, { _id: "a", aa: 1, bb: 2, cc: 3 });
++  await insert(b, { _id: "b", aa: 4, bb: 5, cc: 6 });
++
++  const aAdded = [];
++  const aChanged = [];
++  const bAdded = [];
++  const bChanged = [];
++
++  const aHandler = await observe(a.find({}, { fields: { aa: 1 } }), {
++    added: (id, doc) => aAdded.push([id, plain(doc)]),
++    changed: (id, fields) => aChanged.push([id, plain(fields)]),
++  });
++  const bHandler = await observe(b.find({}, { fields: { cc: 1 } }), {
++    added: (id, doc) => bAdded.push([id, plain(doc)]),
++    changed: (id, fields) => bChanged.push([id, plain(fields)]),
++  });
++
++  assert.deepStrictEqual(aAdded, [["a", { aa: 1, _id: "a" }]]);
++  assert.deepStrictEqual(bAdded, [["b", { cc: 6, _id: "b" }]]);
++
++  await update(a, { _id: "a" }, { $set: { aa: 10, cc: 30 } });
++  assert.deepStrictEqual(aChanged, [["a", { aa: 10 }]]);
++  assert.deepStrictEqual(bChanged, []);
++
++  await update(b, { _id: "b" }, { $set: { aa: 40, cc: 60 } });
++  assert.deepStrictEqual(aChanged, [["a", { aa: 10 }]]);
++  assert.deepStrictEqual(bChanged, [["b", { cc: 60 }]]);
++
++  aHandler.stop();
++  bHandler.stop();
++});
++
++test("repeated observe cycles deliver projected added payloads", async () => {
++
++
++
++
++  const coll = collection("repeated_projection");
++  await insert(coll, { _id: "aa", aa: 10, bb: 20 });
++
++  for (let i = 0; i < 5; i += 1) {
++    const added = [];
++    const handler = await observe(coll.find({ _id: "aa" }, { fields: { aa: 1 } }), {
++      added: (id, doc) => added.push([id, plain(doc)]),
++    });
++
++
++    assert.deepStrictEqual(added, [["aa", { aa: 10, _id: "aa" }]]);
++    handler.stop();
++  }
++});
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,15 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++cd /workspace/repo
++
++exec node --expose-gc --test /workspace/repo/usercase-test-coderl/field_projection_live_queries.test.js

@@ -1,0 +1,577 @@
+diff --git a/api/desecapi/tests/testpdns.py b/api/desecapi/tests/testpdns.py
+new file mode 100644
+index 0000000..bd04afe
+--- /dev/null
++++ b/api/desecapi/tests/testpdns.py
+@@ -0,0 +1,57 @@
++from types import SimpleNamespace
++from unittest.mock import patch
++
++from django.test import SimpleTestCase, override_settings
++
++from desecapi import pdns
++
++
++@override_settings(POWERDNS_API="http://pdns.test/api/v1")
++class ZoneExistsTest(SimpleTestCase):
++    def _response(self, status_code, text=""):
++        return SimpleNamespace(status_code=status_code, text=text)
++
++    @patch("desecapi.pdns.requests.get")
++    def test_zone_exists_true_on_success(self, mock_get):
++        mock_get.return_value = self._response(200, '{"name": "present.example."}')
++
++        self.assertTrue(pdns.zone_exists("present.example"))
++
++    @patch("desecapi.pdns.requests.get")
++    def test_zone_exists_false_on_domain_not_found_422(self, mock_get):
++        mock_get.return_value = self._response(
++            422,
++            'PowerDNS error: Could not find domain "missing.example." in backend',
++        )
++
++        self.assertFalse(pdns.zone_exists("missing.example"))
++
++    @patch("desecapi.pdns.requests.get")
++    def test_zone_exists_false_on_other_domain_not_found_422(self, mock_get):
++        mock_get.return_value = self._response(
++            422,
++            'PowerDNS error: Could not find domain "absent.example." in backend',
++        )
++
++        self.assertFalse(pdns.zone_exists("absent.example"))
++
++    @patch("desecapi.pdns.requests.get")
++    def test_zone_exists_raises_on_unexpected_422_body(self, mock_get):
++        mock_get.return_value = self._response(422, "validation failed for supplied zone")
++
++        with self.assertRaises(Exception):
++            pdns.zone_exists("invalid.example")
++
++    @patch("desecapi.pdns.requests.get")
++    def test_zone_exists_raises_on_other_client_error(self, mock_get):
++        mock_get.return_value = self._response(403, "forbidden")
++
++        with self.assertRaises(Exception):
++            pdns.zone_exists("forbidden.example")
++
++    @patch("desecapi.pdns.requests.get")
++    def test_zone_exists_raises_on_server_error(self, mock_get):
++        mock_get.return_value = self._response(500, "upstream failure")
++
++        with self.assertRaises(Exception):
++            pdns.zone_exists("error.example")
+diff --git a/api/desecapi/tests/testprivacychores.py b/api/desecapi/tests/testprivacychores.py
+index 014c2e7..46dc29b 100644
+--- a/api/desecapi/tests/testprivacychores.py
++++ b/api/desecapi/tests/testprivacychores.py
+@@ -1,15 +1,33 @@
+ from django.core.management import call_command
+ from django.test import TestCase
+ from django.utils import timezone
++from unittest.mock import patch
+ from desecapi.models import User, MyUserManager
+ from .utils import utils
+ from desecapi import settings
+ from datetime import timedelta
+ 
+ 
++class _AbuseSettingsProxy(object):
++    def __init__(self, base, remote_ip_period_hours=None):
++        self.base = base
++        self.remote_ip_period_hours = remote_ip_period_hours
++
++    def __getattr__(self, name):
++        upper = name.upper()
++        is_remote_period = (
++            ("REMOTE" in upper or "REGISTRATION_IP" in upper)
++            and ("IP" in upper or "SOURCE" in upper or "REGISTRATION_IP" in upper)
++            and any(token in upper for token in ("PERIOD", "WINDOW", "HOUR", "HRS"))
++        )
++        if is_remote_period and self.remote_ip_period_hours is not None:
++            return self.remote_ip_period_hours
++        return getattr(self.base, name)
++
++
+ class PrivacyChoresCommandTest(TestCase):
+ 
+-    def test_delete_registration_ip_for_old_users(self):
++    def test_privacy_chores_clears_only_ips_older_than_remote_ip_window(self):
+         name1 = utils.generateUsername()
+         name2 = utils.generateUsername()
+ 
+@@ -21,8 +39,11 @@ class PrivacyChoresCommandTest(TestCase):
+             email=name2,
+             registration_remote_ip='1.3.3.8',
+         ).save()
++        user1 = User.objects.get(email=name1)
++        user1.created = timezone.now() - timedelta(hours=1)
++        user1.save()
+         user2 = User.objects.get(email=name2)
+-        user2.created = timezone.now()-timedelta(hours=settings.ABUSE_LOCK_ACCOUNT_BY_REGISTRATION_IP_PERIOD_HRS+1)
++        user2.created = timezone.now() - timedelta(days=365)
+         user2.save()
+ 
+         user_count = User.objects.all().count()
+@@ -32,3 +53,18 @@ class PrivacyChoresCommandTest(TestCase):
+         self.assertEqual(User.objects.all().count(), user_count)
+         self.assertEqual(User.objects.get(email=name1).registration_remote_ip, '1.3.3.7')
+         self.assertEqual(User.objects.get(email=name2).registration_remote_ip, '')
++
++    @patch("desecapi.management.commands.privacy-chores.settings", _AbuseSettingsProxy(settings, remote_ip_period_hours=7))
++    def test_privacy_chores_runtime_remote_ip_window(self):
++        name = utils.generateUsername()
++        User(
++            email=name,
++            registration_remote_ip='1.3.3.9',
++        ).save()
++        user = User.objects.get(email=name)
++        user.created = timezone.now() - timedelta(hours=8)
++        user.save()
++
++        call_command('privacy-chores')
++
++        self.assertEqual(User.objects.get(email=name).registration_remote_ip, '')
+diff --git a/api/desecapi/tests/testregistration.py b/api/desecapi/tests/testregistration.py
+index 7cc9a7d..ca80be1 100644
+--- a/api/desecapi/tests/testregistration.py
++++ b/api/desecapi/tests/testregistration.py
+@@ -1,20 +1,75 @@
++from datetime import timedelta
++import uuid
++from unittest.mock import patch
++
++from django.core import mail
+ from django.core.urlresolvers import reverse
++from django.utils import timezone
+ from rest_framework import status
+ from rest_framework.test import APITestCase
++
+ from .utils import utils
+ from desecapi import models
+-from datetime import timedelta
+-from django.utils import timezone
+-from django.core import mail
+ from desecapi.emails import send_account_lock_email
+ from desecapi import settings
+ 
+ 
++class _AbuseSettingsProxy(object):
++    def __init__(
++        self,
++        base,
++        remote_ip_limit=None,
++        remote_ip_period_hours=None,
++        email_hostname_limit=None,
++        email_hostname_period_hours=None,
++    ):
++        self.base = base
++        self.remote_ip_limit = remote_ip_limit
++        self.remote_ip_period_hours = remote_ip_period_hours
++        self.email_hostname_limit = email_hostname_limit
++        self.email_hostname_period_hours = email_hostname_period_hours
++
++    def __getattr__(self, name):
++        upper = name.upper()
++        is_remote_source = (
++            ("REMOTE" in upper and ("IP" in upper or "SOURCE" in upper))
++            or "REGISTRATION_IP" in upper
++        )
++        is_email_hostname = (
++            "EMAIL" in upper and ("HOST" in upper or "DOMAIN" in upper)
++        )
++        is_limit = any(token in upper for token in ("LIMIT", "THRESHOLD", "COUNT"))
++        is_period = any(token in upper for token in ("PERIOD", "WINDOW", "HOUR", "HRS"))
++
++        if is_remote_source and is_limit and self.remote_ip_limit is not None:
++            return self.remote_ip_limit
++        if is_remote_source and is_period and self.remote_ip_period_hours is not None:
++            return self.remote_ip_period_hours
++        if is_email_hostname and is_limit and self.email_hostname_limit is not None:
++            return self.email_hostname_limit
++        if is_email_hostname and is_period and self.email_hostname_period_hours is not None:
++            return self.email_hostname_period_hours
++        return getattr(self.base, name)
++
++
+ class RegistrationTest(APITestCase):
+ 
++    def _unique_email(self, domain=None):
++        if domain is None:
++            domain = "%s.example.test" % uuid.uuid4().hex
++        return "%s@%s" % (uuid.uuid4().hex, domain)
++
++    def _register(self, email=None, remote_addr="198.51.100.10", **extra):
++        data = {"email": email or self._unique_email(), "password": utils.generateRandomString(size=12)}
++        response = self.client.post(reverse('register'), data, REMOTE_ADDR=remote_addr, **extra)
++        return response, models.User.objects.get(email=data["email"])
++
++    def _override_abuse_settings(self, **overrides):
++        return patch("desecapi.views.settings", _AbuseSettingsProxy(settings, **overrides))
++
+     def test_registration_successful(self):
+         url = reverse('register')
+-        data = {'email': utils.generateUsername(), 'password': utils.generateRandomString(size=12)}
++        data = {'email': self._unique_email(), 'password': utils.generateRandomString(size=12)}
+         response = self.client.post(url, data, REMOTE_ADDR="1.3.3.7")
+         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+         user = models.User.objects.get(email=data['email'])
+@@ -25,7 +80,7 @@ class RegistrationTest(APITestCase):
+         outboxlen = len(mail.outbox)
+ 
+         url = reverse('register')
+-        data = {'email': utils.generateUsername(), 'password': utils.generateRandomString(size=12)}
++        data = {'email': self._unique_email(), 'password': utils.generateRandomString(size=12)}
+         response = self.client.post(url, data, REMOTE_ADDR="1.3.3.7")
+         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+         user = models.User.objects.get(email=data['email'])
+@@ -36,7 +91,7 @@ class RegistrationTest(APITestCase):
+         self.assertEqual(len(mail.outbox), outboxlen)
+ 
+         url = reverse('register')
+-        data = {'email': utils.generateUsername(), 'password': utils.generateRandomString(size=12)}
++        data = {'email': self._unique_email(), 'password': utils.generateRandomString(size=12)}
+         response = self.client.post(url, data, REMOTE_ADDR="1.3.3.7")
+         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+         user = models.User.objects.get(email=data['email'])
+@@ -47,7 +102,7 @@ class RegistrationTest(APITestCase):
+         self.assertEqual(len(mail.outbox), outboxlen + 1)
+ 
+         url = reverse('register')
+-        data = {'email': utils.generateUsername(), 'password': utils.generateRandomString(size=12)}
++        data = {'email': self._unique_email(), 'password': utils.generateRandomString(size=12)}
+         response = self.client.post(url, data, REMOTE_ADDR="1.3.3.7")
+         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+         user = models.User.objects.get(email=data['email'])
+@@ -59,7 +114,7 @@ class RegistrationTest(APITestCase):
+ 
+     def test_multiple_registration_no_captcha_required_different_ip(self):
+         url = reverse('register')
+-        data = {'email': utils.generateUsername(), 'password': utils.generateRandomString(size=12)}
++        data = {'email': self._unique_email(), 'password': utils.generateRandomString(size=12)}
+         response = self.client.post(url, data, REMOTE_ADDR="1.3.3.8")
+         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+         user = models.User.objects.get(email=data['email'])
+@@ -68,7 +123,7 @@ class RegistrationTest(APITestCase):
+         self.assertEqual(user.captcha_required, False)
+ 
+         url = reverse('register')
+-        data = {'email': utils.generateUsername(), 'password': utils.generateRandomString(size=12)}
++        data = {'email': self._unique_email(), 'password': utils.generateRandomString(size=12)}
+         response = self.client.post(url, data, REMOTE_ADDR="1.3.3.9")
+         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+         user = models.User.objects.get(email=data['email'])
+@@ -78,7 +133,7 @@ class RegistrationTest(APITestCase):
+ 
+     def test_multiple_registration_no_captcha_required_same_ip_long_time(self):
+         url = reverse('register')
+-        data = {'email': utils.generateUsername(), 'password': utils.generateRandomString(size=12)}
++        data = {'email': self._unique_email(), 'password': utils.generateRandomString(size=12)}
+         response = self.client.post(url, data, REMOTE_ADDR="1.3.3.10")
+         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+         user = models.User.objects.get(email=data['email'])
+@@ -87,11 +142,11 @@ class RegistrationTest(APITestCase):
+         self.assertEqual(user.captcha_required, False)
+ 
+         #fake registration time
+-        user.created = timezone.now() - timedelta(hours=settings.ABUSE_LOCK_ACCOUNT_BY_REGISTRATION_IP_PERIOD_HRS+1)
++        user.created = timezone.now() - timedelta(days=365)
+         user.save()
+ 
+         url = reverse('register')
+-        data = {'email': utils.generateUsername(), 'password': utils.generateRandomString(size=12)}
++        data = {'email': self._unique_email(), 'password': utils.generateRandomString(size=12)}
+         response = self.client.post(url, data, REMOTE_ADDR="1.3.3.10")
+         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+         user = models.User.objects.get(email=data['email'])
+@@ -103,10 +158,191 @@ class RegistrationTest(APITestCase):
+         outboxlen = len(mail.outbox)
+ 
+         url = reverse('register')
+-        data = {'email': utils.generateUsername(), 'password': utils.generateRandomString(size=12)}
++        data = {'email': self._unique_email(), 'password': utils.generateRandomString(size=12)}
+         response = self.client.post(url, data, REMOTE_ADDR="1.3.3.10")
+         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+         user = models.User.objects.get(email=data['email'])
+         send_account_lock_email(None, user)
+ 
+         self.assertEqual(len(mail.outbox), outboxlen+1)
++
++    def test_registration_same_remote_addr_ignores_forwarded_for_for_abuse_count(self):
++        outboxlen = len(mail.outbox)
++        remote_addr = "203.0.113.10"
++
++        with self._override_abuse_settings(remote_ip_limit=2, email_hostname_limit=50):
++            first_response, first_user = self._register(
++                remote_addr=remote_addr,
++                HTTP_X_FORWARDED_FOR="198.51.100.1",
++            )
++            self.assertEqual(first_response.status_code, status.HTTP_201_CREATED)
++            self.assertFalse(first_user.captcha_required)
++
++            second_response, second_user = self._register(
++                remote_addr=remote_addr,
++                HTTP_X_FORWARDED_FOR="198.51.100.2",
++            )
++            self.assertEqual(second_response.status_code, status.HTTP_201_CREATED)
++            self.assertFalse(second_user.captcha_required)
++
++            third_response, third_user = self._register(
++                remote_addr=remote_addr,
++                HTTP_X_FORWARDED_FOR="198.51.100.3",
++            )
++            self.assertEqual(third_response.status_code, status.HTTP_201_CREATED)
++            self.assertTrue(third_user.captcha_required)
++            self.assertEqual(len(mail.outbox), outboxlen + 1)
++
++    def test_registration_remote_addr_ignores_non_fixture_forwarded_for_values(self):
++        outboxlen = len(mail.outbox)
++        remote_addr = "203.0.113.11"
++
++        with self._override_abuse_settings(remote_ip_limit=2, email_hostname_limit=50):
++            first_response, first_user = self._register(
++                remote_addr=remote_addr,
++                HTTP_X_FORWARDED_FOR="10.0.0.1",
++            )
++            self.assertEqual(first_response.status_code, status.HTTP_201_CREATED)
++            self.assertFalse(first_user.captcha_required)
++
++            second_response, second_user = self._register(
++                remote_addr=remote_addr,
++                HTTP_X_FORWARDED_FOR="10.0.0.2",
++            )
++            self.assertEqual(second_response.status_code, status.HTTP_201_CREATED)
++            self.assertFalse(second_user.captcha_required)
++
++            third_response, third_user = self._register(
++                remote_addr=remote_addr,
++                HTTP_X_FORWARDED_FOR="10.0.0.3",
++            )
++            self.assertEqual(third_response.status_code, status.HTTP_201_CREATED)
++            self.assertTrue(third_user.captcha_required)
++            self.assertEqual(len(mail.outbox), outboxlen + 1)
++
++    def test_remote_ip_abuse_limit_respects_runtime_config(self):
++        outboxlen = len(mail.outbox)
++        remote_addr = "203.0.113.20"
++
++        with self._override_abuse_settings(remote_ip_limit=2, email_hostname_limit=50):
++            first_response, first_user = self._register(remote_addr=remote_addr)
++            self.assertEqual(first_response.status_code, status.HTTP_201_CREATED)
++            self.assertFalse(first_user.captcha_required)
++
++            second_response, second_user = self._register(remote_addr=remote_addr)
++            self.assertEqual(second_response.status_code, status.HTTP_201_CREATED)
++            self.assertFalse(second_user.captcha_required)
++
++            third_response, third_user = self._register(remote_addr=remote_addr)
++            self.assertEqual(third_response.status_code, status.HTTP_201_CREATED)
++            self.assertTrue(third_user.captcha_required)
++            self.assertEqual(len(mail.outbox), outboxlen + 1)
++
++    def test_remote_ip_abuse_window_respects_runtime_config(self):
++        outboxlen = len(mail.outbox)
++        remote_addr = "203.0.113.21"
++
++        with self._override_abuse_settings(remote_ip_period_hours=7, email_hostname_limit=50):
++            first_response, first_user = self._register(remote_addr=remote_addr)
++            self.assertEqual(first_response.status_code, status.HTTP_201_CREATED)
++            self.assertFalse(first_user.captcha_required)
++            first_user.created = timezone.now() - timedelta(hours=8)
++            first_user.save()
++
++            second_response, second_user = self._register(remote_addr=remote_addr)
++            self.assertEqual(second_response.status_code, status.HTTP_201_CREATED)
++            self.assertFalse(second_user.captcha_required)
++            self.assertEqual(len(mail.outbox), outboxlen)
++
++    def test_remote_ip_abuse_applies_to_loopback_peer(self):
++        outboxlen = len(mail.outbox)
++        remote_addr = "127.0.0.1"
++
++        with self._override_abuse_settings(remote_ip_limit=2, email_hostname_limit=50):
++            first_response, first_user = self._register(remote_addr=remote_addr)
++            self.assertEqual(first_response.status_code, status.HTTP_201_CREATED)
++            self.assertFalse(first_user.captcha_required)
++
++            second_response, second_user = self._register(remote_addr=remote_addr)
++            self.assertEqual(second_response.status_code, status.HTTP_201_CREATED)
++            self.assertFalse(second_user.captcha_required)
++
++            third_response, third_user = self._register(remote_addr=remote_addr)
++            self.assertEqual(third_response.status_code, status.HTTP_201_CREATED)
++            self.assertTrue(third_user.captcha_required)
++            self.assertEqual(len(mail.outbox), outboxlen + 1)
++
++    def test_multiple_registration_captcha_required_same_email_host(self):
++        outboxlen = len(mail.outbox)
++        domain = "%s.same-email.example.test" % uuid.uuid4().hex
++
++        with self._override_abuse_settings(remote_ip_limit=50, email_hostname_limit=2):
++            first_response, first_user = self._register(
++                email=self._unique_email(domain),
++                remote_addr="203.0.113.31",
++            )
++            self.assertEqual(first_response.status_code, status.HTTP_201_CREATED)
++            self.assertFalse(first_user.captcha_required)
++
++            second_response, second_user = self._register(
++                email=self._unique_email(domain),
++                remote_addr="203.0.113.32",
++            )
++            self.assertEqual(second_response.status_code, status.HTTP_201_CREATED)
++            self.assertFalse(second_user.captcha_required)
++
++            third_response, third_user = self._register(
++                email=self._unique_email(domain),
++                remote_addr="203.0.113.33",
++            )
++            self.assertEqual(third_response.status_code, status.HTTP_201_CREATED)
++            self.assertTrue(third_user.captcha_required)
++            self.assertEqual(len(mail.outbox), outboxlen + 1)
++
++    def test_multiple_registration_no_captcha_required_same_email_host_long_time(self):
++        outboxlen = len(mail.outbox)
++        domain = "%s.old-email-window.example.test" % uuid.uuid4().hex
++
++        with self._override_abuse_settings(
++            remote_ip_limit=50,
++            email_hostname_limit=2,
++            email_hostname_period_hours=7,
++        ):
++            for i in range(2):
++                response, user = self._register(
++                    email=self._unique_email(domain),
++                    remote_addr="203.0.113.%d" % (41 + i),
++                )
++                self.assertEqual(response.status_code, status.HTTP_201_CREATED)
++                self.assertFalse(user.captcha_required)
++                user.created = timezone.now() - timedelta(hours=8)
++                user.save()
++
++            response, user = self._register(
++                email=self._unique_email(domain),
++                remote_addr="203.0.113.43",
++            )
++            self.assertEqual(response.status_code, status.HTTP_201_CREATED)
++            self.assertFalse(user.captcha_required)
++            self.assertEqual(len(mail.outbox), outboxlen)
++
++    def test_email_hostname_abuse_uses_domain_not_specific_example(self):
++        outboxlen = len(mail.outbox)
++        domain = "%s.generated-host.example.test" % uuid.uuid4().hex
++
++        with self._override_abuse_settings(remote_ip_limit=50, email_hostname_limit=3):
++            for i in range(3):
++                response, user = self._register(
++                    email=self._unique_email(domain),
++                    remote_addr="203.0.113.%d" % (50 + i),
++                )
++                self.assertEqual(response.status_code, status.HTTP_201_CREATED)
++                self.assertFalse(user.captcha_required)
++
++            response, user = self._register(
++                email=self._unique_email(domain),
++                remote_addr="203.0.113.99",
++            )
++            self.assertEqual(response.status_code, status.HTTP_201_CREATED)
++            self.assertTrue(user.captcha_required)
++            self.assertEqual(len(mail.outbox), outboxlen + 1)
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,93 @@
++#!/bin/bash
++set -uo pipefail
++cd /testbed
++
++
++export DESECSTACK_API_SECRETKEY="test-secret-key-for-testing"
++export DESECSTACK_API_ALLOWED_HOSTS="localhost"
++export DESECSTACK_DBAPI_PASSWORD_desec="test"
++export DESECSTACK_API_EMAIL_HOST="localhost"
++export DESECSTACK_API_EMAIL_HOST_USER="test"
++export DESECSTACK_API_EMAIL_HOST_PASSWORD="test"
++export DESECSTACK_API_EMAIL_PORT="25"
++export DESECSTACK_API_ADMIN="admin@desec.io"
++export DESECSTACK_NSLORD_APIKEY="test"
++export DESECSTACK_API_SEPA_CREDITOR_ID="test"
++export DESECSTACK_NORECAPTCHA_SITE_KEY="test"
++export DESECSTACK_NORECAPTCHA_SECRET_KEY="test"
++
++export DJANGO_SETTINGS_MODULE="desecapi.settings"
++
++
++export PATH="$HOME/.pyenv/bin:$PATH"
++eval "$(pyenv init --path)"
++eval "$(pyenv init -)"
++pyenv global 3.5.10
++
++cd /testbed/api
++
++run_django_tests() {
++    python3 - "$@" <<'PY'
++import os
++import sys
++
++sys.path.insert(0, '.')
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'desecapi.settings')
++
++import django
++from django.conf import settings
++
++settings.DATABASES = {
++    'default': {
++        'ENGINE': 'django.db.backends.sqlite3',
++        'NAME': ':memory:',
++    }
++}
++
++settings.MIGRATION_MODULES = {
++    'desecapi': None,
++    'auth': None,
++    'contenttypes': None,
++    'authtoken': None,
++    'sessions': None,
++    'admin': None,
++}
++
++django.setup()
++
++from django.test.runner import DiscoverRunner
++
++runner = DiscoverRunner(verbosity=2)
++failures = runner.run_tests(list(sys.argv[1:]))
++sys.exit(failures)
++PY
++}
++
++case "${1:-}" in
++  base)
++    run_django_tests \
++      desecapi.tests.testregistration.RegistrationTest.test_registration_successful \
++      desecapi.tests.testregistration.RegistrationTest.test_multiple_registration_captcha_required_same_ip_short_time \
++      desecapi.tests.testregistration.RegistrationTest.test_multiple_registration_no_captcha_required_different_ip \
++      desecapi.tests.testregistration.RegistrationTest.test_multiple_registration_no_captcha_required_same_ip_long_time \
++      desecapi.tests.testregistration.RegistrationTest.test_send_captcha_email_manually
++    ;;
++  new)
++    run_django_tests \
++      desecapi.tests.testprivacychores.PrivacyChoresCommandTest.test_privacy_chores_clears_only_ips_older_than_remote_ip_window \
++      desecapi.tests.testprivacychores.PrivacyChoresCommandTest.test_privacy_chores_runtime_remote_ip_window \
++      desecapi.tests.testregistration.RegistrationTest.test_registration_same_remote_addr_ignores_forwarded_for_for_abuse_count \
++      desecapi.tests.testregistration.RegistrationTest.test_registration_remote_addr_ignores_non_fixture_forwarded_for_values \
++      desecapi.tests.testregistration.RegistrationTest.test_remote_ip_abuse_limit_respects_runtime_config \
++      desecapi.tests.testregistration.RegistrationTest.test_remote_ip_abuse_window_respects_runtime_config \
++      desecapi.tests.testregistration.RegistrationTest.test_remote_ip_abuse_applies_to_loopback_peer \
++      desecapi.tests.testregistration.RegistrationTest.test_multiple_registration_captcha_required_same_email_host \
++      desecapi.tests.testregistration.RegistrationTest.test_multiple_registration_no_captcha_required_same_email_host_long_time \
++      desecapi.tests.testregistration.RegistrationTest.test_email_hostname_abuse_uses_domain_not_specific_example \
++      desecapi.tests.testpdns
++    ;;
++  *)
++    echo "usage: $0 base|new"
++    exit 2
++    ;;
++esac

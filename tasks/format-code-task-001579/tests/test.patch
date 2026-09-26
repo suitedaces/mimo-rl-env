@@ -1,0 +1,516 @@
+diff --git a/dapps/valuetransfers/packages/branchmanager/branchmanager_test.go b/dapps/valuetransfers/packages/branchmanager/branchmanager_test.go
+index f868df810..091758567 100644
+--- a/dapps/valuetransfers/packages/branchmanager/branchmanager_test.go
++++ b/dapps/valuetransfers/packages/branchmanager/branchmanager_test.go
+@@ -5,11 +5,14 @@ import (
+ 	"testing"
+ 
+ 	"github.com/iotaledger/goshimmer/dapps/valuetransfers/packages/transaction"
+-	"github.com/iotaledger/goshimmer/packages/binary/testutil"
++	"github.com/iotaledger/hive.go/kvstore"
++	"github.com/iotaledger/hive.go/kvstore/mapdb"
+ )
+ 
+ func TestSomething(t *testing.T) {
+-	branchManager := New(testutil.DB(t))
++	var store kvstore.KVStore = mapdb.NewMapDB()
++
++	branchManager := New(store)
+ 
+ 	cachedBranch1, _ := branchManager.Fork(BranchID{2}, []BranchID{MasterBranchID}, []ConflictID{transaction.OutputID{4}})
+ 	defer cachedBranch1.Release()
+diff --git a/dapps/valuetransfers/packages/tangle/kvstore_hidden_test.go b/dapps/valuetransfers/packages/tangle/kvstore_hidden_test.go
+new file mode 100644
+index 000000000..f927c251e
+--- /dev/null
++++ b/dapps/valuetransfers/packages/tangle/kvstore_hidden_test.go
+@@ -0,0 +1,19 @@
++package tangle
++
++import (
++	"testing"
++
++	"github.com/iotaledger/hive.go/kvstore"
++	"github.com/iotaledger/hive.go/kvstore/mapdb"
++	"github.com/stretchr/testify/require"
++)
++
++func TestNewAcceptsGenericInMemoryStore(t *testing.T) {
++	var store kvstore.KVStore = mapdb.NewMapDB()
++
++	valueTangle := New(store)
++	require.NotNil(t, valueTangle)
++
++	require.NoError(t, valueTangle.Prune())
++	require.NoError(t, valueTangle.Prune())
++}
+diff --git a/dapps/valuetransfers/packages/test/generic_store_hidden_test.go b/dapps/valuetransfers/packages/test/generic_store_hidden_test.go
+new file mode 100644
+index 000000000..30868077c
+--- /dev/null
++++ b/dapps/valuetransfers/packages/test/generic_store_hidden_test.go
+@@ -0,0 +1,235 @@
++package test
++
++import (
++	"strings"
++	"sync"
++	"testing"
++
++	"github.com/iotaledger/goshimmer/dapps/valuetransfers/packages/address"
++	"github.com/iotaledger/goshimmer/dapps/valuetransfers/packages/balance"
++	"github.com/iotaledger/goshimmer/dapps/valuetransfers/packages/branchmanager"
++	valueTangle "github.com/iotaledger/goshimmer/dapps/valuetransfers/packages/tangle"
++	"github.com/iotaledger/goshimmer/dapps/valuetransfers/packages/transaction"
++	"github.com/iotaledger/hive.go/kvstore"
++	"github.com/stretchr/testify/require"
++)
++
++func TestValueTangleUsesProvidedStoreForSnapshot(t *testing.T) {
++	store := newSharedKVStore()
++	addr := address.Random()
++	txID := transaction.RandomID()
++
++	first := valueTangle.New(store)
++	require.NoError(t, first.Prune())
++	first.LoadSnapshot(map[transaction.ID]map[address.Address][]*balance.Balance{
++		txID: {
++			addr: []*balance.Balance{balance.New(balance.ColorIOTA, 1337)},
++		},
++	})
++	first.Shutdown()
++
++	second := valueTangle.New(store)
++	defer second.Shutdown()
++	require.EqualValues(t, 1337, valueTangle.NewLedgerState(second).Balances(addr)[balance.ColorIOTA])
++
++	isolated := valueTangle.New(newSharedKVStore())
++	defer isolated.Shutdown()
++	require.Zero(t, valueTangle.NewLedgerState(isolated).Balances(addr)[balance.ColorIOTA])
++}
++
++func TestBranchManagerUsesProvidedStoreForBranches(t *testing.T) {
++	store := newSharedKVStore()
++	first := branchmanager.New(store)
++	require.GreaterOrEqual(t, store.realmCount(), 4)
++
++	branchID := branchmanager.BranchID{42}
++	conflictID := branchmanager.ConflictID(transaction.OutputID{9})
++
++	cachedBranch, created := first.Fork(branchID, []branchmanager.BranchID{branchmanager.MasterBranchID}, []branchmanager.ConflictID{conflictID})
++	require.True(t, created)
++	cachedBranch.Release()
++
++	loaded := first.Branch(branchID).Consume(func(branch *branchmanager.Branch) {
++		require.Equal(t, branchID, branch.ID())
++	})
++	require.True(t, loaded)
++
++	foundMember := false
++	first.ConflictMembers(conflictID).Consume(func(member *branchmanager.ConflictMember) {
++		if member.BranchID() == branchID {
++			foundMember = true
++		}
++	})
++	require.True(t, foundMember)
++
++	isolated := branchmanager.New(newSharedKVStore())
++	require.False(t, isolated.Branch(branchID).Consume(func(branch *branchmanager.Branch) {}))
++}
++
++type sharedKVStore struct {
++	mu    *sync.RWMutex
++	data  map[string][]byte
++	realm []byte
++	seen  *[][]byte
++}
++
++func newSharedKVStore() *sharedKVStore {
++	return &sharedKVStore{
++		mu:   &sync.RWMutex{},
++		data: make(map[string][]byte),
++		seen: &[][]byte{},
++	}
++}
++
++func (store *sharedKVStore) WithRealm(realm kvstore.Realm) kvstore.KVStore {
++	store.mu.Lock()
++	*store.seen = append(*store.seen, append([]byte{}, realm...))
++	store.mu.Unlock()
++
++	return &sharedKVStore{
++		mu:    store.mu,
++		data:  store.data,
++		realm: append([]byte{}, realm...),
++		seen:  store.seen,
++	}
++}
++
++func (store *sharedKVStore) realmCount() int {
++	store.mu.RLock()
++	defer store.mu.RUnlock()
++
++	return len(*store.seen)
++}
++
++func (store *sharedKVStore) Realm() kvstore.Realm {
++	return append([]byte{}, store.realm...)
++}
++
++func (store *sharedKVStore) Iterate(prefix kvstore.KeyPrefix, consumer kvstore.IteratorKeyValueConsumerFunc) error {
++	store.mu.RLock()
++	defer store.mu.RUnlock()
++
++	fullPrefix := store.scopedKey(prefix)
++	for key, value := range store.data {
++		if strings.HasPrefix(key, fullPrefix) {
++			if !consumer([]byte(key[len(store.realmPrefix()):]), append([]byte{}, value...)) {
++				break
++			}
++		}
++	}
++	return nil
++}
++
++func (store *sharedKVStore) IterateKeys(prefix kvstore.KeyPrefix, consumer kvstore.IteratorKeyConsumerFunc) error {
++	return store.Iterate(prefix, func(key kvstore.Key, value kvstore.Value) bool {
++		return consumer(key)
++	})
++}
++
++func (store *sharedKVStore) Clear() error {
++	store.mu.Lock()
++	defer store.mu.Unlock()
++
++	realmPrefix := store.realmPrefix()
++	for key := range store.data {
++		if strings.HasPrefix(key, realmPrefix) {
++			delete(store.data, key)
++		}
++	}
++	return nil
++}
++
++func (store *sharedKVStore) Get(key kvstore.Key) (kvstore.Value, error) {
++	store.mu.RLock()
++	defer store.mu.RUnlock()
++
++	value, exists := store.data[store.scopedKey(key)]
++	if !exists {
++		return nil, kvstore.ErrKeyNotFound
++	}
++	return append([]byte{}, value...), nil
++}
++
++func (store *sharedKVStore) Set(key kvstore.Key, value kvstore.Value) error {
++	store.mu.Lock()
++	defer store.mu.Unlock()
++
++	store.data[store.scopedKey(key)] = append([]byte{}, value...)
++	return nil
++}
++
++func (store *sharedKVStore) Has(key kvstore.Key) (bool, error) {
++	store.mu.RLock()
++	defer store.mu.RUnlock()
++
++	_, exists := store.data[store.scopedKey(key)]
++	return exists, nil
++}
++
++func (store *sharedKVStore) Delete(key kvstore.Key) error {
++	store.mu.Lock()
++	defer store.mu.Unlock()
++
++	delete(store.data, store.scopedKey(key))
++	return nil
++}
++
++func (store *sharedKVStore) DeletePrefix(prefix kvstore.KeyPrefix) error {
++	store.mu.Lock()
++	defer store.mu.Unlock()
++
++	fullPrefix := store.scopedKey(prefix)
++	for key := range store.data {
++		if strings.HasPrefix(key, fullPrefix) {
++			delete(store.data, key)
++		}
++	}
++	return nil
++}
++
++func (store *sharedKVStore) Batched() kvstore.BatchedMutations {
++	return &sharedBatch{store: store}
++}
++
++func (store *sharedKVStore) scopedKey(key []byte) string {
++	return store.realmPrefix() + string(key)
++}
++
++func (store *sharedKVStore) realmPrefix() string {
++	return string(store.realm) + "\x00"
++}
++
++type sharedBatch struct {
++	store   *sharedKVStore
++	sets    []struct{ key, value []byte }
++	deletes [][]byte
++}
++
++func (batch *sharedBatch) Set(key kvstore.Key, value kvstore.Value) error {
++	batch.sets = append(batch.sets, struct{ key, value []byte }{append([]byte{}, key...), append([]byte{}, value...)})
++	return nil
++}
++
++func (batch *sharedBatch) Delete(key kvstore.Key) error {
++	batch.deletes = append(batch.deletes, append([]byte{}, key...))
++	return nil
++}
++
++func (batch *sharedBatch) Cancel() {
++	batch.sets = nil
++	batch.deletes = nil
++}
++
++func (batch *sharedBatch) Commit() error {
++	for _, set := range batch.sets {
++		if err := batch.store.Set(set.key, set.value); err != nil {
++			return err
++		}
++	}
++	for _, key := range batch.deletes {
++		if err := batch.store.Delete(key); err != nil {
++			return err
++		}
++	}
++	return nil
++}
+diff --git a/dapps/valuetransfers/packages/test/valuetransfers_test.go b/dapps/valuetransfers/packages/test/valuetransfers_test.go
+index d321c931d..bc13640cd 100644
+--- a/dapps/valuetransfers/packages/test/valuetransfers_test.go
++++ b/dapps/valuetransfers/packages/test/valuetransfers_test.go
+@@ -5,6 +5,8 @@ import (
+ 	"time"
+ 
+ 	"github.com/iotaledger/hive.go/crypto/ed25519"
++	"github.com/iotaledger/hive.go/kvstore"
++	"github.com/iotaledger/hive.go/kvstore/mapdb"
+ 	"github.com/stretchr/testify/assert"
+ 
+ 	"github.com/iotaledger/goshimmer/dapps/valuetransfers/packages/address"
+@@ -12,12 +14,12 @@ import (
+ 	"github.com/iotaledger/goshimmer/dapps/valuetransfers/packages/payload"
+ 	"github.com/iotaledger/goshimmer/dapps/valuetransfers/packages/tangle"
+ 	"github.com/iotaledger/goshimmer/dapps/valuetransfers/packages/transaction"
+-	"github.com/iotaledger/goshimmer/packages/binary/testutil"
+ )
+ 
+ func TestTangle_ValueTransfer(t *testing.T) {
+ 	// initialize tangle + ledgerstate
+-	valueTangle := tangle.New(testutil.DB(t))
++	var store kvstore.KVStore = mapdb.NewMapDB()
++	valueTangle := tangle.New(store)
+ 	if err := valueTangle.Prune(); err != nil {
+ 		t.Error(err)
+ 
+diff --git a/packages/binary/messagelayer/messagefactory/messagefactory_test.go b/packages/binary/messagelayer/messagefactory/messagefactory_test.go
+index 5c8466cce..cb7872dbe 100644
+--- a/packages/binary/messagelayer/messagefactory/messagefactory_test.go
++++ b/packages/binary/messagelayer/messagefactory/messagefactory_test.go
+@@ -2,8 +2,6 @@ package messagefactory
+ 
+ import (
+ 	"encoding"
+-	"io/ioutil"
+-	"os"
+ 	"sync"
+ 	"sync/atomic"
+ 	"testing"
+@@ -12,11 +10,11 @@ import (
+ 	"github.com/iotaledger/goshimmer/packages/binary/messagelayer/message"
+ 	"github.com/iotaledger/goshimmer/packages/binary/messagelayer/payload"
+ 	"github.com/iotaledger/goshimmer/packages/binary/messagelayer/tipselector"
+-	"github.com/iotaledger/goshimmer/packages/database"
+-	"github.com/iotaledger/goshimmer/plugins/config"
+ 
+ 	"github.com/iotaledger/hive.go/events"
+ 	"github.com/iotaledger/hive.go/identity"
++	"github.com/iotaledger/hive.go/kvstore"
++	"github.com/iotaledger/hive.go/kvstore/mapdb"
+ 	"github.com/stretchr/testify/assert"
+ 	"github.com/stretchr/testify/require"
+ )
+@@ -27,22 +25,13 @@ const (
+ )
+ 
+ func TestMessageFactory_BuildMessage(t *testing.T) {
+-	// Set up DB for testing
+-	dir, err := ioutil.TempDir("", t.Name())
+-	require.NoError(t, err)
+-	defer os.Remove(dir)
+-	// use the tempdir for the database
+-	config.Node.Set(database.CFG_DIRECTORY, dir)
+-	db := database.GetBadgerInstance()
+-
+-	localIdentity := identity.GenerateLocalIdentity()
+-	tipSelector := tipselector.New()
++	var store kvstore.KVStore = mapdb.NewMapDB()
++	msgFactory := New(store, identity.GenerateLocalIdentity(), tipselector.New(), []byte(sequenceKey))
++	defer msgFactory.Shutdown()
+ 
+ 	// keep track of sequence numbers
+ 	sequenceNumbers := sync.Map{}
+ 
+-	msgFactory := New(db, localIdentity, tipSelector, []byte(sequenceKey))
+-
+ 	// attach to event and count
+ 	countEvents := uint64(0)
+ 	msgFactory.Events.MessageConstructed.Attach(events.NewClosure(func(msg *message.Message) {
+@@ -116,8 +105,23 @@ func TestMessageFactory_BuildMessage(t *testing.T) {
+ 	})
+ 	assert.EqualValues(t, totalMessages-1, max)
+ 	assert.EqualValues(t, totalMessages, countSequence)
++}
++
++func TestMessageFactorySequencePersistsInProvidedStore(t *testing.T) {
++	var store kvstore.KVStore = mapdb.NewMapDB()
++	sequenceKey := []byte("hidden-persisted-sequence")
++
++	first := New(store, identity.GenerateLocalIdentity(), tipselector.New(), sequenceKey)
++	require.EqualValues(t, 0, first.IssuePayload(NewMockPayload([]byte("first"))).SequenceNumber())
++	first.Shutdown()
++
++	second := New(store, identity.GenerateLocalIdentity(), tipselector.New(), sequenceKey)
++	defer second.Shutdown()
++	require.EqualValues(t, 1, second.IssuePayload(NewMockPayload([]byte("second"))).SequenceNumber())
+ 
+-	_ = db.Close()
++	isolated := New(mapdb.NewMapDB(), identity.GenerateLocalIdentity(), tipselector.New(), sequenceKey)
++	defer isolated.Shutdown()
++	require.EqualValues(t, 0, isolated.IssuePayload(NewMockPayload([]byte("isolated"))).SequenceNumber())
+ }
+ 
+ type MockPayload struct {
+diff --git a/packages/binary/messagelayer/tangle/tangle_test.go b/packages/binary/messagelayer/tangle/tangle_test.go
+index 98eb4ffdc..69eae9128 100644
+--- a/packages/binary/messagelayer/tangle/tangle_test.go
++++ b/packages/binary/messagelayer/tangle/tangle_test.go
+@@ -2,29 +2,20 @@ package tangle
+ 
+ import (
+ 	"fmt"
+-	"io/ioutil"
+-	"os"
+ 	"testing"
+ 	"time"
+ 
+-	"github.com/iotaledger/hive.go/events"
+-	"github.com/iotaledger/hive.go/identity"
+-	"github.com/stretchr/testify/require"
+-
+ 	"github.com/iotaledger/goshimmer/packages/binary/messagelayer/message"
+ 	"github.com/iotaledger/goshimmer/packages/binary/messagelayer/payload"
+-	"github.com/iotaledger/goshimmer/packages/database"
+-	"github.com/iotaledger/goshimmer/plugins/config"
++	"github.com/iotaledger/hive.go/events"
++	"github.com/iotaledger/hive.go/identity"
++	"github.com/iotaledger/hive.go/kvstore"
++	"github.com/iotaledger/hive.go/kvstore/mapdb"
+ )
+ 
+ func BenchmarkTangle_AttachMessage(b *testing.B) {
+-	dir, err := ioutil.TempDir("", b.Name())
+-	require.NoError(b, err)
+-	defer os.Remove(dir)
+-	// use the tempdir for the database
+-	config.Node.Set(database.CFG_DIRECTORY, dir)
+-
+-	tangle := New(database.GetBadgerInstance())
++	var store kvstore.KVStore = mapdb.NewMapDB()
++	tangle := New(store)
+ 	if err := tangle.Prune(); err != nil {
+ 		b.Error(err)
+ 
+@@ -49,13 +40,8 @@ func BenchmarkTangle_AttachMessage(b *testing.B) {
+ }
+ 
+ func TestTangle_AttachMessage(t *testing.T) {
+-	dir, err := ioutil.TempDir("", t.Name())
+-	require.NoError(t, err)
+-	defer os.Remove(dir)
+-	// use the tempdir for the database
+-	config.Node.Set(database.CFG_DIRECTORY, dir)
+-
+-	messageTangle := New(database.GetBadgerInstance())
++	var store kvstore.KVStore = mapdb.NewMapDB()
++	messageTangle := New(store)
+ 	if err := messageTangle.Prune(); err != nil {
+ 		t.Error(err)
+ 
+diff --git a/packages/binary/messagelayer/test/message_test.go b/packages/binary/messagelayer/test/message_test.go
+index 70684aa30..563a991e6 100644
+--- a/packages/binary/messagelayer/test/message_test.go
++++ b/packages/binary/messagelayer/test/message_test.go
+@@ -5,11 +5,15 @@ import (
+ 	"testing"
+ 	"time"
+ 
++	"github.com/iotaledger/goshimmer/packages/binary/messagelayer/messagefactory"
++	"github.com/iotaledger/goshimmer/packages/binary/messagelayer/tipselector"
++	"github.com/iotaledger/hive.go/identity"
++	"github.com/iotaledger/hive.go/kvstore"
++	"github.com/iotaledger/hive.go/kvstore/mapdb"
+ 	"github.com/stretchr/testify/assert"
+ 
+ 	"github.com/iotaledger/goshimmer/packages/binary/messagelayer/message"
+ 	"github.com/iotaledger/goshimmer/packages/binary/messagelayer/payload"
+-	"github.com/iotaledger/goshimmer/packages/binary/testutil"
+ )
+ 
+ func TestMessage_StorableObjectFromKey(t *testing.T) {
+@@ -28,7 +32,11 @@ func TestMessage_StorableObjectFromKey(t *testing.T) {
+ }
+ 
+ func TestMessage_MarshalUnmarshal(t *testing.T) {
+-	testMessage := testutil.MessageFactory(t).IssuePayload(payload.NewData([]byte("sth")))
++	var store kvstore.KVStore = mapdb.NewMapDB()
++	msgFactory := messagefactory.New(store, identity.GenerateLocalIdentity(), tipselector.New(), []byte("message-test-sequence"))
++	defer msgFactory.Shutdown()
++
++	testMessage := msgFactory.IssuePayload(payload.NewData([]byte("sth")))
+ 	assert.Equal(t, true, testMessage.VerifySignature())
+ 
+ 	fmt.Print(testMessage)
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,28 @@
++#!/bin/bash
++set -uo pipefail
++cd /testbed
++
++case "${1:-}" in
++  base)
++    go test -count=1 -v \
++      github.com/iotaledger/goshimmer/dapps/valuetransfers/packages/branchmanager \
++      github.com/iotaledger/goshimmer/dapps/valuetransfers/packages/test \
++      github.com/iotaledger/goshimmer/packages/binary/messagelayer/messagefactory \
++      github.com/iotaledger/goshimmer/packages/binary/messagelayer/tangle \
++      github.com/iotaledger/goshimmer/packages/binary/messagelayer/test
++    ;;
++  new)
++    go test -count=1 -v -run '^(TestSomething|TestTangle_ValueTransfer|TestNewAcceptsGenericInMemoryStore|TestValueTangleUsesProvidedStoreForSnapshot|TestBranchManagerUsesProvidedStoreForBranches|TestMessageFactory_BuildMessage|TestMessageFactorySequencePersistsInProvidedStore|TestTangle_AttachMessage|TestMessage_MarshalUnmarshal|TestNewMemDBDoesNotCreateDefaultDatabaseDirectory)$' \
++      github.com/iotaledger/goshimmer/dapps/valuetransfers/packages/branchmanager \
++      github.com/iotaledger/goshimmer/dapps/valuetransfers/packages/test \
++      github.com/iotaledger/goshimmer/dapps/valuetransfers/packages/tangle \
++      github.com/iotaledger/goshimmer/packages/database \
++      github.com/iotaledger/goshimmer/packages/binary/messagelayer/messagefactory \
++      github.com/iotaledger/goshimmer/packages/binary/messagelayer/tangle \
++      github.com/iotaledger/goshimmer/packages/binary/messagelayer/test
++    ;;
++  *)
++    echo "usage: $0 base|new"
++    exit 2
++    ;;
++esac

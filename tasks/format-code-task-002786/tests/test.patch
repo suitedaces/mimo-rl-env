@@ -1,0 +1,304 @@
+diff --git a/usercase-test-coderl/fixtures/sitecustomize.py b/usercase-test-coderl/fixtures/sitecustomize.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/fixtures/sitecustomize.py
+@@ -0,0 +1,93 @@
++import json
++import os
++import sys
++import types
++
++
++TRACE = os.environ.get("F5_ACCEPT_TRACE")
++
++
++def record(event, **payload):
++    if TRACE:
++        with open(TRACE, "a", encoding="utf-8") as trace_file:
++            trace_file.write(json.dumps({"event": event, **payload}, sort_keys=True) + "\n")
++
++
++cached_path_module = types.ModuleType("cached_path")
++
++
++def cached_path(url):
++    record("cached_path", url=url)
++    cached_map = json.loads(os.environ.get("F5_ACCEPT_CACHED_MAP", "{}"))
++    if url not in cached_map:
++        raise RuntimeError("unexpected cached_path URL: " + url)
++    return cached_map[url]
++
++
++cached_path_module.cached_path = cached_path
++sys.modules["cached_path"] = cached_path_module
++
++model_module = types.ModuleType("f5_tts.model")
++
++
++class DiT:
++    def __init__(self, **kwargs):
++        record("model_cls", cls="DiT", kwargs=kwargs)
++
++
++class UNetT:
++    def __init__(self, **kwargs):
++        record("model_cls", cls="UNetT", kwargs=kwargs)
++
++
++class CFM:
++    def __init__(self, **kwargs):
++        record("cfm", keys=sorted(kwargs.keys()))
++
++
++class Trainer:
++    def __init__(self, *args, **kwargs):
++        record(
++            "trainer_init",
++            checkpoint_path=kwargs.get("checkpoint_path"),
++            wandb_project=kwargs.get("wandb_project"),
++            wandb_run_name=kwargs.get("wandb_run_name"),
++        )
++
++    def train(self, dataset, **kwargs):
++        record("trainer_train", dataset=dataset, kwargs=kwargs)
++        print("TRAIN_CALLED")
++
++
++model_module.CFM = CFM
++model_module.DiT = DiT
++model_module.Trainer = Trainer
++model_module.UNetT = UNetT
++sys.modules["f5_tts.model"] = model_module
++
++dataset_module = types.ModuleType("f5_tts.model.dataset")
++
++
++def load_dataset(dataset_name, tokenizer, mel_spec_kwargs=None):
++    record(
++        "load_dataset",
++        dataset_name=dataset_name,
++        tokenizer=tokenizer,
++        mel_spec_type=(mel_spec_kwargs or {}).get("mel_spec_type"),
++    )
++    return {"dataset_name": dataset_name, "tokenizer": tokenizer}
++
++
++dataset_module.load_dataset = load_dataset
++sys.modules["f5_tts.model.dataset"] = dataset_module
++
++utils_module = types.ModuleType("f5_tts.model.utils")
++
++
++def get_tokenizer(tokenizer_path, tokenizer):
++    record("get_tokenizer", tokenizer_path=tokenizer_path, tokenizer=tokenizer)
++    return {"a": 0, "b": 1, " ": 2}, 3
++
++
++utils_module.get_tokenizer = get_tokenizer
++sys.modules["f5_tts.model.utils"] = utils_module
+diff --git a/usercase-test-coderl/usecase.sh b/usercase-test-coderl/usecase.sh
+new file mode 100755
+--- /dev/null
++++ b/usercase-test-coderl/usecase.sh
+@@ -0,0 +1,184 @@
++#!/usr/bin/env bash
++
++set -u
++export LANG=C.UTF-8 LC_ALL=C.UTF-8 TZ=UTC
++
++REPO=/workspace/repo
++FIXTURES="$REPO/usercase-test-coderl/fixtures"
++CKPTS="$REPO/ckpts"
++
++TMP=$(mktemp -d)
++trap 'rm -rf "$TMP"; rm -rf "$CKPTS"/AccTST_*; rm -rf "$REPO/src/f5_tts.egg-info" "$REPO/src/f5_tts/train/__pycache__"' EXIT
++fail() { echo "FAIL: $*" >&2; exit 1; }
++
++python -m venv "$TMP/venv" || fail "venv"
++BIN="$TMP/venv/bin/f5-tts_finetune-cli"
++
++
++
++cat >"$BIN" <<'SH'
++#!/usr/bin/env bash
++exec "$(dirname "$0")/python" -m f5_tts.train.finetune_cli "$@"
++SH
++chmod +x "$BIN"
++[ -x "$BIN" ] || fail "missing console script $BIN"
++
++mkdir -p "$TMP/srcs"
++printf 'F5V1_DEFAULT_CONTENT' >"$TMP/srcs/model_1250000.safetensors"
++printf 'F5BASE_DEFAULT_CONTENT' >"$TMP/srcs/f5_model_1200000.pt"
++printf 'E2_DEFAULT_CONTENT' >"$TMP/srcs/e2_model_1200000.pt"
++F5_ACCEPT_CACHED_MAP=$(python - "$TMP/srcs" <<'PY'
++import json
++import sys
++
++base = sys.argv[1]
++print(json.dumps({
++    "hf://SWivid/F5-TTS/F5TTS_v1_Base/model_1250000.safetensors": base + "/model_1250000.safetensors",
++    "hf://SWivid/F5-TTS/F5TTS_Base/model_1200000.pt": base + "/f5_model_1200000.pt",
++    "hf://SWivid/E2-TTS/E2TTS_Base/model_1200000.pt": base + "/e2_model_1200000.pt",
++}))
++PY
++)
++export F5_ACCEPT_CACHED_MAP
++export PYTHONPATH="$FIXTURES:$REPO/src"
++
++run_cli() {
++    local name=$1
++    shift
++    F5_ACCEPT_TRACE="$TMP/$name.trace" "$BIN" "$@" >"$TMP/$name.out" 2>"$TMP/$name.err"
++    return $?
++}
++
++assert_trace_line() {
++    local name=$1
++    local expected=$2
++    grep -Fx "$expected" "$TMP/$name.trace" >/dev/null || {
++        echo "trace for $name:" >&2
++        cat "$TMP/$name.trace" >&2
++        fail "$name missing trace line: $expected"
++    }
++}
++
++assert_file_content() {
++    local path=$1
++    local expected=$2
++    [ -f "$path" ] || fail "missing file $path"
++    [ "$(cat "$path")" = "$expected" ] || fail "$path content: $(cat "$path")"
++}
++
++assert_copy_announced_and_training_continued() {
++    local name=$1
++
++    grep -Fx "copy checkpoint for finetune" "$TMP/$name.out" >/dev/null || fail "$name missing copy message"
++    grep -Fx "TRAIN_CALLED" "$TMP/$name.out" >/dev/null || fail "$name did not continue into training"
++}
++
++assert_no_copy_announcement_and_training_continued() {
++    local name=$1
++
++    ! grep -F "copy checkpoint for finetune" "$TMP/$name.out" >/dev/null || fail "$name printed copy message"
++    grep -Fx "TRAIN_CALLED" "$TMP/$name.out" >/dev/null || fail "$name did not continue into training"
++}
++
++assert_training_trace() {
++    local name=$1
++
++    grep -F '"event": "trainer_train"' "$TMP/$name.trace" >/dev/null || {
++        echo "trace for $name:" >&2
++        cat "$TMP/$name.trace" >&2
++        fail "$name did not call trainer.train"
++    }
++}
++
++
++
++
++run_cli help --help; ec=$?
++[ "$ec" -eq 0 ] || fail "F_help exit $ec; want 0"
++grep -F -- "--finetune" "$TMP/help.out" >/dev/null || fail "F_help missing --finetune"
++grep -F -- "--pretrain PRETRAIN" "$TMP/help.out" >/dev/null || fail "F_help missing --pretrain"
++[ ! -s "$TMP/help.err" ] || fail "F_help unexpected stderr: $(cat "$TMP/help.err")"
++
++
++
++
++rm -rf "$CKPTS/AccTST_MyVoice"
++run_cli default_v1 --exp_name F5TTS_v1_Base --dataset_name AccTST_MyVoice --finetune; ec=$?
++[ "$ec" -eq 0 ] || fail "F_default_v1 exit $ec; want 0"
++assert_copy_announced_and_training_continued default_v1
++[ ! -s "$TMP/default_v1.err" ] || fail "F_default_v1 unexpected stderr: $(cat "$TMP/default_v1.err")"
++assert_trace_line default_v1 '{"event": "cached_path", "url": "hf://SWivid/F5-TTS/F5TTS_v1_Base/model_1250000.safetensors"}'
++assert_training_trace default_v1
++assert_file_content "$CKPTS/AccTST_MyVoice/pretrained_model_1250000.safetensors" "F5V1_DEFAULT_CONTENT"
++
++
++
++
++rm -rf "$CKPTS/AccTST_F5Base"
++run_cli default_f5base --exp_name F5TTS_Base --dataset_name AccTST_F5Base --finetune; ec=$?
++[ "$ec" -eq 0 ] || fail "F_default_f5base exit $ec; want 0"
++assert_copy_announced_and_training_continued default_f5base
++[ ! -s "$TMP/default_f5base.err" ] || fail "F_default_f5base unexpected stderr: $(cat "$TMP/default_f5base.err")"
++assert_trace_line default_f5base '{"event": "cached_path", "url": "hf://SWivid/F5-TTS/F5TTS_Base/model_1200000.pt"}'
++assert_file_content "$CKPTS/AccTST_F5Base/pretrained_f5_model_1200000.pt" "F5BASE_DEFAULT_CONTENT"
++
++
++
++
++rm -rf "$CKPTS/AccTST_E2Base"
++run_cli default_e2base --exp_name E2TTS_Base --dataset_name AccTST_E2Base --finetune; ec=$?
++[ "$ec" -eq 0 ] || fail "F_default_e2base exit $ec; want 0"
++assert_copy_announced_and_training_continued default_e2base
++[ ! -s "$TMP/default_e2base.err" ] || fail "F_default_e2base unexpected stderr: $(cat "$TMP/default_e2base.err")"
++assert_trace_line default_e2base '{"event": "cached_path", "url": "hf://SWivid/E2-TTS/E2TTS_Base/model_1200000.pt"}'
++assert_file_content "$CKPTS/AccTST_E2Base/pretrained_e2_model_1200000.pt" "E2_DEFAULT_CONTENT"
++
++
++
++
++printf 'LOCAL_SEED' >"$TMP/seed-local.pt"
++rm -rf "$CKPTS/AccTST_Local"
++run_cli local_unprefixed --exp_name F5TTS_v1_Base --dataset_name AccTST_Local --finetune --pretrain "$TMP/seed-local.pt"; ec=$?
++[ "$ec" -eq 0 ] || fail "F_local_unprefixed exit $ec; want 0"
++assert_copy_announced_and_training_continued local_unprefixed
++[ ! -s "$TMP/local_unprefixed.err" ] || fail "F_local_unprefixed unexpected stderr: $(cat "$TMP/local_unprefixed.err")"
++! grep -F '"event": "cached_path"' "$TMP/local_unprefixed.trace" >/dev/null || fail "F_local_unprefixed unexpectedly downloaded default"
++assert_file_content "$CKPTS/AccTST_Local/pretrained_seed-local.pt" "LOCAL_SEED"
++
++
++
++
++printf 'PREFIX_SEED' >"$TMP/pretrained_voice.pt"
++rm -rf "$CKPTS/AccTST_Prefix"
++run_cli local_prefixed --exp_name F5TTS_v1_Base --dataset_name AccTST_Prefix --finetune --pretrain "$TMP/pretrained_voice.pt"; ec=$?
++[ "$ec" -eq 0 ] || fail "F_local_prefixed exit $ec; want 0"
++assert_copy_announced_and_training_continued local_prefixed
++[ ! -s "$TMP/local_prefixed.err" ] || fail "F_local_prefixed unexpected stderr: $(cat "$TMP/local_prefixed.err")"
++assert_file_content "$CKPTS/AccTST_Prefix/pretrained_voice.pt" "PREFIX_SEED"
++[ ! -e "$CKPTS/AccTST_Prefix/pretrained_pretrained_voice.pt" ] || fail "F_local_prefixed double-prefixed file exists"
++
++
++
++
++rm -rf "$CKPTS/AccTST_Existing"
++mkdir -p "$CKPTS/AccTST_Existing"
++printf 'OLD_DEST' >"$CKPTS/AccTST_Existing/pretrained_seed-existing.pt"
++printf 'NEW_SOURCE' >"$TMP/seed-existing.pt"
++run_cli existing_dest --exp_name F5TTS_v1_Base --dataset_name AccTST_Existing --finetune --pretrain "$TMP/seed-existing.pt"; ec=$?
++[ "$ec" -eq 0 ] || fail "F_existing_dest exit $ec; want 0"
++assert_no_copy_announcement_and_training_continued existing_dest
++[ ! -s "$TMP/existing_dest.err" ] || fail "F_existing_dest unexpected stderr: $(cat "$TMP/existing_dest.err")"
++assert_file_content "$CKPTS/AccTST_Existing/pretrained_seed-existing.pt" "OLD_DEST"
++assert_training_trace existing_dest
++
++
++
++
++rm -rf "$CKPTS/AccTST_Missing"
++run_cli missing_pretrain --exp_name F5TTS_v1_Base --dataset_name AccTST_Missing --finetune --pretrain "$TMP/missing.pt"; ec=$?
++[ "$ec" -ne 0 ] || fail "F_missing_pretrain exit 0; want non-zero"
++
++! grep -F '"event": "trainer_train"' "$TMP/missing_pretrain.trace" >/dev/null 2>&1 || fail "F_missing_pretrain continued into training"
++
++echo "PASS"
++exit 0
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,12 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++exec bash /workspace/repo/usercase-test-coderl/usecase.sh

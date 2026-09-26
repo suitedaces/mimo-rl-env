@@ -1,0 +1,585 @@
+diff --git a/usercase-test-coderl/gist_browsing.test.js b/usercase-test-coderl/gist_browsing.test.js
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/gist_browsing.test.js
+@@ -0,0 +1,495 @@
++
++
++
++
++
++
++
++
++const test = require("node:test");
++const assert = require("node:assert/strict");
++
++const GH3_PATH = "/workspace/repo/gh3.js";
++
++
++
++function endpointFrom(params) {
++  if (typeof params.url === "string" && params.url.length > 0) {
++    try {
++      return new URL(params.url, "https://api.github.com").pathname.replace(/^\/+/, "");
++    } catch (_) {
++      return params.url.split("?")[0].replace(/^\/+/, "");
++    }
++  }
++  if (typeof params.service === "string") {
++    return params.service.replace(/^\/+/, "");
++  }
++  return undefined;
++}
++
++function queryFrom(params) {
++  const query = {};
++  if (typeof params.url === "string") {
++    try {
++      const url = new URL(params.url, "https://api.github.com");
++      for (const [key, value] of url.searchParams) {
++        query[key] = value;
++      }
++    } catch (_) {}
++  }
++  if (params.data && typeof params.data === "object") {
++    Object.assign(query, params.data);
++  }
++  return query;
++}
++
++function assertRequest(request, endpoint, expectedQuery) {
++  assert.equal(request.endpoint, endpoint);
++  if (expectedQuery) {
++    for (const [key, value] of Object.entries(expectedQuery)) {
++      assert.equal(String(request.query[key]), String(value));
++    }
++  }
++}
++
++function installGh3(handler) {
++  const requests = [];
++
++  global.window = { XDomainRequest: null };
++  global.$ = {
++    support: { cors: true },
++    ajaxSetup: {},
++    isFunction(fn) {
++      return typeof fn === "function";
++    },
++    ajax(params) {
++      const request = {
++        endpoint: endpointFrom(params),
++        query: queryFrom(params),
++        service: params.service,
++        url: params.url
++      };
++      if (Object.prototype.hasOwnProperty.call(params, "data")) {
++        request.data = params.data;
++      }
++      requests.push(request);
++
++      const response = handler(request, requests.length);
++      if (response && response.error) {
++        params.error(response.error);
++      } else {
++        params.success(response ? response.body : undefined);
++      }
++    }
++  };
++
++  global._ = {
++    each(value, callback) {
++      if (value == null) return;
++      if (Array.isArray(value)) {
++        value.forEach(callback);
++        return;
++      }
++      Object.keys(value).forEach((key) => callback(value[key], key));
++    },
++    find(value, comparator) {
++      if (value == null) return undefined;
++      for (const item of value) {
++        if (comparator(item)) return item;
++      }
++      return undefined;
++    },
++    filter(value, comparator) {
++      const matches = [];
++      if (value == null) return matches;
++      for (const item of value) {
++        if (comparator(item)) matches.push(item);
++      }
++      return matches;
++    }
++  };
++
++  delete require.cache[require.resolve(GH3_PATH)];
++  return { Gh3: require(GH3_PATH), requests };
++}
++
++test("Gh3.Gists fetch appends pages and exposes the accumulated list", () => {
++
++
++  let fetchCall = 0;
++  const { Gh3, requests } = installGh3((request) => {
++
++    assert.equal(request.endpoint, "users/octo/gists");
++    fetchCall += 1;
++    return {
++      body: fetchCall === 1
++        ? [{ id: "g-1", description: "first page", comments: 1 }]
++        : [
++          { id: "g-2", description: "second page", comments: 0 },
++          { id: "g-3", description: "second more", comments: 2 }
++        ]
++    };
++  });
++
++  const gists = new Gh3.Gists(new Gh3.User("octo"));
++  assert.deepStrictEqual(gists.getGists().map((gist) => gist.id), []);
++
++  let firstCallback = { err: "not-called", sameInstance: false };
++  gists.fetch({ page: 1, per_page: 1 }, null, (err, result) => {
++    firstCallback = { err, sameInstance: result === gists };
++  });
++
++  assertRequest(requests[0], "users/octo/gists", { page: 1, per_page: 1 });
++  assert.equal(firstCallback.err, null);
++  assert.equal(firstCallback.sameInstance, true);
++  assert.deepStrictEqual(gists.getGists().map((gist) => gist.id), ["g-1"]);
++  assert.deepStrictEqual(gists.getGists().map((gist) => gist.description), ["first page"]);
++  assert.deepStrictEqual(gists.getGists().map((gist) => gist.constructor === Gh3.Gist), [true]);
++
++  let secondCallback = { err: "not-called", sameInstance: false };
++  gists.fetch({ page: 2, per_page: 2 }, "next", (err, result) => {
++    secondCallback = { err, sameInstance: result === gists };
++  });
++
++  assertRequest(requests[1], "users/octo/gists", { page: 2, per_page: 2 });
++  assert.equal(secondCallback.err, null);
++  assert.equal(secondCallback.sameInstance, true);
++  assert.deepStrictEqual(gists.getGists().map((gist) => gist.id), ["g-1", "g-2", "g-3"]);
++
++  const eachDescriptions = [];
++  gists.eachGist((gist) => eachDescriptions.push(gist.description));
++  assert.deepStrictEqual(eachDescriptions, ["first page", "second page", "second more"]);
++  assert.deepStrictEqual(gists.filter((gist) => gist.comments > 0).map((gist) => gist.id), ["g-1", "g-3"]);
++});
++
++test("Gh3.Gists fetch reports GitHub API errors as Error(message) with raw response", () => {
++
++
++  const { Gh3, requests } = installGh3(() => ({
++    error: { responseJSON: { message: "No gists for ghost" }, status: 404 }
++  }));
++
++  const gists = new Gh3.Gists(new Gh3.User("ghost"));
++  let callback = { errName: "not-called", message: "", status: 0, sameResponse: false };
++  gists.fetch({ page: 9 }, "next", (err, response) => {
++    callback = {
++      errName: err.constructor.name,
++      message: err.message,
++      status: response.status,
++      sameResponse: response.responseJSON.message === "No gists for ghost"
++    };
++  });
++
++
++  assertRequest(requests[0], "users/ghost/gists", { page: 9 });
++  assert.deepStrictEqual(callback, {
++    errName: "Error",
++    message: "No gists for ghost",
++    status: 404,
++    sameResponse: true
++  });
++  assert.deepStrictEqual(gists.getGists().map((gist) => gist.id), []);
++});
++
++test("Gh3.Gist fetchContents resets files, copies metadata, and exposes file helpers", () => {
++
++
++  let contentCall = 0;
++  const { Gh3, requests } = installGh3((request) => {
++
++    assert.equal(request.endpoint, "gists/detail-1");
++    contentCall += 1;
++    return {
++      body: contentCall === 1
++        ? {
++          id: "detail-1",
++          revision: "first",
++          description: "first content",
++          files: {
++            "old.js": { filename: "old.js", language: "JavaScript", type: "application/javascript", size: 3, content: "old" }
++          }
++        }
++        : {
++          id: "detail-1",
++          revision: "second",
++          description: "second content",
++          public: true,
++          owner: { login: "octo" },
++          files: {
++            "new.js": { filename: "new.js", language: "JavaScript", type: "application/javascript", size: 4, content: "new" },
++            "note.txt": { filename: "note.txt", language: "Text", type: "text/plain", size: 5, content: "note" }
++          }
++        }
++    };
++  });
++
++  const gist = new Gh3.Gist({
++    id: "detail-1",
++    description: "seed",
++    files: [{ filename: "stale.txt" }],
++    comments: [{ id: 99 }]
++  });
++  assert.deepStrictEqual({
++    id: gist.id,
++    description: gist.description,
++    files: gist.files.map((file) => file.filename),
++    comments: gist.comments.map((comment) => comment.id)
++  }, {
++    id: "detail-1",
++    description: "seed",
++    files: ["stale.txt"],
++    comments: [99]
++  });
++
++  let firstCallback = { err: "not-called", sameInstance: false };
++  gist.fetchContents((err, result) => {
++    firstCallback = { err, sameInstance: result === gist };
++  });
++
++  assertRequest(requests[0], "gists/detail-1");
++  assert.equal(firstCallback.err, null);
++  assert.equal(firstCallback.sameInstance, true);
++  assert.deepStrictEqual({
++    revision: gist.revision,
++    description: gist.description,
++    files: gist.getFiles().map((file) => file.filename)
++  }, {
++    revision: "first",
++    description: "first content",
++    files: ["old.js"]
++  });
++
++  let secondCallback = { err: "not-called", sameInstance: false };
++  gist.fetchContents((err, result) => {
++    secondCallback = { err, sameInstance: result === gist };
++  });
++  assert.equal(secondCallback.err, null);
++  assert.equal(secondCallback.sameInstance, true);
++  const secondFileNames = gist.getFiles().map((file) => file.filename);
++  assert.deepStrictEqual({
++    revision: gist.revision,
++    description: gist.description,
++    public: gist.public,
++    owner: gist.owner
++  }, {
++    revision: "second",
++    description: "second content",
++    public: true,
++    owner: { login: "octo" }
++  });
++
++  assert.deepStrictEqual(new Set(secondFileNames), new Set(["new.js", "note.txt"]));
++  assert.deepStrictEqual(gist.getFileByName("new.js"), {
++    filename: "new.js",
++    language: "JavaScript",
++    type: "application/javascript",
++    size: 4,
++    content: "new"
++  });
++
++  const eachFiles = [];
++  gist.eachFile((file) => eachFiles.push(`${file.filename}:${file.size}`));
++
++  assert.deepStrictEqual(new Set(eachFiles), new Set(["new.js:4", "note.txt:5"]));
++});
++
++test("Gh3.Gist fetchContents reports content API errors as Error(message)", () => {
++
++
++  const { Gh3, requests } = installGh3(() => ({
++    error: { responseJSON: { message: "Gist content missing" }, status: 410 }
++  }));
++
++  const gist = new Gh3.Gist({ id: "missing-content" });
++  let callback = { errName: "not-called", message: "", status: 0, rawMessage: "" };
++  gist.fetchContents((err, response) => {
++    callback = {
++      errName: err.constructor.name,
++      message: err.message,
++      status: response.status,
++      rawMessage: response.responseJSON.message
++    };
++  });
++
++
++  assertRequest(requests[0], "gists/missing-content");
++  assert.deepStrictEqual(callback, {
++    errName: "Error",
++    message: "Gist content missing",
++    status: 410,
++    rawMessage: "Gist content missing"
++  });
++});
++
++test("Gh3.Gist fetchComments resets comments and exposes comment helpers", () => {
++
++
++  let commentCall = 0;
++  const { Gh3, requests } = installGh3((request) => {
++
++    assert.equal(request.endpoint, "gists/detail-1/comments");
++    commentCall += 1;
++    return {
++      body: commentCall === 1
++        ? [
++          { id: 1, body: "old", user: { login: "olduser" } },
++          { id: 2, body: "extra", user: { login: "olduser" } }
++        ]
++        : [
++          { id: 3, body: "new", user: { login: "newuser" } }
++        ]
++    };
++  });
++
++  const gist = new Gh3.Gist({
++    id: "detail-1",
++    comments: [{ id: 99, body: "stale", user: { login: "seed" } }]
++  });
++  assert.deepStrictEqual(gist.getComments().map((comment) => `${comment.id}:${comment.body}`), ["99:stale"]);
++
++  let firstCallback = { err: "not-called", sameInstance: false };
++  gist.fetchComments((err, result) => {
++    firstCallback = { err, sameInstance: result === gist };
++  });
++
++  assertRequest(requests[0], "gists/detail-1/comments");
++  assert.equal(firstCallback.err, null);
++  assert.equal(firstCallback.sameInstance, true);
++  assert.deepStrictEqual(gist.getComments().map((comment) => `${comment.id}:${comment.body}`), ["1:old", "2:extra"]);
++  assert.deepStrictEqual(gist.getComments().map((comment) => comment.constructor === Gh3.GistComment), [true, true]);
++
++  let secondCallback = { err: "not-called", sameInstance: false };
++  gist.fetchComments((err, result) => {
++    secondCallback = { err, sameInstance: result === gist };
++  });
++  assert.equal(secondCallback.err, null);
++  assert.equal(secondCallback.sameInstance, true);
++  assert.deepStrictEqual(gist.getComments().map((comment) => `${comment.id}:${comment.body}`), ["3:new"]);
++  assert.deepStrictEqual(gist.getComments().map((comment) => comment.constructor === Gh3.GistComment), [true]);
++
++  const eachComments = [];
++  gist.eachComment((comment) => eachComments.push(`${comment.id}:${comment.user.login}`));
++  assert.deepStrictEqual(eachComments, ["3:newuser"]);
++  assert.deepStrictEqual(gist.filterComments((comment) => comment.user.login === "newuser").map((comment) => comment.body), ["new"]);
++});
++
++test("Gh3.Gist fetchComments reports comment API errors as Error(message)", () => {
++
++
++  const { Gh3, requests } = installGh3(() => ({
++    error: { responseJSON: { message: "Comments disabled" }, status: 451 }
++  }));
++
++  const gist = new Gh3.Gist({ id: "missing-comments" });
++  let callback = { errName: "not-called", message: "", status: 0, rawMessage: "" };
++  gist.fetchComments((err, response) => {
++    callback = {
++      errName: err.constructor.name,
++      message: err.message,
++      status: response.status,
++      rawMessage: response.responseJSON.message
++    };
++  });
++
++
++  assertRequest(requests[0], "gists/missing-comments/comments");
++  assert.deepStrictEqual(callback, {
++    errName: "Error",
++    message: "Comments disabled",
++    status: 451,
++    rawMessage: "Comments disabled"
++  });
++});
++
++test("separate Gists and Gist instances keep independent arrays", () => {
++
++
++  const { Gh3 } = installGh3((request) => {
++    const bodies = {
++      "users/alpha/gists": [{ id: "alpha-1", description: "alpha only", comments: 0 }],
++      "users/beta/gists": [
++        { id: "beta-1", description: "beta first", comments: 0 },
++        { id: "beta-2", description: "beta second", comments: 0 }
++      ],
++      "gists/one": {
++        id: "one",
++        files: { "one.js": { filename: "one.js", size: 1 } }
++      },
++      "gists/one/comments": [
++        { id: 101, body: "one comment", user: { login: "one-user" } }
++      ]
++    };
++
++    return { body: bodies[request.endpoint] };
++  });
++
++  const alpha = new Gh3.Gists(new Gh3.User("alpha"));
++  const beta = new Gh3.Gists(new Gh3.User("beta"));
++  alpha.fetch({ page: 1 }, null, () => {});
++  assert.deepStrictEqual(alpha.getGists().map((gist) => gist.id), ["alpha-1"]);
++  assert.deepStrictEqual(beta.getGists().map((gist) => gist.id), []);
++
++  beta.fetch({ page: 1 }, null, () => {});
++  assert.deepStrictEqual(alpha.getGists().map((gist) => gist.id), ["alpha-1"]);
++  assert.deepStrictEqual(beta.getGists().map((gist) => gist.id), ["beta-1", "beta-2"]);
++
++  const one = new Gh3.Gist({
++    id: "one",
++    files: [{ filename: "one-seed" }],
++    comments: [{ id: 11, body: "one seed" }]
++  });
++  const two = new Gh3.Gist({
++    id: "two",
++    files: [{ filename: "two-seed" }],
++    comments: [{ id: 22, body: "two seed" }]
++  });
++  one.fetchContents(() => {});
++  one.fetchComments(() => {});
++
++  assert.deepStrictEqual(one.getFiles().map((file) => file.filename), ["one.js"]);
++  assert.deepStrictEqual(two.getFiles().map((file) => file.filename), ["two-seed"]);
++  assert.deepStrictEqual(one.getComments().map((comment) => `${comment.id}:${comment.body}`), ["101:one comment"]);
++  assert.deepStrictEqual(two.getComments().map((comment) => `${comment.id}:${comment.body}`), ["22:two seed"]);
++});
++
++test("repeated public gist sessions keep independent arrays", () => {
++
++
++  const observedLists = [];
++  const observedGists = [];
++
++  const { Gh3 } = installGh3((request) => {
++    if (request.endpoint.indexOf("/comments") !== -1) {
++      return { body: [{ id: 1, body: "cycle comment", user: { login: "cycle" } }] };
++    }
++    if (request.endpoint.indexOf("gists/cycle-") === 0) {
++      return { body: { id: request.endpoint.slice("gists/".length), files: { "cycle.js": { filename: "cycle.js", size: 1 } } } };
++    }
++    return { body: [{ id: "cycle-list", description: "cycle", comments: 1 }] };
++  });
++
++  for (let index = 0; index < 120; index += 1) {
++    const list = new Gh3.Gists(new Gh3.User(`cycle-user-${index}`));
++    list.fetch({ page: 1, per_page: 1 }, null, () => {});
++    assert.deepStrictEqual(list.getGists().map((gist) => gist.id), ["cycle-list"]);
++
++    const gist = new Gh3.Gist({ id: `cycle-${index}` });
++    gist.fetchContents(() => {});
++    gist.fetchComments(() => {});
++    assert.deepStrictEqual(gist.getFiles().map((file) => file.filename), ["cycle.js"]);
++    assert.deepStrictEqual(gist.getComments().map((comment) => comment.body), ["cycle comment"]);
++    if (index < 2) {
++      observedLists.push(list);
++      observedGists.push(gist);
++    }
++  }
++
++
++
++  observedLists[0].getGists().push(new Gh3.Gist({ id: "manual-list-mutation" }));
++  assert.deepStrictEqual(observedLists[1].getGists().map((gist) => gist.id), ["cycle-list"]);
++  observedGists[0].getFiles().push({ filename: "manual-file-mutation" });
++  observedGists[0].getComments().push(new Gh3.GistComment({ id: 999, body: "manual-comment-mutation" }));
++  assert.deepStrictEqual(observedGists[1].getFiles().map((file) => file.filename), ["cycle.js"]);
++  assert.deepStrictEqual(observedGists[1].getComments().map((comment) => comment.body), ["cycle comment"]);
++});
+diff --git a/usercase-test-coderl/offline_network_guard.cjs b/usercase-test-coderl/offline_network_guard.cjs
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/offline_network_guard.cjs
+@@ -0,0 +1,60 @@
++
++"use strict";
++
++const blocked = (api) => function blockedNetworkCall() {
++  throw new Error(`local offline network guard blocked ${api}`);
++};
++
++const patchFunction = (object, name, api) => {
++  if (object && typeof object[name] === "function") {
++    object[name] = blocked(api);
++  }
++};
++
++for (const moduleName of ["node:http", "node:https", "node:http2"]) {
++  try {
++    const mod = require(moduleName);
++    patchFunction(mod, "request", `${moduleName}.request`);
++    patchFunction(mod, "get", `${moduleName}.get`);
++    patchFunction(mod, "connect", `${moduleName}.connect`);
++  } catch (_) {
++
++  }
++}
++
++try {
++  const net = require("node:net");
++  patchFunction(net, "connect", "node:net.connect");
++  patchFunction(net, "createConnection", "node:net.createConnection");
++  patchFunction(net.Socket && net.Socket.prototype, "connect", "node:net.Socket.connect");
++} catch (_) {}
++
++try {
++  const tls = require("node:tls");
++  patchFunction(tls, "connect", "node:tls.connect");
++} catch (_) {}
++
++try {
++  const dgram = require("node:dgram");
++  patchFunction(dgram, "createSocket", "node:dgram.createSocket");
++} catch (_) {}
++
++try {
++  const dns = require("node:dns");
++  for (const name of ["lookup", "resolve", "resolve4", "resolve6", "resolveCname", "resolveMx", "resolveTxt", "resolveSrv", "resolveNs", "resolveSoa", "reverse"]) {
++    patchFunction(dns, name, `node:dns.${name}`);
++  }
++  if (dns.promises) {
++    for (const name of ["lookup", "resolve", "resolve4", "resolve6", "resolveCname", "resolveMx", "resolveTxt", "resolveSrv", "resolveNs", "resolveSoa", "reverse"]) {
++      patchFunction(dns.promises, name, `node:dns.promises.${name}`);
++    }
++  }
++} catch (_) {}
++
++if (typeof globalThis.fetch === "function") {
++  globalThis.fetch = blocked("globalThis.fetch");
++}
++
++if (typeof globalThis.WebSocket === "function") {
++  globalThis.WebSocket = blocked("globalThis.WebSocket");
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,15 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++cd /workspace/repo
++
++exec node --require /workspace/repo/usercase-test-coderl/offline_network_guard.cjs --test /workspace/repo/usercase-test-coderl/gist_browsing.test.js

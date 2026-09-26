@@ -1,0 +1,317 @@
+diff --git a/verifier_tests/test_flow_analytics_contract.py b/verifier_tests/test_flow_analytics_contract.py
+new file mode 100644
+index 0000000..7d32001
+--- /dev/null
++++ b/verifier_tests/test_flow_analytics_contract.py
+@@ -0,0 +1,301 @@
++import json
++import sys
++import types
++
++import pytest
++
++
++
++sys.modules.setdefault("pika", types.ModuleType("pika"))
++
++from plugins.heuristics.pcap_stats.pcap_stats import (  # noqa: E402
++    FlowRecord,
++    analyze_pcap,
++    network_machines,
++)
++
++
++@pytest.fixture(autouse=True)
++def clean_legacy_networks():
++    network_machines[:] = []
++    yield
++    network_machines[:] = []
++
++
++def configured_flow(networks):
++    try:
++        return FlowRecord(networks=networks)
++    except TypeError:
++        pytest.fail("FlowRecord must accept the public networks argument")
++
++
++def ingest(flow, packet):
++    method = getattr(flow, "ingest", None)
++    assert callable(method), "FlowRecord.ingest must be public"
++    return method(packet)
++
++
++def snapshot(flow, **kwargs):
++    method = getattr(flow, "snapshot", None)
++    assert callable(method), "FlowRecord.snapshot must be public"
++    return method(**kwargs)
++
++
++def test_configured_exact_and_cidr_membership_and_directional_snapshot():
++    flow = configured_flow([
++        "10.20.0.0/24",
++        "2001:db8:4::/126",
++        "sensor-a",
++    ])
++
++    assert ingest(flow, {
++        "src_ip": "10.20.0.7",
++        "dest_ip": "203.0.113.9",
++        "length": 20,
++    }) is True
++    assert ingest(flow, {
++        "src_ip": "2001:db8:ffff::1",
++        "dest_ip": "2001:db8:4::2",
++        "length": 30,
++    }) is True
++    assert ingest(flow, {
++        "src_ip": "sensor-a",
++        "dest_ip": "collector-x",
++        "length": 7,
++    }) is True
++    assert ingest(flow, {
++        "src_ip": "198.51.100.10",
++        "dest_ip": "203.0.113.10",
++        "length": 99,
++    }) is False
++
++    result = snapshot(flow)
++    assert result == {
++        "10.20.0.7": {
++            "num_packets": 1,
++            "total_bytes": 20,
++            "average_packet_length": 20.0,
++            "sent_to": {"203.0.113.9": 1},
++            "received_from": {},
++        },
++        "2001:db8:4::2": {
++            "num_packets": 1,
++            "total_bytes": 30,
++            "average_packet_length": 30.0,
++            "sent_to": {},
++            "received_from": {"2001:db8:ffff::1": 1},
++        },
++        "sensor-a": {
++            "num_packets": 1,
++            "total_bytes": 7,
++            "average_packet_length": 7.0,
++            "sent_to": {"collector-x": 1},
++            "received_from": {},
++        },
++    }
++    json.dumps(result)
++
++
++def test_internal_peers_and_self_loop_are_counted_once_per_node():
++    flow = configured_flow(["10.0.0.1", "10.0.0.2"])
++
++    assert ingest(flow, {
++        "src_ip": "10.0.0.1",
++        "dest_ip": "10.0.0.2",
++        "length": 10,
++    }) is True
++    assert ingest(flow, {
++        "src_ip": "10.0.0.1",
++        "dest_ip": "10.0.0.1",
++        "length": 5,
++    }) is True
++
++    assert snapshot(flow) == {
++        "10.0.0.1": {
++            "num_packets": 2,
++            "total_bytes": 15,
++            "average_packet_length": 7.5,
++            "sent_to": {"10.0.0.1": 1, "10.0.0.2": 1},
++            "received_from": {"10.0.0.1": 1},
++        },
++        "10.0.0.2": {
++            "num_packets": 1,
++            "total_bytes": 10,
++            "average_packet_length": 10.0,
++            "sent_to": {},
++            "received_from": {"10.0.0.1": 1},
++        },
++    }
++
++
++def test_callback_accepts_mapping_json_and_legacy_literal_bytes():
++    network_machines.append("inside-a")
++    flow = FlowRecord()
++
++    direct = {"src_ip": "inside-a", "dest_ip": "outside-a", "length": 11}
++    assert analyze_pcap(None, None, None, direct, flow) is True
++
++    as_json = json.dumps({
++        "src_ip": "outside-b",
++        "dest_ip": "inside-a",
++        "length": 13,
++    })
++    assert analyze_pcap(None, None, None, as_json, flow) is True
++
++    network_machines.append("inside-b")
++    legacy_bytes = (
++        b"{'src_ip': 'inside-b', 'dest_ip': 'outside-c', 'length': 17}"
++    )
++    assert analyze_pcap(None, None, None, legacy_bytes, flow) is True
++    assert analyze_pcap(None, None, None, json.dumps({
++        "src_ip": "outside-d",
++        "dest_ip": "outside-e",
++        "length": 100,
++    }), flow) is False
++
++    assert snapshot(flow) == {
++        "inside-a": {
++            "num_packets": 2,
++            "total_bytes": 24,
++            "average_packet_length": 12.0,
++            "sent_to": {"outside-a": 1},
++            "received_from": {"outside-b": 1},
++        },
++        "inside-b": {
++            "num_packets": 1,
++            "total_bytes": 17,
++            "average_packet_length": 17.0,
++            "sent_to": {"outside-c": 1},
++            "received_from": {},
++        },
++    }
++
++
++def test_membership_source_distinguishes_none_from_empty_and_is_copied():
++    network_machines.append("legacy-inside")
++    explicit_empty = configured_flow([])
++    packet = {"src_ip": "legacy-inside", "dest_ip": "outside", "length": 4}
++    assert ingest(explicit_empty, packet) is False
++    assert snapshot(explicit_empty) == {}
++
++    configured = ["fixed-inside"]
++    fixed_flow = configured_flow(configured)
++    configured.append("added-later")
++    network_machines.extend(["fixed-inside", "added-later"])
++
++    assert ingest(fixed_flow, {
++        "src_ip": "added-later",
++        "dest_ip": "outside",
++        "length": 8,
++    }) is False
++    assert ingest(fixed_flow, {
++        "src_ip": "fixed-inside",
++        "dest_ip": "outside",
++        "length": 9,
++    }) is True
++    assert set(snapshot(fixed_flow)) == {"fixed-inside"}
++
++
++@pytest.mark.parametrize("bad_packet", [
++    None,
++    [],
++    {"src_ip": "inside", "dest_ip": "outside"},
++    {"src_ip": "", "dest_ip": "outside", "length": 1},
++    {"src_ip": "inside", "dest_ip": None, "length": 1},
++])
++def test_mapping_shape_errors_are_value_errors_and_atomic(bad_packet):
++    flow = configured_flow(["inside"])
++    ingest(flow, {"src_ip": "inside", "dest_ip": "ok", "length": 3})
++    before = snapshot(flow)
++
++    with pytest.raises(ValueError):
++        ingest(flow, bad_packet)
++    assert snapshot(flow) == before
++
++
++@pytest.mark.parametrize("bad_length", [-1, 1.5, True, "12"])
++def test_invalid_lengths_are_value_errors_and_atomic(bad_length):
++    flow = configured_flow(["inside"])
++    ingest(flow, {"src_ip": "inside", "dest_ip": "ok", "length": 3})
++    before = snapshot(flow)
++
++    with pytest.raises(ValueError):
++        ingest(flow, {
++            "src_ip": "inside",
++            "dest_ip": "outside",
++            "length": bad_length,
++        })
++    assert snapshot(flow) == before
++
++
++@pytest.mark.parametrize("bad_body", [
++    "{not a packet",
++    "[]",
++    b"not serialized data",
++])
++def test_callback_decode_errors_are_value_errors_and_atomic(bad_body):
++    network_machines.append("inside")
++    flow = FlowRecord()
++    analyze_pcap(None, None, None, {
++        "src_ip": "inside",
++        "dest_ip": "ok",
++        "length": 3,
++    }, flow)
++    before = snapshot(flow)
++
++    with pytest.raises(ValueError):
++        analyze_pcap(None, None, None, bad_body, flow)
++    assert snapshot(flow) == before
++
++
++def test_snapshot_is_detached_and_reset_returns_the_pre_reset_state():
++    flow = configured_flow(["inside"])
++    packet = {"src_ip": "inside", "dest_ip": "peer", "length": 6}
++    ingest(flow, packet)
++
++    detached = snapshot(flow)
++    detached["inside"]["sent_to"].clear()
++    detached["inside"]["total_bytes"] = 999
++    assert snapshot(flow)["inside"]["sent_to"] == {"peer": 1}
++    assert snapshot(flow)["inside"]["total_bytes"] == 6
++
++    expected = snapshot(flow)
++    returned = snapshot(flow, reset=True)
++    assert returned == expected
++    assert snapshot(flow) == {}
++
++    assert ingest(flow, packet) is True
++    assert snapshot(flow)["inside"]["num_packets"] == 1
++
++
++def test_legacy_update_and_machine_node_accessors_remain_usable():
++    flow = FlowRecord()
++    flow.update("left", True, "right", True, 10)
++    flow.update("left", True, "outside", False, 20)
++
++    left = flow.get_machine_node("left")
++    right = flow.get_machine_node("right")
++    assert left.num_packets == 2
++    assert left.get_avg_packet_len() == 15
++    assert dict(left.get_machines_sent_to()) == {"right": 1, "outside": 1}
++    assert dict(left.get_machines_received_from()) == {}
++    assert right.num_packets == 1
++    assert right.get_avg_packet_len() == 10
++    assert dict(right.get_machines_received_from()) == {"left": 1}
++    assert flow.get_machine_node("missing") is None
++    assert snapshot(flow) == {
++        "left": {
++            "num_packets": 2,
++            "total_bytes": 30,
++            "average_packet_length": 15.0,
++            "sent_to": {"right": 1, "outside": 1},
++            "received_from": {},
++        },
++        "right": {
++            "num_packets": 1,
++            "total_bytes": 10,
++            "average_packet_length": 10.0,
++            "sent_to": {},
++            "received_from": {"left": 1},
++        },
++    }
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,5 @@
++#!/bin/bash
++set -euo pipefail
++
++
++PYTHONPATH=. python -m pytest -q verifier_tests/test_flow_analytics_contract.py

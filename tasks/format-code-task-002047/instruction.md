@@ -1,0 +1,1 @@
+Is there any way of avoiding the encoding of '<' and '>' to \u003c and \u003e using json format. It seems to be the default in go. It would help to avoid diffs with phrase using simple json format, since phrase does not encode html characters in its json output.

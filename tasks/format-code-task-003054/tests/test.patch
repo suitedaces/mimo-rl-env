@@ -1,0 +1,304 @@
+diff --git a/usercase-test-coderl/usecase.sh b/usercase-test-coderl/usecase.sh
+new file mode 100755
+--- /dev/null
++++ b/usercase-test-coderl/usecase.sh
+@@ -0,0 +1,282 @@
++#!/usr/bin/env bash
++
++set -u
++export LANG=C.UTF-8 LC_ALL=C.UTF-8 TZ=UTC USER="${USER:-root}"
++export PYTHONDONTWRITEBYTECODE=1
++
++( cd /workspace/repo && python3 - <<'PY'
++for path in ('zim.py', 'zim/main/__init__.py', 'zim/main/command.py'):
++	with open(path, 'rb') as fh:
++		compile(fh.read(), path, 'exec')
++PY
++) \
++	|| { echo "FAIL: build" >&2; exit 1; }
++BIN="python3 /workspace/repo/zim.py"
++
++TMP=$(mktemp -d)
++trap 'rm -rf "$TMP"' EXIT
++cd "$TMP"
++fail() { echo "FAIL: $*" >&2; exit 1; }
++
++export XDG_CONFIG_HOME="$TMP/xdg-config"
++export XDG_CACHE_HOME="$TMP/xdg-cache"
++export XDG_DATA_HOME="$TMP/xdg-data"
++export XDG_DATA_DIRS="/workspace/repo/data:/usr/share:/usr/local/share"
++export ZIM_TEST_RUNNING=
++mkdir -p "$XDG_CONFIG_HOME/zim" "$XDG_CACHE_HOME" "$XDG_DATA_HOME"
++
++write_notebook_config() {
++	local nb="$1"
++	local name="$2"
++	mkdir -p "$nb"
++	cat > "$nb/notebook.zim" <<EOF
++[Notebook]
++name=$name
++version=0.4
++endofline=unix
++shared=False
++EOF
++}
++
++write_page() {
++	local file="$1"
++	local body="$2"
++	mkdir -p "$(dirname "$file")"
++	cat > "$file" <<EOF
++Content-Type: text/x-zim-wiki
++
++$body
++EOF
++}
++
++summary_db() {
++	local db="$1"
++	python3 - "$db" <<'PY'
++import sqlite3
++import sys
++
++con = sqlite3.connect(sys.argv[1])
++
++def one(sql):
++	row = con.execute(sql).fetchone()
++	return '' if row is None or row[0] is None else str(row[0])
++
++queries = [
++	('pages', 'SELECT count(*) FROM pages'),
++	('page_names', "SELECT group_concat(name, ',') FROM (SELECT name FROM pages ORDER BY name)"),
++	('links', 'SELECT count(*) FROM links'),
++	('tags', 'SELECT count(*) FROM tags'),
++	('tag_names', "SELECT group_concat(name, ',') FROM (SELECT name FROM tags ORDER BY name)"),
++	('tag_sources', 'SELECT count(*) FROM tagsources'),
++	('stale_files', 'SELECT count(*) FROM files WHERE index_status != 0'),
++]
++for key, sql in queries:
++	print(f'{key}={one(sql)}')
++PY
++}
++
++add_notebook_list_entry() {
++	local name="$1"
++	local uri="$2"
++	cat > "$XDG_CONFIG_HOME/zim/notebooks.list" <<EOF
++[NotebookList]
++Default=
++1=$uri
++
++[Notebook 1]
++uri=$uri
++name=$name
++interwiki=
++icon=
++EOF
++}
++
++file_uri() {
++	python3 - "$1" <<'PY'
++import pathlib
++import sys
++print(pathlib.Path(sys.argv[1]).resolve().as_uri())
++PY
++}
++
++run_tty() {
++	local cmd="$1"
++	local out_file="$2"
++	local err_file="$3"
++	local typescript="$TMP/typescript-$RANDOM"
++	script -q -e -c "$cmd" "$typescript" > "$out_file" 2> "$err_file"
++}
++
++
++
++
++$BIN --help >out 2>err; ec=$?
++[ "$ec" -eq 0 ] || fail "F1 exit $ec; want 0"
++
++grep -Eq 'or:[[:space:]]+zim --index[[:space:]]+\[OPTIONS\][[:space:]]+NOTEBOOK' out || fail "F1 missing index usage"
++
++grep -Eq '^[[:space:]]*--index[[:space:]]+builds? an index for a notebook' out || fail "F1 missing general --index help"
++grep -Fq 'Index Options:' out || fail "F1 missing Index Options section"
++
++grep -Eq '^[[:space:]]*-f, --flush[[:space:]].*flush.*index.*rebuild|^[[:space:]]*-f, --flush[[:space:]].*flush.*index.*re-building' out || fail "F1 missing flush help"
++[ ! -s err ] || fail "F1 unexpected stderr: $(cat err)"
++
++
++
++
++NB_PATH="$TMP/path-notebook"
++write_notebook_config "$NB_PATH" "Path Notebook"
++write_page "$NB_PATH/Home.txt" $'Home page\n[[Alpha:Child]]\n@home'
++write_page "$NB_PATH/Alpha/Child.txt" $'Child page\n[[Home]]\n@child'
++$BIN --index "$NB_PATH" >out 2>err; ec=$?
++EXPECTED_SUMMARY=$'pages=4\npage_names=,Alpha,Alpha:Child,Home\nlinks=2\ntags=2\ntag_names=child,home\ntag_sources=2\nstale_files=0'
++[ "$ec" -eq 0 ] || fail "F2 exit $ec; want 0"
++
++! grep -qi 'traceback' out err || fail "F2 traceback in output: $(cat out err)"
++[ "$(summary_db "$NB_PATH/.zim/index.db")" = "$EXPECTED_SUMMARY" ] || fail "F2 index summary: $(summary_db "$NB_PATH/.zim/index.db")"
++
++
++
++
++NB_URI="$TMP/uri-notebook"
++write_notebook_config "$NB_URI" "URI Notebook"
++write_page "$NB_URI/Home.txt" $'Home page\n[[Later]]\n@home'
++$BIN --index "$NB_URI" >out 2>err; ec=$?
++[ "$ec" -eq 0 ] || fail "F3 setup exit $ec; want 0"
++sleep 1
++write_page "$NB_URI/Later.txt" $'Later page\n[[Home]]\n@later'
++URI_ARG="$(file_uri "$NB_URI")"
++$BIN --index "$URI_ARG" >out 2>err; ec=$?
++EXPECTED_SUMMARY=$'pages=3\npage_names=,Home,Later\nlinks=2\ntags=2\ntag_names=home,later\ntag_sources=2\nstale_files=0'
++[ "$ec" -eq 0 ] || fail "F3 exit $ec; want 0"
++
++! grep -qi 'traceback' out err || fail "F3 traceback in output: $(cat out err)"
++[ "$(summary_db "$NB_URI/.zim/index.db")" = "$EXPECTED_SUMMARY" ] || fail "F3 index summary: $(summary_db "$NB_URI/.zim/index.db")"
++
++
++
++
++NB_NAME="$TMP/name-notebook"
++write_notebook_config "$NB_NAME" "named-cli-notebook-coderl"
++write_page "$NB_NAME/Only.txt" $'Only named page\n@named'
++add_notebook_list_entry "named-cli-notebook-coderl" "$(file_uri "$NB_NAME")"
++$BIN --index named-cli-notebook-coderl >out 2>err; ec=$?
++EXPECTED_SUMMARY=$'pages=2\npage_names=,Only\nlinks=0\ntags=1\ntag_names=named\ntag_sources=1\nstale_files=0'
++[ "$ec" -eq 0 ] || fail "F4 exit $ec; want 0"
++
++! grep -qi 'traceback' out err || fail "F4 traceback in output: $(cat out err)"
++[ "$(summary_db "$NB_NAME/.zim/index.db")" = "$EXPECTED_SUMMARY" ] || fail "F4 index summary: $(summary_db "$NB_NAME/.zim/index.db")"
++
++
++
++
++NB_FLUSH_LONG="$TMP/flush-long-notebook"
++write_notebook_config "$NB_FLUSH_LONG" "Long Flush Notebook"
++write_page "$NB_FLUSH_LONG/Home.txt" $'Home page\n@home'
++$BIN --index "$NB_FLUSH_LONG" >out 2>err; ec=$?
++[ "$ec" -eq 0 ] || fail "F5 setup exit $ec; want 0"
++python3 - "$NB_FLUSH_LONG/.zim/index.db" <<'PY'
++import sqlite3
++import sys
++con = sqlite3.connect(sys.argv[1])
++con.execute("INSERT INTO zim_index(key, value) VALUES ('coderl_pollution', 'still_here')")
++con.commit()
++PY
++$BIN --index --flush "$NB_FLUSH_LONG" >out 2>err; ec=$?
++EXPECTED_SUMMARY=$'pages=2\npage_names=,Home\nlinks=0\ntags=1\ntag_names=home\ntag_sources=1\nstale_files=0'
++POLLUTION_COUNT="$(python3 - "$NB_FLUSH_LONG/.zim/index.db" <<'PY'
++import sqlite3
++import sys
++con = sqlite3.connect(sys.argv[1])
++print(con.execute("SELECT count(*) FROM zim_index WHERE key='coderl_pollution'").fetchone()[0])
++PY
++)"
++[ "$ec" -eq 0 ] || fail "F5 exit $ec; want 0"
++[ "$POLLUTION_COUNT" = "0" ] || fail "F5 pollution row survived flush"
++[ "$(summary_db "$NB_FLUSH_LONG/.zim/index.db")" = "$EXPECTED_SUMMARY" ] || fail "F5 index summary: $(summary_db "$NB_FLUSH_LONG/.zim/index.db")"
++
++! grep -qi 'traceback' out err || fail "F5 traceback in output: $(cat out err)"
++
++
++
++
++NB_FLUSH_SHORT="$TMP/flush-short-notebook"
++write_notebook_config "$NB_FLUSH_SHORT" "Short Flush Notebook"
++write_page "$NB_FLUSH_SHORT/Home.txt" $'Home page\n@short'
++$BIN --index "$NB_FLUSH_SHORT" >out 2>err; ec=$?
++[ "$ec" -eq 0 ] || fail "F6 setup exit $ec; want 0"
++python3 - "$NB_FLUSH_SHORT/.zim/index.db" <<'PY'
++import sqlite3
++import sys
++con = sqlite3.connect(sys.argv[1])
++con.execute("INSERT INTO zim_index(key, value) VALUES ('coderl_pollution', 'still_here')")
++con.commit()
++PY
++$BIN --index -f "$NB_FLUSH_SHORT" >out 2>err; ec=$?
++EXPECTED_SUMMARY=$'pages=2\npage_names=,Home\nlinks=0\ntags=1\ntag_names=short\ntag_sources=1\nstale_files=0'
++POLLUTION_COUNT="$(python3 - "$NB_FLUSH_SHORT/.zim/index.db" <<'PY'
++import sqlite3
++import sys
++con = sqlite3.connect(sys.argv[1])
++print(con.execute("SELECT count(*) FROM zim_index WHERE key='coderl_pollution'").fetchone()[0])
++PY
++)"
++[ "$ec" -eq 0 ] || fail "F6 exit $ec; want 0"
++[ "$POLLUTION_COUNT" = "0" ] || fail "F6 pollution row survived flush"
++[ "$(summary_db "$NB_FLUSH_SHORT/.zim/index.db")" = "$EXPECTED_SUMMARY" ] || fail "F6 index summary: $(summary_db "$NB_FLUSH_SHORT/.zim/index.db")"
++
++! grep -qi 'traceback' out err || fail "F6 traceback in output: $(cat out err)"
++
++
++
++
++NB_VERBOSE="$TMP/verbose-notebook"
++write_notebook_config "$NB_VERBOSE" "Verbose Notebook"
++write_page "$NB_VERBOSE/Home.txt" $'Verbose page\n@verbose'
++run_tty "$BIN --index -V '$NB_VERBOSE'" out err; ec=$?
++[ "$ec" -eq 0 ] || fail "F7 exit $ec; want 0"
++[ ! -s err ] || fail "F7 unexpected script stderr: $(cat err)"
++
++grep -Eq "INFO: .*${NB_VERBOSE}/\\.zim/index\\.db" out || fail "F7 missing elevated indexer database message"
++
++grep -Eiq 'INFO: .*check.*notebook.*index' out || fail "F7 missing checking message"
++
++grep -Eiq 'INFO: .*index.*up.to.date|INFO: .*up.to.date.*index' out || fail "F7 missing up-to-date message"
++
++grep -Eq "INFO: .*${NB_VERBOSE}/Home\\.txt" out || fail "F7 missing elevated indexer file message"
++
++
++
++
++run_tty "$BIN --index" out err; ec=$?
++[ "$ec" -ne 0 ] || fail "F8 expected non-zero exit"
++[ ! -s err ] || fail "F8 unexpected script stderr: $(cat err)"
++
++if ! { [ -s out ] && grep -Eiq 'notebook|argument|usage' out; }; then
++	fail "F8 missing command-line error: $(cat out)"
++fi
++
++
++
++
++run_tty "$BIN --index '$NB_PATH' extra" out err; ec=$?
++[ "$ec" -ne 0 ] || fail "F9 expected non-zero exit"
++[ ! -s err ] || fail "F9 unexpected script stderr: $(cat err)"
++
++if ! { [ -s out ] && grep -Eiq 'argument|usage|only|takes' out; }; then
++	fail "F9 missing too-many-arguments error: $(cat out)"
++fi
++
++
++
++
++run_tty "$BIN --index definitely_missing_notebook_name_coderl" out err; ec=$?
++[ "$ec" -ne 0 ] || fail "F10 expected non-zero exit"
++[ ! -s err ] || fail "F10 unexpected script stderr: $(cat err)"
++
++grep -Fq 'definitely_missing_notebook_name_coderl' out || fail "F10 missing unresolved notebook name: $(cat out)"
++
++grep -Eiq 'notebook|file|folder|resolve|find' out || fail "F10 missing lookup error description: $(cat out)"
++
++echo "PASS"
++exit 0
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,12 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++exec bash /workspace/repo/usercase-test-coderl/usecase.sh

@@ -1,0 +1,10 @@
+The REST subscription model is used by several API endpoints and must be able to carry every subscriber shape that the event layer already supports. At present, a run-child-patch subscription cannot be converted at all, and GitHub pull-request targets lose metadata used to identify generated child patches. Some callers also hand the model concrete subscriber values while others hand pointers, so conversion should not depend on one representation.
+
+Extend the public REST subscription models and their conversions so these existing event-layer contracts are preserved in both directions:
+
+- A run-child-patch subscriber must be accepted by APISubscriber.BuildFromService and represented with a target object containing parent_status, child_patch_id, and requester. APISubscriber.ToService must accept that target when it came from a JSON request (a map) and restore an event.ChildPatchSubscriber with all three values unchanged.
+- GitHub pull-request subscriber targets must expose and round-trip the existing child and type metadata in addition to owner, repo, pull-request number, and ref. Use the established snake_case JSON naming used by the other subscriber target fields.
+- BuildFromService must accept both pointer and concrete-value forms for structured subscriber targets (including GitHub check and webhook targets), while retaining the current pointer behavior and existing email/Slack conversions.
+- If a supported structured target is present but has the wrong shape or field types, return the same HTTP 400-style gimlet error used for other malformed subscriber targets, and identify it as malformed rather than reporting the subscriber type as unknown. Unknown subscriber types must remain rejected.
+
+Keep the APISubscription conversion behavior intact: selectors, regex selectors, trigger data, owner fields, and subscriber data must continue to round-trip through the public models. Do not expose webhook secrets when building an API model; existing redaction behavior remains required.

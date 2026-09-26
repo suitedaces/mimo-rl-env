@@ -1,0 +1,270 @@
+diff --git a/pkg/csi/service/wcp/controller_snapshot_test.go b/pkg/csi/service/wcp/controller_snapshot_test.go
+new file mode 100644
+index 00000000..03ac6b06
+--- /dev/null
++++ b/pkg/csi/service/wcp/controller_snapshot_test.go
+@@ -0,0 +1,239 @@
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++package wcp
++
++import (
++	"strings"
++	"testing"
++
++	"github.com/container-storage-interface/spec/lib/go/csi"
++	"github.com/google/uuid"
++	"github.com/vmware/govmomi/pbm"
++	"google.golang.org/grpc/codes"
++	"google.golang.org/grpc/status"
++
++	"sigs.k8s.io/vsphere-csi-driver/v2/pkg/csi/service/common"
++)
++
++
++
++func createBlockVolumeForSnapshotTest(t *testing.T, ct *controllerTest) (string, func()) {
++	params := make(map[string]string)
++	storagePolicyName := "vSAN Default Storage Policy"
++	pc, err := pbm.NewClient(ctx, ct.vcenter.Client.Client)
++	if err != nil {
++		t.Fatal(err)
++	}
++	profileID, err := pc.ProfileIDByName(ctx, storagePolicyName)
++	if err != nil {
++		t.Fatal(err)
++	}
++	params[common.AttributeStoragePolicyID] = profileID
++
++	capabilities := []*csi.VolumeCapability{
++		{
++			AccessMode: &csi.VolumeCapability_AccessMode{
++				Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER,
++			},
++		},
++	}
++	reqCreate := &csi.CreateVolumeRequest{
++		Name: testVolumeName + "-" + uuid.New().String(),
++		CapacityRange: &csi.CapacityRange{
++			RequiredBytes: 1 * common.GbInBytes,
++		},
++		Parameters:         params,
++		VolumeCapabilities: capabilities,
++		AccessibilityRequirements: &csi.TopologyRequirement{
++			Requisite: []*csi.Topology{},
++			Preferred: []*csi.Topology{},
++		},
++	}
++
++	getCandidateDatastores = getFakeDatastores
++	respCreate, err := ct.controller.CreateVolume(ctx, reqCreate)
++	if err != nil {
++		t.Fatal(err)
++	}
++	volID := respCreate.Volume.VolumeId
++
++	cleanup := func() {
++		_, err := ct.controller.DeleteVolume(ctx, &csi.DeleteVolumeRequest{VolumeId: volID})
++		if err != nil {
++			t.Logf("failed to cleanup volume %s: %v", volID, err)
++		}
++	}
++	return volID, cleanup
++}
++
++
++
++func TestWCPCreateDeleteSnapshotLifecycle(t *testing.T) {
++	ct := getControllerTest(t)
++	ct.config.Snapshot.GlobalMaxSnapshotsPerBlockVolume = 3
++
++	volID, cleanup := createBlockVolumeForSnapshotTest(t, ct)
++	defer cleanup()
++
++	reqCreateSnapshot := &csi.CreateSnapshotRequest{
++		SourceVolumeId: volID,
++		Name:           "snapshot-" + uuid.New().String(),
++	}
++	respCreateSnapshot, err := ct.controller.CreateSnapshot(ctx, reqCreateSnapshot)
++	if err != nil {
++		t.Fatalf("CreateSnapshot failed: %v", err)
++	}
++	if respCreateSnapshot == nil || respCreateSnapshot.Snapshot == nil {
++		t.Fatalf("CreateSnapshot returned an empty response")
++	}
++	snap := respCreateSnapshot.Snapshot
++
++
++	if !strings.HasPrefix(snap.SnapshotId, volID+common.VSphereCSISnapshotIdDelimiter) {
++		t.Fatalf("unexpected SnapshotId %q, expected it to start with %q",
++			snap.SnapshotId, volID+common.VSphereCSISnapshotIdDelimiter)
++	}
++	parsedVolID, parsedSnapID, err := common.ParseCSISnapshotID(snap.SnapshotId)
++	if err != nil {
++		t.Fatalf("returned SnapshotId %q is not parseable: %v", snap.SnapshotId, err)
++	}
++	if parsedVolID != volID {
++		t.Fatalf("SnapshotId encodes volume %q, expected %q", parsedVolID, volID)
++	}
++	if parsedSnapID == "" {
++		t.Fatalf("SnapshotId %q does not contain a CNS snapshot id", snap.SnapshotId)
++	}
++
++	if snap.SourceVolumeId != volID {
++		t.Fatalf("SourceVolumeId = %q, expected %q", snap.SourceVolumeId, volID)
++	}
++	if snap.SizeBytes != 1*common.GbInBytes {
++		t.Fatalf("snapshot SizeBytes = %d, expected %d", snap.SizeBytes, 1*common.GbInBytes)
++	}
++	if !snap.ReadyToUse {
++		t.Fatalf("snapshot ReadyToUse = false, expected true")
++	}
++	if snap.CreationTime == nil {
++		t.Fatalf("snapshot CreationTime is nil")
++	}
++
++
++	snapList, _, err := common.QueryVolumeSnapshotsByVolumeID(ctx, ct.controller.manager.VolumeManager,
++		volID, common.QuerySnapshotLimit)
++	if err != nil {
++		t.Fatalf("failed to query snapshots for volume %s: %v", volID, err)
++	}
++	if len(snapList) != 1 {
++		t.Fatalf("expected 1 snapshot on volume %s, found %d", volID, len(snapList))
++	}
++
++
++	respDeleteSnapshot, err := ct.controller.DeleteSnapshot(ctx,
++		&csi.DeleteSnapshotRequest{SnapshotId: snap.SnapshotId})
++	if err != nil {
++		t.Fatalf("DeleteSnapshot failed: %v", err)
++	}
++	if respDeleteSnapshot == nil {
++		t.Fatalf("DeleteSnapshot returned a nil response")
++	}
++
++
++	snapList, _, err = common.QueryVolumeSnapshotsByVolumeID(ctx, ct.controller.manager.VolumeManager,
++		volID, common.QuerySnapshotLimit)
++	if err != nil {
++		t.Fatalf("failed to query snapshots for volume %s after deletion: %v", volID, err)
++	}
++	if len(snapList) != 0 {
++		t.Fatalf("expected 0 snapshots on volume %s after deletion, found %d", volID, len(snapList))
++	}
++}
++
++
++
++func TestWCPCreateSnapshotValidation(t *testing.T) {
++	ct := getControllerTest(t)
++	ct.config.Snapshot.GlobalMaxSnapshotsPerBlockVolume = 3
++
++
++	if _, err := ct.controller.CreateSnapshot(ctx, &csi.CreateSnapshotRequest{
++		Name: "snapshot-" + uuid.New().String(),
++	}); err == nil {
++		t.Fatalf("expected error for CreateSnapshot without a source volume id")
++	}
++
++
++	volID, cleanup := createBlockVolumeForSnapshotTest(t, ct)
++	defer cleanup()
++	if _, err := ct.controller.CreateSnapshot(ctx, &csi.CreateSnapshotRequest{
++		SourceVolumeId: volID,
++	}); err == nil {
++		t.Fatalf("expected error for CreateSnapshot without a snapshot name")
++	}
++}
++
++
++
++func TestWCPCreateSnapshotMigratedVolume(t *testing.T) {
++	ct := getControllerTest(t)
++	ct.config.Snapshot.GlobalMaxSnapshotsPerBlockVolume = 3
++
++	_, err := ct.controller.CreateSnapshot(ctx, &csi.CreateSnapshotRequest{
++		SourceVolumeId: "[datastore] path/volume.vmdk",
++		Name:           "snapshot-" + uuid.New().String(),
++	})
++	if err == nil {
++		t.Fatalf("expected error when snapshotting a migrated vSphere volume")
++	}
++	if status.Code(err) != codes.Unimplemented {
++		t.Fatalf("expected Unimplemented for migrated vSphere volume, got %v", status.Code(err))
++	}
++}
++
++
++
++func TestWCPCreateSnapshotMaxLimit(t *testing.T) {
++	ct := getControllerTest(t)
++	ct.config.Snapshot.GlobalMaxSnapshotsPerBlockVolume = 1
++
++	volID, cleanup := createBlockVolumeForSnapshotTest(t, ct)
++	defer cleanup()
++
++
++	respCreateSnapshot, err := ct.controller.CreateSnapshot(ctx, &csi.CreateSnapshotRequest{
++		SourceVolumeId: volID,
++		Name:           "snapshot-" + uuid.New().String(),
++	})
++	if err != nil {
++		t.Fatalf("first CreateSnapshot failed: %v", err)
++	}
++	firstSnapID := respCreateSnapshot.Snapshot.SnapshotId
++	defer func() {
++		_, _ = ct.controller.DeleteSnapshot(ctx, &csi.DeleteSnapshotRequest{SnapshotId: firstSnapID})
++	}()
++
++
++	_, err = ct.controller.CreateSnapshot(ctx, &csi.CreateSnapshotRequest{
++		SourceVolumeId: volID,
++		Name:           "snapshot-" + uuid.New().String(),
++	})
++	if err == nil {
++		t.Fatalf("expected error when exceeding the maximum number of snapshots per volume")
++	}
++	if status.Code(err) != codes.FailedPrecondition {
++		t.Fatalf("expected FailedPrecondition when exceeding the snapshot maximum, got %v", status.Code(err))
++	}
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,20 @@
++#!/usr/bin/env bash
++
++
++
++
++set -euo pipefail
++HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++cd /testbed
++
++
++
++
++
++
++
++
++go test ./pkg/csi/service/wcp/ -run 'TestWCPCreateVolumeWithStoragePolicy|TestWCPCreateVolumeWithZonalLabelPresentButNoStorageTopoType' -count=1
++
++
++go test ./pkg/csi/service/wcp/ -run 'TestWCPCreateDeleteSnapshotLifecycle|TestWCPCreateSnapshotValidation|TestWCPCreateSnapshotMigratedVolume|TestWCPCreateSnapshotMaxLimit' -count=1

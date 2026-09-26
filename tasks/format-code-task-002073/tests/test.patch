@@ -1,0 +1,536 @@
+diff --git a/pkg/apis/numaflow/v1alpha1/serving_source_podspec_fixture_test.go b/pkg/apis/numaflow/v1alpha1/serving_source_podspec_fixture_test.go
+new file mode 100644
+index 000000000..ff49f69ee
+--- /dev/null
++++ b/pkg/apis/numaflow/v1alpha1/serving_source_podspec_fixture_test.go
+@@ -0,0 +1,343 @@
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++package v1alpha1
++
++import (
++	"encoding/base64"
++	"encoding/json"
++	"strconv"
++	"testing"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++	corev1 "k8s.io/api/core/v1"
++	resource "k8s.io/apimachinery/pkg/api/resource"
++	"k8s.io/apimachinery/pkg/util/intstr"
++)
++
++func fixtureEnvByName(c corev1.Container, name string) (corev1.EnvVar, bool) {
++	for _, env := range c.Env {
++		if env.Name == name {
++			return env, true
++		}
++	}
++	return corev1.EnvVar{}, false
++}
++
++func fixtureContainerByName(containers []corev1.Container, name string) (corev1.Container, bool) {
++	for _, c := range containers {
++		if c.Name == name {
++			return c, true
++		}
++	}
++	return corev1.Container{}, false
++}
++
++func fixtureHasServingProbe(c corev1.Container) bool {
++	probes := []*corev1.Probe{c.LivenessProbe, c.ReadinessProbe, c.StartupProbe}
++	for _, p := range probes {
++		if p == nil || p.HTTPGet == nil {
++			continue
++		}
++		if (p.HTTPGet.Path == "/readyz" || p.HTTPGet.Path == "/livez") &&
++			p.HTTPGet.Scheme == corev1.URISchemeHTTPS &&
++			p.HTTPGet.Port == intstr.FromInt32(VertexHTTPSPort) {
++			return true
++		}
++	}
++	return false
++}
++
++func fixtureServingSource() *ServingSource {
++	url := "redis://redis:6379"
++	return &ServingSource{
++		Store: &ServingStore{URL: &url},
++	}
++}
++
++func fixtureVertexPodSpecReq() *GetVertexPodSpecReq {
++	return &GetVertexPodSpecReq{
++		ISBSvcType: ISBSvcTypeRedis,
++		Image:      testFlowImage,
++		PullPolicy: corev1.PullIfNotPresent,
++		Env:        []corev1.EnvVar{{Name: "fixture-env", Value: "fixture-val"}},
++		DefaultResources: corev1.ResourceRequirements{
++			Requests: corev1.ResourceList{
++				corev1.ResourceCPU:    resource.MustParse("100m"),
++				corev1.ResourceMemory: resource.MustParse("100Mi"),
++			},
++			Limits: corev1.ResourceList{},
++		},
++	}
++}
++
++func fixtureServingPodSpec(t *testing.T, vertexName string, req *GetVertexPodSpecReq, vertices []AbstractVertex, edges []Edge) *corev1.PodSpec {
++	t.Helper()
++
++	vtx := testVertex.DeepCopy()
++	vtx.Spec.Name = vertexName
++	vtx.Spec.Source = &Source{Serving: fixtureServingSource()}
++	vtx.Spec.UDF = nil
++	vtx.Spec.Sink = nil
++
++	reqCopy := req.DeepCopy()
++	reqCopy.PipelineSpec.Vertices = vertices
++	reqCopy.PipelineSpec.Edges = edges
++
++	spec, err := vtx.GetPodSpec(*reqCopy)
++	require.NoError(t, err)
++	require.NotNil(t, spec)
++	return spec
++}
++
++func TestServingSourcePodSpecUsesMainContainerOnlyForServing(t *testing.T) {
++	spec := fixtureServingPodSpec(
++		t,
++		"serving-main-only",
++		fixtureVertexPodSpecReq(),
++		[]AbstractVertex{
++			{Name: "serving-main-only", Source: &Source{Serving: fixtureServingSource()}},
++			{Name: "log-sink", Sink: &Sink{}},
++		},
++		[]Edge{{From: "serving-main-only", To: "log-sink"}},
++	)
++
++	main, ok := fixtureContainerByName(spec.Containers, CtrMain)
++	require.True(t, ok, "main Numaflow container should be present")
++	assert.NotEmpty(t, main.Env)
++
++	_, hasNamedServingSidecar := fixtureContainerByName(spec.Containers, ServingSourceContainer)
++	assert.False(t, hasNamedServingSidecar, "serving source should not create a separate serving sidecar")
++
++	for _, c := range spec.Containers {
++		if c.Name == CtrMain {
++			continue
++		}
++		assert.NotContains(t, c.Args, "--serving", "non-main container must not run serving mode")
++		assert.False(t, fixtureHasServingProbe(c), "non-main container must not expose serving health probes")
++	}
++}
++
++func TestServingSourcePodSpecRejectsSidecarForAlternateServingInputs(t *testing.T) {
++	req := fixtureVertexPodSpecReq()
++	req.Env = []corev1.EnvVar{{Name: "controller-env", Value: "controller-val"}}
++
++	spec := fixtureServingPodSpec(
++		t,
++		"alternate-serving-main",
++		req,
++		[]AbstractVertex{
++			{Name: "alternate-serving-main", Source: &Source{Serving: fixtureServingSource()}},
++			{Name: "alternate-sink", Sink: &Sink{}},
++		},
++		[]Edge{{From: "alternate-serving-main", To: "alternate-sink"}},
++	)
++
++	require.Len(t, spec.Containers, 1, "a simple serving source pod should only have the main container")
++	assert.Equal(t, CtrMain, spec.Containers[0].Name)
++	assert.NotContains(t, spec.Containers[0].Args, "--serving")
++	assert.False(t, fixtureHasServingProbe(spec.Containers[0]), "main container should not be configured as the removed serving sidecar")
++}
++
++func TestServingSourceMainContainerHasServingRuntimeEnv(t *testing.T) {
++	spec := fixtureServingPodSpec(
++		t,
++		"edge-http-in",
++		fixtureVertexPodSpecReq(),
++		[]AbstractVertex{
++			{Name: "edge-http-in", Source: &Source{Serving: fixtureServingSource()}},
++			{Name: "map-a", UDF: &UDF{}},
++			{Name: "sink-a", Sink: &Sink{}},
++		},
++		[]Edge{
++			{From: "edge-http-in", To: "map-a"},
++			{From: "map-a", To: "sink-a"},
++		},
++	)
++
++	main, ok := fixtureContainerByName(spec.Containers, CtrMain)
++	require.True(t, ok)
++
++	minSpecEnv, ok := fixtureEnvByName(main, EnvServingMinPipelineSpec)
++	require.True(t, ok, "main container should receive minimal pipeline spec")
++	require.NotEmpty(t, minSpecEnv.Value)
++	decoded, err := base64.StdEncoding.DecodeString(minSpecEnv.Value)
++	require.NoError(t, err)
++	var decodedSpec PipelineSpec
++	require.NoError(t, json.Unmarshal(decoded, &decodedSpec))
++	require.Len(t, decodedSpec.Vertices, 3)
++	assert.Equal(t, "edge-http-in", decodedSpec.Vertices[0].Name)
++	assert.Equal(t, "map-a", decodedSpec.Vertices[1].Name)
++	require.Len(t, decodedSpec.Edges, 2)
++	assert.Equal(t, "edge-http-in", decodedSpec.Edges[0].From)
++	assert.Equal(t, "map-a", decodedSpec.Edges[0].To)
++	assert.Equal(t, "map-a", decodedSpec.Edges[1].From)
++	assert.Equal(t, "sink-a", decodedSpec.Edges[1].To)
++
++	portEnv, ok := fixtureEnvByName(main, EnvServingPort)
++	require.True(t, ok, "main container should receive serving listen port")
++	assert.Equal(t, strconv.Itoa(VertexHTTPSPort), portEnv.Value)
++	assert.Nil(t, portEnv.ValueFrom)
++
++	hostIPEnv, ok := fixtureEnvByName(main, EnvServingHostIP)
++	require.True(t, ok, "main container should receive pod IP source")
++	require.NotNil(t, hostIPEnv.ValueFrom)
++	require.NotNil(t, hostIPEnv.ValueFrom.FieldRef)
++	assert.Equal(t, "status.podIP", hostIPEnv.ValueFrom.FieldRef.FieldPath)
++}
++
++func TestServingSourceMainContainerRuntimeEnvForSingleEdgePipeline(t *testing.T) {
++	spec := fixtureServingPodSpec(
++		t,
++		"single-edge-serving",
++		fixtureVertexPodSpecReq(),
++		[]AbstractVertex{
++			{Name: "single-edge-serving", Source: &Source{Serving: fixtureServingSource()}},
++			{Name: "single-edge-sink", Sink: &Sink{}},
++		},
++		[]Edge{{From: "single-edge-serving", To: "single-edge-sink"}},
++	)
++
++	main, ok := fixtureContainerByName(spec.Containers, CtrMain)
++	require.True(t, ok)
++
++	minSpecEnv, ok := fixtureEnvByName(main, EnvServingMinPipelineSpec)
++	require.True(t, ok, "main container should receive minimal pipeline spec for every serving source shape")
++	decoded, err := base64.StdEncoding.DecodeString(minSpecEnv.Value)
++	require.NoError(t, err)
++	var decodedSpec PipelineSpec
++	require.NoError(t, json.Unmarshal(decoded, &decodedSpec))
++	require.Len(t, decodedSpec.Vertices, 2)
++	assert.Equal(t, "single-edge-serving", decodedSpec.Vertices[0].Name)
++	assert.Equal(t, "single-edge-sink", decodedSpec.Vertices[1].Name)
++	require.Len(t, decodedSpec.Edges, 1)
++	assert.Equal(t, "single-edge-serving", decodedSpec.Edges[0].From)
++	assert.Equal(t, "single-edge-sink", decodedSpec.Edges[0].To)
++
++	portEnv, ok := fixtureEnvByName(main, EnvServingPort)
++	require.True(t, ok)
++	assert.Equal(t, strconv.Itoa(VertexHTTPSPort), portEnv.Value)
++	assert.Nil(t, portEnv.ValueFrom)
++
++	hostIPEnv, ok := fixtureEnvByName(main, EnvServingHostIP)
++	require.True(t, ok)
++	require.NotNil(t, hostIPEnv.ValueFrom)
++	require.NotNil(t, hostIPEnv.ValueFrom.FieldRef)
++	assert.Equal(t, "status.podIP", hostIPEnv.ValueFrom.FieldRef.FieldPath)
++}
++
++func TestCallbackEnvOnlyForPipelinesWithServingSource(t *testing.T) {
++	servingPipelineReq := fixtureVertexPodSpecReq()
++	servingPipelineReq.PipelineSpec.Vertices = []AbstractVertex{
++		{Name: "callback-serving-in", Source: &Source{Serving: fixtureServingSource()}},
++		{Name: "callback-map", UDF: &UDF{}},
++		{Name: "callback-sink", Sink: &Sink{}},
++	}
++	servingPipelineReq.PipelineSpec.Edges = []Edge{
++		{From: "callback-serving-in", To: "callback-map"},
++		{From: "callback-map", To: "callback-sink"},
++	}
++
++	for _, vtx := range []Vertex{
++		func() Vertex {
++			v := *testVertex.DeepCopy()
++			v.Spec.Name = "callback-serving-in"
++			v.Spec.Source = &Source{Serving: fixtureServingSource()}
++			v.Spec.UDF = nil
++			v.Spec.Sink = nil
++			return v
++		}(),
++		func() Vertex {
++			v := *testVertex.DeepCopy()
++			v.Spec.Name = "callback-map"
++			v.Spec.Source = nil
++			v.Spec.UDF = &UDF{Builtin: &Function{Name: "cat"}}
++			v.Spec.Sink = nil
++			return v
++		}(),
++	} {
++		spec, err := vtx.GetPodSpec(*servingPipelineReq)
++		require.NoError(t, err)
++		main, ok := fixtureContainerByName(spec.Containers, CtrMain)
++		require.True(t, ok)
++
++		callbackEnabled, ok := fixtureEnvByName(main, EnvCallbackEnabled)
++		require.True(t, ok, "all vertices in a serving-source pipeline should have callback enabled")
++		enabled, err := strconv.ParseBool(callbackEnabled.Value)
++		require.NoError(t, err)
++		assert.True(t, enabled)
++		assert.Nil(t, callbackEnabled.ValueFrom, "callback enabled should not be annotation-sourced")
++
++		_, hasCallbackURL := fixtureEnvByName(main, EnvCallbackURL)
++		assert.False(t, hasCallbackURL, "callback URL env should not be injected")
++	}
++
++	nonServingVtx := testVertex.DeepCopy()
++	nonServingVtx.Spec.Name = "plain-source"
++	nonServingVtx.Spec.Source = &Source{}
++	nonServingVtx.Spec.UDF = nil
++	nonServingVtx.Spec.Sink = nil
++	nonServingReq := fixtureVertexPodSpecReq()
++	nonServingReq.PipelineSpec.Vertices = []AbstractVertex{
++		{Name: "plain-source", Source: &Source{}},
++		{Name: "plain-sink", Sink: &Sink{}},
++	}
++	nonServingReq.PipelineSpec.Edges = []Edge{{From: "plain-source", To: "plain-sink"}}
++
++	spec, err := nonServingVtx.GetPodSpec(*nonServingReq)
++	require.NoError(t, err)
++	main, ok := fixtureContainerByName(spec.Containers, CtrMain)
++	require.True(t, ok)
++	_, hasCallbackEnabled := fixtureEnvByName(main, EnvCallbackEnabled)
++	assert.False(t, hasCallbackEnabled, "pipelines without a serving source should not receive callback enabled env")
++	_, hasCallbackURL := fixtureEnvByName(main, EnvCallbackURL)
++	assert.False(t, hasCallbackURL, "pipelines without a serving source should not receive callback URL env")
++}
++
++func TestCallbackEnvEnabledForSinkInServingPipeline(t *testing.T) {
++	servingPipelineReq := fixtureVertexPodSpecReq()
++	servingPipelineReq.PipelineSpec.Vertices = []AbstractVertex{
++		{Name: "orders-http", Source: &Source{Serving: fixtureServingSource()}},
++		{Name: "orders-map", UDF: &UDF{Builtin: &Function{Name: "cat"}}},
++		{Name: "orders-sink", Sink: &Sink{}},
++	}
++	servingPipelineReq.PipelineSpec.Edges = []Edge{
++		{From: "orders-http", To: "orders-map"},
++		{From: "orders-map", To: "orders-sink"},
++	}
++
++	sinkVtx := testVertex.DeepCopy()
++	sinkVtx.Spec.Name = "orders-sink"
++	sinkVtx.Spec.Source = nil
++	sinkVtx.Spec.UDF = nil
++	sinkVtx.Spec.Sink = &Sink{}
++
++	spec, err := sinkVtx.GetPodSpec(*servingPipelineReq)
++	require.NoError(t, err)
++	main, ok := fixtureContainerByName(spec.Containers, CtrMain)
++	require.True(t, ok)
++
++	callbackEnabled, ok := fixtureEnvByName(main, EnvCallbackEnabled)
++	require.True(t, ok, "sink vertices in a serving-source pipeline should have callback enabled")
++	enabled, err := strconv.ParseBool(callbackEnabled.Value)
++	require.NoError(t, err)
++	assert.True(t, enabled)
++	assert.Nil(t, callbackEnabled.ValueFrom, "callback enabled should not be annotation-sourced")
++
++	_, hasCallbackURL := fixtureEnvByName(main, EnvCallbackURL)
++	assert.False(t, hasCallbackURL, "callback URL env should not be injected")
++}
+diff --git a/pkg/reconciler/validator/serving_source_reduce_fixture_test.go b/pkg/reconciler/validator/serving_source_reduce_fixture_test.go
+new file mode 100644
+index 000000000..5bc0572d9
+--- /dev/null
++++ b/pkg/reconciler/validator/serving_source_reduce_fixture_test.go
+@@ -0,0 +1,156 @@
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++package validator
++
++import (
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++	corev1 "k8s.io/api/core/v1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++
++	dfv1 "github.com/numaproj/numaflow/pkg/apis/numaflow/v1alpha1"
++)
++
++func fixturePipelineWithVertices(vertices []dfv1.AbstractVertex, edges []dfv1.Edge) *dfv1.Pipeline {
++	pl := testPipeline.DeepCopy()
++	pl.Spec.Vertices = vertices
++	pl.Spec.Edges = edges
++	return pl
++}
++
++func fixtureReduceUDF() *dfv1.UDF {
++	return &dfv1.UDF{
++		Container: &dfv1.Container{Image: "my-image"},
++		GroupBy: &dfv1.GroupBy{
++			Window: dfv1.Window{
++				Fixed: &dfv1.FixedWindow{
++					Length: &metav1.Duration{Duration: time.Minute},
++				},
++			},
++			Keyed: true,
++			Storage: &dfv1.PBQStorage{
++				EmptyDir: &corev1.EmptyDirVolumeSource{},
++			},
++		},
++	}
++}
++
++func fixtureServingSource() *dfv1.ServingSource {
++	url := "redis://redis:6379"
++	return &dfv1.ServingSource{
++		Store: &dfv1.ServingStore{URL: &url},
++	}
++}
++
++func TestValidatePipelineRejectsServingSourceWithReduce(t *testing.T) {
++	cases := []struct {
++		name       string
++		serving    string
++		reduce     string
++		throughMap string
++	}{
++		{
++			name:       "direct names",
++			serving:    "serving-in",
++			reduce:     "reduce-vtx",
++			throughMap: "map-before-reduce",
++		},
++		{
++			name:       "different names to prevent hardcoding",
++			serving:    "http-in",
++			reduce:     "aggregate",
++			throughMap: "normalize",
++		},
++	}
++
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			pl := fixturePipelineWithVertices(
++				[]dfv1.AbstractVertex{
++					{Name: tc.serving, Source: &dfv1.Source{Serving: fixtureServingSource()}},
++					{Name: tc.throughMap, UDF: &dfv1.UDF{Builtin: &dfv1.Function{Name: "cat"}}},
++					{Name: tc.reduce, UDF: fixtureReduceUDF()},
++					{Name: "out", Sink: &dfv1.Sink{}},
++				},
++				[]dfv1.Edge{
++					{From: tc.serving, To: tc.throughMap},
++					{From: tc.throughMap, To: tc.reduce},
++					{From: tc.reduce, To: "out"},
++				},
++			)
++
++			err := ValidatePipeline(pl)
++			require.Error(t, err)
++		})
++	}
++}
++
++func TestValidatePipelineRejectsServingReduceWhenServingSourceIsNotFirstOrTwoHop(t *testing.T) {
++	pl := fixturePipelineWithVertices(
++		[]dfv1.AbstractVertex{
++			{Name: "plain-source", Source: &dfv1.Source{}},
++			{Name: "late-source", Source: &dfv1.Source{Serving: fixtureServingSource()}},
++			{Name: "direct-reduce", UDF: fixtureReduceUDF()},
++			{Name: "joined-sink", Sink: &dfv1.Sink{}},
++		},
++		[]dfv1.Edge{
++			{From: "plain-source", To: "direct-reduce"},
++			{From: "late-source", To: "direct-reduce"},
++			{From: "direct-reduce", To: "joined-sink"},
++		},
++	)
++
++	err := ValidatePipeline(pl)
++	require.Error(t, err)
++}
++
++func TestValidatePipelineAllowsServingWithoutReduceAndReduceWithoutServing(t *testing.T) {
++	t.Run("serving source without reduce remains valid", func(t *testing.T) {
++		pl := fixturePipelineWithVertices(
++			[]dfv1.AbstractVertex{
++				{Name: "serving-ok", Source: &dfv1.Source{Serving: fixtureServingSource()}},
++				{Name: "map-ok", UDF: &dfv1.UDF{Builtin: &dfv1.Function{Name: "cat"}}},
++				{Name: "sink-ok", Sink: &dfv1.Sink{}},
++			},
++			[]dfv1.Edge{
++				{From: "serving-ok", To: "map-ok"},
++				{From: "map-ok", To: "sink-ok"},
++			},
++		)
++
++		assert.NoError(t, ValidatePipeline(pl))
++	})
++
++	t.Run("reduce without serving source remains valid", func(t *testing.T) {
++		pl := fixturePipelineWithVertices(
++			[]dfv1.AbstractVertex{
++				{Name: "input-ok", Source: &dfv1.Source{}},
++				{Name: "reduce-ok", UDF: fixtureReduceUDF()},
++				{Name: "sink-ok", Sink: &dfv1.Sink{}},
++			},
++			[]dfv1.Edge{
++				{From: "input-ok", To: "reduce-ok"},
++				{From: "reduce-ok", To: "sink-ok"},
++			},
++		)
++
++		assert.NoError(t, ValidatePipeline(pl))
++	})
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,20 @@
++#!/bin/bash
++set -uo pipefail
++
++cd /testbed
++set -e
++
++case "${1:-}" in
++  base)
++    go test ./pkg/reconciler/validator/ -count=1 -run 'TestValidateInterStepBuffer|TestValidateMonoVertex|TestValidatePipeline|TestValidateReducePipeline|TestValidateVertex|TestValidateUDF|Test_validateSideInputs|Test_getCyclesFromVertex|Test_validateCycles|Test_validateIdleSource|TestValidateSink|TestIsValidSinkRetryStrategy' -v
++    go test ./pkg/apis/numaflow/v1alpha1/ -count=1 -run 'TestOwnedBuffers|TestOwnedBuffersSource|TestGetFromBuckets|TestGetToBuffers|TestGetToBuffersSink|TestWithoutReplicas|TestGetVertexReplicas|TestGetHeadlessSvcSpec|TestGetServiceObjs|TestGetHeadlessServiceName|Test_getType|TestVertexMarkPhase|TestVertexMarkPhaseRunning|TestVertexMarkPhaseFailed|Test_VertexMarkPodNotHealthy|Test_VertexMarkPodHealthy|Test_VertexMarkDeployed|Test_VertexMarkDeployFailed|TestGetPipelineSpec|TestUpdateVertexCondition' -v
++    ;;
++  new)
++    go test ./pkg/apis/numaflow/v1alpha1/ -count=1 -run 'TestServingSourcePodSpecUsesMainContainerOnlyForServing|TestServingSourcePodSpecRejectsSidecarForAlternateServingInputs|TestServingSourceMainContainerHasServingRuntimeEnv|TestServingSourceMainContainerRuntimeEnvForSingleEdgePipeline|TestCallbackEnvOnlyForPipelinesWithServingSource|TestCallbackEnvEnabledForSinkInServingPipeline' -v
++    go test ./pkg/reconciler/validator/ -count=1 -run 'TestValidatePipelineRejectsServingSourceWithReduce|TestValidatePipelineRejectsServingReduceWhenServingSourceIsNotFirstOrTwoHop|TestValidatePipelineAllowsServingWithoutReduceAndReduceWithoutServing' -v
++    ;;
++  *)
++    echo "usage: $0 base|new"
++    exit 2
++    ;;
++esac

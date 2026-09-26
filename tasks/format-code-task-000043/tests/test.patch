@@ -1,0 +1,217 @@
+diff --git a/test/data/dataset/test_dataframe_upload.py b/test/data/dataset/test_dataframe_upload.py
+new file mode 100644
+index 00000000..f0ce5690
+--- /dev/null
++++ b/test/data/dataset/test_dataframe_upload.py
+@@ -0,0 +1,190 @@
++# -*- coding: utf-8 -*-
++
++
++
++
++
++
++
++import unittest
++import pandas as pd
++
++from cartoframes.data import Dataset, StrategiesRegistry
++from cartoframes.data.dataset.registry.base_dataset import BaseDataset
++from cartoframes.lib import context
++
++
++class CapturingContext():
++
++
++    def __init__(self):
++        self.copy_query = None
++        self.copy_data = None
++        self.long_running_query = None
++
++    def upload(self, query, data):
++        self.copy_query = query
++        self.copy_data = list(data)
++
++    def execute_query(self, query, **kwargs):
++        return {'rows': [{'current_schema': 'public'}]}
++
++    def execute_long_running_query(self, query):
++        self.long_running_query = query
++
++    def get_schema(self):
++        return 'public'
++
++
++class TestDataFrameUpload(unittest.TestCase):
++    def setUp(self):
++        self._capture = CapturingContext()
++        self._original_create_context = context.create_context
++        context.create_context = lambda credentials: self._capture
++
++        self._original_exists = BaseDataset.exists
++        BaseDataset.exists = lambda instance: False
++
++    def tearDown(self):
++        context.create_context = self._original_create_context
++        BaseDataset.exists = self._original_exists
++        StrategiesRegistry.instance = None
++
++    def _upload(self, df, **kwargs):
++        kwargs.setdefault('table_name', 'fake_table')
++        kwargs.setdefault('credentials', 'fake')
++        Dataset(df).upload(**kwargs)
++        return self._capture
++
++
++
++    def test_cartodb_id_and_the_geom_are_both_kept(self):
++        df = pd.DataFrame.from_dict({'cartodb_id': [1], 'the_geom': ['POINT (1 1)']})
++        cap = self._upload(df)
++
++        self.assertEqual(
++            cap.copy_query,
++            "COPY fake_table(cartodb_id,the_geom) FROM stdin WITH (FORMAT csv, DELIMITER '|');")
++        self.assertEqual(cap.copy_data, [b'1|SRID=4326;POINT (1 1)\n'])
++
++    def test_create_table_has_no_dangling_comma(self):
++        df = pd.DataFrame.from_dict({'cartodb_id': [1], 'the_geom': ['POINT (1 1)']})
++        cap = self._upload(df)
++
++        self.assertIn(
++            'CREATE TABLE fake_table (cartodb_id bigint, the_geom geometry(Point, 4326))',
++            cap.long_running_query)
++        self.assertNotIn('(,', cap.long_running_query)
++
++    def test_single_geometry_column_is_renamed_to_the_geom(self):
++        df = pd.DataFrame([['POINT (1 1)']], columns=['geom'])
++        cap = self._upload(df)
++
++        self.assertEqual(
++            cap.copy_query,
++            "COPY fake_table(the_geom) FROM stdin WITH (FORMAT csv, DELIMITER '|');")
++        self.assertEqual(cap.copy_data, [b'SRID=4326;POINT (1 1)\n'])
++
++    def test_several_geometry_columns_prioritize_the_geom(self):
++        df = pd.DataFrame([['POINT (0 0)', 'POINT (1 1)', 'POINT (2 2)']],
++                          columns=['geom', 'the_geom', 'geometry'])
++        cap = self._upload(df)
++
++        self.assertEqual(
++            cap.copy_query,
++            "COPY fake_table(geom,the_geom,geometry) FROM stdin WITH (FORMAT csv, DELIMITER '|');")
++        self.assertEqual(cap.copy_data, [b'POINT (0 0)|SRID=4326;POINT (1 1)|POINT (2 2)\n'])
++
++    def test_the_geom_webmercator_is_dropped(self):
++        df = pd.DataFrame([[1, 'POINT (1 1)', 'fake']],
++                          columns=['cartodb_id', 'the_geom', 'the_geom_webmercator'])
++        cap = self._upload(df)
++
++        self.assertEqual(
++            cap.copy_query,
++            "COPY fake_table(cartodb_id,the_geom) FROM stdin WITH (FORMAT csv, DELIMITER '|');")
++        self.assertEqual(cap.copy_data, [b'1|SRID=4326;POINT (1 1)\n'])
++
++    def test_ordinary_columns_without_geometry(self):
++        df = pd.DataFrame([[1, True, 'text']], columns=['col1', 'col2', 'col3'])
++        cap = self._upload(df)
++
++        self.assertEqual(
++            cap.copy_query,
++            "COPY fake_table(col1,col2,col3) FROM stdin WITH (FORMAT csv, DELIMITER '|');")
++        self.assertEqual(cap.copy_data, [b'1|True|text\n'])
++
++    def test_column_names_are_normalized(self):
++        df = pd.DataFrame([[1]], columns=['My Column'])
++        cap = self._upload(df)
++
++        self.assertEqual(
++            cap.copy_query,
++            "COPY fake_table(my_column) FROM stdin WITH (FORMAT csv, DELIMITER '|');")
++        self.assertEqual(cap.copy_data, [b'1\n'])
++
++    def test_null_values_become_empty_fields(self):
++        df = pd.DataFrame.from_dict({'test': [None, [None, None]]})
++        cap = self._upload(df)
++
++        self.assertEqual(
++            cap.copy_query,
++            "COPY fake_table(test) FROM stdin WITH (FORMAT csv, DELIMITER '|');")
++        self.assertEqual(cap.copy_data, [b'\n', b'\n'])
++
++    def test_null_geometry_becomes_empty_field(self):
++        df = pd.DataFrame.from_dict({'test': [None], 'the_geom': [None]})
++        cap = self._upload(df)
++
++        self.assertEqual(
++            cap.copy_query,
++            "COPY fake_table(test,the_geom) FROM stdin WITH (FORMAT csv, DELIMITER '|');")
++        self.assertEqual(cap.copy_data, [b'|\n'])
++
++
++
++    def test_with_lnglat_appends_synthesized_geometry(self):
++        df = pd.DataFrame([[1, 1]], columns=['lng', 'lat'])
++        cap = self._upload(df, with_lnglat=('lng', 'lat'))
++
++        self.assertEqual(
++            cap.copy_query,
++            "COPY fake_table(lng,lat,the_geom) FROM stdin WITH (FORMAT csv, DELIMITER '|');")
++        self.assertEqual(cap.copy_data, [b'1|1|SRID=4326;POINT (1 1)\n'])
++
++    def test_with_lnglat_drops_existing_geometry(self):
++        df = pd.DataFrame([[1, 1, 'POINT (2 2)']], columns=['lng', 'lat', 'the_geom'])
++        cap = self._upload(df, with_lnglat=('lng', 'lat'))
++
++        self.assertEqual(
++            cap.copy_query,
++            "COPY fake_table(lng,lat,the_geom) FROM stdin WITH (FORMAT csv, DELIMITER '|');")
++        self.assertEqual(cap.copy_data, [b'1|1|SRID=4326;POINT (1 1)\n'])
++
++    def test_with_lnglat_synthesized_geometry_in_create_table(self):
++        df = pd.DataFrame([[1, 1]], columns=['lng', 'lat'])
++        cap = self._upload(df, with_lnglat=('lng', 'lat'))
++
++        self.assertIn(
++            'CREATE TABLE fake_table (lng bigint, lat bigint, the_geom geometry(Point, 4326))',
++            cap.long_running_query)
++
++
++
++    def test_create_table_type_mapping(self):
++        df = pd.DataFrame.from_dict({
++            'a_int': pd.Series([1], dtype='int64'),
++            'a_float': pd.Series([1.0], dtype='float64'),
++            'a_text': pd.Series(['x'], dtype='object'),
++            'a_bool': pd.Series([True], dtype='bool'),
++        })
++        cap = self._upload(df)
++
++        self.assertIn('a_int bigint', cap.long_running_query)
++        self.assertIn('a_float numeric', cap.long_running_query)
++        self.assertIn('a_text text', cap.long_running_query)
++        self.assertIn('a_bool boolean', cap.long_running_query)
++
++
++if __name__ == '__main__':
++    unittest.main()
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,16 @@
++#!/usr/bin/env bash
++
++
++
++
++set -euo pipefail
++HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++cd /testbed
++
++
++
++
++python -m pytest test/utils/test_columns.py -q
++
++
++python -m pytest test/data/dataset/test_dataframe_upload.py -q

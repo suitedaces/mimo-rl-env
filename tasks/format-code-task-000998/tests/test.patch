@@ -1,0 +1,177 @@
+diff --git a/test/unit/test_source_status_selector_contract.py b/test/unit/test_source_status_selector_contract.py
+new file mode 100644
+index 000000000..000000000
+--- /dev/null
++++ b/test/unit/test_source_status_selector_contract.py
+@@ -0,0 +1,161 @@
++import unittest
++from datetime import datetime, timezone, timedelta
++from types import SimpleNamespace
++
++from dbt.contracts.graph.manifest import Manifest
++from dbt.contracts.results import FreshnessErrorEnum
++from dbt.exceptions import InternalException, RuntimeException
++from dbt.graph.selector import NodeSelector
++from dbt.graph.selector_methods import SourceStatusSelectorMethod
++from dbt.graph.selector_spec import SelectionCriteria
++from dbt.node_types import NodeType
++
++
++SOURCE_ID = "source.root.ingest.events"
++MODEL_ID = "model.root.events_model"
++
++
++def freshness_output(unique_id, loaded_at):
++    return SimpleNamespace(unique_id=unique_id, max_loaded_at=loaded_at)
++
++
++def runtime_error(unique_id):
++    return SimpleNamespace(
++        unique_id=unique_id,
++        status=FreshnessErrorEnum.runtime_error,
++        error="warehouse unavailable",
++    )
++
++
++class TinyGraph:
++
++
++    def __init__(self, nodes):
++        self._nodes = set(nodes)
++
++    def nodes(self):
++        return set(self._nodes)
++
++    def subgraph(self, nodes):
++        return TinyGraph(nodes)
++
++    def select_children(self, selected, max_depth=None):
++        return {MODEL_ID} if SOURCE_ID in selected else set()
++
++    def select_parents(self, selected, max_depth=None):
++        return set()
++
++    def select_childrens_parents(self, selected):
++        return set()
++
++    def select_successors(self, selected):
++        return {MODEL_ID} if SOURCE_ID in selected else set()
++
++
++class SourceStatusSelectorContractTest(unittest.TestCase):
++    def setUp(self):
++        self.source = SimpleNamespace(
++            unique_id=SOURCE_ID,
++            package_name="root",
++            name="events",
++            source_name="ingest",
++            config=SimpleNamespace(enabled=True),
++            resource_type=NodeType.Source,
++        )
++        self.model = SimpleNamespace(
++            unique_id=MODEL_ID,
++            package_name="root",
++            name="events_model",
++            config=SimpleNamespace(enabled=True),
++            resource_type=NodeType.Model,
++            empty=False,
++        )
++
++    def _method(self, previous, current):
++        manifest = SimpleNamespace(
++            nodes={},
++            sources={SOURCE_ID: self.source},
++            exposures={},
++            metrics={},
++        )
++        state = SimpleNamespace(
++            sources=SimpleNamespace(results=previous),
++            sources_current=SimpleNamespace(results=current),
++        )
++        return SourceStatusSelectorMethod(manifest, state, [])
++
++    def test_new_and_strictly_newer_sources_are_fresher(self):
++        baseline = datetime(2024, 1, 1, tzinfo=timezone.utc)
++        current = baseline + timedelta(hours=1)
++        method = self._method(
++            [freshness_output("source.root.old", baseline), freshness_output(SOURCE_ID, baseline)],
++            [freshness_output(SOURCE_ID, current)],
++        )
++        self.assertEqual(list(method.search({SOURCE_ID}, "fresher")), [SOURCE_ID])
++
++        new_method = self._method([], [freshness_output(SOURCE_ID, current)])
++        self.assertEqual(list(new_method.search({SOURCE_ID}, "fresher")), [SOURCE_ID])
++
++    def test_equal_or_older_timestamp_is_not_fresher(self):
++        baseline = datetime(2024, 1, 1, tzinfo=timezone.utc)
++        for current in (baseline, baseline - timedelta(seconds=1)):
++            method = self._method(
++                [freshness_output(SOURCE_ID, baseline)],
++                [freshness_output(SOURCE_ID, current)],
++            )
++            self.assertEqual(list(method.search({SOURCE_ID}, "fresher")), [])
++
++    def test_runtime_errors_in_either_snapshot_are_excluded(self):
++        baseline = datetime(2024, 1, 1, tzinfo=timezone.utc)
++        current = baseline + timedelta(hours=1)
++
++        previous_error = self._method(
++            [runtime_error(SOURCE_ID)], [freshness_output(SOURCE_ID, current)]
++        )
++        self.assertEqual(list(previous_error.search({SOURCE_ID}, "fresher")), [])
++
++        current_error = self._method(
++            [freshness_output(SOURCE_ID, baseline)], [runtime_error(SOURCE_ID)]
++        )
++        self.assertEqual(list(current_error.search({SOURCE_ID}, "fresher")), [])
++
++    def test_fresher_plus_expands_to_downstream_nodes(self):
++        baseline = datetime(2024, 1, 1, tzinfo=timezone.utc)
++        current = baseline + timedelta(hours=1)
++        manifest = Manifest(
++            nodes={MODEL_ID: self.model},
++            sources={SOURCE_ID: self.source},
++            exposures={},
++            metrics={},
++            macros={},
++            docs={},
++        )
++        state = SimpleNamespace(
++            sources=SimpleNamespace(results=[freshness_output(SOURCE_ID, baseline)]),
++            sources_current=SimpleNamespace(results=[freshness_output(SOURCE_ID, current)]),
++        )
++        selector = NodeSelector(TinyGraph({SOURCE_ID, MODEL_ID}), manifest, state)
++        selected, indirect = selector.select_nodes(
++            SelectionCriteria.from_single_spec("source_status:fresher+")
++        )
++        self.assertEqual(selected, {SOURCE_ID, MODEL_ID})
++        self.assertEqual(indirect, set())
++
++    def test_missing_state_artifacts_raise_clear_errors(self):
++        manifest = SimpleNamespace(nodes={}, sources={SOURCE_ID: self.source}, exposures={}, metrics={})
++        no_previous = SimpleNamespace(sources=None, sources_current=SimpleNamespace(results=[]))
++        with self.assertRaises(InternalException):
++            list(SourceStatusSelectorMethod(manifest, no_previous, []).search({SOURCE_ID}, "fresher"))
++
++        no_current = SimpleNamespace(sources=SimpleNamespace(results=[]), sources_current=None)
++        with self.assertRaises(InternalException):
++            list(SourceStatusSelectorMethod(manifest, no_current, []).search({SOURCE_ID}, "fresher"))
++
++    def test_unknown_status_selector_is_rejected(self):
++        method = self._method([], [freshness_output(SOURCE_ID, datetime(2024, 1, 1, tzinfo=timezone.utc))])
++        with self.assertRaises(RuntimeException):
++            list(method.search({SOURCE_ID}, "staler"))
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,5 @@
++#!/bin/bash
++set -euo pipefail
++
++PYTHONPATH="core:.build_env/.venv/lib/python3.11/site-packages" \
++  python -m unittest -v test.unit.test_source_status_selector_contract

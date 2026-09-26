@@ -1,0 +1,441 @@
+diff --git a/codespec_transport_machine_contract_test.go b/codespec_transport_machine_contract_test.go
+new file mode 100644
+index 0000000..56fb486
+--- /dev/null
++++ b/codespec_transport_machine_contract_test.go
+@@ -0,0 +1,426 @@
++package syslog_test
++
++import (
++	"os"
++	"os/exec"
++	"path/filepath"
++	"strings"
++	"testing"
++
++	syslog "github.com/influxdata/go-syslog/v2"
++	"github.com/influxdata/go-syslog/v2/nontransparent"
++	"github.com/influxdata/go-syslog/v2/rfc5424"
++)
++
++func TestCodespecTransportMachineContract(t *testing.T) {
++	doc := exec.Command("go", "doc", ".", "WithMachine")
++	doc.Env = append(os.Environ(), "GOTOOLCHAIN=local")
++	if output, err := doc.CombinedOutput(); err != nil {
++		t.Fatalf("public syslog.WithMachine option is missing: %v\n%s", err, output)
++	}
++
++	var baseline []syslog.Result
++	parser := nontransparent.NewParser(syslog.WithListener(func(result *syslog.Result) {
++		baseline = append(baseline, *result)
++	}))
++	parser.Parse(strings.NewReader("<1>1 - - - - - - body <marker>\n"))
++	if len(baseline) != 1 || baseline[0].Error != nil {
++		t.Fatalf("embedded '<' split an LF-delimited frame: results = %#v", baseline)
++	}
++	message, ok := baseline[0].Message.(*rfc5424.SyslogMessage)
++	if !ok || message.Message == nil || *message.Message != "body <marker>" {
++		t.Fatalf("embedded '<' was not preserved in the RFC5424 payload: message = %#v", baseline[0].Message)
++	}
++
++	var reused []syslog.Result
++	reusable := nontransparent.NewParser(syslog.WithListener(func(result *syslog.Result) {
++		reused = append(reused, *result)
++	}))
++	reusable.Parse(strings.NewReader("<1>1 - - - - - - first"))
++	reusable.Parse(strings.NewReader("<2>1 - - - - - - second\n"))
++	if len(reused) != 2 || reused[1].Error != nil {
++		t.Fatalf("reusing a non-transparent parser replayed prior state: results = %#v", reused)
++	}
++	second, ok := reused[1].Message.(*rfc5424.SyslogMessage)
++	if !ok || second.Message == nil || *second.Message != "second" {
++		t.Fatalf("reused parser did not decode only the fresh stream: message = %#v", reused[1].Message)
++	}
++
++	repo, err := os.Getwd()
++	if err != nil {
++		t.Fatal(err)
++	}
++	dir, err := os.MkdirTemp(repo, "codespec_transport_contract_")
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer os.RemoveAll(dir)
++
++	source := `package contract
++
++import (
++	"errors"
++	"fmt"
++	"io"
++	"strings"
++	"testing"
++	"time"
++
++	syslog "github.com/influxdata/go-syslog/v2"
++	"github.com/influxdata/go-syslog/v2/nontransparent"
++	"github.com/influxdata/go-syslog/v2/octetcounting"
++	"github.com/influxdata/go-syslog/v2/rfc3164"
++	"github.com/influxdata/go-syslog/v2/rfc5424"
++)
++
++var errRejectedPayload = errors.New("contract decoder rejected payload")
++
++type recordingMachine struct {
++	inputs     []string
++	failOn     string
++	bestEffort bool
++}
++
++func (m *recordingMachine) Parse(input []byte) (syslog.Message, error) {
++	value := string(append([]byte(nil), input...))
++	m.inputs = append(m.inputs, value)
++	message := decodedMessage(value)
++	if value == m.failOn {
++		return message, errRejectedPayload
++	}
++	return message, nil
++}
++
++func (m *recordingMachine) WithBestEffort() {
++	m.bestEffort = true
++}
++
++func (m *recordingMachine) HasBestEffort() bool {
++	return m.bestEffort
++}
++
++func decodedMessage(value string) *rfc3164.SyslogMessage {
++	message := &rfc3164.SyslogMessage{}
++	message.ComputeFromPriority(13)
++	message.Message = &value
++	return message
++}
++
++type legacyParser struct {
++	bestEffort bool
++	listener   syslog.ParserListener
++}
++
++func (p *legacyParser) Parse(_ io.Reader) {}
++
++func (p *legacyParser) WithListener(listener syslog.ParserListener) {
++	p.listener = listener
++}
++
++func (p *legacyParser) WithBestEffort() {
++	p.bestEffort = true
++}
++
++func (p *legacyParser) HasBestEffort() bool {
++	return p.bestEffort
++}
++
++func framed(payload string) string {
++	return fmt.Sprintf("%d %s", len([]byte(payload)), payload)
++}
++
++func listenerFor(results *[]syslog.Result) syslog.ParserListener {
++	return func(result *syslog.Result) {
++		*results = append(*results, *result)
++	}
++}
++
++func requireInputs(t *testing.T, got, want []string) {
++	t.Helper()
++	if fmt.Sprint(got) != fmt.Sprint(want) {
++		t.Fatalf("machine inputs = %#v, want %#v", got, want)
++	}
++}
++
++func requireDecoded(t *testing.T, result syslog.Result, want string) {
++	t.Helper()
++	message, ok := result.Message.(*rfc3164.SyslogMessage)
++	if !ok {
++		t.Fatalf("message type = %T, want *rfc3164.SyslogMessage", result.Message)
++	}
++	if message.Message == nil || *message.Message != want {
++		t.Fatalf("decoded message = %#v, want %q", message.Message, want)
++	}
++}
++
++func TestParserInterfaceCompatibilityAndUnsupportedParser(t *testing.T) {
++	var parser syslog.Parser = &legacyParser{}
++	machine := &recordingMachine{}
++	got := syslog.WithMachine(machine)(parser)
++	if got != parser {
++		t.Fatalf("option replaced unsupported parser: got %T", got)
++	}
++	if parser.HasBestEffort() {
++		t.Fatal("WithMachine changed unsupported parser state")
++	}
++}
++
++func TestOctetCountingUsesConfiguredRFC3164Machine(t *testing.T) {
++	payloads := []string{
++		"<13>Dec  2 16:31:03 host app: first",
++		"<14>Dec  3 17:32:04 host app: cafe",
++	}
++	for _, options := range []struct {
++		name  string
++		build func(syslog.Machine, syslog.ParserListener) syslog.Parser
++	}{
++		{
++			name: "machine-before-listener",
++			build: func(machine syslog.Machine, listener syslog.ParserListener) syslog.Parser {
++				return octetcounting.NewParser(syslog.WithMachine(machine), syslog.WithListener(listener))
++			},
++		},
++		{
++			name: "machine-after-best-effort",
++			build: func(machine syslog.Machine, listener syslog.ParserListener) syslog.Parser {
++				return octetcounting.NewParser(syslog.WithListener(listener), syslog.WithBestEffort(), syslog.WithMachine(machine))
++			},
++		},
++	} {
++		t.Run(options.name, func(t *testing.T) {
++			var results []syslog.Result
++			machine := rfc3164.NewParser(rfc3164.WithYear(rfc3164.Year{YYYY: 1987}))
++			parser := options.build(machine, listenerFor(&results))
++			parser.Parse(strings.NewReader(framed(payloads[0]) + framed(payloads[1])))
++			if len(results) != 2 {
++				t.Fatalf("result count = %d, want 2: %#v", len(results), results)
++			}
++			for i, result := range results {
++				if result.Error != nil {
++					t.Fatalf("result %d error = %v", i, result.Error)
++				}
++				message, ok := result.Message.(*rfc3164.SyslogMessage)
++				if !ok {
++					t.Fatalf("result %d type = %T, want *rfc3164.SyslogMessage", i, result.Message)
++				}
++				if message.Timestamp == nil || message.Timestamp.Year() != 1987 {
++					t.Fatalf("result %d timestamp = %v, want year 1987", i, message.Timestamp)
++				}
++			}
++		})
++	}
++}
++
++func TestOctetCountingPassesExactByteCountedPayloads(t *testing.T) {
++	payloads := []string{"<13>legacy cafe", "<14>unicode: κόσμε"}
++	machine := &recordingMachine{}
++	var results []syslog.Result
++	parser := octetcounting.NewParser(
++		syslog.WithMachine(machine),
++		syslog.WithListener(listenerFor(&results)),
++	)
++	parser.Parse(strings.NewReader(framed(payloads[0]) + framed(payloads[1])))
++	requireInputs(t, machine.inputs, payloads)
++	if len(results) != len(payloads) {
++		t.Fatalf("result count = %d, want %d", len(results), len(payloads))
++	}
++	for i := range payloads {
++		requireDecoded(t, results[i], payloads[i])
++	}
++}
++
++func TestNonTransparentUsesOnlyConfiguredTrailerAsBoundary(t *testing.T) {
++	t.Run("LF with embedded less-than", func(t *testing.T) {
++		payloads := []string{"<13>body contains <marker>", "<14>second"}
++		machine := &recordingMachine{}
++		var results []syslog.Result
++		parser := nontransparent.NewParser(
++			syslog.WithListener(listenerFor(&results)),
++			syslog.WithMachine(machine),
++		)
++		parser.Parse(strings.NewReader(strings.Join(payloads, "\n") + "\n"))
++		requireInputs(t, machine.inputs, payloads)
++		if len(results) != 2 {
++			t.Fatalf("result count = %d, want 2", len(results))
++		}
++	})
++
++	t.Run("NUL preserves line feed", func(t *testing.T) {
++		payloads := []string{"<15>line one\nline two", "<16>last"}
++		machine := &recordingMachine{}
++		var results []syslog.Result
++		parser := nontransparent.NewParser(
++			nontransparent.WithTrailer(nontransparent.NUL),
++			syslog.WithMachine(machine),
++			syslog.WithListener(listenerFor(&results)),
++		)
++		parser.Parse(strings.NewReader(strings.Join(payloads, "\x00") + "\x00"))
++		requireInputs(t, machine.inputs, payloads)
++		if len(results) != 2 {
++			t.Fatalf("result count = %d, want 2", len(results))
++		}
++	})
++}
++
++func TestConfiguredMachineErrorSemantics(t *testing.T) {
++	payloads := []string{"<13>ok", "<14>bad", "<15>after"}
++	stream := framed(payloads[0]) + framed(payloads[1]) + framed(payloads[2])
++
++	t.Run("octet-counting strict stops and omits partial", func(t *testing.T) {
++		machine := &recordingMachine{failOn: payloads[1]}
++		var results []syslog.Result
++		parser := octetcounting.NewParser(
++			syslog.WithMachine(machine),
++			syslog.WithListener(listenerFor(&results)),
++		)
++		parser.Parse(strings.NewReader(stream))
++		requireInputs(t, machine.inputs, payloads[:2])
++		if len(results) != 2 || !errors.Is(results[1].Error, errRejectedPayload) {
++			t.Fatalf("strict results = %#v, want success then decoder error", results)
++		}
++		if results[1].Message != nil {
++			t.Fatalf("strict error exposed partial message %T", results[1].Message)
++		}
++	})
++
++	t.Run("octet-counting best effort keeps partial and continues", func(t *testing.T) {
++		machine := &recordingMachine{failOn: payloads[1]}
++		var results []syslog.Result
++		parser := octetcounting.NewParser(
++			syslog.WithMachine(machine),
++			syslog.WithBestEffort(),
++			syslog.WithListener(listenerFor(&results)),
++		)
++		if machine.HasBestEffort() {
++			t.Fatal("framing option mutated caller-supplied machine")
++		}
++		parser.Parse(strings.NewReader(stream))
++		requireInputs(t, machine.inputs, payloads)
++		if len(results) != 3 || !errors.Is(results[1].Error, errRejectedPayload) {
++			t.Fatalf("best-effort results = %#v, want three results with middle decoder error", results)
++		}
++		requireDecoded(t, results[1], payloads[1])
++	})
++
++	for _, bestEffort := range []bool{false, true} {
++		name := "strict"
++		if bestEffort {
++			name = "best-effort"
++		}
++		t.Run("non-transparent "+name+" forwards pair and continues", func(t *testing.T) {
++		machine := &recordingMachine{failOn: payloads[1]}
++		var results []syslog.Result
++		options := []syslog.ParserOption{
++			syslog.WithListener(listenerFor(&results)),
++			syslog.WithMachine(machine),
++		}
++		if bestEffort {
++			options = append(options, syslog.WithBestEffort())
++		}
++		parser := nontransparent.NewParser(options...)
++		if machine.HasBestEffort() {
++			t.Fatal("framing option mutated caller-supplied machine")
++		}
++		parser.Parse(strings.NewReader(strings.Join(payloads, "\n") + "\n"))
++		requireInputs(t, machine.inputs, payloads)
++		if len(results) != 3 || !errors.Is(results[1].Error, errRejectedPayload) {
++			t.Fatalf("non-transparent results = %#v, want three forwarded results", results)
++		}
++		requireDecoded(t, results[1], payloads[1])
++		})
++	}
++}
++
++func TestNilMachineKeepsRFC5424Default(t *testing.T) {
++	for _, tc := range []struct {
++		name  string
++		parse func(syslog.Parser)
++		new   func(syslog.ParserListener) syslog.Parser
++	}{
++		{
++			name:  "octet-counting",
++			parse: func(parser syslog.Parser) { parser.Parse(strings.NewReader(framed("<1>1 - - - - - -"))) },
++			new: func(listener syslog.ParserListener) syslog.Parser {
++				return octetcounting.NewParser(syslog.WithMachine(nil), syslog.WithListener(listener))
++			},
++		},
++		{
++			name:  "non-transparent",
++			parse: func(parser syslog.Parser) { parser.Parse(strings.NewReader("<1>1 - - - - - -\n")) },
++			new: func(listener syslog.ParserListener) syslog.Parser {
++				return nontransparent.NewParser(syslog.WithListener(listener), syslog.WithMachine(nil))
++			},
++		},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			var results []syslog.Result
++			parser := tc.new(listenerFor(&results))
++			tc.parse(parser)
++			if len(results) != 1 || results[0].Error != nil {
++				t.Fatalf("default results = %#v, want one success", results)
++			}
++			if _, ok := results[0].Message.(*rfc5424.SyslogMessage); !ok {
++				t.Fatalf("default message type = %T, want *rfc5424.SyslogMessage", results[0].Message)
++			}
++		})
++	}
++}
++
++func TestConfiguredParsersAreReusableWithoutReplay(t *testing.T) {
++	t.Run("octet-counting", func(t *testing.T) {
++		machine := &recordingMachine{}
++		var results []syslog.Result
++		parser := octetcounting.NewParser(syslog.WithMachine(machine), syslog.WithListener(listenerFor(&results)))
++		parser.Parse(strings.NewReader(framed("<13>first")))
++		parser.Parse(strings.NewReader(framed("<14>second")))
++		requireInputs(t, machine.inputs, []string{"<13>first", "<14>second"})
++		if len(results) != 2 {
++			t.Fatalf("result count after reuse = %d, want 2", len(results))
++		}
++	})
++
++	t.Run("non-transparent after unterminated input", func(t *testing.T) {
++		machine := &recordingMachine{}
++		var results []syslog.Result
++		parser := nontransparent.NewParser(syslog.WithMachine(machine), syslog.WithListener(listenerFor(&results)))
++		parser.Parse(strings.NewReader("<13>unfinished"))
++		parser.Parse(strings.NewReader("<14>fresh\n"))
++		requireInputs(t, machine.inputs, []string{"<13>unfinished", "<14>fresh"})
++		if len(results) != 2 {
++			t.Fatalf("result count after reuse = %d, want 2: %#v", len(results), results)
++		}
++		if results[1].Error != nil {
++			t.Fatalf("fresh session inherited error: %v", results[1].Error)
++		}
++		requireDecoded(t, results[1], "<14>fresh")
++	})
++}
++
++func TestConfiguredMachineDoesNotChangeTimestampStrategy(t *testing.T) {
++	machine := rfc3164.NewParser(rfc3164.WithYear(rfc3164.Year{YYYY: 2001}))
++	var results []syslog.Result
++	parser := nontransparent.NewParser(syslog.WithMachine(machine), syslog.WithListener(listenerFor(&results)))
++	parser.Parse(strings.NewReader("<13>Dec  2 16:31:03 host app: message\n"))
++	if len(results) != 1 || results[0].Error != nil {
++		t.Fatalf("results = %#v, want one success", results)
++	}
++	message, ok := results[0].Message.(*rfc3164.SyslogMessage)
++	if !ok || message.Timestamp == nil || !message.Timestamp.Equal(time.Date(2001, 12, 2, 16, 31, 3, 0, time.UTC)) {
++		t.Fatalf("configured RFC3164 timestamp = %#v, want fixed 2001 UTC timestamp", message)
++	}
++}
++`
++
++	testFile := filepath.Join(dir, "contract_test.go")
++	if err := os.WriteFile(testFile, []byte(source), 0600); err != nil {
++		t.Fatal(err)
++	}
++
++	command := exec.Command("go", "test", "-vet=off", "./"+filepath.Base(dir))
++	command.Dir = repo
++	command.Env = append(os.Environ(), "GOPROXY=off", "GOSUMDB=off", "GOTOOLCHAIN=local")
++	output, err := command.CombinedOutput()
++	if err != nil {
++		t.Fatalf("public transport-machine contract failed: %v\n%s", err, output)
++	}
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,4 @@
++#!/bin/bash
++set -euo pipefail
++
++GOTOOLCHAIN=local GOPROXY=off GOSUMDB=off go test -vet=off . ./octetcounting ./nontransparent -run '^(TestCodespecTransportMachineContract|TestParse|TestParserBestEffortOption)$' -count=1

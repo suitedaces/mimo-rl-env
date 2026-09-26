@@ -1,0 +1,284 @@
+diff --git a/internal/cmd/document_match_test.go b/internal/cmd/document_match_test.go
+new file mode 100644
+index 0000000..1601884
+--- /dev/null
++++ b/internal/cmd/document_match_test.go
+@@ -0,0 +1,269 @@
++package cmd_test
++
++import (
++	"bytes"
++	"fmt"
++	"io/ioutil"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"strings"
++
++	. "github.com/onsi/ginkgo"
++	. "github.com/onsi/gomega"
++)
++
++var documentMatchVerifierBinary string
++
++var _ = BeforeSuite(func() {
++	dir, err := ioutil.TempDir("", "dyff-document-match-verifier")
++	Expect(err).NotTo(HaveOccurred())
++	documentMatchVerifierBinary = filepath.Join(dir, "dyff")
++	build := exec.Command("go", "build", "-o", documentMatchVerifierBinary, "../../cmd/dyff")
++	output, err := build.CombinedOutput()
++	Expect(err).NotTo(HaveOccurred(), string(output))
++})
++
++var _ = AfterSuite(func() {
++	if documentMatchVerifierBinary != "" {
++		_ = os.RemoveAll(filepath.Dir(documentMatchVerifierBinary))
++	}
++})
++
++func runDocumentMatchVerifier(args ...string) (stdout string, stderr string, exitCode int) {
++	command := exec.Command(documentMatchVerifierBinary, args...)
++	var stdoutBuffer, stderrBuffer bytes.Buffer
++	command.Stdout = &stdoutBuffer
++	command.Stderr = &stderrBuffer
++	err := command.Run()
++	if err == nil {
++		return stdoutBuffer.String(), stderrBuffer.String(), 0
++	}
++
++	exitError, ok := err.(*exec.ExitError)
++	Expect(ok).To(BeTrue(), fmt.Sprintf("failed to execute dyff: %v", err))
++	return stdoutBuffer.String(), stderrBuffer.String(), exitError.ExitCode()
++}
++
++var _ = Describe("identity matching for multi-document comparisons", func() {
++	It("keeps positional comparison as the default", func() {
++		from := createTestFile("kind: ConfigMap\nmetadata:\n  name: one\n")
++		defer func() { _ = os.Remove(from) }()
++		to := createTestFile("kind: ConfigMap\nmetadata:\n  name: one\n---\nkind: ConfigMap\nmetadata:\n  name: two\n")
++		defer func() { _ = os.Remove(to) }()
++
++		_, stderr, exitCode := runDocumentMatchVerifier("--color", "off", "between", from, to)
++		Expect(exitCode).NotTo(Equal(0))
++		Expect(stderr).To(ContainSubstring("different number of documents"))
++	})
++
++	It("matches documents by all requested scalar paths independent of stream order", func() {
++		from := createTestFile(`kind: Deployment
++metadata:
++  name: api
++spec:
++  replicas: 1
++---
++kind: Service
++metadata:
++  name: api
++spec:
++  port: 80
++`)
++		defer func() { _ = os.Remove(from) }()
++		to := createTestFile(`kind: Service
++metadata:
++  name: api
++spec:
++  port: 80
++---
++kind: Deployment
++metadata:
++  name: api
++spec:
++  replicas: 2
++`)
++		defer func() { _ = os.Remove(to) }()
++
++		out, stderr, exitCode := runDocumentMatchVerifier("--color", "off", "between", "--omit-header",
++			"--match-documents-by", "/kind",
++			"--match-documents-by", "/metadata/name", from, to)
++		Expect(exitCode).To(Equal(0), stderr)
++		Expect(out).To(ContainSubstring("replicas"))
++		Expect(out).To(ContainSubstring("- 1"))
++		Expect(out).To(ContainSubstring("+ 2"))
++		Expect(strings.Count(out, "port")).To(Equal(0))
++	})
++
++	It("reports documents present on only one side as additions or removals", func() {
++		from := createTestFile(`kind: ConfigMap
++metadata:
++  name: base
++data:
++  value: old
++`)
++		defer func() { _ = os.Remove(from) }()
++		to := createTestFile(`kind: ConfigMap
++metadata:
++  name: base
++data:
++  value: old
++---
++kind: ConfigMap
++metadata:
++  name: worker
++data:
++  value: new
++`)
++		defer func() { _ = os.Remove(to) }()
++
++		out, stderr, exitCode := runDocumentMatchVerifier("--color", "off", "between", "--omit-header",
++			"--match-documents-by", "/kind",
++			"--match-documents-by", "/metadata/name", from, to)
++		Expect(exitCode).To(Equal(0), stderr)
++		Expect(out).To(ContainSubstring("worker"))
++		Expect(out).To(ContainSubstring("value: new"))
++		Expect(out).To(ContainSubstring("added"))
++	})
++
++	It("reports a document removed from the target stream", func() {
++		from := createTestFile(`kind: ConfigMap
++metadata:
++  name: base
++---
++kind: ConfigMap
++metadata:
++  name: retired
++data:
++  value: old
++`)
++		defer func() { _ = os.Remove(from) }()
++		to := createTestFile(`kind: ConfigMap
++metadata:
++  name: base
++`)
++		defer func() { _ = os.Remove(to) }()
++
++		out, stderr, exitCode := runDocumentMatchVerifier("--color", "off", "between", "--omit-header",
++			"--match-documents-by", "/kind",
++			"--match-documents-by", "/metadata/name", from, to)
++		Expect(exitCode).To(Equal(0), stderr)
++		Expect(out).To(ContainSubstring("retired"))
++		Expect(out).To(ContainSubstring("value: old"))
++		Expect(out).To(ContainSubstring("removed"))
++	})
++
++	It("preserves comparison options for matched documents", func() {
++		from := createTestFile(`kind: ConfigMap
++metadata:
++  name: settings
++data:
++  keys:
++  - alpha
++  - beta
++`)
++		defer func() { _ = os.Remove(from) }()
++		to := createTestFile(`kind: ConfigMap
++metadata:
++  name: settings
++data:
++  keys:
++  - beta
++  - alpha
++`)
++		defer func() { _ = os.Remove(to) }()
++
++		out, stderr, exitCode := runDocumentMatchVerifier("--color", "off", "between", "--omit-header", "--ignore-order-changes",
++			"--match-documents-by", "/kind",
++			"--match-documents-by", "/metadata/name", from, to)
++		Expect(exitCode).To(Equal(0), stderr)
++		Expect(out).To(Equal("\n"))
++	})
++
++	It("rejects a document that is missing an identity path", func() {
++		from := createTestFile(`kind: ConfigMap
++metadata: {}
++`)
++		defer func() { _ = os.Remove(from) }()
++		to := createTestFile(`kind: ConfigMap
++metadata:
++  name: settings
++`)
++		defer func() { _ = os.Remove(to) }()
++
++		out, stderr, exitCode := runDocumentMatchVerifier("--color", "off", "between", "--match-documents-by", "/metadata/name", from, to)
++		Expect(exitCode).NotTo(Equal(0))
++		Expect(out).To(BeEmpty())
++		Expect(stderr).To(ContainSubstring("/metadata/name"))
++		Expect(stderr).To(ContainSubstring("document"))
++	})
++
++	It("rejects a non-scalar identity value", func() {
++		from := createTestFile(`kind: ConfigMap
++metadata:
++  name: settings
++  labels:
++    app: demo
++`)
++		defer func() { _ = os.Remove(from) }()
++		to := createTestFile(`kind: ConfigMap
++metadata:
++  name: settings
++  labels:
++    app: demo
++`)
++		defer func() { _ = os.Remove(to) }()
++
++		out, stderr, exitCode := runDocumentMatchVerifier("--color", "off", "between", "--match-documents-by", "/metadata/labels", from, to)
++		Expect(exitCode).NotTo(Equal(0))
++		Expect(out).To(BeEmpty())
++		Expect(stderr).To(ContainSubstring("/metadata/labels"))
++		Expect(stderr).To(ContainSubstring("scalar"))
++	})
++
++	It("rejects duplicate composite identities on either side", func() {
++		from := createTestFile(`kind: ConfigMap
++metadata:
++  name: settings
++---
++kind: ConfigMap
++metadata:
++  name: settings
++`)
++		defer func() { _ = os.Remove(from) }()
++		to := createTestFile(`kind: ConfigMap
++metadata:
++  name: settings
++`)
++		defer func() { _ = os.Remove(to) }()
++
++		out, stderr, exitCode := runDocumentMatchVerifier("--color", "off", "between", "--match-documents-by", "/kind", "--match-documents-by", "/metadata/name", from, to)
++		Expect(exitCode).NotTo(Equal(0))
++		Expect(out).To(BeEmpty())
++		Expect(stderr).To(ContainSubstring("duplicate"))
++		Expect(stderr).To(ContainSubstring("settings"))
++	})
++
++	It("rejects duplicate composite identities in the target stream", func() {
++		from := createTestFile(`kind: ConfigMap
++metadata:
++  name: settings
++`)
++		defer func() { _ = os.Remove(from) }()
++		to := createTestFile(`kind: ConfigMap
++metadata:
++  name: settings
++---
++kind: ConfigMap
++metadata:
++  name: settings
++`)
++		defer func() { _ = os.Remove(to) }()
++
++		out, stderr, exitCode := runDocumentMatchVerifier("--color", "off", "between", "--match-documents-by", "/kind", "--match-documents-by", "/metadata/name", from, to)
++		Expect(exitCode).NotTo(Equal(0))
++		Expect(out).To(BeEmpty())
++		Expect(stderr).To(ContainSubstring("duplicate"))
++		Expect(stderr).To(ContainSubstring("settings"))
++	})
++})
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,4 @@
++#!/bin/bash
++set -euo pipefail
++
++go test ./internal/cmd -run TestCmd -count=1

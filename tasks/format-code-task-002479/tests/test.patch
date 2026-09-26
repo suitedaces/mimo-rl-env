@@ -1,0 +1,211 @@
+diff --git a/pkg/node/node_health_test.go b/pkg/node/node_health_test.go
+new file mode 100644
+index 000000000..53dc2e495
+--- /dev/null
++++ b/pkg/node/node_health_test.go
+@@ -0,0 +1,179 @@
++package node_test
++
++import (
++	"testing"
++	"time"
++
++	"github.com/rancher/rancher/pkg/node"
++	v3 "github.com/rancher/types/apis/management.cattle.io/v3"
++	"github.com/stretchr/testify/assert"
++	corev1 "k8s.io/api/core/v1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++)
++
++const unreachableTaintKey = "node.kubernetes.io/unreachable"
++
++
++func machineWith(taints []corev1.Taint, readyStatus corev1.ConditionStatus, includeReady bool) *v3.Node {
++	machine := &v3.Node{}
++	machine.Spec.InternalNodeSpec.Taints = taints
++	if includeReady {
++		machine.Status.InternalNodeStatus.Conditions = []corev1.NodeCondition{
++			{
++				Type:   corev1.NodeReady,
++				Status: readyStatus,
++			},
++		}
++	}
++	return machine
++}
++
++
++
++func makeUnreachableTaint(effect corev1.TaintEffect, added *time.Time) corev1.Taint {
++	t := corev1.Taint{
++		Key:    unreachableTaintKey,
++		Effect: effect,
++	}
++	if added != nil {
++		t.TimeAdded = &metav1.Time{Time: *added}
++	}
++	return t
++}
++
++func TestIsNodeUnreachable(t *testing.T) {
++	now := time.Now()
++
++	tests := []struct {
++		name    string
++		machine *v3.Node
++		want    bool
++	}{
++		{
++			name:    "unreachable taint NoExecute and Ready Unknown",
++			machine: machineWith([]corev1.Taint{makeUnreachableTaint(corev1.TaintEffectNoExecute, &now)}, corev1.ConditionUnknown, true),
++			want:    true,
++		},
++		{
++			name:    "unreachable taint without recorded time still unreachable",
++			machine: machineWith([]corev1.Taint{makeUnreachableTaint(corev1.TaintEffectNoExecute, nil)}, corev1.ConditionUnknown, true),
++			want:    true,
++		},
++		{
++			name:    "no taints",
++			machine: machineWith(nil, corev1.ConditionUnknown, true),
++			want:    false,
++		},
++		{
++			name:    "unreachable taint but Ready True",
++			machine: machineWith([]corev1.Taint{makeUnreachableTaint(corev1.TaintEffectNoExecute, &now)}, corev1.ConditionTrue, true),
++			want:    false,
++		},
++		{
++			name:    "unreachable taint but Ready False",
++			machine: machineWith([]corev1.Taint{makeUnreachableTaint(corev1.TaintEffectNoExecute, &now)}, corev1.ConditionFalse, true),
++			want:    false,
++		},
++		{
++			name:    "unreachable taint but no Ready condition",
++			machine: machineWith([]corev1.Taint{makeUnreachableTaint(corev1.TaintEffectNoExecute, &now)}, "", false),
++			want:    false,
++		},
++		{
++			name:    "same key but NoSchedule effect does not count",
++			machine: machineWith([]corev1.Taint{makeUnreachableTaint(corev1.TaintEffectNoSchedule, &now)}, corev1.ConditionUnknown, true),
++			want:    false,
++		},
++		{
++			name: "unrelated taint with Ready Unknown",
++			machine: machineWith([]corev1.Taint{{
++				Key:    "some.other/taint",
++				Effect: corev1.TaintEffectNoExecute,
++			}}, corev1.ConditionUnknown, true),
++			want: false,
++		},
++		{
++			name: "matching taint ignores value",
++			machine: machineWith([]corev1.Taint{{
++				Key:    unreachableTaintKey,
++				Value:  "anything",
++				Effect: corev1.TaintEffectNoExecute,
++			}}, corev1.ConditionUnknown, true),
++			want: true,
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			assert.Equal(t, tt.want, node.IsNodeUnreachable(tt.machine))
++		})
++	}
++}
++
++func TestShouldDeleteUnreachableNode(t *testing.T) {
++	now := time.Now()
++	longAgo := now.Add(-time.Hour)
++	recent := now.Add(-time.Second)
++
++	tests := []struct {
++		name    string
++		machine *v3.Node
++		timeout time.Duration
++		want    bool
++	}{
++		{
++			name:    "unreachable longer than timeout",
++			machine: machineWith([]corev1.Taint{makeUnreachableTaint(corev1.TaintEffectNoExecute, &longAgo)}, corev1.ConditionUnknown, true),
++			timeout: time.Minute,
++			want:    true,
++		},
++		{
++			name:    "unreachable but not yet past timeout",
++			machine: machineWith([]corev1.Taint{makeUnreachableTaint(corev1.TaintEffectNoExecute, &recent)}, corev1.ConditionUnknown, true),
++			timeout: time.Hour,
++			want:    false,
++		},
++		{
++			name:    "timeout zero disables deletion even when long unreachable",
++			machine: machineWith([]corev1.Taint{makeUnreachableTaint(corev1.TaintEffectNoExecute, &longAgo)}, corev1.ConditionUnknown, true),
++			timeout: 0,
++			want:    false,
++		},
++		{
++			name:    "negative timeout disables deletion",
++			machine: machineWith([]corev1.Taint{makeUnreachableTaint(corev1.TaintEffectNoExecute, &longAgo)}, corev1.ConditionUnknown, true),
++			timeout: -time.Minute,
++			want:    false,
++		},
++		{
++			name:    "taint without recorded add-time is never deletable",
++			machine: machineWith([]corev1.Taint{makeUnreachableTaint(corev1.TaintEffectNoExecute, nil)}, corev1.ConditionUnknown, true),
++			timeout: time.Minute,
++			want:    false,
++		},
++		{
++			name:    "not unreachable (Ready True) is never deletable",
++			machine: machineWith([]corev1.Taint{makeUnreachableTaint(corev1.TaintEffectNoExecute, &longAgo)}, corev1.ConditionTrue, true),
++			timeout: time.Minute,
++			want:    false,
++		},
++		{
++			name:    "no taints is never deletable",
++			machine: machineWith(nil, corev1.ConditionUnknown, true),
++			timeout: time.Minute,
++			want:    false,
++		},
++		{
++			name:    "same key NoSchedule effect is never deletable",
++			machine: machineWith([]corev1.Taint{makeUnreachableTaint(corev1.TaintEffectNoSchedule, &longAgo)}, corev1.ConditionUnknown, true),
++			timeout: time.Minute,
++			want:    false,
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			assert.Equal(t, tt.want, node.ShouldDeleteUnreachableNode(tt.machine, tt.timeout))
++		})
++	}
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,21 @@
++#!/usr/bin/env bash
++
++
++
++set -euo pipefail
++HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++cd /testbed
++
++
++
++
++
++export GO111MODULE=off
++REPO_DIR="$(go env GOPATH)/src/github.com/rancher/rancher"
++cd "$REPO_DIR"
++
++
++go test ./pkg/node/ -run 'TestIsNodeForNode'
++
++
++go test ./pkg/node/ -run 'TestIsNodeUnreachable|TestShouldDeleteUnreachableNode'

@@ -1,0 +1,215 @@
+diff --git a/lib/spack/spack/test/llnl/util/test_tree_symlink_behavior.py b/lib/spack/spack/test/llnl/util/test_tree_symlink_behavior.py
+new file mode 100644
+index 0000000000..1111111111
+--- /dev/null
++++ b/lib/spack/spack/test/llnl/util/test_tree_symlink_behavior.py
+@@ -0,0 +1,174 @@
++import os
++import shutil
++import subprocess
++import sys
++
++import pytest
++
++import llnl.util.filesystem as fs
++
++
++def _write(path, text):
++    fs.mkdirp(os.path.dirname(str(path)))
++    with open(str(path), "w") as f:
++        f.write(text)
++
++
++def _make_windows_junction(source, link):
++    proc = subprocess.Popen(
++        ["cmd", "/C", "mklink", "/J", str(link), str(source)],
++        stdout=subprocess.PIPE,
++        stderr=subprocess.PIPE,
++    )
++    out, err = proc.communicate()
++    if proc.returncode != 0:
++        pytest.fail("failed to create Windows junction fixture: {0}".format(err or out))
++
++
++@pytest.mark.skipif(sys.platform == "win32", reason="Unix-like dangling symlink behavior")
++def test_copy_tree_preserves_two_broken_symlinks_by_default_on_unix(tmpdir):
++    src = tmpdir.join("src")
++    dest = tmpdir.join("dest")
++    fs.mkdirp(str(src))
++    os.symlink("missing-target-one.txt", str(src.join("first_missing_alias")))
++    os.symlink(os.path.join("nested", "missing-target-two.txt"), str(src.join("second_missing_alias")))
++
++    fs.copy_tree(str(src), str(dest), symlinks=True)
++
++    assert os.path.islink(str(dest.join("first_missing_alias")))
++    assert os.path.islink(str(dest.join("second_missing_alias")))
++    assert os.readlink(str(dest.join("first_missing_alias"))) == "missing-target-one.txt"
++    assert os.readlink(str(dest.join("second_missing_alias"))) == os.path.join(
++        "nested", "missing-target-two.txt"
++    )
++    assert not os.path.exists(str(dest.join("missing-target-one.txt")))
++    assert not os.path.exists(str(dest.join("nested", "missing-target-two.txt")))
++
++
++@pytest.mark.skipif(sys.platform == "win32", reason="Unix-like dangling symlink behavior")
++def test_install_tree_rejects_broken_symlink_when_not_allowed_on_unix(tmpdir):
++    src = tmpdir.join("src")
++    dest = tmpdir.join("dest")
++    fs.mkdirp(str(src))
++    os.symlink("missing-install-target.txt", str(src.join("install_alias")))
++
++    with pytest.raises(Exception):
++        fs.install_tree(str(src), str(dest), symlinks=True, allow_broken_symlinks=False)
++
++
++def test_copy_tree_rejects_allow_broken_symlinks_true_on_windows(tmpdir, monkeypatch):
++    src = tmpdir.join("src")
++    dest = tmpdir.join("dest")
++    fs.mkdirp(str(src))
++    monkeypatch.setattr(sys, "platform", "win32")
++
++    with pytest.raises(Exception):
++        fs.copy_tree(str(src), str(dest), symlinks=True, allow_broken_symlinks=True)
++
++
++def test_install_tree_rejects_allow_broken_symlinks_true_on_windows(tmpdir, monkeypatch):
++    src = tmpdir.join("src")
++    dest = tmpdir.join("dest")
++    fs.mkdirp(str(src))
++    monkeypatch.setattr(sys, "platform", "win32")
++
++    with pytest.raises(Exception):
++        fs.install_tree(str(src), str(dest), symlinks=True, allow_broken_symlinks=True)
++
++
++@pytest.mark.skipif(sys.platform == "win32", reason="Covered by Windows link-like tests below")
++def test_copy_tree_preserves_internal_links_to_files_and_directories(tmpdir):
++    src = tmpdir.join("src")
++    dest = tmpdir.join("dest")
++    _write(src.join("payloads", "data.txt"), "copied file payload")
++    _write(src.join("tree_target", "child.txt"), "copied directory payload")
++    os.symlink(os.path.join("payloads", "data.txt"), str(src.join("alias_to_payload")))
++    os.symlink("tree_target", str(src.join("alias_to_tree")))
++
++    fs.copy_tree(str(src), str(dest), symlinks=True, allow_broken_symlinks=True)
++
++    assert os.path.islink(str(dest.join("alias_to_payload")))
++    assert os.path.islink(str(dest.join("alias_to_tree")))
++    with open(str(dest.join("alias_to_payload"))) as f:
++        assert f.read() == "copied file payload"
++    with open(str(dest.join("alias_to_tree", "child.txt"))) as f:
++        assert f.read() == "copied directory payload"
++
++
++@pytest.mark.skipif(sys.platform == "win32", reason="Covered by Windows link-like tests below")
++def test_copy_tree_does_not_create_internal_links_before_targets_exist(tmpdir, monkeypatch):
++    src = tmpdir.join("src")
++    dest = tmpdir.join("dest")
++    _write(src.join("later", "payload.txt"), "delayed target payload")
++    os.symlink(os.path.join("later", "payload.txt"), str(src.join("alias_before_target")))
++
++    real_symlink = os.symlink
++
++    def reject_temporarily_broken_link(source_path, link_path, *args, **kwargs):
++        target_path = source_path
++        if not os.path.isabs(target_path):
++            target_path = os.path.join(os.path.dirname(link_path), target_path)
++        if not os.path.exists(target_path):
++            raise OSError("target must exist before link creation")
++        return real_symlink(source_path, link_path, *args, **kwargs)
++
++    monkeypatch.setattr(os, "symlink", reject_temporarily_broken_link)
++
++    fs.copy_tree(str(src), str(dest), symlinks=True, allow_broken_symlinks=False)
++
++    copied_alias = str(dest.join("alias_before_target"))
++    assert os.path.islink(copied_alias)
++    with open(copied_alias) as f:
++        assert f.read() == "delayed target payload"
++
++
++@pytest.mark.skipif(sys.platform == "win32", reason="Covered by Windows link-like tests below")
++def test_install_tree_preserves_internal_link_to_nested_file(tmpdir):
++    src = tmpdir.join("src")
++    dest = tmpdir.join("dest")
++    _write(src.join("late", "nested", "payload.txt"), "install tree payload")
++    os.symlink(os.path.join("late", "nested", "payload.txt"), str(src.join("installed_alias")))
++
++    fs.install_tree(str(src), str(dest), symlinks=True, allow_broken_symlinks=True)
++
++    assert os.path.islink(str(dest.join("installed_alias")))
++    with open(str(dest.join("installed_alias"))) as f:
++        assert f.read() == "install tree payload"
++
++
++@pytest.mark.skipif(sys.platform != "win32", reason="Windows directory link-like behavior")
++def test_copy_tree_preserves_windows_directory_link_as_link_like_entry(tmpdir):
++    src = tmpdir.join("src")
++    dest = tmpdir.join("dest")
++    _write(src.join("target_directory", "payload.txt"), "windows tree-copy payload")
++    _make_windows_junction(
++        str(src.join("target_directory")),
++        str(src.join("dir_alias_for_tree_copy")),
++    )
++
++    fs.copy_tree(str(src), str(dest), symlinks=True, allow_broken_symlinks=False)
++
++    copied_alias = str(dest.join("dir_alias_for_tree_copy"))
++    assert os.path.isdir(copied_alias)
++    with open(os.path.join(copied_alias, "payload.txt")) as f:
++        assert f.read() == "windows tree-copy payload"
++    shutil.rmtree(str(dest.join("target_directory")))
++    assert not os.path.exists(os.path.join(copied_alias, "payload.txt"))
++
++
++@pytest.mark.skipif(sys.platform != "win32", reason="Windows directory link-like behavior")
++def test_install_tree_preserves_windows_directory_link_as_link_like_entry(tmpdir):
++    src = tmpdir.join("src")
++    dest = tmpdir.join("dest")
++    _write(src.join("target_directory", "payload.txt"), "windows install-tree payload")
++    _make_windows_junction(
++        str(src.join("target_directory")),
++        str(src.join("dir_alias_for_install_tree")),
++    )
++
++    fs.install_tree(str(src), str(dest), symlinks=True, allow_broken_symlinks=False)
++
++    installed_alias = str(dest.join("dir_alias_for_install_tree"))
++    assert os.path.isdir(installed_alias)
++    with open(os.path.join(installed_alias, "payload.txt")) as f:
++        assert f.read() == "windows install-tree payload"
++    shutil.rmtree(str(dest.join("target_directory")))
++    assert not os.path.exists(os.path.join(installed_alias, "payload.txt"))
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,28 @@
++#!/bin/bash
++set -uo pipefail
++cd /testbed
++
++
++set +u
++source /root/.venv/bin/activate
++set -u
++
++export PYTHONPATH="/testbed/lib/spack:/testbed/lib/spack/external"
++
++
++case "${1:-}" in
++  base)
++    python3 -m pytest \
++      lib/spack/spack/test/llnl/util/filesystem.py \
++      -v
++    ;;
++  new)
++    python3 -m pytest \
++      lib/spack/spack/test/llnl/util/test_tree_symlink_behavior.py \
++      -v
++    ;;
++  *)
++    echo "usage: $0 base|new" >&2
++    exit 2
++    ;;
++esac

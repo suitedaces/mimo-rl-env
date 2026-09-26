@@ -1,0 +1,181 @@
+diff --git a/tests/hf/test_hamiltonians.py b/tests/hf/test_hamiltonians.py
+index a0ece4bda..7c0fbd925 100644
+--- a/tests/hf/test_hamiltonians.py
++++ b/tests/hf/test_hamiltonians.py
+@@ -23,6 +23,7 @@ from pennylane.hf.hamiltonian import (
+     _generate_qubit_operator,
+     _pauli_mult,
+     _return_pauli,
++    simplify,
+     generate_electron_integrals,
+     generate_fermionic_hamiltonian,
+     generate_hamiltonian,
+@@ -379,3 +380,138 @@ def test_gradient_expvalH():
+     grad_finitediff = (e_2 - e_1) / 0.0002
+ 
+     assert np.allclose(grad_autograd[0][0], grad_finitediff)
++
++
++def _pauli_word_coefficients(hamiltonian):
++    """Return an order-insensitive map from Pauli-word semantics to coefficients."""
++    wire_map = dict(zip(hamiltonian.wires, range(len(hamiltonian.wires) + 1)))
++    coeffs, ops = hamiltonian.terms
++
++    terms = {}
++    for coeff, op in zip(coeffs, ops):
++        key = qml.grouping.pauli_word_to_string(
++            qml.operation.Tensor(op).prune(), wire_map=wire_map
++        )
++        terms[key] = terms.get(key, 0.0) + coeff
++
++    return terms
++
++
++def _assert_terms_close(actual, expected):
++    """Compare Hamiltonian terms without depending on output ordering."""
++    assert len(_pauli_word_coefficients(actual)) == len(actual.terms[0])
++
++    actual_terms = _pauli_word_coefficients(actual)
++    expected_terms = _pauli_word_coefficients(expected)
++
++    assert set(actual_terms) == set(expected_terms)
++    for key, coeff in expected_terms.items():
++        assert np.allclose(actual_terms[key], coeff)
++
++
++def test_simplify_is_public_and_returns_hamiltonian():
++    """The public HF simplifier should be importable and return a Hamiltonian."""
++    from pennylane.hf.hamiltonian import simplify as public_simplify
++
++    hamiltonian = qml.Hamiltonian(np.array([0.75]), [qml.PauliZ(0)])
++
++    result = public_simplify(hamiltonian)
++
++    assert isinstance(result, qml.Hamiltonian)
++    _assert_terms_close(result, hamiltonian)
++
++
++def test_simplify_combines_duplicate_pauli_words():
++    """Duplicate Pauli words are combined by summing coefficients."""
++    hamiltonian = qml.Hamiltonian(
++        np.array([0.5, 0.25, 0.75]),
++        [
++            qml.PauliX(0) @ qml.PauliY(1),
++            qml.PauliX(0) @ qml.PauliY(1),
++            qml.PauliZ(0),
++        ],
++    )
++    expected = qml.Hamiltonian(
++        np.array([0.75, 0.75]), [qml.PauliX(0) @ qml.PauliY(1), qml.PauliZ(0)]
++    )
++
++    _assert_terms_close(simplify(hamiltonian), expected)
++
++
++def test_simplify_combines_multiple_duplicate_groups_without_order_dependence():
++    """Interleaved duplicate groups should each be combined correctly."""
++    hamiltonian = qml.Hamiltonian(
++        np.array([0.2, -0.4, 0.3, 0.6]),
++        [qml.PauliX(0), qml.PauliZ(1), qml.PauliX(0), qml.PauliZ(1)],
++    )
++    expected = qml.Hamiltonian(np.array([0.5, 0.2]), [qml.PauliX(0), qml.PauliZ(1)])
++
++    _assert_terms_close(simplify(hamiltonian), expected)
++
++
++def test_simplify_drops_terms_cancelled_by_combination():
++    """A Pauli word whose combined coefficient is zero should be omitted."""
++    hamiltonian = qml.Hamiltonian(
++        np.array([0.5, -0.5, 0.25]),
++        [qml.PauliX(0), qml.PauliX(0), qml.PauliY(1)],
++    )
++    expected = qml.Hamiltonian(np.array([0.25]), [qml.PauliY(1)])
++
++    _assert_terms_close(simplify(hamiltonian), expected)
++
++
++def test_simplify_drops_terms_at_or_below_custom_cutoff():
++    """The cutoff should remove tiny coefficients but retain larger ones."""
++    hamiltonian = qml.Hamiltonian(np.array([0.01, 0.2]), [qml.PauliX(0), qml.PauliZ(0)])
++    expected = qml.Hamiltonian(np.array([0.2]), [qml.PauliZ(0)])
++
++    _assert_terms_close(simplify(hamiltonian, cutoff=0.1), expected)
++
++
++def test_simplify_respects_custom_cutoff_boundary():
++    """Coefficients at or below a custom cutoff are dropped; larger ones remain."""
++    hamiltonian = qml.Hamiltonian(
++        np.array([0.05, 0.1, 0.1000001]),
++        [qml.PauliX(0), qml.PauliY(0), qml.PauliZ(0)],
++    )
++    expected = qml.Hamiltonian(np.array([0.1000001]), [qml.PauliZ(0)])
++
++    _assert_terms_close(simplify(hamiltonian, cutoff=0.1), expected)
++
++
++def test_simplify_applies_cutoff_after_combining_duplicates():
++    """The cutoff is applied to the combined coefficient, not to each input term first."""
++    hamiltonian = qml.Hamiltonian(np.array([0.06, 0.05]), [qml.PauliX(0), qml.PauliX(0)])
++    expected = qml.Hamiltonian(np.array([0.11]), [qml.PauliX(0)])
++
++    _assert_terms_close(simplify(hamiltonian, cutoff=0.1), expected)
++
++
++def test_hf_hamiltonian_result_has_no_duplicate_pauli_words():
++    """Hamiltonians returned by the public HF constructor should not contain duplicates."""
++    mol = Molecule(
++        ["H", "H"],
++        np.array([[0.0, 0.0, 0.0], [0.0, 0.0, 0.74]], requires_grad=False),
++    )
++
++    result = generate_hamiltonian(mol)()
++    simplified_terms = _pauli_word_coefficients(result)
++
++    assert len(result.terms[0]) > 0
++    assert len(simplified_terms) == len(result.terms[0])
++
++
++def test_hf_hamiltonian_respects_cutoff_for_small_terms():
++    """The public HF constructor should apply the user-provided cutoff to its result."""
++    mol = Molecule(
++        ["H", "H"],
++        np.array([[0.0, 0.0, 0.0], [0.0, 0.0, 0.74]], requires_grad=False),
++    )
++
++    low_cutoff_result = generate_hamiltonian(mol)()
++    high_cutoff = 0.05
++    high_cutoff_result = generate_hamiltonian(mol, cutoff=high_cutoff)()
++
++    assert len(low_cutoff_result.terms[0]) > 0
++    assert len(high_cutoff_result.terms[0]) < len(low_cutoff_result.terms[0])
++    assert all(abs(coeff) > high_cutoff for coeff in high_cutoff_result.terms[0])
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,25 @@
++#!/bin/bash
++set -uo pipefail
++cd /testbed
++
++
++python3 -m pip install -e . >/tmp/fixturea_pip_install.log 2>&1
++if [ $? -ne 0 ]; then
++  cat /tmp/fixturea_pip_install.log
++  exit 1
++fi
++
++case "$1" in
++  base)
++    python3 -m pytest tests/hf/test_hamiltonians.py -v \
++      -k 'not (test_simplify_is_public_and_returns_hamiltonian or test_simplify_combines_duplicate_pauli_words or test_simplify_combines_multiple_duplicate_groups_without_order_dependence or test_simplify_drops_terms_cancelled_by_combination or test_simplify_drops_terms_at_or_below_custom_cutoff or test_simplify_respects_custom_cutoff_boundary or test_simplify_applies_cutoff_after_combining_duplicates or test_hf_hamiltonian_result_has_no_duplicate_pauli_words or test_hf_hamiltonian_respects_cutoff_for_small_terms)'
++    ;;
++  new)
++    python3 -m pytest tests/hf/test_hamiltonians.py -v \
++      -k 'test_simplify_is_public_and_returns_hamiltonian or test_simplify_combines_duplicate_pauli_words or test_simplify_combines_multiple_duplicate_groups_without_order_dependence or test_simplify_drops_terms_cancelled_by_combination or test_simplify_drops_terms_at_or_below_custom_cutoff or test_simplify_respects_custom_cutoff_boundary or test_simplify_applies_cutoff_after_combining_duplicates or test_hf_hamiltonian_result_has_no_duplicate_pauli_words or test_hf_hamiltonian_respects_cutoff_for_small_terms'
++    ;;
++  *)
++    echo "usage: $0 base|new"
++    exit 2
++    ;;
++esac

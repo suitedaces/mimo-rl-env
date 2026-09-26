@@ -1,0 +1,191 @@
+diff --git a/test/unit/helper/geojson_bbox_contract.js b/test/unit/helper/geojson_bbox_contract.js
+new file mode 100644
+index 0000000..a4f8301
+--- /dev/null
++++ b/test/unit/helper/geojson_bbox_contract.js
+@@ -0,0 +1,175 @@
++const test = require('tape');
++
++const geojsonify = require('../../../helper/geojsonify');
++const parseBBox = require('../../../middleware/parseBBox')();
++
++function makeDoc(id, lon, lat, boundingBox) {
++  const doc = {
++    _id: `contract:locality:${id}`,
++    source: 'contract',
++    layer: 'locality',
++    name: { default: id },
++    center_point: { lon: lon, lat: lat }
++  };
++
++  if (boundingBox !== undefined) {
++    doc.bounding_box = boundingBox;
++  }
++
++  return doc;
++}
++
++function render(docs) {
++  const response = { data: docs };
++  let nextCalls = 0;
++
++  parseBBox({}, response, () => {
++    nextCalls += 1;
++  });
++
++  if (nextCalls !== 1) {
++    throw new Error(`parseBBox called next ${nextCalls} times`);
++  }
++
++  return geojsonify({}, response.data);
++}
++
++function featureNamed(output, name) {
++  return output.features.find(feature => feature.properties.name === name);
++}
++
++test('bbox contract: supported encodings normalize to GeoJSON feature bboxes', t => {
++  const output = render([
++    makeDoc('encoded-object', 5, 5,
++      '{"min_lon":-10,"min_lat":-5,"max_lon":20,"max_lat":15}'),
++    makeDoc('decoded-object', 31, 0,
++      { min_lon: 30, min_lat: -4, max_lon: 32, max_lat: 4 }),
++    makeDoc('decoded-array', 0, 0, [0, 0, 0, 0]),
++    makeDoc('encoded-array', 46, 0, '[45,-2,47,2]')
++  ]);
++
++  t.deepEqual(featureNamed(output, 'encoded-object').bbox,
++    [-10, -5, 20, 15], 'serialized legacy object');
++  t.deepEqual(featureNamed(output, 'decoded-object').bbox,
++    [30, -4, 32, 4], 'decoded legacy object');
++  t.deepEqual(featureNamed(output, 'decoded-array').bbox,
++    [0, 0, 0, 0], 'decoded GeoJSON array, including zero values');
++  t.deepEqual(featureNamed(output, 'encoded-array').bbox,
++    [45, -2, 47, 2], 'serialized GeoJSON array');
++  t.deepEqual(output.bbox, [-10, -5, 47, 15],
++    'normalized values participate in the collection extent');
++  output.features.forEach(feature => {
++    t.notOk(Object.prototype.hasOwnProperty.call(feature.properties, 'bounding_box'),
++      `${feature.properties.name} does not expose the internal field`);
++  });
++  t.end();
++});
++
++test('bbox contract: coordinate range limits are inclusive', t => {
++  const output = render([
++    makeDoc('boundary-box', 0, 0, '[-180,-90,180,90]')
++  ]);
++
++  t.deepEqual(featureNamed(output, 'boundary-box').bbox,
++    [-180, -90, 180, 90]);
++  t.deepEqual(output.bbox, [-180, -90, 180, 90]);
++  t.end();
++});
++
++test('bbox contract: malformed and semantically invalid boxes fall back to points', t => {
++  const invalidBoxes = [
++    'not json',
++    '{"min_lon":-1,"min_lat":-1,"max_lat":1}',
++    '[1,2,3]',
++    '{"min_lon":"-1","min_lat":-1,"max_lon":1,"max_lat":1}',
++    '{"min_lon":-1,"min_lat":8,"max_lon":1,"max_lat":2}',
++    '{"min_lon":-181,"min_lat":-1,"max_lon":1,"max_lat":1}',
++    '{"min_lon":-1,"min_lat":null,"max_lon":1,"max_lat":1}',
++    { min_lon: -1, min_lat: -1, max_lon: Infinity, max_lat: 1 }
++  ];
++
++  const docs = invalidBoxes.map((bbox, index) =>
++    makeDoc(`invalid-${index}`, index - 3, index - 4, bbox));
++  const output = render(docs);
++
++  t.equal(output.features.length, invalidBoxes.length,
++    'an invalid box does not drop an otherwise valid result');
++  output.features.forEach(feature => {
++    t.notOk(Object.prototype.hasOwnProperty.call(feature, 'bbox'),
++      `${feature.properties.name} has no feature bbox`);
++    t.notOk(Object.prototype.hasOwnProperty.call(feature.properties, 'bounding_box'),
++      `${feature.properties.name} does not leak the internal field`);
++  });
++  t.deepEqual(output.bbox, [-3, -4, 4, 3],
++    'valid center points are used when boxes are rejected');
++  t.end();
++});
++
++test('bbox contract: nearby points on opposite sides of the dateline use a crossing extent', t => {
++  const output = render([
++    makeDoc('east-point', 179, 1),
++    makeDoc('west-point', -178, -2)
++  ]);
++
++  t.deepEqual(output.bbox, [179, -2, -178, 1]);
++  t.end();
++});
++
++test('bbox contract: collection union includes complete box intervals', t => {
++  const output = render([
++    makeDoc('crossing-box', 175, 0,
++      { min_lon: 170, min_lat: -10, max_lon: -175, max_lat: 5 }),
++    makeDoc('nearby-box', 162, 10,
++      { min_lon: 160, min_lat: -5, max_lon: 165, max_lat: 20 }),
++    makeDoc('west-point', -179, 7)
++  ]);
++
++  t.deepEqual(featureNamed(output, 'crossing-box').bbox,
++    [170, -10, -175, 5], 'crossing feature box is preserved');
++  t.deepEqual(featureNamed(output, 'nearby-box').bbox,
++    [160, -5, 165, 20], 'ordinary feature box is preserved');
++  t.deepEqual(output.bbox, [160, -10, -175, 20],
++    'smallest union crosses the dateline and retains latitude extremes');
++  t.end();
++});
++
++test('bbox contract: complementary intervals produce the full-world longitude extent', t => {
++  const output = render([
++    makeDoc('wide-box', 0, 0,
++      [-100, -20, 100, 20]),
++    makeDoc('crossing-half', 180, 0,
++      [90, -10, -90, 10])
++  ]);
++
++  t.deepEqual(output.bbox, [-180, -20, 180, 20]);
++  t.end();
++});
++
++test('bbox contract: equal minimum arcs prefer conventional west-to-east order', t => {
++  const output = render([
++    makeDoc('west-quarter', -90, 0),
++    makeDoc('east-quarter', 90, 1)
++  ]);
++
++  t.deepEqual(output.bbox, [-90, 0, 90, 1]);
++  t.end();
++});
++
++test('bbox contract: conventional mixed extents remain conventional', t => {
++  const output = render([
++    makeDoc('ordinary-box', 0, 0,
++      { min_lon: -20, min_lat: -10, max_lon: 10, max_lat: 30 }),
++    makeDoc('outside-point', 40, -15)
++  ]);
++
++  t.deepEqual(output.bbox, [-20, -15, 40, 30]);
++  t.end();
++});
++
++test('bbox contract: an empty feature collection has no bbox', t => {
++  const output = render([]);
++
++  t.deepEqual(output.features, []);
++  t.notOk(Object.prototype.hasOwnProperty.call(output, 'bbox'));
++  t.end();
++});
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,5 @@
++#!/bin/bash
++set -euo pipefail
++
++
++node test/unit/helper/geojson_bbox_contract.js

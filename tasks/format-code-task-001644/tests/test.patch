@@ -1,0 +1,348 @@
+diff --git a/usercase-test-coderl/report.test.js b/usercase-test-coderl/report.test.js
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/report.test.js
+@@ -0,0 +1,322 @@
++
++
++
++
++
++
++
++
++
++
++
++'use strict';
++
++const assert = require('node:assert/strict');
++const fs = require('node:fs');
++const path = require('node:path');
++const test = require('node:test');
++const vm = require('node:vm');
++
++const REPO = '/workspace/repo';
++
++const sourceFiles = [
++    'source/namespace.js',
++    'source/api/Auth.js',
++    'source/api/Connection.js',
++    'source/api/connections.js',
++    'source/api/Sequence.js',
++    'source/mail/Message.js',
++    'source/mail/Thread.js',
++    'source/mail/Mailbox.js',
++    'source/mail/MessageList.js',
++    'source/mail/MessageSubmission.js',
++    'source/mail/mail-model.js',
++];
++
++const loadPublicJmap = (loadedRecords = {}) => {
++    const context = {
++        clearTimeout,
++        console,
++        setTimeout,
++    };
++    context.global = context;
++    context.O = {};
++    context.O.UndoManager = function (mixin) {
++        Object.assign(this, mixin || {});
++    };
++    context.O.UndoManager.prototype = {
++        constructor: context.O.UndoManager,
++        get(key) {
++            return this[key];
++        },
++        set(key, value) {
++            this[key] = value;
++            return this;
++        },
++        dataDidChange() {
++            this.didChangeCount = (this.didChangeCount || 0) + 1;
++            return this;
++        },
++    };
++
++    vm.createContext(context);
++    sourceFiles.forEach((file) => {
++        vm.runInContext(
++            fs.readFileSync(path.join(REPO, file), 'utf8'),
++            context,
++            { filename: file },
++        );
++    });
++    context.JMAP.store.getRecordFromStoreKey = (storeKey) => loadedRecords[storeKey] || null;
++    context.JMAP.store.getStatus = (storeKey) => loadedRecords[storeKey] ?
++        context.O.Status.READY : 0;
++    context.JMAP.__TypeError = vm.runInContext('TypeError', context);
++    return context.JMAP;
++};
++
++const loadedMessage = (accountId, id, storeKey) => {
++    const calls = [];
++    const data = { accountId, id, storeKey };
++    return {
++        calls,
++        get(key) {
++            calls.push(key);
++            return data[key];
++        },
++        is(status) {
++            return status === 2;
++        },
++    };
++};
++
++const asHostValue = (value) => JSON.parse(JSON.stringify(value));
++
++const drainQueuedCalls = (mail) => asHostValue(mail.makeRequest()[0]);
++
++const drainUndoData = (mail) => {
++    const data = mail.undoManager.getUndoData();
++    return data === null ? null : asHostValue(data);
++};
++
++const reportCallsByAccount = (calls) => {
++    const result = {};
++    calls.forEach((call) => {
++        assert.equal(call[0], 'Email/report');
++        assert.equal(call.length >= 2, true);
++        assert.equal(Object.hasOwn(result, call[1].accountId), false);
++        result[call[1].accountId] = {
++            ids: call[1].ids,
++            type: call[1].type,
++        };
++    });
++    return result;
++};
++
++const assertReportCalls = (calls, expected) => {
++
++    assert.deepStrictEqual(reportCallsByAccount(calls), expected);
++};
++
++const assertUndoReportsInverse = (JMAP, undoData, expected) => {
++
++    assert.ok(Array.isArray(undoData));
++    assert.equal(undoData.length > 0, true);
++    JMAP.mail.undoManager.applyChange(undoData);
++    assertReportCalls(drainQueuedCalls(JMAP.mail), expected);
++};
++
++test('same-account spam report queues one Email/report call and no undo', () => {
++
++
++    const JMAP = loadPublicJmap();
++    const mail = JMAP.mail;
++    const m1 = loadedMessage('accA', 'e1', 'sk1');
++    const m2 = loadedMessage('accA', 'e2', 'sk2');
++
++    const result = mail.report([m1, m2], true, false);
++
++    assert.strictEqual(result === mail, true);
++    assertReportCalls(drainQueuedCalls(mail), {
++        accA: {
++            ids: ['e1', 'e2'],
++            type: 'spam',
++        },
++    });
++    assert.deepStrictEqual(drainUndoData(mail), null);
++});
++
++test('cross-account not-spam report queues per-account calls and inverse undo data', () => {
++
++
++    const m1 = loadedMessage('accA', 'e1', 'sk1');
++    const m3 = loadedMessage('accB', 'e3', 'sk3');
++    const JMAP = loadPublicJmap({ sk1: m1, sk3: m3 });
++    const mail = JMAP.mail;
++
++    const result = mail.report([m1, m3], false, true);
++
++    assert.strictEqual(result === mail, true);
++    assertReportCalls(drainQueuedCalls(mail), {
++        accA: {
++            ids: ['e1'],
++            type: 'notspam',
++        },
++        accB: {
++            ids: ['e3'],
++            type: 'notspam',
++        },
++    });
++    assertUndoReportsInverse(JMAP, mail.undoManager.getUndoData(), {
++        accA: {
++            ids: ['e1'],
++            type: 'spam',
++        },
++        accB: {
++            ids: ['e3'],
++            type: 'spam',
++        },
++    });
++});
++
++test('mixed-account spam report groups ids per account', () => {
++
++
++    const m1 = loadedMessage('accA', 'e1', 'sk1');
++    const m2 = loadedMessage('accA', 'e2', 'sk2');
++    const m3 = loadedMessage('accB', 'e3', 'sk3');
++    const JMAP = loadPublicJmap({ sk1: m1, sk2: m2, sk3: m3 });
++    const mail = JMAP.mail;
++
++    mail.report([m3, m1, m2], true, true);
++
++    assertReportCalls(drainQueuedCalls(mail), {
++        accA: {
++            ids: ['e1', 'e2'],
++            type: 'spam',
++        },
++        accB: {
++            ids: ['e3'],
++            type: 'spam',
++        },
++    });
++    assertUndoReportsInverse(JMAP, mail.undoManager.getUndoData(), {
++        accA: {
++            ids: ['e1', 'e2'],
++            type: 'notspam',
++        },
++        accB: {
++            ids: ['e3'],
++            type: 'notspam',
++        },
++    });
++});
++
++test('report reads account id, message id, and store key from loaded messages', () => {
++
++
++    const m1 = loadedMessage('accA', 'e1', 'sk1');
++    const JMAP = loadPublicJmap({ sk1: m1 });
++
++    JMAP.mail.report([m1], true, true);
++
++
++    assert.deepStrictEqual(new Set(m1.calls), new Set(['accountId', 'id', 'storeKey']));
++    assertReportCalls(drainQueuedCalls(JMAP.mail), {
++        accA: {
++            ids: ['e1'],
++            type: 'spam',
++        },
++    });
++    assertUndoReportsInverse(JMAP, JMAP.mail.undoManager.getUndoData(), {
++        accA: {
++            ids: ['e1'],
++            type: 'notspam',
++        },
++    });
++});
++
++test('request and undo drains are idempotent after reporting', () => {
++
++
++    const m1 = loadedMessage('accA', 'e1', 'sk1');
++    const JMAP = loadPublicJmap({ sk1: m1 });
++    const mail = JMAP.mail;
++
++    mail.report([m1], true, true);
++
++    assertReportCalls(drainQueuedCalls(mail), {
++        accA: {
++            ids: ['e1'],
++            type: 'spam',
++        },
++    });
++
++    assert.deepStrictEqual(drainQueuedCalls(mail), []);
++    assertUndoReportsInverse(JMAP, mail.undoManager.getUndoData(), {
++        accA: {
++            ids: ['e1'],
++            type: 'notspam',
++        },
++    });
++
++    assert.deepStrictEqual(drainUndoData(mail), null);
++});
++
++test('fresh public mail sessions do not share queued report state', () => {
++
++
++    const m1 = loadedMessage('accA', 'e1', 'sk1');
++    const sessionA = loadPublicJmap({ sk1: m1 });
++    const sessionB = loadPublicJmap();
++
++    sessionA.mail.report([m1], false, true);
++
++    assertReportCalls(drainQueuedCalls(sessionA.mail), {
++        accA: {
++            ids: ['e1'],
++            type: 'notspam',
++        },
++    });
++
++    assert.deepStrictEqual(drainQueuedCalls(sessionB.mail), []);
++    assertUndoReportsInverse(sessionA, sessionA.mail.undoManager.getUndoData(), {
++        accA: {
++            ids: ['e1'],
++            type: 'spam',
++        },
++    });
++
++    assert.deepStrictEqual(drainUndoData(sessionB.mail), null);
++});
++
++test('queued report work and pending undo stay bounded across repeated use and drain cycles', () => {
++
++
++    const m1 = loadedMessage('accA', 'e1', 'sk1');
++    const m3 = loadedMessage('accB', 'e3', 'sk3');
++    const JMAP = loadPublicJmap({ sk1: m1, sk3: m3 });
++    const mail = JMAP.mail;
++
++    for (let i = 0; i < 100; i += 1) {
++        mail.report([m1, m3], false, true);
++        const calls = drainQueuedCalls(mail);
++
++        assert.deepStrictEqual(Object.keys(reportCallsByAccount(calls)).sort(), ['accA', 'accB']);
++        const undoData = mail.undoManager.getUndoData();
++        assertUndoReportsInverse(JMAP, undoData, {
++            accA: {
++                ids: ['e1'],
++                type: 'spam',
++            },
++            accB: {
++                ids: ['e3'],
++                type: 'spam',
++            },
++        });
++        drainQueuedCalls(mail);
++    }
++
++
++    assert.deepStrictEqual(drainQueuedCalls(mail), []);
++    assert.deepStrictEqual(drainUndoData(mail), null);
++});
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,16 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++
++cd /workspace/repo
++
++exec node --test /workspace/repo/usercase-test-coderl/report.test.js

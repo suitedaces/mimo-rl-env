@@ -1,0 +1,805 @@
+diff --git a/pkg/kf/buildpacks/builder_creator_test.go b/pkg/kf/buildpacks/builder_creator_test.go
+deleted file mode 100644
+index b1f53a2aa..000000000
+--- a/pkg/kf/buildpacks/builder_creator_test.go
++++ /dev/null
+@@ -1,86 +0,0 @@
+-// Copyright 2019 Google LLC
+-//
+-// Licensed under the Apache License, Version 2.0 (the "License");
+-// you may not use this file except in compliance with the License.
+-// You may obtain a copy of the License at
+-//
+-//     https://www.apache.org/licenses/LICENSE-2.0
+-//
+-// Unless required by applicable law or agreed to in writing, software
+-// distributed under the License is distributed on an "AS IS" BASIS,
+-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-// See the License for the specific language governing permissions and
+-// limitations under the License.
+-
+-package buildpacks_test
+-
+-import (
+-	"errors"
+-	"testing"
+-
+-	"github.com/GoogleCloudPlatform/kf/pkg/kf/buildpacks"
+-	"github.com/GoogleCloudPlatform/kf/pkg/kf/testutil"
+-	"github.com/buildpack/pack"
+-)
+-
+-func TestBuilderCreator(t *testing.T) {
+-	t.Parallel()
+-
+-	for tn, tc := range map[string]struct {
+-		Dir               string
+-		ContainerRegistry string
+-		ExpectedErr       error
+-		Creator           buildpacks.BuilderFactoryCreate
+-	}{
+-		"empty dir": {
+-			Dir:               "",
+-			ContainerRegistry: "some-reg.io",
+-			ExpectedErr:       errors.New("dir must not be empty"),
+-		},
+-		"empty container registry": {
+-			Dir:               "some-path/builder.toml",
+-			ContainerRegistry: "",
+-			ExpectedErr:       errors.New("containerRegistry must not be empty"),
+-		},
+-		"returns an error if creating fails": {
+-			Dir:               "some-path/builder.toml",
+-			ContainerRegistry: "some-registry.io",
+-			Creator:           func(f pack.CreateBuilderFlags) error { return errors.New("some-error") },
+-			ExpectedErr:       errors.New("some-error"),
+-		},
+-		"sets the flags up": {
+-			Dir:               "some-path/builder.toml",
+-			ContainerRegistry: "some-registry.io",
+-			Creator: func(f pack.CreateBuilderFlags) error {
+-				testutil.AssertEqual(t, "publish", true, f.Publish)
+-				testutil.AssertEqual(t, "BuilderTomlPath", "some-path/builder.toml", f.BuilderTomlPath)
+-				testutil.AssertEqual(t, "RepoName", "some-path/builder.toml", f.BuilderTomlPath)
+-				testutil.AssertRegexp(t, "RepoName", `some-registry.io/buildpack-builder:[0-9]+`, f.RepoName)
+-				return nil
+-			},
+-		},
+-		"appends builder.toml if necessary": {
+-			Dir:               "some-path",
+-			ContainerRegistry: "some-registry.io",
+-			Creator: func(f pack.CreateBuilderFlags) error {
+-				testutil.AssertEqual(t, "BuilderTomlPath", "some-path/builder.toml", f.BuilderTomlPath)
+-				return nil
+-			},
+-		},
+-	} {
+-		t.Run(tn, func(t *testing.T) {
+-			if tc.Creator == nil {
+-				tc.Creator = func(f pack.CreateBuilderFlags) error { return nil }
+-			}
+-
+-			b := buildpacks.NewBuilderCreator(tc.Creator)
+-			image, gotErr := b.Create(tc.Dir, tc.ContainerRegistry)
+-			if gotErr != nil || tc.ExpectedErr != nil {
+-				testutil.AssertErrorsEqual(t, tc.ExpectedErr, gotErr)
+-				return
+-			}
+-
+-			testutil.AssertRegexp(t, "image name", tc.ContainerRegistry+`/buildpack-builder:[0-9]+`, image)
+-		})
+-	}
+-}
+diff --git a/pkg/kf/buildpacks/buildpack_lister_test.go b/pkg/kf/buildpacks/buildpack_lister_test.go
+deleted file mode 100644
+index a81f70286..000000000
+--- a/pkg/kf/buildpacks/buildpack_lister_test.go
++++ /dev/null
+@@ -1,232 +0,0 @@
+-// Copyright 2019 Google LLC
+-//
+-// Licensed under the Apache License, Version 2.0 (the "License");
+-// you may not use this file except in compliance with the License.
+-// You may obtain a copy of the License at
+-//
+-//     https://www.apache.org/licenses/LICENSE-2.0
+-//
+-// Unless required by applicable law or agreed to in writing, software
+-// distributed under the License is distributed on an "AS IS" BASIS,
+-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-// See the License for the specific language governing permissions and
+-// limitations under the License.
+-
+-package buildpacks_test
+-
+-import (
+-	"archive/tar"
+-	"bytes"
+-	"errors"
+-	io "io"
+-	"io/ioutil"
+-	"testing"
+-
+-	"github.com/GoogleCloudPlatform/kf/pkg/kf/buildpacks"
+-	"github.com/GoogleCloudPlatform/kf/pkg/kf/testutil"
+-	"github.com/golang/mock/gomock"
+-	"github.com/google/go-containerregistry/pkg/name"
+-	gcrv1 "github.com/google/go-containerregistry/pkg/v1"
+-	"github.com/google/go-containerregistry/pkg/v1/remote"
+-	build "github.com/knative/build/pkg/apis/build/v1alpha1"
+-	"github.com/knative/build/pkg/client/clientset/versioned/typed/build/v1alpha1/fake"
+-	"k8s.io/apimachinery/pkg/runtime"
+-	ktesting "k8s.io/client-go/testing"
+-)
+-
+-//go:generate mockgen --package=buildpacks_test --copyright_file ../internal/tools/option-builder/LICENSE_HEADER --destination=fake_image_test.go --mock_names=Image=FakeImage,Layer=FakeLayer github.com/google/go-containerregistry/pkg/v1 Image,Layer
+-
+-func TestBuildpackLister(t *testing.T) {
+-	t.Parallel()
+-
+-	for tn, tc := range map[string]struct {
+-		ReactorListErr         error
+-		ExpectedErr            error
+-		EmptyBuildTemplateList bool
+-		HandleListAction       func(t *testing.T, action ktesting.Action)
+-		RemoteImageFetcher     func(t *testing.T, ref name.Reference, options ...remote.ImageOption) (gcrv1.Image, error)
+-		HandleOutput           func(t *testing.T, buildpacks []string)
+-	}{
+-		"list only buildpack build template": {
+-			HandleListAction: func(t *testing.T, action ktesting.Action) {
+-				testutil.AssertEqual(t, "Verb", "list", action.GetVerb())
+-				testutil.AssertEqual(t, "Resource", "clusterbuildtemplates", action.GetResource().Resource)
+-				testutil.AssertEqual(t, "FieldSelector Field", "metadata.name", action.(ktesting.ListActionImpl).ListRestrictions.Fields.Requirements()[0].Field)
+-				testutil.AssertEqual(t, "FieldSelector Value", "buildpack", action.(ktesting.ListActionImpl).ListRestrictions.Fields.Requirements()[0].Value)
+-			},
+-		},
+-		"handles empty list of build templates": {
+-			EmptyBuildTemplateList: true,
+-			ExpectedErr:            nil,
+-		},
+-		"fetch image with default keychain": {
+-			RemoteImageFetcher: func(t *testing.T, ref name.Reference, options ...remote.ImageOption) (gcrv1.Image, error) {
+-				testutil.AssertEqual(t, "image name", "index.docker.io/library/some-image:latest", ref.Name())
+-				fakeImage := NewFakeImage(gomock.NewController(t))
+-				fakeImage.EXPECT().Layers().AnyTimes()
+-				return fakeImage, nil
+-			},
+-		},
+-		"fetching container layers fails": {
+-			ExpectedErr: errors.New("some-error"),
+-			RemoteImageFetcher: func(t *testing.T, ref name.Reference, options ...remote.ImageOption) (gcrv1.Image, error) {
+-				fakeImage := NewFakeImage(gomock.NewController(t))
+-				fakeImage.EXPECT().Layers().Return(nil, errors.New("some-error"))
+-				return fakeImage, nil
+-			},
+-		},
+-		"uncompressing layer fails": {
+-			ExpectedErr: errors.New("some-error"),
+-			RemoteImageFetcher: func(t *testing.T, ref name.Reference, options ...remote.ImageOption) (gcrv1.Image, error) {
+-				fakeLayer := NewFakeLayer(gomock.NewController(t))
+-				fakeLayer.EXPECT().Uncompressed().Return(nil, errors.New("some-error"))
+-
+-				fakeImage := NewFakeImage(gomock.NewController(t))
+-				fakeImage.EXPECT().Layers().Return([]gcrv1.Layer{fakeLayer}, nil)
+-				return fakeImage, nil
+-			},
+-		},
+-		"reads buldpack from order.toml in container": {
+-			RemoteImageFetcher: func(t *testing.T, ref name.Reference, options ...remote.ImageOption) (gcrv1.Image, error) {
+-				testutil.AssertEqual(t, "image name", "index.docker.io/library/some-image:latest", ref.Name())
+-				fakeLayer := NewFakeLayer(gomock.NewController(t))
+-				fakeLayer.EXPECT().Uncompressed().Return(buildTar(t), nil)
+-
+-				fakeImage := NewFakeImage(gomock.NewController(t))
+-				fakeImage.EXPECT().Layers().Return([]gcrv1.Layer{fakeLayer}, nil)
+-				return fakeImage, nil
+-			},
+-			HandleOutput: func(t *testing.T, buildpacks []string) {
+-				testutil.AssertEqual(t, "buildpack", "io.buildpacks.samples.nodejs", buildpacks[0])
+-				testutil.AssertEqual(t, "buildpack", "io.buildpacks.samples.go", buildpacks[1])
+-				testutil.AssertEqual(t, "buildpack", "io.buildpacks.samples.java", buildpacks[2])
+-			},
+-		},
+-		"fetching image fails": {
+-			ExpectedErr: errors.New("some-error"),
+-			RemoteImageFetcher: func(t *testing.T, ref name.Reference, options ...remote.ImageOption) (gcrv1.Image, error) {
+-				return nil, errors.New("some-error")
+-			},
+-		},
+-		"fetching image layers fails": {
+-			ExpectedErr: errors.New("some-error"),
+-			RemoteImageFetcher: func(t *testing.T, ref name.Reference, options ...remote.ImageOption) (gcrv1.Image, error) {
+-				fakeImage := NewFakeImage(gomock.NewController(t))
+-				fakeImage.EXPECT().Layers().Return(nil, errors.New("some-error"))
+-				return fakeImage, nil
+-			},
+-		},
+-		"empty number of layers": {
+-			ExpectedErr: nil, // should not fail
+-			RemoteImageFetcher: func(t *testing.T, ref name.Reference, options ...remote.ImageOption) (gcrv1.Image, error) {
+-				fakeImage := NewFakeImage(gomock.NewController(t))
+-				fakeImage.EXPECT().Layers().Return(nil, nil)
+-				return fakeImage, nil
+-			},
+-		},
+-	} {
+-		t.Run(tn, func(t *testing.T) {
+-			fake := &fake.FakeBuildV1alpha1{
+-				Fake: &ktesting.Fake{},
+-			}
+-
+-			fake.AddReactor("*", "*", ktesting.ReactionFunc(func(action ktesting.Action) (handled bool, ret runtime.Object, err error) {
+-				if tc.HandleListAction != nil {
+-					tc.HandleListAction(t, action)
+-				}
+-
+-				return true, buildTemplateList(tc.EmptyBuildTemplateList), tc.ReactorListErr
+-			}))
+-
+-			l := buildpacks.NewBuildpackLister(fake, func(ref name.Reference, options ...remote.ImageOption) (gcrv1.Image, error) {
+-				if tc.RemoteImageFetcher == nil {
+-					fakeImage := NewFakeImage(gomock.NewController(t))
+-					fakeImage.EXPECT().Layers().AnyTimes()
+-					return fakeImage, nil
+-				}
+-
+-				return tc.RemoteImageFetcher(t, ref, options...)
+-			})
+-
+-			bps, gotErr := l.List()
+-			if gotErr != nil || tc.ExpectedErr != nil {
+-				testutil.AssertErrorsEqual(t, tc.ExpectedErr, gotErr)
+-				return
+-			}
+-
+-			if tc.HandleOutput != nil {
+-				tc.HandleOutput(t, bps)
+-			}
+-		})
+-	}
+-}
+-
+-func buildTemplateList(empty bool) *build.ClusterBuildTemplateList {
+-	if empty {
+-		return &build.ClusterBuildTemplateList{}
+-	}
+-	builderImageDefault := "some-image"
+-	return &build.ClusterBuildTemplateList{
+-		Items: []build.ClusterBuildTemplate{{
+-			Spec: build.BuildTemplateSpec{
+-				Parameters: []build.ParameterSpec{
+-					{
+-						Name: "some-param",
+-					},
+-					{
+-						Name:    "BUILDER_IMAGE",
+-						Default: &builderImageDefault,
+-					},
+-				},
+-			},
+-		}},
+-	}
+-}
+-
+-func buildTar(t *testing.T) io.ReadCloser {
+-	var buf bytes.Buffer
+-	tw := tar.NewWriter(&buf)
+-	var files = []struct {
+-		Name, Body string
+-	}{
+-		{"readme.txt", "This archive contains some text files."},
+-		{"gopher.txt", "Gopher names:\nGeorge\nGeoffrey\nGonzo"},
+-		{"/buildpacks/order.toml", `
+-[[groups]]
+-
+-  [[groups.buildpacks]]
+-    id = "io.buildpacks.samples.nodejs"
+-    version = "latest"
+-
+-[[groups]]
+-
+-  [[groups.buildpacks]]
+-    id = "io.buildpacks.samples.go"
+-    version = "latest"
+-
+-[[groups]]
+-
+-  [[groups.buildpacks]]
+-    id = "io.buildpacks.samples.java"
+-    version = "latest"
+-`},
+-	}
+-	for _, file := range files {
+-		hdr := &tar.Header{
+-			Name: file.Name,
+-			Mode: 0600,
+-			Size: int64(len(file.Body)),
+-		}
+-		if err := tw.WriteHeader(hdr); err != nil {
+-			t.Fatal(err)
+-		}
+-		if _, err := tw.Write([]byte(file.Body)); err != nil {
+-			t.Fatal(err)
+-		}
+-	}
+-	if err := tw.Close(); err != nil {
+-		t.Fatal(err)
+-	}
+-
+-	return ioutil.NopCloser(&buf)
+-}
+diff --git a/pkg/kf/buildpacks/build_template_uploader_test.go b/pkg/kf/buildpacks/client_test.go
+similarity index 51%
+rename from pkg/kf/buildpacks/build_template_uploader_test.go
+rename to pkg/kf/buildpacks/client_test.go
+index 1a0bcd927..ba16aaba3 100644
+--- a/pkg/kf/buildpacks/build_template_uploader_test.go
++++ b/pkg/kf/buildpacks/client_test.go
+@@ -14,12 +14,23 @@
+ 
+ package buildpacks_test
+ 
++//go:generate mockgen --package=buildpacks_test --copyright_file ../internal/tools/option-builder/LICENSE_HEADER --destination=fake_image_test.go --mock_names=Image=FakeImage,Layer=FakeLayer github.com/google/go-containerregistry/pkg/v1 Image,Layer
++
+ import (
++	"archive/tar"
++	"bytes"
+ 	"errors"
++	io "io"
++	"io/ioutil"
+ 	"testing"
+ 
+ 	"github.com/GoogleCloudPlatform/kf/pkg/kf/buildpacks"
+ 	"github.com/GoogleCloudPlatform/kf/pkg/kf/testutil"
++	"github.com/buildpack/pack"
++	gomock "github.com/golang/mock/gomock"
++	"github.com/google/go-containerregistry/pkg/name"
++	gcrv1 "github.com/google/go-containerregistry/pkg/v1"
++	"github.com/google/go-containerregistry/pkg/v1/remote"
+ 	build "github.com/knative/build/pkg/apis/build/v1alpha1"
+ 	"github.com/knative/build/pkg/client/clientset/versioned/typed/build/v1alpha1/fake"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+@@ -27,7 +38,7 @@ import (
+ 	ktesting "k8s.io/client-go/testing"
+ )
+ 
+-func TestBuildTemplateUploader(t *testing.T) {
++func TestClient_UploadBuildTemplate(t *testing.T) {
+ 	t.Parallel()
+ 
+ 	for tn, tc := range map[string]struct {
+@@ -241,8 +252,12 @@ func TestBuildTemplateUploader(t *testing.T) {
+ 				return false, nil, nil
+ 			}))
+ 
+-			u := buildpacks.NewBuildTemplateUploader(fake)
+-			gotErr := u.UploadBuildTemplate(tc.ImageName)
++			c := buildpacks.NewClient(
++				fake,
++				nil,
++				nil,
++			)
++			gotErr := c.UploadBuildTemplate(tc.ImageName)
+ 			if gotErr != nil || tc.ExpectedErr != nil {
+ 				testutil.AssertErrorsEqual(t, tc.ExpectedErr, gotErr)
+ 				return
+@@ -250,3 +265,270 @@ func TestBuildTemplateUploader(t *testing.T) {
+ 		})
+ 	}
+ }
++
++func TestClient_List(t *testing.T) {
++	t.Parallel()
++
++	for tn, tc := range map[string]struct {
++		ReactorListErr         error
++		ExpectedErr            error
++		EmptyBuildTemplateList bool
++		HandleListAction       func(t *testing.T, action ktesting.Action)
++		RemoteImageFetcher     func(t *testing.T, ref name.Reference, options ...remote.ImageOption) (gcrv1.Image, error)
++		HandleOutput           func(t *testing.T, buildpacks []string)
++	}{
++		"list only buildpack build template": {
++			HandleListAction: func(t *testing.T, action ktesting.Action) {
++				testutil.AssertEqual(t, "Verb", "list", action.GetVerb())
++				testutil.AssertEqual(t, "Resource", "clusterbuildtemplates", action.GetResource().Resource)
++				testutil.AssertEqual(t, "FieldSelector Field", "metadata.name", action.(ktesting.ListActionImpl).ListRestrictions.Fields.Requirements()[0].Field)
++				testutil.AssertEqual(t, "FieldSelector Value", "buildpack", action.(ktesting.ListActionImpl).ListRestrictions.Fields.Requirements()[0].Value)
++			},
++		},
++		"handles empty list of build templates": {
++			EmptyBuildTemplateList: true,
++			ExpectedErr:            nil,
++		},
++		"fetch image with default keychain": {
++			RemoteImageFetcher: func(t *testing.T, ref name.Reference, options ...remote.ImageOption) (gcrv1.Image, error) {
++				testutil.AssertEqual(t, "image name", "index.docker.io/library/some-image:latest", ref.Name())
++				fakeImage := NewFakeImage(gomock.NewController(t))
++				fakeImage.EXPECT().Layers().AnyTimes()
++				return fakeImage, nil
++			},
++		},
++		"fetching container layers fails": {
++			ExpectedErr: errors.New("some-error"),
++			RemoteImageFetcher: func(t *testing.T, ref name.Reference, options ...remote.ImageOption) (gcrv1.Image, error) {
++				fakeImage := NewFakeImage(gomock.NewController(t))
++				fakeImage.EXPECT().Layers().Return(nil, errors.New("some-error"))
++				return fakeImage, nil
++			},
++		},
++		"uncompressing layer fails": {
++			ExpectedErr: errors.New("some-error"),
++			RemoteImageFetcher: func(t *testing.T, ref name.Reference, options ...remote.ImageOption) (gcrv1.Image, error) {
++				fakeLayer := NewFakeLayer(gomock.NewController(t))
++				fakeLayer.EXPECT().Uncompressed().Return(nil, errors.New("some-error"))
++
++				fakeImage := NewFakeImage(gomock.NewController(t))
++				fakeImage.EXPECT().Layers().Return([]gcrv1.Layer{fakeLayer}, nil)
++				return fakeImage, nil
++			},
++		},
++		"reads buldpack from order.toml in container": {
++			RemoteImageFetcher: func(t *testing.T, ref name.Reference, options ...remote.ImageOption) (gcrv1.Image, error) {
++				testutil.AssertEqual(t, "image name", "index.docker.io/library/some-image:latest", ref.Name())
++				fakeLayer := NewFakeLayer(gomock.NewController(t))
++				fakeLayer.EXPECT().Uncompressed().Return(buildTar(t), nil)
++
++				fakeImage := NewFakeImage(gomock.NewController(t))
++				fakeImage.EXPECT().Layers().Return([]gcrv1.Layer{fakeLayer}, nil)
++				return fakeImage, nil
++			},
++			HandleOutput: func(t *testing.T, buildpacks []string) {
++				testutil.AssertEqual(t, "buildpack", "io.buildpacks.samples.nodejs", buildpacks[0])
++				testutil.AssertEqual(t, "buildpack", "io.buildpacks.samples.go", buildpacks[1])
++				testutil.AssertEqual(t, "buildpack", "io.buildpacks.samples.java", buildpacks[2])
++			},
++		},
++		"fetching image fails": {
++			ExpectedErr: errors.New("some-error"),
++			RemoteImageFetcher: func(t *testing.T, ref name.Reference, options ...remote.ImageOption) (gcrv1.Image, error) {
++				return nil, errors.New("some-error")
++			},
++		},
++		"fetching image layers fails": {
++			ExpectedErr: errors.New("some-error"),
++			RemoteImageFetcher: func(t *testing.T, ref name.Reference, options ...remote.ImageOption) (gcrv1.Image, error) {
++				fakeImage := NewFakeImage(gomock.NewController(t))
++				fakeImage.EXPECT().Layers().Return(nil, errors.New("some-error"))
++				return fakeImage, nil
++			},
++		},
++		"empty number of layers": {
++			ExpectedErr: nil,
++			RemoteImageFetcher: func(t *testing.T, ref name.Reference, options ...remote.ImageOption) (gcrv1.Image, error) {
++				fakeImage := NewFakeImage(gomock.NewController(t))
++				fakeImage.EXPECT().Layers().Return(nil, nil)
++				return fakeImage, nil
++			},
++		},
++	} {
++		t.Run(tn, func(t *testing.T) {
++			fake := &fake.FakeBuildV1alpha1{
++				Fake: &ktesting.Fake{},
++			}
++
++			fake.AddReactor("*", "*", ktesting.ReactionFunc(func(action ktesting.Action) (handled bool, ret runtime.Object, err error) {
++				if tc.HandleListAction != nil {
++					tc.HandleListAction(t, action)
++				}
++
++				return true, buildTemplateList(tc.EmptyBuildTemplateList), tc.ReactorListErr
++			}))
++
++			rif := func(ref name.Reference, options ...remote.ImageOption) (gcrv1.Image, error) {
++				if tc.RemoteImageFetcher == nil {
++					fakeImage := NewFakeImage(gomock.NewController(t))
++					fakeImage.EXPECT().Layers().AnyTimes()
++					return fakeImage, nil
++				}
++
++				return tc.RemoteImageFetcher(t, ref, options...)
++			}
++
++			c := buildpacks.NewClient(
++				fake,
++				rif,
++				nil,
++			)
++
++			bps, gotErr := c.List()
++			if gotErr != nil || tc.ExpectedErr != nil {
++				testutil.AssertErrorsEqual(t, tc.ExpectedErr, gotErr)
++				return
++			}
++
++			if tc.HandleOutput != nil {
++				tc.HandleOutput(t, bps)
++			}
++		})
++	}
++}
++
++func buildTemplateList(empty bool) *build.ClusterBuildTemplateList {
++	if empty {
++		return &build.ClusterBuildTemplateList{}
++	}
++	builderImageDefault := "some-image"
++	return &build.ClusterBuildTemplateList{
++		Items: []build.ClusterBuildTemplate{{
++			Spec: build.BuildTemplateSpec{
++				Parameters: []build.ParameterSpec{
++					{
++						Name: "some-param",
++					},
++					{
++						Name:    "BUILDER_IMAGE",
++						Default: &builderImageDefault,
++					},
++				},
++			},
++		}},
++	}
++}
++
++func buildTar(t *testing.T) io.ReadCloser {
++	var buf bytes.Buffer
++	tw := tar.NewWriter(&buf)
++	var files = []struct {
++		Name, Body string
++	}{
++		{"readme.txt", "This archive contains some text files."},
++		{"gopher.txt", "Gopher names:\nGeorge\nGeoffrey\nGonzo"},
++		{"/buildpacks/order.toml", `
++[[groups]]
++
++  [[groups.buildpacks]]
++    id = "io.buildpacks.samples.nodejs"
++    version = "latest"
++
++[[groups]]
++
++  [[groups.buildpacks]]
++    id = "io.buildpacks.samples.go"
++    version = "latest"
++
++[[groups]]
++
++  [[groups.buildpacks]]
++    id = "io.buildpacks.samples.java"
++    version = "latest"
++`},
++	}
++	for _, file := range files {
++		hdr := &tar.Header{
++			Name: file.Name,
++			Mode: 0600,
++			Size: int64(len(file.Body)),
++		}
++		if err := tw.WriteHeader(hdr); err != nil {
++			t.Fatal(err)
++		}
++		if _, err := tw.Write([]byte(file.Body)); err != nil {
++			t.Fatal(err)
++		}
++	}
++	if err := tw.Close(); err != nil {
++		t.Fatal(err)
++	}
++
++	return ioutil.NopCloser(&buf)
++}
++
++func TestClient_Create(t *testing.T) {
++	t.Parallel()
++
++	for tn, tc := range map[string]struct {
++		Dir               string
++		ContainerRegistry string
++		ExpectedErr       error
++		Creator           buildpacks.BuilderFactoryCreate
++	}{
++		"empty dir": {
++			Dir:               "",
++			ContainerRegistry: "some-reg.io",
++			ExpectedErr:       errors.New("dir must not be empty"),
++		},
++		"empty container registry": {
++			Dir:               "some-path/builder.toml",
++			ContainerRegistry: "",
++			ExpectedErr:       errors.New("containerRegistry must not be empty"),
++		},
++		"returns an error if creating fails": {
++			Dir:               "some-path/builder.toml",
++			ContainerRegistry: "some-registry.io",
++			Creator:           func(f pack.CreateBuilderFlags) error { return errors.New("some-error") },
++			ExpectedErr:       errors.New("some-error"),
++		},
++		"sets the flags up": {
++			Dir:               "some-path/builder.toml",
++			ContainerRegistry: "some-registry.io",
++			Creator: func(f pack.CreateBuilderFlags) error {
++				testutil.AssertEqual(t, "publish", true, f.Publish)
++				testutil.AssertEqual(t, "BuilderTomlPath", "some-path/builder.toml", f.BuilderTomlPath)
++				testutil.AssertEqual(t, "RepoName", "some-path/builder.toml", f.BuilderTomlPath)
++				testutil.AssertRegexp(t, "RepoName", `some-registry.io/buildpack-builder:[0-9]+`, f.RepoName)
++				return nil
++			},
++		},
++		"appends builder.toml if necessary": {
++			Dir:               "some-path",
++			ContainerRegistry: "some-registry.io",
++			Creator: func(f pack.CreateBuilderFlags) error {
++				testutil.AssertEqual(t, "BuilderTomlPath", "some-path/builder.toml", f.BuilderTomlPath)
++				return nil
++			},
++		},
++	} {
++		t.Run(tn, func(t *testing.T) {
++			if tc.Creator == nil {
++				tc.Creator = func(f pack.CreateBuilderFlags) error { return nil }
++			}
++
++			c := buildpacks.NewClient(
++				nil,
++				nil,
++				tc.Creator,
++			)
++			image, gotErr := c.Create(tc.Dir, tc.ContainerRegistry)
++			if gotErr != nil || tc.ExpectedErr != nil {
++				testutil.AssertErrorsEqual(t, tc.ExpectedErr, gotErr)
++				return
++			}
++
++			testutil.AssertRegexp(t, "image name", tc.ContainerRegistry+`/buildpack-builder:[0-9]+`, image)
++		})
++	}
++}
+diff --git a/pkg/kf/commands/buildpacks/buildpacks_test.go b/pkg/kf/commands/buildpacks/buildpacks_test.go
+index 39e2092fe..2da2a52d0 100644
+--- a/pkg/kf/commands/buildpacks/buildpacks_test.go
++++ b/pkg/kf/commands/buildpacks/buildpacks_test.go
+@@ -33,7 +33,7 @@ func TestBuildpacks(t *testing.T) {
+ 		Namespace   string
+ 		ExpectedErr error
+ 		Args        []string
+-		Setup       func(t *testing.T, fake *fake.FakeBuildpackLister)
++		Setup       func(t *testing.T, fake *fake.FakeClient)
+ 		BufferF     func(t *testing.T, buffer *bytes.Buffer)
+ 	}{
+ 		"wrong number of args": {ExpectedErr: errors.New("accepts 0 arg(s), received 1"),
+@@ -41,12 +41,12 @@ func TestBuildpacks(t *testing.T) {
+ 		},
+ 		"listing failes": {
+ 			ExpectedErr: errors.New("some-error"),
+-			Setup: func(t *testing.T, fake *fake.FakeBuildpackLister) {
++			Setup: func(t *testing.T, fake *fake.FakeClient) {
+ 				fake.EXPECT().List().Return(nil, errors.New("some-error"))
+ 			},
+ 		},
+ 		"lists each buildpack": {
+-			Setup: func(t *testing.T, fake *fake.FakeBuildpackLister) {
++			Setup: func(t *testing.T, fake *fake.FakeClient) {
+ 				fake.EXPECT().List().Return([]string{"bp-1", "bp-2"}, nil)
+ 			},
+ 			BufferF: func(t *testing.T, buffer *bytes.Buffer) {
+@@ -56,7 +56,7 @@ func TestBuildpacks(t *testing.T) {
+ 	} {
+ 		t.Run(tn, func(t *testing.T) {
+ 			ctrl := gomock.NewController(t)
+-			fake := fake.NewFakeBuildpackLister(ctrl)
++			fake := fake.NewFakeClient(ctrl)
+ 
+ 			if tc.Setup != nil {
+ 				tc.Setup(t, fake)
+diff --git a/pkg/kf/commands/buildpacks/upload_buildpacks_test.go b/pkg/kf/commands/buildpacks/upload_buildpacks_test.go
+index 12f7735af..4d71bfb78 100644
+--- a/pkg/kf/commands/buildpacks/upload_buildpacks_test.go
++++ b/pkg/kf/commands/buildpacks/upload_buildpacks_test.go
+@@ -35,69 +35,67 @@ func TestUploadBuildpacks(t *testing.T) {
+ 	for tn, tc := range map[string]struct {
+ 		Namespace   string
+ 		ExpectedErr error
+-		Setup       func(t *testing.T, c *cobra.Command, fakeBuilderCreator *fake.FakeBuilderCreator, fakeBuildTemplateUploader *fake.FakeBuildTemplateUploader)
++		Setup       func(t *testing.T, c *cobra.Command, fakeClient *fake.FakeClient)
+ 	}{
+ 		"uses correct container registry and path": {
+-			Setup: func(t *testing.T, c *cobra.Command, fakeBuilderCreator *fake.FakeBuilderCreator, fakeBuildTemplateUploader *fake.FakeBuildTemplateUploader) {
++			Setup: func(t *testing.T, c *cobra.Command, fakeClient *fake.FakeClient) {
+ 				c.Flags().Set("path", "/some-path")
+ 				c.Flags().Set("container-registry", "some-registry.io")
+-				fakeBuilderCreator.EXPECT().Create("/some-path", "some-registry.io").Return("some-image", nil)
+-				fakeBuildTemplateUploader.EXPECT().UploadBuildTemplate("some-image")
++				fakeClient.EXPECT().Create("/some-path", "some-registry.io").Return("some-image", nil)
++				fakeClient.EXPECT().UploadBuildTemplate("some-image")
+ 			},
+ 		},
+ 		"converts relative path to absolute": {
+-			Setup: func(t *testing.T, c *cobra.Command, fakeBuilderCreator *fake.FakeBuilderCreator, fakeBuildTemplateUploader *fake.FakeBuildTemplateUploader) {
++			Setup: func(t *testing.T, c *cobra.Command, fakeClient *fake.FakeClient) {
+ 				c.Flags().Set("path", "some-path")
+-				fakeBuilderCreator.EXPECT().Create(gomock.Any(), gomock.Any()).Do(func(path, containerRegistry string) {
++				fakeClient.EXPECT().Create(gomock.Any(), gomock.Any()).Do(func(path, containerRegistry string) {
+ 					if !filepath.IsAbs(path) {
+ 						t.Fatalf("expetec path to be absolute: %s", path)
+ 					}
+ 				})
+-				fakeBuildTemplateUploader.EXPECT().UploadBuildTemplate(gomock.Any())
++				fakeClient.EXPECT().UploadBuildTemplate(gomock.Any())
+ 			},
+ 		},
+ 		"converts empty path to current directory": {
+-			Setup: func(t *testing.T, c *cobra.Command, fakeBuilderCreator *fake.FakeBuilderCreator, fakeBuildTemplateUploader *fake.FakeBuildTemplateUploader) {
++			Setup: func(t *testing.T, c *cobra.Command, fakeClient *fake.FakeClient) {
+ 				cwd, err := os.Getwd()
+ 				if err != nil {
+ 					t.Fatal(err)
+ 				}
+-				fakeBuilderCreator.EXPECT().Create(cwd, gomock.Any())
+-				fakeBuildTemplateUploader.EXPECT().UploadBuildTemplate(gomock.Any())
++				fakeClient.EXPECT().Create(cwd, gomock.Any())
++				fakeClient.EXPECT().UploadBuildTemplate(gomock.Any())
+ 			},
+ 		},
+ 		"returns error when upload fails": {
+ 			ExpectedErr: errors.New("some-error"),
+-			Setup: func(t *testing.T, c *cobra.Command, fakeBuilderCreator *fake.FakeBuilderCreator, fakeBuildTemplateUploader *fake.FakeBuildTemplateUploader) {
++			Setup: func(t *testing.T, c *cobra.Command, fakeClient *fake.FakeClient) {
+ 				c.Flags().Set("path", "/some-path")
+ 				c.Flags().Set("container-registry", "some-registry.io")
+-				fakeBuilderCreator.EXPECT().Create("/some-path", "some-registry.io")
+-				fakeBuildTemplateUploader.EXPECT().UploadBuildTemplate(gomock.Any()).Return(errors.New("some-error"))
++				fakeClient.EXPECT().Create("/some-path", "some-registry.io")
++				fakeClient.EXPECT().UploadBuildTemplate(gomock.Any()).Return(errors.New("some-error"))
+ 			},
+ 		},
+ 		"returns error when create fails": {
+ 			ExpectedErr: errors.New("some-error"),
+-			Setup: func(t *testing.T, c *cobra.Command, fakeBuilderCreator *fake.FakeBuilderCreator, fakeBuildTemplateUploader *fake.FakeBuildTemplateUploader) {
+-				fakeBuilderCreator.EXPECT().Create(gomock.Any(), gomock.Any()).Return("", errors.New("some-error"))
++			Setup: func(t *testing.T, c *cobra.Command, fakeClient *fake.FakeClient) {
++				fakeClient.EXPECT().Create(gomock.Any(), gomock.Any()).Return("", errors.New("some-error"))
+ 			},
+ 		},
+ 	} {
+ 		t.Run(tn, func(t *testing.T) {
+ 			ctrl := gomock.NewController(t)
+-			fakeBuilderCreator := fake.NewFakeBuilderCreator(ctrl)
+-			fakeBuildTemplateUploader := fake.NewFakeBuildTemplateUploader(ctrl)
++			fakeClient := fake.NewFakeClient(ctrl)
+ 
+ 			c := cbuildpacks.NewUploadBuildpacks(
+ 				&config.KfParams{
+ 					Namespace: tc.Namespace,
+ 					Output:    &bytes.Buffer{},
+ 				},
+-				fakeBuilderCreator,
+-				fakeBuildTemplateUploader,
++				fakeClient,
+ 			)
+ 
+ 			if tc.Setup != nil {
+-				tc.Setup(t, c, fakeBuilderCreator, fakeBuildTemplateUploader)
++				tc.Setup(t, c, fakeClient)
+ 			}
+ 
+ 			gotErr := c.Execute()
+diff --git a/mimo_build_env.tar.gz.b64 b/mimo_build_env.tar.gz.b64
+new file mode 100644
+--- /dev/null
++++ b/mimo_build_env.tar.gz.b64
+@@ -0,0 +1,4 @@
++H4sIAAAAAAAAA+3SWQrCMBSF4Tx3FVlB0sSmLqd0cqB2wLSu37aISkF9UUT8v5d7SS4k4URlw/5Q
++JGVz0uJTwtHaubmOlnXujbPGWhvFNhahMXG4EtJ97EZ3Bt+nRynFsW37Z3Ov9n+UuuXfl75P8rau
++06ZQfve+M17lb4y75h9NcyaKTSRk+L4rPPbn+eeFnIPPyiLYtnJqpdJdtdXVRs9/o0vzymul1G39
++8kn8YiD49mMAAAAAAAAAAAAAAACAP3MG4DifjwAoAAA=
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,6 @@
++#!/usr/bin/env bash
++
++set -uo pipefail
++cd /testbed || exit 1
++base64 -d mimo_build_env.tar.gz.b64 | tar -xzf - -C /testbed || exit 1
++exec bash -lc 'cd /testbed && bash -eo pipefail /testbed/.build_env/test_command.sh'

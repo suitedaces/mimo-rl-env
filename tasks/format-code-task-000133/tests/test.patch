@@ -1,0 +1,421 @@
+diff --git a/app/common/__tests__/network.test.js b/app/common/__tests__/network.test.js
+index f3bde7a5c..ac19db890 100644
+--- a/app/common/__tests__/network.test.js
++++ b/app/common/__tests__/network.test.js
+@@ -1,6 +1,10 @@
+ import * as networkUtils from '../network';
+ import * as db from '../database';
+ import nock from 'nock';
++import dns from 'dns';
++import fs from 'fs';
++import http from 'http';
++import https from 'https';
+ import {resolve as pathResolve, join as pathJoin} from 'path';
+ import {getRenderedRequest} from '../render';
+ import * as models from '../../models';
+@@ -127,7 +131,7 @@ describe('actuallySend()', () => {
+       cookies
+     });
+ 
+-    mock = nock('http://[::1]:80')
++    mock = nock('http://localhost')
+       .matchHeader('Content-Type', 'application/json')
+       .matchHeader('Authorization', 'Basic dXNlcjpwYXNz')
+       .matchHeader('Cookie', 'foo=barrrrr')
+@@ -160,7 +164,7 @@ describe('actuallySend()', () => {
+       settings
+     );
+ 
+-    expect(mock.basePath).toBe('http://::1:80');
++    expect(mock.basePath).toBe('http://localhost:80');
+     expect(response.error).toBe('');
+     expect(response.url).toBe('http://localhost/?foo%20bar=hello%26world');
+     expect(response.body).toBe(new Buffer('response body').toString('base64'));
+@@ -174,7 +178,7 @@ describe('actuallySend()', () => {
+     const settings = await models.settings.create();
+     await models.cookieJar.create({parentId: workspace._id});
+ 
+-    mock = nock('http://[::1]:80')
++    mock = nock('http://localhost')
+       .matchHeader('Content-Type', 'application/octet-stream')
+       .post('/', 'Hello World!')
+       .reply(200, 'response body')
+@@ -199,7 +203,7 @@ describe('actuallySend()', () => {
+       settings
+     );
+ 
+-    expect(mock.basePath).toBe('http://::1:80');
++    expect(mock.basePath).toBe('http://localhost:80');
+     expect(response.error).toBe('');
+     expect(response.url).toBe('http://localhost/');
+     expect(response.body).toBe(new Buffer('response body').toString('base64'));
+@@ -214,7 +218,7 @@ describe('actuallySend()', () => {
+     await models.cookieJar.create({parentId: workspace._id});
+     const fileName = pathResolve(pathJoin(__dirname, './testfile.txt'));
+     let requestBody = 'n/a';
+-    mock = nock('http://[::1]:80')
++    mock = nock('http://localhost')
+       .matchHeader('Content-Type', /^multipart\/form-data/)
+       .post('/', body => {
+         requestBody = body;
+@@ -249,7 +253,7 @@ describe('actuallySend()', () => {
+       settings
+     );
+ 
+-    expect(mock.basePath).toBe('http://::1:80');
++    expect(mock.basePath).toBe('http://localhost:80');
+     expect(response.error).toBe('');
+     expect(response.url).toBe('http://localhost/');
+     expect(response.body).toBe(new Buffer('response body').toString('base64'));
+@@ -269,4 +273,272 @@ describe('actuallySend()', () => {
+     expect(lines[9]).toMatch(/^----------------------------\d{24}--/);
+     expect(lines[10]).toBe('');
+   });
++
++  it('preserves the requested hostname for virtual-host routing', async () => {
++    const originalLookup = dns.lookup;
++    let server;
++    const loopback = await new Promise((resolve, reject) => {
++      originalLookup('127.0.0.1', (err, address, family) => err ? reject(err) : resolve({address, family}));
++    });
++    dns.lookup = (hostname, options, callback) => {
++      const cb = typeof options === 'function' ? options : callback;
++      const wantsAll = options && options.all;
++      const result = {address: '127.0.0.1', family: loopback.family};
++
++      if (wantsAll) {
++        cb(null, [result]);
++      } else {
++        cb(null, result.address, result.family);
++      }
++    };
++
++    try {
++      const workspace = await models.workspace.create();
++      const settings = await models.settings.create();
++      await models.cookieJar.create({parentId: workspace._id});
++
++      server = await new Promise(resolve => {
++        const s = http.createServer((req, res) => {
++          const host = req.headers.host || '';
++
++          if (req.url === '/virtual-host-check' && /^alpha\.insomnia\.test:/.test(host)) {
++            res.writeHead(200);
++            res.end('alpha-vhost-response');
++          } else if (req.url === '/virtual-host-check' && /^beta\.insomnia\.test:/.test(host)) {
++            res.writeHead(200);
++            res.end('beta-vhost-response');
++          } else {
++            res.writeHead(421);
++            res.end(`wrong-vhost:${host}`);
++          }
++        });
++
++        s.listen(0, '127.0.0.1', () => resolve(s));
++      });
++
++      const port = server.address().port;
++
++      const alphaRequest = await models.request.create({
++        parentId: workspace._id,
++        method: 'GET',
++        url: `http://alpha.insomnia.test:${port}/virtual-host-check`,
++      });
++
++      const betaRequest = await models.request.create({
++        parentId: workspace._id,
++        method: 'GET',
++        url: `http://beta.insomnia.test:${port}/virtual-host-check`,
++      });
++
++      const alphaResponse = await networkUtils._actuallySend(
++        await getRenderedRequest(alphaRequest),
++        workspace,
++        settings
++      );
++
++      const betaResponse = await networkUtils._actuallySend(
++        await getRenderedRequest(betaRequest),
++        workspace,
++        settings
++      );
++
++      expect(alphaResponse.error).toBe('');
++      expect(betaResponse.error).toBe('');
++      expect(alphaResponse.body).toBe(new Buffer('alpha-vhost-response').toString('base64'));
++      expect(betaResponse.body).toBe(new Buffer('beta-vhost-response').toString('base64'));
++    } finally {
++      dns.lookup = originalLookup;
++      if (server) {
++        server.close();
++      }
++    }
++  });
++
++  it('preserves the requested hostname for HTTPS virtual-host routing', async () => {
++    const originalLookup = dns.lookup;
++    let server;
++    const loopback = await new Promise((resolve, reject) => {
++      originalLookup('127.0.0.1', (err, address, family) => err ? reject(err) : resolve({address, family}));
++    });
++    dns.lookup = (hostname, options, callback) => {
++      const cb = typeof options === 'function' ? options : callback;
++      const wantsAll = options && options.all;
++      const result = {address: '127.0.0.1', family: loopback.family};
++
++      if (wantsAll) {
++        cb(null, [result]);
++      } else {
++        cb(null, result.address, result.family);
++      }
++    };
++
++    try {
++      const workspace = await models.workspace.create();
++      const settings = await models.settings.create({validateSSL: false});
++      await models.cookieJar.create({parentId: workspace._id});
++
++      const key = fs.readFileSync(pathResolve(pathJoin(
++        __dirname,
++        '../../../node_modules/webpack-dev-server/ssl/server.key'
++      )));
++      const cert = fs.readFileSync(pathResolve(pathJoin(
++        __dirname,
++        '../../../node_modules/webpack-dev-server/ssl/server.crt'
++      )));
++
++      server = await new Promise(resolve => {
++        const s = https.createServer({key, cert}, (req, res) => {
++          const host = req.headers.host || '';
++          const servername = req.socket.servername || '';
++
++          if (
++            req.url === '/secure-host-check' &&
++            /^tls\.insomnia\.test:/.test(host) &&
++            servername === 'tls.insomnia.test'
++          ) {
++            res.writeHead(200);
++            res.end('tls-vhost-response');
++          } else {
++            res.writeHead(421);
++            res.end(`wrong-tls-vhost:${host}:${servername}`);
++          }
++        });
++
++        s.listen(0, '127.0.0.1', () => resolve(s));
++      });
++
++      const port = server.address().port;
++      const request = await models.request.create({
++        parentId: workspace._id,
++        method: 'GET',
++        url: `https://tls.insomnia.test:${port}/secure-host-check`,
++      });
++
++      const response = await networkUtils._actuallySend(
++        await getRenderedRequest(request),
++        workspace,
++        settings
++      );
++
++      expect(response.error).toBe('');
++      expect(response.body).toBe(new Buffer('tls-vhost-response').toString('base64'));
++    } finally {
++      dns.lookup = originalLookup;
++      if (server) {
++        server.close();
++      }
++    }
++  });
++
++  it('keeps cookie jar state across redirects and writes response cookies back', async () => {
++    const originalLookup = dns.lookup;
++    let server;
++    const loopback = await new Promise((resolve, reject) => {
++      originalLookup('127.0.0.1', (err, address, family) => err ? reject(err) : resolve({address, family}));
++    });
++    dns.lookup = (hostname, options, callback) => {
++      const cb = typeof options === 'function' ? options : callback;
++      const wantsAll = options && options.all;
++      const result = {address: '127.0.0.1', family: loopback.family};
++
++      if (wantsAll) {
++        cb(null, [result]);
++      } else {
++        cb(null, result.address, result.family);
++      }
++    };
++
++    try {
++      const workspace = await models.workspace.create();
++      const settings = await models.settings.create();
++      const nonce = `${Date.now()}${Math.floor(Math.random() * 100000)}`;
++      const seedName = `seed_${nonce}`;
++      const seedValue = `seed-value-${nonce}`;
++      const redirectName = `redirect_${nonce}`;
++      const redirectValue = `redirect-value-${nonce}`;
++
++      const cookieJar = await models.cookieJar.create({
++        parentId: workspace._id,
++        cookies: [
++          {
++            key: seedName,
++            value: seedValue,
++            domain: 'cookie-flow.insomnia.test',
++            path: '/',
++            secure: false,
++            httpOnly: false,
++            expires: new Date('2096-10-12T04:40:49.000Z'),
++          },
++        ],
++      });
++
++      let firstHopCookie = '';
++      let secondHopCookie = '';
++      server = await new Promise(resolve => {
++        const s = http.createServer((req, res) => {
++          if (req.url === '/start') {
++            firstHopCookie = req.headers.cookie || '';
++            if (!firstHopCookie.includes(`${seedName}=${seedValue}`)) {
++              res.writeHead(400);
++              res.end('missing-seed-cookie');
++              return;
++            }
++
++            res.writeHead(302, {
++              Location: '/after-redirect',
++              'Set-Cookie': `${redirectName}=${redirectValue}; Path=/`,
++            });
++            res.end();
++          } else if (req.url === '/after-redirect') {
++            secondHopCookie = req.headers.cookie || '';
++            if (
++              secondHopCookie.includes(`${seedName}=${seedValue}`) &&
++              secondHopCookie.includes(`${redirectName}=${redirectValue}`)
++            ) {
++              res.writeHead(200);
++              res.end('redirected-cookie-ok');
++            } else {
++              res.writeHead(400);
++              res.end('missing-redirect-cookie');
++            }
++          } else {
++            res.writeHead(404);
++            res.end('not-found');
++          }
++        });
++
++        s.listen(0, '127.0.0.1', () => resolve(s));
++      });
++
++      const port = server.address().port;
++
++      const request = await models.request.create({
++        parentId: workspace._id,
++        method: 'GET',
++        url: `http://cookie-flow.insomnia.test:${port}/start`,
++      });
++
++      const response = await networkUtils._actuallySend(
++        await getRenderedRequest(request),
++        workspace,
++        settings
++      );
++
++      const updatedJar = await models.cookieJar.getById(cookieJar._id);
++      const storedCookie = updatedJar.cookies.find(cookie => cookie.key === redirectName);
++
++      expect(firstHopCookie).toContain(`${seedName}=${seedValue}`);
++      expect(secondHopCookie).toContain(`${seedName}=${seedValue}`);
++      expect(secondHopCookie).toContain(`${redirectName}=${redirectValue}`);
++      expect(response.error).toBe('');
++      expect(response.body).toBe(new Buffer('redirected-cookie-ok').toString('base64'));
++      expect(storedCookie).toBeTruthy();
++      expect(storedCookie.value).toBe(redirectValue);
++    } finally {
++      dns.lookup = originalLookup;
++      if (server) {
++        server.close();
++      }
++    }
++  });
+ });
+diff --git a/app/models/__mocks__/uuid.js b/app/models/__mocks__/uuid.js
+index 87359ac75..5a50fc8b2 100644
+--- a/app/models/__mocks__/uuid.js
++++ b/app/models/__mocks__/uuid.js
+@@ -24,7 +24,37 @@ const uuids = [
+   '884b5a86-5e6d-49ef-8bea-b5dcb7564cdc',
+   '2fea36e5-4e92-4da6-8088-2821f580cf20',
+   '1e310193-7209-430d-9ed2-f8d73ec932b5',
+-  '9996a7f7-ff6a-414e-9a75-2adadbde88a9'
++  '9996a7f7-ff6a-414e-9a75-2adadbde88a9',
++  '50b9c66c-5359-4ef1-a4cf-a4efc75c4e40',
++  'cd80dc20-25b6-45b9-8cf4-ad3616632194',
++  '4f4d6cbd-72eb-4af8-bf48-61748c8f3ded',
++  '2cf858b1-38ee-4066-96d3-784efbcd8749',
++  '0f160c37-6da9-468d-9f6e-2237d20ce645',
++  'c02e3a38-19c1-4fce-9747-745c9aa5c6d4',
++  '29fdc38d-d8c3-43a6-b3bb-ad1ac533d9fe',
++  '7add3a5c-c66f-41c4-a15b-92718b16d08a',
++  'f6d132ac-276e-44fc-93a9-4f4ff9103645',
++  'c6f08e09-c598-441b-ac67-ce446b33460c',
++  '0b187758-a5f8-44e0-a3ce-8d32d2e2d731',
++  'f7c23854-e202-48ac-80fc-8f2cd6e69cdf',
++  '422cb833-02cf-492f-a96c-61a9d7e98c50',
++  '23e61f2d-6bc5-4d53-91b4-5a50c3019100',
++  '5d4c56f8-c9f6-4a3d-ae19-3654df7c24a9',
++  'd5a31c7b-9f61-47e5-bca3-65f5b98d14db',
++  'c2a9de66-3385-41bc-bd26-b3bc260841b5',
++  'be353d88-03d9-43d1-a021-f6bed08da499',
++  '7c5f6382-892b-48f0-a287-2d27d4f8577b',
++  '426b8c1b-7d1e-43ef-a0eb-491221a5d90d',
++  '131d4bde-1a52-476c-9efc-37661346c833',
++  '704c7201-e2a8-4b77-9f64-f826d8ddaf56',
++  '83f1086b-a010-44b0-890f-1d2243efec90',
++  'f43218dd-6c3c-43b6-a676-ee43902f61e7',
++  '01f76472-b6a0-4f71-a412-a648cf254fc7',
++  '6c39b723-6a21-40e2-a608-290856d1d901',
++  '1d078a0c-8780-45d0-94f3-c35229f620ab',
++  '51bc2a2c-73da-4f8e-a40b-974ebd1e6d3e',
++  '51e3d820-fc56-45d3-bc13-35acaad958d4',
++  '52ca9bd7-f98d-49d0-b536-9d4aab57444e'
+ ];
+ 
+ function v4 () {
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,31 @@
++#!/bin/bash
++set -uo pipefail
++cd /testbed
++
++
++dev-switch node 20 2>/dev/null || true
++
++if [ ! -d node_modules ]; then
++  cp package.json /tmp/package.json.orig
++  sed -i 's|"httpsnippet": "git@github.com:getinsomnia/httpsnippet.git#a3a2c0a0167fa844bf92df52a1442fa1d68a9053"|"httpsnippet": "2.0.0"|' package.json
++  sed -i 's|"srp": "git@github.com:getinsomnia/srp-js.git#6ebd8c3acfbcf69645e4c6e6f8f6b55138ff22c3"|"srp": "0.2.0"|' package.json
++  git config --global url."https://github.com/".insteadOf "git@github.com:" 2>/dev/null || true
++  npm install --legacy-peer-deps --ignore-scripts
++  cp /tmp/package.json.orig package.json
++fi
++
++
++case "${1:-}" in
++  base)
++    npx jest --silent --testPathPattern="app/common/__tests__/network\\.test\\.js" \
++      --testNamePattern="builds a default config|builds a complex config"
++    ;;
++  new)
++    npx jest --silent --testPathPattern="app/common/__tests__/network\\.test\\.js" \
++      --testNamePattern="does something|sends a file|sends multipart form data|preserves the requested hostname for virtual-host routing|preserves the requested hostname for HTTPS virtual-host routing|keeps cookie jar state across redirects and writes response cookies back"
++    ;;
++  *)
++    echo "usage: $0 base|new"
++    exit 2
++    ;;
++esac

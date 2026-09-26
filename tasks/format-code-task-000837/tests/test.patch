@@ -1,0 +1,637 @@
+diff --git a/usercase-test-coderl/log_stream_reader_test.go b/usercase-test-coderl/log_stream_reader_test.go
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/log_stream_reader_test.go
+@@ -0,0 +1,602 @@
++package usercase_test_coderl
++
++import (
++	"bytes"
++	"encoding/binary"
++	stdErrors "errors"
++	"fmt"
++	"os"
++	"path/filepath"
++	"runtime"
++	"testing"
++	"time"
++
++	"github.com/dropbox/godropbox/database/binlog"
++	mysql_proto "github.com/dropbox/godropbox/proto/mysql"
++)
++
++
++
++
++
++const (
++	binPrefix   = "bin."
++	relayPrefix = "relay."
++)
++
++type streamFiles struct {
++	files  map[string][]byte
++	opened []string
++}
++
++func newStreamFiles() *streamFiles {
++	return &streamFiles{files: make(map[string][]byte)}
++}
++
++func (s *streamFiles) add(prefix string, num uint, writers ...func(*bytes.Buffer)) {
++	s.files[logName(prefix, num)] = makeLogFile(writers...)
++}
++
++func (s *streamFiles) creator(
++	dir string,
++	file string,
++	parsers binlog.V4EventParserMap) (binlog.EventReader, error) {
++
++	s.opened = append(s.opened, file)
++	data, ok := s.files[file]
++	if !ok {
++		return nil, fmt.Errorf("missing %s/%s", dir, file)
++	}
++	return binlog.NewLogFileV4EventReader(
++		bytes.NewReader(data),
++		file,
++		parsers,
++		testLogger()), nil
++}
++
++func testLogger() binlog.Logger {
++	return binlog.Logger{
++		Fatalf: func(pattern string, values ...interface{}) {
++			panic(fmt.Sprintf(pattern, values...))
++		},
++		Infof:        func(string, ...interface{}) {},
++		VerboseInfof: func(string, ...interface{}) {},
++	}
++}
++
++func logName(prefix string, num uint) string {
++	return fmt.Sprintf("%s%06d", prefix, num)
++}
++
++func makeLogFile(writers ...func(*bytes.Buffer)) []byte {
++	buf := bytes.NewBuffer([]byte{0xfe, 'b', 'i', 'n'})
++	writeFDE(buf)
++	for _, write := range writers {
++		write(buf)
++	}
++	return append([]byte(nil), buf.Bytes()...)
++}
++
++func writeEvent(buf *bytes.Buffer, eventType mysql_proto.LogEventType_Type, data []byte) {
++	eventBytes, err := binlog.CreateEventBytes(
++		0,
++		uint8(eventType),
++		1,
++		uint32(buf.Len()+19+len(data)),
++		1,
++		data)
++	if err != nil {
++		panic(err)
++	}
++	buf.Write(eventBytes)
++}
++
++func writeFDE(buf *bytes.Buffer) {
++	writeEvent(buf, mysql_proto.LogEventType_FORMAT_DESCRIPTION_EVENT, []byte{
++		4, 0,
++		53, 46, 53, 46, 51, 52, 45, 51, 50, 46,
++		48, 45, 108, 111, 103, 0, 0, 0, 0, 0,
++		0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++		0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++		0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++		0, 0, 0, 0,
++		19,
++		56, 13, 0, 8, 0, 18, 0, 4, 4, 4, 4, 18, 0, 0, 84, 0, 4,
++		26, 8, 0, 0, 0, 8, 8, 8, 2, 0,
++	})
++}
++
++func xid(id uint64) func(*bytes.Buffer) {
++	return func(buf *bytes.Buffer) {
++		data := &bytes.Buffer{}
++		if err := binary.Write(data, binary.LittleEndian, id); err != nil {
++			panic(err)
++		}
++		writeEvent(buf, mysql_proto.LogEventType_XID_EVENT, data.Bytes())
++	}
++}
++
++func rotate(prefix string, num uint) func(*bytes.Buffer) {
++	return rotateName(logName(prefix, num))
++}
++
++func rotateName(name string) func(*bytes.Buffer) {
++	return func(buf *bytes.Buffer) {
++		data := &bytes.Buffer{}
++		if err := binary.Write(data, binary.LittleEndian, uint64(4)); err != nil {
++			panic(err)
++		}
++		data.WriteString(name)
++		writeEvent(buf, mysql_proto.LogEventType_ROTATE_EVENT, data.Bytes())
++	}
++}
++
++func stop() func(*bytes.Buffer) {
++	return func(buf *bytes.Buffer) {
++		writeEvent(buf, mysql_proto.LogEventType_STOP_EVENT, nil)
++	}
++}
++
++func writeRealLogFile(t *testing.T, dir string, prefix string, num uint, writers ...func(*bytes.Buffer)) {
++	t.Helper()
++	if err := os.WriteFile(filepath.Join(dir, logName(prefix, num)), makeLogFile(writers...), 0600); err != nil {
++		t.Fatalf("write log file: %v", err)
++	}
++}
++
++func nextEvent(t *testing.T, reader binlog.EventReader) binlog.Event {
++	t.Helper()
++	event, err := reader.NextEvent()
++	if err != nil {
++		t.Fatalf("NextEvent returned unexpected error: %T %v", err, err)
++	}
++	if event == nil {
++		t.Fatalf("NextEvent returned nil event")
++	}
++	return event
++}
++
++func eventSummary(event binlog.Event) string {
++	base := filepath.Base(event.SourceName())
++	switch e := event.(type) {
++	case *binlog.FormatDescriptionEvent:
++		return fmt.Sprintf(
++			"fde file=%s pos=%d next=%d len=%d version=%d server=%s extra=%d known=%d checksum=%d",
++			base,
++			event.SourcePosition(),
++			event.NextPosition(),
++			event.EventLength(),
++			e.BinlogVersion(),
++			string(e.ServerVersion()),
++			e.ExtraHeadersSize(),
++			e.NumKnownEventTypes(),
++			int(e.ChecksumAlgorithm()))
++	case *binlog.XidEvent:
++		return fmt.Sprintf(
++			"xid file=%s pos=%d next=%d len=%d xid=%d",
++			base,
++			event.SourcePosition(),
++			event.NextPosition(),
++			event.EventLength(),
++			e.Xid())
++	case *binlog.RotateEvent:
++		return fmt.Sprintf(
++			"rotate file=%s pos=%d next=%d len=%d name=%s newpos=%d",
++			base,
++			event.SourcePosition(),
++			event.NextPosition(),
++			event.EventLength(),
++			string(e.NewLogName()),
++			e.NewPosition())
++	case *binlog.StopEvent:
++		return fmt.Sprintf(
++			"stop file=%s pos=%d next=%d len=%d",
++			base,
++			event.SourcePosition(),
++			event.NextPosition(),
++			event.EventLength())
++	default:
++		return fmt.Sprintf("%T file=%s pos=%d next=%d len=%d", event, base, event.SourcePosition(), event.NextPosition(), event.EventLength())
++	}
++}
++
++func requireSourceFile(t *testing.T, event binlog.Event, source string) {
++	t.Helper()
++	if got := filepath.Base(event.SourceName()); got != source {
++		t.Fatalf("event source = %q, want %q (event=%s)", got, source, eventSummary(event))
++	}
++}
++
++func requireNextFDE(t *testing.T, reader binlog.EventReader, source string) {
++	t.Helper()
++	event := nextEvent(t, reader)
++	fde, ok := event.(*binlog.FormatDescriptionEvent)
++	if !ok {
++		t.Fatalf("event type = %T, want *binlog.FormatDescriptionEvent (event=%s)", event, eventSummary(event))
++	}
++	requireSourceFile(t, event, source)
++	if fde.BinlogVersion() != 4 {
++		t.Fatalf("format-description binlog version = %d, want 4", fde.BinlogVersion())
++	}
++}
++
++func requireNextXID(t *testing.T, reader binlog.EventReader, source string, id uint64) {
++	t.Helper()
++	event := nextEvent(t, reader)
++	xid, ok := event.(*binlog.XidEvent)
++	if !ok {
++		t.Fatalf("event type = %T, want *binlog.XidEvent (event=%s)", event, eventSummary(event))
++	}
++	requireSourceFile(t, event, source)
++	if xid.Xid() != id {
++		t.Fatalf("xid = %d, want %d (event=%s)", xid.Xid(), id, eventSummary(event))
++	}
++}
++
++func requireNextRotate(t *testing.T, reader binlog.EventReader, source string, name string) {
++	t.Helper()
++	event := nextEvent(t, reader)
++	requireRotateEvent(t, event, source, name)
++}
++
++func requireRotateEvent(t *testing.T, event binlog.Event, source string, name string) {
++	t.Helper()
++	rotate, ok := event.(*binlog.RotateEvent)
++	if !ok {
++		if event == nil {
++			t.Fatalf("event type = <nil>, want *binlog.RotateEvent")
++		}
++		t.Fatalf("event type = %T, want *binlog.RotateEvent (event=%s)", event, eventSummary(event))
++	}
++	requireSourceFile(t, event, source)
++	if string(rotate.NewLogName()) != name {
++		t.Fatalf("rotate name = %q, want %q (event=%s)", string(rotate.NewLogName()), name, eventSummary(event))
++	}
++}
++
++func requireNextStop(t *testing.T, reader binlog.EventReader, source string) {
++	t.Helper()
++	event := nextEvent(t, reader)
++	if _, ok := event.(*binlog.StopEvent); !ok {
++		t.Fatalf("event type = %T, want *binlog.StopEvent (event=%s)", event, eventSummary(event))
++	}
++	requireSourceFile(t, event, source)
++}
++
++func requireFailedOpen(t *testing.T, err error, logFileNum uint) {
++	t.Helper()
++	var failed *binlog.FailedToOpenFileError
++	if !stdErrors.As(err, &failed) {
++		t.Fatalf("error type = %T, want *binlog.FailedToOpenFileError", err)
++	}
++	if failed.LogFileNum != logFileNum {
++		t.Fatalf("failed.LogFileNum = %d, want %d", failed.LogFileNum, logFileNum)
++	}
++}
++
++func requireInvalidRotation(t *testing.T, err error) {
++	t.Helper()
++	var invalid *binlog.InvalidRotationError
++	if !stdErrors.As(err, &invalid) {
++		t.Fatalf("error type = %T, want *binlog.InvalidRotationError", err)
++	}
++}
++
++func requireClosedReaderError(t *testing.T, err error) {
++	t.Helper()
++
++
++	if err == nil {
++		t.Fatalf("NextEvent after Close returned nil error")
++	}
++}
++
++func TestPublicConstructorReadsNamedFilesAndRotates(t *testing.T) {
++
++
++
++
++	dir := t.TempDir()
++	writeRealLogFile(t, dir, binPrefix, 0, xid(11), rotate(binPrefix, 1))
++	writeRealLogFile(t, dir, binPrefix, 1, xid(22))
++
++	reader := binlog.NewLogStreamV4EventReader(dir, binPrefix, 0, false, testLogger())
++	defer reader.Close()
++
++
++
++	requireNextFDE(t, reader, "bin.000000")
++	requireNextXID(t, reader, "bin.000000", 11)
++	requireNextRotate(t, reader, "bin.000000", "bin.000001")
++	requireNextFDE(t, reader, "bin.000001")
++	requireNextXID(t, reader, "bin.000001", 22)
++	event, err := reader.NextEvent()
++	if event != nil {
++		t.Fatalf("event after second file = %s, want nil", eventSummary(event))
++	}
++
++
++	if err == nil {
++		t.Fatalf("error after second file = nil, want non-nil error")
++	}
++}
++
++func TestStopAdvancesToNextFileAndMissingFileCanBeRetried(t *testing.T) {
++
++
++
++
++	files := newStreamFiles()
++	files.add(binPrefix, 1, xid(101), stop())
++
++	reader := binlog.NewLogStreamV4EventReaderWithLogFileReaderCreator(
++		"/virtual", binPrefix, 1, false, testLogger(), files.creator)
++	defer reader.Close()
++
++
++
++	requireNextFDE(t, reader, "bin.000001")
++	requireNextXID(t, reader, "bin.000001", 101)
++	requireNextStop(t, reader, "bin.000001")
++	event, err := reader.NextEvent()
++	if event != nil {
++		t.Fatalf("event on missing file = %s, want nil", eventSummary(event))
++	}
++	requireFailedOpen(t, err, 2)
++
++	files.add(binPrefix, 2, xid(202))
++	requireNextFDE(t, reader, "bin.000002")
++	requireNextXID(t, reader, "bin.000002", 202)
++	if fmt.Sprint(files.opened) != "[bin.000001 bin.000002 bin.000002]" {
++		t.Fatalf("opened files = %v", files.opened)
++	}
++}
++
++func TestRotateNumberRollsOverFrom999999To000000(t *testing.T) {
++
++
++
++
++	files := newStreamFiles()
++	files.add(binPrefix, 999999, xid(999999), rotate(binPrefix, 0))
++	files.add(binPrefix, 0, xid(0))
++
++	reader := binlog.NewLogStreamV4EventReaderWithLogFileReaderCreator(
++		"/virtual", binPrefix, 999999, false, testLogger(), files.creator)
++	defer reader.Close()
++
++
++
++	requireNextFDE(t, reader, "bin.999999")
++	requireNextXID(t, reader, "bin.999999", 999999)
++	requireNextRotate(t, reader, "bin.999999", "bin.000000")
++	requireNextFDE(t, reader, "bin.000000")
++	requireNextXID(t, reader, "bin.000000", 0)
++}
++
++func TestInvalidRotatePrefixReturnsEventErrorAndReaderContinues(t *testing.T) {
++
++
++
++
++	files := newStreamFiles()
++	files.add(binPrefix, 0, xid(5), rotate("bad.", 1), xid(6))
++
++	reader := binlog.NewLogStreamV4EventReaderWithLogFileReaderCreator(
++		"/virtual", binPrefix, 0, false, testLogger(), files.creator)
++	defer reader.Close()
++
++
++
++	requireNextFDE(t, reader, "bin.000000")
++	requireNextXID(t, reader, "bin.000000", 5)
++	event, err := reader.NextEvent()
++	requireRotateEvent(t, event, "bin.000000", "bad.000001")
++	requireInvalidRotation(t, err)
++	requireNextXID(t, reader, "bin.000000", 6)
++}
++
++func TestInvalidRotateNonNumericSuffixReturnsEventErrorAndReaderContinues(t *testing.T) {
++
++
++
++
++	files := newStreamFiles()
++	files.add(binPrefix, 0, xid(7), rotateName("bin.xxxxxx"), xid(8))
++
++	reader := binlog.NewLogStreamV4EventReaderWithLogFileReaderCreator(
++		"/virtual", binPrefix, 0, false, testLogger(), files.creator)
++	defer reader.Close()
++
++
++
++	requireNextFDE(t, reader, "bin.000000")
++	requireNextXID(t, reader, "bin.000000", 7)
++	event, err := reader.NextEvent()
++	requireRotateEvent(t, event, "bin.000000", "bin.xxxxxx")
++	requireInvalidRotation(t, err)
++	requireNextXID(t, reader, "bin.000000", 8)
++}
++
++func TestInvalidRotateUnexpectedNumberReturnsEventError(t *testing.T) {
++
++
++
++
++	files := newStreamFiles()
++	files.add(binPrefix, 123, xid(123), rotate(binPrefix, 125))
++	files.add(binPrefix, 125, xid(125))
++
++	reader := binlog.NewLogStreamV4EventReaderWithLogFileReaderCreator(
++		"/virtual", binPrefix, 123, false, testLogger(), files.creator)
++	defer reader.Close()
++
++
++
++	requireNextFDE(t, reader, "bin.000123")
++	requireNextXID(t, reader, "bin.000123", 123)
++	event, err := reader.NextEvent()
++	requireRotateEvent(t, event, "bin.000123", "bin.000125")
++	requireInvalidRotation(t, err)
++	event, err = reader.NextEvent()
++	if event != nil {
++		t.Fatalf("event after invalid rotate EOF = %s, want nil", eventSummary(event))
++	}
++
++
++	if err == nil {
++		t.Fatalf("error after invalid rotate EOF = nil, want non-nil error")
++	}
++	if fmt.Sprint(files.opened) != "[bin.000123]" {
++		t.Fatalf("opened files = %v", files.opened)
++	}
++}
++
++func TestRelayLogSkipsWrapperRecordsButReturnsMasterRotate(t *testing.T) {
++
++
++
++
++	files := newStreamFiles()
++	files.add(relayPrefix, 1, xid(1), rotate(binPrefix, 12345), xid(10), rotate(relayPrefix, 2))
++	files.add(relayPrefix, 2, xid(2), writeFDE, xid(20), rotate(binPrefix, 333), xid(200))
++
++	reader := binlog.NewLogStreamV4EventReaderWithLogFileReaderCreator(
++		"/virtual", relayPrefix, 1, true, testLogger(), files.creator)
++	defer reader.Close()
++
++
++
++	requireNextXID(t, reader, "relay.000001", 1)
++	requireNextRotate(t, reader, "relay.000001", "bin.012345")
++	requireNextXID(t, reader, "relay.000001", 10)
++	requireNextXID(t, reader, "relay.000002", 2)
++	requireNextFDE(t, reader, "relay.000002")
++	requireNextXID(t, reader, "relay.000002", 20)
++	requireNextRotate(t, reader, "relay.000002", "bin.000333")
++	requireNextXID(t, reader, "relay.000002", 200)
++}
++
++func TestNextEventAfterCloseReturnsError(t *testing.T) {
++
++
++
++
++	files := newStreamFiles()
++	files.add(binPrefix, 0, xid(1))
++
++	reader := binlog.NewLogStreamV4EventReaderWithLogFileReaderCreator(
++		"/virtual", binPrefix, 0, false, testLogger(), files.creator)
++
++	if err := reader.Close(); err != nil {
++		t.Fatalf("first Close error = %T %v, want nil", err, err)
++	}
++	event, err := reader.NextEvent()
++	if event != nil {
++		t.Fatalf("event after close = %s, want nil", eventSummary(event))
++	}
++	requireClosedReaderError(t, err)
++	if fmt.Sprint(files.opened) != "[]" {
++		t.Fatalf("opened files after close = %v", files.opened)
++	}
++}
++
++func TestCloseStopsReaderAfterReaderOpened(t *testing.T) {
++
++
++
++
++	files := newStreamFiles()
++	files.add(binPrefix, 0, xid(1))
++
++	reader := binlog.NewLogStreamV4EventReaderWithLogFileReaderCreator(
++		"/virtual", binPrefix, 0, false, testLogger(), files.creator)
++
++
++	requireNextFDE(t, reader, "bin.000000")
++	if err := reader.Close(); err != nil {
++		t.Fatalf("first Close error = %T %v, want nil", err, err)
++	}
++
++
++	_ = reader.Close()
++	event, err := reader.NextEvent()
++	if event != nil {
++		t.Fatalf("event after double close = %s, want nil", eventSummary(event))
++	}
++	requireClosedReaderError(t, err)
++}
++
++func TestTwoStreamsAdvanceIndependently(t *testing.T) {
++
++
++
++
++	files := newStreamFiles()
++	files.add(binPrefix, 0, xid(10), stop())
++	files.add(binPrefix, 1, xid(11))
++	files.add(binPrefix, 50, xid(500))
++
++	a := binlog.NewLogStreamV4EventReaderWithLogFileReaderCreator(
++		"/virtual", binPrefix, 0, false, testLogger(), files.creator)
++	defer a.Close()
++	b := binlog.NewLogStreamV4EventReaderWithLogFileReaderCreator(
++		"/virtual", binPrefix, 50, false, testLogger(), files.creator)
++	defer b.Close()
++
++
++
++	requireNextFDE(t, a, "bin.000000")
++	requireNextXID(t, a, "bin.000000", 10)
++	requireNextStop(t, a, "bin.000000")
++	requireNextFDE(t, b, "bin.000050")
++	requireNextXID(t, b, "bin.000050", 500)
++	requireNextFDE(t, a, "bin.000001")
++	requireNextXID(t, a, "bin.000001", 11)
++}
++
++func TestCloseDoesNotRetainOpenFileDescriptorsAcrossCycles(t *testing.T) {
++
++
++
++
++	dir := t.TempDir()
++	writeRealLogFile(t, dir, binPrefix, 0, xid(99))
++
++	runtime.GC()
++	beforeFDs := countFDs(t)
++	readers := make([]binlog.EventReader, 0, 100)
++
++	for i := 0; i < 100; i++ {
++		reader := binlog.NewLogStreamV4EventReader(dir, binPrefix, 0, false, testLogger())
++
++
++		requireNextFDE(t, reader, "bin.000000")
++		if err := reader.Close(); err != nil {
++			t.Fatalf("cycle %d Close error = %T %v, want nil", i, err, err)
++		}
++		readers = append(readers, reader)
++	}
++
++	runtime.GC()
++	runtime.Gosched()
++	time.Sleep(25 * time.Millisecond)
++	runtime.GC()
++	afterFDs := countFDs(t)
++
++	if afterFDs-beforeFDs > 10 {
++		t.Fatalf("fd growth after 100 close cycles = %d (before=%d after=%d), want <= 10", afterFDs-beforeFDs, beforeFDs, afterFDs)
++	}
++	if len(readers) != 100 {
++		t.Fatalf("retained readers = %d, want 100", len(readers))
++	}
++}
++
++func countFDs(t *testing.T) int {
++	t.Helper()
++	entries, err := os.ReadDir("/proc/self/fd")
++	if err != nil {
++		t.Fatalf("read /proc/self/fd: %v", err)
++	}
++	return len(entries)
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,25 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++
++
++set -euo pipefail
++
++cd /workspace/repo
++export GOPATH="${GOPATH:-/root/go}"
++export GOMODCACHE="${GOMODCACHE:-${GOPATH}/pkg/mod}"
++export GOPROXY=off
++export GOSUMDB=off
++export GOVCS='*:off'
++export GOTOOLCHAIN=local
++export GOTELEMETRY=off
++export GOFLAGS="${GOFLAGS:-} -mod=readonly"
++go test -v -count=1 ./usercase-test-coderl/...

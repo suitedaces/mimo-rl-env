@@ -1,0 +1,524 @@
+diff --git a/proxmox/api/retry_contract_test.go b/proxmox/api/retry_contract_test.go
+new file mode 100644
+index 00000000..0a21c9e0
+--- /dev/null
++++ b/proxmox/api/retry_contract_test.go
+@@ -0,0 +1,508 @@
++
++
++
++
++
++
++package api
++
++import (
++	"context"
++	"errors"
++	"io"
++	"net/http"
++	"strings"
++	"sync/atomic"
++	"testing"
++)
++
++type retryContractRoundTripper func(*http.Request) (*http.Response, error)
++
++func (f retryContractRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
++	return f(req)
++}
++
++type retryContractAuthenticator struct {
++	calls  atomic.Int32
++	failAt int32
++	err    error
++}
++
++func (a *retryContractAuthenticator) IsRoot(context.Context) bool { return false }
++
++func (a *retryContractAuthenticator) IsRootTicket(context.Context) bool { return false }
++
++func (a *retryContractAuthenticator) AuthenticateRequest(_ context.Context, req *http.Request) error {
++	call := a.calls.Add(1)
++	if a.failAt != 0 && call == a.failAt {
++		return a.err
++	}
++
++	req.Header.Set("X-Retry-Auth-Attempt", string(rune('0'+call)))
++
++	return nil
++}
++
++type retryContractBody struct {
++	io.Reader
++	closed atomic.Int32
++}
++
++func (b *retryContractBody) Close() error {
++	b.closed.Add(1)
++	return nil
++}
++
++func newRetryContractClient(rt http.RoundTripper, auth Authenticator) Client {
++	return &client{
++		conn: &Connection{
++			endpoint:   "http://retry-contract.invalid",
++			httpClient: &http.Client{Transport: rt},
++		},
++		auth: auth,
++	}
++}
++
++func retryContractResponse(code int, status, body string) *http.Response {
++	return &http.Response{
++		StatusCode: code,
++		Status:     status,
++		Body:       io.NopCloser(strings.NewReader(body)),
++		Header:     make(http.Header),
++	}
++}
++
++func TestRetryContractRetriesTransportFailuresForReplayableIdempotentMethods(t *testing.T) {
++	t.Parallel()
++
++	for _, method := range []string{http.MethodGet, http.MethodHead, http.MethodPut, http.MethodDelete} {
++		method := method
++		t.Run(method, func(t *testing.T) {
++			t.Parallel()
++
++			attempts := 0
++			transportErr := errors.New("retry contract temporary transport failure")
++			c := newRetryContractClient(retryContractRoundTripper(func(_ *http.Request) (*http.Response, error) {
++				attempts++
++				if attempts < 3 {
++					return nil, transportErr
++				}
++
++				return retryContractResponse(http.StatusOK, "200 OK", ""), nil
++			}), &retryContractAuthenticator{})
++
++			if err := c.DoRequest(t.Context(), method, "nodes", nil, nil); err != nil {
++				t.Fatalf("DoRequest() returned an error after a recoverable failure: %v", err)
++			}
++			if attempts != 3 {
++				t.Fatalf("DoRequest() attempts = %d, want 3", attempts)
++			}
++		})
++	}
++}
++
++func TestRetryContractReplaysFormBodyAndAuthenticatesEveryAttempt(t *testing.T) {
++	t.Parallel()
++
++	type requestBody struct {
++		Name  string `url:"name"`
++		Count int    `url:"count"`
++	}
++
++	auth := &retryContractAuthenticator{}
++	var bodies []string
++	var authHeaders []string
++	attempts := 0
++	transportErr := errors.New("retry contract body replay failure")
++	c := newRetryContractClient(retryContractRoundTripper(func(req *http.Request) (*http.Response, error) {
++		attempts++
++		body, err := io.ReadAll(req.Body)
++		if err != nil {
++			return nil, err
++		}
++		bodies = append(bodies, string(body))
++		authHeaders = append(authHeaders, req.Header.Get("X-Retry-Auth-Attempt"))
++
++		if attempts < 3 {
++			return nil, transportErr
++		}
++
++		return retryContractResponse(http.StatusOK, "200 OK", ""), nil
++	}), auth)
++
++	err := c.DoRequest(t.Context(), http.MethodPut, "nodes/node-a/config", requestBody{
++		Name:  "value with spaces",
++		Count: 7,
++	}, nil)
++	if err != nil {
++		t.Fatalf("DoRequest() returned an error after a recoverable failure: %v", err)
++	}
++
++	wantBody := "count=7&name=value+with+spaces"
++	if len(bodies) != 3 {
++		t.Fatalf("captured %d request bodies, want 3", len(bodies))
++	}
++	for i, body := range bodies {
++		if body != wantBody {
++			t.Errorf("request body on attempt %d = %q, want %q", i+1, body, wantBody)
++		}
++	}
++	if auth.calls.Load() != 3 {
++		t.Errorf("authentication calls = %d, want 3", auth.calls.Load())
++	}
++	for i, header := range authHeaders {
++		want := string(rune('1' + i))
++		if header != want {
++			t.Errorf("authentication header on attempt %d = %q, want %q", i+1, header, want)
++		}
++	}
++}
++
++func TestRetryContractRetriesTransientHTTPResponsesAndClosesBodies(t *testing.T) {
++	t.Parallel()
++
++	tests := []struct {
++		method string
++		code   int
++		status string
++	}{
++		{http.MethodGet, http.StatusTooManyRequests, "429 Too Many Requests"},
++		{http.MethodHead, http.StatusBadGateway, "502 Bad Gateway"},
++		{http.MethodPut, http.StatusServiceUnavailable, "503 Service Unavailable"},
++		{http.MethodDelete, http.StatusGatewayTimeout, "504 Gateway Timeout"},
++	}
++
++	for _, tt := range tests {
++		tt := tt
++		t.Run(tt.status, func(t *testing.T) {
++			t.Parallel()
++
++			attempts := 0
++			firstBody := &retryContractBody{Reader: strings.NewReader(`{"data":null}`)}
++			closedBeforeRetry := false
++			c := newRetryContractClient(retryContractRoundTripper(func(_ *http.Request) (*http.Response, error) {
++				attempts++
++				if attempts == 1 {
++					return &http.Response{
++						StatusCode: tt.code,
++						Status:     tt.status,
++						Body:       firstBody,
++						Header:     make(http.Header),
++					}, nil
++				}
++
++				closedBeforeRetry = firstBody.closed.Load() > 0
++				return retryContractResponse(http.StatusOK, "200 OK", ""), nil
++			}), &retryContractAuthenticator{})
++
++			if err := c.DoRequest(t.Context(), tt.method, "version", nil, nil); err != nil {
++				t.Fatalf("DoRequest() returned an error after HTTP %d: %v", tt.code, err)
++			}
++			if attempts != 2 {
++				t.Fatalf("DoRequest() attempts = %d, want 2", attempts)
++			}
++			if !closedBeforeRetry {
++				t.Error("transient response body was not closed before the retry")
++			}
++		})
++	}
++}
++
++func TestRetryContractStopsAfterThreeTransientResponses(t *testing.T) {
++	t.Parallel()
++
++	attempts := 0
++	var bodies []*retryContractBody
++	c := newRetryContractClient(retryContractRoundTripper(func(_ *http.Request) (*http.Response, error) {
++		attempts++
++		body := &retryContractBody{Reader: strings.NewReader(`{"errors":{"attempt":"still unavailable"}}`)}
++		bodies = append(bodies, body)
++		return &http.Response{
++			StatusCode: http.StatusServiceUnavailable,
++			Status:     "503 Service Unavailable",
++			Body:       body,
++			Header:     make(http.Header),
++		}, nil
++	}), &retryContractAuthenticator{})
++
++	err := c.DoRequest(t.Context(), http.MethodGet, "cluster/resources", nil, nil)
++	if err == nil {
++		t.Fatal("DoRequest() returned nil after all transient attempts failed")
++	}
++	if attempts != 3 {
++		t.Fatalf("DoRequest() attempts = %d, want 3", attempts)
++	}
++
++	var httpErr *HTTPError
++	if !errors.As(err, &httpErr) || httpErr.Code != http.StatusServiceUnavailable {
++		t.Fatalf("DoRequest() error = %v, want an HTTPError with code 503", err)
++	}
++	if !strings.Contains(httpErr.Message, "attempt: still unavailable") {
++		t.Fatalf("HTTPError message = %q, want final response details", httpErr.Message)
++	}
++	for i, body := range bodies {
++		if body.closed.Load() == 0 {
++			t.Errorf("response body %d was not closed", i+1)
++		}
++	}
++}
++
++func TestRetryContractStopsAfterThreeTransportFailures(t *testing.T) {
++	t.Parallel()
++
++	attempts := 0
++	transportErr := errors.New("retry contract exhausted transport failure")
++	c := newRetryContractClient(retryContractRoundTripper(func(_ *http.Request) (*http.Response, error) {
++		attempts++
++		return nil, transportErr
++	}), &retryContractAuthenticator{})
++
++	err := c.DoRequest(t.Context(), http.MethodDelete, "nodes/node-a/network/vmbr0", nil, nil)
++	if !errors.Is(err, transportErr) {
++		t.Fatalf("DoRequest() error = %v, want final transport error", err)
++	}
++	if attempts != 3 {
++		t.Fatalf("DoRequest() attempts = %d, want 3", attempts)
++	}
++}
++
++func TestRetryContractDoesNotRetryUnsafeOrNonReplayableRequests(t *testing.T) {
++	t.Parallel()
++
++	t.Run("POST transport failure", func(t *testing.T) {
++		t.Parallel()
++
++		attempts := 0
++		transportErr := errors.New("retry contract unsafe request")
++		c := newRetryContractClient(retryContractRoundTripper(func(_ *http.Request) (*http.Response, error) {
++			attempts++
++			return nil, transportErr
++		}), &retryContractAuthenticator{})
++
++		err := c.DoRequest(t.Context(), http.MethodPost, "nodes", struct {
++			Name string `url:"name"`
++		}{Name: "node-a"}, nil)
++		if !errors.Is(err, transportErr) {
++			t.Fatalf("DoRequest() error = %v, want transport error", err)
++		}
++		if attempts != 1 {
++			t.Fatalf("DoRequest() attempts = %d, want 1", attempts)
++		}
++	})
++
++	t.Run("POST transient response", func(t *testing.T) {
++		t.Parallel()
++
++		for _, method := range []string{http.MethodPost, http.MethodPatch} {
++			method := method
++			t.Run(method, func(t *testing.T) {
++				t.Parallel()
++
++				attempts := 0
++				c := newRetryContractClient(retryContractRoundTripper(func(_ *http.Request) (*http.Response, error) {
++					attempts++
++					return retryContractResponse(http.StatusServiceUnavailable, "503 Service Unavailable", ""), nil
++				}), &retryContractAuthenticator{})
++
++				err := c.DoRequest(t.Context(), method, "nodes", nil, nil)
++				var httpErr *HTTPError
++				if !errors.As(err, &httpErr) || httpErr.Code != http.StatusServiceUnavailable {
++					t.Fatalf("DoRequest() error = %v, want an HTTPError with code 503", err)
++				}
++				if attempts != 1 {
++					t.Fatalf("DoRequest() attempts = %d, want 1", attempts)
++				}
++			})
++		}
++	})
++
++	t.Run("non-transient response", func(t *testing.T) {
++		t.Parallel()
++
++		attempts := 0
++		c := newRetryContractClient(retryContractRoundTripper(func(_ *http.Request) (*http.Response, error) {
++			attempts++
++			return retryContractResponse(http.StatusInternalServerError, "500 Internal Server Error", ""), nil
++		}), &retryContractAuthenticator{})
++
++		err := c.DoRequest(t.Context(), http.MethodPut, "nodes", nil, nil)
++		var httpErr *HTTPError
++		if !errors.As(err, &httpErr) || httpErr.Code != http.StatusInternalServerError {
++			t.Fatalf("DoRequest() error = %v, want an HTTPError with code 500", err)
++		}
++		if attempts != 1 {
++			t.Fatalf("DoRequest() attempts = %d, want 1", attempts)
++		}
++	})
++
++	t.Run("multipart body", func(t *testing.T) {
++		t.Parallel()
++
++		attempts := 0
++		transportErr := errors.New("retry contract multipart request")
++		c := newRetryContractClient(retryContractRoundTripper(func(req *http.Request) (*http.Response, error) {
++			attempts++
++			_, _ = io.ReadAll(req.Body)
++			return nil, transportErr
++		}), &retryContractAuthenticator{})
++
++		err := c.DoRequest(t.Context(), http.MethodPut, "upload", &MultiPartData{
++			Boundary: "retry-contract-boundary",
++			Reader:   strings.NewReader("payload"),
++		}, nil)
++		if !errors.Is(err, transportErr) {
++			t.Fatalf("DoRequest() error = %v, want transport error", err)
++		}
++		if attempts != 1 {
++			t.Fatalf("DoRequest() attempts = %d, want 1", attempts)
++		}
++	})
++
++	t.Run("multipart body transient response", func(t *testing.T) {
++		t.Parallel()
++
++		attempts := 0
++		c := newRetryContractClient(retryContractRoundTripper(func(req *http.Request) (*http.Response, error) {
++			attempts++
++			_, _ = io.ReadAll(req.Body)
++			return retryContractResponse(http.StatusServiceUnavailable, "503 Service Unavailable", ""), nil
++		}), &retryContractAuthenticator{})
++
++		err := c.DoRequest(t.Context(), http.MethodPut, "upload", &MultiPartData{
++			Boundary: "retry-contract-response-boundary",
++			Reader:   strings.NewReader("payload"),
++		}, nil)
++		var httpErr *HTTPError
++		if !errors.As(err, &httpErr) || httpErr.Code != http.StatusServiceUnavailable {
++			t.Fatalf("DoRequest() error = %v, want an HTTPError with code 503", err)
++		}
++		if attempts != 1 {
++			t.Fatalf("DoRequest() attempts = %d, want 1", attempts)
++		}
++	})
++
++	t.Run("pipe body", func(t *testing.T) {
++		t.Parallel()
++
++		attempts := 0
++		transportErr := errors.New("retry contract pipe request")
++		c := newRetryContractClient(retryContractRoundTripper(func(req *http.Request) (*http.Response, error) {
++			attempts++
++			_, _ = io.ReadAll(req.Body)
++			return nil, transportErr
++		}), &retryContractAuthenticator{})
++
++		reader, writer := io.Pipe()
++		go func() {
++			_, _ = writer.Write([]byte("payload"))
++			_ = writer.Close()
++		}()
++
++		err := c.DoRequest(t.Context(), http.MethodPut, "upload", reader, nil)
++		if !errors.Is(err, transportErr) {
++			t.Fatalf("DoRequest() error = %v, want transport error", err)
++		}
++		if attempts != 1 {
++			t.Fatalf("DoRequest() attempts = %d, want 1", attempts)
++		}
++	})
++
++	t.Run("pipe body transient response", func(t *testing.T) {
++		t.Parallel()
++
++		attempts := 0
++		c := newRetryContractClient(retryContractRoundTripper(func(req *http.Request) (*http.Response, error) {
++			attempts++
++			_, _ = io.ReadAll(req.Body)
++			return retryContractResponse(http.StatusServiceUnavailable, "503 Service Unavailable", ""), nil
++		}), &retryContractAuthenticator{})
++
++		reader, writer := io.Pipe()
++		go func() {
++			_, _ = writer.Write([]byte("payload"))
++			_ = writer.Close()
++		}()
++
++		err := c.DoRequest(t.Context(), http.MethodPut, "upload", reader, nil)
++		var httpErr *HTTPError
++		if !errors.As(err, &httpErr) || httpErr.Code != http.StatusServiceUnavailable {
++			t.Fatalf("DoRequest() error = %v, want an HTTPError with code 503", err)
++		}
++		if attempts != 1 {
++			t.Fatalf("DoRequest() attempts = %d, want 1", attempts)
++		}
++	})
++}
++
++func TestRetryContractStopsForCancellationAndAuthenticationFailure(t *testing.T) {
++	t.Parallel()
++
++	t.Run("context cancellation", func(t *testing.T) {
++		t.Parallel()
++
++		ctx, cancel := context.WithCancel(t.Context())
++		attempts := 0
++		c := newRetryContractClient(retryContractRoundTripper(func(_ *http.Request) (*http.Response, error) {
++			attempts++
++			cancel()
++			return nil, errors.New("retry contract canceled transport")
++		}), &retryContractAuthenticator{})
++
++		err := c.DoRequest(ctx, http.MethodGet, "version", nil, nil)
++		if !errors.Is(err, context.Canceled) {
++			t.Fatalf("DoRequest() error = %v, want context.Canceled", err)
++		}
++		if attempts != 1 {
++			t.Fatalf("DoRequest() attempts = %d, want 1", attempts)
++		}
++	})
++
++	t.Run("authentication failure during retry", func(t *testing.T) {
++		t.Parallel()
++
++		authErr := errors.New("retry contract authentication failure")
++		auth := &retryContractAuthenticator{failAt: 2, err: authErr}
++		attempts := 0
++		c := newRetryContractClient(retryContractRoundTripper(func(_ *http.Request) (*http.Response, error) {
++			attempts++
++			return nil, errors.New("retry contract temporary transport failure")
++		}), auth)
++
++		err := c.DoRequest(t.Context(), http.MethodGet, "version", nil, nil)
++		if !errors.Is(err, authErr) {
++			t.Fatalf("DoRequest() error = %v, want authentication error", err)
++		}
++		if attempts != 1 {
++			t.Fatalf("transport attempts = %d, want 1", attempts)
++		}
++		if auth.calls.Load() != 2 {
++			t.Fatalf("authentication calls = %d, want 2", auth.calls.Load())
++		}
++	})
++}
++
++func TestRetryContractPreservesNotFoundErrorClassification(t *testing.T) {
++	t.Parallel()
++
++	attempts := 0
++	c := newRetryContractClient(retryContractRoundTripper(func(_ *http.Request) (*http.Response, error) {
++		attempts++
++		return retryContractResponse(
++			http.StatusNotFound,
++			"404 Not Found",
++			`{"errors":{"vmid":"configuration does not exist"}}`,
++		), nil
++	}), &retryContractAuthenticator{})
++
++	err := c.DoRequest(t.Context(), http.MethodGet, "nodes/node-a/qemu/101/config", nil, nil)
++	if !errors.Is(err, ErrResourceDoesNotExist) {
++		t.Fatalf("DoRequest() error = %v, want ErrResourceDoesNotExist", err)
++	}
++	var httpErr *HTTPError
++	if !errors.As(err, &httpErr) || httpErr.Code != http.StatusNotFound {
++		t.Fatalf("DoRequest() error = %v, want an HTTPError with code 404", err)
++	}
++	if attempts != 1 {
++		t.Fatalf("DoRequest() attempts = %d, want 1", attempts)
++	}
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,5 @@
++#!/bin/bash
++set -euo pipefail
++
++
++go test ./proxmox/api -run '^TestRetryContract' -count=1

@@ -1,0 +1,324 @@
+diff --git a/build/yamls/cluster_identity_manifest_test.go b/build/yamls/cluster_identity_manifest_test.go
+new file mode 100644
+index 000000000..0f9ca2e64
+--- /dev/null
++++ b/build/yamls/cluster_identity_manifest_test.go
+@@ -0,0 +1,291 @@
++package yamls
++
++import (
++	"io"
++	"os"
++	"path/filepath"
++	"reflect"
++	"sort"
++	"testing"
++
++	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
++	"k8s.io/apimachinery/pkg/util/yaml"
++	sigsyaml "sigs.k8s.io/yaml"
++)
++
++const (
++	clusterIdentityConfigMapName = "antrea-cluster-identity"
++	clusterIdentityReaderName    = "antrea-cluster-identity-reader"
++	antreaNamespace              = "kube-system"
++)
++
++var installManifests = []string{
++	"antrea.yml",
++	"antrea-aks.yml",
++	"antrea-eks.yml",
++	"antrea-gke.yml",
++	"antrea-ipsec.yml",
++}
++
++func readObjects(t *testing.T, path string) []unstructured.Unstructured {
++	t.Helper()
++
++	f, err := os.Open(path)
++	if err != nil {
++		t.Fatalf("failed to open %s: %v", path, err)
++	}
++	defer f.Close()
++
++	decoder := yaml.NewYAMLOrJSONDecoder(f, 4096)
++	var objects []unstructured.Unstructured
++	for {
++		var raw map[string]interface{}
++		err := decoder.Decode(&raw)
++		if err == io.EOF {
++			break
++		}
++		if err != nil {
++			t.Fatalf("failed to decode %s: %v", path, err)
++		}
++		if len(raw) == 0 {
++			continue
++		}
++		objects = append(objects, unstructured.Unstructured{Object: raw})
++	}
++	return objects
++}
++
++func findObject(objects []unstructured.Unstructured, kind, name, namespace string) *unstructured.Unstructured {
++	for i := range objects {
++		obj := &objects[i]
++		if obj.GetKind() != kind || obj.GetName() != name {
++			continue
++		}
++		if namespace != "" && obj.GetNamespace() != namespace {
++			continue
++		}
++		return obj
++	}
++	return nil
++}
++
++func stringSlice(v interface{}) []string {
++	items, ok := v.([]interface{})
++	if !ok {
++		return nil
++	}
++	out := make([]string, 0, len(items))
++	for _, item := range items {
++		s, ok := item.(string)
++		if !ok {
++			return nil
++		}
++		out = append(out, s)
++	}
++	sort.Strings(out)
++	return out
++}
++
++func exactStrings(actual []string, expected ...string) bool {
++	sort.Strings(expected)
++	return reflect.DeepEqual(actual, expected)
++}
++
++func assertScopedReaderRole(t *testing.T, role *unstructured.Unstructured, source string) {
++	t.Helper()
++	if role == nil {
++		t.Fatalf("%s: missing ClusterRole %q", source, clusterIdentityReaderName)
++	}
++
++	rules, ok, err := unstructured.NestedSlice(role.Object, "rules")
++	if err != nil || !ok || len(rules) == 0 {
++		t.Fatalf("%s: reader ClusterRole has no rules: ok=%v err=%v", source, ok, err)
++	}
++
++	for i, rawRule := range rules {
++		rule, ok := rawRule.(map[string]interface{})
++		if !ok {
++			t.Fatalf("%s: rule %d is not an object", source, i)
++		}
++		if !exactStrings(stringSlice(rule["apiGroups"]), "") {
++			t.Fatalf("%s: rule %d apiGroups = %v, want only core API group", source, i, rule["apiGroups"])
++		}
++		if !exactStrings(stringSlice(rule["resources"]), "configmaps") {
++			t.Fatalf("%s: rule %d resources = %v, want only configmaps", source, i, rule["resources"])
++		}
++		if !exactStrings(stringSlice(rule["resourceNames"]), clusterIdentityConfigMapName) {
++			t.Fatalf("%s: rule %d resourceNames = %v, want only %s", source, i, rule["resourceNames"], clusterIdentityConfigMapName)
++		}
++		if !exactStrings(stringSlice(rule["verbs"]), "get") {
++			t.Fatalf("%s: rule %d verbs = %v, want only get", source, i, rule["verbs"])
++		}
++	}
++}
++
++func TestInstallManifestsIncludeClusterIdentityConfigMap(t *testing.T) {
++	for _, manifest := range installManifests {
++		t.Run(manifest, func(t *testing.T) {
++			objects := readObjects(t, manifest)
++			cm := findObject(objects, "ConfigMap", clusterIdentityConfigMapName, antreaNamespace)
++			if cm == nil {
++				t.Fatalf("%s: missing ConfigMap %s/%s", manifest, antreaNamespace, clusterIdentityConfigMapName)
++			}
++			if got := cm.GetLabels()["app"]; got != "antrea" {
++				t.Fatalf("%s: ConfigMap label app = %q, want antrea", manifest, got)
++			}
++			if data, ok, err := unstructured.NestedStringMap(cm.Object, "data"); err != nil || (ok && len(data) != 0) {
++				t.Fatalf("%s: ConfigMap data = %v (present=%v err=%v), want absent or empty", manifest, data, ok, err)
++			}
++		})
++	}
++}
++
++func TestInstallManifestsIncludeScopedClusterIdentityReaderRole(t *testing.T) {
++	for _, manifest := range installManifests {
++		t.Run(manifest, func(t *testing.T) {
++			objects := readObjects(t, manifest)
++			role := findObject(objects, "ClusterRole", clusterIdentityReaderName, "")
++			assertScopedReaderRole(t, role, manifest)
++			if got := role.GetLabels()["app"]; got != "antrea" {
++				t.Fatalf("%s: reader ClusterRole label app = %q, want antrea", manifest, got)
++			}
++		})
++	}
++}
++
++func ruleAllowsScopedConfigMapVerbs(role *unstructured.Unstructured, resourceName string, requiredVerbs ...string) bool {
++	rules, ok, err := unstructured.NestedSlice(role.Object, "rules")
++	if err != nil || !ok {
++		return false
++	}
++	required := map[string]bool{}
++	for _, verb := range requiredVerbs {
++		required[verb] = false
++	}
++	for _, rawRule := range rules {
++		rule, ok := rawRule.(map[string]interface{})
++		if !ok {
++			continue
++		}
++		if !exactStrings(stringSlice(rule["apiGroups"]), "") {
++			continue
++		}
++		if !exactStrings(stringSlice(rule["resources"]), "configmaps") {
++			continue
++		}
++		names := stringSlice(rule["resourceNames"])
++		if !contains(names, resourceName) {
++			continue
++		}
++		for _, verb := range stringSlice(rule["verbs"]) {
++			if _, needed := required[verb]; needed {
++				required[verb] = true
++			}
++		}
++	}
++	for _, seen := range required {
++		if !seen {
++			return false
++		}
++	}
++	return true
++}
++
++func TestControllerRoleCanPersistClusterIdentity(t *testing.T) {
++	manifests := append([]string{}, installManifests...)
++	manifests = append(manifests, filepath.Join("base", "controller-rbac.yml"))
++
++	for _, manifest := range manifests {
++		t.Run(manifest, func(t *testing.T) {
++			objects := readObjects(t, manifest)
++			role := findObject(objects, "ClusterRole", "antrea-controller", "")
++			if role == nil {
++				t.Fatalf("%s: missing antrea-controller ClusterRole", manifest)
++			}
++			for _, name := range []string{"antrea-ca", clusterIdentityConfigMapName} {
++				if !ruleAllowsScopedConfigMapVerbs(role, name, "get", "update") {
++					t.Fatalf("%s: antrea-controller lacks scoped get/update access to ConfigMap %s", manifest, name)
++				}
++			}
++		})
++	}
++}
++
++func TestFlowAggregatorBindsClusterIdentityReader(t *testing.T) {
++	for _, manifest := range []string{
++		"flow-aggregator.yml",
++		filepath.Join("flow-aggregator", "base", "flow-aggregator.yml"),
++	} {
++		t.Run(manifest, func(t *testing.T) {
++			objects := readObjects(t, manifest)
++			if !hasClusterIdentityReaderBinding(objects) {
++				t.Fatalf("%s: missing binding from flow-aggregator ServiceAccount to %s", manifest, clusterIdentityReaderName)
++			}
++		})
++	}
++}
++
++func TestBaseKustomizationReferencesClusterIdentityReader(t *testing.T) {
++	content, err := os.ReadFile(filepath.Join("base", "kustomization.yml"))
++	if err != nil {
++		t.Fatalf("failed to read base kustomization: %v", err)
++	}
++	var kustomization struct {
++		Resources []string `yaml:"resources"`
++	}
++	if err := sigsyaml.Unmarshal(content, &kustomization); err != nil {
++		t.Fatalf("failed to parse base kustomization: %v", err)
++	}
++	var role *unstructured.Unstructured
++	var roleSource string
++	for _, resource := range kustomization.Resources {
++		objects := readObjects(t, filepath.Join("base", resource))
++		if role = findObject(objects, "ClusterRole", clusterIdentityReaderName, ""); role != nil {
++			roleSource = filepath.Join("base", resource)
++			break
++		}
++	}
++	if role == nil {
++		t.Fatalf("base kustomization resources = %v, none include ClusterRole %q", kustomization.Resources, clusterIdentityReaderName)
++	}
++	assertScopedReaderRole(t, role, roleSource)
++}
++
++func hasClusterIdentityReaderBinding(objects []unstructured.Unstructured) bool {
++	for i := range objects {
++		obj := &objects[i]
++		if obj.GetKind() != "ClusterRoleBinding" {
++			continue
++		}
++		roleKind, _, _ := unstructured.NestedString(obj.Object, "roleRef", "kind")
++		roleName, _, _ := unstructured.NestedString(obj.Object, "roleRef", "name")
++		if roleKind != "ClusterRole" || roleName != clusterIdentityReaderName {
++			continue
++		}
++		subjects, ok, _ := unstructured.NestedSlice(obj.Object, "subjects")
++		if !ok {
++			continue
++		}
++		for _, rawSubject := range subjects {
++			subject, ok := rawSubject.(map[string]interface{})
++			if !ok {
++				continue
++			}
++			if subject["kind"] == "ServiceAccount" &&
++				subject["name"] == "flow-aggregator" &&
++				subject["namespace"] == "flow-aggregator" {
++				return true
++			}
++		}
++	}
++	return false
++}
++
++func contains(items []string, want string) bool {
++	for _, item := range items {
++		if item == want {
++			return true
++		}
++	}
++	return false
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,22 @@
++#!/bin/bash
++set -uo pipefail
++cd /testbed
++
++
++cd /testbed
++
++set -e
++
++
++case "${1:-}" in
++  base)
++    go test ./pkg/util/env -count=1
++    ;;
++  new)
++    go test -v ./build/yamls -run 'Test(InstallManifestsIncludeClusterIdentityConfigMap|InstallManifestsIncludeScopedClusterIdentityReaderRole|ControllerRoleCanPersistClusterIdentity|FlowAggregatorBindsClusterIdentityReader|BaseKustomizationReferencesClusterIdentityReader)$' -count=1
++    ;;
++  *)
++    echo "usage: $0 base|new"
++    exit 2
++    ;;
++esac

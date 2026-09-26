@@ -1,0 +1,252 @@
+diff --git a/tests/test_connection_header_contract.py b/tests/test_connection_header_contract.py
+new file mode 100644
+index 0000000..c1f88b0
+--- /dev/null
++++ b/tests/test_connection_header_contract.py
+@@ -0,0 +1,234 @@
++from io import BytesIO
++
++import django
++import urllib3
++from django.http import StreamingHttpResponse
++from django.test import RequestFactory, SimpleTestCase, override_settings
++from mock import MagicMock, Mock, patch
++
++from revproxy.views import ProxyView
++
++django.setup()
++
++
++URLOPEN = 'urllib3.PoolManager.urlopen'
++FIXED_HOP_HEADERS = (
++    'connection',
++    'keep-alive',
++    'proxy-authenticate',
++    'proxy-authorization',
++    'proxy-connection',
++    'te',
++    'trailer',
++    'trailers',
++    'transfer-encoding',
++    'upgrade',
++)
++
++
++class BoundaryProxyView(ProxyView):
++    upstream = 'http://upstream.example/base/'
++
++
++class ExtendingBoundaryProxyView(BoundaryProxyView):
++    def get_proxy_request_headers(self, request):
++        headers = super(ExtendingBoundaryProxyView, self).\
++            get_proxy_request_headers(request)
++        headers['X-Extension-Secret'] = 'must-not-leak'
++        headers['X-Extension-Public'] = 'visible'
++        return headers
++
++
++@override_settings(ALLOWED_HOSTS=['frontend.example'])
++class ConnectionHeaderBoundaryContractTests(SimpleTestCase):
++    def setUp(self):
++        self.factory = RequestFactory()
++
++    def proxy(self, upstream_headers=None, body=b'ok', status=200,
++              request_headers=None, view=BoundaryProxyView,
++              path='/asset.bin'):
++        headers = upstream_headers or urllib3.response.HTTPHeaderDict()
++        if not isinstance(headers, urllib3.response.HTTPHeaderDict):
++            headers = urllib3.response.HTTPHeaderDict(headers)
++
++        raw_response = urllib3.HTTPResponse(
++            BytesIO(body),
++            headers,
++            status,
++            preload_content=False,
++            original_response=Mock(name='http.client.HTTPResponse'),
++        )
++        urlopen = MagicMock(return_value=raw_response)
++        request_kwargs = {'HTTP_HOST': 'frontend.example'}
++        request_kwargs.update(request_headers or {})
++        request = self.factory.get(path, **request_kwargs)
++
++        with patch(URLOPEN, urlopen):
++            response = view.as_view()(request, path)
++
++        sent_headers = {
++            name.lower(): value
++            for name, value in urlopen.call_args[1]['headers'].items()
++        }
++        return response, sent_headers
++
++    def test_request_fixed_hop_headers_are_not_forwarded(self):
++        request_headers = {
++            'HTTP_CONNECTION': 'keep-alive',
++            'HTTP_KEEP_ALIVE': 'timeout=5',
++            'HTTP_PROXY_AUTHENTICATE': 'Basic realm=private',
++            'HTTP_PROXY_AUTHORIZATION': 'Basic c2VjcmV0',
++            'HTTP_PROXY_CONNECTION': 'close',
++            'HTTP_TE': 'trailers',
++            'HTTP_TRAILER': 'X-Checksum',
++            'HTTP_TRAILERS': 'X-Legacy-Checksum',
++            'HTTP_TRANSFER_ENCODING': 'chunked',
++            'HTTP_UPGRADE': 'websocket',
++            'HTTP_X_END_TO_END': 'preserved',
++        }
++
++        _, sent = self.proxy(request_headers=request_headers)
++
++        for name in FIXED_HOP_HEADERS:
++            self.assertNotIn(name, sent)
++        self.assertEqual('preserved', sent['x-end-to-end'])
++
++    def test_request_connection_tokens_are_case_insensitive_exact_names(self):
++        request_headers = {
++            'HTTP_CONNECTION': '  X-Client-Secret  , ',
++            'HTTP_X_CLIENT_SECRET': 'remove-me',
++            'HTTP_X_CLIENT_SECRETLY': 'preserve-me',
++        }
++
++        _, sent = self.proxy(request_headers=request_headers)
++
++        self.assertNotIn('x-client-secret', sent)
++        self.assertEqual('preserve-me', sent['x-client-secretly'])
++
++    def test_request_filter_applies_after_public_header_extension(self):
++        request_headers = {
++            'HTTP_CONNECTION': 'x-extension-secret',
++        }
++
++        _, sent = self.proxy(request_headers=request_headers,
++                             view=ExtendingBoundaryProxyView)
++
++        self.assertNotIn('x-extension-secret', sent)
++        self.assertEqual('visible', sent['x-extension-public'])
++
++    def test_existing_request_exclusions_remain_in_place(self):
++        request_headers = {
++            'HTTP_ACCEPT_ENCODING': 'gzip',
++            'HTTP_X_APPLICATION': 'kept-verbatim',
++        }
++
++        _, sent = self.proxy(request_headers=request_headers)
++
++        self.assertNotIn('host', sent)
++        self.assertNotIn('accept-encoding', sent)
++        self.assertEqual('kept-verbatim', sent['x-application'])
++
++    def test_response_fixed_hop_headers_are_not_exposed(self):
++        headers = urllib3.response.HTTPHeaderDict()
++        for name in FIXED_HOP_HEADERS:
++            headers.add(name, 'private')
++        headers.add('Content-Type', 'text/plain')
++        headers.add('Content-Length', '2')
++        headers.add('X-End-To-End', 'preserved')
++
++        response, _ = self.proxy(upstream_headers=headers)
++        exposed = {name.lower() for name, value in response.items()}
++
++        for name in FIXED_HOP_HEADERS:
++            self.assertNotIn(name, exposed)
++        self.assertEqual('preserved', response['X-End-To-End'])
++
++    def test_response_connection_tokens_use_all_lines_and_exact_names(self):
++        headers = urllib3.response.HTTPHeaderDict()
++        headers.add('Connection', ' X-Internal ')
++        headers.add('connection', ' X-Second-Secret ')
++        headers.add('X-Internal', 'remove-one')
++        headers.add('X-Second-Secret', 'remove-two')
++        headers.add('X-Internal-Suffix', 'preserved')
++        headers.add('Content-Type', 'text/plain')
++        headers.add('Content-Length', '2')
++
++        response, _ = self.proxy(upstream_headers=headers)
++
++        self.assertFalse(response.has_header('X-Internal'))
++        self.assertFalse(response.has_header('X-Second-Secret'))
++        self.assertEqual('preserved', response['X-Internal-Suffix'])
++
++    def test_scoped_location_and_content_type_do_not_affect_processing(self):
++        headers = urllib3.response.HTTPHeaderDict()
++        headers.add('Connection', ' Location, content-TYPE ')
++        headers.add('Location', 'http://upstream.example/private')
++        headers.add('Content-Type', 'application/x-private')
++        headers.add('Content-Length', '2')
++
++        response, _ = self.proxy(upstream_headers=headers)
++
++        self.assertFalse(response.has_header('Location'))
++        self.assertEqual('application/octet-stream',
++                         response['Content-Type'])
++
++    def test_connection_scoped_content_length_uses_no_length_streaming(self):
++        headers = urllib3.response.HTTPHeaderDict()
++        headers.add('Connection', 'Content-Length')
++        headers.add('Content-Length', '2')
++        headers.add('Content-Type', 'application/octet-stream')
++        body = b'payload-without-a-trusted-length'
++
++        response, _ = self.proxy(upstream_headers=headers, body=body)
++
++        self.assertIsInstance(response, StreamingHttpResponse)
++        self.assertFalse(response.has_header('Content-Length'))
++        self.assertEqual(body, b''.join(response.streaming_content))
++
++    def test_connection_scoped_set_cookie_is_not_materialized(self):
++        headers = urllib3.response.HTTPHeaderDict()
++        headers.add('Connection', 'set-cookie')
++        headers.add('Set-Cookie', 'private_one=one; Path=/')
++        headers.add('Set-Cookie', 'private_two=two; Path=/')
++        headers.add('Content-Type', 'text/plain')
++        headers.add('Content-Length', '2')
++
++        response, _ = self.proxy(upstream_headers=headers)
++
++        self.assertEqual([], list(response.cookies.keys()))
++
++    def test_ordinary_duplicate_set_cookies_are_preserved(self):
++        headers = urllib3.response.HTTPHeaderDict()
++        headers.add('Set-Cookie', 'public_one=one; Path=/one; HttpOnly')
++        headers.add('Set-Cookie', 'public_two=two; Path=/two; Secure')
++        headers.add('Content-Type', 'text/plain')
++        headers.add('Content-Length', '2')
++
++        response, _ = self.proxy(upstream_headers=headers)
++
++        self.assertEqual({'public_one', 'public_two'},
++                         set(response.cookies.keys()))
++        self.assertEqual('/one', response.cookies['public_one']['path'])
++        self.assertTrue(response.cookies['public_one']['httponly'])
++        self.assertEqual('/two', response.cookies['public_two']['path'])
++        self.assertTrue(response.cookies['public_two']['secure'])
++
++    def test_ordinary_response_behavior_and_redirect_rewriting_survive(self):
++        headers = urllib3.response.HTTPHeaderDict()
++        headers.add('Location',
++                    'http://upstream.example/next?from=proxy#result')
++        headers.add('Content-Type', 'text/plain')
++        headers.add('Content-Length', '7')
++        headers.add('X-Application', 'visible')
++        body = b'content'
++
++        response, _ = self.proxy(upstream_headers=headers, body=body,
++                                 status=307)
++
++        self.assertEqual(307, response.status_code)
++        self.assertEqual(body, response.content)
++        self.assertEqual('visible', response['X-Application'])
++        self.assertEqual(
++            'http://frontend.example/next?from=proxy#result',
++            response['Location'],
++        )
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,7 @@
++#!/bin/bash
++set -euo pipefail
++
++
++export DJANGO_SETTINGS_MODULE=tests.settings
++export PYTHONPATH="${PWD}/.build_env/.venv/lib/python3.11/site-packages${PYTHONPATH:+:${PYTHONPATH}}"
++/usr/bin/python3 -m pytest -q tests/test_connection_header_contract.py

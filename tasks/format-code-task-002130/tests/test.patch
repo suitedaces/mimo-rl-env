@@ -1,0 +1,249 @@
+diff --git a/usercase-test-coderl/usecase.sh b/usercase-test-coderl/usecase.sh
+new file mode 100755
+--- /dev/null
++++ b/usercase-test-coderl/usecase.sh
+@@ -0,0 +1,227 @@
++#!/usr/bin/env bash
++
++set -u
++export LANG=C.UTF-8 LC_ALL=C.UTF-8 TZ=UTC NO_COLOR=1 COLUMNS=160
++
++fail() { echo "FAIL: $*" >&2; exit 1; }
++
++
++PYTHON=/opt/openapi-python-client-coderl/bin/python
++[ -x "$PYTHON" ] || fail "offline Python environment missing: $PYTHON"
++
++export PYTHONPATH="/workspace/repo${PYTHONPATH:+:$PYTHONPATH}"
++BIN=("$PYTHON" -m openapi_python_client)
++
++RUN_ROOT=/tmp/openapi-python-client-coderl-fixture
++rm -rf "$RUN_ROOT"
++mkdir -p "$RUN_ROOT"
++trap 'rm -rf "$RUN_ROOT"' EXIT
++
++assert_file_contains() {
++    local file=$1
++    local pattern=$2
++    local label=$3
++    grep -Eq "$pattern" "$file" || fail "$label missing pattern $pattern in $file"
++}
++
++assert_file_not_contains() {
++    local file=$1
++    local pattern=$2
++    local label=$3
++    ! grep -Eq "$pattern" "$file" || fail "$label unexpected pattern $pattern in $file"
++}
++
++assert_no_config_specific_stream() {
++    local label=$1
++    local stream_file=$2
++    local stream_name=$3
++    local config_file=$4
++
++    ! grep -Eqi 'config|Unable to parse config' "$stream_file" || fail "$label $stream_name included config-specific text: $(cat "$stream_file")"
++    ! grep -Fq "$config_file" "$stream_file" || fail "$label $stream_name mentioned config file $config_file: $(cat "$stream_file")"
++}
++
++assert_no_config_specific_output() {
++    local label=$1
++    local config_file=$2
++    assert_no_config_specific_stream "$label" out stdout "$config_file"
++    assert_no_config_specific_stream "$label" err stderr "$config_file"
++}
++
++assert_unable_to_parse_config() {
++    local label=$1
++    local out_dir=$2
++    local ec=$3
++    [ "$ec" -eq 2 ] || fail "$label exit $ec; want 2"
++
++    ! grep -q 'Generating ' out || fail "$label stdout suggests generation started: $(cat out)"
++    grep -q 'Unable to parse config' err || fail "$label stderr missing Unable to parse config: $(cat err)"
++    [ ! -e "$out_dir" ] || fail "$label generated $out_dir before rejecting config"
++}
++
++
++
++
++cd "$RUN_ROOT"
++"${BIN[@]}" generate --help >out 2>err; ec=$?
++[ "$ec" -eq 0 ] || fail "F0 exit $ec; want 0"
++grep -q -- '--config' out || fail "F0 help did not include --config"
++
++! grep -q 'No such option' err || fail "F0 help rejected --config-capable CLI: $(cat err)"
++
++
++
++
++cat > spec_full.yml <<'EOF'
++openapi: '3.1.0'
++info:
++  title: Fixture API
++  version: '9.8.7'
++paths:
++  /items:
++    get:
++      operationId: get_item
++      tags: [items]
++      responses:
++        '200':
++          description: ok
++          content:
++            application/json:
++              schema:
++                $ref: '#/components/schemas/Item'
++components:
++  schemas:
++    Item:
++      type: object
++      required: [_secret, status]
++      properties:
++        _secret:
++          type: string
++        status:
++          $ref: '#/components/schemas/Status'
++    Status:
++      type: string
++      enum: [available, sold]
++EOF
++cat > client.yml <<'EOF'
++package_name_override: cfg_pkg
++project_name_override: cfg-project
++field_prefix: cfg_
++class_overrides:
++  Item:
++    class_name: InventoryItem
++    module_name: inventory_item
++post_hooks:
++  - python -c "from pathlib import Path; Path('hook.txt').write_text('yaml-hook')"
++literal_enums: true
++EOF
++"${BIN[@]}" generate --path spec_full.yml --config client.yml >out 2>err; ec=$?
++[ "$ec" -eq 0 ] || fail "F1 exit $ec; want 0; stderr: $(cat err)"
++assert_no_config_specific_output F1 client.yml
++[ -d cfg-project/cfg_pkg ] || fail "F1 cfg_pkg package directory missing"
++
++assert_file_contains cfg-project/pyproject.toml '^name = "cfg-project"$' F1
++assert_file_contains cfg-project/pyproject.toml 'include = "cfg_pkg"' F1
++[ -f cfg-project/cfg_pkg/models/inventory_item.py ] || fail "F1 class_overrides module inventory_item.py missing"
++assert_file_contains cfg-project/cfg_pkg/models/inventory_item.py '^class InventoryItem:' F1
++assert_file_contains cfg-project/cfg_pkg/models/inventory_item.py 'cfg_secret' F1
++assert_file_contains cfg-project/cfg_pkg/models/inventory_item.py '"_secret"' F1
++assert_file_not_contains cfg-project/cfg_pkg/models/inventory_item.py 'field_secret' F1
++assert_file_contains cfg-project/cfg_pkg/models/__init__.py 'InventoryItem' F1
++assert_file_contains cfg-project/cfg_pkg/models/status.py 'Literal' F1
++assert_file_contains cfg-project/cfg_pkg/models/status.py 'available' F1
++assert_file_contains cfg-project/cfg_pkg/models/status.py 'sold' F1
++[ "$(cat cfg-project/hook.txt)" = "yaml-hook" ] || fail "F1 post hook did not run from config"
++
++
++
++
++mkdir f2
++cd f2
++cat > spec_min.yml <<'EOF'
++openapi: '3.1.0'
++info:
++  title: JSON API
++  version: '1.2.3'
++paths: {}
++EOF
++cat > client.json <<'EOF'
++{"package_name_override":"json_pkg","project_name_override":"json-project","post_hooks":[]}
++EOF
++"${BIN[@]}" generate --path spec_min.yml --config client.json >out 2>err; ec=$?
++[ "$ec" -eq 0 ] || fail "F2 exit $ec; want 0; stderr: $(cat err)"
++assert_no_config_specific_output F2 client.json
++[ -f json-project/json_pkg/__init__.py ] || fail "F2 json_pkg package missing"
++
++assert_file_contains json-project/pyproject.toml '^name = "json-project"$' F2
++assert_file_contains json-project/pyproject.toml 'include = "json_pkg"' F2
++cd "$RUN_ROOT"
++
++
++
++
++mkdir f3
++cd f3
++cat > spec_min.yml <<'EOF'
++openapi: '3.1.0'
++info:
++  title: YAML Extension API
++  version: '4.5.6'
++paths: {}
++EOF
++cat > client.yaml <<'EOF'
++package_name_override: yaml_ext_pkg
++post_hooks: []
++EOF
++"${BIN[@]}" generate --path spec_min.yml --config client.yaml --meta none >out 2>err; ec=$?
++[ "$ec" -eq 0 ] || fail "F3 exit $ec; want 0; stderr: $(cat err)"
++assert_no_config_specific_output F3 client.yaml
++[ -f yaml_ext_pkg/__init__.py ] || fail "F3 yaml_ext_pkg package missing"
++
++[ -f yaml_ext_pkg/types.py ] || fail "F3 generated package types.py missing"
++cd "$RUN_ROOT"
++
++
++mkdir f_err
++cd f_err
++cat > spec_min.yml <<'EOF'
++openapi: '3.1.0'
++info: {title: Error API, version: '1.0'}
++paths: {}
++EOF
++
++
++
++
++"${BIN[@]}" generate --path spec_min.yml --config missing.yml --output-path should-not-exist >out 2>err; ec=$?
++assert_unable_to_parse_config F4 should-not-exist "$ec"
++
++
++
++
++cat > malformed.yml <<'EOF'
++package_name_override: [unterminated
++EOF
++"${BIN[@]}" generate --path spec_min.yml --config malformed.yml --output-path should-not-exist-yaml >out 2>err; ec=$?
++assert_unable_to_parse_config F5 should-not-exist-yaml "$ec"
++
++
++
++
++cat > invalid.yml <<'EOF'
++literal_enums: definitely
++EOF
++"${BIN[@]}" generate --path spec_min.yml --config invalid.yml --output-path should-not-exist-invalid >out 2>err; ec=$?
++assert_unable_to_parse_config F6 should-not-exist-invalid "$ec"
++
++
++
++
++cat > yaml_syntax.json <<'EOF'
++package_name_override: yaml_not_json
++EOF
++"${BIN[@]}" generate --path spec_min.yml --config yaml_syntax.json --output-path should-not-exist-json >out 2>err; ec=$?
++assert_unable_to_parse_config F7 should-not-exist-json "$ec"
++
++echo "PASS"
++exit 0
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,12 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++exec bash /workspace/repo/usercase-test-coderl/usecase.sh

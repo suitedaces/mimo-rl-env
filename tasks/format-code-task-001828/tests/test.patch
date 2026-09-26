@@ -1,0 +1,355 @@
+diff --git a/usercase-test-coderl/coordinate_transform_test.go b/usercase-test-coderl/coordinate_transform_test.go
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/coordinate_transform_test.go
+@@ -0,0 +1,320 @@
++package usercase_test_coderl
++
++import (
++	"errors"
++	"math"
++	"os"
++	"os/exec"
++	"runtime"
++	"strconv"
++	"strings"
++	"testing"
++
++	gdal "github.com/lukeroth/gdal"
++)
++
++
++
++
++
++
++func makeSpatialReference(t *testing.T, epsg int) gdal.SpatialReference {
++	t.Helper()
++
++	sr := gdal.CreateSpatialReference("")
++	if sr.IsNull() {
++		t.Fatalf("CreateSpatialReference(%q).IsNull() = true, want false", "")
++	}
++	if err := sr.FromEPSG(epsg); err != nil {
++		t.Fatalf("FromEPSG(%d) error = %v, want nil", epsg, err)
++	}
++	sr.SetAxisMappingStrategy(gdal.OAMS_TraditionalGisOrder)
++	t.Cleanup(sr.Destroy)
++	return sr
++}
++
++func makeWGS84ToWebMercator(t *testing.T) (gdal.SpatialReference, gdal.SpatialReference, gdal.CoordinateTransform) {
++	t.Helper()
++
++	source := makeSpatialReference(t, 4326)
++	dest := makeSpatialReference(t, 3857)
++	ct := gdal.CreateCoordinateTransform(source, dest)
++	t.Cleanup(ct.Destroy)
++	return source, dest, ct
++}
++
++func assertNear(t *testing.T, name string, got, want, tolerance float64) {
++	t.Helper()
++	if math.Abs(got-want) > tolerance {
++		t.Fatalf("%s = %.12f, want %.12f within %.12f", name, got, want, tolerance)
++	}
++}
++
++func assertErrPresent(t *testing.T, name string, got error) {
++	t.Helper()
++	if got == nil {
++
++		t.Fatalf("%s = nil, want non-nil error", name)
++	}
++}
++
++func TestCoordinateTransformHappySessionMutatesSlices(t *testing.T) {
++
++
++	_, _, ct := makeWGS84ToWebMercator(t)
++
++	if ct.IsNull() != false {
++		t.Fatalf("ct.IsNull() = %v, want false", ct.IsNull())
++	}
++	if got := ct.Err(); got != nil {
++		t.Fatalf("ct.Err() = %v, want nil", got)
++	}
++	if got := ct.Warn(); got != nil {
++		t.Fatalf("ct.Warn() = %v, want nil", got)
++	}
++
++	x, y, z := ct.TransformPoint(0, 0)
++	assertNear(t, "TransformPoint(0,0) x", x, 0.0, 0.000000001)
++	assertNear(t, "TransformPoint(0,0) y", y, 0.0, 0.000000001)
++	assertNear(t, "TransformPoint(0,0) z", z, 0.0, 0.000000001)
++
++	xs := []float64{0, 10}
++	ys := []float64{0, 20}
++	zs := []float64{0, 5}
++	if ok := ct.Transform(2, xs, ys, zs); ok != true {
++		t.Fatalf("Transform(2, ...) = %v, want true", ok)
++	}
++	assertNear(t, "xs[0]", xs[0], 0.0, 0.000000001)
++	assertNear(t, "ys[0]", ys[0], 0.0, 0.000000001)
++	assertNear(t, "zs[0]", zs[0], 0.0, 0.000000001)
++	assertNear(t, "xs[1]", xs[1], 1113194.907932735747, 0.0001)
++	assertNear(t, "ys[1]", ys[1], 2273030.926987689454, 0.0001)
++	assertNear(t, "zs[1]", zs[1], 5.0, 0.000000001)
++}
++
++func TestCoordinateTransformConversionFailureState(t *testing.T) {
++
++
++	_, _, ct := makeWGS84ToWebMercator(t)
++
++	xs := []float64{0}
++	ys := []float64{100}
++	zs := []float64{7}
++	if ok := ct.Transform(1, xs, ys, zs); ok != false {
++		t.Fatalf("Transform(1, invalid latitude) = %v, want false", ok)
++	}
++	assertErrPresent(t, "ct.Err() after invalid Transform", ct.Err())
++	if got := ct.Warn(); got != nil {
++		t.Fatalf("ct.Warn() after invalid Transform = %v, want nil", got)
++	}
++
++	x, y, z := ct.TransformPoint(0, 100)
++	assertNear(t, "TransformPoint(0,100) x", x, 0.0, 0.000000001)
++	assertNear(t, "TransformPoint(0,100) y", y, 0.0, 0.000000001)
++	assertNear(t, "TransformPoint(0,100) z", z, 0.0, 0.000000001)
++	assertErrPresent(t, "ct.Err() after invalid TransformPoint", ct.Err())
++	if got := ct.Warn(); got != nil {
++		t.Fatalf("ct.Warn() after invalid TransformPoint = %v, want nil", got)
++	}
++}
++
++func TestCoordinateTransformConstructionFailureIsObservable(t *testing.T) {
++
++
++	dest := makeSpatialReference(t, 3857)
++	invalidSource := gdal.CreateSpatialReference("")
++	t.Cleanup(invalidSource.Destroy)
++
++	ct := gdal.CreateCoordinateTransform(invalidSource, dest)
++	if ct.IsNull() != true {
++		t.Fatalf("ct.IsNull() for invalid source = %v, want true", ct.IsNull())
++	}
++	assertErrPresent(t, "ct.Err() for invalid source", ct.Err())
++	if got := ct.Warn(); got != nil {
++		t.Fatalf("ct.Warn() for invalid source = %v, want nil", got)
++	}
++}
++
++func TestGeometryTransformUsesCoordinateTransformHandle(t *testing.T) {
++
++
++	source, _, ct := makeWGS84ToWebMercator(t)
++	geom, err := gdal.CreateFromWKT("POINT (10 20 5)", source)
++	if err != nil {
++		t.Fatalf("CreateFromWKT point error = %v, want nil", err)
++	}
++	t.Cleanup(geom.Destroy)
++
++	if err := geom.Transform(ct); err != nil {
++		t.Fatalf("Geometry.Transform(valid ct) error = %v, want nil", err)
++	}
++	x, y, z := geom.Point(0)
++	assertNear(t, "geometry x", x, 1113194.907932735747, 0.0001)
++	assertNear(t, "geometry y", y, 2273030.926987689454, 0.0001)
++	assertNear(t, "geometry z", z, 5.0, 0.000000001)
++	wkt, err := geom.ToWKT()
++	if err != nil {
++		t.Fatalf("geom.ToWKT() error = %v, want nil", err)
++	}
++
++	if strings.TrimSpace(wkt) == "" {
++		t.Fatalf("geom.ToWKT() = %q, want non-empty WKT", wkt)
++	}
++}
++
++func TestGeometryTransformFailureReturnsGDALError(t *testing.T) {
++
++
++	source, _, ct := makeWGS84ToWebMercator(t)
++	geom, err := gdal.CreateFromWKT("POINT (10 100 5)", source)
++	if err != nil {
++		t.Fatalf("CreateFromWKT invalid-latitude point error = %v, want nil", err)
++	}
++	t.Cleanup(geom.Destroy)
++
++	err = geom.Transform(ct)
++	if !errors.Is(err, gdal.ErrFailure) {
++		t.Fatalf("Geometry.Transform(invalid latitude) error = %v, want gdal.ErrFailure", err)
++	}
++
++	x, y, z := geom.Point(0)
++	if math.IsNaN(x) || math.IsNaN(y) || math.IsNaN(z) {
++
++		t.Fatalf("geometry point after failed transform contains NaN: (%.12f, %.12f, %.12f)", x, y, z)
++	}
++}
++
++func TestCoordinateTransformInstancesStayIndependent(t *testing.T) {
++
++
++	wgs84 := makeSpatialReference(t, 4326)
++	webMercator := makeSpatialReference(t, 3857)
++	forward := gdal.CreateCoordinateTransform(wgs84, webMercator)
++	t.Cleanup(forward.Destroy)
++	reverse := gdal.CreateCoordinateTransform(webMercator, wgs84)
++	t.Cleanup(reverse.Destroy)
++
++	rx, ry, rz := reverse.TransformPoint(1113194.907932735747, 2273030.926987689454)
++	assertNear(t, "reverse x", rx, 10.0, 0.000000001)
++	assertNear(t, "reverse y", ry, 20.0, 0.000000001)
++	assertNear(t, "reverse z", rz, 0.0, 0.000000001)
++
++	fx, fy, fz := forward.TransformPoint(10, 20)
++	assertNear(t, "forward x", fx, 1113194.907932735747, 0.0001)
++	assertNear(t, "forward y", fy, 2273030.926987689454, 0.0001)
++	assertNear(t, "forward z", fz, 0.0, 0.000000001)
++}
++
++func TestDestroyDoesNotAffectSpatialReferences(t *testing.T) {
++
++
++	source := makeSpatialReference(t, 4326)
++	dest := makeSpatialReference(t, 3857)
++	ct := gdal.CreateCoordinateTransform(source, dest)
++	x, y, z := ct.TransformPoint(10, 20)
++	assertNear(t, "first transform x", x, 1113194.907932735747, 0.0001)
++	assertNear(t, "first transform y", y, 2273030.926987689454, 0.0001)
++	assertNear(t, "first transform z", z, 0.0, 0.000000001)
++	ct.Destroy()
++
++	next := gdal.CreateCoordinateTransform(source, dest)
++	t.Cleanup(next.Destroy)
++	if next.IsNull() != false {
++		t.Fatalf("recreated transform IsNull() = %v, want false", next.IsNull())
++	}
++	x, y, z = next.TransformPoint(10, 20)
++	assertNear(t, "recreated transform x", x, 1113194.907932735747, 0.0001)
++	assertNear(t, "recreated transform y", y, 2273030.926987689454, 0.0001)
++	assertNear(t, "recreated transform z", z, 0.0, 0.000000001)
++}
++
++func TestDestroyTwiceDoesNotAbortProcess(t *testing.T) {
++
++
++	cmd := exec.Command(os.Args[0], "-test.run=^TestDestroyTwiceChildProcess$")
++	cmd.Env = append(os.Environ(), "GDAL_COORDINATE_TRANSFORM_DOUBLE_DESTROY_CHILD=1")
++	out, err := cmd.CombinedOutput()
++	if err != nil {
++		t.Fatalf("double Destroy child failed: %v\n%s", err, out)
++	}
++
++}
++
++func TestDestroyTwiceChildProcess(t *testing.T) {
++
++
++	if os.Getenv("GDAL_COORDINATE_TRANSFORM_DOUBLE_DESTROY_CHILD") != "1" {
++		return
++	}
++	source := makeSpatialReference(t, 4326)
++	dest := makeSpatialReference(t, 3857)
++	ct := gdal.CreateCoordinateTransform(source, dest)
++	ct.Destroy()
++
++	os.Exit(0)
++}
++
++func TestCoordinateTransformDestroyHasNativeMemoryLeakFloor(t *testing.T) {
++
++
++	for i := 0; i < 100; i++ {
++		coordinateTransformLeakCycle(t)
++	}
++	runtime.GC()
++	before := residentSetKB(t)
++
++	for i := 0; i < 1000; i++ {
++		coordinateTransformLeakCycle(t)
++	}
++	runtime.GC()
++	after := residentSetKB(t)
++
++	if delta := after - before; delta > 8192 {
++		t.Fatalf("VmRSS delta after 1000 transform cycles = %d KiB, want <= 8192 KiB (before=%d after=%d)", delta, before, after)
++	}
++}
++
++func coordinateTransformLeakCycle(t *testing.T) {
++	t.Helper()
++	source := gdal.CreateSpatialReference("")
++	if err := source.FromEPSG(4326); err != nil {
++		t.Fatalf("warm FromEPSG(4326) error = %v, want nil", err)
++	}
++	source.SetAxisMappingStrategy(gdal.OAMS_TraditionalGisOrder)
++	dest := gdal.CreateSpatialReference("")
++	if err := dest.FromEPSG(3857); err != nil {
++		t.Fatalf("warm FromEPSG(3857) error = %v, want nil", err)
++	}
++	dest.SetAxisMappingStrategy(gdal.OAMS_TraditionalGisOrder)
++	ct := gdal.CreateCoordinateTransform(source, dest)
++	x, y, z := ct.TransformPoint(10, 20)
++	assertNear(t, "leak-cycle x", x, 1113194.907932735747, 0.0001)
++	assertNear(t, "leak-cycle y", y, 2273030.926987689454, 0.0001)
++	assertNear(t, "leak-cycle z", z, 0.0, 0.000000001)
++	ct.Destroy()
++	source.Destroy()
++	dest.Destroy()
++}
++
++func residentSetKB(t *testing.T) int {
++	t.Helper()
++	status, err := os.ReadFile("/proc/self/status")
++	if err != nil {
++		t.Fatalf("read /proc/self/status error = %v, want nil", err)
++	}
++	for _, line := range strings.Split(string(status), "\n") {
++		if strings.HasPrefix(line, "VmRSS:") {
++			fields := strings.Fields(line)
++			if len(fields) < 2 {
++				t.Fatalf("VmRSS line = %q, want at least two fields", line)
++			}
++			kb, err := strconv.Atoi(fields[1])
++			if err != nil {
++				t.Fatalf("parse VmRSS from %q error = %v, want nil", line, err)
++			}
++			return kb
++		}
++	}
++	t.Fatalf("VmRSS line missing from /proc/self/status")
++	return 0
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,25 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++
++cd /workspace/repo
++
++export GOPATH="/go"
++export GOMODCACHE="/go/pkg/mod"
++export GOPROXY="off"
++export GOSUMDB="off"
++export GOVCS="*:off"
++export GOTOOLCHAIN="local"
++export GOFLAGS="-mod=readonly"
++export PROJ_NETWORK="OFF"
++
++go test -v -count=1 ./usercase-test-coderl/...

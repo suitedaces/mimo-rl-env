@@ -1,0 +1,7 @@
+I want `Ants.get_replay(self) -> dict` available on an initialized or finished `Ants` game object. It should take no arguments and return a JSON-serializable revision 3 replay summary of the game state at the moment it is called.
+
+The top-level dictionary should include `revision: 3`, `players`, timing settings, radius settings, engine and player seeds, food settings, `map`, `food`, `ants`, `hills`, `scores`, `bonus`, `hive_history`, `winning_turn`, `ranking_turn`, and `cutoff`. The `map` value should contain `rows`, `cols`, and `data`, where `data` is the rendered replay map; for scenario games, the replay map should reflect the original map layout.
+
+Each food entry should be `[row, col, start_turn, end_turn]`, using the current turn plus one when that food is still present, and should append the gathering owner when the food was gathered. Each ant entry should be `[initial_row, initial_col, spawn_turn, end_turn, owner, orders]`, using the current turn plus one for living ants, the death turn for killed ants, and a single concatenated string for the ant's recorded orders. Each hill entry should be `[row, col, owner, end_turn]`, using the current turn plus one for active hills and the hill's end turn for razed hills.
+
+Calling `get_replay()` repeatedly without advancing the game should return equal dictionaries, and it should not advance turns, alter scores, change ant/food/hill state, or write files.

@@ -1,0 +1,326 @@
+diff --git a/usercase-test-coderl/printer_spooling_test.go b/usercase-test-coderl/printer_spooling_test.go
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/printer_spooling_test.go
+@@ -0,0 +1,288 @@
++package usercase_test_coderl
++
++import (
++	"bytes"
++	"io"
++	"testing"
++
++	"fyne.io/fyne/v2"
++	"fyne.io/fyne/v2/test"
++	terminal "github.com/fyne-io/terminal"
++)
++
++type noopWriteCloser struct{}
++
++func (w noopWriteCloser) Write(p []byte) (int, error) {
++	return len(p), nil
++}
++
++func (w noopWriteCloser) Close() error {
++	return nil
++}
++
++type chunkReader struct {
++	chunks [][]byte
++}
++
++func (r *chunkReader) Read(p []byte) (int, error) {
++	if len(r.chunks) == 0 {
++		return 0, io.EOF
++	}
++	n := copy(p, r.chunks[0])
++	r.chunks = r.chunks[1:]
++	return n, nil
++}
++
++func runTerminal(t *testing.T, input io.Reader, printer terminal.PrinterFunc) (string, [][]byte) {
++	t.Helper()
++
++	test.NewApp()
++	term := terminal.New()
++	win := test.NewWindow(term)
++	defer win.Close()
++	win.Resize(fyne.NewSize(640, 320))
++	term.Resize(fyne.NewSize(640, 320))
++
++	var printed [][]byte
++	if printer != nil {
++		term.SetPrinterFunc(terminal.PrinterFunc(func(d []byte) {
++			copied := append([]byte(nil), d...)
++			printed = append(printed, copied)
++			printer(d)
++		}))
++	}
++
++
++	err := term.RunWithConnection(noopWriteCloser{}, input)
++	if err != nil {
++		t.Fatalf("RunWithConnection returned error: %v", err)
++	}
++
++	return term.Text(), printed
++}
++
++func TestPrinterFuncImplementsPrinterAndIsCallable(t *testing.T) {
++
++
++	var got []byte
++	var printer terminal.Printer = terminal.PrinterFunc(func(d []byte) {
++		got = append([]byte(nil), d...)
++	})
++
++	printer.Print([]byte{0x70, 0x72, 0x6e})
++
++	if !bytes.Equal(got, []byte{0x70, 0x72, 0x6e}) {
++		t.Fatalf("PrinterFunc callback bytes = %v; want %v", got, []byte{0x70, 0x72, 0x6e})
++	}
++}
++
++func TestPrintModeSpoolsMiddleOfStreamOnceAndKeepsVisibleText(t *testing.T) {
++
++
++	callbackCalls := 0
++	var callbackPayload []byte
++	text, printed := runTerminal(t, bytes.NewReader([]byte("abc\x1b[5idef\x1b[4ighi")),
++		func(d []byte) {
++			callbackCalls++
++			callbackPayload = append([]byte(nil), d...)
++		})
++
++	if text != "abcghi" {
++		t.Fatalf("Text() = %q; want %q", text, "abcghi")
++	}
++	if len(printed) != 1 {
++		t.Fatalf("printer calls = %d; want %d", len(printed), 1)
++	}
++	if !bytes.Equal(printed[0], []byte{0x64, 0x65, 0x66}) {
++		t.Fatalf("spooled bytes = %v; want %v", printed[0], []byte{0x64, 0x65, 0x66})
++	}
++	if callbackCalls != 1 {
++		t.Fatalf("callback calls = %d; want %d", callbackCalls, 1)
++	}
++	if !bytes.Equal(callbackPayload, []byte{0x64, 0x65, 0x66}) {
++		t.Fatalf("callback payload = %v; want %v", callbackPayload, []byte{0x64, 0x65, 0x66})
++	}
++}
++
++func TestPrintModePreservesUtf8SingleByteAndEmbeddedEscPayloads(t *testing.T) {
++
++
++	text, printed := runTerminal(t, bytes.NewReader([]byte("\x1b[5iHello, 世界!\x1b[4i\x1b[5iH\xe9llo\x1bZtail\x1b[4i")),
++		func(d []byte) {})
++
++	if text != "" {
++		t.Fatalf("Text() = %q; want %q", text, "")
++	}
++	if len(printed) != 2 {
++		t.Fatalf("printer calls = %d; want %d", len(printed), 2)
++	}
++	if !bytes.Equal(printed[0], []byte{72, 101, 108, 108, 111, 44, 32, 228, 184, 150, 231, 149, 140, 33}) {
++		t.Fatalf("UTF-8 payload bytes = %v; want %v", printed[0], []byte{72, 101, 108, 108, 111, 44, 32, 228, 184, 150, 231, 149, 140, 33})
++	}
++	if !bytes.Equal(printed[1], []byte{72, 233, 108, 108, 111, 27, 90, 116, 97, 105, 108}) {
++		t.Fatalf("single-byte/ESC payload bytes = %v; want %v", printed[1], []byte{72, 233, 108, 108, 111, 27, 90, 116, 97, 105, 108})
++	}
++}
++
++func TestPrintModeSpoolsLargeBinaryPayloadSplitAcrossReads(t *testing.T) {
++
++
++	payload := append([]byte("%PDF-1.7\n\x00\xff"), bytes.Repeat([]byte{0x25, 0x41, 0x00, 0x1b, 0x42}, 7000)...)
++	reader := &chunkReader{chunks: [][]byte{
++		[]byte("pre"),
++		[]byte("\x1b["),
++		[]byte("5i"),
++		payload[:17],
++		payload[17:32781],
++		payload[32781:],
++		[]byte("\x1b"),
++		[]byte("[4"),
++		[]byte("ipost"),
++	}}
++
++	text, printed := runTerminal(t, reader, func(d []byte) {})
++
++	if text != "prepost" {
++		t.Fatalf("Text() = %q; want %q", text, "prepost")
++	}
++	if len(printed) != 1 {
++		t.Fatalf("printer calls = %d; want %d", len(printed), 1)
++	}
++	if len(printed[0]) != 35011 {
++		t.Fatalf("payload length = %d; want %d", len(printed[0]), 35011)
++	}
++	if !bytes.Equal(printed[0], payload) {
++		t.Fatalf("large payload did not match the bytes sent between print-mode controls")
++	}
++	if !bytes.Equal(printed[0][:10], []byte{37, 80, 68, 70, 45, 49, 46, 55, 10, 0}) {
++		t.Fatalf("payload prefix = %v; want %v", printed[0][:10], []byte{37, 80, 68, 70, 45, 49, 46, 55, 10, 0})
++	}
++	if !bytes.Equal(printed[0][35006:], []byte{37, 65, 0, 27, 66}) {
++		t.Fatalf("payload suffix = %v; want %v", printed[0][35006:], []byte{37, 65, 0, 27, 66})
++	}
++}
++
++func TestNoRegisteredPrinterConsumesPayloadWithoutDrawingIt(t *testing.T) {
++
++
++	text, printed := runTerminal(t, bytes.NewReader([]byte("left\x1b[5ihidden\x1b[4iright")), nil)
++
++	if text != "leftright" {
++		t.Fatalf("Text() = %q; want %q", text, "leftright")
++	}
++	if len(printed) != 0 {
++		t.Fatalf("printer calls = %d; want %d", len(printed), 0)
++	}
++}
++
++func TestPrinterRegistrationIsPerTerminalInstance(t *testing.T) {
++
++
++	aCalls := 0
++	var aPayload []byte
++	aText, aPrinted := runTerminal(t, bytes.NewReader([]byte("A\x1b[5ione\x1b[4iZ")),
++		func(d []byte) {
++			aCalls++
++			aPayload = append([]byte(nil), d...)
++		})
++	bText, bPrinted := runTerminal(t, bytes.NewReader([]byte("B\x1b[5itwo\x1b[4iY")), nil)
++
++	if aText != "AZ" {
++		t.Fatalf("terminal A Text() = %q; want %q", aText, "AZ")
++	}
++	if len(aPrinted) != 1 {
++		t.Fatalf("terminal A printer calls = %d; want %d", len(aPrinted), 1)
++	}
++	if !bytes.Equal(aPrinted[0], []byte{111, 110, 101}) {
++		t.Fatalf("terminal A payload = %v; want %v", aPrinted[0], []byte{111, 110, 101})
++	}
++	if aCalls != 1 {
++		t.Fatalf("terminal A callback calls = %d; want %d", aCalls, 1)
++	}
++	if !bytes.Equal(aPayload, []byte{111, 110, 101}) {
++		t.Fatalf("terminal A callback payload = %v; want %v", aPayload, []byte{111, 110, 101})
++	}
++	if bText != "BY" {
++		t.Fatalf("terminal B Text() = %q; want %q", bText, "BY")
++	}
++	if len(bPrinted) != 0 {
++		t.Fatalf("terminal B printer calls = %d; want %d", len(bPrinted), 0)
++	}
++	if aCalls != 1 {
++		t.Fatalf("terminal A callback calls after running terminal B = %d; want %d", aCalls, 1)
++	}
++}
++
++func TestPrintModeSpoolingIsRepeatableOnSameTerminal(t *testing.T) {
++
++
++
++	test.NewApp()
++	term := terminal.New()
++	win := test.NewWindow(term)
++	defer win.Close()
++	win.Resize(fyne.NewSize(640, 320))
++	term.Resize(fyne.NewSize(640, 320))
++
++	var printed [][]byte
++	term.SetPrinterFunc(terminal.PrinterFunc(func(d []byte) {
++		printed = append(printed, append([]byte(nil), d...))
++	}))
++
++	if err := term.RunWithConnection(noopWriteCloser{}, bytes.NewReader([]byte("a\x1b[5ione\x1b[4ib"))); err != nil {
++		t.Fatalf("first RunWithConnection returned error: %v", err)
++	}
++	if term.Text() != "ab" {
++		t.Fatalf("Text() after first run = %q; want %q", term.Text(), "ab")
++	}
++	if len(printed) != 1 {
++		t.Fatalf("printer calls after first run = %d; want %d", len(printed), 1)
++	}
++	if !bytes.Equal(printed[0], []byte("one")) {
++		t.Fatalf("first payload = %v; want %v", printed[0], []byte("one"))
++	}
++
++	if err := term.RunWithConnection(noopWriteCloser{}, bytes.NewReader([]byte("c\x1b[5itwo\x1b[4id"))); err != nil {
++		t.Fatalf("second RunWithConnection returned error: %v", err)
++	}
++	if term.Text() != "abcd" {
++		t.Fatalf("Text() after second run = %q; want %q", term.Text(), "abcd")
++	}
++	if len(printed) != 2 {
++		t.Fatalf("printer calls after second run = %d; want %d", len(printed), 2)
++	}
++	if !bytes.Equal(printed[1], []byte("two")) {
++		t.Fatalf("second payload = %v; want %v", printed[1], []byte("two"))
++	}
++}
++
++func TestPrintModeSpoolingRepeatedCycles(t *testing.T) {
++
++
++
++	for i := 0; i < 100; i++ {
++		test.NewApp()
++		term := terminal.New()
++		win := test.NewWindow(term)
++		win.Resize(fyne.NewSize(640, 320))
++		term.Resize(fyne.NewSize(640, 320))
++		var printed [][]byte
++		term.SetPrinterFunc(terminal.PrinterFunc(func(d []byte) {
++			printed = append(printed, append([]byte(nil), d...))
++		}))
++		err := term.RunWithConnection(noopWriteCloser{}, bytes.NewReader([]byte("\x1b[5ix\x1b[4i")))
++		win.Close()
++		if err != nil {
++			t.Fatalf("RunWithConnection cycle %d returned error: %v", i, err)
++		}
++		if term.Text() != "" {
++			t.Fatalf("Text() after cycle %d = %q; want %q", i, term.Text(), "")
++		}
++		if len(printed) != 1 {
++			t.Fatalf("printer calls after cycle %d = %d; want %d", i, len(printed), 1)
++		}
++		if !bytes.Equal(printed[0], []byte("x")) {
++			t.Fatalf("payload after cycle %d = %v; want %v", i, printed[0], []byte("x"))
++		}
++	}
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,28 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++
++
++set -euo pipefail
++
++export LANG=C.UTF-8
++export LC_ALL=C.UTF-8
++export LANGUAGE=en_US
++export GOPATH=/root/go
++export GOMODCACHE=/root/go/pkg/mod
++export GOCACHE=/opt/coderl-go-build-cache
++export GOPROXY=off
++export GOSUMDB=off
++export GOVCS='*:off'
++export GOTOOLCHAIN=local
++
++cd /workspace/repo
++exec go test -mod=readonly -v -count=1 ./usercase-test-coderl

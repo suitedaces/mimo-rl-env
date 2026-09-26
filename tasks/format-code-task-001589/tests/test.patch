@@ -1,0 +1,241 @@
+diff --git a/usercase-test-coderl/usecase.sh b/usercase-test-coderl/usecase.sh
+new file mode 100755
+--- /dev/null
++++ b/usercase-test-coderl/usecase.sh
+@@ -0,0 +1,219 @@
++#!/usr/bin/env bash
++
++set -u
++export LANG=C.UTF-8 LC_ALL=C.UTF-8 TZ=UTC
++
++fail() { echo "FAIL: $*" >&2; exit 1; }
++
++REPO=/workspace/repo
++VENV=${ARK_USECASE_VENV:-/opt/ark-unpacker-usecase-venv}
++
++
++[ -x "$VENV/bin/python" ] || fail "missing preinstalled venv at $VENV"
++
++BIN="$VENV/bin/python $REPO/Main.py"
++TMP=$(mktemp -d)
++trap 'rm -rf "$TMP"' EXIT
++
++run_cmd() {
++    # shellcheck disable=SC2086
++    $BIN "$@"
++}
++
++assert_no_crash_stderr() {
++    local path=$1
++
++    ! grep -Eiq 'traceback|unhandled exception' "$path" || fail "unexpected crash output in $path"
++}
++
++assert_json_shape() {
++    local path=$1
++    local top_key=$2
++    local expected_count=$3
++    "$VENV/bin/python" - "$path" "$top_key" "$expected_count" <<'PY'
++import json
++import sys
++path, top_key, expected_count = sys.argv[1], sys.argv[2], int(sys.argv[3])
++with open(path, "rb") as f:
++    data = json.loads(f.read().decode("utf-8", "surrogateescape"))
++if list(data.keys()) != [top_key]:
++    raise SystemExit(f"top keys {list(data.keys())!r}")
++objects = data[top_key]
++if len(objects) != expected_count:
++    raise SystemExit(f"object count {len(objects)}")
++if not all(isinstance(k, str) for k in objects.keys()):
++    raise SystemExit("path id keys are not strings")
++if not all(isinstance(v, dict) and v for v in objects.values()):
++    raise SystemExit("typetree values are not non-empty objects")
++PY
++}
++
++assert_json_matches_bundle_typetrees() {
++    local json_path=$1
++    local top_key=$2
++    local bundle_path=$3
++    "$VENV/bin/python" - "$json_path" "$top_key" "$bundle_path" <<'PY'
++import json
++import sys
++
++import UnityPy
++
++json_path, top_key, bundle_path = sys.argv[1:4]
++
++def serialize(value):
++    if isinstance(value, dict):
++        return {k: serialize(v) for k, v in value.items()}
++    if isinstance(value, list):
++        return [serialize(v) for v in value]
++    if isinstance(value, bytes):
++        return str(value, "utf-8", errors="surrogateescape")
++    return value
++
++with open(json_path, "rb") as f:
++    actual = json.loads(f.read().decode("utf-8", "surrogateescape"))
++
++with open(bundle_path, "rb") as f:
++    env = UnityPy.load(f)
++
++objects = {}
++for obj in env.objects:
++    read_typetree = getattr(obj, "read_typetree", None)
++    if not callable(read_typetree):
++        continue
++    try:
++        tree = read_typetree()
++    except Exception:
++        continue
++    if tree:
++        objects[str(obj.path_id)] = serialize(tree)
++
++expected = {top_key: objects}
++
++expected = json.loads(json.dumps(expected, ensure_ascii=False))
++if actual != expected:
++    actual_objects = actual.get(top_key, {}) if isinstance(actual, dict) else {}
++    raise SystemExit(
++        f"typetree data mismatch: top keys={list(actual) if isinstance(actual, dict) else type(actual).__name__}, "
++        f"object count={len(actual_objects) if isinstance(actual_objects, dict) else type(actual_objects).__name__}, "
++        f"expected count={len(objects)}"
++    )
++PY
++}
++
++
++
++
++run_cmd --help >"$TMP/help.out" 2>"$TMP/help.err"; ec=$?
++[ "$ec" -eq 0 ] || fail "F_help exit $ec; want 0"
++assert_no_crash_stderr "$TMP/help.err"
++grep -Fq -- "--typetree" "$TMP/help.out" || fail "F_help missing --typetree"
++grep -Fq -- "--image" "$TMP/help.out" || fail "F_help missing --image"
++grep -Fq -- "--text" "$TMP/help.out" || fail "F_help missing --text"
++grep -Fq -- "--audio" "$TMP/help.out" || fail "F_help missing --audio"
++grep -Fq -- "--mesh" "$TMP/help.out" || fail "F_help missing --mesh"
++grep -Fq -- "-d" "$TMP/help.out" || fail "F_help missing -d"
++grep -Fq -- "-g" "$TMP/help.out" || fail "F_help missing -g"
++
++
++
++
++OUT_SINGLE="$TMP/out_single"
++run_cmd -m ab -i "$REPO/test/res/client-2.2/chararts-char_002_amiya.ab" -o "$OUT_SINGLE" --typetree -l 0 >"$TMP/single.out" 2>"$TMP/single.err"; ec=$?
++[ "$ec" -eq 0 ] || fail "F_single exit $ec; want 0"
++assert_no_crash_stderr "$TMP/single.err"
++[ "$(find "$OUT_SINGLE" -type f -printf '%P\n' | sort)" = "TT_char_002_amiya.ab.json" ] || fail "F_single file list mismatch"
++
++assert_json_matches_bundle_typetrees "$OUT_SINGLE/TT_char_002_amiya.ab.json" "char_002_amiya.ab" "$REPO/test/res/client-2.2/chararts-char_002_amiya.ab" || fail "F_single typetree data mismatch"
++assert_json_shape "$OUT_SINGLE/TT_char_002_amiya.ab.json" "char_002_amiya.ab" 120 || fail "F_single JSON shape mismatch"
++
++
++
++
++SRC_GROUP="$TMP/src_group"
++OUT_GROUP="$TMP/out_group"
++mkdir -p "$SRC_GROUP/client-2.2" "$SRC_GROUP/client-2.4"
++cp "$REPO/test/res/client-2.2/chararts-char_002_amiya.ab" "$SRC_GROUP/client-2.2/chararts-char_002_amiya.ab"
++cp "$REPO/test/res/client-2.4/chararts-char_388_mint.ab" "$SRC_GROUP/client-2.4/chararts-char_388_mint.ab"
++run_cmd -m ab -i "$SRC_GROUP" -o "$OUT_GROUP" --typetree -g -l 0 >"$TMP/group.out" 2>"$TMP/group.err"; ec=$?
++[ "$ec" -eq 0 ] || fail "F_group exit $ec; want 0"
++assert_no_crash_stderr "$TMP/group.err"
++EXPECTED_GROUP_FILES=$(cat <<'EOF'
++client-2.2/chararts-char_002_amiya/TT_char_002_amiya.ab.json
++client-2.4/chararts-char_388_mint/TT_char_388_mint.ab.json
++EOF
++)
++[ "$(find "$OUT_GROUP" -type f -printf '%P\n' | sort)" = "$EXPECTED_GROUP_FILES" ] || fail "F_group file list mismatch"
++
++assert_json_matches_bundle_typetrees "$OUT_GROUP/client-2.2/chararts-char_002_amiya/TT_char_002_amiya.ab.json" "char_002_amiya.ab" "$SRC_GROUP/client-2.2/chararts-char_002_amiya.ab" || fail "F_group amiya typetree data mismatch"
++assert_json_matches_bundle_typetrees "$OUT_GROUP/client-2.4/chararts-char_388_mint/TT_char_388_mint.ab.json" "char_388_mint.ab" "$SRC_GROUP/client-2.4/chararts-char_388_mint.ab" || fail "F_group mint typetree data mismatch"
++assert_json_shape "$OUT_GROUP/client-2.4/chararts-char_388_mint/TT_char_388_mint.ab.json" "char_388_mint.ab" 190 || fail "F_group mint JSON shape mismatch"
++
++
++
++
++OUT_NONE="$TMP/out_none"
++run_cmd -m ab -i "$REPO/test/res/client-2.2/chararts-char_002_amiya.ab" -o "$OUT_NONE" -l 0 >"$TMP/none.out" 2>"$TMP/none.err"; ec=$?
++[ "$ec" -eq 0 ] || fail "F_no_typetree exit $ec; want 0"
++assert_no_crash_stderr "$TMP/none.err"
++[ -z "$(find "$OUT_NONE" -type f -printf '%P\n' 2>/dev/null | sort)" ] || fail "F_no_typetree unexpectedly exported files"
++
++
++
++
++CFG_WORK="$TMP/cfg_work"
++OUT_INDENT="$TMP/out_indent"
++mkdir -p "$CFG_WORK"
++cat >"$CFG_WORK/ArkUnpackerConfig.json" <<'JSON'
++{
++    "log_file": "ArkUnpackerLogs.log",
++    "log_level": 1,
++    "min_spare_memory_mb": 256,
++    "performance_level": 0,
++    "usm_encoding": "gbk",
++    "usm_export_video_codec": "vp9",
++    "usm_export_audio_codec": "libvorbis",
++    "usm_export_video_ext": ".mkv",
++    "usm_export_audio_ext": ".ogg",
++    "export_encoding": "utf-8",
++    "export_json_indent": 2
++}
++JSON
++( cd "$CFG_WORK" && run_cmd -m ab -i "$REPO/test/res/client-2.2/chararts-char_002_amiya.ab" -o "$OUT_INDENT" --typetree -l 0 >"$TMP/indent.out" 2>"$TMP/indent.err" ); ec=$?
++[ "$ec" -eq 0 ] || fail "F_indent exit $ec; want 0"
++assert_no_crash_stderr "$TMP/indent.err"
++
++assert_json_matches_bundle_typetrees "$OUT_INDENT/TT_char_002_amiya.ab.json" "char_002_amiya.ab" "$REPO/test/res/client-2.2/chararts-char_002_amiya.ab" || fail "F_indent typetree data mismatch"
++"$VENV/bin/python" - "$OUT_INDENT/TT_char_002_amiya.ab.json" <<'PY' || fail "F_indent indentation mismatch"
++import pathlib
++import sys
++b = pathlib.Path(sys.argv[1]).read_bytes()
++if b'\n  "char_002_amiya.ab"' not in b:
++    raise SystemExit("missing 2-space top-level indentation")
++if b'\n    "char_002_amiya.ab"' in b:
++    raise SystemExit("found default 4-space top-level indentation")
++PY
++
++
++
++
++OUT_INTER="$TMP/out_interactive"
++printf '2\n%s\n%s\nj\ny\n\n0\n' "$REPO/test/res/client-2.2/chararts-char_002_amiya.ab" "$OUT_INTER" | run_cmd -l 0 >"$TMP/inter.out" 2>"$TMP/inter.err"; ec=$?
++[ "$ec" -eq 0 ] || fail "F_interactive exit $ec; want 0"
++assert_no_crash_stderr "$TMP/inter.err"
++grep -Fq "j=Typetree JSON" "$TMP/inter.out" || fail "F_interactive prompt did not advertise typetree"
++
++[ "$(grep -F "Typetree JSON" "$TMP/inter.out" | wc -l)" -ge 2 ] || fail "F_interactive summary did not mention typetree"
++[ "$(find "$OUT_INTER" -type f -printf '%P\n' | sort)" = "TT_char_002_amiya.ab.json" ] || fail "F_interactive file list mismatch"
++
++assert_json_matches_bundle_typetrees "$OUT_INTER/TT_char_002_amiya.ab.json" "char_002_amiya.ab" "$REPO/test/res/client-2.2/chararts-char_002_amiya.ab" || fail "F_interactive typetree data mismatch"
++
++
++
++
++run_cmd -m ab -i "$TMP/does-not-exist" -o "$TMP/out_error" --typetree -l 0 >"$TMP/error.out" 2>"$TMP/error.err"; ec=$?
++
++[ "$ec" -ne 0 ] || fail "F_error exit $ec; want non-zero"
++[ -s "$TMP/error.out" ] || [ -s "$TMP/error.err" ] || fail "F_error missing diagnostic"
++
++echo "PASS"
++exit 0
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,12 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++exec bash /workspace/repo/usercase-test-coderl/usecase.sh

@@ -1,0 +1,466 @@
+diff --git a/usercase-test-coderl/test_agent_tools.py b/usercase-test-coderl/test_agent_tools.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/test_agent_tools.py
+@@ -0,0 +1,439 @@
++import copy
++import json
++import os
++import subprocess
++import sys
++import textwrap
++import types
++
++import pytest
++
++
++def _install_import_stubs() -> None:
++    sys.path.insert(0, "/workspace/repo/api")
++
++    sqlalchemy = types.ModuleType("sqlalchemy")
++
++    class FakeSelect:
++        def __init__(self, *columns):
++            self.columns = columns
++            self.conditions = []
++
++        def where(self, *args, **kwargs):
++            self.conditions.extend(args)
++            return self
++
++    sqlalchemy.select = lambda *args, **kwargs: FakeSelect(*args)
++    sys.modules["sqlalchemy"] = sqlalchemy
++
++    common = types.ModuleType("common")
++    context = types.ModuleType("common.context")
++
++    class FakeRequestContext:
++        @staticmethod
++        def get_effective_tenant_id():
++            return "tenant-from-context"
++
++    context.RequestContext = FakeRequestContext
++    sys.modules["common"] = common
++    sys.modules["common.context"] = context
++
++    rag_do = types.ModuleType("module_rag.entity.do.rag_do")
++
++    class FakeColumn:
++        def __init__(self, name):
++            self.name = name
++
++        def __eq__(self, other):
++            return ("eq", self.name, other)
++
++    class FakeRagDataset:
++        id = FakeColumn("id")
++        source_id = FakeColumn("source_id")
++
++    rag_do.RagDataset = FakeRagDataset
++    sys.modules.setdefault("module_rag.entity", types.ModuleType("module_rag.entity"))
++    sys.modules.setdefault("module_rag.entity.do", types.ModuleType("module_rag.entity.do"))
++    sys.modules["module_rag.entity.do.rag_do"] = rag_do
++
++    retrieval = types.ModuleType("module_rag.retrieval")
++    retrieval.retrieve = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("retrieve not patched"))
++    sys.modules["module_rag.retrieval"] = retrieval
++
++    sync_db = types.ModuleType("module_task_schedule.sync_db")
++    sync_db.get_sync_session_local = lambda: (_ for _ in ()).throw(AssertionError("db not patched"))
++    sys.modules.setdefault("module_task_schedule", types.ModuleType("module_task_schedule"))
++    sys.modules["module_task_schedule.sync_db"] = sync_db
++
++
++_install_import_stubs()
++from module_rag import agent_tools
++
++
++def _patch_source_lookup(monkeypatch, source_map=None):
++    source_map = source_map or {}
++
++    class FakeScalarResult:
++        def __init__(self, rows):
++            self._rows = rows
++
++        def all(self):
++            return list(self._rows)
++
++    class FakeExecuteResult:
++        def __init__(self, rows):
++            self._rows = rows
++
++        def scalars(self):
++            return FakeScalarResult(self._rows)
++
++    class FakeSession:
++        def execute(self, statement):
++            source_id = None
++            for condition in getattr(statement, "conditions", []):
++                if isinstance(condition, tuple) and condition[:2] == ("eq", "source_id"):
++                    source_id = condition[2]
++            return FakeExecuteResult(source_map.get(source_id, []))
++
++        def close(self):
++            pass
++
++    def fake_get_sync_session_local():
++        return lambda: FakeSession()
++
++
++    monkeypatch.setattr(agent_tools, "get_sync_session_local", fake_get_sync_session_local, raising=False)
++    monkeypatch.setattr(sys.modules["module_task_schedule.sync_db"], "get_sync_session_local", fake_get_sync_session_local)
++
++
++def _patch_retrieve(monkeypatch, responses):
++    calls = []
++
++    def fake_retrieve(tenant_id, query, dataset_ids, *, k=5, retrieval_type="hybrid", rerank=False, **kwargs):
++        calls.append(
++            {
++                "tenant_id": tenant_id,
++                "query": query,
++                "dataset_ids": list(dataset_ids),
++                "k": k,
++                "retrieval_type": retrieval_type,
++                "rerank": rerank,
++            }
++        )
++        return copy.deepcopy(responses[query])
++
++
++    monkeypatch.setattr(sys.modules["module_rag.retrieval"], "retrieve", fake_retrieve)
++    monkeypatch.setattr(agent_tools, "retrieve", fake_retrieve, raising=False)
++    return calls
++
++
++def test_returns_exact_message_when_no_datasets_are_available(monkeypatch):
++
++
++
++
++    _patch_source_lookup(monkeypatch)
++
++    actual = agent_tools.search_knowledge_base("anything")
++
++    assert actual == "未找到可用知识库。"
++
++
++def test_source_id_with_no_attached_datasets_returns_no_available_message(monkeypatch):
++
++
++
++
++    _patch_source_lookup(monkeypatch, {"empty-src": []})
++
++    actual = agent_tools.search_knowledge_base("anything", source_id="empty-src", tenant_id=7)
++
++    assert actual == "未找到可用知识库。"
++
++
++def test_returns_exact_message_when_retrieval_has_no_records(monkeypatch):
++
++
++
++
++    _patch_source_lookup(monkeypatch)
++    _patch_retrieve(monkeypatch, {"empty retrieval": {"total": 0, "records": []}})
++
++    actual = agent_tools.search_knowledge_base("empty retrieval", dataset_ids=["kb-empty"], tenant_id=7)
++
++    assert actual == "知识库中未检索到相关内容。"
++
++
++def test_formats_ranked_qa_and_chunk_records_with_trimmed_content(monkeypatch):
++
++
++
++
++    _patch_source_lookup(monkeypatch)
++    _patch_retrieve(
++        monkeypatch,
++        {
++            "format records": {
++                "total": 2,
++                "records": [
++                    {"content": "  年假为 10 天  ", "chunk_type": "qa"},
++                    {"content": "\n订单表包含金额字段\t", "chunk_type": "chunk"},
++                ],
++            }
++        },
++    )
++
++    actual = agent_tools.search_knowledge_base("format records", dataset_ids=["kb1"], tenant_id=7)
++
++    assert actual == "[1] (QA) 年假为 10 天\n\n[2] (片段) 订单表包含金额字段"
++
++
++def test_combines_source_and_explicit_datasets_dedupes_and_forwards_options(monkeypatch):
++
++
++
++
++    _patch_source_lookup(monkeypatch, {"src-a": ["kb2", "kb3"]})
++    calls = _patch_retrieve(
++        monkeypatch,
++        {
++            "format records": {
++                "records": [
++                    {"content": "年假为 10 天", "chunk_type": "qa"},
++                    {"content": "订单表包含金额字段", "chunk_type": "chunk"},
++                ]
++            }
++        },
++    )
++
++    actual = agent_tools.search_knowledge_base(
++        "format records",
++        source_id="src-a",
++        dataset_ids=["kb1", "kb2", "kb1"],
++        tenant_id=7,
++        top_k=9,
++        retrieval_type="keyword",
++        rerank=True,
++    )
++
++    assert actual == "[1] (QA) 年假为 10 天\n\n[2] (片段) 订单表包含金额字段"
++    assert calls == [
++        {
++            "tenant_id": 7,
++            "query": "format records",
++            "dataset_ids": ["kb1", "kb2", "kb3"],
++            "k": 9,
++            "retrieval_type": "keyword",
++            "rerank": True,
++        }
++    ]
++
++
++def test_omitted_tenant_uses_current_effective_tenant_and_default_options(monkeypatch):
++
++
++
++
++    _patch_source_lookup(monkeypatch)
++    calls = _patch_retrieve(
++        monkeypatch,
++        {"tenant query": {"records": [{"content": "向量结果", "chunk_type": "chunk"}]}},
++    )
++
++    actual = agent_tools.search_knowledge_base("tenant query", dataset_ids=["kb-v"])
++
++    assert actual == "[1] (片段) 向量结果"
++    assert calls == [
++        {
++            "tenant_id": "tenant-from-context",
++            "query": "tenant query",
++            "dataset_ids": ["kb-v"],
++            "k": 5,
++            "retrieval_type": "hybrid",
++            "rerank": False,
++        }
++    ]
++
++
++def test_vector_mode_is_forwarded_to_retrieval_backend(monkeypatch):
++
++
++
++
++    _patch_source_lookup(monkeypatch)
++    calls = _patch_retrieve(
++        monkeypatch,
++        {"vector query": {"records": [{"content": "向量结果", "chunk_type": "chunk"}]}},
++    )
++
++    actual = agent_tools.search_knowledge_base("vector query", dataset_ids=["kb-v"], tenant_id=8, retrieval_type="vector")
++
++    assert actual == "[1] (片段) 向量结果"
++    assert calls == [
++        {
++            "tenant_id": 8,
++            "query": "vector query",
++            "dataset_ids": ["kb-v"],
++            "k": 5,
++            "retrieval_type": "vector",
++            "rerank": False,
++        }
++    ]
++
++
++def test_make_kb_tool_delegates_with_fixed_scope_and_top_k(monkeypatch):
++
++
++
++
++    _patch_source_lookup(monkeypatch)
++    calls = _patch_retrieve(
++        monkeypatch,
++        {"orders 表有哪些字段": {"records": [{"content": "工具闭包结果", "chunk_type": "chunk"}]}},
++    )
++    tool = agent_tools.make_kb_tool(dataset_ids=["kb1"], tenant_id=7, top_k=3)
++
++    actual = tool("orders 表有哪些字段")
++
++    assert actual == "[1] (片段) 工具闭包结果"
++    assert calls == [
++        {
++            "tenant_id": 7,
++            "query": "orders 表有哪些字段",
++            "dataset_ids": ["kb1"],
++            "k": 3,
++            "retrieval_type": "hybrid",
++            "rerank": False,
++        }
++    ]
++
++
++def test_make_kb_tool_callable_rejects_extra_arguments(monkeypatch):
++
++
++
++
++    _patch_source_lookup(monkeypatch)
++    tool = agent_tools.make_kb_tool(dataset_ids=["kb1"], tenant_id=7, top_k=3)
++
++    with pytest.raises(TypeError):
++        tool("orders 表有哪些字段", top_k=9)
++
++
++def test_referential_transparency_for_same_input(monkeypatch):
++    _patch_source_lookup(monkeypatch)
++    _patch_retrieve(
++        monkeypatch,
++        {"stable query": {"records": [{"content": "状态稳定", "chunk_type": "qa"}]}},
++    )
++
++    first = agent_tools.search_knowledge_base("stable query", dataset_ids=["kb-state"], tenant_id=9)
++    second = agent_tools.search_knowledge_base("stable query", dataset_ids=["kb-state"], tenant_id=9)
++
++    assert first == "[1] (QA) 状态稳定"
++    assert second == "[1] (QA) 状态稳定"
++    assert first == second
++
++
++def test_dataset_ids_input_list_is_not_mutated(monkeypatch):
++    _patch_source_lookup(monkeypatch, {"src-a": ["kb2", "kb3"]})
++    _patch_retrieve(
++        monkeypatch,
++        {"mutation query": {"records": [{"content": "列表未变", "chunk_type": "chunk"}]}},
++    )
++    dataset_ids = ["kb1", "kb2", "kb1"]
++    before = copy.deepcopy(dataset_ids)
++
++    actual = agent_tools.search_knowledge_base("mutation query", source_id="src-a", dataset_ids=dataset_ids, tenant_id=7)
++
++    assert actual == "[1] (片段) 列表未变"
++    assert dataset_ids == before
++
++
++def test_same_input_matches_fresh_python_process(monkeypatch):
++    _patch_source_lookup(monkeypatch)
++    _patch_retrieve(
++        monkeypatch,
++        {"state query": {"records": [{"content": "状态稳定", "chunk_type": "qa"}]}},
++    )
++    in_process = agent_tools.search_knowledge_base("state query", dataset_ids=["kb-state"], tenant_id=9)
++
++    script = r'''
++import copy, json, sys, types
++sys.path.insert(0, "/workspace/repo/api")
++sqlalchemy = types.ModuleType("sqlalchemy")
++class FakeSelect:
++    def where(self, *args, **kwargs):
++        return self
++sqlalchemy.select = lambda *args, **kwargs: FakeSelect()
++sys.modules["sqlalchemy"] = sqlalchemy
++common = types.ModuleType("common")
++context = types.ModuleType("common.context")
++class FakeRequestContext:
++    @staticmethod
++    def get_effective_tenant_id():
++        return "tenant-from-context"
++context.RequestContext = FakeRequestContext
++sys.modules["common"] = common
++sys.modules["common.context"] = context
++rag_do = types.ModuleType("module_rag.entity.do.rag_do")
++class FakeColumn:
++    def __eq__(self, other):
++        return ("eq", other)
++class FakeRagDataset:
++    id = FakeColumn()
++    source_id = FakeColumn()
++rag_do.RagDataset = FakeRagDataset
++sys.modules.setdefault("module_rag.entity", types.ModuleType("module_rag.entity"))
++sys.modules.setdefault("module_rag.entity.do", types.ModuleType("module_rag.entity.do"))
++sys.modules["module_rag.entity.do.rag_do"] = rag_do
++retrieval = types.ModuleType("module_rag.retrieval")
++retrieval.retrieve = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("retrieve not patched"))
++sys.modules["module_rag.retrieval"] = retrieval
++sync_db = types.ModuleType("module_task_schedule.sync_db")
++sync_db.get_sync_session_local = lambda: (_ for _ in ()).throw(AssertionError("db not patched"))
++sys.modules.setdefault("module_task_schedule", types.ModuleType("module_task_schedule"))
++sys.modules["module_task_schedule.sync_db"] = sync_db
++from module_rag import agent_tools
++def fake_retrieve(tenant_id, query, dataset_ids, *, k=5, retrieval_type="hybrid", rerank=False, **kwargs):
++    return {"records": [{"content": "状态稳定", "chunk_type": "qa"}]}
++#
++sys.modules["module_rag.retrieval"].retrieve = fake_retrieve
++agent_tools.retrieve = fake_retrieve
++print(json.dumps(agent_tools.search_knowledge_base("state query", dataset_ids=["kb-state"], tenant_id=9), ensure_ascii=False))
++'''
++    completed = subprocess.run(
++        [sys.executable, "-c", script],
++        check=True,
++        capture_output=True,
++        text=True,
++    )
++    fresh_process = json.loads(completed.stdout)
++
++    assert in_process == "[1] (QA) 状态稳定"
++    assert fresh_process == "[1] (QA) 状态稳定"
++    assert in_process == fresh_process
++
++
++def test_search_wrapper_calls_backend_and_formats_response(monkeypatch):
++    _patch_source_lookup(monkeypatch)
++    calls = _patch_retrieve(
++        monkeypatch,
++        {"side effect query": {"records": [{"content": "无副作用", "chunk_type": "chunk"}]}},
++    )
++
++
++    actual = agent_tools.search_knowledge_base("side effect query", dataset_ids=["kb-side"], tenant_id=7)
++
++    assert actual == "[1] (片段) 无副作用"
++    assert calls == [
++        {
++            "tenant_id": 7,
++            "query": "side effect query",
++            "dataset_ids": ["kb-side"],
++            "k": 5,
++            "retrieval_type": "hybrid",
++            "rerank": False,
++        }
++    ]
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,17 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++cd /workspace/repo
++export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
++export PIP_NO_INDEX=1
++export PIP_DISABLE_PIP_VERSION_CHECK=1
++exec python -m pytest -p no:cacheprovider /workspace/repo/usercase-test-coderl/test_agent_tools.py -v

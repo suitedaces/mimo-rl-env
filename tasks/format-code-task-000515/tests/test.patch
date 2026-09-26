@@ -1,0 +1,545 @@
+diff --git a/usercase-test-coderl/search_library.test.ts b/usercase-test-coderl/search_library.test.ts
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/search_library.test.ts
+@@ -0,0 +1,506 @@
++
++
++
++
++
++
++
++
++
++
++
++const assert = require('assert/strict');
++const path = require('path');
++const Module = require('module');
++
++type TrackProjection = {
++    title: string;
++    artist: string;
++    album: string;
++    fileName: string;
++};
++
++type TestCase = {
++    name: string;
++    fn: () => Promise<void> | void;
++};
++
++const tests: TestCase[] = [];
++
++function test(name: string, fn: TestCase['fn']): void {
++    tests.push({name, fn});
++}
++
++function installAliasResolver(): void {
++    const originalResolve = Module._resolveFilename;
++    if ((Module as any).__coderlAliasResolverInstalled) {
++        return;
++    }
++
++    Module._resolveFilename = function resolveWithRendererAliases(
++        request: string,
++        parent: unknown,
++        isMain: boolean,
++        options: unknown
++    ) {
++        const aliases: Record<string, string> = {
++            '@/': path.join(process.cwd(), 'src/renderer/src/'),
++            '@api/': path.join(process.cwd(), 'src/renderer/src/api/'),
++            '@utils/': path.join(process.cwd(), 'src/renderer/src/utils/'),
++            '@ui/': path.join(process.cwd(), 'src/renderer/src/ui/'),
++            '@extensions/': path.join(process.cwd(), 'src/renderer/src/extensions/'),
++            '@styles/': path.join(process.cwd(), 'src/renderer/src/styles/'),
++            '@assets/': path.join(process.cwd(), 'src/renderer/src/assets/')
++        };
++
++        for (const [prefix, target] of Object.entries(aliases)) {
++            if (request.startsWith(prefix)) {
++                return originalResolve.call(
++                    this,
++                    path.join(target, request.slice(prefix.length)),
++                    parent,
++                    isMain,
++                    options
++                );
++            }
++        }
++
++        return originalResolve.call(this, request, parent, isMain, options);
++    };
++
++    (Module as any).__coderlAliasResolverInstalled = true;
++}
++
++installAliasResolver();
++
++const {LibraryCacheManager} = require('../src/main/services/library/LibraryCacheManager');
++const {LibraryController} = require('../src/main/controllers/LibraryController');
++const {libraryGateway} = require('../src/renderer/src/infrastructure/electron');
++const {LibraryDataService} = require('../src/renderer/src/features/library/service/LibraryDataService');
++const {LibraryService} = require('../src/renderer/src/features/library/service/LibraryService');
++const {LibraryAPI} = require('../src/renderer/src/api/modules/LibraryAPI');
++
++const BLUE_TRACK = {
++    fileId: 'blue-id',
++    title: 'Blue Monday',
++    artist: 'New Order',
++    album: 'Substance',
++    fileName: 'blue-monday.flac',
++    filePath: '/music/blue-monday.flac'
++};
++
++const AROUND_TRACK = {
++    fileId: 'around-id',
++    title: 'Around the World',
++    artist: 'Daft Punk',
++    album: 'Homework',
++    fileName: 'around.mp3',
++    filePath: '/music/around.mp3'
++};
++
++const SILENT_TRACK = {
++    fileId: 'silent-id',
++    title: 'Silent Shout',
++    artist: 'The Knife',
++    album: 'Deep Cuts',
++    fileName: 'knife.ogg',
++    filePath: '/music/knife.ogg'
++};
++
++const API_TRACKS = [BLUE_TRACK, AROUND_TRACK];
++
++const ALL_CACHE_TRACKS: TrackProjection[] = [
++    {title: 'Blue Monday', artist: 'New Order', album: 'Substance', fileName: 'blue-monday.flac'},
++    {title: 'Around the World', artist: 'Daft Punk', album: 'Homework', fileName: 'around.mp3'},
++    {title: 'Silent Shout', artist: 'The Knife', album: 'Deep Cuts', fileName: 'knife.ogg'}
++];
++
++const BLUE_ONLY: TrackProjection[] = [
++    {title: 'Blue Monday', artist: 'New Order', album: 'Substance', fileName: 'blue-monday.flac'}
++];
++
++const AROUND_ONLY: TrackProjection[] = [
++    {title: 'Around the World', artist: 'Daft Punk', album: 'Homework', fileName: 'around.mp3'}
++];
++
++function projectTracks(tracks: Array<Record<string, unknown>>): TrackProjection[] {
++    return tracks.map((track) => ({
++        title: track.title as string,
++        artist: track.artist as string,
++        album: track.album as string,
++        fileName: track.fileName as string
++    }));
++}
++
++function projectIds(tracks: Array<Record<string, unknown>>): string[] {
++    return tracks.map((track) => track.fileId as string);
++}
++
++function mkStats(size: number, ms: number): {size: number; mtime: Date} {
++    return {size, mtime: new Date(ms)};
++}
++
++async function freshCacheManager(): Promise<any> {
++    const manager = new LibraryCacheManager(null);
++    manager.saveCache = async () => {};
++    await manager.clearCache();
++    return manager;
++}
++
++async function seededCacheManager(): Promise<any> {
++    const manager = await freshCacheManager();
++    manager.addTracks([
++        {
++            trackData: {title: 'Blue Monday', artist: 'New Order', album: 'Substance'},
++            filePath: '/music/blue-monday.flac',
++            stats: mkStats(1000, 1700000000000)
++        },
++        {
++            trackData: {title: 'Around the World', artist: 'Daft Punk', album: 'Homework'},
++            filePath: '/music/around.mp3',
++            stats: mkStats(2000, 1700000001000)
++        },
++        {
++            trackData: {title: 'Silent Shout', artist: 'The Knife', album: 'Deep Cuts'},
++            filePath: '/music/knife.ogg',
++            stats: mkStats(3000, 1700000002000)
++        }
++    ]);
++    return manager;
++}
++
++function installWindowSearch(search: (query: string) => Promise<unknown[]>): Array<[string, string]> {
++    const calls: Array<[string, string]> = [];
++    (globalThis as any).window = {
++        electronAPI: {
++            library: {
++                search: async (query: string) => {
++                    calls.push(['search', query]);
++                    return search(query);
++                },
++                scanDirectory: async () => {
++                    throw new Error('scanDirectory must not be called by search');
++                },
++                getTrackMetadata: async () => {
++                    throw new Error('getTrackMetadata must not be called by search');
++                },
++                updateTrackMetadata: async () => {
++                    throw new Error('updateTrackMetadata must not be called by search');
++                },
++                addTrackToLibrary: async () => {
++                    throw new Error('addTrackToLibrary must not be called by search');
++                },
++                loadCachedTracks: async () => {
++                    throw new Error('loadCachedTracks must not be called by search');
++                },
++                getTracks: async () => {
++                    throw new Error('getTracks must not be called by search');
++                }
++            }
++        }
++    };
++    return calls;
++}
++
++function searchApiTracks(query: string): Promise<unknown[]> {
++    if (!query.trim()) {
++        return Promise.resolve(API_TRACKS);
++    }
++
++    const term = query.toLowerCase();
++    return Promise.resolve(API_TRACKS.filter((track) =>
++        track.title.toLowerCase().includes(term) ||
++        track.artist.toLowerCase().includes(term) ||
++        track.album.toLowerCase().includes(term) ||
++        track.fileName.toLowerCase().includes(term)
++    ));
++}
++
++
++
++async function cacheSearchReturnsAllTracksForBlankQueriesInOrder(): Promise<void> {
++    const manager = await seededCacheManager();
++
++    assert.deepStrictEqual(projectTracks(manager.searchTracks('')), ALL_CACHE_TRACKS);
++    assert.deepStrictEqual(projectTracks(manager.searchTracks('   ')), ALL_CACHE_TRACKS);
++    assert.deepStrictEqual(projectTracks(manager.getAllTracks()), ALL_CACHE_TRACKS);
++}
++
++test('cache search returns all tracks for blank queries in cache order', cacheSearchReturnsAllTracksForBlankQueriesInOrder);
++
++
++
++async function cacheSearchMatchesEachFieldCaseInsensitively(): Promise<void> {
++    const manager = await seededCacheManager();
++
++    assert.deepStrictEqual(projectTracks(manager.searchTracks('order')), BLUE_ONLY);
++    assert.deepStrictEqual(projectTracks(manager.searchTracks('SUBSTANCE')), BLUE_ONLY);
++    assert.deepStrictEqual(projectTracks(manager.searchTracks('flac')), BLUE_ONLY);
++    assert.deepStrictEqual(projectTracks(manager.searchTracks('around')), AROUND_ONLY);
++    assert.deepStrictEqual(projectTracks(manager.searchTracks('missing-term')), []);
++    assert.deepStrictEqual(projectTracks(manager.getAllTracks()), ALL_CACHE_TRACKS);
++}
++
++test('cache search matches title artist album and file name case-insensitively', cacheSearchMatchesEachFieldCaseInsensitively);
++
++
++
++async function cacheSearchObservesStateAddedAfterEarlierSearch(): Promise<void> {
++    const manager = await freshCacheManager();
++
++    assert.deepStrictEqual(projectTracks(manager.searchTracks('')), []);
++
++    manager.addTrack(
++        {title: 'Blue Monday', artist: 'New Order', album: 'Substance'},
++        '/music/blue-monday.flac',
++        mkStats(1000, 1700000000000)
++    );
++    assert.deepStrictEqual(projectTracks(manager.searchTracks('')), BLUE_ONLY);
++
++    manager.addTrack(
++        {title: 'Around the World', artist: 'Daft Punk', album: 'Homework'},
++        '/music/around.mp3',
++        mkStats(2000, 1700000001000)
++    );
++    assert.deepStrictEqual(projectTracks(manager.searchTracks('')), [
++        {title: 'Blue Monday', artist: 'New Order', album: 'Substance', fileName: 'blue-monday.flac'},
++        {title: 'Around the World', artist: 'Daft Punk', album: 'Homework', fileName: 'around.mp3'}
++    ]);
++    assert.deepStrictEqual(projectTracks(manager.searchTracks('around')), AROUND_ONLY);
++}
++
++test('cache search observes cache state added after an earlier search', cacheSearchObservesStateAddedAfterEarlierSearch);
++
++
++
++async function preloadExposesLibrarySearchOnLibrarySearchIpcChannel(): Promise<void> {
++    const originalLoad = Module._load;
++    const calls: unknown[][] = [];
++    let exposedApi: any = null;
++
++    delete require.cache[require.resolve('../src/main/preload.ts')];
++    Module._load = function loadWithFakeElectron(request: string) {
++        if (request === 'electron') {
++            return {
++                contextBridge: {
++                    exposeInMainWorld: (name: string, api: unknown) => {
++                        calls.push(['exposeInMainWorld', name]);
++                        if (name === 'electronAPI') {
++                            exposedApi = api;
++                        }
++                    }
++                },
++                ipcRenderer: {
++                    invoke: async (...args: unknown[]) => {
++                        calls.push(['invoke', ...args]);
++                        return API_TRACKS;
++                    },
++                    on: () => {},
++                    removeListener: () => {}
++                }
++            };
++        }
++        return originalLoad.apply(this, arguments as any);
++    };
++
++    try {
++        require('../src/main/preload.ts');
++
++        assert.ok(calls.some((call) => call[0] === 'exposeInMainWorld' && call[1] === 'electronAPI'));
++        assert.strictEqual(typeof exposedApi?.library?.search, 'function');
++
++        calls.length = 0;
++        const result = await exposedApi.library.search('order');
++
++        assert.ok(Array.isArray(result));
++        assert.deepStrictEqual(projectIds(result), ['blue-id', 'around-id']);
++
++        assert.ok(calls.some((call) =>
++            call[0] === 'invoke' && call[1] === 'library:search' && call[2] === 'order'
++        ));
++    } finally {
++        Module._load = originalLoad;
++    }
++}
++
++test('preload exposes electronAPI.library.search on the library search IPC channel', preloadExposesLibrarySearchOnLibrarySearchIpcChannel);
++
++
++
++async function publicSearchStackDelegatesConsistentlyToGatewaySearch(): Promise<void> {
++    const calls = installWindowSearch(searchApiTracks);
++
++    assert.deepStrictEqual(projectIds(await libraryGateway.search('')), ['blue-id', 'around-id']);
++    assert.deepStrictEqual(projectIds(await new LibraryDataService().searchLibrary('order')), ['blue-id']);
++    assert.deepStrictEqual(projectIds(await new LibraryService().searchLibrary('SUBSTANCE')), ['blue-id']);
++    assert.deepStrictEqual(projectIds(await new LibraryAPI().searchLibrary('around')), ['around-id']);
++    assert.deepStrictEqual(calls, [
++        ['search', ''],
++        ['search', 'order'],
++        ['search', 'SUBSTANCE'],
++        ['search', 'around']
++    ]);
++}
++
++test('public search stack delegates consistently to gateway search', publicSearchStackDelegatesConsistentlyToGatewaySearch);
++
++
++
++async function nonStringQueryFailsBeforeIpcRequest(): Promise<void> {
++    const calls = installWindowSearch(searchApiTracks);
++
++
++    await assert.rejects(
++        async () => new LibraryDataService().searchLibrary(42 as any)
++    );
++    assert.deepStrictEqual(calls, []);
++}
++
++test('non-string query fails validation before any IPC request', nonStringQueryFailsBeforeIpcRequest);
++
++
++
++async function searchFailuresResolveToEmptyArrays(): Promise<void> {
++    const controller = new LibraryController(
++        {searchTracks: () => { throw new TypeError('cache exploded'); }},
++        {},
++        {},
++        {},
++        {},
++        async () => ({}),
++        {}
++    );
++
++    assert.deepStrictEqual(await controller.search('anything'), []);
++
++    const calls = installWindowSearch(async (query) => {
++        throw new Error(`ipc failed for ${query}`);
++    });
++
++    assert.deepStrictEqual(await new LibraryDataService().searchLibrary('fail'), []);
++    assert.deepStrictEqual(await new LibraryService().searchLibrary('fail'), []);
++    assert.deepStrictEqual(await new LibraryAPI().searchLibrary('fail'), []);
++    assert.deepStrictEqual(await new LibraryAPI().searchLibrary('fail-again'), []);
++    assert.deepStrictEqual(calls, [
++        ['search', 'fail'],
++        ['search', 'fail'],
++        ['search', 'fail'],
++        ['search', 'fail-again']
++    ]);
++}
++
++test('cache-side and higher-level IPC search failures resolve to empty arrays', searchFailuresResolveToEmptyArrays);
++
++
++
++async function cacheManagersKeepSearchStateIndependentAcrossInstances(): Promise<void> {
++    const a = await freshCacheManager();
++    const b = await freshCacheManager();
++
++    a.addTrack(
++        {title: 'Blue Monday', artist: 'New Order', album: 'Substance'},
++        '/music/blue-monday.flac',
++        mkStats(1000, 1700000000000)
++    );
++    a.addTrack(
++        {title: 'Around the World', artist: 'Daft Punk', album: 'Homework'},
++        '/music/around.mp3',
++        mkStats(2000, 1700000001000)
++    );
++    b.addTrack(
++        {title: 'Red Eyes', artist: 'The War on Drugs', album: 'Lost in the Dream'},
++        '/other/red-eyes.wav',
++        mkStats(4000, 1700000003000)
++    );
++
++    assert.deepStrictEqual(projectTracks(a.searchTracks('')), [
++        {title: 'Blue Monday', artist: 'New Order', album: 'Substance', fileName: 'blue-monday.flac'},
++        {title: 'Around the World', artist: 'Daft Punk', album: 'Homework', fileName: 'around.mp3'}
++    ]);
++    assert.deepStrictEqual(projectTracks(b.searchTracks('')), [
++        {title: 'Red Eyes', artist: 'The War on Drugs', album: 'Lost in the Dream', fileName: 'red-eyes.wav'}
++    ]);
++}
++
++test('cache managers keep search state independent across instances', cacheManagersKeepSearchStateIndependentAcrossInstances);
++
++
++
++async function repeatedSearchesDoNotStartWorkOrAccumulateResources(): Promise<void> {
++    const counters = {
++        scanDirectory: 0,
++        getTrackMetadata: 0,
++        updateTrackMetadata: 0,
++        addTrackToLibrary: 0,
++        loadCachedTracks: 0,
++        getTracks: 0
++    };
++    const calls: Array<[string, string]> = [];
++
++    (globalThis as any).window = {
++        electronAPI: {
++            library: {
++                search: async (query: string) => {
++                    calls.push(['search', query]);
++                    return searchApiTracks(query);
++                },
++                scanDirectory: async () => {
++                    counters.scanDirectory++;
++                    return false;
++                },
++                getTrackMetadata: async () => {
++                    counters.getTrackMetadata++;
++                    return null;
++                },
++                updateTrackMetadata: async () => {
++                    counters.updateTrackMetadata++;
++                    return null;
++                },
++                addTrackToLibrary: async () => {
++                    counters.addTrackToLibrary++;
++                    return {success: false};
++                },
++                loadCachedTracks: async () => {
++                    counters.loadCachedTracks++;
++                    return [];
++                },
++                getTracks: async () => {
++                    counters.getTracks++;
++                    return [];
++                }
++            }
++        }
++    };
++
++    for (let i = 0; i < 100; i++) {
++        assert.deepStrictEqual(projectIds(await new LibraryDataService().searchLibrary('order')), ['blue-id']);
++    }
++
++    assert.strictEqual(calls.length, 100);
++    assert.deepStrictEqual(counters, {
++        scanDirectory: 0,
++        getTrackMetadata: 0,
++        updateTrackMetadata: 0,
++        addTrackToLibrary: 0,
++        loadCachedTracks: 0,
++        getTracks: 0
++    });
++
++
++    const nonSearchWorkCount = Object.values(counters).reduce((sum, count) => sum + count, 0);
++    assert.strictEqual(nonSearchWorkCount, 0);
++}
++
++test('repeated searches do not scan parse write or accumulate Node resources', repeatedSearchesDoNotStartWorkOrAccumulateResources);
++
++async function run(): Promise<void> {
++    for (const {name, fn} of tests) {
++        await fn();
++        console.log(`ok - ${name}`);
++    }
++}
++
++run().catch((error: Error) => {
++    console.error(error);
++    process.exitCode = 1;
++});
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,29 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++
++
++set -euo pipefail
++
++cd /workspace/repo
++
++if [ ! -d node_modules ]; then
++  echo "node_modules is required for offline test execution" >&2
++  exit 127
++fi
++
++export npm_config_offline=true
++export npm_config_ignore_scripts=true
++
++export TS_NODE_TRANSPILE_ONLY=1
++export TS_NODE_COMPILER_OPTIONS='{"module":"CommonJS","moduleResolution":"node","experimentalDecorators":true,"esModuleInterop":true,"skipLibCheck":true,"target":"ES2022","ignoreDeprecations":"6.0"}'
++
++exec node -r ts-node/register /workspace/repo/usercase-test-coderl/search_library.test.ts

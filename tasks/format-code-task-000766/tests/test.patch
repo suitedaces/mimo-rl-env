@@ -1,0 +1,532 @@
+diff --git a/usercase-test-coderl/cache_stateful_test.go b/usercase-test-coderl/cache_stateful_test.go
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/cache_stateful_test.go
+@@ -0,0 +1,499 @@
++package usercase_test_coderl
++
++import (
++	"encoding/json"
++	"errors"
++	"io/ioutil"
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++	"time"
++
++	aw "github.com/deanishe/awgo"
++)
++
++
++
++
++
++
++
++type repoRecord struct {
++	Name  string `json:"name"`
++	Stars int    `json:"stars"`
++}
++
++type unmarshalableRecord struct {
++	Bad func()
++}
++
++func TestByteCacheSessionStoreLoadDelete(t *testing.T) {
++
++
++	dir := filepath.Join(t.TempDir(), "nested", "cache")
++	c := aw.NewCache(dir)
++
++	if c.Dir != dir {
++		t.Fatalf("Cache.Dir = %q, want %q", c.Dir, dir)
++	}
++	if !isDir(c.Dir) {
++		t.Fatalf("cache directory exists = false, want true")
++	}
++	if c.Exists("answer.txt") != false {
++		t.Fatalf("fresh Exists = true, want false")
++	}
++
++	if c.Expired("answer.txt", time.Hour) != true {
++		t.Fatalf("fresh Expired(1h) = false, want true")
++	}
++
++	data, err := c.Load("answer.txt")
++	if string(data) != "" {
++		t.Fatalf("fresh Load bytes = %q, want empty", string(data))
++	}
++	if !isPathNotExist(err) {
++		t.Fatalf("fresh Load error = %T %[1]v, want missing *os.PathError", err)
++	}
++
++	if err := c.Store("answer.txt", []byte("42")); err != nil {
++		t.Fatalf("Store bytes error = %v, want nil", err)
++	}
++	if c.Exists("answer.txt") != true {
++		t.Fatalf("stored Exists = false, want true")
++	}
++
++	if c.Expired("answer.txt", time.Hour) != false {
++		t.Fatalf("stored Expired(1h) = true, want false")
++	}
++	data, err = c.Load("answer.txt")
++	if err != nil {
++		t.Fatalf("Load stored error = %v, want nil", err)
++	}
++	if string(data) != "42" {
++		t.Fatalf("Load stored bytes = %q, want %q", string(data), "42")
++	}
++	raw, err := ioutil.ReadFile(filepath.Join(c.Dir, "answer.txt"))
++	if err != nil {
++		t.Fatalf("read relative cache file error = %v, want nil", err)
++	}
++	if string(raw) != "42" {
++		t.Fatalf("relative cache file bytes = %q, want %q", string(raw), "42")
++	}
++	age, err := c.Age("answer.txt")
++	if err != nil {
++		t.Fatalf("Age stored error = %v, want nil", err)
++	}
++	if age < 0 {
++		t.Fatalf("Age stored negative = true, want false")
++	}
++
++	if err := c.Store("answer.txt", nil); err != nil {
++		t.Fatalf("Store nil delete error = %v, want nil", err)
++	}
++	if c.Exists("answer.txt") != false {
++		t.Fatalf("deleted Exists = true, want false")
++	}
++
++	if c.Expired("answer.txt", time.Hour) != true {
++		t.Fatalf("deleted Expired(1h) = false, want true")
++	}
++	data, err = c.Load("answer.txt")
++	if string(data) != "" {
++		t.Fatalf("deleted Load bytes = %q, want empty", string(data))
++	}
++	if !isPathNotExist(err) {
++		t.Fatalf("deleted Load error = %T %[1]v, want missing *os.PathError", err)
++	}
++}
++
++func TestJSONCacheSessionMarshalLoadDeleteAndErrors(t *testing.T) {
++
++
++	c := aw.NewCache(t.TempDir())
++
++	if err := c.StoreJSON("repo.json", repoRecord{Name: "awgo", Stars: 7}); err != nil {
++		t.Fatalf("StoreJSON valid error = %v, want nil", err)
++	}
++	raw, err := ioutil.ReadFile(filepath.Join(c.Dir, "repo.json"))
++	if err != nil {
++		t.Fatalf("read JSON cache file error = %v, want nil", err)
++	}
++
++	assertIndentedRepoJSON(t, raw, repoRecord{Name: "awgo", Stars: 7})
++
++	var out repoRecord
++	if err := c.LoadJSON("repo.json", &out); err != nil {
++		t.Fatalf("LoadJSON valid error = %v, want nil", err)
++	}
++	if out != (repoRecord{Name: "awgo", Stars: 7}) {
++		t.Fatalf("LoadJSON decoded = %#v, want %#v", out, repoRecord{Name: "awgo", Stars: 7})
++	}
++
++	if err := c.StoreJSON("repo.json", nil); err != nil {
++		t.Fatalf("StoreJSON nil delete error = %v, want nil", err)
++	}
++	if c.Exists("repo.json") != false {
++		t.Fatalf("deleted JSON Exists = true, want false")
++	}
++	err = c.LoadJSON("repo.json", &out)
++
++	if err == nil {
++		t.Fatalf("LoadJSON missing error = nil, want non-nil")
++	}
++
++	err = c.StoreJSON("bad.json", unmarshalableRecord{Bad: func() {}})
++
++	if err == nil {
++		t.Fatalf("StoreJSON unmarshalable error = nil, want non-nil")
++	}
++
++	if err := ioutil.WriteFile(filepath.Join(c.Dir, "malformed.json"), []byte("{not json"), 0600); err != nil {
++		t.Fatalf("write malformed JSON fixture error = %v, want nil", err)
++	}
++	err = c.LoadJSON("malformed.json", &out)
++
++	if err == nil {
++		t.Fatalf("LoadJSON malformed error = nil, want non-nil")
++	}
++}
++
++func TestLoadOrStoreByteSessionMissingFreshExpiredAndReloadError(t *testing.T) {
++
++
++	c := aw.NewCache(t.TempDir())
++	calls := 0
++	reload := func() ([]byte, error) {
++		calls++
++		if calls == 1 {
++			return []byte("payload-1"), nil
++		}
++		return []byte("payload-2"), nil
++	}
++
++	data, err := c.LoadOrStore("payload.bin", 0, reload)
++	if err != nil {
++		t.Fatalf("LoadOrStore missing error = %v, want nil", err)
++	}
++	if string(data) != "payload-1" {
++		t.Fatalf("LoadOrStore missing bytes = %q, want %q", string(data), "payload-1")
++	}
++	if calls != 1 {
++		t.Fatalf("LoadOrStore missing calls = %d, want 1", calls)
++	}
++	if c.Exists("payload.bin") != true {
++		t.Fatalf("LoadOrStore missing Exists = false, want true")
++	}
++
++	data, err = c.LoadOrStore("payload.bin", 0, reload)
++	if err != nil {
++		t.Fatalf("LoadOrStore fresh error = %v, want nil", err)
++	}
++	if string(data) != "payload-1" {
++		t.Fatalf("LoadOrStore fresh bytes = %q, want %q", string(data), "payload-1")
++	}
++	if calls != 1 {
++		t.Fatalf("LoadOrStore fresh calls = %d, want 1", calls)
++	}
++
++	makeOld(t, filepath.Join(c.Dir, "payload.bin"))
++	if c.Expired("payload.bin", time.Hour) != true {
++		t.Fatalf("old payload Expired(1h) = false, want true")
++	}
++	data, err = c.LoadOrStore("payload.bin", time.Hour, reload)
++	if err != nil {
++		t.Fatalf("LoadOrStore expired error = %v, want nil", err)
++	}
++	if string(data) != "payload-2" {
++		t.Fatalf("LoadOrStore expired bytes = %q, want %q", string(data), "payload-2")
++	}
++	if calls != 2 {
++		t.Fatalf("LoadOrStore expired calls = %d, want 2", calls)
++	}
++
++	makeOld(t, filepath.Join(c.Dir, "payload.bin"))
++	reloadFailure := errors.New("boom")
++	reloadErr := func() ([]byte, error) {
++		calls++
++		return nil, reloadFailure
++	}
++	data, err = c.LoadOrStore("payload.bin", time.Hour, reloadErr)
++	if data != nil {
++		t.Fatalf("LoadOrStore reload-error bytes = %q, want nil", string(data))
++	}
++
++	if !errors.Is(err, reloadFailure) {
++		t.Fatalf("LoadOrStore reload-error = %T %[1]v, want error wrapping reload failure", err)
++	}
++	if calls != 3 {
++		t.Fatalf("LoadOrStore reload-error calls = %d, want 3", calls)
++	}
++	data, err = c.Load("payload.bin")
++	if err != nil {
++		t.Fatalf("Load after reload-error error = %v, want nil", err)
++	}
++	if string(data) != "payload-2" {
++		t.Fatalf("Load after reload-error bytes = %q, want %q", string(data), "payload-2")
++	}
++}
++
++func TestLoadOrStoreJSONSessionMissingFreshExpiredAndReloadError(t *testing.T) {
++
++
++	c := aw.NewCache(t.TempDir())
++	calls := 0
++	reload := func() (interface{}, error) {
++		calls++
++		if calls == 1 {
++			return repoRecord{Name: "repo-1", Stars: 11}, nil
++		}
++		return repoRecord{Name: "repo-2", Stars: 12}, nil
++	}
++
++	var out repoRecord
++	err := c.LoadOrStoreJSON("payload.json", 0, reload, &out)
++	if err != nil {
++		t.Fatalf("LoadOrStoreJSON missing error = %v, want nil", err)
++	}
++	if out != (repoRecord{Name: "repo-1", Stars: 11}) {
++		t.Fatalf("LoadOrStoreJSON missing decoded = %#v, want %#v", out, repoRecord{Name: "repo-1", Stars: 11})
++	}
++	if calls != 1 {
++		t.Fatalf("LoadOrStoreJSON missing calls = %d, want 1", calls)
++	}
++
++	out = repoRecord{}
++	err = c.LoadOrStoreJSON("payload.json", 0, reload, &out)
++	if err != nil {
++		t.Fatalf("LoadOrStoreJSON fresh error = %v, want nil", err)
++	}
++	if out != (repoRecord{Name: "repo-1", Stars: 11}) {
++		t.Fatalf("LoadOrStoreJSON fresh decoded = %#v, want %#v", out, repoRecord{Name: "repo-1", Stars: 11})
++	}
++	if calls != 1 {
++		t.Fatalf("LoadOrStoreJSON fresh calls = %d, want 1", calls)
++	}
++
++	makeOld(t, filepath.Join(c.Dir, "payload.json"))
++	out = repoRecord{}
++	err = c.LoadOrStoreJSON("payload.json", time.Hour, reload, &out)
++	if err != nil {
++		t.Fatalf("LoadOrStoreJSON expired error = %v, want nil", err)
++	}
++	if out != (repoRecord{Name: "repo-2", Stars: 12}) {
++		t.Fatalf("LoadOrStoreJSON expired decoded = %#v, want %#v", out, repoRecord{Name: "repo-2", Stars: 12})
++	}
++	if calls != 2 {
++		t.Fatalf("LoadOrStoreJSON expired calls = %d, want 2", calls)
++	}
++	raw, err := ioutil.ReadFile(filepath.Join(c.Dir, "payload.json"))
++	if err != nil {
++		t.Fatalf("read payload JSON after expired reload error = %v, want nil", err)
++	}
++
++	assertIndentedRepoJSON(t, raw, repoRecord{Name: "repo-2", Stars: 12})
++
++	makeOld(t, filepath.Join(c.Dir, "payload.json"))
++	reloadFailure := errors.New("boom")
++	reloadErr := func() (interface{}, error) {
++		calls++
++		return nil, reloadFailure
++	}
++	out = repoRecord{}
++	err = c.LoadOrStoreJSON("payload.json", time.Hour, reloadErr, &out)
++
++	if !errors.Is(err, reloadFailure) {
++		t.Fatalf("LoadOrStoreJSON reload-error = %T %[1]v, want error wrapping reload failure", err)
++	}
++	if out != (repoRecord{}) {
++		t.Fatalf("LoadOrStoreJSON reload-error decoded = %#v, want zero value", out)
++	}
++	if calls != 3 {
++		t.Fatalf("LoadOrStoreJSON reload-error calls = %d, want 3", calls)
++	}
++}
++
++func TestOrderingErrorsUseSpecificFilesystemErrorTypes(t *testing.T) {
++
++
++	c := aw.NewCache(t.TempDir())
++
++	_, err := c.Load("missing.txt")
++	if !isPathNotExist(err) {
++		t.Fatalf("Load before Store error = %T %[1]v, want missing *os.PathError", err)
++	}
++
++
++
++	var out repoRecord
++	err = c.LoadJSON("missing.json", &out)
++
++	if err == nil {
++		t.Fatalf("LoadJSON before StoreJSON error = nil, want non-nil")
++	}
++}
++
++func TestNilDeleteCleanupIsIdempotent(t *testing.T) {
++
++
++	c := aw.NewCache(t.TempDir())
++
++	if err := c.Store("answer.txt", []byte("42")); err != nil {
++		t.Fatalf("Store before cleanup error = %v, want nil", err)
++	}
++	if err := c.Store("answer.txt", nil); err != nil {
++		t.Fatalf("first Store nil cleanup error = %v, want nil", err)
++	}
++	if c.Exists("answer.txt") != false {
++		t.Fatalf("after first Store nil Exists = true, want false")
++	}
++
++	if err := c.Store("answer.txt", []byte("42")); err != nil {
++		t.Fatalf("Store before second cleanup error = %v, want nil", err)
++	}
++	if err := c.Store("answer.txt", nil); err != nil {
++		t.Fatalf("second Store nil cleanup error = %v, want nil", err)
++	}
++	if c.Exists("answer.txt") != false {
++		t.Fatalf("after second Store nil Exists = true, want false")
++	}
++
++	if err := c.StoreJSON("repo.json", repoRecord{Name: "awgo", Stars: 7}); err != nil {
++		t.Fatalf("StoreJSON before cleanup error = %v, want nil", err)
++	}
++	if err := c.StoreJSON("repo.json", nil); err != nil {
++		t.Fatalf("first StoreJSON nil cleanup error = %v, want nil", err)
++	}
++	if c.Exists("repo.json") != false {
++		t.Fatalf("after first StoreJSON nil Exists = true, want false")
++	}
++
++	if err := c.StoreJSON("repo.json", repoRecord{Name: "awgo", Stars: 7}); err != nil {
++		t.Fatalf("StoreJSON before second cleanup error = %v, want nil", err)
++	}
++	if err := c.StoreJSON("repo.json", nil); err != nil {
++		t.Fatalf("second StoreJSON nil cleanup error = %v, want nil", err)
++	}
++	if c.Exists("repo.json") != false {
++		t.Fatalf("after second StoreJSON nil Exists = true, want false")
++	}
++}
++
++func TestCacheInstancesHaveIndependentDirectoriesAndState(t *testing.T) {
++
++
++	base := t.TempDir()
++	a := aw.NewCache(filepath.Join(base, "a"))
++	b := aw.NewCache(filepath.Join(base, "b"))
++
++	if err := a.Store("shared.txt", []byte("from-a")); err != nil {
++		t.Fatalf("Store in cache a error = %v, want nil", err)
++	}
++	if a.Exists("shared.txt") != true {
++		t.Fatalf("cache a Exists after a store = false, want true")
++	}
++	if b.Exists("shared.txt") != false {
++		t.Fatalf("cache b Exists after a store = true, want false")
++	}
++
++	if err := b.Store("shared.txt", []byte("from-b")); err != nil {
++		t.Fatalf("Store in cache b error = %v, want nil", err)
++	}
++	adata, err := a.Load("shared.txt")
++	if err != nil {
++		t.Fatalf("Load from cache a error = %v, want nil", err)
++	}
++	if string(adata) != "from-a" {
++		t.Fatalf("Load from cache a = %q, want %q", string(adata), "from-a")
++	}
++	bdata, err := b.Load("shared.txt")
++	if err != nil {
++		t.Fatalf("Load from cache b error = %v, want nil", err)
++	}
++	if string(bdata) != "from-b" {
++		t.Fatalf("Load from cache b = %q, want %q", string(bdata), "from-b")
++	}
++
++	if err := a.Store("shared.txt", nil); err != nil {
++		t.Fatalf("cleanup cache a error = %v, want nil", err)
++	}
++	if a.Exists("shared.txt") != false {
++		t.Fatalf("cache a Exists after a cleanup = true, want false")
++	}
++	if b.Exists("shared.txt") != true {
++		t.Fatalf("cache b Exists after a cleanup = false, want true")
++	}
++}
++
++func TestStoreNilCleanupLeakFloorKeepsCacheDirectoryBounded(t *testing.T) {
++
++
++	c := aw.NewCache(t.TempDir())
++
++	if fileCount(t, c.Dir) != 0 {
++		t.Fatalf("initial cache file count = %d, want 0", fileCount(t, c.Dir))
++	}
++	for i := 0; i < 100; i++ {
++		name := "cycle-" + string(rune('A'+(i%26))) + ".bin"
++		if err := c.Store(name, []byte("42")); err != nil {
++			t.Fatalf("cycle %d Store error = %v, want nil", i, err)
++		}
++		if err := c.Store(name, nil); err != nil {
++			t.Fatalf("cycle %d Store nil cleanup error = %v, want nil", i, err)
++		}
++	}
++	if fileCount(t, c.Dir) != 0 {
++		t.Fatalf("cache file count after 100 store/delete cycles = %d, want 0", fileCount(t, c.Dir))
++	}
++}
++
++func assertIndentedRepoJSON(t *testing.T, raw []byte, want repoRecord) {
++	t.Helper()
++	var got repoRecord
++	if err := json.Unmarshal(raw, &got); err != nil {
++		t.Fatalf("stored JSON parse error = %v, want nil", err)
++	}
++	if got != want {
++		t.Fatalf("stored JSON decoded = %#v, want %#v", got, want)
++	}
++	lines := strings.Split(string(raw), "\n")
++	for _, line := range lines[1:] {
++		if strings.HasPrefix(line, " ") || strings.HasPrefix(line, "\t") {
++			return
++		}
++	}
++	t.Fatalf("stored JSON = %q, want indented JSON", string(raw))
++}
++
++func isDir(path string) bool {
++	fi, err := os.Stat(path)
++	return err == nil && fi.IsDir()
++}
++
++func isPathNotExist(err error) bool {
++	var pathErr *os.PathError
++	return errors.As(err, &pathErr) && os.IsNotExist(err)
++}
++
++func makeOld(t *testing.T, path string) {
++	t.Helper()
++	old := time.Now().Add(-2 * time.Hour)
++	if err := os.Chtimes(path, old, old); err != nil {
++		t.Fatalf("make old %s error = %v, want nil", path, err)
++	}
++}
++
++func fileCount(t *testing.T, dir string) int {
++	t.Helper()
++	entries, err := ioutil.ReadDir(dir)
++	if err != nil {
++		t.Fatalf("read cache dir %s error = %v, want nil", dir, err)
++	}
++	count := 0
++	for _, entry := range entries {
++		if !entry.IsDir() {
++			count++
++		}
++	}
++	return count
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,23 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++
++
++set -euo pipefail
++
++cd /workspace/repo
++
++
++export GOPROXY=off
++export GOSUMDB=off
++export GOVCS='*:off'
++export GOTOOLCHAIN=local
++exec go test -mod=readonly -v -count=1 ./usercase-test-coderl/...

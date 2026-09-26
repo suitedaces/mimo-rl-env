@@ -1,0 +1,421 @@
+diff --git a/usercase-test-coderl/dgram_logstream_test.go b/usercase-test-coderl/dgram_logstream_test.go
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/dgram_logstream_test.go
+@@ -0,0 +1,388 @@
++//go:build unix
++
++package usercase_test_coderl
++
++import (
++	"context"
++	"errors"
++	"net"
++	"os"
++	"path/filepath"
++	"runtime"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/google/mtail/internal/tailer/logstream"
++)
++
++
++
++
++
++
++const receiveTimeout = 2 * time.Second
++
++
++
++const cleanupStressCycles = 25
++const cleanupFDSlack = 12
++const cleanupGoroutineSlack = 16
++
++type alwaysWaker struct{}
++
++func (alwaysWaker) Wake() <-chan struct{} {
++	ch := make(chan struct{})
++	close(ch)
++	return ch
++}
++
++func TestUDPDatagramStreamEmitsReceivedLines(t *testing.T) {
++
++
++	var wg sync.WaitGroup
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++
++	addr := freeUDPAddr(t)
++	pathname := "udp://" + addr
++	stream, err := logstream.New(ctx, &wg, alwaysWaker{}, pathname, logstream.OneShotDisabled)
++	if err != nil {
++		t.Fatalf("New(%q) error = %v, want nil", pathname, err)
++	}
++	defer finishStream(t, cancel, &wg, stream.Lines())
++
++	sendDatagram(t, "udp", addr, []byte("alpha\n"))
++	first := receiveLine(t, stream.Lines())
++	if first.Filename != pathname {
++		t.Fatalf("first Filename = %q, want %q", first.Filename, pathname)
++	}
++	if first.Line != "alpha" {
++		t.Fatalf("first Line = %q, want %q", first.Line, "alpha")
++	}
++
++	sendDatagram(t, "udp", addr, []byte("beta\n"))
++	second := receiveLine(t, stream.Lines())
++	if second.Filename != pathname {
++		t.Fatalf("second Filename = %q, want %q", second.Filename, pathname)
++	}
++	if second.Line != "beta" {
++		t.Fatalf("second Line = %q, want %q", second.Line, "beta")
++	}
++}
++
++func TestUnixgramDatagramStreamEmitsReceivedLine(t *testing.T) {
++
++
++	var wg sync.WaitGroup
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++
++	addr := filepath.Join(t.TempDir(), "mtail.sock")
++	pathname := "unixgram://" + addr
++	stream, err := logstream.New(ctx, &wg, alwaysWaker{}, pathname, logstream.OneShotDisabled)
++	if err != nil {
++		t.Fatalf("New(%q) error = %v, want nil", pathname, err)
++	}
++	defer finishStream(t, cancel, &wg, stream.Lines())
++
++	sendDatagram(t, "unixgram", addr, []byte("alpha\n"))
++	line := receiveLine(t, stream.Lines())
++	if line.Filename != pathname {
++		t.Fatalf("Filename = %q, want %q", line.Filename, pathname)
++	}
++	if line.Line != "alpha" {
++		t.Fatalf("Line = %q, want %q", line.Line, "alpha")
++	}
++}
++
++func TestDatagramStreamEmptyAddressReturnsSpecificError(t *testing.T) {
++
++
++	for _, pathname := range []string{"udp://", "unixgram://"} {
++		var wg sync.WaitGroup
++		stream, err := logstream.New(context.Background(), &wg, alwaysWaker{}, pathname, logstream.OneShotDisabled)
++		if stream != nil {
++			t.Fatalf("New(%q) stream = %#v, want nil", pathname, stream)
++		}
++		if !errors.Is(err, logstream.ErrEmptySocketAddress) {
++			t.Fatalf("New(%q) error = %v, want ErrEmptySocketAddress", pathname, err)
++		}
++	}
++}
++
++func TestCancelFlushesPartialLineAndClosesChannel(t *testing.T) {
++
++
++	var wg sync.WaitGroup
++	ctx, cancel := context.WithCancel(context.Background())
++
++	addr := freeUDPAddr(t)
++	pathname := "udp://" + addr
++	stream, err := logstream.New(ctx, &wg, alwaysWaker{}, pathname, logstream.OneShotDisabled)
++	if err != nil {
++		t.Fatalf("New(%q) error = %v, want nil", pathname, err)
++	}
++
++	sendDatagram(t, "udp", addr, []byte("partial"))
++	time.Sleep(25 * time.Millisecond)
++	cancel()
++
++	line := receiveLine(t, stream.Lines())
++	if line.Filename != pathname {
++		t.Fatalf("Filename = %q, want %q", line.Filename, pathname)
++	}
++	if line.Line != "partial" {
++		t.Fatalf("Line = %q, want %q", line.Line, "partial")
++	}
++	waitForWaitGroup(t, &wg)
++	assertClosed(t, stream.Lines())
++}
++
++func TestOneShotZeroLengthDatagramEndsStreamAfterPriorLines(t *testing.T) {
++
++
++	var wg sync.WaitGroup
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++
++	addr := freeUDPAddr(t)
++	pathname := "udp://" + addr
++	stream, err := logstream.New(ctx, &wg, alwaysWaker{}, pathname, logstream.OneShotEnabled)
++	if err != nil {
++		t.Fatalf("New(%q) error = %v, want nil", pathname, err)
++	}
++
++	sendDatagram(t, "udp", addr, []byte("before-zero\n"))
++	line := receiveLine(t, stream.Lines())
++	if line.Filename != pathname {
++		t.Fatalf("Filename = %q, want %q", line.Filename, pathname)
++	}
++	if line.Line != "before-zero" {
++		t.Fatalf("Line = %q, want %q", line.Line, "before-zero")
++	}
++
++	sendDatagram(t, "udp", addr, []byte{})
++	waitForWaitGroup(t, &wg)
++	assertClosed(t, stream.Lines())
++}
++
++func TestCancelCanBeCalledTwiceAfterDatagramStreamCleanup(t *testing.T) {
++
++
++	var wg sync.WaitGroup
++	ctx, cancel := context.WithCancel(context.Background())
++
++	addr := freeUDPAddr(t)
++	stream, err := logstream.New(ctx, &wg, alwaysWaker{}, "udp://"+addr, logstream.OneShotDisabled)
++	if err != nil {
++		t.Fatalf("New udp stream error = %v, want nil", err)
++	}
++
++	cancel()
++	cancel()
++	waitForWaitGroup(t, &wg)
++	assertClosed(t, stream.Lines())
++}
++
++func TestDatagramStreamsKeepIndependentState(t *testing.T) {
++
++
++	var wgA sync.WaitGroup
++	ctxA, cancelA := context.WithCancel(context.Background())
++	addrA := freeUDPAddr(t)
++	pathA := "udp://" + addrA
++	streamA, err := logstream.New(ctxA, &wgA, alwaysWaker{}, pathA, logstream.OneShotDisabled)
++	if err != nil {
++		t.Fatalf("New(%q) error = %v, want nil", pathA, err)
++	}
++	defer finishStream(t, cancelA, &wgA, streamA.Lines())
++
++	var wgB sync.WaitGroup
++	ctxB, cancelB := context.WithCancel(context.Background())
++	addrB := freeUDPAddr(t)
++	pathB := "udp://" + addrB
++	streamB, err := logstream.New(ctxB, &wgB, alwaysWaker{}, pathB, logstream.OneShotDisabled)
++	if err != nil {
++		t.Fatalf("New(%q) error = %v, want nil", pathB, err)
++	}
++	defer finishStream(t, cancelB, &wgB, streamB.Lines())
++
++	sendDatagram(t, "udp", addrA, []byte("alpha\n"))
++	lineA := receiveLine(t, streamA.Lines())
++	if lineA.Filename != pathA {
++		t.Fatalf("streamA Filename = %q, want %q", lineA.Filename, pathA)
++	}
++	if lineA.Line != "alpha" {
++		t.Fatalf("streamA Line = %q, want %q", lineA.Line, "alpha")
++	}
++	assertNoLine(t, streamB.Lines(), 50*time.Millisecond)
++
++	sendDatagram(t, "udp", addrB, []byte("bravo\n"))
++	lineB := receiveLine(t, streamB.Lines())
++	if lineB.Filename != pathB {
++		t.Fatalf("streamB Filename = %q, want %q", lineB.Filename, pathB)
++	}
++	if lineB.Line != "bravo" {
++		t.Fatalf("streamB Line = %q, want %q", lineB.Line, "bravo")
++	}
++}
++
++func TestDatagramStreamRepeatedCreateUseCancelDoesNotLeakResources(t *testing.T) {
++
++
++	runtime.GC()
++	startFDs := countFDs(t)
++	startGoroutines := runtime.NumGoroutine()
++
++	for i := 0; i < cleanupStressCycles; i++ {
++		var wg sync.WaitGroup
++		ctx, cancel := context.WithCancel(context.Background())
++		addr := freeUDPAddr(t)
++		pathname := "udp://" + addr
++		stream, err := logstream.New(ctx, &wg, alwaysWaker{}, pathname, logstream.OneShotDisabled)
++		if err != nil {
++			t.Fatalf("cycle %d New(%q) error = %v, want nil", i, pathname, err)
++		}
++
++		sendDatagram(t, "udp", addr, []byte("cycle\n"))
++		line := receiveLine(t, stream.Lines())
++		if line.Filename != pathname {
++			t.Fatalf("cycle %d Filename = %q, want %q", i, line.Filename, pathname)
++		}
++		if line.Line != "cycle" {
++			t.Fatalf("cycle %d Line = %q, want %q", i, line.Line, "cycle")
++		}
++
++		cancel()
++		waitForWaitGroup(t, &wg)
++		assertClosed(t, stream.Lines())
++	}
++
++	runtime.GC()
++	time.Sleep(50 * time.Millisecond)
++	endFDs := countFDs(t)
++	endGoroutines := runtime.NumGoroutine()
++
++	if endFDs > startFDs+cleanupFDSlack {
++		t.Fatalf("fd count after cleanup = %d, want at most %d", endFDs, startFDs+cleanupFDSlack)
++	}
++	if endGoroutines > startGoroutines+cleanupGoroutineSlack {
++		t.Fatalf("goroutines after cleanup = %d, want at most %d", endGoroutines, startGoroutines+cleanupGoroutineSlack)
++	}
++}
++
++func freeUDPAddr(t *testing.T) string {
++	t.Helper()
++	conn, err := net.ListenPacket("udp", "127.0.0.1:0")
++	if err != nil {
++		t.Fatalf("ListenPacket udp 127.0.0.1:0 error = %v", err)
++	}
++	addr := conn.LocalAddr().String()
++	if err := conn.Close(); err != nil {
++		t.Fatalf("closing free-port probe error = %v", err)
++	}
++	return addr
++}
++
++func sendDatagram(t *testing.T, network, address string, payload []byte) {
++	t.Helper()
++	conn, err := net.Dial(network, address)
++	if err != nil {
++		t.Fatalf("Dial(%q, %q) error = %v", network, address, err)
++	}
++	defer conn.Close()
++	if _, err := conn.Write(payload); err != nil {
++		t.Fatalf("Write(%q, %q, %q) error = %v", network, address, string(payload), err)
++	}
++}
++
++func receiveLine[T any](t *testing.T, lines <-chan T) T {
++	t.Helper()
++	timer := time.NewTimer(receiveTimeout)
++	defer timer.Stop()
++	select {
++	case line, ok := <-lines:
++		if !ok {
++			t.Fatalf("Lines channel closed before receiving expected line")
++		}
++		return line
++	case <-timer.C:
++		t.Fatalf("timed out waiting for LogLine")
++	}
++	var zero T
++	return zero
++}
++
++func assertNoLine[T any](t *testing.T, lines <-chan T, d time.Duration) {
++	t.Helper()
++	timer := time.NewTimer(d)
++	defer timer.Stop()
++	select {
++	case line, ok := <-lines:
++		t.Fatalf("unexpected line from independent stream: ok=%v line=%#v", ok, line)
++	case <-timer.C:
++	}
++}
++
++func assertClosed[T any](t *testing.T, lines <-chan T) {
++	t.Helper()
++	timer := time.NewTimer(receiveTimeout)
++	defer timer.Stop()
++	select {
++	case line, ok := <-lines:
++		if ok {
++			t.Fatalf("Lines channel yielded %#v, want closed channel", line)
++		}
++	case <-timer.C:
++		t.Fatalf("timed out waiting for Lines channel to close")
++	}
++}
++
++func waitForWaitGroup(t *testing.T, wg *sync.WaitGroup) {
++	t.Helper()
++	done := make(chan struct{})
++	go func() {
++		wg.Wait()
++		close(done)
++	}()
++	timer := time.NewTimer(receiveTimeout)
++	defer timer.Stop()
++	select {
++	case <-done:
++	case <-timer.C:
++		t.Fatalf("timed out waiting for stream wait group")
++	}
++}
++
++func finishStream[T any](t *testing.T, cancel context.CancelFunc, wg *sync.WaitGroup, lines <-chan T) {
++	t.Helper()
++	cancel()
++	waitForWaitGroup(t, wg)
++	drainUntilClosed(t, lines)
++}
++
++func drainUntilClosed[T any](t *testing.T, lines <-chan T) {
++	t.Helper()
++	timer := time.NewTimer(receiveTimeout)
++	defer timer.Stop()
++	for {
++		select {
++		case _, ok := <-lines:
++			if !ok {
++				return
++			}
++		case <-timer.C:
++			t.Fatalf("timed out draining Lines channel")
++		}
++	}
++}
++
++func countFDs(t *testing.T) int {
++	t.Helper()
++	entries, err := os.ReadDir("/proc/self/fd")
++	if err != nil {
++		t.Fatalf("ReadDir(/proc/self/fd) error = %v", err)
++	}
++	return len(entries)
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,23 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++
++
++set -euo pipefail
++
++cd /workspace/repo
++
++export GOPROXY=off
++export GOSUMDB=off
++export GOTOOLCHAIN=local
++export GOVCS='*:off'
++
++exec go test -v -count=1 -mod=readonly ./usercase-test-coderl/...

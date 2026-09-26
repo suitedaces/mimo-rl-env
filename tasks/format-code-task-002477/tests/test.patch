@@ -1,0 +1,296 @@
+diff --git a/usercase-test-coderl/test_wal_stateful_acceptance.py b/usercase-test-coderl/test_wal_stateful_acceptance.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/test_wal_stateful_acceptance.py
+@@ -0,0 +1,261 @@
++from dataclasses import dataclass, fields, is_dataclass
++import os
++import tempfile
++
++import pytest
++
++from raiden.storage.serialization import JSONSerializer
++from raiden.storage.sqlite import HIGH_STATECHANGE_ULID, RANGE_ALL_STATE_CHANGES
++from raiden.storage.sqlite import SerializedSQLiteStorage
++from raiden.storage.wal import SavedState, WriteAheadLog
++from raiden.transfer.architecture import Event, State, StateChange, TransitionResult
++
++
++
++
++
++
++
++
++
++@dataclass
++class ToyCounterState(State):
++    value: int
++
++
++@dataclass(frozen=True)
++class ToyIncrement(StateChange):
++    amount: int
++    label: str
++
++
++@dataclass(frozen=True)
++class ToyCounterEvent(Event):
++    label: str
++    before: int
++    after: int
++
++
++def toy_transition(state: ToyCounterState, state_change: ToyIncrement):
++    before = state.value
++    state.value = before + state_change.amount
++    return TransitionResult(
++        state,
++        [ToyCounterEvent(label=state_change.label, before=before, after=state.value)],
++    )
++
++
++def saved_state_values(saved_state):
++    if is_dataclass(saved_state):
++        return [getattr(saved_state, field.name) for field in fields(saved_state)]
++    if hasattr(saved_state, "_asdict"):
++        return list(saved_state._asdict().values())
++    if isinstance(saved_state, tuple):
++        return list(saved_state)
++    if hasattr(saved_state, "__dict__"):
++        return list(vars(saved_state).values())
++    return []
++
++
++def assert_no_committed_saved_state(wal):
++
++    assert not isinstance(getattr(wal, "saved_state", None), SavedState)
++
++
++def make_wal(initial_value=0, database_path=":memory:"):
++    storage = SerializedSQLiteStorage(database_path, JSONSerializer())
++    initial_state = ToyCounterState(initial_value)
++    storage.write_first_state_snapshot(initial_state)
++    return WriteAheadLog(initial_state, storage, toy_transition)
++
++
++def test_batch_dispatch_commits_state_changes_events_saved_state_and_snapshot():
++
++
++
++    wal = make_wal(0)
++
++
++    assert wal.version == wal.storage.get_version()
++    with pytest.raises(AttributeError):
++        wal.version = 5
++    assert wal.get_current_state() == ToyCounterState(value=0)
++    assert_no_committed_saved_state(wal)
++
++    with wal.process_state_change_atomically() as dispatcher:
++        assert dispatcher.latest_state() == ToyCounterState(value=0)
++        assert wal.get_current_state() == ToyCounterState(value=0)
++
++        first_events = dispatcher.dispatch(ToyIncrement(amount=1, label="first"))
++        assert first_events == [ToyCounterEvent(label="first", before=0, after=1)]
++        assert dispatcher.latest_state() == ToyCounterState(value=1)
++        assert wal.get_current_state() == ToyCounterState(value=0)
++
++        second_events = dispatcher.dispatch(ToyIncrement(amount=1, label="second"))
++        assert second_events == [ToyCounterEvent(label="second", before=1, after=2)]
++        assert dispatcher.latest_state() == ToyCounterState(value=2)
++        assert wal.get_current_state() == ToyCounterState(value=0)
++
++    assert wal.get_current_state() == ToyCounterState(value=2)
++    assert isinstance(wal.saved_state, SavedState)
++    saved_state_parts = saved_state_values(wal.saved_state)
++
++    assert ToyCounterState(value=2) in saved_state_parts
++    assert wal.storage.count_state_changes() == 2
++    state_change_records = wal.storage.get_statechanges_records_by_range(RANGE_ALL_STATE_CHANGES)
++
++    assert sorted([record.data for record in state_change_records], key=lambda item: item.label) == [
++        ToyIncrement(amount=1, label="first"),
++        ToyIncrement(amount=1, label="second"),
++    ]
++    state_change_ids_by_label = {
++        record.data.label: record.state_change_identifier for record in state_change_records
++    }
++    second_state_change_id = state_change_ids_by_label["second"]
++
++    assert second_state_change_id in saved_state_parts
++
++    assert sorted(wal.storage.get_events(), key=lambda item: item.label) == [
++        ToyCounterEvent(label="first", before=0, after=1),
++        ToyCounterEvent(label="second", before=1, after=2),
++    ]
++
++    wal.snapshot(2)
++    snapshot = wal.storage.get_snapshot_before_state_change(HIGH_STATECHANGE_ULID)
++    assert snapshot.state_change_qty == 2
++    assert snapshot.data == ToyCounterState(value=2)
++    assert snapshot.state_change_identifier == second_state_change_id
++
++    wal.storage.close()
++
++
++def test_aborted_batch_rolls_back_copied_state_and_partial_writes():
++
++
++
++    wal = make_wal(10)
++
++    with pytest.raises(RuntimeError) as excinfo:
++        with wal.process_state_change_atomically() as dispatcher:
++            assert dispatcher.dispatch(ToyIncrement(amount=5, label="boom")) == [
++                ToyCounterEvent(label="boom", before=10, after=15)
++            ]
++            assert dispatcher.latest_state() == ToyCounterState(value=15)
++            assert wal.get_current_state() == ToyCounterState(value=10)
++            raise RuntimeError("abort batch")
++
++
++    assert isinstance(excinfo.value, RuntimeError)
++    assert wal.get_current_state() == ToyCounterState(value=10)
++    assert wal.storage.count_state_changes() == 0
++    assert wal.storage.get_events() == []
++    assert_no_committed_saved_state(wal)
++
++    wal.storage.close()
++
++
++def test_non_callable_transition_is_rejected_with_value_error():
++
++
++
++    storage = SerializedSQLiteStorage(":memory:", JSONSerializer())
++    initial_state = ToyCounterState(value=0)
++    storage.write_first_state_snapshot(initial_state)
++
++    with pytest.raises(ValueError) as excinfo:
++        WriteAheadLog(initial_state, storage, None)
++
++
++    assert excinfo.type is ValueError
++    storage.close()
++
++
++def test_snapshot_before_any_dispatched_state_change_is_out_of_order():
++
++
++
++    wal = make_wal(0)
++
++    try:
++        wal.snapshot(0)
++    except Exception:
++        pass
++
++
++    assert_no_committed_saved_state(wal)
++    assert wal.get_current_state() == ToyCounterState(value=0)
++    assert wal.storage.count_state_changes() == 0
++    assert len(wal.storage.database.get_snapshots()) == 1
++
++    wal.storage.close()
++
++
++def test_empty_atomic_context_can_be_cleaned_up_repeatedly():
++
++
++
++    wal = make_wal(3)
++
++    with wal.process_state_change_atomically() as dispatcher:
++        assert dispatcher.latest_state() == ToyCounterState(value=3)
++    assert wal.get_current_state() == ToyCounterState(value=3)
++    assert_no_committed_saved_state(wal)
++
++    with wal.process_state_change_atomically() as dispatcher:
++        assert dispatcher.latest_state() == ToyCounterState(value=3)
++    assert wal.get_current_state() == ToyCounterState(value=3)
++    assert_no_committed_saved_state(wal)
++
++    wal.storage.close()
++
++
++def test_two_wals_keep_independent_committed_state_and_storage_history():
++
++
++
++    wal_a = make_wal(0)
++    wal_b = make_wal(100)
++
++    with wal_a.process_state_change_atomically() as dispatcher:
++        assert dispatcher.dispatch(ToyIncrement(amount=2, label="only-a")) == [
++            ToyCounterEvent(label="only-a", before=0, after=2)
++        ]
++
++    assert wal_a.get_current_state() == ToyCounterState(value=2)
++    assert wal_a.storage.count_state_changes() == 1
++
++    assert sorted(wal_a.storage.get_events(), key=lambda item: item.label) == [
++        ToyCounterEvent(label="only-a", before=0, after=2)
++    ]
++    assert wal_b.get_current_state() == ToyCounterState(value=100)
++    assert wal_b.storage.count_state_changes() == 0
++    assert wal_b.storage.get_events() == []
++
++    wal_a.storage.close()
++    wal_b.storage.close()
++
++
++def test_repeated_file_backed_wal_cycles_do_not_leak_sqlite_fds():
++
++
++
++    fd_count_before = len(os.listdir("/proc/self/fd"))
++
++    for _ in range(120):
++        fd, database_path = tempfile.mkstemp(prefix="wal-acceptance-", suffix=".db")
++        os.close(fd)
++        try:
++            wal = make_wal(0, database_path=database_path)
++            with wal.process_state_change_atomically() as dispatcher:
++                assert dispatcher.dispatch(ToyIncrement(amount=1, label="cycle")) == [
++                    ToyCounterEvent(label="cycle", before=0, after=1)
++                ]
++            assert wal.get_current_state() == ToyCounterState(value=1)
++            wal.storage.close()
++        finally:
++            if os.path.exists(database_path):
++                os.unlink(database_path)
++
++    fd_count_after = len(os.listdir("/proc/self/fd"))
++
++    assert fd_count_after == fd_count_before
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,25 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++
++cd /workspace/repo
++
++VENV="/opt/raiden-stage4a-venv"
++if [ ! -x "$VENV/bin/python" ]; then
++  echo "Missing staged offline venv at $VENV" >&2
++  exit 1
++fi
++
++export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
++
++PYTHONPATH=/workspace/repo exec "$VENV/bin/python" -m pytest \
++  /workspace/repo/usercase-test-coderl/test_wal_stateful_acceptance.py -v

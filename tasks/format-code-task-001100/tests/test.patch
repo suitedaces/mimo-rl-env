@@ -1,0 +1,153 @@
+diff --git a/tests/core/tests/test_import_context.py b/tests/core/tests/test_import_context.py
+new file mode 100644
+index 0000000..3379ac7
+--- /dev/null
++++ b/tests/core/tests/test_import_context.py
+@@ -0,0 +1,137 @@
++import tablib
++
++from django.test import TestCase
++
++from import_export import fields, resources, widgets
++
++from ..models import Book, Category
++
++
++class ImportContextResource(resources.ModelResource):
++    categories = fields.Field(
++        attribute="categories",
++        widget=widgets.ManyToManyWidget(Category, field="name", separator="|"),
++    )
++    delete = fields.Field(widget=widgets.BooleanWidget())
++
++    class Meta:
++        model = Book
++        exclude = ("imported",)
++
++    def __init__(self, *args, **kwargs):
++        self.events = []
++        super().__init__(*args, **kwargs)
++
++    def before_import(self, dataset, using_transactions, dry_run, **kwargs):
++        self.events.append(("before_import", kwargs.copy()))
++        return super().before_import(dataset, using_transactions, dry_run, **kwargs)
++
++    def before_import_row(self, row, row_number=None, **kwargs):
++        self.events.append(("before_import_row", row_number, kwargs.copy()))
++        return super().before_import_row(row, row_number=row_number, **kwargs)
++
++    def after_import_instance(self, instance, new, row_number=None, **kwargs):
++        self.events.append(("after_import_instance", row_number, kwargs.copy()))
++        return super().after_import_instance(instance, new, row_number=row_number, **kwargs)
++
++    def validate_instance(self, instance, import_validation_errors=None, validate_unique=True, **kwargs):
++        self.events.append(("validate_instance", kwargs.copy()))
++        return super().validate_instance(instance, import_validation_errors, validate_unique, **kwargs)
++
++    def skip_row(self, instance, original, row, import_validation_errors=None, **kwargs):
++        self.events.append(("skip_row", kwargs.copy()))
++        return super().skip_row(instance, original, row, import_validation_errors, **kwargs)
++
++    def before_save_instance(self, instance, using_transactions, dry_run, **kwargs):
++        self.events.append(("before_save_instance", kwargs.copy()))
++        return super().before_save_instance(instance, using_transactions, dry_run, **kwargs)
++
++    def save_instance(self, instance, is_create, using_transactions=True, dry_run=False, **kwargs):
++        self.events.append(("save_instance", kwargs.copy()))
++        return super().save_instance(instance, is_create, using_transactions, dry_run, **kwargs)
++
++    def after_save_instance(self, instance, using_transactions, dry_run, **kwargs):
++        self.events.append(("after_save_instance", kwargs.copy()))
++        return super().after_save_instance(instance, using_transactions, dry_run, **kwargs)
++
++    def save_m2m(self, instance, data, using_transactions, dry_run, **kwargs):
++        self.events.append(("save_m2m", kwargs.copy()))
++        return super().save_m2m(instance, data, using_transactions, dry_run, **kwargs)
++
++    def for_delete(self, row, instance, **kwargs):
++        self.events.append(("for_delete", kwargs.copy()))
++        return self.fields["delete"].clean(row)
++
++    def before_delete_instance(self, instance, dry_run, **kwargs):
++        self.events.append(("before_delete_instance", kwargs.copy()))
++        return super().before_delete_instance(instance, dry_run, **kwargs)
++
++    def delete_instance(self, instance, using_transactions=True, dry_run=False, **kwargs):
++        self.events.append(("delete_instance", kwargs.copy()))
++        return super().delete_instance(instance, using_transactions, dry_run, **kwargs)
++
++    def after_delete_instance(self, instance, dry_run, **kwargs):
++        self.events.append(("after_delete_instance", kwargs.copy()))
++        return super().after_delete_instance(instance, dry_run, **kwargs)
++
++    def after_import_row(self, row, row_result, row_number=None, **kwargs):
++        self.events.append(("after_import_row", row_number, kwargs.copy()))
++        return super().after_import_row(row, row_result, row_number=row_number, **kwargs)
++
++    def after_import(self, dataset, result, using_transactions, dry_run, **kwargs):
++        self.events.append(("after_import", kwargs.copy()))
++        return super().after_import(dataset, result, using_transactions, dry_run, **kwargs)
++
++
++class ImportContextPropagationTest(TestCase):
++    def test_context_reaches_create_lifecycle_and_m2m(self):
++        category = Category.objects.create(name="Context category")
++        dataset = tablib.Dataset(
++            [None, "Context book", "", "", "0", "", "", "", category.name],
++            headers=["id", "name", "author", "author_email", "delete", "published", "published_time", "price", "categories"],
++        )
++        resource = ImportContextResource()
++
++        result = resource.import_data(
++            dataset, raise_errors=True, actor="alice", tenant_id="tenant-7", enabled=False
++        )
++
++        expected = {"actor": "alice", "tenant_id": "tenant-7", "enabled": False}
++        self.assertFalse(result.has_errors())
++        self.assertEqual(Book.objects.get(name="Context book").categories.get(), category)
++        names = [event[0] for event in resource.events]
++        for name in (
++            "before_import", "before_import_row", "after_import_instance",
++            "for_delete", "validate_instance", "skip_row", "before_save_instance",
++            "save_instance", "after_save_instance", "save_m2m", "after_import_row", "after_import",
++        ):
++            self.assertIn(name, names)
++        for event in resource.events:
++            self.assertEqual(event[-1], expected)
++
++    def test_context_reaches_delete_lifecycle(self):
++        book = Book.objects.create(name="Delete me")
++        dataset = tablib.Dataset([book.pk, book.name, "1"], headers=["id", "name", "delete"])
++        resource = ImportContextResource()
++
++        result = resource.import_data(dataset, raise_errors=True, actor="bob", tenant_id="tenant-9")
++
++        self.assertFalse(Book.objects.filter(pk=book.pk).exists())
++        self.assertEqual(result.rows[0].import_type, "delete")
++        events = {event[0]: event[-1] for event in resource.events}
++        for name in ("for_delete", "before_delete_instance", "delete_instance", "after_delete_instance"):
++            self.assertEqual(events[name], {"actor": "bob", "tenant_id": "tenant-9"})
++
++    def test_import_without_context_keeps_legacy_hook_signatures_working(self):
++        class LegacyResource(resources.ModelResource):
++            class Meta:
++                model = Book
++
++            def before_save_instance(self, instance, using_transactions, dry_run):
++                return super().before_save_instance(instance, using_transactions, dry_run)
++
++        dataset = tablib.Dataset(headers=["id", "name"])
++        dataset.append([None, "Legacy book"])
++        result = LegacyResource().import_data(dataset, raise_errors=True)
++        self.assertFalse(result.has_errors())
++        self.assertTrue(Book.objects.filter(name="Legacy book").exists())
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,5 @@
++#!/bin/bash
++set -euo pipefail
++
++
++python tests/manage.py test core.tests.test_import_context --settings=settings

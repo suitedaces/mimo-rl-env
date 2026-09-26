@@ -1,0 +1,259 @@
+diff --git a/test/mitmproxy/addons/test_clientplayback_replay_lifecycle.py b/test/mitmproxy/addons/test_clientplayback_replay_lifecycle.py
+new file mode 100644
+index 000000000..cd9d178ba
+--- /dev/null
++++ b/test/mitmproxy/addons/test_clientplayback_replay_lifecycle.py
+@@ -0,0 +1,120 @@
++from unittest import mock
++
++from mitmproxy.addons import clientplayback
++from mitmproxy.test import taddons
++from mitmproxy.test import tflow
++
++
++class ControlledThread:
++    def __init__(self):
++        self.alive = True
++
++    def is_alive(self):
++        return self.alive
++
++
++def _event_names(trigger_mock):
++    return [
++        call.args[0]
++        for call in trigger_mock.call_args_list
++        if call.args
++    ]
++
++
++def test_clientplayback_count_includes_active_replay():
++    cp = clientplayback.ClientPlayback()
++    first = ControlledThread()
++    second = ControlledThread()
++    flows = [tflow.tflow(), tflow.tflow()]
++
++    with taddons.context() as tctx:
++        tctx.master.addons.trigger = mock.Mock()
++        tctx.master.replay_request = mock.Mock(side_effect=[first, second])
++
++        cp.start_replay(flows)
++        cp.tick()
++        assert cp.count() == 2
++
++        first.alive = False
++        cp.tick()
++        assert cp.count() == 1
++
++        second.alive = False
++        cp.tick()
++        assert cp.count() == 0
++
++
++def test_clientplayback_update_on_replay_finish():
++    cp = clientplayback.ClientPlayback()
++    worker = ControlledThread()
++
++    with taddons.context() as tctx:
++        tctx.master.addons.trigger = mock.Mock()
++        tctx.master.replay_request = mock.Mock(return_value=worker)
++
++        cp.start_replay([tflow.tflow()])
++        cp.tick()
++        tctx.master.addons.trigger.reset_mock()
++
++        worker.alive = False
++        cp.tick()
++
++        assert "update" in _event_names(tctx.master.addons.trigger)
++
++
++def test_clientplayback_processing_complete_once_after_final_finish():
++    cp = clientplayback.ClientPlayback()
++    first = ControlledThread()
++    second = ControlledThread()
++
++    with taddons.context() as tctx:
++        tctx.master.addons.trigger = mock.Mock()
++        tctx.master.replay_request = mock.Mock(side_effect=[first, second])
++
++        cp.start_replay([tflow.tflow(), tflow.tflow()])
++        cp.tick()
++        tctx.master.addons.trigger.reset_mock()
++
++        first.alive = False
++        cp.tick()
++
++        tctx.master.addons.trigger.reset_mock()
++        second.alive = False
++        cp.tick()
++
++        completion_calls = [
++            call
++            for call in tctx.master.addons.trigger.call_args_list
++            if call.args and call.args[0] == "processing_complete"
++        ]
++        assert len(completion_calls) == 1
++
++        cp.tick()
++        cp.tick()
++        completion_calls = [
++            call
++            for call in tctx.master.addons.trigger.call_args_list
++            if call.args and call.args[0] == "processing_complete"
++        ]
++        assert len(completion_calls) == 1
++
++
++def test_start_replay_does_not_mutate_caller_sequence():
++    cp = clientplayback.ClientPlayback()
++    first = ControlledThread()
++    second = ControlledThread()
++    caller_flows = [tflow.tflow(), tflow.tflow()]
++    original_flows = list(caller_flows)
++
++    with taddons.context() as tctx:
++        tctx.master.addons.trigger = mock.Mock()
++        tctx.master.replay_request = mock.Mock(side_effect=[first, second])
++
++        cp.start_replay(caller_flows)
++        cp.tick()
++        first.alive = False
++        cp.tick()
++        second.alive = False
++        cp.tick()
++
++    assert caller_flows == original_flows
+diff --git a/test/mitmproxy/proxy/protocol/test_http_replay_shutdown.py b/test/mitmproxy/proxy/protocol/test_http_replay_shutdown.py
+new file mode 100644
+index 000000000..1dabfea7e
+--- /dev/null
++++ b/test/mitmproxy/proxy/protocol/test_http_replay_shutdown.py
+@@ -0,0 +1,42 @@
++import subprocess
++import sys
++import textwrap
++
++
++def test_replay_worker_does_not_block_process_exit():
++    script = textwrap.dedent(
++        """
++        import queue
++        import sys
++        import threading
++        import time
++
++        from mitmproxy import options
++        from mitmproxy.proxy.protocol import http_replay
++        from mitmproxy.test import tflow
++
++        def block_forever(self):
++            while True:
++                time.sleep(60)
++
++        http_replay.RequestReplayThread.run = block_forever
++
++        worker = http_replay.RequestReplayThread(
++            options.Options(),
++            tflow.tflow(),
++            queue.Queue(),
++            threading.Event(),
++        )
++        worker.start()
++        sys.exit(0)
++        """
++    )
++
++    completed = subprocess.run(
++        [sys.executable, "-c", script],
++        stdout=subprocess.PIPE,
++        stderr=subprocess.PIPE,
++        timeout=3,
++    )
++
++    assert completed.returncode == 0, completed.stderr.decode("utf8", "replace")
+diff --git a/test/mitmproxy/test_flow_state_immutability.py b/test/mitmproxy/test_flow_state_immutability.py
+new file mode 100644
+index 000000000..10cb6a3de
+--- /dev/null
++++ b/test/mitmproxy/test_flow_state_immutability.py
+@@ -0,0 +1,24 @@
++import copy
++
++from mitmproxy.test import tflow
++
++
++def test_flow_set_state_does_not_mutate_input():
++    flow = tflow.tflow()
++    state = flow.get_state()
++    expected = copy.deepcopy(state)
++
++    flow.set_state(state)
++
++    assert state == expected
++
++
++def test_http_request_set_state_does_not_mutate_input():
++    request = tflow.tflow().request
++    state = request.get_state()
++    state["extra_regression_sentinel"] = {"nested": ["value"]}
++    expected = copy.deepcopy(state)
++
++    request.set_state(state)
++
++    assert state == expected
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,50 @@
++#!/bin/bash
++set -uo pipefail
++cd /testbed
++
++run_pytest() {
++    python3 - "$@" <<'PY'
++import collections
++import collections.abc
++import sys
++
++for name in [
++    "MutableMapping",
++    "MutableSequence",
++    "MutableSet",
++    "Mapping",
++    "Sequence",
++    "Callable",
++    "Iterable",
++    "Iterator",
++    "ByteString",
++    "Set",
++    "Hashable",
++    "Sized",
++    "Container",
++]:
++    if not hasattr(collections, name):
++        setattr(collections, name, getattr(collections.abc, name))
++
++import pytest
++
++sys.exit(pytest.main(["-v"] + sys.argv[1:]))
++PY
++}
++
++case "${1:-}" in
++    base)
++        run_pytest \
++            test/mitmproxy/test_flow.py
++        ;;
++    new)
++        run_pytest \
++            test/mitmproxy/addons/test_clientplayback_replay_lifecycle.py \
++            test/mitmproxy/proxy/protocol/test_http_replay_shutdown.py \
++            test/mitmproxy/test_flow_state_immutability.py
++        ;;
++    *)
++        echo "usage: $0 base|new"
++        exit 2
++        ;;
++esac

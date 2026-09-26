@@ -1,0 +1,240 @@
+diff --git a/tests/test_loss_wrapper_metric.py b/tests/test_loss_wrapper_metric.py
+new file mode 100644
+index 0000000000..0000000000
+--- /dev/null
++++ b/tests/test_loss_wrapper_metric.py
+@@ -0,0 +1,169 @@
++
++
++
++
++import unittest
++
++import torch
++
++from monai.metrics import LossMetric
++
++
++def _assert_close(testcase, actual, expected):
++    testcase.assertIsInstance(actual, torch.Tensor)
++    expected = expected.to(device=actual.device, dtype=actual.dtype)
++    if actual.numel() != expected.numel():
++        testcase.assertEqual(tuple(actual.shape), tuple(expected.shape))
++    testcase.assertTrue(torch.allclose(actual.reshape(-1), expected.reshape(-1), equal_nan=True), f"{actual} != {expected}")
++
++
++class TestLossMetric(unittest.TestCase):
++    def test_public_import_iteration_return_and_accumulation(self):
++        def per_sample_mean(y_pred):
++            return y_pred.mean(dim=1, keepdim=True)
++
++        metric = LossMetric(loss_fn=per_sample_mean, reduction="mean")
++
++        first = torch.tensor([[1.0, 3.0], [5.0, 7.0]])
++        second = torch.tensor([[2.0, 8.0]])
++
++        expected_first = torch.tensor([[2.0], [6.0]])
++        expected_second = torch.tensor([[5.0]])
++
++        first_result = metric(first)
++        second_result = metric(second)
++
++        _assert_close(self, first_result, expected_first)
++        _assert_close(self, second_result, expected_second)
++
++        expected_all = torch.cat([expected_first, expected_second], dim=0)
++        aggregated = metric.aggregate(reduction="none")
++        _assert_close(self, aggregated, expected_all)
++
++    def test_prediction_only_and_prediction_with_label_call_signatures(self):
++        pred_only_calls = []
++
++        def pred_only_loss(*args):
++            pred_only_calls.append(len(args))
++            return args[0].sum().reshape(1, 1)
++
++        label_calls = []
++
++        def pred_and_label_loss(*args):
++            label_calls.append(len(args))
++            y_pred, y = args
++            return (y_pred - y).abs().sum().reshape(1, 1)
++
++        y_pred = torch.tensor([[1.0, 2.0, 4.0]])
++        y = torch.tensor([[0.5, 3.0, 1.0]])
++
++        pred_only_result = LossMetric(loss_fn=pred_only_loss)(y_pred)
++        self.assertEqual(pred_only_calls, [1])
++        _assert_close(self, pred_only_result, torch.tensor([[7.0]]))
++
++        label_result = LossMetric(loss_fn=pred_and_label_loss)(y_pred, y)
++        self.assertEqual(label_calls, [2])
++        _assert_close(self, label_result, torch.tensor([[4.5]]))
++
++    def test_scalar_and_vector_loss_outputs_are_batch_first_compatible(self):
++        scalar_metric = LossMetric(loss_fn=lambda x: x.mean(), reduction="none")
++
++        scalar_first = scalar_metric(torch.tensor([2.0, 3.0]))
++        scalar_second = scalar_metric(torch.tensor([4.0, 6.0]))
++
++        self.assertGreaterEqual(scalar_first.ndim, 2)
++        self.assertGreaterEqual(scalar_second.ndim, 2)
++        _assert_close(self, scalar_first, torch.tensor([[2.5]]))
++        _assert_close(self, scalar_second, torch.tensor([[5.0]]))
++
++        scalar_aggregate = scalar_metric.aggregate(reduction="none")
++        self.assertGreaterEqual(scalar_aggregate.ndim, 2)
++        _assert_close(self, scalar_aggregate, torch.tensor([[2.5], [5.0]]))
++
++        def vector_loss(x):
++            return torch.stack([x.sum(), x.mean()])
++
++        vector_metric = LossMetric(loss_fn=vector_loss, reduction="mean")
++        vector_metric(torch.tensor([1.0, 2.0]))
++        vector_metric(torch.tensor([3.0, 5.0]))
++
++        _assert_close(self, vector_metric.aggregate(reduction="none"), torch.tensor([[3.0, 1.5], [8.0, 4.0]]))
++        _assert_close(self, vector_metric.aggregate(reduction="mean"), torch.tensor(4.125))
++
++    @staticmethod
++    def _expected_reductions(data):
++        return {
++            "none": data,
++            "mean": data.mean(),
++            "sum": data.sum(),
++            "mean_batch": data.mean(dim=0),
++            "sum_batch": data.sum(dim=0),
++            "mean_channel": data.mean(dim=1),
++            "sum_channel": data.sum(dim=1),
++        }
++
++    def _run_reduction_case(self, first, second):
++        calls = [first.clone(), second.clone()]
++
++        def queued_loss(_):
++            return calls.pop(0)
++
++        metric = LossMetric(loss_fn=queued_loss, reduction="sum")
++        metric(torch.zeros(first.shape[0], 1))
++        metric(torch.zeros(second.shape[0], 1))
++
++        all_data = torch.cat([first, second], dim=0)
++        expected = self._expected_reductions(all_data)
++
++        for reduction, expected_value in expected.items():
++            with self.subTest(reduction=reduction, data=all_data.tolist()):
++                _assert_close(self, metric.aggregate(reduction=reduction), expected_value)
++
++        _assert_close(self, metric.aggregate(reduction="mean"), expected["mean"])
++        _assert_close(self, metric.aggregate(), expected["sum"])
++
++    def test_reduction_modes_and_aggregate_override(self):
++        cases = [
++            (torch.tensor([[1.0, 2.0], [3.0, 4.0]]), torch.tensor([[5.0, 8.0]])),
++            (torch.tensor([[2.0, 6.0], [4.0, 10.0]]), torch.tensor([[8.0, 12.0]])),
++        ]
++        for first, second in cases:
++            self._run_reduction_case(first, second)
++
++    def test_get_not_nans_return_contract(self):
++        loss_value = torch.tensor([[1.0, float("nan")], [3.0, 4.0]])
++
++        def loss_fn(_):
++            return loss_value.clone()
++
++        default_metric = LossMetric(loss_fn=loss_fn, reduction="none")
++        default_metric(torch.zeros(2, 1))
++        default_result = default_metric.aggregate()
++        self.assertNotIsInstance(default_result, tuple)
++        _assert_close(self, default_result, loss_value)
++
++        not_nan_metric = LossMetric(loss_fn=loss_fn, reduction="none", get_not_nans=True)
++        not_nan_metric(torch.zeros(2, 1))
++        result = not_nan_metric.aggregate()
++        self.assertIsInstance(result, tuple)
++        self.assertEqual(len(result), 2)
++        metric_value, not_nans = result
++        _assert_close(self, metric_value, loss_value)
++        _assert_close(self, not_nans, torch.tensor([[1.0, 0.0], [1.0, 1.0]]))
++
++    def test_empty_aggregate_returns_zero_tensor_values(self):
++        empty_metric = LossMetric(loss_fn=lambda x: x.mean())
++        empty_result = empty_metric.aggregate()
++        self.assertIsInstance(empty_result, torch.Tensor)
++        _assert_close(self, empty_result, torch.tensor(0.0))
++
++        empty_metric_with_counts = LossMetric(loss_fn=lambda x: x.mean(), get_not_nans=True)
++        empty_result_with_counts = empty_metric_with_counts.aggregate()
++        self.assertIsInstance(empty_result_with_counts, tuple)
++        self.assertEqual(len(empty_result_with_counts), 2)
++        _assert_close(self, empty_result_with_counts[0], torch.tensor(0.0))
++        _assert_close(self, empty_result_with_counts[1], torch.tensor(0.0))
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/test_loss_wrapper_metric_docs.py b/tests/test_loss_wrapper_metric_docs.py
+new file mode 100644
+index 0000000000..0000000000
+--- /dev/null
++++ b/tests/test_loss_wrapper_metric_docs.py
+@@ -0,0 +1,38 @@
++
++
++
++
++import os
++import re
++import unittest
++
++
++class TestLossMetricDocs(unittest.TestCase):
++    def test_metrics_docs_include_loss_wrapper_api_entry(self):
++        repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
++        docs_path = os.path.join(repo_root, "docs", "source", "metrics.rst")
++
++        with open(docs_path, encoding="utf-8") as docs_file:
++            docs_text = docs_file.read()
++
++        title_entry = re.search(r"(?m)^`?LossMetric`?\s*$", docs_text) is not None
++        direct_api_entry = re.search(r"(?m)^\s*\.\.\s*auto(?:class|function|summary)::\s*LossMetric\b", docs_text)
++        autosummary_item = re.search(r"(?m)^\s+LossMetric\s*$", docs_text)
++
++        self.assertTrue(
++            title_entry or direct_api_entry or autosummary_item,
++            "metrics documentation should contain a structured LossMetric API entry",
++        )
++
++        if title_entry:
++            entry_start = re.search(r"(?m)^`?LossMetric`?\s*$", docs_text).start()
++            following_text = docs_text[entry_start : entry_start + 300]
++            self.assertRegex(
++                following_text,
++                r"\.\.\s*auto(?:class|function|summary)::\s*LossMetric\b|^\s+LossMetric\s*$",
++                "LossMetric docs entry should expose the API, not only mention the name in prose",
++            )
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,16 @@
++#!/bin/bash
++set -uo pipefail
++cd /testbed
++
++case "${1:-}" in
++  base)
++    python3 -m pytest tests/test_cumulative.py tests/test_compute_meandice.py -q
++    ;;
++  new)
++    python3 -m pytest tests/test_loss_wrapper_metric.py tests/test_loss_wrapper_metric_docs.py -q
++    ;;
++  *)
++    echo "usage: $0 base|new"
++    exit 2
++    ;;
++esac

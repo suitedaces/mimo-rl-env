@@ -1,0 +1,2 @@
+gRPC SAN whitelist breaks with empty list
+`grpc/creds:serverTransportCredentials.validateClient` is meant to [ignore the check](https://github.com/letsencrypt/boulder/blob/master/grpc/creds/creds.go#L144) if the `acceptedSANs` map it is constructed with is `nil`. This never happens as the map is constructed using [`make(map[string]struct{})`](https://github.com/letsencrypt/boulder/blob/master/grpc/server.go#L49) meaning it can never be `nil`.

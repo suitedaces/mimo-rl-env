@@ -1,0 +1,467 @@
+diff --git a/usercase-test-coderl/elastic_ordered_buffer_test.go b/usercase-test-coderl/elastic_ordered_buffer_test.go
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/elastic_ordered_buffer_test.go
+@@ -0,0 +1,436 @@
++package usercase_test_coderl
++
++import (
++	"bytes"
++	"errors"
++	"io"
++	"strings"
++	"testing"
++
++	elastic "github.com/panjf2000/gnet/v2/pkg/buffer/elastic"
++	errorx "github.com/panjf2000/gnet/v2/pkg/errors"
++)
++
++
++
++
++
++func joinChunks(chunks [][]byte) string {
++	var out bytes.Buffer
++	for _, chunk := range chunks {
++		out.Write(chunk)
++	}
++	return out.String()
++}
++
++func requireNoError(t *testing.T, err error) {
++	t.Helper()
++	if err != nil {
++		t.Fatalf("unexpected error: %v", err)
++	}
++}
++
++func requireErrorIs(t *testing.T, err, target error) {
++	t.Helper()
++	if !errors.Is(err, target) {
++		t.Fatalf("expected error %v, got %v", target, err)
++	}
++}
++
++func TestNewRejectsNonPositiveAndPositiveStartsEmpty(t *testing.T) {
++
++
++	b, err := elastic.New(0)
++
++	if b != nil {
++		b.Release()
++	}
++	requireErrorIs(t, err, errorx.ErrNegativeSize)
++
++	b, err = elastic.New(-3)
++
++	if b != nil {
++		b.Release()
++	}
++	requireErrorIs(t, err, errorx.ErrNegativeSize)
++
++	b, err = elastic.New(4)
++	requireNoError(t, err)
++	if b == nil {
++		t.Fatalf("New(4) buffer nil = true")
++	}
++	if got := b.Buffered(); got != 0 {
++		t.Fatalf("fresh Buffered() = %d, want 0", got)
++	}
++	if got := b.IsEmpty(); got != true {
++		t.Fatalf("fresh IsEmpty() = %v, want true", got)
++	}
++	b.Release()
++}
++
++func TestWritePeekDiscardReadPreservesOrderAcrossStaticSpill(t *testing.T) {
++
++
++	b, err := elastic.New(4)
++	requireNoError(t, err)
++	defer b.Release()
++
++	n, err := b.Write([]byte("abcd"))
++	requireNoError(t, err)
++	if n != 4 {
++		t.Fatalf("Write(\"abcd\") = %d, want 4", n)
++	}
++	if got := b.Buffered(); got != 4 {
++		t.Fatalf("after first write Buffered() = %d, want 4", got)
++	}
++	if got := b.IsEmpty(); got != false {
++		t.Fatalf("after first write IsEmpty() = %v, want false", got)
++	}
++
++	n, err = b.Write([]byte("ef"))
++	requireNoError(t, err)
++	if n != 2 {
++		t.Fatalf("Write(\"ef\") = %d, want 2", n)
++	}
++	if got := b.Buffered(); got != 6 {
++		t.Fatalf("after second write Buffered() = %d, want 6", got)
++	}
++
++	chunks, err := b.Peek(-1)
++	requireNoError(t, err)
++	if got := joinChunks(chunks); got != "abcdef" {
++		t.Fatalf("Peek(-1) joined = %q, want %q", got, "abcdef")
++	}
++	if got := b.Buffered(); got != 6 {
++		t.Fatalf("after Peek(-1) Buffered() = %d, want 6", got)
++	}
++
++	discarded, err := b.Discard(4)
++	requireNoError(t, err)
++	if discarded != 4 {
++		t.Fatalf("Discard(4) = %d, want 4", discarded)
++	}
++	if got := b.Buffered(); got != 2 {
++		t.Fatalf("after Discard(4) Buffered() = %d, want 2", got)
++	}
++
++	buf := make([]byte, 2)
++	n, err = b.Read(buf)
++	requireNoError(t, err)
++	if n != 2 {
++		t.Fatalf("Read(2) = %d, want 2", n)
++	}
++	if got := string(buf); got != "ef" {
++		t.Fatalf("Read(2) bytes = %q, want %q", got, "ef")
++	}
++	if got := b.Buffered(); got != 0 {
++		t.Fatalf("after Read(2) Buffered() = %d, want 0", got)
++	}
++	if got := b.IsEmpty(); got != true {
++		t.Fatalf("after Read(2) IsEmpty() = %v, want true", got)
++	}
++}
++
++func TestWritevAppendsSlicesInOrderAndShortPeekErrors(t *testing.T) {
++
++
++	b, err := elastic.New(4)
++	requireNoError(t, err)
++	defer b.Release()
++
++	n, err := b.Write([]byte("zz"))
++	requireNoError(t, err)
++	if n != 2 {
++		t.Fatalf("setup Write(\"zz\") = %d, want 2", n)
++	}
++	if got := b.Buffered(); got != 2 {
++		t.Fatalf("before Reset(4) Buffered() = %d, want 2", got)
++	}
++
++	b.Reset(4)
++	if got := b.Buffered(); got != 0 {
++		t.Fatalf("after Reset(4) Buffered() = %d, want 0", got)
++	}
++	if got := b.IsEmpty(); got != true {
++		t.Fatalf("after Reset(4) IsEmpty() = %v, want true", got)
++	}
++
++	n, err = b.Writev([][]byte{[]byte("ab"), []byte("cd"), []byte("ef")})
++	requireNoError(t, err)
++	if n != 6 {
++		t.Fatalf("Writev = %d, want 6", n)
++	}
++	if got := b.Buffered(); got != 6 {
++		t.Fatalf("after Writev Buffered() = %d, want 6", got)
++	}
++
++	chunks, err := b.Peek(6)
++	requireNoError(t, err)
++	if got := joinChunks(chunks); got != "abcdef" {
++		t.Fatalf("Peek(6) joined = %q, want %q", got, "abcdef")
++	}
++	if got := b.Buffered(); got != 6 {
++		t.Fatalf("after Peek(6) Buffered() = %d, want 6", got)
++	}
++
++	_, err = b.Peek(7)
++
++	requireErrorIs(t, err, io.ErrShortBuffer)
++	if got := b.Buffered(); got != 6 {
++		t.Fatalf("after Peek(7) Buffered() = %d, want 6", got)
++	}
++}
++
++func TestReadFromWriteToAppendAndDrainInOrder(t *testing.T) {
++
++
++	b, err := elastic.New(4)
++	requireNoError(t, err)
++	defer b.Release()
++
++	n, err := b.Write([]byte("hi"))
++	requireNoError(t, err)
++	if n != 2 {
++		t.Fatalf("Write(\"hi\") = %d, want 2", n)
++	}
++	if got := b.Buffered(); got != 2 {
++		t.Fatalf("before ReadFrom Buffered() = %d, want 2", got)
++	}
++
++	read, err := b.ReadFrom(strings.NewReader("there"))
++	requireNoError(t, err)
++	if read != 5 {
++		t.Fatalf("ReadFrom(\"there\") = %d, want 5", read)
++	}
++	if got := b.Buffered(); got != 7 {
++		t.Fatalf("after ReadFrom Buffered() = %d, want 7", got)
++	}
++	chunks, err := b.Peek(-1)
++	requireNoError(t, err)
++	if got := joinChunks(chunks); got != "hithere" {
++		t.Fatalf("after ReadFrom Peek(-1) = %q, want %q", got, "hithere")
++	}
++
++	var out bytes.Buffer
++	written, err := b.WriteTo(&out)
++	requireNoError(t, err)
++	if written != 7 {
++		t.Fatalf("WriteTo = %d, want 7", written)
++	}
++	if got := out.String(); got != "hithere" {
++		t.Fatalf("WriteTo bytes = %q, want %q", got, "hithere")
++	}
++	if got := b.Buffered(); got != 0 {
++		t.Fatalf("after WriteTo Buffered() = %d, want 0", got)
++	}
++	if got := b.IsEmpty(); got != true {
++		t.Fatalf("after WriteTo IsEmpty() = %v, want true", got)
++	}
++}
++
++func TestResetClearsAndNonPositiveResetKeepsBufferUsable(t *testing.T) {
++
++
++	b, err := elastic.New(8)
++	requireNoError(t, err)
++	defer b.Release()
++
++	n, err := b.Write([]byte("abcd"))
++	requireNoError(t, err)
++	if n != 4 {
++		t.Fatalf("Write(\"abcd\") = %d, want 4", n)
++	}
++	if got := b.Buffered(); got != 4 {
++		t.Fatalf("before Reset(2) Buffered() = %d, want 4", got)
++	}
++
++	b.Reset(2)
++	if got := b.Buffered(); got != 0 {
++		t.Fatalf("after Reset(2) Buffered() = %d, want 0", got)
++	}
++	if got := b.IsEmpty(); got != true {
++		t.Fatalf("after Reset(2) IsEmpty() = %v, want true", got)
++	}
++
++	n, err = b.Write([]byte("wxyz"))
++	requireNoError(t, err)
++	if n != 4 {
++		t.Fatalf("after Reset(2) Write(\"wxyz\") = %d, want 4", n)
++	}
++	chunks, err := b.Peek(-1)
++	requireNoError(t, err)
++	if got := joinChunks(chunks); got != "wxyz" {
++		t.Fatalf("after Reset(2) Peek(-1) = %q, want %q", got, "wxyz")
++	}
++	if got := b.Buffered(); got != 4 {
++		t.Fatalf("after Reset(2) reuse Buffered() = %d, want 4", got)
++	}
++
++	b.Reset(-1)
++	if got := b.Buffered(); got != 0 {
++		t.Fatalf("after Reset(-1) Buffered() = %d, want 0", got)
++	}
++	if got := b.IsEmpty(); got != true {
++		t.Fatalf("after Reset(-1) IsEmpty() = %v, want true", got)
++	}
++
++	n, err = b.Write([]byte("pqrs"))
++	requireNoError(t, err)
++	if n != 4 {
++		t.Fatalf("after Reset(-1) Write(\"pqrs\") = %d, want 4", n)
++	}
++	chunks, err = b.Peek(-1)
++	requireNoError(t, err)
++	if got := joinChunks(chunks); got != "pqrs" {
++		t.Fatalf("after Reset(-1) Peek(-1) = %q, want %q", got, "pqrs")
++	}
++	if got := b.Buffered(); got != 4 {
++		t.Fatalf("after Reset(-1) reuse Buffered() = %d, want 4", got)
++	}
++}
++
++func TestReadBeforeAnyWriteDoesNotExposeData(t *testing.T) {
++
++
++	b, err := elastic.New(4)
++	requireNoError(t, err)
++	defer b.Release()
++
++	buf := make([]byte, 1)
++	n, _ := b.Read(buf)
++	if n != 0 {
++		t.Fatalf("fresh Read n = %d, want 0", n)
++	}
++
++	if got := b.Buffered(); got != 0 {
++		t.Fatalf("after fresh Read Buffered() = %d, want 0", got)
++	}
++	if got := b.IsEmpty(); got != true {
++		t.Fatalf("after fresh Read IsEmpty() = %v, want true", got)
++	}
++}
++
++func TestReleaseClearsObservableState(t *testing.T) {
++
++
++	b, err := elastic.New(4)
++	requireNoError(t, err)
++
++	n, err := b.Write([]byte("abcdef"))
++	requireNoError(t, err)
++	if n != 6 {
++		t.Fatalf("Write(\"abcdef\") = %d, want 6", n)
++	}
++	if got := b.Buffered(); got != 6 {
++		t.Fatalf("before Release Buffered() = %d, want 6", got)
++	}
++
++	b.Release()
++	if got := b.Buffered(); got != 0 {
++		t.Fatalf("after first Release Buffered() = %d, want 0", got)
++	}
++	if got := b.IsEmpty(); got != true {
++		t.Fatalf("after first Release IsEmpty() = %v, want true", got)
++	}
++
++}
++
++func TestIndependentInstancesMaintainOwnBufferedBytes(t *testing.T) {
++
++
++	a, err := elastic.New(4)
++	requireNoError(t, err)
++	defer a.Release()
++	b, err := elastic.New(4)
++	requireNoError(t, err)
++	defer b.Release()
++
++	n, err := a.Write([]byte("abcd"))
++	requireNoError(t, err)
++	if n != 4 {
++		t.Fatalf("a Write(\"abcd\") = %d, want 4", n)
++	}
++	n, err = a.Write([]byte("ef"))
++	requireNoError(t, err)
++	if n != 2 {
++		t.Fatalf("a Write(\"ef\") = %d, want 2", n)
++	}
++	n, err = b.Write([]byte("xy"))
++	requireNoError(t, err)
++	if n != 2 {
++		t.Fatalf("b Write(\"xy\") = %d, want 2", n)
++	}
++
++	if got := a.Buffered(); got != 6 {
++		t.Fatalf("a Buffered() = %d, want 6", got)
++	}
++	if got := a.IsEmpty(); got != false {
++		t.Fatalf("a IsEmpty() = %v, want false", got)
++	}
++	chunks, err := a.Peek(-1)
++	requireNoError(t, err)
++	if got := joinChunks(chunks); got != "abcdef" {
++		t.Fatalf("a Peek(-1) = %q, want %q", got, "abcdef")
++	}
++
++	if got := b.Buffered(); got != 2 {
++		t.Fatalf("b Buffered() = %d, want 2", got)
++	}
++	if got := b.IsEmpty(); got != false {
++		t.Fatalf("b IsEmpty() = %v, want false", got)
++	}
++	chunks, err = b.Peek(-1)
++	requireNoError(t, err)
++	if got := joinChunks(chunks); got != "xy" {
++		t.Fatalf("b Peek(-1) = %q, want %q", got, "xy")
++	}
++}
++
++func TestReleaseLeakFloorClearsObservableCountersAcrossCycles(t *testing.T) {
++
++
++
++	const cycles = 128
++	buffers := make([]*elastic.Buffer, 0, cycles)
++	for i := 0; i < cycles; i++ {
++		b, err := elastic.New(4)
++		requireNoError(t, err)
++		n, err := b.Write([]byte("abcd"))
++		requireNoError(t, err)
++		if n != 4 {
++			t.Fatalf("cycle %d Write(\"abcd\") = %d, want 4", i, n)
++		}
++		n, err = b.Write([]byte("ef"))
++		requireNoError(t, err)
++		if n != 2 {
++			t.Fatalf("cycle %d Write(\"ef\") = %d, want 2", i, n)
++		}
++		if got := b.Buffered(); got != 6 {
++			t.Fatalf("cycle %d before Release Buffered() = %d, want 6", i, got)
++		}
++		b.Release()
++		if got := b.Buffered(); got != 0 {
++			t.Fatalf("cycle %d after Release Buffered() = %d, want 0", i, got)
++		}
++		if got := b.IsEmpty(); got != true {
++			t.Fatalf("cycle %d after Release IsEmpty() = %v, want true", i, got)
++		}
++		buffers = append(buffers, b)
++	}
++
++	totalBuffered := 0
++	emptyCount := 0
++	for _, b := range buffers {
++		totalBuffered += b.Buffered()
++		if b.IsEmpty() {
++			emptyCount++
++		}
++	}
++	if totalBuffered != 0 {
++		t.Fatalf("aggregate Buffered() across released buffers = %d, want 0", totalBuffered)
++	}
++	if emptyCount != 128 {
++		t.Fatalf("released IsEmpty() count = %d, want 128", emptyCount)
++	}
++
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,21 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++
++
++set -euo pipefail
++
++cd /workspace/repo
++export GOTOOLCHAIN=local
++export GOPROXY=off
++export GOSUMDB=off
++export GOFLAGS="-mod=readonly -buildvcs=false"
++exec go test -v -count=1 ./usercase-test-coderl/...

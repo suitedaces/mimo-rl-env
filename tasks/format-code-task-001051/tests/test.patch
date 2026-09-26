@@ -1,0 +1,220 @@
+diff --git a/tests/unit/test_connection_wrapper_contract.py b/tests/unit/test_connection_wrapper_contract.py
+new file mode 100644
+index 0000000..39ae9f1
+--- /dev/null
++++ b/tests/unit/test_connection_wrapper_contract.py
+@@ -0,0 +1,201 @@
++import unittest
++from datetime import date, datetime
++from decimal import Decimal
++
++from dbt.adapters.trino.connections import ConnectionWrapper, TrinoConnectionManager
++
++
++class _FakeCursor:
++    def __init__(self, rows, label):
++        self.rows = rows
++        self.label = label
++        self.calls = []
++        self.cancel_count = 0
++        self.close_count = 0
++        self.description = [(label, "varchar")]
++        self.update_type = "SELECT"
++        self.rowcount = len(rows) if rows is not None else -1
++        self.query = f"select {label}"
++        self.query_id = f"query-{label}"
++
++    def execute(self, sql, params=None):
++        self.calls.append((sql, params))
++        return "driver-result"
++
++    def fetchall(self):
++        return self.rows
++
++    def cancel(self):
++        self.cancel_count += 1
++
++    def close(self):
++        self.close_count += 1
++
++
++class _FakeHandle:
++    def __init__(self, result_sets):
++        self.result_sets = list(result_sets)
++        self.cursors = []
++        self.close_count = 0
++
++    def cursor(self):
++        rows = self.result_sets[len(self.cursors)]
++        cursor = _FakeCursor(rows, f"value_{len(self.cursors) + 1}")
++        self.cursors.append(cursor)
++        return cursor
++
++    def close(self):
++        self.close_count += 1
++
++
++class TestConnectionWrapperCursorOwnership(unittest.TestCase):
++    def test_cursors_have_independent_driver_state_results_and_metadata(self):
++        handle = _FakeHandle([[(1,), (2,)], [(10,), (20,)]])
++        connection = ConnectionWrapper(handle, prepared_statements_enabled=True)
++
++        first = connection.cursor()
++        second = connection.cursor()
++        self.assertIsNot(first, second)
++        self.assertEqual(len(handle.cursors), 2)
++
++        first.execute("first query")
++        second.execute("second query")
++        self.assertEqual(first.fetchone(), (1,))
++        self.assertEqual(second.fetchone(), (10,))
++        self.assertEqual(first.fetchall(), [(2,)])
++        self.assertEqual(second.fetchall(), [(20,)])
++        self.assertEqual(first.description, [("value_1", "varchar")])
++        self.assertEqual(second.description, [("value_2", "varchar")])
++
++    def test_cursor_close_and_cancel_are_local_but_connection_owns_all_cursors(self):
++        handle = _FakeHandle([[('first',)], [('second',)]])
++        connection = ConnectionWrapper(handle, prepared_statements_enabled=True)
++        first = connection.cursor()
++        second = connection.cursor()
++
++        first.cancel()
++        first.close()
++        first.close()
++        self.assertEqual(handle.cursors[0].cancel_count, 1)
++        self.assertEqual(handle.cursors[0].close_count, 1)
++        self.assertEqual(handle.cursors[1].cancel_count, 0)
++        self.assertEqual(handle.close_count, 0)
++
++        connection.cancel()
++        self.assertEqual(handle.cursors[0].cancel_count, 1)
++        self.assertEqual(handle.cursors[1].cancel_count, 1)
++
++        connection.close()
++        connection.close()
++        self.assertEqual(handle.cursors[0].close_count, 1)
++        self.assertEqual(handle.cursors[1].close_count, 1)
++        self.assertEqual(handle.close_count, 1)
++
++    def test_connection_manager_can_build_response_from_returned_cursor(self):
++        handle = _FakeHandle([[('row',)]])
++        cursor = ConnectionWrapper(handle, prepared_statements_enabled=True).cursor()
++        cursor.execute("select value")
++
++        response = TrinoConnectionManager.get_response(cursor)
++
++        self.assertEqual(str(response), "SELECT (1 rows)")
++        self.assertEqual(response.rows_affected, 1)
++        self.assertEqual(response.query, "select value_1")
++        self.assertEqual(response.query_id, "query-value_1")
++
++
++class TestConnectionWrapperResultBuffer(unittest.TestCase):
++    def test_mixed_fetches_drain_rows_in_order_without_loss(self):
++        handle = _FakeHandle([[(1,), (2,), (3,), (4,)]])
++        wrapper = ConnectionWrapper(handle, prepared_statements_enabled=True).cursor()
++
++        self.assertEqual(wrapper.execute("select value"), "driver-result")
++        self.assertEqual(wrapper.fetchone(), (1,))
++        self.assertEqual(wrapper.fetchmany(2), [(2,), (3,)])
++        self.assertEqual(wrapper.fetchone(), (4,))
++        self.assertEqual(wrapper.fetchone(), None)
++        self.assertEqual(wrapper.fetchmany(3), [])
++        self.assertEqual(wrapper.fetchall(), [])
++
++    def test_partial_fetchmany_preserves_unread_rows_and_zero_is_non_consuming(self):
++        handle = _FakeHandle([[("a",), ("b",), ("c",)]])
++        wrapper = ConnectionWrapper(handle, prepared_statements_enabled=True).cursor()
++        wrapper.execute("select value")
++
++        self.assertEqual(wrapper.fetchmany(0), [])
++        self.assertEqual(wrapper.fetchone(), ("a",))
++        self.assertEqual(wrapper.fetchmany(1), [("b",)])
++        self.assertEqual(wrapper.fetchall(), [("c",)])
++
++    def test_execute_discards_previous_result_set_and_normalizes_no_rows(self):
++        handle = _FakeHandle([[(1,)]])
++        wrapper = ConnectionWrapper(handle, prepared_statements_enabled=True).cursor()
++        wrapper.execute("first")
++        self.assertEqual(wrapper.fetchone(), (1,))
++
++        handle.cursors[0].rows = [(2,), (3,)]
++        wrapper.execute("second")
++        self.assertEqual(wrapper.fetchall(), [(2,), (3,)])
++
++        handle.cursors[0].rows = None
++        wrapper.execute("third")
++        self.assertEqual(wrapper.fetchall(), [])
++        self.assertEqual(wrapper.fetchone(), None)
++
++
++class TestConnectionWrapperBindings(unittest.TestCase):
++    def test_prepared_mode_forwards_bindings_without_rewriting(self):
++        handle = _FakeHandle([[]])
++        wrapper = ConnectionWrapper(handle, prepared_statements_enabled=True).cursor()
++        bindings = ["O'Reilly", None, Decimal("1.20")]
++
++        wrapper.execute("select %s, %s, %s", bindings)
++
++        self.assertEqual(
++            handle.cursors[0].calls,
++            [("select %s, %s, %s", bindings)],
++        )
++
++    def test_legacy_mode_escapes_text_null_and_numeric_values(self):
++        handle = _FakeHandle([[]])
++        wrapper = ConnectionWrapper(handle, prepared_statements_enabled=False).cursor()
++
++        wrapper.execute("select %s, %s, %s", ["O'Reilly", None, Decimal("1.20")])
++
++        self.assertEqual(
++            handle.cursors[0].calls,
++            [(
++                "select 'O''Reilly', NULL, 1.20",
++                None,
++            )],
++        )
++
++    def test_legacy_mode_formats_date_and_millisecond_timestamp_literals(self):
++        handle = _FakeHandle([[]])
++        wrapper = ConnectionWrapper(handle, prepared_statements_enabled=False).cursor()
++
++        wrapper.execute(
++            "select %s, %s",
++            [date(2024, 1, 2), datetime(2024, 1, 2, 3, 4, 5, 678901)],
++        )
++
++        self.assertEqual(
++            handle.cursors[0].calls,
++            [(
++                "select DATE '2024-01-02', TIMESTAMP '2024-01-02 03:04:05.678'",
++                None,
++            )],
++        )
++
++    def test_legacy_mode_rejects_unsupported_values_without_running_sql(self):
++        handle = _FakeHandle([[]])
++        wrapper = ConnectionWrapper(handle, prepared_statements_enabled=False).cursor()
++
++        with self.assertRaisesRegex(ValueError, "Cannot escape"):
++            wrapper.execute("select %s", [object()])
++
++        self.assertEqual(handle.cursors[0].calls, [])
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,8 @@
++#!/bin/bash
++set -euo pipefail
++
++
++/opt/dbt-venv/bin/python -m unittest \
++  tests.unit.test_adapter \
++  tests.unit.test_connection_wrapper_contract \
++  -v

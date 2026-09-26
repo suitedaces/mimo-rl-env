@@ -1,0 +1,574 @@
+diff --git a/usercase-test-coderl/test_table_exports.py b/usercase-test-coderl/test_table_exports.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/test_table_exports.py
+@@ -0,0 +1,541 @@
++
++
++
++
++
++
++
++from __future__ import annotations
++
++import json
++import os
++import socket
++import sqlite3
++import subprocess
++import sys
++import zipfile
++from html.parser import HTMLParser
++from pathlib import Path
++
++import pandas as pd
++import pytest
++from openpyxl import load_workbook
++
++from camelot.core import Table
++from camelot.core import TableList
++
++
++CSV_AB = '"A","B"\n"1","2"\n'
++CSV_CD = '"C","D"\n"3","4"\n'
++RECORDS_AB = [{"0": "A", "1": "B"}, {"0": "1", "1": "2"}]
++RECORDS_CD = [{"0": "C", "1": "D"}, {"0": "3", "1": "4"}]
++
++
++class _HTMLTextCollector(HTMLParser):
++    def __init__(self):
++        super().__init__()
++        self.text = []
++
++    def handle_data(self, data):
++        value = data.strip()
++        if value:
++            self.text.append(value)
++
++
++def make_table(data=None, page=1, order=2):
++    table = Table(cols=[(0, 50), (50, 100)], rows=[(100, 50), (50, 0)])
++    table.df = pd.DataFrame(data or [["A", "B"], ["1", "2"]])
++    table.shape = table.df.shape
++    table.page = page
++    table.order = order
++    return table
++
++
++def make_table_list():
++    return TableList(
++        [
++            make_table([["A", "B"], ["1", "2"]], page=1, order=1),
++            make_table([["C", "D"], ["3", "4"]], page=2, order=1),
++        ]
++    )
++
++
++def worksheet_matrix(path, sheet_name):
++    workbook = load_workbook(path)
++    sheet = workbook[sheet_name]
++    return [
++        [sheet.cell(row=row, column=col).value for col in range(1, sheet.max_column + 1)]
++        for row in range(1, sheet.max_row + 1)
++    ]
++
++
++def assert_records_json(text, expected):
++
++    assert json.loads(text) == expected
++
++
++def assert_html_table_text(text, expected_values):
++
++    assert "<table" in text.lower()
++    assert "</table>" in text.lower()
++    parser = _HTMLTextCollector()
++    parser.feed(text)
++    for value in expected_values:
++        assert value in parser.text
++
++
++def assert_markdown_table_text(text, expected_values):
++
++    table_lines = [line for line in text.splitlines() if "|" in line]
++    assert len(table_lines) >= 3
++    for value in expected_values:
++        assert value in text
++
++
++def assert_sheet_contains_values(path, sheet_name, expected_values):
++
++    matrix = worksheet_matrix(path, sheet_name)
++    flat = [value for row in matrix for value in row]
++    for value in expected_values:
++        assert value in flat
++
++
++def assert_zip_member_content(archive, fmt, members):
++
++    first, second = members
++    if fmt == "csv":
++        assert archive.read(first).decode("utf-8") == CSV_AB
++        assert archive.read(second).decode("utf-8") == CSV_CD
++    elif fmt == "json":
++        assert_records_json(archive.read(first).decode("utf-8"), RECORDS_AB)
++        assert_records_json(archive.read(second).decode("utf-8"), RECORDS_CD)
++    elif fmt == "html":
++        assert_html_table_text(archive.read(first).decode("utf-8"), ["A", "B", "1", "2"])
++        assert_html_table_text(archive.read(second).decode("utf-8"), ["C", "D", "3", "4"])
++    elif fmt == "markdown":
++        assert_markdown_table_text(archive.read(first).decode("utf-8"), ["A", "B", "1", "2"])
++        assert_markdown_table_text(archive.read(second).decode("utf-8"), ["C", "D", "3", "4"])
++    else:
++        raise AssertionError(f"unexpected compressed export format: {fmt}")
++
++
++def assert_zipped_single_artifact(tmp_path, archive, fmt, expected_member):
++
++    extract_dir = tmp_path / "zipcheck"
++    extract_dir.mkdir()
++    extracted = extract_dir / expected_member
++    extracted.write_bytes(archive.read(expected_member))
++    if fmt == "excel":
++        assert load_workbook(extracted).sheetnames == ["page-1-table-1", "page-2-table-1"]
++        assert_sheet_contains_values(extracted, "page-1-table-1", ["A", "B", "1", "2"])
++        assert_sheet_contains_values(extracted, "page-2-table-1", ["C", "D", "3", "4"])
++    elif fmt == "sqlite":
++        assert sqlite_table_names(extracted) == [("page-1-table-1",), ("page-2-table-1",)]
++        assert sqlite_rows(extracted, "page-1-table-1") == [("A", "B"), ("1", "2")]
++        assert sqlite_rows(extracted, "page-2-table-1") == [("C", "D"), ("3", "4")]
++    else:
++        raise AssertionError(f"unexpected compressed export format: {fmt}")
++
++
++def sqlite_rows(path, table_name):
++    connection = sqlite3.connect(path)
++    try:
++        return connection.execute(f'select * from "{table_name}"').fetchall()
++    finally:
++        connection.close()
++
++
++def sqlite_table_names(path):
++    connection = sqlite3.connect(path)
++    try:
++        return connection.execute(
++            "select name from sqlite_master where type='table' order by name"
++        ).fetchall()
++    finally:
++        connection.close()
++
++
++def test_table_to_csv_writes_utf8_csv_without_index_or_header(tmp_path):
++
++
++
++
++    path = tmp_path / "out.csv"
++
++    result = make_table().to_csv(path)
++
++    assert result is None
++    assert path.read_bytes() == b'"A","B"\n"1","2"\n'
++    assert path.read_text(encoding="utf-8") == CSV_AB
++
++
++def test_table_to_json_writes_records_oriented_json(tmp_path):
++
++
++
++
++    path = tmp_path / "out.json"
++
++    result = make_table().to_json(path)
++
++    assert result is None
++    assert_records_json(path.read_text(encoding="utf-8"), RECORDS_AB)
++
++
++def test_table_to_json_mode_append_consumed_by_file_open(tmp_path):
++
++
++
++
++    path = tmp_path / "out.json"
++    path.write_text("prefix|", encoding="utf-8")
++
++    result = make_table().to_json(path, mode="a")
++
++    assert result is None
++    text = path.read_text(encoding="utf-8")
++    assert text.startswith("prefix|")
++    assert_records_json(text.removeprefix("prefix|"), RECORDS_AB)
++
++
++def test_table_to_excel_writes_named_sheet_without_index_or_headers(tmp_path):
++
++
++
++
++    path = tmp_path / "out.xlsx"
++
++    result = make_table().to_excel(path)
++
++    assert result is None
++    assert load_workbook(path).sheetnames == ["page-1-table-2"]
++
++    assert worksheet_matrix(path, "page-1-table-2") == [["A", "B"], ["1", "2"]]
++
++
++def test_table_to_excel_allows_index_and_header_kwargs_to_override_defaults(tmp_path):
++
++
++
++
++    path = tmp_path / "out.xlsx"
++
++    result = make_table().to_excel(path, index=True, header=True)
++
++    assert result is None
++
++    assert worksheet_matrix(path, "page-1-table-2") == [
++        [None, 0, 1],
++        [0, "A", "B"],
++        [1, "1", "2"],
++    ]
++
++
++def test_table_to_html_writes_pandas_html_and_appends_with_mode(tmp_path):
++
++
++
++
++    path = tmp_path / "out.html"
++    path.write_text("prefix|", encoding="utf-8")
++
++    result = make_table().to_html(path, mode="a")
++
++    assert result is None
++    text = path.read_text(encoding="utf-8")
++    assert text.startswith("prefix|")
++    assert_html_table_text(text.removeprefix("prefix|"), ["A", "B", "1", "2"])
++
++
++def test_table_to_markdown_writes_pandas_markdown_and_appends_with_mode(tmp_path):
++
++
++
++
++    path = tmp_path / "out.md"
++    path.write_text("prefix|", encoding="utf-8")
++
++    result = make_table().to_markdown(path, mode="a")
++
++    assert result is None
++    text = path.read_text(encoding="utf-8")
++    assert text.startswith("prefix|")
++    assert_markdown_table_text(text.removeprefix("prefix|"), ["A", "B", "1", "2"])
++
++
++def test_table_to_sqlite_replaces_named_table_without_index_column(tmp_path):
++
++
++
++
++    path = tmp_path / "out.sqlite"
++
++    result = make_table().to_sqlite(path)
++
++    assert result is None
++    assert sqlite_table_names(path) == [("page-1-table-2",)]
++    assert sqlite_rows(path, "page-1-table-2") == [("A", "B"), ("1", "2")]
++
++
++def test_tablelist_export_csv_writes_one_named_file_per_table(tmp_path):
++
++
++
++
++    result = make_table_list().export(str(tmp_path / "out.csv"), f="csv")
++
++    assert result is None
++    assert sorted(path.name for path in tmp_path.iterdir()) == [
++        "out-page-1-table-1.csv",
++        "out-page-2-table-1.csv",
++    ]
++    assert (tmp_path / "out-page-1-table-1.csv").read_text(encoding="utf-8") == CSV_AB
++    assert (tmp_path / "out-page-2-table-1.csv").read_text(encoding="utf-8") == CSV_CD
++
++
++def test_tablelist_export_json_writes_one_named_file_per_table(tmp_path):
++
++
++
++
++    result = make_table_list().export(str(tmp_path / "out.json"), f="json")
++
++    assert result is None
++    assert sorted(path.name for path in tmp_path.iterdir()) == [
++        "out-page-1-table-1.json",
++        "out-page-2-table-1.json",
++    ]
++    assert_records_json(
++        (tmp_path / "out-page-1-table-1.json").read_text(encoding="utf-8"),
++        RECORDS_AB,
++    )
++    assert_records_json(
++        (tmp_path / "out-page-2-table-1.json").read_text(encoding="utf-8"),
++        RECORDS_CD,
++    )
++
++
++def test_tablelist_export_html_writes_one_named_file_per_table(tmp_path):
++
++
++
++
++    result = make_table_list().export(str(tmp_path / "out.html"), f="html")
++
++    assert result is None
++    assert sorted(path.name for path in tmp_path.iterdir()) == [
++        "out-page-1-table-1.html",
++        "out-page-2-table-1.html",
++    ]
++    assert_html_table_text(
++        (tmp_path / "out-page-1-table-1.html").read_text(encoding="utf-8"),
++        ["A", "B", "1", "2"],
++    )
++    assert_html_table_text(
++        (tmp_path / "out-page-2-table-1.html").read_text(encoding="utf-8"),
++        ["C", "D", "3", "4"],
++    )
++
++
++def test_tablelist_export_markdown_writes_one_named_file_per_table(tmp_path):
++
++
++
++
++    result = make_table_list().export(str(tmp_path / "out.md"), f="markdown")
++
++    assert result is None
++    assert sorted(path.name for path in tmp_path.iterdir()) == [
++        "out-page-1-table-1.md",
++        "out-page-2-table-1.md",
++    ]
++    assert_markdown_table_text(
++        (tmp_path / "out-page-1-table-1.md").read_text(encoding="utf-8"),
++        ["A", "B", "1", "2"],
++    )
++    assert_markdown_table_text(
++        (tmp_path / "out-page-2-table-1.md").read_text(encoding="utf-8"),
++        ["C", "D", "3", "4"],
++    )
++
++
++def test_tablelist_export_excel_creates_single_workbook_at_exact_path(tmp_path):
++
++
++
++
++    path = tmp_path / "book.xlsx"
++
++    result = make_table_list().export(str(path), f="excel")
++
++    assert result is None
++    assert sorted(child.name for child in tmp_path.iterdir()) == ["book.xlsx"]
++    assert load_workbook(path).sheetnames == ["page-1-table-1", "page-2-table-1"]
++    assert_sheet_contains_values(path, "page-1-table-1", ["A", "B", "1", "2"])
++    assert_sheet_contains_values(path, "page-2-table-1", ["C", "D", "3", "4"])
++
++
++def test_tablelist_export_sqlite_creates_single_database_at_exact_path(tmp_path):
++
++
++
++
++    path = tmp_path / "db.sqlite"
++
++    result = make_table_list().export(str(path), f="sqlite")
++
++    assert result is None
++    assert sorted(child.name for child in tmp_path.iterdir()) == ["db.sqlite"]
++    assert sqlite_table_names(path) == [("page-1-table-1",), ("page-2-table-1",)]
++    assert sqlite_rows(path, "page-1-table-1") == [("A", "B"), ("1", "2")]
++    assert sqlite_rows(path, "page-2-table-1") == [("C", "D"), ("3", "4")]
++
++
++@pytest.mark.parametrize(
++    ("fmt", "extension", "expected_members"),
++    [
++        ("csv", ".csv", ["zipout-page-1-table-1.csv", "zipout-page-2-table-1.csv"]),
++        (
++            "html",
++            ".html",
++            ["zipout-page-1-table-1.html", "zipout-page-2-table-1.html"],
++        ),
++        (
++            "json",
++            ".json",
++            ["zipout-page-1-table-1.json", "zipout-page-2-table-1.json"],
++        ),
++        (
++            "markdown",
++            ".md",
++            ["zipout-page-1-table-1.md", "zipout-page-2-table-1.md"],
++        ),
++    ],
++)
++def test_tablelist_export_compresses_multi_file_formats_into_zip(
++    tmp_path, fmt, extension, expected_members
++):
++
++
++
++
++    result = make_table_list().export(str(tmp_path / f"zipout{extension}"), f=fmt, compress=True)
++
++    assert result is None
++    assert sorted(child.name for child in tmp_path.iterdir()) == ["zipout.zip"]
++    with zipfile.ZipFile(tmp_path / "zipout.zip") as archive:
++        assert sorted(archive.namelist()) == expected_members
++        assert_zip_member_content(archive, fmt, expected_members)
++
++
++@pytest.mark.parametrize(
++    ("fmt", "extension", "expected_member"),
++    [("excel", ".xlsx", "zipout.xlsx"), ("sqlite", ".sqlite", "zipout.sqlite")],
++)
++def test_tablelist_export_compresses_single_artifact_formats_into_zip(
++    tmp_path, fmt, extension, expected_member
++):
++
++
++
++
++    result = make_table_list().export(str(tmp_path / f"zipout{extension}"), f=fmt, compress=True)
++
++    assert result is None
++    assert sorted(child.name for child in tmp_path.iterdir()) == ["zipout.zip"]
++    with zipfile.ZipFile(tmp_path / "zipout.zip") as archive:
++        assert sorted(archive.namelist()) == [expected_member]
++        assert_zipped_single_artifact(tmp_path, archive, fmt, expected_member)
++
++
++def test_table_to_json_writes_to_requested_path(tmp_path):
++
++    path = tmp_path / "out.json"
++
++    result = make_table().to_json(path)
++
++    assert result is None
++    assert path.exists()
++    assert_records_json(path.read_text(encoding="utf-8"), RECORDS_AB)
++
++
++def test_referential_transparency_for_same_table_export_result(tmp_path):
++    first_path = tmp_path / "first.json"
++    second_path = tmp_path / "second.json"
++    table = make_table()
++
++    first = table.to_json(first_path)
++    second = table.to_json(second_path)
++
++    assert first == second == None
++    assert_records_json(first_path.read_text(encoding="utf-8"), RECORDS_AB)
++    assert_records_json(second_path.read_text(encoding="utf-8"), RECORDS_AB)
++
++
++def test_table_export_does_not_mutate_caller_table(tmp_path):
++    table = make_table()
++    before_df = table.df.copy(deep=True)
++    before_page = table.page
++    before_order = table.order
++
++    table.to_csv(tmp_path / "out.csv")
++
++    assert table.df.equals(before_df)
++
++    assert table.page == before_page
++    assert table.order == before_order
++
++
++def test_no_global_state_matches_fresh_process_for_same_input(tmp_path):
++    in_process_path = tmp_path / "in_process.json"
++    make_table().to_json(in_process_path)
++    in_process = in_process_path.read_text(encoding="utf-8")
++    child_path = tmp_path / "child.json"
++    script = f"""
++import sys
++from pathlib import Path
++sys.path.insert(0, {str(Path('/workspace/repo'))!r})
++import pandas as pd
++from camelot.core import Table
++t = Table(cols=[(0, 50), (50, 100)], rows=[(100, 50), (50, 0)])
++t.df = pd.DataFrame([["A", "B"], ["1", "2"]])
++t.shape = t.df.shape
++t.page = 1
++t.order = 2
++t.to_json(Path({str(child_path)!r}))
++sys.stdout.write(Path({str(child_path)!r}).read_text(encoding="utf-8"))
++"""
++
++    fresh_process = subprocess.run(
++        [sys.executable, "-c", script],
++        check=True,
++        text=True,
++        stdout=subprocess.PIPE,
++        stderr=subprocess.PIPE,
++    ).stdout
++
++    assert_records_json(in_process, RECORDS_AB)
++    assert_records_json(fresh_process, RECORDS_AB)
++
++
++def test_export_writes_only_declared_output_files_and_never_uses_network(
++    tmp_path, monkeypatch
++):
++    def fail_socket(*args, **kwargs):
++        raise AssertionError("network access is not declared by the export contract")
++
++    monkeypatch.setattr(socket, "socket", fail_socket)
++    previous_cwd = Path.cwd()
++    try:
++        os.chdir(tmp_path)
++        before = sorted(path.name for path in tmp_path.iterdir())
++        result = make_table_list().export("reports.csv", f="csv")
++        after = sorted(path.name for path in tmp_path.iterdir())
++    finally:
++        os.chdir(previous_cwd)
++
++    assert before == []
++    assert result is None
++    assert after == ["reports-page-1-table-1.csv", "reports-page-2-table-1.csv"]
++    assert (tmp_path / "reports-page-1-table-1.csv").read_text(encoding="utf-8") == CSV_AB
++    assert (tmp_path / "reports-page-2-table-1.csv").read_text(encoding="utf-8") == CSV_CD
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,23 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++
++
++set -euo pipefail
++cd /workspace/repo
++PYTHON=/workspace/repo/.venv/bin/python
++if [ ! -x "$PYTHON" ]; then
++  echo "Expected offline test venv missing at $PYTHON" >&2
++  exit 1
++fi
++export PYTHONPATH="/workspace/repo${PYTHONPATH:+:$PYTHONPATH}"
++export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
++exec "$PYTHON" -m pytest /workspace/repo/usercase-test-coderl/test_table_exports.py -v

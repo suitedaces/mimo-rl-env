@@ -1,0 +1,375 @@
+diff --git a/usercase-test-coderl/fixtures/broken.ipynb b/usercase-test-coderl/fixtures/broken.ipynb
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/fixtures/broken.ipynb
+@@ -0,0 +1,1 @@
++{"metadata": {}, "nbformat": 4, "cells": [
+diff --git a/usercase-test-coderl/fixtures/mixed_analysis.ipynb b/usercase-test-coderl/fixtures/mixed_analysis.ipynb
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/fixtures/mixed_analysis.ipynb
+@@ -0,0 +1,1 @@
++{"metadata":{"original":"metadata-is-not-saved-by-gt"},"nbformat":4,"nbformat_minor":5,"cells":[{"cell_type":"markdown","id":"md_intro","metadata":{"heading":true},"source":["# Analysis\n","Initial notes"]},{"cell_type":"code","id":"code_calc","execution_count":7,"metadata":{"collapsed":false,"custom":"kept"},"outputs":[{"output_type":"stream","name":"stdout","text":"3\n"}],"source":["x = 1 + 2\n","print(x)"]},{"cell_type":"markdown","id":"md_tail","metadata":{},"source":"Done."}]}
+diff --git a/usercase-test-coderl/fixtures/probe_notebook_io.py b/usercase-test-coderl/fixtures/probe_notebook_io.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/fixtures/probe_notebook_io.py
+@@ -0,0 +1,272 @@
++#!/usr/bin/env python3
++import argparse
++import asyncio
++import json
++import os
++from pathlib import Path
++from typing import Any
++
++from src.app import Erys
++from src.cell import Cell
++from src.notebook import Notebook
++
++
++REPO_ROOT = Path(__file__).resolve().parents[2]
++
++
++class ProbeErys(Erys):
++    CSS_PATH = str(REPO_ROOT / "src" / "styles.tcss")
++
++    def __init__(self, paths: list[Path]) -> None:
++        super().__init__(paths)
++        self.probe_notices: list[dict[str, Any]] = []
++
++    def notify(
++        self,
++        message: str,
++        *,
++        title: str = "",
++        severity: str = "information",
++        timeout: float | None = None,
++        markup: bool = True,
++    ) -> None:
++        self.probe_notices.append(
++            {
++                "markup": markup,
++                "message": str(message),
++                "severity": severity,
++                "timeout": timeout,
++                "title": str(title),
++            }
++        )
++        return super().notify(
++            message,
++            title=title,
++            severity=severity,
++            timeout=timeout,
++            markup=markup,
++        )
++
++
++class FixtureKernel:
++    initialized = False
++
++    def get_kernel_info(self) -> dict[str, str]:
++        return {"name": "fixture-kernel"}
++
++    def get_kernel_spec(self) -> dict[str, str]:
++        return {
++            "display_name": "Fixture Python",
++            "language": "python",
++            "name": "fixture-python",
++        }
++
++    def get_language_info(self) -> dict[str, Any]:
++        return {
++            "file_extension": ".py",
++            "mimetype": "text/x-python",
++            "name": "python",
++            "pygments_lexer": "ipython3",
++            "version": "3.12-fixture",
++        }
++
++
++def canonical(value: Any) -> str:
++    return json.dumps(value, sort_keys=True, separators=(",", ":"))
++
++
++def cell_summary(cell: Cell) -> dict[str, Any]:
++    return {
++        "class": type(cell).__name__,
++        "editable": bool(getattr(cell, "input_text", None))
++        and not bool(getattr(cell.input_text, "read_only", False)),
++        "exec_count": getattr(cell, "exec_count", None),
++        "id": getattr(cell, "_cell_id", None),
++        "next": getattr(cell.next, "_cell_id", None),
++        "outputs": getattr(cell, "outputs", None),
++        "prev": getattr(cell.prev, "_cell_id", None),
++        "source": cell.input_text.text,
++        "type": cell.cell_type,
++    }
++
++
++async def settle(pilot) -> None:
++    await pilot.pause(0.5)
++    await pilot.pause(0.5)
++
++
++def disable_kernel_startup() -> None:
++    os.environ.pop("VIRTUAL_ENV", None)
++    os.environ.pop("CONDA_PREFIX", None)
++
++
++def assert_required_saved_notebook(saved_json: dict[str, Any]) -> None:
++
++    required_top_level = {"metadata", "nbformat", "nbformat_minor", "cells"}
++    missing = required_top_level - set(saved_json)
++    assert not missing, f"saved notebook missing top-level fields: {sorted(missing)}"
++    assert isinstance(saved_json["metadata"], dict), "saved metadata must be an object"
++    assert isinstance(saved_json["cells"], list), "saved cells must be an array"
++
++
++    for key in ["kernel_info", "kernel_spec", "language_info"]:
++        assert key in saved_json["metadata"], f"saved metadata missing {key}"
++        assert isinstance(saved_json["metadata"][key], dict), f"{key} must be an object"
++
++
++def assert_saved_cells_match_editor(
++    saved_json: dict[str, Any], cells: list[Cell]
++) -> None:
++
++    assert len(saved_json["cells"]) == len(cells), "saved cell count must match editor"
++    for idx, (saved_cell, editor_cell) in enumerate(zip(saved_json["cells"], cells)):
++        assert saved_cell.get("cell_type") == editor_cell.cell_type, (
++            f"saved cell {idx} type does not match editor"
++        )
++        assert saved_cell.get("source") == editor_cell.input_text.text, (
++            f"saved cell {idx} source does not match editor"
++        )
++
++
++def assert_loaded_cells(cells: list[Cell], expected: list[dict[str, str]]) -> None:
++
++    assert len(cells) == len(expected), "loaded notebook cell count mismatch"
++    for idx, (cell, want) in enumerate(zip(cells, expected)):
++        assert cell.cell_type == want["cell_type"], f"loaded cell {idx} type mismatch"
++        assert cell.input_text.text == want["source"], f"loaded cell {idx} source mismatch"
++        assert not getattr(cell.input_text, "read_only", False), (
++            f"loaded cell {idx} is not editable"
++        )
++
++
++async def valid_open_save(args: argparse.Namespace) -> None:
++    disable_kernel_startup()
++    app = ProbeErys([args.notebook])
++    async with app.run_test(headless=True, size=(100, 40), notifications=True) as pilot:
++        await settle(pilot)
++        notebook = app.switcher.query_one("#tab0", Notebook)
++        cells = [
++            child for child in notebook.cell_container.children if isinstance(child, Cell)
++        ]
++        notebook.notebook_kernel = FixtureKernel()
++        notebook.save_notebook(args.output)
++
++        saved_text = args.output.read_text(encoding="utf-8")
++        saved_json = json.loads(saved_text)
++
++        assert_loaded_cells(
++            cells,
++            [
++                {"cell_type": "markdown", "source": "# Analysis\nInitial notes"},
++                {"cell_type": "code", "source": "x = 1 + 2\nprint(x)"},
++                {"cell_type": "markdown", "source": "Done."},
++            ],
++        )
++
++        assert notebook.last_focused is cells[0], "first loaded cell must have focus"
++        assert_required_saved_notebook(saved_json)
++        assert_saved_cells_match_editor(saved_json, cells)
++        assert Path(args.output).is_file(), "save path was not written"
++        print(
++            canonical(
++                {
++                    "cells": [cell_summary(cell) for cell in cells],
++                    "result": "ok",
++                }
++            )
++        )
++
++
++async def empty_open_save(args: argparse.Namespace) -> None:
++    disable_kernel_startup()
++    app = ProbeErys([args.notebook])
++    async with app.run_test(headless=True, size=(100, 40), notifications=True) as pilot:
++        await settle(pilot)
++        notebook = app.switcher.query_one("#tab0", Notebook)
++        cells = [
++            child for child in notebook.cell_container.children if isinstance(child, Cell)
++        ]
++        notebook.notebook_kernel = FixtureKernel()
++        notebook.save_notebook(args.output)
++        saved_json = json.loads(args.output.read_text(encoding="utf-8"))
++
++
++        assert cells == [], "empty notebook file should open with no cells"
++        assert notebook.last_focused is None, "empty notebook should not focus a loaded cell"
++        assert_required_saved_notebook(saved_json)
++        assert saved_json["cells"] == [], "empty notebook should save zero cells"
++        print(
++            canonical(
++                {
++                    "cells": [cell_summary(cell) for cell in cells],
++                    "result": "ok",
++                }
++            )
++        )
++
++
++async def invalid_json(args: argparse.Namespace) -> None:
++    disable_kernel_startup()
++    app = ProbeErys([args.notebook])
++    async with app.run_test(headless=True, size=(100, 40), notifications=True) as pilot:
++        await settle(pilot)
++        try:
++            notebook = app.switcher.query_one("#tab0", Notebook)
++        except Exception:
++            notebook = None
++        invalid_notices = [
++            notice
++            for notice in app.probe_notices
++            if "not a valid notebook. Failed to decode JSON." in notice["message"]
++        ]
++
++        expected_message = (
++            f"{args.notebook} is not a valid notebook. Failed to decode JSON."
++        )
++        assert any(
++            notice["message"] == expected_message and notice["severity"] == "error"
++            for notice in invalid_notices
++        ), "invalid JSON should notify with the mandated error"
++        assert notebook is None, "broken notebook tab should be closed"
++        assert str(args.notebook) not in app.path_to_tab_id, (
++            "broken notebook path should not remain registered"
++        )
++        assert str(args.notebook) not in [str(tab.label) for tab in app.tabs.query("Tab")], (
++            "broken notebook tab label should not remain open"
++        )
++        print(
++            canonical(
++                {
++                    "invalid_notices": invalid_notices,
++                    "result": "ok",
++                }
++            )
++        )
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser()
++    subparsers = parser.add_subparsers(dest="command", required=True)
++
++    valid = subparsers.add_parser("valid-open-save")
++    valid.add_argument("notebook", type=Path)
++    valid.add_argument("output", type=Path)
++
++    empty = subparsers.add_parser("empty-open-save")
++    empty.add_argument("notebook", type=Path)
++    empty.add_argument("output", type=Path)
++
++    invalid = subparsers.add_parser("invalid-json")
++    invalid.add_argument("notebook", type=Path)
++
++    args = parser.parse_args()
++    if args.command == "valid-open-save":
++        asyncio.run(valid_open_save(args))
++    elif args.command == "empty-open-save":
++        asyncio.run(empty_open_save(args))
++    elif args.command == "invalid-json":
++        asyncio.run(invalid_json(args))
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/usercase-test-coderl/usecase.sh b/usercase-test-coderl/usecase.sh
+new file mode 100755
+--- /dev/null
++++ b/usercase-test-coderl/usecase.sh
+@@ -0,0 +1,64 @@
++#!/usr/bin/env bash
++
++set -u
++export LANG=C.UTF-8 LC_ALL=C.UTF-8 TZ=UTC
++export PIP_NO_INDEX=1 PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_ROOT_USER_ACTION=ignore
++export PYTHONNOUSERSITE=1
++
++
++
++PY=/opt/coderl-erys-venv/bin/python
++BIN=/opt/coderl-erys-venv/bin/erys
++
++[ -x "$PY" ] || { echo "FAIL: offline python not installed" >&2; exit 1; }
++[ -x "$BIN" ] || { echo "FAIL: erys entry point not installed" >&2; exit 1; }
++
++TMP=$(mktemp -d)
++trap 'rm -rf "$TMP"' EXIT
++cd "$TMP" || exit 1
++
++fail() { echo "FAIL: $*" >&2; exit 1; }
++PROBE=/workspace/repo/usercase-test-coderl/fixtures/probe_notebook_io.py
++
++
++
++
++"$BIN" --help >out 2>err; ec=$?
++[ "$ec" -eq 0 ] || fail "F0 exit $ec; want 0"
++
++[ -s out ] || fail "F0 help produced no stdout"
++grep -qi "notebook" out || fail "F0 help missing notebook keyword"
++[ ! -s err ] || fail "F0 unexpected stderr: $(cat err)"
++
++
++
++
++cp /workspace/repo/usercase-test-coderl/fixtures/mixed_analysis.ipynb analysis.ipynb
++"$PY" "$PROBE" valid-open-save analysis.ipynb saved-analysis.ipynb >out 2>err; ec=$?
++[ "$ec" -eq 0 ] || fail "F1 exit $ec; stderr: $(cat err)"
++
++grep -q '"result":"ok"' out || fail "F1 probe did not report ok: $(cat out)"
++[ ! -s err ] || fail "F1 unexpected stderr: $(cat err)"
++
++
++
++
++: > empty.ipynb
++"$PY" "$PROBE" empty-open-save empty.ipynb saved-empty.ipynb >out 2>err; ec=$?
++[ "$ec" -eq 0 ] || fail "F2 exit $ec; stderr: $(cat err)"
++
++grep -q '"result":"ok"' out || fail "F2 probe did not report ok: $(cat out)"
++[ ! -s err ] || fail "F2 unexpected stderr: $(cat err)"
++
++
++
++
++cp /workspace/repo/usercase-test-coderl/fixtures/broken.ipynb broken.ipynb
++"$PY" "$PROBE" invalid-json broken.ipynb >out 2>err; ec=$?
++[ "$ec" -eq 0 ] || fail "F3 exit $ec; stderr: $(cat err)"
++
++grep -q '"result":"ok"' out || fail "F3 probe did not report ok: $(cat out)"
++[ ! -s err ] || fail "F3 unexpected stderr: $(cat err)"
++
++echo "PASS"
++exit 0
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,12 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++exec bash /workspace/repo/usercase-test-coderl/usecase.sh

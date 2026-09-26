@@ -1,0 +1,370 @@
+diff --git a/usercase-test-coderl/html_to_pdf_test.go b/usercase-test-coderl/html_to_pdf_test.go
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/html_to_pdf_test.go
+@@ -0,0 +1,338 @@
++package usercase_test_coderl
++
++import (
++	"bytes"
++	"fmt"
++	"io"
++	"log"
++	"math"
++	"os"
++	"path/filepath"
++	"reflect"
++	"strings"
++	"testing"
++
++	goweasyprint "github.com/benoitkugler/go-weasyprint"
++	pdfreader "github.com/benoitkugler/pdf/reader"
++	"github.com/benoitkugler/webrender/backend"
++	"github.com/benoitkugler/webrender/html/tree"
++	"github.com/benoitkugler/webrender/logger"
++	"github.com/benoitkugler/webrender/text"
++	"github.com/benoitkugler/webrender/utils"
++	"github.com/go-text/typesetting/fontscan"
++)
++
++type pdfSummary struct {
++	ByteLen         int
++	Header          string
++	PageCount       int
++	FirstMediaBox   string
++	AttachmentNames []string
++	FirstContent    []byte
++	FirstContentLen int
++}
++
++func init() {
++	logger.ProgressLogger.SetOutput(io.Discard)
++	logger.WarningLogger.SetOutput(io.Discard)
++}
++
++func newFontConfig(t *testing.T) text.FontConfiguration {
++	t.Helper()
++	fm := fontscan.NewFontMap(log.New(io.Discard, "", 0))
++	if err := fm.UseSystemFonts(t.TempDir()); err != nil {
++		t.Fatalf("loading system fonts: %v", err)
++	}
++	return text.NewFontConfigurationGotext(fm)
++}
++
++func convertWithSimpleAPI(t *testing.T, input goweasyprint.ContentInput) []byte {
++	t.Helper()
++	var buf bytes.Buffer
++	if err := goweasyprint.HtmlToPdf(&buf, input, newFontConfig(t)); err != nil {
++		t.Fatalf("HtmlToPdf returned error: %v", err)
++	}
++	return buf.Bytes()
++}
++
++func summarizePDF(t *testing.T, data []byte) pdfSummary {
++	t.Helper()
++	if len(data) < 8 {
++		t.Fatalf("PDF output too short: %d bytes", len(data))
++	}
++	doc, _, err := pdfreader.ParsePDFReader(bytes.NewReader(data), pdfreader.Options{})
++	if err != nil {
++		t.Fatalf("output is not parseable as PDF: %v", err)
++	}
++	pages := doc.Catalog.Pages.FlattenInherit()
++	firstMediaBox := "<nil>"
++	var firstContent []byte
++	firstContentLen := 0
++	if len(pages) != 0 {
++		if pages[0].MediaBox != nil {
++			firstMediaBox = pages[0].MediaBox.String()
++		}
++		content, err := pages[0].DecodeAllContents()
++		if err != nil {
++			t.Fatalf("decoding first page contents: %v", err)
++		}
++		firstContent = append([]byte(nil), content...)
++		firstContentLen = len(content)
++	}
++	attachments := make([]string, len(doc.Catalog.Names.EmbeddedFiles))
++	for i, file := range doc.Catalog.Names.EmbeddedFiles {
++		attachments[i] = file.Name
++	}
++	return pdfSummary{
++		ByteLen:         len(data),
++		Header:          string(data[:8]),
++		PageCount:       len(pages),
++		FirstMediaBox:   firstMediaBox,
++		AttachmentNames: attachments,
++		FirstContent:    firstContent,
++		FirstContentLen: firstContentLen,
++	}
++}
++
++func assertReadablePDF(t *testing.T, data []byte) pdfSummary {
++	t.Helper()
++	actual := summarizePDF(t, data)
++
++	if actual.ByteLen == 0 {
++		t.Fatal("PDF output is empty")
++	}
++	if !strings.HasPrefix(actual.Header, "%PDF-") {
++		t.Fatalf("PDF header = %q, expected PDF signature", actual.Header)
++	}
++	if actual.PageCount == 0 {
++		t.Fatal("PDF has no pages")
++	}
++	if actual.FirstContentLen == 0 {
++		t.Fatal("first PDF page has no decoded content")
++	}
++	return actual
++}
++
++func assertMediaBoxApprox(t *testing.T, actual string, wantWidth, wantHeight float64) {
++	t.Helper()
++	var x0, y0, width, height float64
++	if _, err := fmt.Sscanf(actual, "[%f %f %f %f]", &x0, &y0, &width, &height); err != nil {
++		t.Fatalf("parsing media box %q: %v", actual, err)
++	}
++	const tolerance = 0.01
++	if math.Abs(width-wantWidth) > tolerance || math.Abs(height-wantHeight) > tolerance {
++		t.Fatalf("media box = %q, expected approximately %.2fx%.2f", actual, wantWidth, wantHeight)
++	}
++}
++
++
++
++func TestHtmlToPdfInputStringWritesReadablePDF(t *testing.T) {
++	data := convertWithSimpleAPI(t, goweasyprint.InputString("<html><body><h1>Hello</h1></body></html>"))
++	assertReadablePDF(t, data)
++}
++
++
++
++func TestHtmlToPdfInputReaderWritesReadablePDF(t *testing.T) {
++	input := goweasyprint.InputReader{ReadCloser: io.NopCloser(strings.NewReader("<p>Reader input</p>"))}
++	data := convertWithSimpleAPI(t, input)
++	assertReadablePDF(t, data)
++}
++
++
++
++func TestHtmlToPdfInputFilenameWritesReadablePDF(t *testing.T) {
++	dir := t.TempDir()
++	htmlPath := filepath.Join(dir, "sample.html")
++	if err := os.WriteFile(htmlPath, []byte(`<style>@page{size:90px 70px;margin:0}</style><p>File input</p>`), 0o600); err != nil {
++		t.Fatalf("writing fixture HTML: %v", err)
++	}
++	data := convertWithSimpleAPI(t, goweasyprint.InputFilename(htmlPath))
++	actual := assertReadablePDF(t, data)
++
++	assertMediaBoxApprox(t, actual.FirstMediaBox, 67.5, 52.5)
++}
++
++
++
++func TestHtmlToPdfInputUrlDataURLWritesReadablePDF(t *testing.T) {
++	input := goweasyprint.InputUrl("data:text/html,%3Cstyle%3E%40page%7Bsize%3A100px%2080px%3Bmargin%3A0%7D%3C%2Fstyle%3E%3Cp%3EData%20URL%3C%2Fp%3E")
++	data := convertWithSimpleAPI(t, input)
++	actual := assertReadablePDF(t, data)
++
++	assertMediaBoxApprox(t, actual.FirstMediaBox, 75, 60)
++}
++
++
++
++func TestHtmlToPdfOptionsDefaultArgumentsMatchSimpleConversion(t *testing.T) {
++	var buf bytes.Buffer
++	if err := goweasyprint.HtmlToPdfOptions(&buf, goweasyprint.InputString("<html><body><h1>Hello</h1></body></html>"), "", nil, "", nil, false, newFontConfig(t), 1, nil); err != nil {
++		t.Fatalf("HtmlToPdfOptions returned error: %v", err)
++	}
++	optionsSummary := assertReadablePDF(t, buf.Bytes())
++	simpleSummary := assertReadablePDF(t, convertWithSimpleAPI(t, goweasyprint.InputString("<html><body><h1>Hello</h1></body></html>")))
++
++	if optionsSummary.PageCount != simpleSummary.PageCount || optionsSummary.FirstMediaBox != simpleSummary.FirstMediaBox || len(optionsSummary.AttachmentNames) != len(simpleSummary.AttachmentNames) {
++		t.Fatalf("default HtmlToPdfOptions summary = %#v, simple HtmlToPdf summary = %#v", optionsSummary, simpleSummary)
++	}
++}
++
++
++
++func TestHtmlToPdfOptionsUsesBaseURLFetcherAndMediaType(t *testing.T) {
++	var calls []string
++	fetcher := func(url string) (utils.RemoteRessource, error) {
++		calls = append(calls, url)
++		return utils.RemoteRessource{
++			Content:       bytes.NewReader([]byte(`@media screen { @page{size:70px 50px;margin:0} } @media print { @page{size:140px 100px;margin:0} }`)),
++			MimeType:      "text/css",
++			RedirectedUrl: url,
++		}, nil
++	}
++
++	var buf bytes.Buffer
++	err := goweasyprint.HtmlToPdfOptions(&buf, goweasyprint.InputString(`<link rel="stylesheet" href="theme.css"><p>Linked stylesheet</p>`), "https://assets.test/root/doc.html", fetcher, "screen", nil, false, newFontConfig(t), 1, nil)
++	if err != nil {
++		t.Fatalf("HtmlToPdfOptions returned error: %v", err)
++	}
++	if !reflect.DeepEqual(calls, []string{"https://assets.test/root/theme.css"}) {
++		t.Fatalf("fetcher calls = %#v, expected %#v", calls, []string{"https://assets.test/root/theme.css"})
++	}
++	actual := assertReadablePDF(t, buf.Bytes())
++
++	assertMediaBoxApprox(t, actual.FirstMediaBox, 52.5, 37.5)
++}
++
++
++
++func TestHtmlToPdfOptionsAppliesStylesheetZoomAndAttachments(t *testing.T) {
++	css, err := tree.NewCSSDefault(utils.InputString(`@page{size:130px 65px;margin:0}`))
++	if err != nil {
++		t.Fatalf("parsing fixture stylesheet: %v", err)
++	}
++	attachments := []backend.Attachment{{
++		Title:       "notes.txt",
++		Description: "Design notes",
++		Content:     []byte("attachment body"),
++	}}
++
++	var buf bytes.Buffer
++	err = goweasyprint.HtmlToPdfOptions(&buf, goweasyprint.InputString(`<p>Styled and attached</p>`), "https://example.test/base/", nil, "print", []tree.CSS{css}, true, newFontConfig(t), 2, attachments)
++	if err != nil {
++		t.Fatalf("HtmlToPdfOptions returned error: %v", err)
++	}
++	actual := assertReadablePDF(t, buf.Bytes())
++
++	assertMediaBoxApprox(t, actual.FirstMediaBox, 195, 97.5)
++	if len(actual.AttachmentNames) != 1 {
++		t.Fatalf("attachment count = %d, expected 1", len(actual.AttachmentNames))
++	}
++}
++
++
++
++func TestHtmlToPdfOptionsAppliesPresentationalHints(t *testing.T) {
++	var buf bytes.Buffer
++	err := goweasyprint.HtmlToPdfOptions(&buf, goweasyprint.InputString(`<body bgcolor="#00ff00"><p>Hinted body</p>`), "", nil, "", nil, true, newFontConfig(t), 1, nil)
++	if err != nil {
++		t.Fatalf("HtmlToPdfOptions returned error: %v", err)
++	}
++	withHints := assertReadablePDF(t, buf.Bytes())
++
++	var withoutHints bytes.Buffer
++	err = goweasyprint.HtmlToPdfOptions(&withoutHints, goweasyprint.InputString(`<body bgcolor="#00ff00"><p>Hinted body</p>`), "", nil, "", nil, false, newFontConfig(t), 1, nil)
++	if err != nil {
++		t.Fatalf("HtmlToPdfOptions without hints returned error: %v", err)
++	}
++	withoutHintsSummary := assertReadablePDF(t, withoutHints.Bytes())
++
++	if bytes.Equal(withHints.FirstContent, withoutHintsSummary.FirstContent) {
++		t.Fatalf("presentational hints had no observable effect: with=%#v without=%#v", withHints, withoutHintsSummary)
++	}
++}
++
++
++
++func TestHtmlToPdfOptionsReturnsResourceResolutionError(t *testing.T) {
++	var buf bytes.Buffer
++	err := goweasyprint.HtmlToPdfOptions(&buf, goweasyprint.InputUrl("https://example.test/missing.html"), "", func(string) (utils.RemoteRessource, error) {
++		return utils.RemoteRessource{}, os.ErrNotExist
++	}, "", nil, false, newFontConfig(t), 1, nil)
++	if err == nil {
++		t.Fatal("expected an error, got nil")
++	}
++
++	if got := err.Error(); !strings.Contains(got, os.ErrNotExist.Error()) {
++		t.Fatalf("error message = %q, expected it to surface %q", got, os.ErrNotExist.Error())
++	}
++	if buf.Len() != 0 {
++		t.Fatalf("writer length after failed conversion = %d, expected 0", buf.Len())
++	}
++}
++
++func TestReferentialTransparencySameInputSameOutput(t *testing.T) {
++	input := goweasyprint.InputString(`<style>@page{size:120px 80px;margin:0}</style><p>Stable</p>`)
++	first := summarizePDF(t, convertWithSimpleAPI(t, input))
++	second := summarizePDF(t, convertWithSimpleAPI(t, input))
++
++	if first.PageCount == 0 || second.PageCount == 0 || first.FirstMediaBox != second.FirstMediaBox {
++		t.Fatalf("summaries = %#v and %#v, expected repeated conversions with matching rendered shape", first, second)
++	}
++	assertMediaBoxApprox(t, first.FirstMediaBox, 90, 60)
++}
++
++func TestDoesNotMutateCallerAttachments(t *testing.T) {
++	attachments := []backend.Attachment{{
++		Title:       "notes.txt",
++		Description: "Design notes",
++		Content:     []byte("attachment body"),
++	}}
++	var buf bytes.Buffer
++	err := goweasyprint.HtmlToPdfOptions(&buf, goweasyprint.InputString(`<style>@page{size:80px 40px;margin:0}</style><p>Mutation check</p>`), "", nil, "", nil, false, newFontConfig(t), 1, attachments)
++	if err != nil {
++		t.Fatalf("HtmlToPdfOptions returned error: %v", err)
++	}
++	actual := assertReadablePDF(t, buf.Bytes())
++
++	if len(actual.AttachmentNames) != 1 {
++		t.Fatalf("attachment count = %d, expected 1", len(actual.AttachmentNames))
++	}
++}
++
++func TestNoGlobalStateAfterDifferentConversions(t *testing.T) {
++	targetInput := goweasyprint.InputString(`<style>@page{size:120px 80px;margin:0}</style><p>Stable</p>`)
++	first := assertReadablePDF(t, convertWithSimpleAPI(t, targetInput))
++	noiseA := assertReadablePDF(t, convertWithSimpleAPI(t, goweasyprint.InputString(`<style>@page{size:90px 70px;margin:0}</style><p>Noise A</p>`)))
++	noiseB := assertReadablePDF(t, convertWithSimpleAPI(t, goweasyprint.InputString(`<style>@page{size:140px 90px;margin:0}</style><p>Noise B</p>`)))
++	second := assertReadablePDF(t, convertWithSimpleAPI(t, targetInput))
++
++	assertMediaBoxApprox(t, first.FirstMediaBox, 90, 60)
++	assertMediaBoxApprox(t, noiseA.FirstMediaBox, 67.5, 52.5)
++	assertMediaBoxApprox(t, noiseB.FirstMediaBox, 105, 67.5)
++	assertMediaBoxApprox(t, second.FirstMediaBox, 90, 60)
++}
++
++func TestNoUndeclaredCwdWritesForStringConversion(t *testing.T) {
++	fc := newFontConfig(t)
++	originalWD, err := os.Getwd()
++	if err != nil {
++		t.Fatalf("reading working directory: %v", err)
++	}
++	tmp := t.TempDir()
++	if err := os.Chdir(tmp); err != nil {
++		t.Fatalf("changing working directory: %v", err)
++	}
++	defer func() {
++		if err := os.Chdir(originalWD); err != nil {
++			t.Fatalf("restoring working directory: %v", err)
++		}
++	}()
++	var buf bytes.Buffer
++	if err := goweasyprint.HtmlToPdf(&buf, goweasyprint.InputString(`<p>No cwd writes</p>`), fc); err != nil {
++		t.Fatalf("HtmlToPdf returned error: %v", err)
++	}
++
++	assertReadablePDF(t, buf.Bytes())
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,22 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++
++
++set -euo pipefail
++cd /workspace/repo
++export GOPATH=/root/go
++export GOMODCACHE=/root/go/pkg/mod
++export GOPROXY=off
++export GOSUMDB=off
++export GOTOOLCHAIN=local
++GO_BIN=/root/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.1.linux-amd64/bin/go
++exec "$GO_BIN" test -mod=readonly -v ./usercase-test-coderl -count=1

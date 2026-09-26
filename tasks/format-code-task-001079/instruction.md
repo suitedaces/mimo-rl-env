@@ -1,0 +1,11 @@
+## Make automatic query-engine selection resilient to engine failures
+
+Ape chooses a query engine from plugin estimates, but an engine can become unavailable after estimating successfully, and some engines only surface a failure when their result iterator is consumed. At present, either case can abort the query even though another registered engine could answer it. Make `QueryManager.query()` provide deterministic failover while preserving strict explicit engine selection.
+
+When no `engine_to_use` is supplied, obtain estimates from the registered engines. An estimate of `None`, or a `QueryEngineError` raised while estimating, means that engine is unavailable for this query. Rank the remaining candidates by ascending numeric estimate; equal estimates retain registration order. Try candidates in that order until one produces a complete result. A `QueryEngineError` raised by `perform_query()` or later while consuming its iterator is a recoverable engine failure and advances to the next candidate. A failed iterator is not a partial success: none of its values may be exposed or cached, so callers receive only the complete winning result. Once a candidate completes, do not execute slower candidates.
+
+After a successful automatic query, preserve cache fan-out: every registered engine other than the winner gets the complete winning result through `update_cache()`, including engines that failed as candidates or did not provide an estimate. A cache engine's `QueryEngineError` must not change the successful result. Cache updates must never receive values from a failed attempt.
+
+Explicit selection remains an opt-out from arbitration. A named engine must be used even if its estimate is `None`; do not try an alternate if that engine raises `QueryEngineError`, whether eagerly or during result iteration. Existing unknown-engine behavior remains unchanged.
+
+`QueryEngineError` is the only recoverable engine signal in automatic mode. Other exception types from estimation, invocation, or iteration must propagate immediately without trying another engine. If every estimated candidate fails with `QueryEngineError`, raise one `QueryEngineError` whose text identifies every attempted engine and includes each underlying error message. If no engine supplies a usable estimate at all, retain the existing `No query engines are available.` error behavior.

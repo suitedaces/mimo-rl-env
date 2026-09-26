@@ -1,0 +1,228 @@
+diff --git a/usercase-test-coderl/test_apply_delta.py b/usercase-test-coderl/test_apply_delta.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/test_apply_delta.py
+@@ -0,0 +1,200 @@
++
++
++
++
++
++
++
++
++
++
++from __future__ import annotations
++
++import ast
++import builtins
++import copy
++import os
++import socket
++import subprocess
++import sys
++from pathlib import Path
++
++import pytest
++
++from dulwich.errors import ApplyDeltaError
++from dulwich.pack import apply_delta
++
++
++def _snapshot_tree(root: Path) -> dict[str, bytes | None]:
++    snapshot: dict[str, bytes | None] = {}
++    for path in sorted(root.rglob("*")):
++        rel = path.relative_to(root).as_posix()
++        snapshot[rel] = path.read_bytes() if path.is_file() else None
++    return snapshot
++
++
++def test_insert_only_delta_from_empty_source_returns_inserted_chunk() -> None:
++
++
++
++    actual = apply_delta(b"", b"\x00\x03\x03abc")
++
++    assert actual == [b"abc"]
++
++
++def test_copy_then_insert_delta_materializes_query_example() -> None:
++
++
++
++    actual = apply_delta(b"hello world", b"\x0b\x0c\x90\x06\x06there!")
++
++    assert actual == [b"hello ", b"there!"]
++    assert b"".join(actual) == b"hello there!"
++
++
++def test_chunk_list_inputs_are_concatenated_without_changing_result() -> None:
++
++
++
++    src_chunks = [b"012", b"3456789", b"abcdef"]
++    delta_chunks = [b"\x10\x08\x91", b"\x04\x05", b"\x03XYZ"]
++
++    actual = apply_delta(src_chunks, delta_chunks)
++
++
++    assert isinstance(actual, list)
++    assert all(isinstance(chunk, bytes) for chunk in actual)
++    assert b"".join(actual) == b"45678XYZ"
++
++
++def test_nonzero_copy_offsets_can_materialize_multiple_source_slices() -> None:
++
++
++
++    actual = apply_delta(
++        b"abcdefghijklmnop",
++        b"\x10\x07\x91\x02\x03\x91\x0c\x04",
++    )
++
++
++    assert isinstance(actual, list)
++    assert all(isinstance(chunk, bytes) for chunk in actual)
++    assert b"".join(actual) == b"cdemnop"
++
++
++def test_truncated_size_header_raises_apply_delta_error() -> None:
++
++
++
++    with pytest.raises(ApplyDeltaError):
++        apply_delta(b"", b"\x80")
++
++
++def test_declared_source_size_mismatch_raises_apply_delta_error() -> None:
++
++
++
++    with pytest.raises(ApplyDeltaError):
++        apply_delta(b"abc", b"\x04\x00")
++
++
++def test_opcode_zero_raises_apply_delta_error() -> None:
++
++
++
++    with pytest.raises(ApplyDeltaError):
++        apply_delta(b"", b"\x00\x00\x00")
++
++
++def test_truncated_insert_cannot_reach_declared_dest_size() -> None:
++
++
++
++    with pytest.raises(ApplyDeltaError):
++        apply_delta(b"", b"\x00\x03\x05ab")
++
++
++def test_copy_past_source_cannot_reach_declared_dest_size() -> None:
++
++
++
++    with pytest.raises(ApplyDeltaError):
++        apply_delta(b"abc", b"\x03\x05\x90\x04")
++
++
++def test_referential_transparency_for_same_inputs() -> None:
++    first = apply_delta(b"hello world", b"\x0b\x0c\x90\x06\x06there!")
++    second = apply_delta(b"hello world", b"\x0b\x0c\x90\x06\x06there!")
++
++    assert first == [b"hello ", b"there!"]
++    assert second == [b"hello ", b"there!"]
++    assert first == second
++
++
++def test_chunk_list_inputs_are_not_mutated() -> None:
++    src_chunks = [b"012", b"3456789", b"abcdef"]
++    delta_chunks = [b"\x10\x08\x91", b"\x04\x05", b"\x03XYZ"]
++    src_before = copy.deepcopy(src_chunks)
++    delta_before = copy.deepcopy(delta_chunks)
++
++    actual = apply_delta(src_chunks, delta_chunks)
++
++
++    assert isinstance(actual, list)
++    assert all(isinstance(chunk, bytes) for chunk in actual)
++    assert b"".join(actual) == b"45678XYZ"
++    assert src_chunks == src_before
++    assert delta_chunks == delta_before
++
++
++def test_no_hidden_global_state_across_fresh_process() -> None:
++    in_process = apply_delta(b"hello world", b"\x0b\x0c\x90\x06\x06there!")
++    script = (
++        "import sys; "
++        "sys.path.insert(0, '/workspace/repo'); "
++        "from dulwich.pack import apply_delta; "
++        "sys.stdout.write(repr(apply_delta("
++        "b'hello world', b'\\x0b\\x0c\\x90\\x06\\x06there!')))"
++    )
++
++    completed = subprocess.run(
++        [sys.executable, "-c", script],
++        check=True,
++        capture_output=True,
++        text=True,
++    )
++    fresh_process = ast.literal_eval(completed.stdout)
++
++    assert in_process == [b"hello ", b"there!"]
++    assert fresh_process == [b"hello ", b"there!"]
++    assert fresh_process == in_process
++
++
++def test_no_filesystem_writes_or_network_access(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    def fail_socket(*args: object, **kwargs: object) -> None:
++        raise AssertionError("apply_delta attempted network access")
++
++    real_open = builtins.open
++
++    def guarded_open(file: object, mode: str = "r", *args: object, **kwargs: object):
++        if any(flag in mode for flag in ("w", "a", "x", "+")):
++            raise AssertionError(f"apply_delta attempted file write: {file!r}")
++        return real_open(file, mode, *args, **kwargs)
++
++    monkeypatch.setattr(socket, "socket", fail_socket)
++    monkeypatch.setattr(socket, "create_connection", fail_socket)
++    monkeypatch.setattr(builtins, "open", guarded_open)
++
++    original_cwd = Path.cwd()
++    before = _snapshot_tree(tmp_path)
++    try:
++        os.chdir(tmp_path)
++        actual = apply_delta(b"hello world", b"\x0b\x0c\x90\x06\x06there!")
++        after = _snapshot_tree(tmp_path)
++    finally:
++        os.chdir(original_cwd)
++
++    assert actual == [b"hello ", b"there!"]
++    assert after == before
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,18 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++
++
++set -euo pipefail
++cd /workspace/repo
++export PYTHONPATH="/workspace/repo${PYTHONPATH:+:$PYTHONPATH}"
++export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
++exec python3 -m pytest /workspace/repo/usercase-test-coderl/test_apply_delta.py -v --import-mode=prepend

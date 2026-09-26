@@ -1,0 +1,652 @@
+diff --git a/usercase-test-coderl/farm_quorum_write_test.go b/usercase-test-coderl/farm_quorum_write_test.go
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/farm_quorum_write_test.go
+@@ -0,0 +1,620 @@
++package usercase_test_coderl
++
++import (
++	"errors"
++	"fmt"
++	"reflect"
++	"strings"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/soundcloud/roshi/cluster"
++	"github.com/soundcloud/roshi/common"
++	"github.com/soundcloud/roshi/farm"
++	"github.com/soundcloud/roshi/instrumentation"
++)
++
++
++
++
++
++
++var batch = []common.KeyScoreMember{
++	{Key: "alpha", Score: 11, Member: "one"},
++	{Key: "beta", Score: 22, Member: "two"},
++}
++
++func TestInsertBroadcastsBatchAndSucceedsAtWriteQuorum(t *testing.T) {
++
++
++	c1 := newScriptedCluster("cluster-a", nil, 0)
++	c2 := newScriptedCluster("cluster-b", nil, 5*time.Millisecond)
++	c3 := newScriptedCluster("cluster-c", errors.New("cluster-c denied"), 30*time.Millisecond)
++	instr := &recordingInstrumentation{}
++	f := farm.New([]cluster.Cluster{c1, c2, c3}, 2, farm.SendAllReadAll, farm.NoRepairs, instr)
++
++	err := f.Insert(batch)
++	if err != nil {
++		t.Fatalf("expected nil insert error, got %v", err)
++	}
++	waitForWriteCalls(t, []*scriptedCluster{c1, c2, c3}, 1, 0, 1)
++
++	assertCounts(t, "cluster-a", c1.snapshot(), clusterSnapshot{
++		insertCalls: 1,
++		deleteCalls: 0,
++		insertBatches: [][]common.KeyScoreMember{
++			{
++				{Key: "alpha", Score: 11, Member: "one"},
++				{Key: "beta", Score: 22, Member: "two"},
++			},
++		},
++		deleteBatches: [][]common.KeyScoreMember{},
++	})
++	assertCounts(t, "cluster-b", c2.snapshot(), clusterSnapshot{
++		insertCalls: 1,
++		deleteCalls: 0,
++		insertBatches: [][]common.KeyScoreMember{
++			{
++				{Key: "alpha", Score: 11, Member: "one"},
++				{Key: "beta", Score: 22, Member: "two"},
++			},
++		},
++		deleteBatches: [][]common.KeyScoreMember{},
++	})
++	assertCounts(t, "cluster-c", c3.snapshot(), clusterSnapshot{
++		insertCalls: 1,
++		deleteCalls: 0,
++		insertBatches: [][]common.KeyScoreMember{
++			{
++				{Key: "alpha", Score: 11, Member: "one"},
++				{Key: "beta", Score: 22, Member: "two"},
++			},
++		},
++		deleteBatches: [][]common.KeyScoreMember{},
++	})
++	assertInstrumentation(t, instr.snapshot(), instrumentationSnapshot{
++		insertCalls:               1,
++		insertRecordCountTotal:    2,
++		insertCallDurationCalls:   1,
++		insertRecordDurationCalls: 1,
++		insertQuorumFailures:      0,
++		deleteCalls:               0,
++		deleteRecordCountTotal:    0,
++		deleteCallDurationCalls:   0,
++		deleteRecordDurationCalls: 0,
++		deleteQuorumFailures:      0,
++	})
++}
++
++func TestInsertQuorumFailureReturnsJoinedClusterErrors(t *testing.T) {
++
++
++	c1 := newScriptedCluster("cluster-a", nil, 0)
++	c2 := newScriptedCluster("cluster-b", errors.New("cluster-b denied"), 5*time.Millisecond)
++	c3 := newScriptedCluster("cluster-c", errors.New("cluster-c denied"), 10*time.Millisecond)
++	instr := &recordingInstrumentation{}
++	f := farm.New([]cluster.Cluster{c1, c2, c3}, 2, farm.SendAllReadAll, farm.NoRepairs, instr)
++
++	err := f.Insert(batch)
++
++	assertQuorumError(t, err, []string{"cluster-b denied", "cluster-c denied"})
++	waitForWriteCalls(t, []*scriptedCluster{c1, c2, c3}, 1, 0, 1)
++
++	assertInstrumentation(t, instr.snapshot(), instrumentationSnapshot{
++		insertCalls:               1,
++		insertRecordCountTotal:    2,
++		insertCallDurationCalls:   1,
++		insertRecordDurationCalls: 1,
++		insertQuorumFailures:      1,
++		deleteCalls:               0,
++		deleteRecordCountTotal:    0,
++		deleteCallDurationCalls:   0,
++		deleteRecordDurationCalls: 0,
++		deleteQuorumFailures:      0,
++	})
++}
++
++func TestDeleteBroadcastsBatchAndReportsQuorumFailure(t *testing.T) {
++
++
++	c1 := newScriptedCluster("cluster-a", nil, 0)
++	c2 := newScriptedCluster("cluster-b", errors.New("cluster-b denied"), 5*time.Millisecond)
++	c3 := newScriptedCluster("cluster-c", errors.New("cluster-c denied"), 10*time.Millisecond)
++	instr := &recordingInstrumentation{}
++	f := farm.New([]cluster.Cluster{c1, c2, c3}, 2, farm.SendAllReadAll, farm.NoRepairs, instr)
++
++	err := f.Delete(batch)
++
++	assertQuorumError(t, err, []string{"cluster-b denied", "cluster-c denied"})
++	waitForWriteCalls(t, []*scriptedCluster{c1, c2, c3}, 0, 1, 1)
++
++	for name, c := range map[string]*scriptedCluster{"cluster-a": c1, "cluster-b": c2, "cluster-c": c3} {
++		assertCounts(t, name, c.snapshot(), clusterSnapshot{
++			insertCalls:   0,
++			deleteCalls:   1,
++			insertBatches: [][]common.KeyScoreMember{},
++			deleteBatches: [][]common.KeyScoreMember{
++				{
++					{Key: "alpha", Score: 11, Member: "one"},
++					{Key: "beta", Score: 22, Member: "two"},
++				},
++			},
++		})
++	}
++	assertInstrumentation(t, instr.snapshot(), instrumentationSnapshot{
++		insertCalls:               0,
++		insertRecordCountTotal:    0,
++		insertCallDurationCalls:   0,
++		insertRecordDurationCalls: 0,
++		insertQuorumFailures:      0,
++		deleteCalls:               1,
++		deleteRecordCountTotal:    2,
++		deleteCallDurationCalls:   1,
++		deleteRecordDurationCalls: 1,
++		deleteQuorumFailures:      1,
++	})
++}
++
++func TestEmptyBatchesReturnNilWithoutClusterWrites(t *testing.T) {
++
++
++	c1 := newScriptedCluster("cluster-a", nil, 0)
++	c2 := newScriptedCluster("cluster-b", nil, 0)
++	c3 := newScriptedCluster("cluster-c", nil, 0)
++	instr := &recordingInstrumentation{}
++	f := farm.New([]cluster.Cluster{c1, c2, c3}, 2, farm.SendAllReadAll, farm.NoRepairs, instr)
++
++	if err := f.Insert([]common.KeyScoreMember{}); err != nil {
++		t.Fatalf("expected nil empty insert error, got %v", err)
++	}
++	if err := f.Delete([]common.KeyScoreMember{}); err != nil {
++		t.Fatalf("expected nil empty delete error, got %v", err)
++	}
++
++	for name, c := range map[string]*scriptedCluster{"cluster-a": c1, "cluster-b": c2, "cluster-c": c3} {
++		assertCounts(t, name, c.snapshot(), clusterSnapshot{
++			insertCalls:   0,
++			deleteCalls:   0,
++			insertBatches: [][]common.KeyScoreMember{},
++			deleteBatches: [][]common.KeyScoreMember{},
++		})
++	}
++}
++
++func TestRepeatedWritesOnOneFarmAccumulateObservableState(t *testing.T) {
++
++
++	c1 := newScriptedCluster("cluster-a", nil, 0)
++	c2 := newScriptedCluster("cluster-b", nil, 0)
++	c3 := newScriptedCluster("cluster-c", nil, 0)
++	instr := &recordingInstrumentation{}
++	f := farm.New([]cluster.Cluster{c1, c2, c3}, 2, farm.SendAllReadAll, farm.NoRepairs, instr)
++
++	if err := f.Insert(batch); err != nil {
++		t.Fatalf("expected nil insert error, got %v", err)
++	}
++	waitForWriteCalls(t, []*scriptedCluster{c1, c2, c3}, 1, 0, 1)
++	assertCounts(t, "cluster-a after insert", c1.snapshot(), clusterSnapshot{
++		insertCalls: 1,
++		deleteCalls: 0,
++		insertBatches: [][]common.KeyScoreMember{
++			{
++				{Key: "alpha", Score: 11, Member: "one"},
++				{Key: "beta", Score: 22, Member: "two"},
++			},
++		},
++		deleteBatches: [][]common.KeyScoreMember{},
++	})
++
++	if err := f.Delete(batch); err != nil {
++		t.Fatalf("expected nil delete error, got %v", err)
++	}
++	waitForWriteCalls(t, []*scriptedCluster{c1, c2, c3}, 1, 1, 1)
++	assertCounts(t, "cluster-a after delete", c1.snapshot(), clusterSnapshot{
++		insertCalls: 1,
++		deleteCalls: 1,
++		insertBatches: [][]common.KeyScoreMember{
++			{
++				{Key: "alpha", Score: 11, Member: "one"},
++				{Key: "beta", Score: 22, Member: "two"},
++			},
++		},
++		deleteBatches: [][]common.KeyScoreMember{
++			{
++				{Key: "alpha", Score: 11, Member: "one"},
++				{Key: "beta", Score: 22, Member: "two"},
++			},
++		},
++	})
++	assertInstrumentation(t, instr.snapshot(), instrumentationSnapshot{
++		insertCalls:               1,
++		insertRecordCountTotal:    2,
++		insertCallDurationCalls:   1,
++		insertRecordDurationCalls: 1,
++		insertQuorumFailures:      0,
++		deleteCalls:               1,
++		deleteRecordCountTotal:    2,
++		deleteCallDurationCalls:   1,
++		deleteRecordDurationCalls: 1,
++		deleteQuorumFailures:      0,
++	})
++}
++
++func TestIndependentFarmsDoNotShareWriteState(t *testing.T) {
++
++
++	a1 := newScriptedCluster("a1", nil, 0)
++	a2 := newScriptedCluster("a2", nil, 0)
++	a3 := newScriptedCluster("a3", nil, 0)
++	b1 := newScriptedCluster("b1", nil, 0)
++	b2 := newScriptedCluster("b2", nil, 0)
++	b3 := newScriptedCluster("b3", nil, 0)
++	farmAInstr := &recordingInstrumentation{}
++	farmBInstr := &recordingInstrumentation{}
++	farmA := farm.New([]cluster.Cluster{a1, a2, a3}, 2, farm.SendAllReadAll, farm.NoRepairs, farmAInstr)
++	farmB := farm.New([]cluster.Cluster{b1, b2, b3}, 2, farm.SendAllReadAll, farm.NoRepairs, farmBInstr)
++
++	if err := farmA.Insert(batch); err != nil {
++		t.Fatalf("expected nil insert error, got %v", err)
++	}
++	waitForWriteCalls(t, []*scriptedCluster{a1, a2, a3}, 1, 0, 1)
++
++	assertCounts(t, "farm A cluster 1", a1.snapshot(), clusterSnapshot{
++		insertCalls: 1,
++		deleteCalls: 0,
++		insertBatches: [][]common.KeyScoreMember{
++			{
++				{Key: "alpha", Score: 11, Member: "one"},
++				{Key: "beta", Score: 22, Member: "two"},
++			},
++		},
++		deleteBatches: [][]common.KeyScoreMember{},
++	})
++	assertCounts(t, "farm B cluster 1", b1.snapshot(), clusterSnapshot{
++		insertCalls:   0,
++		deleteCalls:   0,
++		insertBatches: [][]common.KeyScoreMember{},
++		deleteBatches: [][]common.KeyScoreMember{},
++	})
++	assertInstrumentation(t, farmAInstr.snapshot(), instrumentationSnapshot{
++		insertCalls:               1,
++		insertRecordCountTotal:    2,
++		insertCallDurationCalls:   1,
++		insertRecordDurationCalls: 1,
++		insertQuorumFailures:      0,
++		deleteCalls:               0,
++		deleteRecordCountTotal:    0,
++		deleteCallDurationCalls:   0,
++		deleteRecordDurationCalls: 0,
++		deleteQuorumFailures:      0,
++	})
++	assertInstrumentation(t, farmBInstr.snapshot(), instrumentationSnapshot{
++		insertCalls:               0,
++		insertRecordCountTotal:    0,
++		insertCallDurationCalls:   0,
++		insertRecordDurationCalls: 0,
++		insertQuorumFailures:      0,
++		deleteCalls:               0,
++		deleteRecordCountTotal:    0,
++		deleteCallDurationCalls:   0,
++		deleteRecordDurationCalls: 0,
++		deleteQuorumFailures:      0,
++	})
++
++	_ = farmB
++}
++
++func TestRepeatedConstructWriteCyclesKeepBehaviorStable(t *testing.T) {
++
++
++
++	for i := 0; i < 150; i++ {
++		c1 := newScriptedCluster("cluster-a", nil, 0)
++		c2 := newScriptedCluster("cluster-b", nil, 0)
++		c3 := newScriptedCluster("cluster-c", nil, 0)
++		f := farm.New([]cluster.Cluster{c1, c2, c3}, 2, farm.SendAllReadAll, farm.NoRepairs, instrumentation.NopInstrumentation{})
++		if err := f.Insert(batch); err != nil {
++			t.Fatalf("cycle %d: expected nil insert error, got %v", i, err)
++		}
++		waitForWriteCalls(t, []*scriptedCluster{c1, c2, c3}, 1, 0, 1)
++	}
++}
++
++type scriptedCluster struct {
++	name          string
++	writeErr      error
++	writeDelay    time.Duration
++	mu            sync.Mutex
++	insertCalls   int
++	deleteCalls   int
++	insertBatches [][]common.KeyScoreMember
++	deleteBatches [][]common.KeyScoreMember
++}
++
++func newScriptedCluster(name string, writeErr error, writeDelay time.Duration) *scriptedCluster {
++	return &scriptedCluster{name: name, writeErr: writeErr, writeDelay: writeDelay}
++}
++
++func (c *scriptedCluster) Insert(tuples []common.KeyScoreMember) error {
++	c.mu.Lock()
++	c.insertCalls++
++	c.insertBatches = append(c.insertBatches, cloneBatch(tuples))
++	c.mu.Unlock()
++	time.Sleep(c.writeDelay)
++	return c.writeErr
++}
++
++func (c *scriptedCluster) Delete(tuples []common.KeyScoreMember) error {
++	c.mu.Lock()
++	c.deleteCalls++
++	c.deleteBatches = append(c.deleteBatches, cloneBatch(tuples))
++	c.mu.Unlock()
++	time.Sleep(c.writeDelay)
++	return c.writeErr
++}
++
++func (c *scriptedCluster) SelectOffset(keys []string, offset, limit int) <-chan cluster.Element {
++	ch := make(chan cluster.Element)
++	close(ch)
++	return ch
++}
++
++func (c *scriptedCluster) SelectRange(keys []string, start, stop common.Cursor, limit int) <-chan cluster.Element {
++	ch := make(chan cluster.Element)
++	close(ch)
++	return ch
++}
++
++func (c *scriptedCluster) Score(keyMembers []common.KeyMember) (map[common.KeyMember]cluster.Presence, error) {
++	return map[common.KeyMember]cluster.Presence{}, nil
++}
++
++func (c *scriptedCluster) Keys(batchSize int) <-chan []string {
++	ch := make(chan []string)
++	close(ch)
++	return ch
++}
++
++func (c *scriptedCluster) snapshot() clusterSnapshot {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	return clusterSnapshot{
++		insertCalls:   c.insertCalls,
++		deleteCalls:   c.deleteCalls,
++		insertBatches: cloneBatches(c.insertBatches),
++		deleteBatches: cloneBatches(c.deleteBatches),
++	}
++}
++
++type clusterSnapshot struct {
++	insertCalls   int
++	deleteCalls   int
++	insertBatches [][]common.KeyScoreMember
++	deleteBatches [][]common.KeyScoreMember
++}
++
++func waitForWriteCalls(t *testing.T, clusters []*scriptedCluster, insertCalls, deleteCalls, totalCalls int) {
++	t.Helper()
++	deadline := time.Now().Add(500 * time.Millisecond)
++	for time.Now().Before(deadline) {
++		allReady := true
++		for _, c := range clusters {
++			s := c.snapshot()
++			if s.insertCalls < insertCalls || s.deleteCalls < deleteCalls || s.insertCalls+s.deleteCalls < totalCalls {
++				allReady = false
++				break
++			}
++		}
++		if allReady {
++			return
++		}
++		time.Sleep(time.Millisecond)
++	}
++	for _, c := range clusters {
++		t.Fatalf("timed out waiting for %s writes: got %+v", c.name, c.snapshot())
++	}
++}
++
++func assertCounts(t *testing.T, name string, got, expected clusterSnapshot) {
++	t.Helper()
++	if !reflect.DeepEqual(got, expected) {
++		t.Fatalf("%s: expected %+v, got %+v", name, expected, got)
++	}
++}
++
++func assertQuorumError(t *testing.T, err error, expectedMessages []string) {
++	t.Helper()
++	if err == nil {
++		t.Fatalf("expected non-nil quorum error")
++	}
++	got := fmt.Sprint(err)
++	const prefix = "no quorum ("
++	if !strings.HasPrefix(got, prefix) || !strings.HasSuffix(got, ")") {
++		t.Fatalf("expected quorum error formatted as %q, got %q", "no quorum (<cluster errors>)", got)
++	}
++	body := strings.TrimSuffix(strings.TrimPrefix(got, prefix), ")")
++	parts := strings.Split(body, "; ")
++	if len(parts) != len(expectedMessages) {
++		t.Fatalf("expected quorum errors %v, got %v", expectedMessages, parts)
++	}
++	counts := map[string]int{}
++	for _, msg := range expectedMessages {
++		counts[msg]++
++	}
++	for _, msg := range parts {
++		counts[msg]--
++	}
++	for msg, count := range counts {
++		if count != 0 {
++			t.Fatalf("expected quorum errors %v, got %v; mismatch at %q", expectedMessages, parts, msg)
++		}
++	}
++}
++
++type recordingInstrumentation struct {
++	mu                        sync.Mutex
++	insertCalls               int
++	insertRecordCountTotal    int
++	insertCallDurationCalls   int
++	insertRecordDurationCalls int
++	insertQuorumFailures      int
++	deleteCalls               int
++	deleteRecordCountTotal    int
++	deleteCallDurationCalls   int
++	deleteRecordDurationCalls int
++	deleteQuorumFailures      int
++}
++
++func (i *recordingInstrumentation) InsertCall() {
++	i.mu.Lock()
++	defer i.mu.Unlock()
++	i.insertCalls++
++}
++
++func (i *recordingInstrumentation) InsertRecordCount(n int) {
++	i.mu.Lock()
++	defer i.mu.Unlock()
++	i.insertRecordCountTotal += n
++}
++
++func (i *recordingInstrumentation) InsertCallDuration(time.Duration) {
++	i.mu.Lock()
++	defer i.mu.Unlock()
++	i.insertCallDurationCalls++
++}
++
++func (i *recordingInstrumentation) InsertRecordDuration(time.Duration) {
++	i.mu.Lock()
++	defer i.mu.Unlock()
++	i.insertRecordDurationCalls++
++}
++
++func (i *recordingInstrumentation) InsertQuorumFailure() {
++	i.mu.Lock()
++	defer i.mu.Unlock()
++	i.insertQuorumFailures++
++}
++
++func (i *recordingInstrumentation) DeleteCall() {
++	i.mu.Lock()
++	defer i.mu.Unlock()
++	i.deleteCalls++
++}
++
++func (i *recordingInstrumentation) DeleteRecordCount(n int) {
++	i.mu.Lock()
++	defer i.mu.Unlock()
++	i.deleteRecordCountTotal += n
++}
++
++func (i *recordingInstrumentation) DeleteCallDuration(time.Duration) {
++	i.mu.Lock()
++	defer i.mu.Unlock()
++	i.deleteCallDurationCalls++
++}
++
++func (i *recordingInstrumentation) DeleteRecordDuration(time.Duration) {
++	i.mu.Lock()
++	defer i.mu.Unlock()
++	i.deleteRecordDurationCalls++
++}
++
++func (i *recordingInstrumentation) DeleteQuorumFailure() {
++	i.mu.Lock()
++	defer i.mu.Unlock()
++	i.deleteQuorumFailures++
++}
++
++func (i *recordingInstrumentation) SelectCall()                               {}
++func (i *recordingInstrumentation) SelectKeys(int)                            {}
++func (i *recordingInstrumentation) SelectSendTo(int)                          {}
++func (i *recordingInstrumentation) SelectFirstResponseDuration(time.Duration) {}
++func (i *recordingInstrumentation) SelectPartialError()                       {}
++func (i *recordingInstrumentation) SelectBlockingDuration(time.Duration)      {}
++func (i *recordingInstrumentation) SelectOverheadDuration(time.Duration)      {}
++func (i *recordingInstrumentation) SelectDuration(time.Duration)              {}
++func (i *recordingInstrumentation) SelectSendAllPermitGranted()               {}
++func (i *recordingInstrumentation) SelectSendAllPermitRejected()              {}
++func (i *recordingInstrumentation) SelectSendAllPromotion()                   {}
++func (i *recordingInstrumentation) SelectRetrieved(int)                       {}
++func (i *recordingInstrumentation) SelectReturned(int)                        {}
++func (i *recordingInstrumentation) SelectRepairNeeded(int)                    {}
++func (i *recordingInstrumentation) RepairCall()                               {}
++func (i *recordingInstrumentation) RepairRequest(int)                         {}
++func (i *recordingInstrumentation) RepairDiscarded(int)                       {}
++func (i *recordingInstrumentation) RepairWriteSuccess(int)                    {}
++func (i *recordingInstrumentation) RepairWriteFailure(int)                    {}
++func (i *recordingInstrumentation) WalkKeys(int)                              {}
++
++func (i *recordingInstrumentation) snapshot() instrumentationSnapshot {
++	i.mu.Lock()
++	defer i.mu.Unlock()
++	return instrumentationSnapshot{
++		insertCalls:               i.insertCalls,
++		insertRecordCountTotal:    i.insertRecordCountTotal,
++		insertCallDurationCalls:   i.insertCallDurationCalls,
++		insertRecordDurationCalls: i.insertRecordDurationCalls,
++		insertQuorumFailures:      i.insertQuorumFailures,
++		deleteCalls:               i.deleteCalls,
++		deleteRecordCountTotal:    i.deleteRecordCountTotal,
++		deleteCallDurationCalls:   i.deleteCallDurationCalls,
++		deleteRecordDurationCalls: i.deleteRecordDurationCalls,
++		deleteQuorumFailures:      i.deleteQuorumFailures,
++	}
++}
++
++type instrumentationSnapshot struct {
++	insertCalls               int
++	insertRecordCountTotal    int
++	insertCallDurationCalls   int
++	insertRecordDurationCalls int
++	insertQuorumFailures      int
++	deleteCalls               int
++	deleteRecordCountTotal    int
++	deleteCallDurationCalls   int
++	deleteRecordDurationCalls int
++	deleteQuorumFailures      int
++}
++
++func assertInstrumentation(t *testing.T, got, expected instrumentationSnapshot) {
++	t.Helper()
++	if !reflect.DeepEqual(got, expected) {
++		t.Fatalf("expected instrumentation %+v, got %+v", expected, got)
++	}
++}
++
++func cloneBatch(in []common.KeyScoreMember) []common.KeyScoreMember {
++	out := make([]common.KeyScoreMember, len(in))
++	copy(out, in)
++	return out
++}
++
++func cloneBatches(in [][]common.KeyScoreMember) [][]common.KeyScoreMember {
++	out := make([][]common.KeyScoreMember, len(in))
++	for i := range in {
++		out[i] = cloneBatch(in[i])
++	}
++	return out
++}
++
++func TestScriptedClusterSatisfiesPublicInterface(t *testing.T) {
++
++
++	var _ cluster.Cluster = (*scriptedCluster)(nil)
++	var _ instrumentation.Instrumentation = (*recordingInstrumentation)(nil)
++}
++
++func TestQuorumErrorMessageDoesNotDependOnFailureOrder(t *testing.T) {
++
++
++
++	c1 := newScriptedCluster("cluster-a", nil, 0)
++	c2 := newScriptedCluster("cluster-b", errors.New("cluster-b denied"), 20*time.Millisecond)
++	c3 := newScriptedCluster("cluster-c", errors.New("cluster-c denied"), 1*time.Millisecond)
++	f := farm.New([]cluster.Cluster{c1, c2, c3}, 2, farm.SendAllReadAll, farm.NoRepairs, instrumentation.NopInstrumentation{})
++
++	err := f.Insert(batch)
++	assertQuorumError(t, err, []string{"cluster-b denied", "cluster-c denied"})
++	waitForWriteCalls(t, []*scriptedCluster{c1, c2, c3}, 1, 0, 1)
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,22 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++
++cd /workspace/repo
++export GOPATH=/root/go
++export GOMODCACHE=/root/go/pkg/mod
++export GOPROXY=off
++export GOSUMDB=off
++export GONOSUMDB='*'
++export GOTOOLCHAIN=local
++export GOFLAGS="${GOFLAGS:-} -mod=readonly"
++exec go test -v -count=1 ./usercase-test-coderl/...

@@ -1,0 +1,291 @@
+diff --git a/vertical-pod-autoscaler/pkg/recommender/routines/recommender_conditions_test.go b/vertical-pod-autoscaler/pkg/recommender/routines/recommender_conditions_test.go
+new file mode 100644
+index 000000000..d73551de5
+--- /dev/null
++++ b/vertical-pod-autoscaler/pkg/recommender/routines/recommender_conditions_test.go
+@@ -0,0 +1,252 @@
++package routines
++
++import (
++	"encoding/json"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/assert"
++	core "k8s.io/api/core/v1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/labels"
++	"k8s.io/apimachinery/pkg/runtime"
++	vpa_types "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/apis/autoscaling.k8s.io/v1beta2"
++	vpa_fake "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/client/clientset/versioned/fake"
++	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/recommender/logic"
++	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/recommender/model"
++	k8stesting "k8s.io/client-go/testing"
++)
++
++const noPodsMatchedMessage = "No live pods match this VPA object"
++
++func TestUpdateVPAsWritesNoPodsMatchedStatusForSelectorMiss(t *testing.T) {
++	const namespace = "prod-blue"
++	const vpaName = "selector-miss-vpa"
++
++	cluster := newClusterWithObservedVPA(t, namespace, vpaName, labels.Set{
++		"tier":    "backend",
++		"release": "canary",
++	})
++
++	fakeClient := newVPAStatusClient(cluster.ObservedVpas[0])
++	recommender := newStatusOnlyRecommender(cluster, fakeClient, nil)
++
++	recommender.UpdateVPAs()
++
++	status := statusFromSinglePatch(t, fakeClient.Actions())
++	assertStatusCondition(t, status, vpa_types.NoPodsMatched, core.ConditionTrue,
++		"NoPodsMatched", noPodsMatchedMessage)
++	assertStatusCondition(t, status, vpa_types.RecommendationProvided, core.ConditionFalse,
++		"NoPodsMatched", noPodsMatchedMessage)
++}
++
++func TestUpdateVPAsDoesNotMarkNoPodsMatchedWhenLivePodMatches(t *testing.T) {
++	const namespace = "team-green"
++	const vpaName = "matching-pod-vpa"
++
++	cluster := newClusterWithObservedVPA(t, namespace, vpaName, labels.Set{
++		"component": "api",
++		"track":     "stable",
++	})
++	podID := model.PodID{Namespace: namespace, PodName: "api-pod-7"}
++	cluster.AddOrUpdatePod(podID, labels.Set{
++		"component": "api",
++		"track":     "stable",
++	}, core.PodRunning)
++	assert.NoError(t, cluster.AddOrUpdateContainer(
++		model.ContainerID{PodID: podID, ContainerName: "main"},
++		model.Resources{}))
++
++	fakeClient := newVPAStatusClient(cluster.ObservedVpas[0])
++	recommender := newStatusOnlyRecommender(cluster, fakeClient, nil)
++
++	recommender.UpdateVPAs()
++
++	status := statusFromSinglePatch(t, fakeClient.Actions())
++	assertNoConditionTrue(t, status, vpa_types.NoPodsMatched)
++}
++
++func TestUpdateVPAsKeepsRecommendationProvidedTrueWhenRecommendationExists(t *testing.T) {
++	const namespace = "prod-red"
++	const vpaName = "recommended-without-current-pods"
++
++	cluster := newClusterWithObservedVPA(t, namespace, vpaName, labels.Set{
++		"role": "worker",
++		"zone": "west",
++	})
++	recommendation := logic.RecommendedPodResources{
++		"main": {
++			Target: model.Resources{
++				model.ResourceCPU:    model.CPUAmountFromCores(0.25),
++				model.ResourceMemory: model.MemoryAmountFromBytes(128 * 1024 * 1024),
++			},
++			LowerBound: model.Resources{
++				model.ResourceCPU:    model.CPUAmountFromCores(0.20),
++				model.ResourceMemory: model.MemoryAmountFromBytes(96 * 1024 * 1024),
++			},
++			UpperBound: model.Resources{
++				model.ResourceCPU:    model.CPUAmountFromCores(0.50),
++				model.ResourceMemory: model.MemoryAmountFromBytes(256 * 1024 * 1024),
++			},
++		},
++	}
++
++	fakeClient := newVPAStatusClient(cluster.ObservedVpas[0])
++	recommender := newStatusOnlyRecommender(cluster, fakeClient, recommendation)
++
++	recommender.UpdateVPAs()
++
++	status := statusFromSinglePatch(t, fakeClient.Actions())
++	assertStatusCondition(t, status, vpa_types.NoPodsMatched, core.ConditionTrue,
++		"NoPodsMatched", noPodsMatchedMessage)
++	assertConditionStatus(t, status, vpa_types.RecommendationProvided, core.ConditionTrue)
++}
++
++func newClusterWithObservedVPA(t *testing.T, namespace, name string, selector labels.Set) *model.ClusterState {
++	t.Helper()
++
++	cluster := model.NewClusterState()
++	selectorObj := labels.SelectorFromSet(selector)
++	id := model.VpaID{Namespace: namespace, VpaName: name}
++	cluster.Vpas[id] = model.NewVpa(id, selectorObj, time.Unix(10, 0))
++	cluster.ObservedVpas = []*vpa_types.VerticalPodAutoscaler{{
++		ObjectMeta: metav1.ObjectMeta{
++			Namespace: namespace,
++			Name:      name,
++		},
++	}}
++	return cluster
++}
++
++func newVPAStatusClient(vpa *vpa_types.VerticalPodAutoscaler) *vpa_fake.Clientset {
++	client := vpa_fake.NewSimpleClientset(vpa)
++	client.PrependReactor("patch", "verticalpodautoscalers", func(action k8stesting.Action) (bool, runtime.Object, error) {
++		return true, vpa, nil
++	})
++	return client
++}
++
++func assertStatusCondition(
++	t *testing.T,
++	status *vpa_types.VerticalPodAutoscalerStatus,
++	conditionType vpa_types.VerticalPodAutoscalerConditionType,
++	expectedStatus core.ConditionStatus,
++	expectedReason string,
++	expectedMessage string,
++) {
++	t.Helper()
++
++	condition, found := findCondition(status, conditionType)
++	if !assert.True(t, found, "missing condition %s in %#v", conditionType, status.Conditions) {
++		return
++	}
++	assert.Equal(t, expectedStatus, condition.Status, "condition %s status", conditionType)
++	assert.Equal(t, expectedReason, condition.Reason, "condition %s reason", conditionType)
++	assert.Equal(t, expectedMessage, condition.Message, "condition %s message", conditionType)
++}
++
++func assertConditionStatus(
++	t *testing.T,
++	status *vpa_types.VerticalPodAutoscalerStatus,
++	conditionType vpa_types.VerticalPodAutoscalerConditionType,
++	expectedStatus core.ConditionStatus,
++) {
++	t.Helper()
++
++	condition, found := findCondition(status, conditionType)
++	if !assert.True(t, found, "missing condition %s in %#v", conditionType, status.Conditions) {
++		return
++	}
++	assert.Equal(t, expectedStatus, condition.Status, "condition %s status", conditionType)
++}
++
++func assertNoConditionTrue(
++	t *testing.T,
++	status *vpa_types.VerticalPodAutoscalerStatus,
++	conditionType vpa_types.VerticalPodAutoscalerConditionType,
++) {
++	t.Helper()
++
++	condition, found := findCondition(status, conditionType)
++	if !found {
++		return
++	}
++	assert.NotEqual(t, core.ConditionTrue, condition.Status,
++		"condition %s must not be true when a live pod matches the VPA selector", conditionType)
++}
++
++func findCondition(
++	status *vpa_types.VerticalPodAutoscalerStatus,
++	conditionType vpa_types.VerticalPodAutoscalerConditionType,
++) (vpa_types.VerticalPodAutoscalerCondition, bool) {
++	for _, condition := range status.Conditions {
++		if condition.Type == conditionType {
++			return condition, true
++		}
++	}
++	return vpa_types.VerticalPodAutoscalerCondition{}, false
++}
++
++func statusFromSinglePatch(t *testing.T, actions []k8stesting.Action) *vpa_types.VerticalPodAutoscalerStatus {
++	t.Helper()
++
++	if !assert.Len(t, actions, 1, "expected exactly one status patch action") {
++		return nil
++	}
++	patchAction, ok := actions[0].(k8stesting.PatchAction)
++	if !assert.True(t, ok, "expected patch action, got %T", actions[0]) {
++		return nil
++	}
++
++	status := decodeStatusPatch(t, patchAction.GetPatch())
++	if !assert.NotNil(t, status, "status patch did not include /status") {
++		return nil
++	}
++	return status
++}
++
++func decodeStatusPatch(t *testing.T, patch []byte) *vpa_types.VerticalPodAutoscalerStatus {
++	t.Helper()
++
++
++
++	var records []struct {
++		Op    string                                 `json:"op"`
++		Path  string                                 `json:"path"`
++		Value *vpa_types.VerticalPodAutoscalerStatus `json:"value"`
++	}
++	if !assert.NoError(t, json.Unmarshal(patch, &records)) {
++		return nil
++	}
++	for _, record := range records {
++		if record.Path == "/status" {
++			return record.Value
++		}
++	}
++	return nil
++}
++
++func newStatusOnlyRecommender(
++	cluster *model.ClusterState,
++	client *vpa_fake.Clientset,
++	recommendation logic.RecommendedPodResources,
++) *recommender {
++	return &recommender{
++		clusterState:           cluster,
++		vpaClient:              client.AutoscalingV1beta2(),
++		podResourceRecommender: &fixedPodResourceRecommender{recommendation: recommendation},
++	}
++}
++
++type fixedPodResourceRecommender struct {
++	recommendation logic.RecommendedPodResources
++}
++
++func (f *fixedPodResourceRecommender) GetRecommendedPodResources(
++	_ model.ContainerNameToAggregateStateMap,
++) logic.RecommendedPodResources {
++	if f.recommendation == nil {
++		return logic.RecommendedPodResources{}
++	}
++	return f.recommendation
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,28 @@
++#!/bin/bash
++set -uo pipefail
++cd /testbed
++
++
++
++
++mkdir -p /root/go/src/k8s.io/autoscaler
++ln -sf /testbed/vertical-pod-autoscaler /root/go/src/k8s.io/autoscaler/vertical-pod-autoscaler
++
++
++export GO111MODULE=off
++
++cd /root/go/src/k8s.io/autoscaler/vertical-pod-autoscaler
++
++
++case "${1:-}" in
++  base)
++    go test -v ./pkg/recommender/model/
++    ;;
++  new)
++    go test -v ./pkg/recommender/routines/ -run 'TestUpdateVPAs(WritesNoPodsMatchedStatusForSelectorMiss|DoesNotMarkNoPodsMatchedWhenLivePodMatches|KeepsRecommendationProvidedTrueWhenRecommendationExists)$'
++    ;;
++  *)
++    echo "usage: $0 base|new"
++    exit 2
++    ;;
++esac

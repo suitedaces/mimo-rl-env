@@ -1,0 +1,11 @@
+## Add first-class common table expressions to QueryBuilder
+
+Knex currently makes callers drop down to an entire raw statement when they need a common table expression, which loses the query builder's normal composition, binding-order, and dialect-quoting behavior. Add chainable `with` and `withRecursive` support so CTEs compose with ordinary queries. Both methods must be available on a `QueryBuilder` and as root `knex.with(...)` / `knex.withRecursive(...)` chain starters. Support `with(alias, body)` and `with(alias, columns, body)` (and the same overloads for `withRecursive`), where `body` is a callback, a QueryBuilder, or a Raw query. A callback must receive the new body builder both as `this` and as its first argument.
+
+Render declarations in call order using the existing lowercase SQL and dialect identifier-quoting conventions: `with [recursive] <alias>(<optional columns>) as (<body>), ... <outer statement>`. Declaration aliases and optional column names are identifiers and must be quoted by the active dialect. Bindings from CTE bodies must remain in declaration/body order and precede every binding from the outer statement. QueryBuilder bodies may themselves contain CTEs.
+
+If any declaration is recursive, PostgreSQL, SQLite, and MySQL must emit one `with recursive` prefix for the complete declaration list. MSSQL must emit plain `with` because it does not use the `recursive` keyword. CTE prefixes must work for SELECT, INSERT, UPDATE, and DELETE output. Preserve dialect-specific `toSQL()` metadata such as PostgreSQL's `method` and `returning` fields when adding the prefix.
+
+Reject invalid declarations immediately with `TypeError`: the alias must be a non-empty string and its error must contain `CTE alias`; when supplied, `columns` must be a non-empty array of non-empty strings and its error must contain `CTE columns`; the body must be one of the three supported forms and its error must contain `CTE body`. Apply the same validation to recursive declarations.
+
+Cloning a builder must give the clone an independent CTE declaration list, and compiling either builder repeatedly must be stable. Raw CTE bodies must compile with the enclosing builder's active dialect, even when the same Raw instance is reused by builders from different dialects; one compilation must not contaminate the next builder's SQL or bindings.

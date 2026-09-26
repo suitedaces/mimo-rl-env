@@ -1,0 +1,462 @@
+diff --git a/usercase-test-coderl/tenant_heartbeat_test.go b/usercase-test-coderl/tenant_heartbeat_test.go
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/tenant_heartbeat_test.go
+@@ -0,0 +1,433 @@
++package usercase_test_coderl
++
++import (
++	"encoding/json"
++	"errors"
++	"net/http"
++	"net/http/httptest"
++	"os"
++	"runtime"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	lark "github.com/go-lark/lark"
++)
++
++
++
++
++
++
++
++
++const (
++	authPath    = "/open-apis/auth/v3/tenant_access_token/internal/"
++	botInfoPath = "/open-apis/bot/v3/info/"
++)
++
++type authResponse struct {
++	token  string
++	expire int
++	raw    string
++}
++
++type authServer struct {
++	t         *testing.T
++	server    *httptest.Server
++	responses []authResponse
++
++	authCount int64
++	mu        sync.Mutex
++	bodies    []map[string]string
++	headers   []string
++}
++
++func newAuthServer(t *testing.T, responses []authResponse) *authServer {
++	t.Helper()
++	s := &authServer{t: t, responses: responses}
++	s.server = httptest.NewServer(http.HandlerFunc(s.handle))
++	return s
++}
++
++func (s *authServer) close() {
++	s.server.Close()
++}
++
++func (s *authServer) url() string {
++	return s.server.URL
++}
++
++func (s *authServer) count() int64 {
++	return atomic.LoadInt64(&s.authCount)
++}
++
++func (s *authServer) authBodies() []map[string]string {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++
++	out := make([]map[string]string, len(s.bodies))
++	for i, body := range s.bodies {
++		out[i] = map[string]string{
++			"app_id":     body["app_id"],
++			"app_secret": body["app_secret"],
++		}
++	}
++	return out
++}
++
++func (s *authServer) botInfoHeaders() []string {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++
++	out := make([]string, len(s.headers))
++	copy(out, s.headers)
++	return out
++}
++
++func (s *authServer) handle(w http.ResponseWriter, r *http.Request) {
++	w.Header().Set("Content-Type", "application/json")
++
++	switch r.URL.Path {
++	case authPath:
++		n := atomic.AddInt64(&s.authCount, 1)
++		var body map[string]string
++		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
++			s.t.Errorf("auth request body did not decode: %v", err)
++		}
++		s.mu.Lock()
++		s.bodies = append(s.bodies, body)
++		s.mu.Unlock()
++
++		idx := int(n) - 1
++		if idx >= len(s.responses) {
++			idx = len(s.responses) - 1
++		}
++		resp := s.responses[idx]
++		if resp.raw != "" {
++			_, _ = w.Write([]byte(resp.raw))
++			return
++		}
++		_ = json.NewEncoder(w).Encode(map[string]interface{}{
++			"code":                0,
++			"msg":                 "ok",
++			"tenant_access_token": resp.token,
++			"expire":              resp.expire,
++		})
++	case botInfoPath:
++		s.mu.Lock()
++		s.headers = append(s.headers, r.Header.Get("Authorization"))
++		s.mu.Unlock()
++		_ = json.NewEncoder(w).Encode(map[string]interface{}{
++			"code": 0,
++			"msg":  "ok",
++			"bot": map[string]interface{}{
++				"activate_status": 1,
++				"app_name":        "Heartbeat Fixture Bot",
++				"avatar_url":      "https://example.invalid/avatar.png",
++				"ip_white_list":   []string{"203.0.113.7"},
++				"open_id":         "ou_fixture_bot",
++			},
++		})
++	default:
++		http.NotFound(w, r)
++	}
++}
++
++func waitFor(t *testing.T, label string, timeout time.Duration, cond func() bool) {
++	t.Helper()
++	deadline := time.Now().Add(timeout)
++	for time.Now().Before(deadline) {
++		if cond() {
++			return
++		}
++		time.Sleep(25 * time.Millisecond)
++	}
++	t.Fatalf("timed out waiting for %s", label)
++}
++
++func requireNoError(t *testing.T, err error) {
++	t.Helper()
++	if err != nil {
++		t.Fatalf("unexpected error: %T %v", err, err)
++	}
++}
++
++func countFDs(t *testing.T) int {
++	t.Helper()
++	entries, err := os.ReadDir("/proc/self/fd")
++	if err != nil {
++		t.Fatalf("count /proc/self/fd: %v", err)
++	}
++	return len(entries)
++}
++
++func TestStartHeartbeatFetchesStoresTokenAndAuthenticatedCallsUseIt(t *testing.T) {
++
++
++
++
++	srv := newAuthServer(t, []authResponse{{token: "tenant-token-001", expire: 7200}})
++	defer srv.close()
++
++	bot := lark.NewChatBot("app-id-main", "secret-main")
++	bot.SetDomain(srv.url())
++
++	if got := bot.TenantAccessToken(); got != "" {
++		t.Fatalf("fresh tenant token = %q, want %q", got, "")
++	}
++	requireNoError(t, bot.StartHeartbeat())
++	defer bot.StopHeartbeat()
++
++	if got := srv.count(); got != 1 {
++		t.Fatalf("auth request count after StartHeartbeat = %d, want %d", got, 1)
++	}
++	if got := bot.TenantAccessToken(); got != "tenant-token-001" {
++		t.Fatalf("tenant token after StartHeartbeat = %q, want %q", got, "tenant-token-001")
++	}
++	bodies := srv.authBodies()
++
++	if len(bodies) != 1 || bodies[0]["app_id"] != "app-id-main" || bodies[0]["app_secret"] != "secret-main" {
++		t.Fatalf("auth request bodies = %#v, want one app_id/app_secret literal pair", bodies)
++	}
++
++	resp, err := bot.GetBotInfo()
++	requireNoError(t, err)
++
++	if resp == nil {
++		t.Fatal("GetBotInfo returned nil response")
++	}
++	headers := srv.botInfoHeaders()
++	if len(headers) != 1 {
++		t.Fatalf("GetBotInfo authorization header count = %d, want %d", len(headers), 1)
++	}
++	if got := headers[0]; got != "Bearer tenant-token-001" {
++		t.Fatalf("GetBotInfo authorization header = %q, want %q", got, "Bearer tenant-token-001")
++	}
++}
++
++func TestStartHeartbeatInitialAuthFailureReturnsErrorAndLeavesTokenEmpty(t *testing.T) {
++
++
++
++
++	srv := newAuthServer(t, []authResponse{{raw: "!"}})
++	defer srv.close()
++
++	bot := lark.NewChatBot("app-id-failure", "secret-failure")
++	bot.SetDomain(srv.url())
++
++	err := bot.StartHeartbeat()
++
++	if err == nil {
++		t.Fatal("StartHeartbeat error = nil, want non-nil initial auth error")
++	}
++	if got := srv.count(); got != 1 {
++		t.Fatalf("auth request count after failed StartHeartbeat = %d, want %d", got, 1)
++	}
++	if got := bot.TenantAccessToken(); got != "" {
++		t.Fatalf("tenant token after failed StartHeartbeat = %q, want %q", got, "")
++	}
++}
++
++func TestNotificationBotStartHeartbeatReturnsBotTypeErrorWithoutAuthWork(t *testing.T) {
++
++
++
++
++	srv := newAuthServer(t, []authResponse{{token: "must-not-be-requested", expire: 7200}})
++	defer srv.close()
++
++	bot := lark.NewNotificationBot("https://example.invalid/webhook")
++	bot.SetDomain(srv.url())
++
++	err := bot.StartHeartbeat()
++	if !errors.Is(err, lark.ErrBotTypeError) {
++		t.Fatalf("StartHeartbeat on notification bot error = %T %v, want ErrBotTypeError", err, err)
++	}
++	time.Sleep(150 * time.Millisecond)
++	if got := srv.count(); got != 0 {
++		t.Fatalf("notification bot auth request count = %d, want %d", got, 0)
++	}
++	if got := bot.TenantAccessToken(); got != "" {
++		t.Fatalf("notification bot tenant token = %q, want %q", got, "")
++	}
++}
++
++func TestHeartbeatRenewalUpdatesTokenUsesExpireIntervalAndStopHaltsLoop(t *testing.T) {
++
++
++
++
++	srv := newAuthServer(t, []authResponse{
++		{token: "tenant-renew-001", expire: 20},
++		{token: "tenant-renew-002", expire: 21},
++		{token: "tenant-renew-003", expire: 21},
++	})
++	defer srv.close()
++
++	bot := lark.NewChatBot("app-id-renew", "secret-renew")
++	bot.SetDomain(srv.url())
++	requireNoError(t, bot.StartHeartbeat())
++
++	if got := srv.count(); got != 1 {
++		t.Fatalf("auth request count immediately after StartHeartbeat = %d, want %d", got, 1)
++	}
++	if got := bot.TenantAccessToken(); got != "tenant-renew-001" {
++		t.Fatalf("tenant token immediately after StartHeartbeat = %q, want %q", got, "tenant-renew-001")
++	}
++	time.Sleep(1500 * time.Millisecond)
++	if got := srv.count(); got != 1 {
++		t.Fatalf("auth request count before default interval elapses = %d, want %d", got, 1)
++	}
++
++	waitFor(t, "default 10s renewal", 12*time.Second, func() bool {
++		return srv.count() == 2 && bot.TenantAccessToken() == "tenant-renew-002"
++	})
++	if got := srv.count(); got != 2 {
++		t.Fatalf("auth request count after default renewal = %d, want %d", got, 2)
++	}
++	if got := bot.TenantAccessToken(); got != "tenant-renew-002" {
++		t.Fatalf("tenant token after default renewal = %q, want %q", got, "tenant-renew-002")
++	}
++
++	waitFor(t, "expire-minus-20 renewal", 2500*time.Millisecond, func() bool {
++		return srv.count() == 3 && bot.TenantAccessToken() == "tenant-renew-003"
++	})
++	if got := srv.count(); got != 3 {
++		t.Fatalf("auth request count after expire-minus-20 renewal = %d, want %d", got, 3)
++	}
++	if got := bot.TenantAccessToken(); got != "tenant-renew-003" {
++		t.Fatalf("tenant token after expire-minus-20 renewal = %q, want %q", got, "tenant-renew-003")
++	}
++
++	bot.StopHeartbeat()
++	time.Sleep(1500 * time.Millisecond)
++	if got := srv.count(); got != 3 {
++		t.Fatalf("auth request count after StopHeartbeat = %d, want %d", got, 3)
++	}
++	if got := bot.TenantAccessToken(); got != "tenant-renew-003" {
++		t.Fatalf("tenant token after StopHeartbeat = %q, want %q", got, "tenant-renew-003")
++	}
++}
++
++func TestLaterRenewalErrorDoesNotCrashAndKeepsPreviousToken(t *testing.T) {
++
++
++
++
++	srv := newAuthServer(t, []authResponse{
++		{token: "tenant-error-001", expire: 20},
++		{raw: "!"},
++	})
++	defer srv.close()
++
++	bot := lark.NewChatBot("app-id-later-error", "secret-later-error")
++	bot.SetDomain(srv.url())
++	requireNoError(t, bot.StartHeartbeat())
++	defer bot.StopHeartbeat()
++
++	if got := srv.count(); got != 1 {
++		t.Fatalf("auth request count immediately after StartHeartbeat = %d, want %d", got, 1)
++	}
++	if got := bot.TenantAccessToken(); got != "tenant-error-001" {
++		t.Fatalf("tenant token before renewal error = %q, want %q", got, "tenant-error-001")
++	}
++
++	waitFor(t, "background renewal error", 12*time.Second, func() bool {
++		return srv.count() == 2
++	})
++	if got := srv.count(); got != 2 {
++		t.Fatalf("auth request count after background renewal error = %d, want %d", got, 2)
++	}
++	if got := bot.TenantAccessToken(); got != "tenant-error-001" {
++		t.Fatalf("tenant token after background renewal error = %q, want %q", got, "tenant-error-001")
++	}
++}
++
++func TestTwoChatBotsKeepIndependentTenantTokens(t *testing.T) {
++
++
++
++
++	serverA := newAuthServer(t, []authResponse{{token: "tenant-A-001", expire: 7200}})
++	defer serverA.close()
++	serverB := newAuthServer(t, []authResponse{{token: "tenant-B-001", expire: 7200}})
++	defer serverB.close()
++
++	a := lark.NewChatBot("app-id-A", "secret-A")
++	a.SetDomain(serverA.url())
++	b := lark.NewChatBot("app-id-B", "secret-B")
++	b.SetDomain(serverB.url())
++
++	if got := a.TenantAccessToken(); got != "" {
++		t.Fatalf("fresh tenant token for bot A = %q, want %q", got, "")
++	}
++	if got := b.TenantAccessToken(); got != "" {
++		t.Fatalf("fresh tenant token for bot B = %q, want %q", got, "")
++	}
++
++	requireNoError(t, a.StartHeartbeat())
++	defer a.StopHeartbeat()
++	if got := a.TenantAccessToken(); got != "tenant-A-001" {
++		t.Fatalf("tenant token for bot A after StartHeartbeat = %q, want %q", got, "tenant-A-001")
++	}
++	if got := b.TenantAccessToken(); got != "" {
++		t.Fatalf("tenant token for bot B before its StartHeartbeat = %q, want %q", got, "")
++	}
++
++	requireNoError(t, b.StartHeartbeat())
++	defer b.StopHeartbeat()
++	if got := a.TenantAccessToken(); got != "tenant-A-001" {
++		t.Fatalf("tenant token for bot A after bot B starts = %q, want %q", got, "tenant-A-001")
++	}
++	if got := b.TenantAccessToken(); got != "tenant-B-001" {
++		t.Fatalf("tenant token for bot B after StartHeartbeat = %q, want %q", got, "tenant-B-001")
++	}
++	if got := serverA.count(); got != 1 {
++		t.Fatalf("auth request count for bot A = %d, want %d", got, 1)
++	}
++	if got := serverB.count(); got != 1 {
++		t.Fatalf("auth request count for bot B = %d, want %d", got, 1)
++	}
++}
++
++func TestHeartbeatStartStopCyclesKeepGoroutinesAndFDsBounded(t *testing.T) {
++
++
++
++
++	srv := newAuthServer(t, []authResponse{{token: "tenant-leak-001", expire: 7200}})
++	defer srv.close()
++
++	runtime.GC()
++	time.Sleep(100 * time.Millisecond)
++	beforeGoroutines := runtime.NumGoroutine()
++	beforeFDs := countFDs(t)
++
++	for i := 0; i < 100; i++ {
++		bot := lark.NewChatBot("app-id-leak", "secret-leak")
++		bot.SetDomain(srv.url())
++		requireNoError(t, bot.StartHeartbeat())
++		if got := bot.TenantAccessToken(); got != "tenant-leak-001" {
++			t.Fatalf("tenant token in leak-floor cycle %d = %q, want %q", i, got, "tenant-leak-001")
++		}
++		bot.StopHeartbeat()
++	}
++
++	runtime.GC()
++	time.Sleep(300 * time.Millisecond)
++	afterGoroutines := runtime.NumGoroutine()
++	afterFDs := countFDs(t)
++
++	if got := srv.count(); got != 100 {
++		t.Fatalf("auth request count after 100 start-stop cycles = %d, want %d", got, 100)
++	}
++	if delta := afterGoroutines - beforeGoroutines; delta > 10 {
++		t.Fatalf("goroutine delta after 100 start-stop cycles = %d, want <= %d (before=%d after=%d)", delta, 10, beforeGoroutines, afterGoroutines)
++	}
++	if delta := afterFDs - beforeFDs; delta > 20 {
++		t.Fatalf("fd delta after 100 start-stop cycles = %d, want <= %d (before=%d after=%d)", delta, 20, beforeFDs, afterFDs)
++	}
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,19 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++export GOPROXY=off
++export GOSUMDB=off
++export GOTOOLCHAIN=local
++export GOVCS='*:off'
++set -e
++cd /workspace/repo
++set -euo pipefail
++cd /workspace/repo
++
++exec go test -mod=readonly -v -count=1 ./usercase-test-coderl/...

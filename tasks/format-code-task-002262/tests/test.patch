@@ -1,0 +1,451 @@
+diff --git a/usercase-test-coderl/test_singlefile_storage_acceptance.py b/usercase-test-coderl/test_singlefile_storage_acceptance.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/test_singlefile_storage_acceptance.py
+@@ -0,0 +1,416 @@
++from __future__ import annotations
++
++import os
++import time
++import gc
++import tracemalloc
++
++import pytest
++
++from vdirsyncer import exceptions
++from vdirsyncer.storage.singlefile import SingleFileStorage
++from vdirsyncer.vobject import Item
++
++
++
++
++
++
++
++
++ALICE_RAW = """BEGIN:VCALENDAR
++VERSION:2.0
++PRODID:-//acceptance//singlefile//EN
++BEGIN:VEVENT
++SUMMARY:Alpha
++UID:alice
++END:VEVENT
++END:VCALENDAR"""
++
++BOB_RAW = """BEGIN:VCALENDAR
++VERSION:2.0
++PRODID:-//acceptance//singlefile//EN
++BEGIN:VEVENT
++SUMMARY:Beta
++UID:bob
++END:VEVENT
++END:VCALENDAR"""
++
++ALICE_UPDATED_RAW = """BEGIN:VCALENDAR
++VERSION:2.0
++PRODID:-//acceptance//singlefile//EN
++BEGIN:VEVENT
++SUMMARY:Alpha updated
++UID:alice
++END:VEVENT
++END:VCALENDAR"""
++
++ALICE_BATCH_UPDATED_RAW = """BEGIN:VCALENDAR
++VERSION:2.0
++PRODID:-//acceptance//singlefile//EN
++BEGIN:VEVENT
++SUMMARY:Alpha batch update
++UID:alice
++END:VEVENT
++END:VCALENDAR"""
++
++CASE_RAW = """BEGIN:VCALENDAR
++VERSION:2.0
++PRODID:-//acceptance//singlefile//EN
++BEGIN:VEVENT
++SUMMARY:Case
++UID:Alice
++END:VEVENT
++END:VCALENDAR"""
++
++OUTSIDE_RAW = """BEGIN:VCALENDAR
++VERSION:2.0
++PRODID:-//acceptance//singlefile//EN
++BEGIN:VEVENT
++SUMMARY:Outside
++UID:outside
++END:VEVENT
++END:VCALENDAR"""
++
++
++async def collect(async_iterable):
++    return [item async for item in async_iterable]
++
++
++def item_from(raw):
++    return Item(raw)
++
++
++def assert_item_has(item, *, uid, summary):
++
++
++    assert item.uid == uid
++    assert f"SUMMARY:{summary}" in item.raw
++
++
++@pytest.mark.asyncio
++async def test_constructor_create_and_discover_contract(tmp_path, monkeypatch):
++
++
++
++    home = tmp_path / "home"
++    home.mkdir()
++    monkeypatch.setenv("HOME", str(home))
++    existing = home / "calendar.ics"
++    existing.write_text("", encoding="utf-8")
++
++    s = SingleFileStorage(
++        "~/calendar.ics",
++        encoding="utf-8",
++        collection="work",
++        instance_name="local",
++        read_only=False,
++        no_delete=True,
++    )
++
++    assert s.storage_name == "singlefile"
++    assert s.path == str(existing)
++    assert s.encoding == "utf-8"
++    assert s.collection == "work"
++    assert s.instance_name == "local/work"
++    assert s.read_only is False
++    assert s.no_delete is True
++    assert await collect(s.list()) == []
++
++    with pytest.raises(exceptions.CollectionNotFound):
++        SingleFileStorage(str(tmp_path / "missing.ics"))
++    directory = tmp_path / "a-directory"
++    directory.mkdir()
++    with pytest.raises(OSError):
++        SingleFileStorage(str(directory))
++
++    pattern = str(tmp_path / "%s.ics")
++    created = await SingleFileStorage.create_collection(
++        "work",
++        path=pattern,
++        instance_name="main",
++        read_only=False,
++        no_delete=False,
++    )
++    assert created["path"] == str(tmp_path / "work.ics")
++    assert created["collection"] == "work"
++    assert created["instance_name"] == "main"
++    assert created["read_only"] is False
++    assert created["no_delete"] is False
++    assert (tmp_path / "work.ics").read_text(encoding="utf-8") == ""
++
++    exact = await SingleFileStorage.create_collection(None, path=str(tmp_path / "exact.ics"))
++    assert exact["path"] == str(tmp_path / "exact.ics")
++    assert exact["collection"] is None
++    assert (tmp_path / "exact.ics").read_text(encoding="utf-8") == ""
++
++    await SingleFileStorage.create_collection("blue", path=pattern)
++    await SingleFileStorage.create_collection("red", path=pattern)
++    discovered = sorted(
++        await collect(SingleFileStorage.discover(path=pattern)),
++        key=lambda kwargs: kwargs["collection"],
++    )
++
++
++    assert [(x["collection"], x["path"]) for x in discovered] == [
++        ("blue", str(tmp_path / "blue.ics")),
++        ("exact", str(tmp_path / "exact.ics")),
++        ("red", str(tmp_path / "red.ics")),
++        ("work", str(tmp_path / "work.ics")),
++    ]
++
++    with pytest.raises(TypeError):
++        await collect(SingleFileStorage.discover(path=pattern, collection="work"))
++    with pytest.raises(NotImplementedError):
++        await collect(SingleFileStorage.discover(path=str(tmp_path / "plain.ics")))
++    with pytest.raises(NotImplementedError):
++        await collect(SingleFileStorage.discover(path=str(tmp_path / "%s-%s.ics")))
++    with pytest.raises(ValueError):
++        await SingleFileStorage.create_collection("x", path=str(tmp_path / "plain.ics"))
++    with pytest.raises(ValueError):
++        await SingleFileStorage.create_collection("x", path=str(tmp_path / "%s-%s.ics"))
++
++
++@pytest.mark.asyncio
++async def test_item_session_crud_errors_and_case_sensitive_hrefs(tmp_path):
++
++
++
++    path = tmp_path / "items.ics"
++    path.write_text("", encoding="utf-8")
++    s = SingleFileStorage(str(path))
++
++    alice = item_from(ALICE_RAW)
++    bob = item_from(BOB_RAW)
++    alice_updated = item_from(ALICE_UPDATED_RAW)
++    case_variant = item_from(CASE_RAW)
++
++    assert await collect(s.list()) == []
++    assert await s.upload(alice) == ("alice", alice.hash)
++    assert await collect(s.list()) == [("alice", alice.hash)]
++    got_alice, got_alice_etag = await s.get("alice")
++    assert_item_has(got_alice, uid="alice", summary="Alpha")
++    assert got_alice_etag == alice.hash
++
++    assert await s.upload(bob) == ("bob", bob.hash)
++    assert await collect(s.list()) == [("alice", alice.hash), ("bob", bob.hash)]
++    multi = [
++        (href, item, etag)
++        async for href, item, etag in s.get_multi(["alice", "alice", "bob"])
++    ]
++    assert [(href, etag) for href, item, etag in multi] == [
++        ("alice", alice.hash),
++        ("bob", bob.hash),
++    ]
++    assert_item_has(multi[0][1], uid="alice", summary="Alpha")
++    assert_item_has(multi[1][1], uid="bob", summary="Beta")
++
++
++    assert await collect(SingleFileStorage(str(path)).list()) == [
++        ("alice", alice.hash),
++        ("bob", bob.hash),
++    ]
++
++    assert await s.upload(case_variant) == ("Alice", case_variant.hash)
++    assert await collect(s.list()) == [
++        ("alice", alice.hash),
++        ("bob", bob.hash),
++        ("Alice", case_variant.hash),
++    ]
++
++    with pytest.raises(exceptions.AlreadyExistingError) as duplicate:
++        await s.upload(Item(ALICE_RAW))
++    assert duplicate.value.existing_href == "alice"
++
++    with pytest.raises(exceptions.NotFoundError) as missing_get:
++        await s.get("missing")
++
++    assert isinstance(missing_get.value, exceptions.NotFoundError)
++
++    assert await s.update("alice", alice_updated, alice.hash) == alice_updated.hash
++    assert await collect(s.list()) == [
++        ("alice", alice_updated.hash),
++        ("bob", bob.hash),
++        ("Alice", case_variant.hash),
++    ]
++
++    with pytest.raises(exceptions.WrongEtagError) as stale_update:
++        await s.update("alice", alice, alice.hash)
++
++
++    assert isinstance(stale_update.value, exceptions.WrongEtagError)
++    assert await collect(s.list()) == [
++        ("alice", alice_updated.hash),
++        ("bob", bob.hash),
++        ("Alice", case_variant.hash),
++    ]
++
++    with pytest.raises(exceptions.NotFoundError) as missing_update:
++        await s.update("missing", alice, "etag")
++
++    assert isinstance(missing_update.value, exceptions.NotFoundError)
++
++    assert await s.delete("bob", bob.hash) is None
++    assert await collect(s.list()) == [
++        ("alice", alice_updated.hash),
++        ("Alice", case_variant.hash),
++    ]
++
++    with pytest.raises(exceptions.NotFoundError) as missing_delete:
++        await s.delete("bob", bob.hash)
++
++    assert isinstance(missing_delete.value, exceptions.NotFoundError)
++
++    with pytest.raises(exceptions.WrongEtagError) as stale_delete:
++        await s.delete("alice", alice.hash)
++
++
++    assert isinstance(stale_delete.value, exceptions.WrongEtagError)
++    assert await collect(s.list()) == [
++        ("alice", alice_updated.hash),
++        ("Alice", case_variant.hash),
++    ]
++
++
++@pytest.mark.asyncio
++async def test_at_once_buffers_writes_and_repeated_context_cleanup_is_idempotent(tmp_path):
++
++
++
++    path = tmp_path / "batch.ics"
++    path.write_text("", encoding="utf-8")
++    s = SingleFileStorage(str(path))
++    alice = item_from(ALICE_RAW)
++    bob = item_from(BOB_RAW)
++    alice_updated = item_from(ALICE_BATCH_UPDATED_RAW)
++
++    async with s.at_once():
++        assert await s.upload(alice) == ("alice", alice.hash)
++        assert await s.upload(bob) == ("bob", bob.hash)
++        assert path.read_text(encoding="utf-8") == ""
++
++    assert await collect(s.list()) == [("alice", alice.hash), ("bob", bob.hash)]
++
++
++    assert await collect(SingleFileStorage(str(path)).list()) == [
++        ("alice", alice.hash),
++        ("bob", bob.hash),
++    ]
++
++    async with s.at_once():
++        assert await s.update("alice", alice_updated, alice.hash) == alice_updated.hash
++        assert await s.delete("bob", bob.hash) is None
++
++    assert await collect(s.list()) == [("alice", alice_updated.hash)]
++
++
++    fresh_item, fresh_etag = await SingleFileStorage(str(path)).get("alice")
++    assert_item_has(fresh_item, uid="alice", summary="Alpha batch update")
++    assert fresh_etag == alice_updated.hash
++
++
++@pytest.mark.asyncio
++async def test_at_once_precondition_blocks_overwriting_external_file_changes(tmp_path):
++
++
++
++    path = tmp_path / "conflict.ics"
++    path.write_text("", encoding="utf-8")
++    s = SingleFileStorage(str(path))
++    alice = item_from(ALICE_RAW)
++    outside = item_from(OUTSIDE_RAW)
++
++    with pytest.raises(exceptions.PreconditionFailed) as conflict:
++        async with s.at_once():
++            assert await s.upload(alice) == ("alice", alice.hash)
++            time.sleep(1.1)
++            path.write_text(OUTSIDE_RAW, encoding="utf-8")
++
++
++    assert isinstance(conflict.value, exceptions.PreconditionFailed)
++
++
++    fresh = SingleFileStorage(str(path))
++    assert await collect(fresh.list()) == [("outside", outside.hash)]
++
++
++@pytest.mark.asyncio
++async def test_instances_keep_independent_file_backed_state(tmp_path):
++
++
++
++    a_path = tmp_path / "a.ics"
++    b_path = tmp_path / "b.ics"
++    a_path.write_text("", encoding="utf-8")
++    b_path.write_text("", encoding="utf-8")
++    a = SingleFileStorage(str(a_path))
++    b = SingleFileStorage(str(b_path))
++
++    alice = item_from(ALICE_RAW)
++    bob = item_from(BOB_RAW)
++    case_variant = item_from(CASE_RAW)
++
++    assert await a.upload(alice) == ("alice", alice.hash)
++    assert await b.upload(bob) == ("bob", bob.hash)
++    assert await a.upload(case_variant) == ("Alice", case_variant.hash)
++
++    assert await collect(a.list()) == [
++        ("alice", alice.hash),
++        ("Alice", case_variant.hash),
++    ]
++    assert await collect(b.list()) == [("bob", bob.hash)]
++
++
++@pytest.mark.asyncio
++async def test_missing_operations_raise_specific_ordering_errors(tmp_path):
++
++
++
++    path = tmp_path / "empty.ics"
++    path.write_text("", encoding="utf-8")
++    s = SingleFileStorage(str(path))
++
++    with pytest.raises(exceptions.NotFoundError) as get_error:
++        await s.get("missing")
++
++    assert isinstance(get_error.value, exceptions.NotFoundError)
++
++    with pytest.raises(exceptions.NotFoundError) as update_error:
++        await s.update("missing", item_from(ALICE_RAW), "etag")
++
++    assert isinstance(update_error.value, exceptions.NotFoundError)
++
++    with pytest.raises(exceptions.NotFoundError) as delete_error:
++        await s.delete("missing", "etag")
++
++    assert isinstance(delete_error.value, exceptions.NotFoundError)
++
++
++@pytest.mark.asyncio
++async def test_at_once_cleanup_leak_floor_keeps_pending_state_bounded(tmp_path):
++
++
++
++    gc.collect()
++    tracemalloc.start()
++
++    for index in range(150):
++        path = tmp_path / f"cycle-{index}.ics"
++        path.write_text("", encoding="utf-8")
++        s = SingleFileStorage(str(path))
++        alice = item_from(ALICE_RAW)
++        async with s.at_once():
++            assert await s.upload(alice) == ("alice", alice.hash)
++
++
++        fresh = SingleFileStorage(str(path))
++        assert await collect(fresh.list()) == [("alice", alice.hash)]
++        del fresh, s
++
++    gc.collect()
++    current, peak = tracemalloc.get_traced_memory()
++    tracemalloc.stop()
++
++
++    assert current >= 0
++    assert peak >= current
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,25 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++
++
++set -euo pipefail
++
++cd /workspace/repo
++export PIP_NO_INDEX=1
++export PYTHONPATH="/workspace/repo${PYTHONPATH:+:$PYTHONPATH}"
++export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
++
++
++if [ ! -f /workspace/repo/vdirsyncer/version.py ]; then
++  printf '%s\n' 'version = "0+localb"' > /workspace/repo/vdirsyncer/version.py
++fi
++exec python -m pytest -o addopts= -p pytest_asyncio.plugin /workspace/repo/usercase-test-coderl/test_singlefile_storage_acceptance.py -v

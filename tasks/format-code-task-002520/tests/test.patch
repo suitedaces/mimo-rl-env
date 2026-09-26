@@ -1,0 +1,271 @@
+diff --git a/usercase-test-coderl/test_checkdmarc.py b/usercase-test-coderl/test_checkdmarc.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/test_checkdmarc.py
+@@ -0,0 +1,231 @@
++from types import SimpleNamespace
++
++import aiodns
++import pytest
++
++from pyoti.domains import CheckDMARC
++
++
++
++
++DNS_TXT = {
++    "example.com": [("v=spf1 include:_spf.example.com -all", 300)],
++    "_dmarc.example.com": [
++        ("v=DMARC1; p=reject; rua=mailto:dmarc@example.com", 600)
++    ],
++    "missing-dmarc.test": [("v=spf1 include:_spf.example.com -all", 300)],
++    "_dmarc.missing-dmarc.test": [],
++    "none-policy.test": [("v=spf1 include:_spf.example.com ~all", 301)],
++    "_dmarc.none-policy.test": [
++        ("v=DMARC1; p=none; rua=mailto:dmarc@example.com", 601)
++    ],
++    "weak-spf.test": [("v=spf1 include:_spf.example.com ?all", 302)],
++    "_dmarc.weak-spf.test": [
++        ("v=DMARC1; p=quarantine; rua=mailto:dmarc@example.com", 602)
++    ],
++}
++
++
++@pytest.fixture
++def deterministic_dns(monkeypatch):
++    calls = []
++
++    class DeterministicResolver:
++        def __init__(self, *args, **kwargs):
++
++            nameservers = kwargs.get("nameservers")
++            if nameservers is None and args and isinstance(args[0], (list, tuple)):
++                nameservers = args[0]
++            calls.append(("init", tuple(nameservers or [])))
++
++        async def query(self, host, record):
++            calls.append(("query", host, record))
++            if host == "dns-error.test":
++                raise aiodns.error.DNSError(4, "Domain name not found")
++            return [
++                SimpleNamespace(text=text, ttl=ttl)
++                for text, ttl in DNS_TXT.get(host, [])
++            ]
++
++    monkeypatch.setattr(aiodns, "DNSResolver", DeterministicResolver)
++    return calls
++
++
++def query_events(calls):
++    return [call for call in calls if call[0] == "query"]
++
++
++def assert_txt_query_made(calls, host):
++    assert ("query", host, "TXT") in query_events(calls)
++
++
++def test_query_txt_returns_txt_records_and_empty_list_on_dns_failure(deterministic_dns):
++
++
++
++
++    checker = CheckDMARC("example.com")
++
++    records = checker.query_txt("example.com")
++    assert [(record.text, record.ttl) for record in records] == [
++        ("v=spf1 include:_spf.example.com -all", 300)
++    ]
++
++    assert_txt_query_made(deterministic_dns, "example.com")
++
++    assert checker.query_txt("dns-error.test") == []
++
++    assert_txt_query_made(deterministic_dns, "dns-error.test")
++
++
++def test_check_domain_returns_exact_non_spoofable_result(deterministic_dns):
++
++
++
++
++    checker = CheckDMARC("example.com")
++
++    result = checker.check_domain()
++
++    assert result["domain"] == "example.com"
++    assert result == {
++        "domain": "example.com",
++        "dmarc": {
++            "txt": "v=DMARC1; p=reject; rua=mailto:dmarc@example.com",
++            "ttl": 600,
++        },
++        "spf": {"txt": "v=spf1 include:_spf.example.com -all", "ttl": 300},
++        "spoofable": False,
++    }
++
++    assert_txt_query_made(deterministic_dns, "example.com")
++    assert_txt_query_made(deterministic_dns, "_dmarc.example.com")
++
++
++def test_check_domain_with_default_domain_returns_empty_spoofable_result(
++    deterministic_dns,
++):
++
++
++
++
++    checker = CheckDMARC()
++
++    result = checker.check_domain()
++
++    assert result["domain"] is None
++    assert result == {
++        "domain": None,
++        "dmarc": {},
++        "spf": {},
++        "spoofable": True,
++    }
++
++    assert set(result) == {"domain", "dmarc", "spf", "spoofable"}
++
++
++def test_check_domain_marks_missing_dmarc_as_spoofable(deterministic_dns):
++
++
++
++
++    checker = CheckDMARC("missing-dmarc.test")
++
++    assert checker.check_domain() == {
++        "domain": "missing-dmarc.test",
++        "dmarc": {},
++        "spf": {"txt": "v=spf1 include:_spf.example.com -all", "ttl": 300},
++        "spoofable": True,
++    }
++
++
++def test_check_domain_marks_dmarc_none_policy_as_spoofable(deterministic_dns):
++
++
++
++
++    checker = CheckDMARC("none-policy.test")
++
++    assert checker.check_domain() == {
++        "domain": "none-policy.test",
++        "dmarc": {
++            "txt": "v=DMARC1; p=none; rua=mailto:dmarc@example.com",
++            "ttl": 601,
++        },
++        "spf": {"txt": "v=spf1 include:_spf.example.com ~all", "ttl": 301},
++        "spoofable": True,
++    }
++
++
++def test_check_domain_marks_spf_without_hard_or_soft_all_as_spoofable(
++    deterministic_dns,
++):
++
++
++
++
++    checker = CheckDMARC("weak-spf.test")
++
++    assert checker.check_domain() == {
++        "domain": "weak-spf.test",
++        "dmarc": {
++            "txt": "v=DMARC1; p=quarantine; rua=mailto:dmarc@example.com",
++            "ttl": 602,
++        },
++        "spf": {"txt": "v=spf1 include:_spf.example.com ?all", "ttl": 302},
++        "spoofable": True,
++    }
++
++
++def test_two_checkers_keep_constructor_domain_state_independent(deterministic_dns):
++
++
++
++
++    a = CheckDMARC("example.com")
++    b = CheckDMARC("missing-dmarc.test")
++
++    a_result = a.check_domain()
++    b_result = b.check_domain()
++
++
++    assert a_result["domain"] == "example.com"
++    assert b_result["domain"] == "missing-dmarc.test"
++    assert a_result == {
++        "domain": "example.com",
++        "dmarc": {
++            "txt": "v=DMARC1; p=reject; rua=mailto:dmarc@example.com",
++            "ttl": 600,
++        },
++        "spf": {"txt": "v=spf1 include:_spf.example.com -all", "ttl": 300},
++        "spoofable": False,
++    }
++    assert b_result == {
++        "domain": "missing-dmarc.test",
++        "dmarc": {},
++        "spf": {"txt": "v=spf1 include:_spf.example.com -all", "ttl": 300},
++        "spoofable": True,
++    }
++
++
++def test_repeated_checker_cycles_stay_consistent(deterministic_dns):
++
++
++
++
++    expected = {
++        "domain": "example.com",
++        "dmarc": {
++            "txt": "v=DMARC1; p=reject; rua=mailto:dmarc@example.com",
++            "ttl": 600,
++        },
++        "spf": {"txt": "v=spf1 include:_spf.example.com -all", "ttl": 300},
++        "spoofable": False,
++    }
++
++    for _ in range(100):
++        checker = CheckDMARC("example.com")
++        assert checker.check_domain() == expected
++
++
++    assert CheckDMARC("example.com").check_domain() == expected
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,30 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++
++cd /workspace/repo
++
++export PIP_NO_INDEX=1
++export PIP_DISABLE_PIP_VERSION_CHECK=1
++export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
++export PYTHONPATH="/workspace/repo:${PYTHONPATH:-}"
++
++python - <<'PY'
++import aiodns
++import disposable_email_domains
++import pycares
++import pytest
++import requests
++import setuptools
++PY
++
++exec python -m pytest /workspace/repo/usercase-test-coderl/test_checkdmarc.py -v

@@ -1,0 +1,336 @@
+diff --git a/tests/unit/test_storage_bulk_contract.py b/tests/unit/test_storage_bulk_contract.py
+new file mode 100644
+index 0000000..10ac8b4
+--- /dev/null
++++ b/tests/unit/test_storage_bulk_contract.py
+@@ -0,0 +1,321 @@
++import sys
++
++import pytest
++
++
++
++from redis.commands.search import index_definition
++
++sys.modules.setdefault("redis.commands.search.indexDefinition", index_definition)
++
++from redisvl.index.storage import HashStorage, JsonStorage
++
++
++class _PipelineJson:
++    def __init__(self, pipe):
++        self.pipe = pipe
++
++    def set(self, key, path, value):
++        self.pipe.pending.append(("set", key, value))
++
++    def get(self, key):
++        self.pipe.pending.append(("get", key))
++
++
++class _Pipeline:
++    def __init__(self, client):
++        self.client = client
++        self.pending = []
++        self.executions = []
++        self.write_batches = []
++
++    def __enter__(self):
++        return self
++
++    def __exit__(self, *exc):
++        return False
++
++    def json(self):
++        return _PipelineJson(self)
++
++    def hset(self, name, mapping):
++        self.pending.append(("hset", name, dict(mapping)))
++
++    def hgetall(self, key):
++        self.pending.append(("get", key))
++
++    def expire(self, key, ttl):
++        self.pending.append(("expire", key, ttl))
++
++    def delete(self, key):
++        self.pending.append(("delete", key))
++
++    def execute(self):
++        commands = self.pending
++        self.pending = []
++        self.executions.append(commands)
++        self.write_batches.append(
++            sum(command[0] in ("hset", "set") for command in commands)
++        )
++        results = []
++        for command in commands:
++            op, key, *args = command
++            if op == "hset":
++                self.client.values[key] = args[0]
++                results.append(1)
++            elif op == "set":
++                self.client.values[key] = args[0]
++                results.append(True)
++            elif op == "expire":
++                self.client.expirations.append((key, args[0]))
++                results.append(True)
++            elif op == "get":
++                results.append(self.client.values.get(key))
++            elif op == "delete":
++                self.client.values.pop(key, None)
++                results.append(1)
++        return results
++
++
++class _SyncClient:
++    def __init__(self):
++        self.values = {}
++        self.expirations = []
++        self.pipes = []
++
++    def pipeline(self, transaction=False):
++        pipe = _Pipeline(self)
++        self.pipes.append(pipe)
++        return pipe
++
++    def expire(self, key, ttl):
++        self.expirations.append((key, ttl))
++        return True
++
++
++class _AsyncJson:
++    def __init__(self, client):
++        self.client = client
++
++    async def set(self, key, path, value):
++        self.client.values[key] = value
++        return True
++
++    async def get(self, key):
++        return self.client.values.get(key)
++
++
++class _AsyncClient:
++    def __init__(self):
++        self.values = {}
++        self.expirations = []
++
++    async def hset(self, name, mapping):
++        self.values[name] = dict(mapping)
++        return 1
++
++    async def hgetall(self, key):
++        return self.values.get(key, {})
++
++    async def expire(self, key, ttl):
++        self.expirations.append((key, ttl))
++        return True
++
++    def json(self):
++        return _AsyncJson(self)
++
++
++@pytest.fixture(params=[HashStorage, JsonStorage])
++def storage(request):
++    return request.param(prefix="items", key_separator=":")
++
++
++@pytest.fixture
++def sync_client():
++    return _SyncClient()
++
++
++@pytest.fixture
++def async_client():
++    return _AsyncClient()
++
++
++def test_sync_write_accepts_generators_batches_and_applies_ttl(
++    storage, sync_client
++):
++    records = ({"id": value, "body": value.upper()} for value in ("a", "b", "c"))
++
++    keys = storage.write(
++        sync_client, records, id_field="id", ttl=30, batch_size=2
++    )
++
++    assert keys == ["items:a", "items:b", "items:c"]
++    assert sync_client.values["items:a"]["body"] == "A"
++    assert sync_client.values["items:c"]["body"] == "C"
++    assert sync_client.pipes[0].write_batches == [2, 1]
++    assert sync_client.expirations == [
++        ("items:a", 30),
++        ("items:b", 30),
++        ("items:c", 30),
++    ]
++
++
++def test_sync_write_applies_zero_ttl(storage, sync_client):
++    storage.write(sync_client, [{"id": "zero"}], id_field="id", ttl=0)
++    assert sync_client.expirations == [("items:zero", 0)]
++
++
++def test_empty_write_is_a_noop(storage, sync_client):
++    assert storage.write(sync_client, (item for item in ()), batch_size=4) == []
++
++
++def test_sync_write_rejects_nonpositive_batch_size(storage, sync_client):
++    with pytest.raises(ValueError):
++        storage.write(sync_client, [], batch_size=0)
++    with pytest.raises(ValueError):
++        storage.write(sync_client, [], batch_size=-2)
++
++
++def test_sync_write_rejects_mismatched_keys_before_writes(storage, sync_client):
++    with pytest.raises(ValueError, match="Length of keys"):
++        storage.write(
++            sync_client,
++            ({"id": "a"}, {"id": "b"}),
++            keys=(key for key in ("only",)),
++        )
++    assert sync_client.values == {}
++
++
++def test_sync_write_rejects_invalid_ttl(storage, sync_client):
++    with pytest.raises(ValueError):
++        storage.write(sync_client, [], ttl=-1)
++    with pytest.raises(ValueError):
++        storage.write(sync_client, [], ttl=1.5)
++
++
++def test_sync_get_accepts_generators_and_preserves_order(storage, sync_client):
++    sync_client.values.update(
++        {
++            "items:first": {"value": b"one"},
++            "items:second": {"value": b"two"},
++        }
++    )
++
++    result = storage.get(
++        sync_client, (key for key in ("items:first", "items:second")), batch_size=1
++    )
++
++    assert result == [{"value": "one"}, {"value": "two"}]
++
++
++def test_sync_get_empty_input_is_a_noop(storage, sync_client):
++    assert storage.get(sync_client, (key for key in ())) == []
++
++
++def test_sync_get_rejects_invalid_batch_size_and_key_types(storage, sync_client):
++    with pytest.raises(ValueError):
++        storage.get(sync_client, [], batch_size=0)
++
++
++def test_sync_get_rejects_non_string_keys(storage, sync_client):
++    with pytest.raises(TypeError):
++        storage.get(sync_client, ["items:first", 3])
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("storage_class", [HashStorage, JsonStorage])
++async def test_async_write_accepts_generators_and_preserves_key_order(
++    storage_class, async_client
++):
++    storage = storage_class(prefix="items", key_separator=":")
++    records = ({"id": value, "body": value} for value in ("a", "b", "c"))
++    keys = ("items:" + value for value in ("a", "b", "c"))
++
++    written = await storage.awrite(async_client, records, keys=keys, ttl=30, concurrency=2)
++    assert written == ["items:a", "items:b", "items:c"]
++    assert [async_client.values[key]["body"] for key in written] == ["a", "b", "c"]
++    assert async_client.expirations == [(key, 30) for key in written]
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("storage_class", [HashStorage, JsonStorage])
++async def test_async_get_accepts_generators_and_preserves_order(
++    storage_class, async_client
++):
++    storage = storage_class(prefix="items", key_separator=":")
++    async_client.values.update(
++        {
++            "items:first": {"body": b"one"},
++            "items:second": {"body": b"two"},
++        }
++    )
++
++    fetched = await storage.aget(
++        async_client, (key for key in ("items:first", "items:second")), concurrency=2
++    )
++    assert [record["body"] for record in fetched] == ["one", "two"]
++
++
++@pytest.mark.asyncio
++async def test_async_write_applies_zero_ttl(async_client):
++    storage = HashStorage(prefix="items", key_separator=":")
++    await storage.awrite(
++        async_client, [{"id": "zero"}], keys=["items:zero"], ttl=0
++    )
++    assert async_client.expirations == [("items:zero", 0)]
++
++
++@pytest.mark.asyncio
++async def test_async_write_empty_input_is_a_noop(async_client):
++    storage = HashStorage(prefix="items", key_separator=":")
++    assert await storage.awrite(async_client, (item for item in ()), concurrency=2) == []
++    assert async_client.values == {}
++
++
++@pytest.mark.asyncio
++async def test_async_write_rejects_invalid_ttl(async_client):
++    storage = HashStorage(prefix="items", key_separator=":")
++    with pytest.raises(ValueError):
++        await storage.awrite(async_client, [], ttl=-1)
++    with pytest.raises(ValueError):
++        await storage.awrite(async_client, [], ttl=1.5)
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("storage_class", [HashStorage, JsonStorage])
++async def test_async_get_empty_input_is_a_noop(storage_class, async_client):
++    storage = storage_class(prefix="items", key_separator=":")
++    assert await storage.aget(async_client, (key for key in ())) == []
++
++
++@pytest.mark.asyncio
++async def test_async_write_rejects_mismatched_keys_before_writes(async_client):
++    storage = HashStorage(prefix="items", key_separator=":")
++    with pytest.raises(ValueError, match="Length of keys"):
++        await storage.awrite(
++            async_client,
++            ({"id": "a"}, {"id": "b"}),
++            keys=(key for key in ("items:a",)),
++        )
++    assert async_client.values == {}
++
++
++@pytest.mark.asyncio
++async def test_async_operations_reject_nonpositive_concurrency(async_client):
++    storage = HashStorage(prefix="items", key_separator=":")
++    with pytest.raises(ValueError):
++        await storage.awrite(async_client, [], concurrency=0)
++
++
++@pytest.mark.asyncio
++async def test_async_get_rejects_nonpositive_concurrency(async_client):
++    storage = HashStorage(prefix="items", key_separator=":")
++    with pytest.raises(ValueError):
++        await storage.aget(async_client, [], concurrency=-1)
++
++
++@pytest.mark.asyncio
++async def test_async_get_rejects_non_string_keys(async_client):
++    storage = HashStorage(prefix="items", key_separator=":")
++    with pytest.raises(TypeError):
++        await storage.aget(async_client, ["items:first", 3])
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,4 @@
++#!/bin/bash
++set -euo pipefail
++
++pytest -q tests/unit/test_storage_bulk_contract.py

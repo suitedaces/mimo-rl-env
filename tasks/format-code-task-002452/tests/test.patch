@@ -1,0 +1,234 @@
+diff --git a/satpy/tests/writer_tests/test_cf.py b/satpy/tests/writer_tests/test_cf.py
+index 508c7d8a5..621450f0c 100644
+--- a/satpy/tests/writer_tests/test_cf.py
++++ b/satpy/tests/writer_tests/test_cf.py
+@@ -17,6 +17,7 @@
+ # satpy.  If not, see <http://www.gnu.org/licenses/>.
+ """Tests for the CF writer."""
+ 
++import logging
+ import os
+ import tempfile
+ import unittest
+@@ -1132,6 +1133,182 @@ class TestCFWriter(unittest.TestCase):
+                 self.assertIn('Created by pytroll/satpy on', f.attrs['history'])
+ 
+ 
++def _assert_xy_metadata(obj, x_standard_name, x_units, y_standard_name, y_units):
++    """Assert public CF x/y coordinate metadata."""
++    assert obj["x"].attrs["standard_name"] == x_standard_name
++    assert obj["x"].attrs["units"] == x_units
++    assert obj["y"].attrs["standard_name"] == y_standard_name
++    assert obj["y"].attrs["units"] == y_units
++
++
++def _data_array_with_area(area, name="test_data"):
++    """Create a small DataArray with x/y/CRS coordinates from *area*."""
++    import xarray as xr
++
++    from satpy.resample import add_crs_xy_coords
++
++    data = xr.DataArray(
++        np.arange(24).reshape(4, 6),
++        dims=("y", "x"),
++        name=name,
++        attrs={"area": area},
++    )
++    return add_crs_xy_coords(data, area)
++
++
++def test_cf_writer_geographic_area_writes_lonlat_xy_metadata(tmp_path):
++    """Geographic areas written by the CF writer use lon/lat x/y metadata."""
++    import xarray as xr
++    from pyresample import create_area_def
++
++    from satpy import Scene
++    from satpy.resample import add_crs_xy_coords
++
++    area = create_area_def(
++        "geo_file_area",
++        4326,
++        shape=(5, 5),
++        center=(0, 0),
++        resolution=(1, 1),
++    )
++    data = xr.DataArray(
++        np.arange(25).reshape(5, 5),
++        dims=("y", "x"),
++        name="geographic_file_data",
++        attrs={"area": area},
++    )
++    data = add_crs_xy_coords(data, area)
++    scn = Scene()
++    scn["geographic_file_data"] = data
++
++    filename = os.fspath(tmp_path / "geographic_area.nc")
++    scn.save_datasets(filename=filename, writer="cf", include_lonlats=False)
++
++    with xr.open_dataset(filename) as ds:
++        _assert_xy_metadata(
++            ds,
++            "longitude",
++            "degrees_east",
++            "latitude",
++            "degrees_north",
++        )
++
++
++def test_da2cf_custom_geographic_area_encodes_lonlat_xy_metadata():
++    """A non-EPSG-shorthand geographic CRS is encoded as lon/lat metadata."""
++    from pyresample import create_area_def
++
++    from satpy.writers.cf_writer import CFWriter
++
++    area = create_area_def(
++        "custom_lonlat_area",
++        {"proj": "longlat", "datum": "WGS84", "type": "crs"},
++        shape=(4, 6),
++        center=(12.5, 48.0),
++        resolution=(0.25, 0.25),
++        units="degrees",
++    )
++
++    result = CFWriter.da2cf(_data_array_with_area(area, name="custom_geo_data"))
++
++    _assert_xy_metadata(
++        result,
++        "longitude",
++        "degrees_east",
++        "latitude",
++        "degrees_north",
++    )
++    assert "crs" not in result.coords
++
++
++def test_da2cf_uses_crs_not_area_name_or_existing_xy_units():
++    """CRS semantics, not fixture names or stale x/y units, choose metadata."""
++    from pyresample import create_area_def
++
++    from satpy.writers.cf_writer import CFWriter
++
++    area = create_area_def(
++        "unlisted_lonlat_area",
++        {"proj": "longlat", "datum": "WGS84", "type": "crs"},
++        shape=(4, 6),
++        center=(-35.0, 12.0),
++        resolution=(0.5, 0.5),
++        units="degrees",
++    )
++    data = _data_array_with_area(area, name="geo_crs_precedence_data")
++    data["x"].attrs["units"] = "m"
++    data["y"].attrs["units"] = "m"
++
++    result = CFWriter.da2cf(data)
++
++    _assert_xy_metadata(
++        result,
++        "longitude",
++        "degrees_east",
++        "latitude",
++        "degrees_north",
++    )
++    assert "crs" not in result.coords
++
++
++def test_da2cf_projected_area_preserves_projected_xy_metadata():
++    """Projected areas keep projected x/y coordinate metadata."""
++    from pyresample import create_area_def
++
++    from satpy.writers.cf_writer import CFWriter
++
++    area = create_area_def(
++        "projected_area",
++        {"proj": "eqc", "lat_ts": 0, "lat_0": 0, "lon_0": 0,
++         "x_0": 0, "y_0": 0, "ellps": "sphere", "units": "m",
++         "no_defs": None, "type": "crs"},
++        units="m",
++        shape=(4, 6),
++        resolution=1000,
++        center=(0, 0),
++    )
++
++    result = CFWriter.da2cf(_data_array_with_area(area, name="projected_data"))
++
++    _assert_xy_metadata(
++        result,
++        "projection_x_coordinate",
++        "m",
++        "projection_y_coordinate",
++        "m",
++    )
++    assert "crs" not in result.coords
++
++
++def test_da2cf_indeterminate_projection_warns_and_defaults_to_projected(caplog):
++    """Ambiguous x/y coordinates remain projected-compatible and warn."""
++    import xarray as xr
++
++    from satpy.writers.cf_writer import CFWriter
++
++    data = xr.DataArray(
++        np.arange(12).reshape(3, 4),
++        dims=("y", "x"),
++        coords={
++            "x": xr.DataArray(np.arange(4), dims=("x",)),
++            "y": xr.DataArray(np.arange(3), dims=("y",)),
++        },
++        name="ambiguous_data",
++    )
++
++    with caplog.at_level(logging.WARNING):
++        result = CFWriter.da2cf(data)
++
++    assert caplog.records
++    _assert_xy_metadata(
++        result,
++        "projection_x_coordinate",
++        "m",
++        "projection_y_coordinate",
++        "m",
++    )
++
++
+ class TestCFWriterData(unittest.TestCase):
+     """Test case for CF writer where data arrays are needed."""
+ 
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,34 @@
++#!/bin/bash
++set -uo pipefail
++cd /testbed
++
++
++if [ ! -x /testbed/.venv/bin/python3 ] || [ ! -f /testbed/.venv/pyvenv.cfg ]; then
++  rm -rf /testbed/.venv
++  python3 -m venv /testbed/.venv
++fi
++/testbed/.venv/bin/python3 -m pip install -U pip setuptools wheel
++/testbed/.venv/bin/python3 -m pip install -e '.[cf]' pytest dask[array] netCDF4 h5netcdf 'numpy<2.0' 'zarr<3' 'xarray==2022.12.0' 'pandas<2.0'
++
++
++NEW_TESTS=(
++  satpy/tests/writer_tests/test_cf.py::test_cf_writer_geographic_area_writes_lonlat_xy_metadata
++  satpy/tests/writer_tests/test_cf.py::test_da2cf_custom_geographic_area_encodes_lonlat_xy_metadata
++  satpy/tests/writer_tests/test_cf.py::test_da2cf_uses_crs_not_area_name_or_existing_xy_units
++  satpy/tests/writer_tests/test_cf.py::test_da2cf_projected_area_preserves_projected_xy_metadata
++  satpy/tests/writer_tests/test_cf.py::test_da2cf_indeterminate_projection_warns_and_defaults_to_projected
++)
++
++case "${1:-}" in
++  base)
++    /testbed/.venv/bin/python3 -m pytest satpy/tests/writer_tests/test_cf.py -x -v \
++      -k 'not test_cf_writer_geographic_area_writes_lonlat_xy_metadata and not test_da2cf_custom_geographic_area_encodes_lonlat_xy_metadata and not test_da2cf_uses_crs_not_area_name_or_existing_xy_units and not test_da2cf_projected_area_preserves_projected_xy_metadata and not test_da2cf_indeterminate_projection_warns_and_defaults_to_projected'
++    ;;
++  new)
++    /testbed/.venv/bin/python3 -m pytest "${NEW_TESTS[@]}" -v
++    ;;
++  *)
++    echo "usage: $0 base|new"
++    exit 2
++    ;;
++esac

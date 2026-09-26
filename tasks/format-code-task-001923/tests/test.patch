@@ -1,0 +1,112 @@
+diff --git a/pkg/util/cache/reload_contract_test.go b/pkg/util/cache/reload_contract_test.go
+new file mode 100644
+index 0000000000..cdb9c4ef0c
+--- /dev/null
++++ b/pkg/util/cache/reload_contract_test.go
+@@ -0,0 +1,95 @@
++package cache_test
++
++import (
++	"context"
++	"errors"
++	"sync/atomic"
++	"testing"
++
++	"github.com/stretchr/testify/require"
++
++	"github.com/milvus-io/milvus/pkg/v2/util/cache"
++)
++
++func TestReloadFailureIsVisibleAndRetryable(t *testing.T) {
++	reloadErr := errors.New("reload unavailable")
++	var attempts atomic.Int32
++
++	builder := cache.NewCacheBuilder[string, string]()
++	builder.WithLoader(func(context.Context, string) (string, error) { return "before", nil })
++	builder.WithReloader(func(context.Context, string) (string, error) {
++		if attempts.Add(1) == 1 {
++			return "", reloadErr
++		}
++		return "after", nil
++	})
++	c := builder.Build()
++
++	missing, err := c.Do(context.Background(), "segment", func(_ context.Context, value string) error {
++		require.Equal(t, "before", value)
++		return nil
++	})
++	require.True(t, missing)
++	require.NoError(t, err)
++	require.True(t, c.MarkItemNeedReload(context.Background(), "segment"))
++
++	called := false
++	missing, err = c.Do(context.Background(), "segment", func(_ context.Context, value string) error {
++		called = true
++		require.Equal(t, "before", value)
++		return nil
++	})
++	require.False(t, missing)
++	require.ErrorIs(t, err, reloadErr)
++	require.False(t, called, "a failed reload must not run the operation on stale data")
++
++	missing, err = c.Do(context.Background(), "segment", func(_ context.Context, value string) error {
++		require.Equal(t, "after", value)
++		return nil
++	})
++	require.False(t, missing)
++	require.NoError(t, err)
++	require.Equal(t, int32(2), attempts.Load(), "a failed reload must remain retryable")
++}
++
++func TestReloadCancellationIsReturnedAndDoesNotClearMarker(t *testing.T) {
++	var attempts atomic.Int32
++	builder := cache.NewCacheBuilder[string, string]()
++	builder.WithLoader(func(context.Context, string) (string, error) { return "before", nil })
++	builder.WithReloader(func(ctx context.Context, _ string) (string, error) {
++		attempts.Add(1)
++		if err := ctx.Err(); err != nil {
++			return "", err
++		}
++		return "after", nil
++	})
++	c := builder.Build()
++
++	_, err := c.Do(context.Background(), "segment", func(_ context.Context, _ string) error { return nil })
++	require.NoError(t, err)
++	require.True(t, c.MarkItemNeedReload(context.Background(), "segment"))
++
++	ctx, cancel := context.WithCancel(context.Background())
++	cancel()
++	called := false
++	missing, err := c.Do(ctx, "segment", func(_ context.Context, _ string) error {
++		called = true
++		return nil
++	})
++	require.False(t, missing)
++	require.ErrorIs(t, err, context.Canceled)
++	require.False(t, called)
++
++	missing, err = c.Do(context.Background(), "segment", func(_ context.Context, value string) error {
++		require.Equal(t, "after", value)
++		return nil
++	})
++	require.False(t, missing)
++	require.NoError(t, err)
++	require.Equal(t, int32(2), attempts.Load())
++}
++
++func TestMarkItemNeedReloadOnlyMarksResidentItems(t *testing.T) {
++	c := cache.NewCacheBuilder[string, string]().Build()
++	require.False(t, c.MarkItemNeedReload(context.Background(), "missing"))
++}
++
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,5 @@
++#!/bin/bash
++set -euo pipefail
++
++cd pkg
++go test ./util/cache -run 'TestReload(FailureIsVisibleAndRetryable|CancellationIsReturnedAndDoesNotClearMarker)|TestMarkItemNeedReloadOnlyMarksResidentItems' -count=1

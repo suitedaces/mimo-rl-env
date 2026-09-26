@@ -1,0 +1,277 @@
+diff --git a/command/agent/cache/pass_through_test.go b/command/agent/cache/pass_through_test.go
+new file mode 100644
+index 0000000000..206ad66245
+--- /dev/null
++++ b/command/agent/cache/pass_through_test.go
+@@ -0,0 +1,241 @@
++package cache
++
++import (
++	"context"
++	"errors"
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++
++	hclog "github.com/hashicorp/go-hclog"
++	"github.com/hashicorp/vault/api"
++)
++
++type scriptedProxier struct {
++	responses []*SendResponse
++	errs      []error
++	next      int
++}
++
++func (p *scriptedProxier) Send(ctx context.Context, req *SendRequest) (*SendResponse, error) {
++	if p.next >= len(p.responses) {
++		return nil, errors.New("scripted proxier exhausted")
++	}
++	resp := p.responses[p.next]
++	var err error
++	if p.next < len(p.errs) {
++		err = p.errs[p.next]
++	}
++	p.next++
++	return resp, err
++}
++
++func makeSendResponse(status int, contentType, body string, extra http.Header) *SendResponse {
++	header := make(http.Header)
++	if contentType != "" {
++		header.Set("Content-Type", contentType)
++	}
++	for key, values := range extra {
++		for _, value := range values {
++			header.Add(key, value)
++		}
++	}
++	return &SendResponse{
++		Response: &api.Response{
++			Response: &http.Response{
++				StatusCode: status,
++				Status:     http.StatusText(status),
++				Header:     header,
++				Body:       io.NopCloser(strings.NewReader(body)),
++				Request:    httptest.NewRequest("GET", "http://example.com/v1/secret/data/example", nil),
++			},
++		},
++		ResponseBody: []byte(body),
++	}
++}
++
++func readResponseBody(t *testing.T, resp *SendResponse) string {
++	t.Helper()
++	if resp.ResponseBody != nil {
++		return string(resp.ResponseBody)
++	}
++	data, err := io.ReadAll(resp.Response.Body)
++	if err != nil {
++		t.Fatal(err)
++	}
++	return string(data)
++}
++
++func TestAgentCacheListenerPassesThroughVaultErrorResponses(t *testing.T) {
++	tests := []struct {
++		name   string
++		status int
++		body   string
++		header string
++	}{
++		{
++			name:   "not found response",
++			status: http.StatusNotFound,
++			body:   `{"errors":["missing path from upstream"]}`,
++			header: "missing-path-case",
++		},
++		{
++			name:   "permission response",
++			status: http.StatusForbidden,
++			body:   `{"errors":["denied by upstream"]}`,
++			header: "permission-case",
++		},
++		{
++			name:   "bad request response",
++			status: http.StatusBadRequest,
++			body:   `{"errors":["bad request from upstream"]}`,
++			header: "bad-request-case",
++		},
++	}
++
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			upstreamHeaders := http.Header{
++				"X-Vault-Test-Passthrough": []string{tc.header},
++				"X-Vault-Request":          []string{"request-" + tc.header},
++			}
++			proxier := &scriptedProxier{
++				responses: []*SendResponse{
++					makeSendResponse(tc.status, "application/json", tc.body, upstreamHeaders),
++				},
++				errs: []error{errors.New("vault returned an HTTP error response")},
++			}
++
++			handler := Handler(context.Background(), hclog.NewNullLogger(), proxier, nil)
++			rec := httptest.NewRecorder()
++			req := httptest.NewRequest("GET", "http://example.com/v1/secret/data/example", nil)
++			handler.ServeHTTP(rec, req)
++
++			if rec.Code != tc.status {
++				t.Fatalf("expected upstream status %d to pass through, got %d with body %q", tc.status, rec.Code, rec.Body.String())
++			}
++			if rec.Code == http.StatusInternalServerError {
++				t.Fatalf("expected Vault-originated error not to be rewritten as a 500")
++			}
++			if got := rec.Body.String(); got != tc.body {
++				t.Fatalf("expected upstream body %q, got %q", tc.body, got)
++			}
++			if strings.Contains(rec.Body.String(), "failed to get the response:") {
++				t.Fatalf("expected Vault-originated response body, got Agent wrapper body %q", rec.Body.String())
++			}
++			if got := rec.Header().Get("X-Vault-Test-Passthrough"); got != tc.header {
++				t.Fatalf("expected passthrough header %q, got %q", tc.header, got)
++			}
++			if got := rec.Header().Get("X-Vault-Request"); got != "request-"+tc.header {
++				t.Fatalf("expected Vault request header to pass through, got %q", got)
++			}
++		})
++	}
++}
++
++func TestAgentCacheListenerPreservesErrorsReturnedByAPIProxy(t *testing.T) {
++	const body = `{"errors":["api proxy saw bad input"]}`
++
++	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		w.Header().Set("Content-Type", "application/json")
++		w.Header().Set("X-Vault-Request", "api-proxy-request")
++		w.WriteHeader(http.StatusBadRequest)
++		io.WriteString(w, body)
++	}))
++	defer upstream.Close()
++
++	client, err := api.NewClient(&api.Config{Address: upstream.URL})
++	if err != nil {
++		t.Fatal(err)
++	}
++	proxier, err := NewAPIProxy(&APIProxyConfig{
++		Client: client,
++		Logger: hclog.NewNullLogger(),
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	handler := Handler(context.Background(), hclog.NewNullLogger(), proxier, nil)
++	rec := httptest.NewRecorder()
++	req := httptest.NewRequest("GET", "http://example.com/v1/secret/data/api-proxy-error", nil)
++	handler.ServeHTTP(rec, req)
++
++	if rec.Code != http.StatusBadRequest {
++		t.Fatalf("expected APIProxy-backed Vault error status to pass through, got %d with body %q", rec.Code, rec.Body.String())
++	}
++	if got := rec.Body.String(); got != body {
++		t.Fatalf("expected APIProxy-backed Vault error body %q, got %q", body, got)
++	}
++	if got := rec.Header().Get("X-Vault-Request"); got != "api-proxy-request" {
++		t.Fatalf("expected APIProxy-backed Vault header to pass through, got %q", got)
++	}
++}
++
++func TestAgentCacheListenerKeepsFallbackForProxyErrorsWithoutHTTPResponse(t *testing.T) {
++	proxier := &scriptedProxier{
++		responses: []*SendResponse{nil},
++		errs:      []error{errors.New("dial tcp failed before receiving a response")},
++	}
++
++	handler := Handler(context.Background(), hclog.NewNullLogger(), proxier, nil)
++	rec := httptest.NewRecorder()
++	req := httptest.NewRequest("GET", "http://example.com/v1/secret/data/example", nil)
++	handler.ServeHTTP(rec, req)
++
++	if rec.Code != http.StatusInternalServerError {
++		t.Fatalf("expected no-response proxy failure to remain a 500, got %d with body %q", rec.Code, rec.Body.String())
++	}
++	if !strings.Contains(rec.Body.String(), "failed to get the response:") {
++		t.Fatalf("expected fallback wrapper in response body, got %q", rec.Body.String())
++	}
++}
++
++func TestLeaseCacheDoesNotCacheNonSuccessOrNonJSONResponses(t *testing.T) {
++	tests := []struct {
++		name   string
++		first  *SendResponse
++		second *SendResponse
++	}{
++		{
++			name:   "unsuccessful JSON response",
++			first:  makeSendResponse(http.StatusBadRequest, "application/json", `{"lease_id":"first","renewable":true,"data":{"value":"bad-request"}}`, nil),
++			second: makeSendResponse(http.StatusOK, "application/json", `{"lease_id":"second","renewable":true,"data":{"value":"after-error"}}`, nil),
++		},
++		{
++			name:   "successful non JSON response",
++			first:  makeSendResponse(http.StatusOK, "text/plain", `{"lease_id":"first","renewable":true,"data":{"value":"plain-text"}}`, nil),
++			second: makeSendResponse(http.StatusOK, "application/json", `{"lease_id":"second","renewable":true,"data":{"value":"after-plain-text"}}`, nil),
++		},
++	}
++
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			lc := testNewLeaseCache(t, []*SendResponse{tc.first, tc.second})
++			req := &SendRequest{
++				Token:   "root",
++				Request: httptest.NewRequest("GET", "http://example.com/v1/secret/data/cache-test", nil),
++			}
++
++			first, err := lc.Send(context.Background(), req)
++			if err != nil {
++				t.Fatalf("first send returned error: %v", err)
++			}
++			if first.Response.StatusCode != tc.first.Response.StatusCode || readResponseBody(t, first) != string(tc.first.ResponseBody) {
++				t.Fatalf("first response mismatch: got status=%d body=%q, want status=%d body=%q",
++					first.Response.StatusCode, readResponseBody(t, first), tc.first.Response.StatusCode, string(tc.first.ResponseBody))
++			}
++
++			second, err := lc.Send(context.Background(), req)
++			if err != nil {
++				t.Fatalf("second send returned error; first response may have been treated as cacheable success: %v", err)
++			}
++			if second.Response.StatusCode != tc.second.Response.StatusCode || readResponseBody(t, second) != string(tc.second.ResponseBody) {
++				t.Fatalf("second identical request should consume the next upstream response, got status=%d body=%q, want status=%d body=%q",
++					second.Response.StatusCode, readResponseBody(t, second), tc.second.Response.StatusCode, string(tc.second.ResponseBody))
++			}
++		})
++	}
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,25 @@
++#!/bin/bash
++set -uo pipefail
++cd /testbed
++
++export GOPATH=/root/go
++export GO111MODULE=off
++
++
++mkdir -p /root/go/src/github.com/hashicorp
++ln -sf /testbed /root/go/src/github.com/hashicorp/vault 2>/dev/null
++
++cd /root/go/src/github.com/hashicorp/vault
++
++case "${1:-}" in
++  base)
++    go test -vet=off -v -count=1 ./command/agent/cache/ -run 'Test(APIProxy|Cache_|LeaseCache_(EmptyToken|SendNonCacheableNonTokenLease|HandleCacheClear)|Cache_DeriveNamespaceAndRevocationPath)' -timeout 120s
++    ;;
++  new)
++    go test -vet=off -v -count=1 ./command/agent/cache/ -run 'TestAgentCacheListener(PassesThroughVaultErrorResponses|PreservesErrorsReturnedByAPIProxy|KeepsFallbackForProxyErrorsWithoutHTTPResponse|KeepsFallbackForProxyErrorsWithNonErrorResponse)|TestLeaseCacheDoesNotCacheNonSuccessOrNonJSONResponses' -timeout 120s
++    ;;
++  *)
++    echo "usage: $0 base|new"
++    exit 2
++    ;;
++esac

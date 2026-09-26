@@ -1,0 +1,534 @@
+diff --git a/usercase-test-coderl/local_infile_test.go b/usercase-test-coderl/local_infile_test.go
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/local_infile_test.go
+@@ -0,0 +1,505 @@
++package usercase_test_coderl
++
++import (
++	"context"
++	"database/sql"
++	"errors"
++	"fmt"
++	"io"
++	"net"
++	"os"
++	"path/filepath"
++	"strconv"
++	"strings"
++	"testing"
++
++	mysql "github.com/go-sql-driver/mysql"
++)
++
++
++
++
++type infileServer struct {
++	requestPath   string
++	expectUpload  bool
++	expectCOMQuit bool
++	finalRows     byte
++	clientConn    net.Conn
++	serverConn    net.Conn
++	uploaded      chan string
++	queries       chan string
++	done          chan struct{}
++	errs          chan error
++}
++
++func newInfileServer(t *testing.T, requestPath string, expectUpload bool, finalRows byte) *infileServer {
++	t.Helper()
++	client, server := net.Pipe()
++	s := &infileServer{
++		requestPath:   requestPath,
++		expectUpload:  expectUpload,
++		expectCOMQuit: true,
++		finalRows:     finalRows,
++		clientConn:    client,
++		serverConn:    server,
++		uploaded:      make(chan string, 1),
++		queries:       make(chan string, 1),
++		done:          make(chan struct{}),
++		errs:          make(chan error, 1),
++	}
++	go s.serve(server)
++	t.Cleanup(func() {
++		_ = s.clientConn.Close()
++		_ = s.serverConn.Close()
++		<-s.done
++		select {
++		case err := <-s.errs:
++			t.Fatalf("fake MySQL server failed: %v", err)
++		default:
++		}
++	})
++	return s
++}
++
++func (s *infileServer) dialFunc(context.Context, string, string) (net.Conn, error) {
++	return s.clientConn, nil
++}
++
++func (s *infileServer) serve(conn net.Conn) {
++	defer close(s.done)
++	if err := s.run(conn); err != nil {
++		s.errs <- err
++	}
++}
++
++func (s *infileServer) run(conn net.Conn) error {
++	defer conn.Close()
++
++	if err := writePacket(conn, 0, handshakePacket()); err != nil {
++		return err
++	}
++	if _, _, err := readPacket(conn); err != nil {
++		return fmt.Errorf("read handshake response: %w", err)
++	}
++	if err := writePacket(conn, 2, okPacket(0)); err != nil {
++		return err
++	}
++
++	payload, _, err := readPacket(conn)
++	if err != nil {
++		return fmt.Errorf("read command: %w", err)
++	}
++	if len(payload) == 0 {
++		return errors.New("empty command packet")
++	}
++	if payload[0] == 0x01 {
++		return nil
++	}
++	if payload[0] == 0x0e {
++		s.queries <- "COM_PING"
++		return writePacket(conn, 1, okPacket(0))
++	}
++	if payload[0] != 0x03 {
++		return fmt.Errorf("first command = %#x, want COM_QUERY", payload[0])
++	}
++	s.queries <- string(payload[1:])
++	if err := writePacket(conn, 1, append([]byte{0xfb}, []byte(s.requestPath)...)); err != nil {
++		return err
++	}
++	finalOKSeq := byte(2)
++	if s.expectUpload {
++		var b strings.Builder
++		for {
++			part, seq, err := readPacket(conn)
++			if err != nil {
++				return fmt.Errorf("read infile upload: %w", err)
++			}
++			if len(part) == 0 {
++				finalOKSeq = seq + 1
++				break
++			}
++			b.Write(part)
++		}
++		s.uploaded <- b.String()
++	} else {
++		part, seq, err := readPacket(conn)
++		if err != nil {
++			return fmt.Errorf("read rejected infile terminator: %w", err)
++		}
++		if len(part) != 0 {
++			return fmt.Errorf("rejected infile packet = %q, want empty terminator", string(part))
++		}
++		finalOKSeq = seq + 1
++		s.uploaded <- ""
++	}
++	if err := writePacket(conn, finalOKSeq, okPacket(s.finalRows)); err != nil {
++		return err
++	}
++
++	payload, _, err = readPacket(conn)
++	if err != nil {
++		return nil
++	}
++	if s.expectCOMQuit && (len(payload) == 0 || payload[0] != 0x01) {
++		return fmt.Errorf("close command = %x, want COM_QUIT", payload)
++	}
++	return nil
++}
++
++func handshakePacket() []byte {
++	payload := []byte{0x0a}
++	payload = append(payload, []byte("8.0.0-usercase")...)
++	payload = append(payload, 0x00)
++	payload = append(payload, 0x01, 0x00, 0x00, 0x00)
++	payload = append(payload, []byte("abcdefgh")...)
++	payload = append(payload, 0x00)
++	payload = append(payload, 0x00, 0x82)
++	payload = append(payload, 0x21)
++	payload = append(payload, 0x00, 0x00)
++	payload = append(payload, 0x00, 0x00)
++	payload = append(payload, 21)
++	payload = append(payload, make([]byte, 6)...)
++	payload = append(payload, make([]byte, 4)...)
++	payload = append(payload, []byte("ijklmnopqrst")...)
++	payload = append(payload, 0x00)
++	payload = append(payload, []byte("mysql_native_password")...)
++	payload = append(payload, 0x00)
++	return payload
++}
++
++func okPacket(rows byte) []byte {
++	return []byte{0x00, rows, 0x00, 0x02, 0x00, 0x00, 0x00}
++}
++
++func writePacket(w io.Writer, seq byte, payload []byte) error {
++	header := []byte{byte(len(payload)), byte(len(payload) >> 8), byte(len(payload) >> 16), seq}
++	if _, err := w.Write(append(header, payload...)); err != nil {
++		return err
++	}
++	return nil
++}
++
++func readPacket(r io.Reader) ([]byte, byte, error) {
++	header := make([]byte, 4)
++	if _, err := io.ReadFull(r, header); err != nil {
++		return nil, 0, err
++	}
++	n := int(header[0]) | int(header[1])<<8 | int(header[2])<<16
++	payload := make([]byte, n)
++	if _, err := io.ReadFull(r, payload); err != nil {
++		return nil, 0, err
++	}
++	return payload, header[3], nil
++}
++
++func execLocalInfile(t *testing.T, requestPath string, allowAllFiles bool, finalRows byte) (string, int64, string, error) {
++	t.Helper()
++	s := newInfileServer(t, requestPath, true, finalRows)
++	cfg := mysql.NewConfig()
++	cfg.Net = "tcp"
++	cfg.Addr = "usercase.invalid:3306"
++	cfg.User = "user"
++	cfg.DBName = "db"
++	cfg.AllowAllFiles = allowAllFiles
++	cfg.MaxAllowedPacket = 64 << 20
++	cfg.DialFunc = s.dialFunc
++	connector, err := mysql.NewConnector(cfg)
++	if err != nil {
++		t.Fatalf("NewConnector failed: %v", err)
++	}
++	db := sql.OpenDB(connector)
++	defer db.Close()
++
++	query := "LOAD DATA LOCAL INFILE '" + requestPath + "' INTO TABLE t"
++	result, err := db.ExecContext(context.Background(), query)
++	if err != nil {
++		return "", 0, "", err
++	}
++	rows, err := result.RowsAffected()
++	if err != nil {
++		return "", 0, "", err
++	}
++	return <-s.uploaded, rows, <-s.queries, nil
++}
++
++func execLocalInfileReject(t *testing.T, requestPath string) error {
++	t.Helper()
++	s := newInfileServer(t, requestPath, false, 0)
++	cfg := mysql.NewConfig()
++	cfg.Net = "tcp"
++	cfg.Addr = "usercase.invalid:3306"
++	cfg.User = "user"
++	cfg.DBName = "db"
++	cfg.MaxAllowedPacket = 64 << 20
++	cfg.DialFunc = s.dialFunc
++	connector, err := mysql.NewConnector(cfg)
++	if err != nil {
++		t.Fatalf("NewConnector failed: %v", err)
++	}
++	db := sql.OpenDB(connector)
++	defer db.Close()
++
++	_, err = db.ExecContext(context.Background(), "LOAD DATA LOCAL INFILE '"+requestPath+"' INTO TABLE t")
++	return err
++}
++
++func writeFixture(t *testing.T, name string, content string) string {
++	t.Helper()
++	path := filepath.Join(t.TempDir(), name)
++	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
++		t.Fatalf("write fixture: %v", err)
++	}
++	return path
++}
++
++func TestRegisteredEmptyFilesystemSourceLoadsZeroRows(t *testing.T) {
++
++
++	path := writeFixture(t, "empty.tsv", "")
++	mysql.RegisterLocalFile(path)
++	defer mysql.DeregisterLocalFile(path)
++
++
++	uploaded, rows, query, err := execLocalInfile(t, path, false, 0)
++	if err != nil {
++		t.Fatalf("Exec failed: %v", err)
++	}
++	if uploaded != "" {
++		t.Fatalf("uploaded payload = %q, want %q", uploaded, "")
++	}
++	if rows != 0 {
++		t.Fatalf("RowsAffected = %d, want 0", rows)
++	}
++	if query != "LOAD DATA LOCAL INFILE '"+path+"' INTO TABLE t" {
++		t.Fatalf("query = %q, want LOAD DATA LOCAL INFILE %q INTO TABLE t", query, path)
++	}
++}
++
++func TestRegisteredTabSeparatedFilesystemSourceUploadsRows(t *testing.T) {
++
++
++	path := writeFixture(t, "rows.tsv", "1\talpha\n2\tbeta\n")
++	mysql.RegisterLocalFile(path)
++	defer mysql.DeregisterLocalFile(path)
++
++
++	uploaded, rows, _, err := execLocalInfile(t, path, false, 2)
++	if err != nil {
++		t.Fatalf("Exec failed: %v", err)
++	}
++	if uploaded != "1\talpha\n2\tbeta\n" {
++		t.Fatalf("uploaded payload = %q, want %q", uploaded, "1\talpha\n2\tbeta\n")
++	}
++
++	if rows < 0 {
++		t.Fatalf("RowsAffected = %d, want non-negative value", rows)
++	}
++}
++
++func TestDeregisteredPathIsRejectedOnLaterRequest(t *testing.T) {
++
++
++	path := writeFixture(t, "removed.tsv", "9\tremoved\n")
++	mysql.RegisterLocalFile(path)
++	mysql.DeregisterLocalFile(path)
++
++
++	err := execLocalInfileReject(t, path)
++	if err == nil {
++		t.Fatal("Exec succeeded, want unregistered local file error")
++	}
++
++	if !strings.Contains(err.Error(), path) || !strings.Contains(strings.ToLower(err.Error()), "not registered") {
++		t.Fatalf("Exec error = %q, want path and not-registered indication", err.Error())
++	}
++}
++
++func TestUnregisteredOrdinaryFilesystemPathIsRejected(t *testing.T) {
++
++
++	path := writeFixture(t, "unregistered.tsv", "3\tgamma\n")
++	mysql.DeregisterLocalFile(path)
++
++
++	err := execLocalInfileReject(t, path)
++	if err == nil {
++		t.Fatal("Exec succeeded, want unregistered local file error")
++	}
++
++	if !strings.Contains(err.Error(), path) || !strings.Contains(strings.ToLower(err.Error()), "not registered") {
++		t.Fatalf("Exec error = %q, want path and not-registered indication", err.Error())
++	}
++}
++
++func TestAllowAllFilesDSNParsingFormattingAndUpload(t *testing.T) {
++
++
++	for _, dsn := range []string{"/db?allowAllFiles=true", "/db?allowAllFiles=TRUE", "/db?allowAllFiles=True", "/db?allowAllFiles=1"} {
++		cfg, err := mysql.ParseDSN(dsn)
++		if err != nil {
++			t.Fatalf("ParseDSN(%q) failed: %v", dsn, err)
++		}
++		if cfg.AllowAllFiles != true {
++			t.Fatalf("ParseDSN(%q).AllowAllFiles = %v, want true", dsn, cfg.AllowAllFiles)
++		}
++	}
++	cfg, err := mysql.ParseDSN("/db?allowAllFiles=false")
++	if err != nil {
++		t.Fatalf("ParseDSN false failed: %v", err)
++	}
++	if cfg.AllowAllFiles != false {
++		t.Fatalf("ParseDSN false AllowAllFiles = %v, want false", cfg.AllowAllFiles)
++	}
++	formatCfg := mysql.NewConfig()
++	formatCfg.AllowAllFiles = true
++	formatted := formatCfg.FormatDSN()
++
++	if !strings.Contains(formatted, "allowAllFiles=true") {
++		t.Fatalf("FormatDSN = %q, want allowAllFiles=true parameter", formatted)
++	}
++	roundTripCfg, err := mysql.ParseDSN(formatted)
++	if err != nil {
++		t.Fatalf("ParseDSN(FormatDSN()) failed: %v", err)
++	}
++	if !roundTripCfg.AllowAllFiles {
++		t.Fatalf("ParseDSN(FormatDSN()).AllowAllFiles = false, want true")
++	}
++
++	path := writeFixture(t, "allow-all.tsv", "7\topen\n")
++	mysql.DeregisterLocalFile(path)
++
++	uploaded, rows, _, err := execLocalInfile(t, path, true, 1)
++	if err != nil {
++		t.Fatalf("Exec failed: %v", err)
++	}
++	if uploaded != "7\topen\n" {
++		t.Fatalf("uploaded payload = %q, want %q", uploaded, "7\topen\n")
++	}
++
++	if rows < 0 {
++		t.Fatalf("RowsAffected = %d, want non-negative value", rows)
++	}
++}
++
++func TestInvalidAllowAllFilesBooleanIsRejected(t *testing.T) {
++
++
++	_, err := mysql.ParseDSN("/db?allowAllFiles=maybe")
++	if err == nil {
++		t.Fatal("ParseDSN succeeded, want invalid bool error")
++	}
++
++}
++
++func TestAllowAllFilesStillSurfacesOpenFailures(t *testing.T) {
++
++
++	path := filepath.Join(t.TempDir(), "missing.tsv")
++	mysql.DeregisterLocalFile(path)
++
++
++	err := func() error {
++		s := newInfileServer(t, path, true, 0)
++		cfg := mysql.NewConfig()
++		cfg.Net = "tcp"
++		cfg.Addr = "usercase.invalid:3306"
++		cfg.User = "user"
++		cfg.DBName = "db"
++		cfg.AllowAllFiles = true
++		cfg.MaxAllowedPacket = 64 << 20
++		cfg.DialFunc = s.dialFunc
++		connector, connectorErr := mysql.NewConnector(cfg)
++		if connectorErr != nil {
++			t.Fatalf("NewConnector failed: %v", connectorErr)
++		}
++		db := sql.OpenDB(connector)
++		defer db.Close()
++		_, execErr := db.ExecContext(context.Background(), "LOAD DATA LOCAL INFILE '"+path+"' INTO TABLE t")
++		return execErr
++	}()
++	if err == nil {
++		t.Fatal("Exec succeeded, want open failure")
++	}
++
++	if !strings.Contains(err.Error(), path) {
++		t.Fatalf("Exec error = %q, want it to mention missing path %q", err.Error(), path)
++	}
++}
++
++func TestLocalFileRegistrationIsIndependentByPath(t *testing.T) {
++
++
++	registered := writeFixture(t, "registered.tsv", "4\tkept\n")
++	unregistered := writeFixture(t, "other.tsv", "5\tblocked\n")
++	mysql.RegisterLocalFile(registered)
++	defer mysql.DeregisterLocalFile(registered)
++	mysql.DeregisterLocalFile(unregistered)
++
++
++	uploaded, rows, _, err := execLocalInfile(t, registered, false, 1)
++	if err != nil {
++		t.Fatalf("registered Exec failed: %v", err)
++	}
++	if uploaded != "4\tkept\n" {
++		t.Fatalf("registered uploaded payload = %q, want %q", uploaded, "4\tkept\n")
++	}
++
++	if rows < 0 {
++		t.Fatalf("registered RowsAffected = %d, want non-negative value", rows)
++	}
++	err = execLocalInfileReject(t, unregistered)
++	if err == nil {
++		t.Fatal("unregistered Exec succeeded, want unregistered local file error")
++	}
++
++	if !strings.Contains(err.Error(), unregistered) || !strings.Contains(strings.ToLower(err.Error()), "not registered") {
++		t.Fatalf("unregistered Exec error = %q, want path and not-registered indication", err.Error())
++	}
++}
++
++func TestDeregisterLocalFileIsIdempotent(t *testing.T) {
++
++
++	path := writeFixture(t, "idempotent-deregister.tsv", "6\tgone\n")
++	mysql.RegisterLocalFile(path)
++	mysql.DeregisterLocalFile(path)
++
++	mysql.DeregisterLocalFile(path)
++
++	err := execLocalInfileReject(t, path)
++	if err == nil {
++		t.Fatal("Exec succeeded, want unregistered local file error")
++	}
++	if !strings.Contains(err.Error(), path) || !strings.Contains(strings.ToLower(err.Error()), "not registered") {
++		t.Fatalf("Exec error = %q, want path and not-registered indication", err.Error())
++	}
++}
++
++func TestRepeatedRegisterUseDeregisterCycles(t *testing.T) {
++
++
++	for i := 0; i < 120; i++ {
++		path := writeFixture(t, "cycle-"+strconv.Itoa(i)+".tsv", "1\tcycle\n")
++		mysql.RegisterLocalFile(path)
++		uploaded, rows, _, err := execLocalInfile(t, path, false, 1)
++		mysql.DeregisterLocalFile(path)
++		if err != nil {
++			t.Fatalf("cycle %d Exec failed: %v", i, err)
++		}
++		if uploaded != "1\tcycle\n" {
++			t.Fatalf("cycle %d uploaded payload = %q, want %q", i, uploaded, "1\tcycle\n")
++		}
++
++		if rows < 0 {
++			t.Fatalf("cycle %d RowsAffected = %d, want non-negative value", i, rows)
++		}
++
++		err = execLocalInfileReject(t, path)
++		if err == nil {
++			t.Fatalf("cycle %d post-deregister Exec succeeded, want unregistered local file error", i)
++		}
++		if !strings.Contains(err.Error(), path) || !strings.Contains(strings.ToLower(err.Error()), "not registered") {
++			t.Fatalf("cycle %d post-deregister Exec error = %q, want path and not-registered indication", i, err.Error())
++		}
++	}
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,19 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++export PATH="/root/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/bin:${PATH}"
++export GOTOOLCHAIN=local
++export GOPROXY=off
++export GOSUMDB=off
++set -e
++cd /workspace/repo
++set -euo pipefail
++cd /workspace/repo
++
++go test -v -count=1 ./usercase-test-coderl/...

@@ -1,0 +1,410 @@
+diff --git a/usercase-test-coderl/test_pdm_score_api.py b/usercase-test-coderl/test_pdm_score_api.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/test_pdm_score_api.py
+@@ -0,0 +1,385 @@
++
++
++
++
++
++
++from __future__ import annotations
++
++import builtins
++import json
++import os
++import socket
++import subprocess
++import sys
++from dataclasses import asdict
++from pathlib import Path
++
++import numpy as np
++import pytest
++
++from navsim.common.dataclasses import PDMResults, Trajectory
++from navsim.evaluate.pdm_score import pdm_score, pdm_score_multi
++from navsim.planning.metric_caching.metric_cache import MetricCache
++from navsim.planning.simulation.planner.pdm_planner.utils.pdm_enums import MultiMetricIndex, WeightedMetricIndex
++from nuplan.common.actor_state.ego_state import EgoState
++from nuplan.common.actor_state.state_representation import StateSE2, StateVector2D, TimePoint
++from nuplan.common.actor_state.vehicle_parameters import get_pacifica_parameters
++from nuplan.planning.simulation.trajectory.interpolated_trajectory import InterpolatedTrajectory
++from nuplan.planning.simulation.trajectory.trajectory_sampling import TrajectorySampling
++
++
++VEHICLE_PARAMETERS = get_pacifica_parameters()
++SAMPLING = TrajectorySampling(time_horizon=1.0, interval_length=0.5)
++
++
++def _ego_state(x: float, y: float, heading: float, time_us: int) -> EgoState:
++    return EgoState.build_from_rear_axle(
++        rear_axle_pose=StateSE2(x, y, heading),
++        rear_axle_velocity_2d=StateVector2D(0.0, 0.0),
++        rear_axle_acceleration_2d=StateVector2D(0.0, 0.0),
++        tire_steering_angle=0.0,
++        time_point=TimePoint(time_us),
++        vehicle_parameters=VEHICLE_PARAMETERS,
++    )
++
++
++def _metric_cache(reference_offsets: list[tuple[float, float, float]]) -> MetricCache:
++    initial_ego_state = _ego_state(10.0, -2.0, 0.25, 1_000_000)
++    reference_states = [initial_ego_state]
++    for index, (dx, dy, dheading) in enumerate(reference_offsets, start=1):
++        reference_states.append(
++            _ego_state(10.0 + dx, -2.0 + dy, 0.25 + dheading, 1_000_000 + index * 500_000)
++        )
++
++    return MetricCache(
++        file_path=Path("/unused/metric-cache.pkl.xz"),
++        trajectory=InterpolatedTrajectory(reference_states),
++        ego_state=initial_ego_state,
++        observation={"obs": "sentinel"},
++        centerline=("centerline", 3),
++        route_lane_ids=["r1", "r2"],
++        drivable_area_map={"map": True},
++    )
++
++
++class RecordingSimulator:
++    def __init__(self, offset: float = 100.0) -> None:
++        self.offset = offset
++        self.calls: list[np.ndarray] = []
++
++    def simulate_proposals(self, trajectory_states: np.ndarray, initial_ego_state: EgoState) -> np.ndarray:
++        assert initial_ego_state.rear_axle.serialize() == [10.0, -2.0, 0.25]
++        self.calls.append(np.array(trajectory_states, copy=True))
++        return trajectory_states + self.offset
++
++
++class LiteralScorer:
++    def __init__(
++        self,
++        *,
++        scores: list[float],
++        multi_metrics: list[list[float]],
++        weighted_metrics: list[list[float]],
++        expected_simulated_pose_columns: list | None = None,
++    ) -> None:
++        self._scores = np.array(scores, dtype=float)
++        self._multi_metrics = np.array(multi_metrics, dtype=float)
++        self._weighted_metrics = np.array(weighted_metrics, dtype=float)
++        self._expected_simulated_pose_columns = (
++            None if expected_simulated_pose_columns is None else np.array(expected_simulated_pose_columns, dtype=float)
++        )
++        self.calls: list[np.ndarray] = []
++
++    def score_proposals(
++        self,
++        simulated_states: np.ndarray,
++        observation: object,
++        centerline: object,
++        route_lane_ids: object,
++        drivable_area_map: object,
++    ) -> np.ndarray:
++        assert observation == {"obs": "sentinel"}
++        assert centerline == ("centerline", 3)
++        assert route_lane_ids == ["r1", "r2"]
++        assert drivable_area_map == {"map": True}
++        if self._expected_simulated_pose_columns is not None:
++
++            np.testing.assert_allclose(
++                simulated_states[:, :, :3],
++                self._expected_simulated_pose_columns,
++                rtol=0.0,
++                atol=1e-8,
++            )
++        self.calls.append(np.array(simulated_states, copy=True))
++        return self._scores
++
++
++def _trajectory(poses: list[list[float]]) -> Trajectory:
++    return Trajectory(np.array(poses, dtype=np.float32), SAMPLING)
++
++
++def _example_single_a() -> PDMResults:
++    metric_cache = _metric_cache([(1.0, 0.0, 0.0), (2.0, 0.2, 0.1)])
++    simulator = RecordingSimulator()
++    scorer = LiteralScorer(
++        scores=[0.75, 0.42],
++        multi_metrics=[[0.9, 1.0], [0.25, 0.5]],
++        weighted_metrics=[[0.2, 0.8], [0.3, 1.0], [0.4, 0.0], [0.5, 1.0]],
++    )
++    return pdm_score(metric_cache, _trajectory([[0.5, 0.0, 0.0], [1.25, 0.3, 0.1]]), SAMPLING, simulator, scorer)
++
++
++def test_single_trajectory_returns_prediction_row_from_scorer_index_one() -> None:
++
++
++
++
++    expected = PDMResults(
++        no_at_fault_collisions=1.0,
++        drivable_area_compliance=0.5,
++        time_to_collision_within_bound=1.0,
++        comfort=0.0,
++        ego_progress=0.8,
++        driving_direction_compliance=1.0,
++        score=0.42,
++    )
++
++    assert _example_single_a() == expected
++
++
++def test_single_trajectory_transforms_reference_and_ego_relative_prediction_before_scoring() -> None:
++
++
++
++
++    metric_cache = _metric_cache([(1.0, 0.0, 0.0), (2.0, 0.2, 0.1)])
++
++    expected_simulated_pose_columns = [
++        [
++            [110.0, 98.0, 100.25],
++            [111.0, 98.0, 100.25],
++            [112.0, 98.2, 100.35],
++        ],
++        [
++            [110.0, 98.0, 100.25],
++            [110.48445621, 98.12370198, 100.25],
++            [111.13691934, 98.59992869, 100.35],
++        ],
++    ]
++    simulator = RecordingSimulator()
++    scorer = LiteralScorer(
++        scores=[0.75, 0.42],
++        multi_metrics=[[0.9, 1.0], [0.25, 0.5]],
++        weighted_metrics=[[0.2, 0.8], [0.3, 1.0], [0.4, 0.0], [0.5, 1.0]],
++        expected_simulated_pose_columns=expected_simulated_pose_columns,
++    )
++
++    actual = pdm_score(
++        metric_cache,
++        _trajectory([[0.5, 0.0, 0.0], [1.25, 0.3, 0.1]]),
++        SAMPLING,
++        simulator,
++        scorer,
++    )
++
++    assert actual == PDMResults(1.0, 0.5, 1.0, 0.0, 0.8, 1.0, 0.42)
++
++    assert len(simulator.calls) >= 1
++    assert len(scorer.calls) >= 1
++
++
++def test_single_trajectory_uses_another_literal_score_and_progress_row() -> None:
++
++
++
++
++    metric_cache = _metric_cache([(0.0, 1.0, 0.0), (0.0, 2.0, -0.2)])
++    simulator = RecordingSimulator()
++    scorer = LiteralScorer(
++        scores=[0.6, 0.9],
++        multi_metrics=[[0.4, 1.0], [0.3, 1.0]],
++        weighted_metrics=[[0.1, 0.7], [0.2, 1.0], [0.3, 1.0], [0.4, 1.0]],
++    )
++
++    actual = pdm_score(
++        metric_cache,
++        _trajectory([[0.0, 0.75, 0.0], [-0.25, 1.5, -0.15]]),
++        SAMPLING,
++        simulator,
++        scorer,
++    )
++
++    assert actual == PDMResults(1.0, 1.0, 1.0, 1.0, 0.7, 1.0, 0.9)
++
++
++def test_multi_trajectory_returns_only_prediction_scores_after_reference() -> None:
++
++
++
++
++    metric_cache = _metric_cache([(1.0, 1.0, 0.05), (2.0, 1.5, 0.1)])
++
++    expected_simulated_pose_columns = [
++        [
++            [110.0, 98.0, 100.25],
++            [111.0, 99.0, 100.3],
++            [112.0, 99.5, 100.35],
++        ],
++        [
++            [110.0, 98.0, 100.25],
++            [110.96891242, 98.24740396, 100.25],
++            [111.93782484, 98.49480792, 100.25],
++        ],
++        [
++            [110.0, 98.0, 100.25],
++            [109.75259604, 98.96891242, 100.3],
++            [109.50519208, 99.93782484, 100.35],
++        ],
++    ]
++    simulator = RecordingSimulator()
++    scorer = LiteralScorer(
++        scores=[0.2, 0.4, 0.8],
++        multi_metrics=[[1.0, 1.0, 1.0], [1.0, 1.0, 1.0]],
++        weighted_metrics=[[1.0, 1.0, 1.0], [1.0, 1.0, 1.0], [1.0, 1.0, 1.0], [1.0, 1.0, 1.0]],
++        expected_simulated_pose_columns=expected_simulated_pose_columns,
++    )
++
++    actual = pdm_score_multi(
++        metric_cache,
++        [
++            _trajectory([[1.0, 0.0, 0.0], [2.0, 0.0, 0.0]]),
++            _trajectory([[0.0, 1.0, 0.05], [0.0, 2.0, 0.1]]),
++        ],
++        SAMPLING,
++        simulator,
++        scorer,
++    )
++
++    np.testing.assert_array_equal(actual, np.array([0.4, 0.8]))
++
++
++def test_multi_trajectory_one_prediction_boundary_returns_one_score() -> None:
++
++
++
++
++    metric_cache = _metric_cache([(-1.0, 0.2, 0.0), (-2.0, 0.4, 0.0)])
++    simulator = RecordingSimulator()
++    scorer = LiteralScorer(
++        scores=[0.33, 0.66],
++        multi_metrics=[[1.0, 1.0], [1.0, 1.0]],
++        weighted_metrics=[[1.0, 1.0], [1.0, 1.0], [1.0, 1.0], [1.0, 1.0]],
++    )
++
++    actual = pdm_score_multi(
++        metric_cache,
++        [_trajectory([[0.2, -0.5, 0.0], [0.4, -1.0, -0.05]])],
++        SAMPLING,
++        simulator,
++        scorer,
++    )
++
++    np.testing.assert_array_equal(actual, np.array([0.66]))
++
++
++def test_multi_trajectory_empty_list_has_no_predicted_scores_or_raises_value_error() -> None:
++
++
++
++
++    metric_cache = _metric_cache([(1.0, 1.0, 0.05), (2.0, 1.5, 0.1)])
++
++    try:
++        actual = pdm_score_multi(
++            metric_cache,
++            [],
++            SAMPLING,
++            RecordingSimulator(),
++            LiteralScorer(
++                scores=[0.2],
++                multi_metrics=[[1.0], [1.0]],
++                weighted_metrics=[[1.0], [1.0], [1.0], [1.0]],
++            ),
++        )
++    except ValueError:
++
++        return
++
++
++    assert isinstance(actual, np.ndarray)
++    assert actual.shape == (0,)
++
++
++def test_referential_transparency_same_inputs_same_values() -> None:
++    first = _example_single_a()
++    second = _example_single_a()
++
++    assert first == second
++    assert first == PDMResults(1.0, 0.5, 1.0, 0.0, 0.8, 1.0, 0.42)
++
++
++def test_model_trajectory_poses_are_not_mutated() -> None:
++    metric_cache = _metric_cache([(0.0, 1.0, 0.0), (0.0, 2.0, -0.2)])
++    trajectory = _trajectory([[0.0, 0.75, 0.0], [-0.25, 1.5, -0.15]])
++    before = trajectory.poses.copy()
++    simulator = RecordingSimulator()
++    scorer = LiteralScorer(
++        scores=[0.6, 0.9],
++        multi_metrics=[[0.4, 1.0], [0.3, 1.0]],
++        weighted_metrics=[[0.1, 0.7], [0.2, 1.0], [0.3, 1.0], [0.4, 1.0]],
++    )
++
++    pdm_score(metric_cache, trajectory, SAMPLING, simulator, scorer)
++
++    np.testing.assert_array_equal(trajectory.poses, before)
++    np.testing.assert_array_equal(trajectory.poses, np.array([[0.0, 0.75, 0.0], [-0.25, 1.5, -0.15]], dtype=np.float32))
++
++
++def test_no_global_state_matches_fresh_python_process() -> None:
++    in_process = asdict(_example_single_a())
++    script = (
++        "import json, sys; "
++        "sys.path.insert(0, '/workspace/repo/usercase-test-coderl'); "
++        "sys.path.insert(0, '/workspace/repo'); "
++        "from dataclasses import asdict; "
++        "from test_pdm_score_api import _example_single_a; "
++        "print(json.dumps(asdict(_example_single_a()), sort_keys=True))"
++    )
++    completed = subprocess.run([sys.executable, "-c", script], check=True, text=True, capture_output=True)
++    fresh_process = json.loads(completed.stdout)
++
++    assert in_process == {
++        "no_at_fault_collisions": 1.0,
++        "drivable_area_compliance": 0.5,
++        "time_to_collision_within_bound": 1.0,
++        "comfort": 0.0,
++        "ego_progress": 0.8,
++        "driving_direction_compliance": 1.0,
++        "score": 0.42,
++    }
++    assert fresh_process == in_process
++
++
++def test_no_undeclared_file_writes_or_network_connections(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
++    original_open = builtins.open
++
++    def guarded_open(file, mode="r", *args, **kwargs):
++        if any(flag in mode for flag in ("w", "a", "x", "+")):
++            raise AssertionError(f"unexpected file write through open({file!r}, {mode!r})")
++        return original_open(file, mode, *args, **kwargs)
++
++    def blocked_socket(*args, **kwargs):
++        raise AssertionError("unexpected network socket creation")
++
++    monkeypatch.setattr(builtins, "open", guarded_open)
++    monkeypatch.setattr(socket, "socket", blocked_socket)
++    monkeypatch.chdir(tmp_path)
++    before = sorted(path.relative_to(tmp_path).as_posix() for path in tmp_path.rglob("*"))
++
++    actual = _example_single_a()
++
++    after = sorted(path.relative_to(tmp_path).as_posix() for path in tmp_path.rglob("*"))
++    assert actual == PDMResults(1.0, 0.5, 1.0, 0.0, 0.8, 1.0, 0.42)
++    assert before == []
++    assert after == []
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,15 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++cd /workspace/repo
++export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
++exec python -m pytest -p no:cacheprovider /workspace/repo/usercase-test-coderl/test_pdm_score_api.py -v

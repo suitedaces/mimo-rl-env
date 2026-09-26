@@ -1,0 +1,439 @@
+diff --git a/usercase-test-coderl/convert_to_paragraph_test.go b/usercase-test-coderl/convert_to_paragraph_test.go
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/convert_to_paragraph_test.go
+@@ -0,0 +1,357 @@
++package usercase_test_coderl
++
++import (
++	"errors"
++	"os"
++	"reflect"
++	"strings"
++	"testing"
++
++	"pault.ag/go/debian/control"
++)
++
++
++
++
++
++
++type basicFixture struct {
++	Foo     string
++	Count   int
++	Enabled bool
++}
++
++type taggedFixture struct {
++	Package  string   `control:"Source"`
++	Arches   []string `control:"Architecture" delim:", "`
++	Empty    string
++	Required string `required:"true"`
++}
++
++type skippedFixture struct {
++	First  string
++	Secret string `control:"-"`
++	Last   string
++}
++
++type pointerScalarFixture struct {
++	Pointer  *string `control:"Pointer"`
++	Words    []string
++	Signed   int
++	Unsigned uint
++	Disabled bool
++	Note     string `multiline:"true"`
++}
++
++type embeddedFixture struct {
++	control.Paragraph
++	Source string `control:"Source"`
++	Count  int
++}
++
++type customValue struct {
++	Text string
++}
++
++func (c customValue) MarshalControl() (string, error) {
++	return "custom:" + c.Text, nil
++}
++
++type customFixture struct {
++	Field customValue `control:"Custom"`
++}
++
++var errMarshalSentinel = errors.New("sentinel marshal failure")
++
++type failingValue struct{}
++
++func (f failingValue) MarshalControl() (string, error) {
++	return "", errMarshalSentinel
++}
++
++type failingFixture struct {
++	Field failingValue `control:"Failure"`
++}
++
++type plainNested struct {
++	Value string
++}
++
++type badNestedFixture struct {
++	Field plainNested `control:"Nested"`
++}
++
++func requireParagraph(t *testing.T, actual *control.Paragraph, expectedOrder []string, expectedValues map[string]string) {
++	t.Helper()
++	if actual == nil {
++		t.Fatal("ConvertToParagraph returned nil paragraph")
++	}
++	if !reflect.DeepEqual(actual.Order, expectedOrder) {
++		t.Fatalf("Order mismatch:\nactual:   %#v\nexpected: %#v", actual.Order, expectedOrder)
++	}
++	if !reflect.DeepEqual(actual.Values, expectedValues) {
++		t.Fatalf("Values mismatch:\nactual:   %#v\nexpected: %#v", actual.Values, expectedValues)
++	}
++}
++
++func mustConvert(t *testing.T, incoming interface{}) *control.Paragraph {
++	t.Helper()
++	paragraph, err := control.ConvertToParagraph(incoming)
++	if err != nil {
++		t.Fatalf("ConvertToParagraph returned error: %v", err)
++	}
++	return paragraph
++}
++
++
++
++func TestConvertToParagraphBasicPrimitiveFields(t *testing.T) {
++	input := &basicFixture{Foo: "hello", Count: 2, Enabled: true}
++	actual := mustConvert(t, input)
++	requireParagraph(t, actual,
++		[]string{"Foo", "Count", "Enabled"},
++		map[string]string{"Foo": "hello", "Count": "2", "Enabled": "yes"},
++	)
++}
++
++
++
++func TestConvertToParagraphSkipsHyphenTaggedFields(t *testing.T) {
++	input := &skippedFixture{First: "alpha", Secret: "hidden", Last: "omega"}
++	actual := mustConvert(t, input)
++	requireParagraph(t, actual,
++		[]string{"First", "Last"},
++		map[string]string{"First": "alpha", "Last": "omega"},
++	)
++}
++
++
++
++func TestConvertToParagraphTaggedRequiredAndDelimitedFields(t *testing.T) {
++	input := &taggedFixture{Package: "demo", Arches: []string{"amd64", "arm64"}}
++	actual := mustConvert(t, input)
++	requireParagraph(t, actual,
++		[]string{"Source", "Architecture", "Required"},
++		map[string]string{"Source": "demo", "Architecture": "amd64, arm64", "Required": ""},
++	)
++}
++
++
++
++func TestConvertToParagraphPointersScalarsDefaultSliceAndMultiline(t *testing.T) {
++	pointed := "target"
++	input := &pointerScalarFixture{
++		Pointer:  &pointed,
++		Words:    []string{"one", "two", "three"},
++		Signed:   -7,
++		Unsigned: 42,
++		Disabled: false,
++		Note:     "line one\nline two",
++	}
++	actual := mustConvert(t, input)
++	requireParagraph(t, actual,
++		[]string{"Pointer", "Words", "Signed", "Unsigned", "Disabled", "Note"},
++		map[string]string{
++			"Pointer":  "target",
++			"Words":    "one two three",
++			"Signed":   "-7",
++			"Unsigned": "42",
++			"Disabled": "no",
++			"Note":     "\nline one\nline two",
++		},
++	)
++}
++
++
++
++func TestConvertToParagraphEmbeddedParagraphIsPreservedAndOverlaid(t *testing.T) {
++	input := &embeddedFixture{
++		Paragraph: control.Paragraph{
++			Order: []string{"X-Unknown", "Source", "Trailing"},
++			Values: map[string]string{
++				"X-Unknown": "keep me",
++				"Source":    "old-source",
++				"Trailing":  "after-source",
++			},
++		},
++		Source: "new-source",
++		Count:  7,
++	}
++	actual := mustConvert(t, input)
++	if actual == nil {
++		t.Fatal("ConvertToParagraph returned nil paragraph")
++	}
++	expectedValues := map[string]string{
++		"X-Unknown": "keep me",
++		"Source":    "new-source",
++		"Trailing":  "after-source",
++		"Count":     "7",
++	}
++	if !reflect.DeepEqual(actual.Values, expectedValues) {
++		t.Fatalf("Values mismatch:\nactual:   %#v\nexpected: %#v", actual.Values, expectedValues)
++	}
++
++
++	seen := map[string]int{}
++	sourceIndex, countIndex := -1, -1
++	for i, key := range actual.Order {
++		seen[key]++
++		if key == "Source" {
++			sourceIndex = i
++		}
++		if key == "Count" {
++			countIndex = i
++		}
++	}
++	if !reflect.DeepEqual(seen, map[string]int{"X-Unknown": 1, "Source": 1, "Trailing": 1, "Count": 1}) {
++		t.Fatalf("Order must contain preserved and derived fields exactly once, got %#v", actual.Order)
++	}
++	if sourceIndex == -1 || countIndex == -1 || sourceIndex > countIndex {
++		t.Fatalf("derived field order mismatch: Source index %d, Count index %d, order %#v", sourceIndex, countIndex, actual.Order)
++	}
++}
++
++
++
++func TestConvertToParagraphUsesMarshallableStructValue(t *testing.T) {
++	input := &customFixture{Field: customValue{Text: "value"}}
++	actual := mustConvert(t, input)
++	requireParagraph(t, actual,
++		[]string{"Custom"},
++		map[string]string{"Custom": "custom:value"},
++	)
++}
++
++
++
++func TestConvertToParagraphPropagatesMarshallableError(t *testing.T) {
++	_, err := control.ConvertToParagraph(&failingFixture{Field: failingValue{}})
++	if !errors.Is(err, errMarshalSentinel) {
++		t.Fatalf("expected sentinel marshal error, got %v", err)
++	}
++}
++
++
++
++func TestConvertToParagraphRejectsNonPointer(t *testing.T) {
++	_, err := control.ConvertToParagraph(basicFixture{Foo: "hello", Count: 2, Enabled: true})
++
++	if err == nil {
++		t.Fatal("expected non-pointer error, got nil")
++	}
++}
++
++
++
++func TestConvertToParagraphRejectsPointerToNonStruct(t *testing.T) {
++	input := []string{"not", "a", "struct"}
++	_, err := control.ConvertToParagraph(&input)
++
++	if err == nil {
++		t.Fatal("expected pointer-to-non-struct error, got nil")
++	}
++}
++
++
++
++func TestConvertToParagraphRejectsNestedStructWithoutMarshallable(t *testing.T) {
++	_, err := control.ConvertToParagraph(&badNestedFixture{Field: plainNested{Value: "raw"}})
++
++	if err == nil || !strings.Contains(err.Error(), "plainNested") {
++		t.Fatalf("expected nested struct error naming plainNested, got %v", err)
++	}
++}
++
++func TestConvertToParagraphReferentialTransparency(t *testing.T) {
++	input := &basicFixture{Foo: "hello", Count: 2, Enabled: true}
++	first := mustConvert(t, input)
++	second := mustConvert(t, input)
++	if !reflect.DeepEqual(first, second) {
++		t.Fatalf("same input produced different paragraphs:\nfirst:  %#v\nsecond: %#v", first, second)
++	}
++	requireParagraph(t, second,
++		[]string{"Foo", "Count", "Enabled"},
++		map[string]string{"Foo": "hello", "Count": "2", "Enabled": "yes"},
++	)
++}
++
++func TestConvertToParagraphDoesNotMutateInput(t *testing.T) {
++	pointed := "target"
++	input := &pointerScalarFixture{
++		Pointer:  &pointed,
++		Words:    []string{"one", "two", "three"},
++		Signed:   -7,
++		Unsigned: 42,
++		Disabled: false,
++		Note:     "line one\nline two",
++	}
++	pointedCopy := *input.Pointer
++	before := &pointerScalarFixture{
++		Pointer:  &pointedCopy,
++		Words:    append([]string(nil), input.Words...),
++		Signed:   input.Signed,
++		Unsigned: input.Unsigned,
++		Disabled: input.Disabled,
++		Note:     input.Note,
++	}
++	_ = mustConvert(t, input)
++	if !reflect.DeepEqual(input, before) {
++		t.Fatalf("input mutated:\nafter:  %#v\nbefore: %#v", input, before)
++	}
++}
++
++func TestConvertToParagraphNoGlobalStateWithNoiseInputs(t *testing.T) {
++	input := &basicFixture{Foo: "hello", Count: 2, Enabled: true}
++	first := mustConvert(t, input)
++
++	_ = mustConvert(t, &taggedFixture{Package: "demo", Arches: []string{"amd64", "arm64"}})
++	pointed := "target"
++	_ = mustConvert(t, &pointerScalarFixture{
++		Pointer:  &pointed,
++		Words:    []string{"one", "two", "three"},
++		Signed:   -7,
++		Unsigned: 42,
++		Disabled: false,
++		Note:     "line one\nline two",
++	})
++
++	second := mustConvert(t, input)
++	if !reflect.DeepEqual(first, second) {
++		t.Fatalf("paragraph changed after noise inputs:\nfirst:  %#v\nsecond: %#v", first, second)
++	}
++	requireParagraph(t, second,
++		[]string{"Foo", "Count", "Enabled"},
++		map[string]string{"Foo": "hello", "Count": "2", "Enabled": "yes"},
++	)
++}
++
++func TestConvertToParagraphDoesNotWriteCurrentDirectory(t *testing.T) {
++	oldwd, err := os.Getwd()
++	if err != nil {
++		t.Fatalf("Getwd failed: %v", err)
++	}
++	defer func() {
++		if err := os.Chdir(oldwd); err != nil {
++			t.Fatalf("failed to restore cwd: %v", err)
++		}
++	}()
++
++	dir := t.TempDir()
++	if err := os.Chdir(dir); err != nil {
++		t.Fatalf("Chdir failed: %v", err)
++	}
++	before, err := os.ReadDir(".")
++	if err != nil {
++		t.Fatalf("ReadDir before call failed: %v", err)
++	}
++
++	_ = mustConvert(t, &basicFixture{Foo: "hello", Count: 2, Enabled: true})
++
++	after, err := os.ReadDir(".")
++	if err != nil {
++		t.Fatalf("ReadDir after call failed: %v", err)
++	}
++	if !reflect.DeepEqual(before, after) {
++		t.Fatalf("current directory changed:\nbefore: %#v\nafter:  %#v", before, after)
++	}
++}
+diff --git a/usercase-test-coderl/offline.go.mod b/usercase-test-coderl/offline.go.mod
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/offline.go.mod
+@@ -0,0 +1,19 @@
++module pault.ag/go/debian
++
++go 1.23.0
++
++toolchain go1.24.4
++
++require (
++	github.com/ProtonMail/go-crypto v1.4.1
++	github.com/kjk/lzma v0.0.0-20161016003348-3fd93898850d
++	github.com/klauspost/compress v1.18.0
++	github.com/xi2/xz v0.0.0-20171230120015-48954b6210f8
++	pault.ag/go/topsort v0.1.1
++)
++
++require (
++	github.com/cloudflare/circl v1.6.2 // indirect
++	golang.org/x/crypto v0.41.0 // indirect
++	golang.org/x/sys v0.35.0 // indirect
++)
+diff --git a/usercase-test-coderl/offline.go.sum b/usercase-test-coderl/offline.go.sum
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/offline.go.sum
+@@ -0,0 +1,24 @@
++github.com/ProtonMail/go-crypto v1.4.1 h1:9RfcZHqEQUvP8RzecWEUafnZVtEvrBVL9BiF67IQOfM=
++github.com/ProtonMail/go-crypto v1.4.1/go.mod h1:e1OaTyu5SYVrO9gKOEhTc+5UcXtTUa+P3uLudwcgPqo=
++github.com/bwesterb/go-ristretto v1.2.3 h1:1w53tCkGhCQ5djbat3+MH0BAQ5Kfgbt56UZQ/JMzngw=
++github.com/bwesterb/go-ristretto v1.2.3/go.mod h1:fUIoIZaG73pV5biE2Blr2xEzDoMj7NFEuV9ekS419A0=
++github.com/cloudflare/circl v1.6.2 h1:hL7VBpHHKzrV5WTfHCaBsgx/HGbBYlgrwvNXEVDYYsQ=
++github.com/cloudflare/circl v1.6.2/go.mod h1:2eXP6Qfat4O/Yhh8BznvKnJ+uzEoTQ6jVKJRn81BiS4=
++github.com/kjk/lzma v0.0.0-20161016003348-3fd93898850d h1:RnWZeH8N8KXfbwMTex/KKMYMj0FJRCF6tQubUuQ02GM=
++github.com/kjk/lzma v0.0.0-20161016003348-3fd93898850d/go.mod h1:phT/jsRPBAEqjAibu1BurrabCBNTYiVI+zbmyCZJY6Q=
++github.com/klauspost/compress v1.18.0 h1:c/Cqfb0r+Yi+JtIEq73FWXVkRonBlf0CRNYc8Zttxdo=
++github.com/klauspost/compress v1.18.0/go.mod h1:2Pp+KzxcywXVXMr50+X0Q/Lsb43OQHYWRCY2AiWywWQ=
++github.com/xi2/xz v0.0.0-20171230120015-48954b6210f8 h1:nIPpBwaJSVYIxUFsDv3M8ofmx9yWTog9BfvIu0q41lo=
++github.com/xi2/xz v0.0.0-20171230120015-48954b6210f8/go.mod h1:HUYIGzjTL3rfEspMxjDjgmT5uz5wzYJKVo23qUhYTos=
++golang.org/x/crypto v0.41.0 h1:WKYxWedPGCTVVl5+WHSSrOBT0O8lx32+zxmHxijgXp4=
++golang.org/x/crypto v0.41.0/go.mod h1:pO5AFd7FA68rFak7rOAGVuygIISepHftHnr8dr6+sUc=
++golang.org/x/net v0.42.0 h1:jzkYrhi3YQWD6MLBJcsklgQsoAcw89EcZbJw8Z614hs=
++golang.org/x/net v0.42.0/go.mod h1:FF1RA5d3u7nAYA4z2TkclSCKh68eSXtiFwcWQpPXdt8=
++golang.org/x/sys v0.35.0 h1:vz1N37gP5bs89s7He8XuIYXpyY0+QlsKmzipCbUtyxI=
++golang.org/x/sys v0.35.0/go.mod h1:BJP2sWEmIv4KK5OTEluFJCKSidICx8ciO85XgH3Ak8k=
++golang.org/x/term v0.34.0 h1:O/2T7POpk0ZZ7MAzMeWFSg6S5IpWd/RXDlM9hgM3DR4=
++golang.org/x/term v0.34.0/go.mod h1:5jC53AEywhIVebHgPVeg0mj8OD3VO9OzclacVrqpaAw=
++golang.org/x/text v0.28.0 h1:rhazDwis8INMIwQ4tpjLDzUhx6RlXqZNPEM0huQojng=
++golang.org/x/text v0.28.0/go.mod h1:U8nCwOR8jO/marOQ0QbDiOngZVEBB7MAiitBuMjXiNU=
++pault.ag/go/topsort v0.1.1 h1:L0QnhUly6LmTv0e3DEzbN2q6/FGgAcQvaEw65S53Bg4=
++pault.ag/go/topsort v0.1.1/go.mod h1:r1kc/L0/FZ3HhjezBIPaNVhkqv8L0UJ9bxRuHRVZ0q4=
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,19 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++export GOTOOLCHAIN=local
++export GOPROXY=off
++export GOSUMDB=off
++export GOVCS='*:off'
++export GOFLAGS="${GOFLAGS:-} -mod=readonly -modfile=/workspace/repo/usercase-test-coderl/offline.go.mod"
++set -e
++cd /workspace/repo
++set -euo pipefail
++cd /workspace/repo
++exec go test -v ./usercase-test-coderl/...

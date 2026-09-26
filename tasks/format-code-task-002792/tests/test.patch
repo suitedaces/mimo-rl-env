@@ -1,0 +1,643 @@
+diff --git a/usercase-test-coderl/fixtures/nested_input.js b/usercase-test-coderl/fixtures/nested_input.js
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/fixtures/nested_input.js
+@@ -0,0 +1,1 @@
++function outer(a){ var y = a; return function inner(b){ return y + b; }; }
+diff --git a/usercase-test-coderl/parser_entries.test.js b/usercase-test-coderl/parser_entries.test.js
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/parser_entries.test.js
+@@ -0,0 +1,613 @@
++
++
++
++
++
++const assert = require('assert');
++const childProcess = require('child_process');
++const fs = require('fs');
++const net = require('net');
++const os = require('os');
++const path = require('path');
++const vm = require('vm');
++
++const REPO = '/workspace/repo';
++const FIXTURES = '/workspace/repo/usercase-test-coderl/fixtures';
++
++const deepStrictEqual = assert.deepStrictEqual.bind(assert);
++function jsonValue(value) {
++    return JSON.parse(JSON.stringify(value));
++}
++assert.deepStrictEqual = function (actual, expected, message) {
++    return deepStrictEqual(jsonValue(actual), jsonValue(expected), message);
++};
++
++function loadTachyonParser() {
++    const context = {
++        Error: Error,
++        config: { verbosity: 0 },
++    };
++
++    context.print = function (value) {
++        process.stdout.write(String(value) + '\n');
++    };
++    context.readFile = function (fileName) {
++        return fs.readFileSync(fileName, 'utf8');
++    };
++    context.global = context;
++
++    vm.createContext(context);
++
++    [
++        'source/utility/debug.js',
++        'source/utility/strings.js',
++        'source/utility/iterators.js',
++        'source/utility/arrays.js',
++        'source/utility/hashmap.js',
++        'source/utility/num.js',
++        'source/utility/log.js',
++        'source/parser/scanner.js',
++        'source/parser/parser.js',
++
++        'source/parser/ast-passes.js',
++        'source/parser/pp.js',
++        'source/compiler/params.js',
++        'source/parser/misc.js',
++    ].forEach((relPath) => {
++        vm.runInContext(
++            fs.readFileSync(path.join(REPO, relPath), 'utf8'),
++            context,
++            { filename: relPath }
++        );
++    });
++
++    return context;
++}
++
++const tachyon = loadTachyonParser();
++
++function makeParams(options) {
++    options = options || {};
++    const params = Object.create(tachyon.CompParams.prototype);
++    params.parserWarnings = options.parserWarnings === true;
++    params.debugTrace = options.debugTrace === true;
++    params.printAST = options.printAST === true;
++    return params;
++}
++
++function locOf(node) {
++    return node && node.loc ? node.loc.to_string() : null;
++}
++
++function idName(id) {
++    if (id === null || id === undefined)
++        return null;
++
++    if (id.id !== undefined)
++        return idName(id.id);
++
++    if (id.value !== undefined)
++        return id.value;
++
++    return String(id);
++}
++
++function varMapSummary(vars) {
++    if (!vars)
++        return {};
++
++    const out = {};
++    Object.keys(vars).sort().forEach((name) => {
++        const variable = vars[name];
++        out[name] = {
++            id: idName(variable),
++            isParam: variable.is_param,
++            scope: variable.scope && variable.scope.constructor
++                ? variable.scope.constructor.name
++                : null,
++            loc: variable.id && variable.id.loc ? variable.id.loc.to_string() : null,
++        };
++    });
++    return out;
++}
++
++function scopeKeys(vars) {
++    return vars ? Object.keys(vars).sort() : [];
++}
++
++function functionHead(node) {
++    if (node instanceof tachyon.FunctionDeclaration) {
++        return {
++            type: 'FunctionDeclaration',
++            loc: locOf(node),
++            id: idName(node.id),
++        };
++    }
++
++    if (node instanceof tachyon.FunctionExpr) {
++        return {
++            type: 'FunctionExpr',
++            loc: locOf(node),
++            id: idName(node.id),
++            params: node.params.map((param) => idName(param)),
++        };
++    }
++
++    return {
++        type: node && node.constructor && node.constructor.name
++            ? node.constructor.name
++            : typeof node,
++        loc: locOf(node),
++    };
++}
++
++function summarizeAst(node) {
++    if (node === null || node === undefined)
++        return null;
++
++    if (node instanceof tachyon.Program) {
++        return {
++            type: 'Program',
++            loc: locOf(node),
++            vars: varMapSummary(node.vars),
++            freeVars: varMapSummary(node.free_vars),
++            funcs: (node.funcs || []).map((fn) => functionHead(fn)),
++            usesArguments: node.usesArguments,
++            usesEval: node.usesEval,
++            block: summarizeAst(node.block),
++        };
++    }
++
++    if (node instanceof tachyon.BlockStatement) {
++        return {
++            type: 'BlockStatement',
++            loc: locOf(node),
++            statements: node.statements.map((statement) => summarizeAst(statement)),
++        };
++    }
++
++    if (node instanceof tachyon.FunctionDeclaration) {
++        return {
++            type: 'FunctionDeclaration',
++            loc: locOf(node),
++            id: idName(node.id),
++            funct: summarizeAst(node.funct),
++        };
++    }
++
++    if (node instanceof tachyon.FunctionExpr) {
++        return {
++            type: 'FunctionExpr',
++            loc: locOf(node),
++            id: idName(node.id),
++            params: node.params.map((param) => idName(param)),
++            vars: varMapSummary(node.vars),
++            freeVars: varMapSummary(node.free_vars),
++            closVars: varMapSummary(node.clos_vars),
++            escVars: varMapSummary(node.esc_vars),
++            funcs: (node.funcs || []).map((fn) => functionHead(fn)),
++            usesArguments: node.usesArguments,
++            usesEval: node.usesEval,
++            body: node.body.map((statement) => summarizeAst(statement)),
++        };
++    }
++
++    if (node instanceof tachyon.ExprStatement) {
++        return {
++            type: 'ExprStatement',
++            loc: locOf(node),
++            expr: summarizeAst(node.expr),
++        };
++    }
++
++    if (node instanceof tachyon.ReturnStatement) {
++        return {
++            type: 'ReturnStatement',
++            loc: locOf(node),
++            expr: summarizeAst(node.expr),
++        };
++    }
++
++    if (node instanceof tachyon.IfStatement) {
++        return {
++            type: 'IfStatement',
++            loc: locOf(node),
++            expr: summarizeAst(node.expr),
++            statements: node.statements.map((statement) => summarizeAst(statement)),
++        };
++    }
++
++    if (node instanceof tachyon.OpExpr) {
++        return {
++            type: 'OpExpr',
++            loc: locOf(node),
++            op: node.op,
++            exprs: node.exprs.map((expr) => summarizeAst(expr)),
++        };
++    }
++
++    if (node instanceof tachyon.CallExpr) {
++        return {
++            type: 'CallExpr',
++            loc: locOf(node),
++            fn: summarizeAst(node.fn),
++            args: node.args.map((arg) => summarizeAst(arg)),
++        };
++    }
++
++    if (node instanceof tachyon.Ref) {
++        return {
++            type: 'Ref',
++            loc: locOf(node),
++            name: idName(node.id),
++            scope: node.id && node.id.scope && node.id.scope.constructor
++                ? node.id.scope.constructor.name
++                : null,
++        };
++    }
++
++    if (node instanceof tachyon.Literal) {
++        return {
++            type: 'Literal',
++            loc: locOf(node),
++            value: node.value,
++            valueType: typeof node.value,
++        };
++    }
++
++    return {
++        type: node.constructor && node.constructor.name
++            ? node.constructor.name
++            : typeof node,
++        loc: locOf(node),
++    };
++}
++
++function summarizeDebugTraceProgram(program) {
++    const topLevelHeads = program.block.statements.map((statement) => {
++        if (statement instanceof tachyon.FunctionDeclaration)
++            return ['FunctionDeclaration', idName(statement.id)];
++
++        if (
++            statement instanceof tachyon.ExprStatement &&
++            statement.expr instanceof tachyon.CallExpr
++        ) {
++            return ['ExprStatement', idName(statement.expr.fn.id)];
++        }
++
++        return [
++            statement.constructor && statement.constructor.name
++                ? statement.constructor.name
++                : typeof statement,
++            null,
++        ];
++    });
++
++    const userFunction = program.block.statements.filter((statement) => {
++        return statement instanceof tachyon.FunctionDeclaration && idName(statement.id) === 'f';
++    })[0];
++
++    return {
++        type: 'Program',
++        loc: locOf(program),
++        varsSubset: [
++            'f',
++            'profile$end_of_program',
++            'profile$enter',
++            'profile$return0',
++            'profile$return1',
++        ].filter((name) => program.vars[name] !== undefined),
++        freeVarsSubset: ['arguments'].filter((name) => program.free_vars[name] !== undefined),
++        topLevelCount: topLevelHeads.length,
++        finalTopLevelHeads: topLevelHeads.slice(-2),
++        userFunctionBody: userFunction.funct.body.map((statement) => summarizeAst(statement)),
++    };
++}
++
++function summarizeNestedFileProgram(program) {
++    const outerDecl = program.block.statements[0];
++    const outer = outerDecl.funct;
++    const assignment = outer.body[0].expr;
++    const inner = outer.body[1].expr;
++    const innerReturn = inner.body[0].expr;
++
++    return {
++        type: 'Program',
++        loc: locOf(program),
++        programVars: scopeKeys(program.vars),
++        programFuncs: program.funcs.map((fn) => functionHead(fn)),
++        outer: {
++            id: idName(outerDecl.id),
++            params: outer.params.map((param) => idName(param)),
++            vars: scopeKeys(outer.vars),
++            freeVars: scopeKeys(outer.free_vars),
++            closVars: scopeKeys(outer.clos_vars),
++            escVars: scopeKeys(outer.esc_vars),
++            funcs: outer.funcs.map((fn) => functionHead(fn)),
++            firstAssignment: {
++                loc: locOf(assignment),
++                op: assignment.op,
++                left: summarizeAst(assignment.exprs[0]),
++                right: summarizeAst(assignment.exprs[1]),
++            },
++        },
++        inner: {
++            id: idName(inner.id),
++            params: inner.params.map((param) => idName(param)),
++            vars: scopeKeys(inner.vars),
++            freeVars: scopeKeys(inner.free_vars),
++            closVars: scopeKeys(inner.clos_vars),
++            escVars: scopeKeys(inner.esc_vars),
++            returnExpr: {
++                loc: locOf(innerReturn),
++                op: innerReturn.op,
++                exprs: innerReturn.exprs.map((expr) => summarizeAst(expr)),
++            },
++        },
++    };
++}
++
++function capturePrint(callback) {
++    const originalPrint = tachyon.print;
++    const lines = [];
++    tachyon.print = function (value) {
++        lines.push(String(value));
++    };
++
++    try {
++        const result = callback();
++        return { result: result, output: lines.join('\n') + (lines.length ? '\n' : '') };
++    } finally {
++        tachyon.print = originalPrint;
++    }
++}
++
++function renderPrettyAst(program) {
++    const originalPrint = tachyon.print;
++    const lines = [];
++    tachyon.print = function (value) {
++        lines.push(String(value));
++    };
++
++    try {
++        tachyon.pp(program);
++        return lines.join('\n') + (lines.length ? '\n' : '');
++    } finally {
++        tachyon.print = originalPrint;
++    }
++}
++
++function assertThrowsNormalAssertionError(callback) {
++
++    assert.throws(
++        callback,
++        (err) => err instanceof Error
++    );
++}
++
++function test(name, callback) {
++    callback();
++    process.stdout.write('ok - ' + name + '\n');
++}
++
++if (process.argv[2] === '--fresh-process-snapshot') {
++    process.stdout.write(JSON.stringify(
++        summarizeAst(tachyon.parse_src_str('var x = 1;', makeParams()))
++    ));
++    process.exit(0);
++}
++
++test('parse_src_str_var_statement', function () {
++
++
++
++
++    const actual = summarizeAst(tachyon.parse_src_str('var x = 1;', makeParams()));
++    const expected = {"type":"Program","loc":"\"<string>\"@1.1-1.11","vars":{"x":{"id":"x","isParam":false,"scope":"Program","loc":"\"<string>\"@1.5-1.6"}},"freeVars":{},"funcs":[],"usesArguments":false,"usesEval":false,"block":{"type":"BlockStatement","loc":"\"<string>\"@1.1-1.11","statements":[{"type":"ExprStatement","loc":"\"<string>\"@1.5-1.10","expr":{"type":"OpExpr","loc":"\"<string>\"@1.5-1.10","op":"x = y","exprs":[{"type":"Ref","loc":"\"<string>\"@1.5-1.6","name":"x","scope":"Program"},{"type":"Literal","loc":"\"<string>\"@1.9-1.10","value":1,"valueType":"number"}]}}]}};
++    assert.deepStrictEqual(actual, expected);
++});
++
++test('parse_src_str_matches_string_input_port', function () {
++
++
++
++
++    const expected = {"type":"Program","loc":"\"<string>\"@1.1-1.11","vars":{"x":{"id":"x","isParam":false,"scope":"Program","loc":"\"<string>\"@1.5-1.6"}},"freeVars":{},"funcs":[],"usesArguments":false,"usesEval":false,"block":{"type":"BlockStatement","loc":"\"<string>\"@1.1-1.11","statements":[{"type":"ExprStatement","loc":"\"<string>\"@1.5-1.10","expr":{"type":"OpExpr","loc":"\"<string>\"@1.5-1.10","op":"x = y","exprs":[{"type":"Ref","loc":"\"<string>\"@1.5-1.6","name":"x","scope":"Program"},{"type":"Literal","loc":"\"<string>\"@1.9-1.10","value":1,"valueType":"number"}]}}]}};
++    assert.deepStrictEqual(
++        summarizeAst(tachyon.parse_src_str('var x = 1;', makeParams())),
++        expected
++    );
++    assert.deepStrictEqual(
++        summarizeAst(tachyon.parse_src_port(new tachyon.String_input_port('var x = 1;'), makeParams())),
++        expected
++    );
++});
++
++test('parse_src_str_empty_program', function () {
++
++
++
++
++    const actual = summarizeAst(tachyon.parse_src_str('', makeParams()));
++    const expected = {"type":"Program","loc":"\"<string>\"@1.1-1.1","vars":{},"freeVars":{},"funcs":[],"usesArguments":false,"usesEval":false,"block":{"type":"BlockStatement","loc":"\"<string>\"@1.1-1.1","statements":[]}};
++    assert.deepStrictEqual(actual, expected);
++});
++
++test('parse_src_file_nested_function_scope_metadata', function () {
++
++
++
++
++    const inputPath = path.join(FIXTURES, 'nested_input.js');
++    const originalReadFile = tachyon.readFile;
++    const readPaths = [];
++
++    tachyon.readFile = function (fileName) {
++        readPaths.push(fileName);
++        return originalReadFile(fileName);
++    };
++
++    try {
++        const actual = summarizeNestedFileProgram(tachyon.parse_src_file(inputPath, makeParams()));
++        const expected = {"type":"Program","loc":"\"/workspace/repo/usercase-test-coderl/fixtures/nested_input.js\"@1.1-1.75","programVars":["outer"],"programFuncs":[{"type":"FunctionDeclaration","loc":"\"/workspace/repo/usercase-test-coderl/fixtures/nested_input.js\"@1.1-1.75","id":"outer"}],"outer":{"id":"outer","params":["a"],"vars":["a","y"],"freeVars":[],"closVars":[],"escVars":["y"],"funcs":[{"type":"FunctionExpr","loc":"\"/workspace/repo/usercase-test-coderl/fixtures/nested_input.js\"@1.38-1.72","id":"inner","params":["b"]}],"firstAssignment":{"loc":"\"/workspace/repo/usercase-test-coderl/fixtures/nested_input.js\"@1.24-1.29","op":"x = y","left":{"type":"Ref","loc":"\"/workspace/repo/usercase-test-coderl/fixtures/nested_input.js\"@1.24-1.25","name":"y","scope":"FunctionExpr"},"right":{"type":"Ref","loc":"\"/workspace/repo/usercase-test-coderl/fixtures/nested_input.js\"@1.28-1.29","name":"a","scope":"FunctionExpr"}}},"inner":{"id":"inner","params":["b"],"vars":["b","inner"],"freeVars":["y"],"closVars":["y"],"escVars":[],"returnExpr":{"loc":"\"/workspace/repo/usercase-test-coderl/fixtures/nested_input.js\"@1.64-1.69","op":"x + y","exprs":[{"type":"Ref","loc":"\"/workspace/repo/usercase-test-coderl/fixtures/nested_input.js\"@1.64-1.65","name":"y","scope":"FunctionExpr"},{"type":"Ref","loc":"\"/workspace/repo/usercase-test-coderl/fixtures/nested_input.js\"@1.68-1.69","name":"b","scope":"FunctionExpr"}]}}};
++        assert.deepStrictEqual(actual, expected);
++        assert.deepStrictEqual(readPaths, [inputPath]);
++    } finally {
++        tachyon.readFile = originalReadFile;
++    }
++});
++
++test('parse_src_port_if_statement', function () {
++
++
++
++
++    const port = new tachyon.String_input_port('if (flag) flag = false; else flag = true;');
++    const actual = summarizeAst(tachyon.parse_src_port(port, makeParams()));
++    const expected = {"type":"Program","loc":"\"<string>\"@1.1-1.42","vars":{},"freeVars":{"flag":{"id":"flag","isParam":false,"scope":"Program","loc":"\"<string>\"@1.5-1.9"}},"funcs":[],"usesArguments":false,"usesEval":false,"block":{"type":"BlockStatement","loc":"\"<string>\"@1.1-1.42","statements":[{"type":"IfStatement","loc":"\"<string>\"@1.1-1.42","expr":{"type":"Ref","loc":"\"<string>\"@1.5-1.9","name":"flag","scope":"Program"},"statements":[{"type":"ExprStatement","loc":"\"<string>\"@1.11-1.24","expr":{"type":"OpExpr","loc":"\"<string>\"@1.11-1.23","op":"x = y","exprs":[{"type":"Ref","loc":"\"<string>\"@1.11-1.15","name":"flag","scope":"Program"},{"type":"Literal","loc":"\"<string>\"@1.18-1.23","value":false,"valueType":"boolean"}]}},{"type":"ExprStatement","loc":"\"<string>\"@1.30-1.42","expr":{"type":"OpExpr","loc":"\"<string>\"@1.30-1.41","op":"x = y","exprs":[{"type":"Ref","loc":"\"<string>\"@1.30-1.34","name":"flag","scope":"Program"},{"type":"Literal","loc":"\"<string>\"@1.37-1.41","value":true,"valueType":"boolean"}]}}]}]}};
++    assert.deepStrictEqual(actual, expected);
++});
++
++test('parse_src_port_uses_debug_trace_for_normalization', function () {
++
++
++
++
++    const port = new tachyon.String_input_port('function f(a){ return a; }');
++    const actual = summarizeDebugTraceProgram(
++        tachyon.parse_src_port(port, makeParams({ debugTrace: true }))
++    );
++    const expected = {"type":"Program","loc":"\"<string>\"@1.1-1.27","varsSubset":["f","profile$end_of_program","profile$enter","profile$return0","profile$return1"],"freeVarsSubset":["arguments"],"topLevelCount":84,"finalTopLevelHeads":[["FunctionDeclaration","f"],["ExprStatement","profile$end_of_program"]],"userFunctionBody":[{"type":"ExprStatement","loc":"\"<string>\"@1.1-1.27","expr":{"type":"CallExpr","loc":"\"<string>\"@1.1-1.27","fn":{"type":"Ref","loc":"\"<string>\"@1.1-1.27","name":"profile$enter","scope":"Program"},"args":[{"type":"Literal","loc":"\"<string>\"@1.1-1.27","value":"\"<string>\"@1.1-1.27","valueType":"string"},{"type":"Literal","loc":"\"<string>\"@1.1-1.27","value":"f(a)","valueType":"string"},{"type":"Ref","loc":"\"<string>\"@1.1-1.27","name":"arguments","scope":"Program"}]}},{"type":"ReturnStatement","loc":"\"<string>\"@1.16-1.25","expr":{"type":"CallExpr","loc":"\"<string>\"@1.16-1.25","fn":{"type":"Ref","loc":"\"<string>\"@1.16-1.25","name":"profile$return1","scope":"Program"},"args":[{"type":"Literal","loc":"\"<string>\"@1.16-1.25","value":"\"<string>\"@1.16-1.25","valueType":"string"},{"type":"Ref","loc":"\"<string>\"@1.23-1.24","name":"a","scope":"FunctionExpr"}]}},{"type":"ExprStatement","loc":"\"<string>\"@1.1-1.27","expr":{"type":"CallExpr","loc":"\"<string>\"@1.1-1.27","fn":{"type":"Ref","loc":"\"<string>\"@1.1-1.27","name":"profile$return0","scope":"Program"},"args":[{"type":"Literal","loc":"\"<string>\"@1.1-1.27","value":"\"<string>\"@1.1-1.27","valueType":"string"}]}}]};
++    assert.deepStrictEqual(actual, expected);
++});
++
++test('parse_src_port_prints_normalized_ast_when_requested', function () {
++
++
++
++
++    const capture = capturePrint(function () {
++        return tachyon.parse_src_port(new tachyon.String_input_port('var printed = 3;'), makeParams({ printAST: true }));
++    });
++    assert.deepStrictEqual(summarizeAst(capture.result), {"type":"Program","loc":"\"<string>\"@1.1-1.17","vars":{"printed":{"id":"printed","isParam":false,"scope":"Program","loc":"\"<string>\"@1.5-1.12"}},"freeVars":{},"funcs":[],"usesArguments":false,"usesEval":false,"block":{"type":"BlockStatement","loc":"\"<string>\"@1.1-1.17","statements":[{"type":"ExprStatement","loc":"\"<string>\"@1.5-1.16","expr":{"type":"OpExpr","loc":"\"<string>\"@1.5-1.16","op":"x = y","exprs":[{"type":"Ref","loc":"\"<string>\"@1.5-1.12","name":"printed","scope":"Program"},{"type":"Literal","loc":"\"<string>\"@1.15-1.16","value":3,"valueType":"number"}]}}]}});
++
++    assert.strictEqual(capture.output, renderPrettyAst(capture.result));
++});
++
++test('parse_src_port_uses_parser_warnings_flag', function () {
++
++
++
++
++    const originalVerbosity = tachyon.config.verbosity;
++    tachyon.config.verbosity = tachyon.log.WARN;
++    try {
++        const capture = capturePrint(function () {
++            return tachyon.parse_src_port(new tachyon.String_input_port('x == y;'), makeParams({ parserWarnings: true }));
++        });
++        assert.deepStrictEqual(summarizeAst(capture.result), {"type":"Program","loc":"\"<string>\"@1.1-1.8","vars":{},"freeVars":{"x":{"id":"x","isParam":false,"scope":"Program","loc":"\"<string>\"@1.1-1.2"},"y":{"id":"y","isParam":false,"scope":"Program","loc":"\"<string>\"@1.6-1.7"}},"funcs":[],"usesArguments":false,"usesEval":false,"block":{"type":"BlockStatement","loc":"\"<string>\"@1.1-1.8","statements":[{"type":"ExprStatement","loc":"\"<string>\"@1.1-1.8","expr":{"type":"OpExpr","loc":"\"<string>\"@1.1-1.7","op":"x == y","exprs":[{"type":"Ref","loc":"\"<string>\"@1.1-1.2","name":"x","scope":"Program"},{"type":"Ref","loc":"\"<string>\"@1.6-1.7","name":"y","scope":"Program"}]}}]}});
++
++        assert.match(capture.output, /warning/i);
++    } finally {
++        tachyon.config.verbosity = originalVerbosity;
++    }
++});
++
++test('invalid_calls_raise_normal_assertion_errors', function () {
++
++
++
++
++    assertThrowsNormalAssertionError(function () {
++        tachyon.parse_src_file(undefined, makeParams());
++    });
++    assertThrowsNormalAssertionError(function () {
++        tachyon.parse_src_str(undefined, makeParams());
++    });
++    assertThrowsNormalAssertionError(function () {
++        tachyon.parse_src_port(new tachyon.String_input_port('var x = 1;'), {});
++    });
++});
++
++test('referential_transparency_same_input_same_output', function () {
++    const first = summarizeAst(tachyon.parse_src_str('var x = 1;', makeParams()));
++    const second = summarizeAst(tachyon.parse_src_str('var x = 1;', makeParams()));
++    assert.deepStrictEqual(first, second);
++});
++
++test('does_not_mutate_comp_params_input', function () {
++    const params = makeParams();
++    const before = JSON.stringify({
++        parserWarnings: params.parserWarnings,
++        debugTrace: params.debugTrace,
++        printAST: params.printAST,
++    });
++    tachyon.parse_src_str('var x = 1;', params);
++    const after = JSON.stringify({
++        parserWarnings: params.parserWarnings,
++        debugTrace: params.debugTrace,
++        printAST: params.printAST,
++    });
++    assert.strictEqual(after, before);
++});
++
++test('no_global_state_across_fresh_process', function () {
++    const inProcess = JSON.stringify(summarizeAst(tachyon.parse_src_str('var x = 1;', makeParams())));
++    const freshProcess = childProcess.execFileSync(
++        process.execPath,
++        [__filename, '--fresh-process-snapshot'],
++        { encoding: 'utf8' }
++    );
++    assert.strictEqual(freshProcess, inProcess);
++});
++
++test('parse_src_str_has_no_undeclared_file_or_network_side_effects', function () {
++    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tachyon-parser-'));
++    const originalCwd = process.cwd();
++    const originalWriteFileSync = fs.writeFileSync;
++    const originalOpenSync = fs.openSync;
++    const originalSocket = net.Socket;
++    const writes = [];
++    let socketCreated = false;
++
++    function snapshot(dir) {
++        return fs.readdirSync(dir).sort();
++    }
++
++    process.chdir(tmpDir);
++    const before = snapshot(tmpDir);
++
++    fs.writeFileSync = function () {
++        writes.push(arguments[0]);
++        return originalWriteFileSync.apply(this, arguments);
++    };
++    fs.openSync = function (fileName, flags) {
++        if (typeof flags === 'string' && /[wax+]/.test(flags))
++            writes.push(fileName);
++        return originalOpenSync.apply(this, arguments);
++    };
++    net.Socket = function () {
++        socketCreated = true;
++        throw new Error('network access is not declared for parse_src_str');
++    };
++
++    try {
++        const capture = capturePrint(function () {
++            return tachyon.parse_src_str('var x = 1;', makeParams());
++        });
++        assert.deepStrictEqual(
++            summarizeAst(capture.result),
++            {"type":"Program","loc":"\"<string>\"@1.1-1.11","vars":{"x":{"id":"x","isParam":false,"scope":"Program","loc":"\"<string>\"@1.5-1.6"}},"freeVars":{},"funcs":[],"usesArguments":false,"usesEval":false,"block":{"type":"BlockStatement","loc":"\"<string>\"@1.1-1.11","statements":[{"type":"ExprStatement","loc":"\"<string>\"@1.5-1.10","expr":{"type":"OpExpr","loc":"\"<string>\"@1.5-1.10","op":"x = y","exprs":[{"type":"Ref","loc":"\"<string>\"@1.5-1.6","name":"x","scope":"Program"},{"type":"Literal","loc":"\"<string>\"@1.9-1.10","value":1,"valueType":"number"}]}}]}}
++        );
++        assert.strictEqual(capture.output, '');
++        assert.deepStrictEqual(snapshot(tmpDir), before);
++        assert.deepStrictEqual(writes, []);
++        assert.strictEqual(socketCreated, false);
++    } finally {
++        fs.writeFileSync = originalWriteFileSync;
++        fs.openSync = originalOpenSync;
++        net.Socket = originalSocket;
++        process.chdir(originalCwd);
++        fs.rmSync(tmpDir, { recursive: true, force: true });
++    }
++});
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,14 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++cd /workspace/repo
++exec node /workspace/repo/usercase-test-coderl/parser_entries.test.js

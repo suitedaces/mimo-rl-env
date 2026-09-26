@@ -1,0 +1,207 @@
+diff --git a/commands/scp_test.go b/commands/scp_test.go
+index e4e020c9..78605642 100644
+--- a/commands/scp_test.go
++++ b/commands/scp_test.go
+@@ -1,7 +1,9 @@
+ package commands
+ 
+ import (
++	"errors"
+ 	"os/exec"
++	"strings"
+ 	"testing"
+ 
+ 	"github.com/stretchr/testify/assert"
+@@ -12,6 +14,8 @@ type MockHostInfo struct {
+ 	ip          string
+ 	sshUsername string
+ 	sshKeyPath  string
++	sshPort     int
++	sshPortErr  error
+ }
+ 
+ func (h *MockHostInfo) GetMachineName() string {
+@@ -30,6 +34,10 @@ func (h *MockHostInfo) GetSSHKeyPath() string {
+ 	return h.sshKeyPath
+ }
+ 
++func (h *MockHostInfo) GetSSHPort() (int, error) {
++	return h.sshPort, h.sshPortErr
++}
++
+ type MockHostInfoLoader struct {
+ 	hostInfo MockHostInfo
+ }
+@@ -62,7 +70,8 @@ func TestGetInfoForRemoteScpArg(t *testing.T) {
+ 	host, path, opts, err := getInfoForScpArg("myfunhost:/home/docker/foo", &hostInfoLoader)
+ 	assert.Equal(t, "myfunhost", host.GetMachineName())
+ 	assert.Equal(t, "/home/docker/foo", path)
+-	assert.Equal(t, []string{"-i", "/fake/keypath/id_rsa"}, opts)
++	assert.Contains(t, opts, "-i")
++	assert.Contains(t, opts, "/fake/keypath/id_rsa")
+ 	assert.NoError(t, err)
+ 
+ 	host, path, opts, err = getInfoForScpArg("myfunhost:C:\\path", &hostInfoLoader)
+@@ -99,21 +108,16 @@ func TestGetScpCmd(t *testing.T) {
+ 
+ 	cmd, err := getScpCmd("/tmp/foo", "myfunhost:/home/docker/foo", true, &hostInfoLoader)
+ 
+-	expectedArgs := append(
+-		baseSSHArgs,
+-		"-3",
+-		"-r",
+-		"-o",
+-		"IdentitiesOnly=yes",
+-		"-i",
+-		"/fake/keypath/id_rsa",
+-		"/tmp/foo",
+-		"root@12.34.56.78:/home/docker/foo",
+-	)
+-	expectedCmd := exec.Command("/usr/bin/scp", expectedArgs...)
+-
+-	assert.Equal(t, expectedCmd, cmd)
+ 	assert.NoError(t, err)
++	assert.NotNil(t, cmd)
++
++	joined := strings.Join(cmd.Args, " ")
++
++	assert.Contains(t, joined, "/tmp/foo")
++	assert.Contains(t, joined, "root@12.34.56.78:/home/docker/foo")
++	assert.Contains(t, joined, "-i /fake/keypath/id_rsa")
++
++	assert.NotContains(t, cmd.Args, "-P")
+ }
+ 
+ func TestGetScpCmdWithoutSshKey(t *testing.T) {
+@@ -124,15 +128,100 @@ func TestGetScpCmdWithoutSshKey(t *testing.T) {
+ 
+ 	cmd, err := getScpCmd("/tmp/foo", "myfunhost:/home/docker/foo", true, &hostInfoLoader)
+ 
+-	expectedArgs := append(
+-		baseSSHArgs,
+-		"-3",
+-		"-r",
+-		"/tmp/foo",
+-		"user@1.2.3.4:/home/docker/foo",
+-	)
+-	expectedCmd := exec.Command("/usr/bin/scp", expectedArgs...)
++	assert.NoError(t, err)
++	assert.NotNil(t, cmd)
++	joined := strings.Join(cmd.Args, " ")
++	assert.Contains(t, joined, "/tmp/foo")
++	assert.Contains(t, joined, "user@1.2.3.4:/home/docker/foo")
++
++	assert.NotContains(t, cmd.Args, "-i")
++
++	assert.NotContains(t, cmd.Args, "-P")
++}
++
++
++func argsContainsFlagValue(args []string, flag, value string) bool {
++	for i := 0; i < len(args)-1; i++ {
++		if args[i] == flag && args[i+1] == value {
++			return true
++		}
++	}
++	return false
++}
++
++
++
++func TestGetScpCmdWithCustomPort(t *testing.T) {
++	hostInfoLoader := MockHostInfoLoader{MockHostInfo{
++		ip:          "104.131.33.10",
++		sshUsername: "root",
++		sshKeyPath:  "/fake/keypath/id_rsa",
++		sshPort:     2222,
++	}}
++
++	cmd, err := getScpCmd("myfile.txt", "myfunhost:myfile.txt", false, &hostInfoLoader)
+ 
+-	assert.Equal(t, expectedCmd, cmd)
+ 	assert.NoError(t, err)
++	assert.NotNil(t, cmd)
++
++	assert.True(t, argsContainsFlagValue(cmd.Args, "-P", "2222"),
++		"expected -P 2222 in scp args, got: %v", cmd.Args)
++
++	joined := strings.Join(cmd.Args, " ")
++	assert.Contains(t, joined, "root@104.131.33.10")
+ }
++
++
++
++func TestGetScpCmdPortValuePropagated(t *testing.T) {
++	hostInfoLoader := MockHostInfoLoader{MockHostInfo{
++		ip:          "10.0.0.1",
++		sshUsername: "ubuntu",
++		sshKeyPath:  "/fake/keypath/id_rsa",
++		sshPort:     9999,
++	}}
++
++	cmd, err := getScpCmd("/tmp/foo", "remote:/home/foo", false, &hostInfoLoader)
++
++	assert.NoError(t, err)
++	assert.True(t, argsContainsFlagValue(cmd.Args, "-P", "9999"),
++		"expected -P 9999 in scp args, got: %v", cmd.Args)
++
++	assert.False(t, argsContainsFlagValue(cmd.Args, "-P", "22"))
++	assert.False(t, argsContainsFlagValue(cmd.Args, "-P", "2222"))
++}
++
++
++
++func TestGetScpCmdWithZeroPort(t *testing.T) {
++	hostInfoLoader := MockHostInfoLoader{MockHostInfo{
++		ip:          "1.2.3.4",
++		sshUsername: "root",
++		sshKeyPath:  "/fake/keypath/id_rsa",
++		sshPort:     0,
++	}}
++
++	cmd, err := getScpCmd("/tmp/foo", "remote:/home/foo", false, &hostInfoLoader)
++
++	assert.NoError(t, err)
++	assert.NotContains(t, cmd.Args, "-P",
++		"unexpected -P flag for zero port: %v", cmd.Args)
++}
++
++
++
++func TestGetScpCmd_LocalSourceLocalDest(t *testing.T) {
++	hostInfoLoader := MockHostInfoLoader{MockHostInfo{}}
++	cmd, err := getScpCmd("/tmp/a", "/tmp/b", false, &hostInfoLoader)
++	assert.NoError(t, err)
++	assert.NotNil(t, cmd)
++	assert.NotContains(t, cmd.Args, "-P")
++
++	joined := strings.Join(cmd.Args, " ")
++	assert.Contains(t, joined, "/tmp/a")
++	assert.Contains(t, joined, "/tmp/b")
++}
++
++
++var _ = errors.New
++var _ = exec.Command
+diff --git a/test_commands.json b/test_commands.json
+new file mode 100644
+index 00000000..d804f37f
+--- /dev/null
++++ b/test_commands.json
+@@ -0,0 +1,3 @@
++{
++  "test_commands": ["mkdir -p /tmp/gopath/src/github.com/docker && rm -f /tmp/gopath/src/github.com/docker/machine && ln -s \"$(pwd)\" /tmp/gopath/src/github.com/docker/machine && cd /tmp/gopath/src/github.com/docker/machine && GOPATH=/tmp/gopath:/go GO111MODULE=off go test ./commands/ -run 'TestGetScp|TestGetInfoFor|TestHostLocation|TestRemoteLocation' -v"]
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,8 @@
++#!/usr/bin/env bash
++
++set -uo pipefail
++cd /testbed
++rc=0
++mkdir -p /tmp/gopath/src/github.com/docker && rm -f /tmp/gopath/src/github.com/docker/machine && ln -s "$(pwd)" /tmp/gopath/src/github.com/docker/machine && cd /tmp/gopath/src/github.com/docker/machine && GOPATH=/tmp/gopath:/go GO111MODULE=off go test ./commands/ -run 'TestGetScp|TestGetInfoFor|TestHostLocation|TestRemoteLocation' -v
++rc=$(( rc | $? ))
++exit $rc

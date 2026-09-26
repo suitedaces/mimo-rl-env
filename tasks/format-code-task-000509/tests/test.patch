@@ -1,0 +1,410 @@
+diff --git a/usercase-test-coderl/manifest_interpolation_test.go b/usercase-test-coderl/manifest_interpolation_test.go
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/manifest_interpolation_test.go
+@@ -0,0 +1,380 @@
++package usercase_test_coderl
++
++import (
++	"fmt"
++	"io/fs"
++	"os"
++	"path/filepath"
++	"reflect"
++	"strings"
++	"testing"
++
++	"github.com/aws/copilot-cli/internal/pkg/manifest"
++	"gopkg.in/yaml.v3"
++)
++
++
++
++
++
++
++var interpolatorEnvKeys = []string{
++	"A",
++	"B",
++	"C",
++	"COUNT",
++	"COPILOT_APPLICATION_NAME",
++	"COPILOT_ENVIRONMENT_NAME",
++	"FEATURE",
++	"KEYNAME",
++	"NAME",
++	"SECURITY_GROUPS",
++	"TAG",
++}
++
++func TestInterpolateSubstitutesPredefinedAndOSEnvironmentVariablesInStringValues(t *testing.T) {
++
++
++	withInterpolatorEnv(t, map[string]string{"TAG": "latest"}, func() {
++		actual, err := manifest.NewInterpolator("myApp", "test").Interpolate("image: repo/${COPILOT_ENVIRONMENT_NAME}:${TAG}\napp: ${COPILOT_APPLICATION_NAME}\n")
++		if err != nil {
++			t.Fatalf("Interpolate returned error: %v", err)
++		}
++
++
++		requireYAMLStringValue(t, actual, []string{"image"}, "repo/test:latest")
++		requireYAMLStringValue(t, actual, []string{"app"}, "myApp")
++	})
++}
++
++func TestInterpolateTurnsJSONStringArrayValueIntoYAMLSequence(t *testing.T) {
++
++
++	withInterpolatorEnv(t, map[string]string{"SECURITY_GROUPS": `["sg-1","sg-2"]`}, func() {
++		input := "network:\n  vpc:\n    security_groups: ${SECURITY_GROUPS}\n"
++		actual, err := manifest.NewInterpolator("myApp", "test").Interpolate(input)
++		if err != nil {
++			t.Fatalf("Interpolate returned error: %v", err)
++		}
++
++
++		requireYAMLSequenceMembers(t, actual, []string{"network", "vpc", "security_groups"}, []string{"sg-1", "sg-2"})
++	})
++}
++
++func TestInterpolateLeavesEscapedPlaceholderLiteralWithoutReadingEnvironment(t *testing.T) {
++
++
++	withInterpolatorEnv(t, nil, func() {
++		actual, err := manifest.NewInterpolator("myApp", "test").Interpolate("command: echo \\${NAME}\n")
++		if err != nil {
++			t.Fatalf("Interpolate returned error: %v", err)
++		}
++
++
++		requireYAMLStringValue(t, actual, []string{"command"}, "echo ${NAME}")
++	})
++}
++
++func TestInterpolateOnlySubstitutesYAMLStringValuesNotMapKeys(t *testing.T) {
++
++
++	withInterpolatorEnv(t, map[string]string{
++		"COUNT":   "7",
++		"FEATURE": "enabled",
++		"KEYNAME": "actualKey",
++	}, func() {
++		input := "${KEYNAME}: ${FEATURE}\nreplicas: 3\nquoted_count: \"${COUNT}\"\nlist:\n  - ${FEATURE}\n"
++		actual, err := manifest.NewInterpolator("appA", "dev").Interpolate(input)
++		if err != nil {
++			t.Fatalf("Interpolate returned error: %v", err)
++		}
++
++
++		requireYAMLStringValue(t, actual, []string{"${KEYNAME}"}, "enabled")
++		requireYAMLStringValue(t, actual, []string{"quoted_count"}, "7")
++		requireYAMLSequenceMembers(t, actual, []string{"list"}, []string{"enabled"})
++	})
++}
++
++func TestInterpolateSubstitutesMultiplePlaceholdersInOneStringValue(t *testing.T) {
++
++
++	withInterpolatorEnv(t, map[string]string{
++		"A": "one",
++		"B": "two",
++		"C": "three",
++	}, func() {
++		actual, err := manifest.NewInterpolator("alpha", "qa").Interpolate("value: ${A}-${B}${C}\n")
++		if err != nil {
++			t.Fatalf("Interpolate returned error: %v", err)
++		}
++
++
++		requireYAMLStringValue(t, actual, []string{"value"}, "one-twothree")
++	})
++}
++
++func TestInterpolateReturnsSpecificErrorForUnsetEnvironmentVariable(t *testing.T) {
++
++
++	withInterpolatorEnv(t, nil, func() {
++		_, err := manifest.NewInterpolator("myApp", "test").Interpolate("command: echo ${NAME}\n")
++
++		requireErrorContains(t, err, "NAME", "defined")
++	})
++}
++
++func TestInterpolateReturnsSpecificErrorForPredefinedEnvironmentOverride(t *testing.T) {
++
++
++	withInterpolatorEnv(t, map[string]string{"COPILOT_ENVIRONMENT_NAME": "prod"}, func() {
++		_, err := manifest.NewInterpolator("myApp", "test").Interpolate("image: repo/${COPILOT_ENVIRONMENT_NAME}:${TAG}\n")
++
++		requireErrorContains(t, err, "COPILOT_ENVIRONMENT_NAME", "predefined", "overrid")
++	})
++}
++
++func TestInterpolateIsReferentiallyTransparentForSameInputs(t *testing.T) {
++	withInterpolatorEnv(t, map[string]string{"TAG": "latest"}, func() {
++		interpolator := manifest.NewInterpolator("myApp", "test")
++		input := "image: repo/${COPILOT_ENVIRONMENT_NAME}:${TAG}\n"
++
++		first, firstErr := interpolator.Interpolate(input)
++		second, secondErr := interpolator.Interpolate(input)
++		if firstErr != nil || secondErr != nil {
++			t.Fatalf("Interpolate returned errors: first=%v second=%v", firstErr, secondErr)
++		}
++		if first != second {
++			t.Fatalf("same input produced different outputs: first=%q second=%q", first, second)
++		}
++	})
++}
++
++func TestInterpolateDoesNotMutateCallerInputString(t *testing.T) {
++	withInterpolatorEnv(t, map[string]string{"TAG": "latest"}, func() {
++		input := "image: repo/${COPILOT_ENVIRONMENT_NAME}:${TAG}\n"
++		original := string([]byte(input))
++
++		_, err := manifest.NewInterpolator("myApp", "test").Interpolate(input)
++		if err != nil {
++			t.Fatalf("Interpolate returned error: %v", err)
++		}
++		if input != original {
++			t.Fatalf("input string mutated: expected %q, got %q", original, input)
++		}
++	})
++}
++
++func TestInterpolateDoesNotReuseGlobalStateAcrossDifferentCalls(t *testing.T) {
++	withInterpolatorEnv(t, map[string]string{"TAG": "latest"}, func() {
++		input := "image: repo/${COPILOT_ENVIRONMENT_NAME}:${TAG}\n"
++		first, err := manifest.NewInterpolator("myApp", "test").Interpolate(input)
++		if err != nil {
++			t.Fatalf("initial Interpolate returned error: %v", err)
++		}
++
++		requireYAMLStringValue(t, first, []string{"image"}, "repo/test:latest")
++	})
++
++	withInterpolatorEnv(t, map[string]string{"A": "left", "B": "right"}, func() {
++		noise, err := manifest.NewInterpolator("noiseApp", "noiseEnv").Interpolate("noise: ${A}/${B}/${COPILOT_APPLICATION_NAME}/${COPILOT_ENVIRONMENT_NAME}\n")
++		if err != nil {
++			t.Fatalf("noise Interpolate returned error: %v", err)
++		}
++
++		requireYAMLStringValue(t, noise, []string{"noise"}, "left/right/noiseApp/noiseEnv")
++	})
++
++	withInterpolatorEnv(t, map[string]string{"SECURITY_GROUPS": `["sg-a","sg-b"]`}, func() {
++		noise, err := manifest.NewInterpolator("netApp", "prod").Interpolate("groups: ${SECURITY_GROUPS}\n")
++		if err != nil {
++			t.Fatalf("second noise Interpolate returned error: %v", err)
++		}
++
++		requireYAMLSequenceMembers(t, noise, []string{"groups"}, []string{"sg-a", "sg-b"})
++	})
++
++	withInterpolatorEnv(t, map[string]string{"TAG": "latest"}, func() {
++		actual, err := manifest.NewInterpolator("myApp", "test").Interpolate("image: repo/${COPILOT_ENVIRONMENT_NAME}:${TAG}\n")
++		if err != nil {
++			t.Fatalf("final Interpolate returned error: %v", err)
++		}
++
++		requireYAMLStringValue(t, actual, []string{"image"}, "repo/test:latest")
++	})
++}
++
++func TestInterpolateDoesNotWriteToCurrentWorkingDirectory(t *testing.T) {
++	withInterpolatorEnv(t, map[string]string{"TAG": "latest"}, func() {
++		tmpDir := t.TempDir()
++		oldDir, err := os.Getwd()
++		if err != nil {
++			t.Fatalf("get working directory: %v", err)
++		}
++		if err := os.Chdir(tmpDir); err != nil {
++			t.Fatalf("chdir to temp dir: %v", err)
++		}
++		defer func() {
++			if err := os.Chdir(oldDir); err != nil {
++				t.Fatalf("restore working directory: %v", err)
++			}
++		}()
++
++		before := snapshotTree(t, tmpDir)
++		_, err = manifest.NewInterpolator("myApp", "test").Interpolate("image: repo/${COPILOT_ENVIRONMENT_NAME}:${TAG}\n")
++		if err != nil {
++			t.Fatalf("Interpolate returned error: %v", err)
++		}
++		after := snapshotTree(t, tmpDir)
++		if !reflect.DeepEqual(before, after) {
++			t.Fatalf("current working directory changed:\nbefore=%v\nafter=%v", before, after)
++		}
++	})
++}
++
++func requireErrorContains(t *testing.T, err error, fragments ...string) {
++	t.Helper()
++	if err == nil {
++		t.Fatalf("expected error containing %q, got nil", fragments)
++	}
++	message := err.Error()
++	for _, fragment := range fragments {
++		if !strings.Contains(strings.ToLower(message), strings.ToLower(fragment)) {
++			t.Fatalf("expected error %q to contain %q", message, fragment)
++		}
++	}
++}
++
++func requireYAMLStringValue(t *testing.T, input string, path []string, expected string) {
++	t.Helper()
++	node := lookupYAMLPath(t, input, path)
++	if node.Kind != yaml.ScalarNode || node.Tag != "!!str" || node.Value != expected {
++		t.Fatalf("unexpected YAML string at %v: kind=%v tag=%q value=%q, expected string %q", path, node.Kind, node.Tag, node.Value, expected)
++	}
++}
++
++func requireYAMLSequenceMembers(t *testing.T, input string, path []string, expected []string) {
++	t.Helper()
++	node := lookupYAMLPath(t, input, path)
++	if node.Kind != yaml.SequenceNode {
++		t.Fatalf("unexpected YAML node at %v: kind=%v, expected sequence", path, node.Kind)
++	}
++	if len(node.Content) != len(expected) {
++		t.Fatalf("unexpected YAML sequence length at %v: got %d, expected %d", path, len(node.Content), len(expected))
++	}
++	missing := make(map[string]int)
++	for _, value := range expected {
++		missing[value]++
++	}
++	for _, item := range node.Content {
++		if item.Kind != yaml.ScalarNode || item.Tag != "!!str" {
++			t.Fatalf("unexpected YAML sequence item at %v: kind=%v tag=%q value=%q, expected string item", path, item.Kind, item.Tag, item.Value)
++		}
++		if missing[item.Value] == 0 {
++			t.Fatalf("unexpected YAML sequence item at %v: %q not in expected %v", path, item.Value, expected)
++		}
++		missing[item.Value]--
++	}
++	for value, count := range missing {
++		if count != 0 {
++			t.Fatalf("missing YAML sequence item at %v: %q", path, value)
++		}
++	}
++}
++
++func lookupYAMLPath(t *testing.T, input string, path []string) *yaml.Node {
++	t.Helper()
++	var doc yaml.Node
++	if err := yaml.Unmarshal([]byte(input), &doc); err != nil {
++		t.Fatalf("interpolated output is not valid YAML: %v\n%s", err, input)
++	}
++	if len(doc.Content) != 1 {
++		t.Fatalf("interpolated output has %d YAML documents, expected 1", len(doc.Content))
++	}
++	node := doc.Content[0]
++	for _, key := range path {
++		if node.Kind != yaml.MappingNode {
++			t.Fatalf("YAML node before key %q is kind=%v, expected mapping", key, node.Kind)
++		}
++		var next *yaml.Node
++		for idx := 0; idx < len(node.Content); idx += 2 {
++			if node.Content[idx].Value == key {
++				next = node.Content[idx+1]
++				break
++			}
++		}
++		if next == nil {
++			t.Fatalf("YAML key %q not found while resolving path %v in:\n%s", key, path, input)
++		}
++		node = next
++	}
++	return node
++}
++
++func withInterpolatorEnv(t *testing.T, vars map[string]string, fn func()) {
++	t.Helper()
++	saved := make(map[string]*string)
++	for _, key := range interpolatorEnvKeys {
++		if value, ok := os.LookupEnv(key); ok {
++			copied := value
++			saved[key] = &copied
++		} else {
++			saved[key] = nil
++		}
++		if err := os.Unsetenv(key); err != nil {
++			t.Fatalf("unset env %s: %v", key, err)
++		}
++	}
++	for key, value := range vars {
++		if err := os.Setenv(key, value); err != nil {
++			t.Fatalf("set env %s: %v", key, err)
++		}
++	}
++	defer func() {
++		for _, key := range interpolatorEnvKeys {
++			if saved[key] == nil {
++				if err := os.Unsetenv(key); err != nil {
++					t.Fatalf("restore unset env %s: %v", key, err)
++				}
++				continue
++			}
++			if err := os.Setenv(key, *saved[key]); err != nil {
++				t.Fatalf("restore env %s: %v", key, err)
++			}
++		}
++	}()
++
++	fn()
++}
++
++func snapshotTree(t *testing.T, root string) map[string]string {
++	t.Helper()
++	snapshot := make(map[string]string)
++	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
++		if walkErr != nil {
++			return walkErr
++		}
++		if path == root {
++			return nil
++		}
++		info, err := entry.Info()
++		if err != nil {
++			return err
++		}
++		rel, err := filepath.Rel(root, path)
++		if err != nil {
++			return err
++		}
++		kind := "file"
++		if entry.IsDir() {
++			kind = "dir"
++		}
++		snapshot[rel] = fmt.Sprintf("%s:%d", kind, info.Size())
++		return nil
++	})
++	if err != nil {
++		t.Fatalf("snapshot %s: %v", root, err)
++	}
++	return snapshot
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,20 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++
++cd /workspace/repo
++export GOTOOLCHAIN=local
++export GOPROXY=off
++export GOSUMDB=off
++export GONOSUMDB='*'
++export GOMODCACHE="${GOMODCACHE:-/root/go/pkg/mod}"
++exec go test -mod=mod -v ./usercase-test-coderl

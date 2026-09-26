@@ -1,0 +1,362 @@
+diff --git a/koku/api/report/test/aws/test_views.py b/koku/api/report/test/aws/test_views.py
+index 32e79053c..1cab88788 100644
+--- a/koku/api/report/test/aws/test_views.py
++++ b/koku/api/report/test/aws/test_views.py
+@@ -328,3 +328,181 @@ class AWSReportViewTest(IamTestCase):
+         url = reverse("reports-aws-storage") + qs
+         response = self.client.get(url, **self.headers)
+         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
++
++    def _costs_org_unit_response(self, org_unit_id="R_001", extra_qs=""):
++        """Return the AWS costs response for an org unit group-by request."""
++        qs = f"?group_by[org_unit_id]={org_unit_id}{extra_qs}"
++        url = reverse("reports-aws-costs") + qs
++        response = self.client.get(url, **self.headers)
++        self.assertEqual(response.status_code, status.HTTP_200_OK)
++        return response
++
++    def _nested_value_for_key(self, data, key):
++        if isinstance(data, dict):
++            if key in data:
++                return data[key]
++            for value in data.values():
++                nested_value = self._nested_value_for_key(value, key)
++                if nested_value is not None:
++                    return nested_value
++        return None
++
++    def _org_entity_ids_by_date(self, response_data):
++        return {
++            entry.get("date"): [org_entity.get("id") for org_entity in entry.get("org_entities", [])]
++            for entry in response_data.get("data", [])
++        }
++
++    def _org_entity_costs(self, entry):
++        return [
++            org_entity["values"][0]["cost"]["total"]["value"]
++            for org_entity in entry.get("org_entities", [])
++        ]
++
++    def _unique_org_entity_ids(self, response_data):
++        org_ids = set()
++        for entry in response_data.get("data", []):
++            org_ids.update(
++                org_entity.get("id")
++                for org_entity in entry.get("org_entities", [])
++                if org_entity.get("id") is not None
++            )
++        return org_ids
++
++    @RbacPermissions({"aws.account": {"read": ["*"]}, "aws.organizational_unit": {"read": ["*"]}})
++    def test_group_by_org_unit_wildcard_costs_reports(self):
++        """Test that grouping by org unit with a wildcard raises a validation error."""
++        qs = "?group_by[org_unit_id]=*"
++        url = reverse("reports-aws-costs") + qs
++        response = self.client.get(url, **self.headers)
++
++        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
++        response_data = response.json()
++        org_unit_error = self._nested_value_for_key(response_data, "org_unit_id")
++        self.assertIsNotNone(org_unit_error)
++
++        self.assertIn("Unsupported parameter or invalid value", str(org_unit_error))
++
++    @RbacPermissions({"aws.account": {"read": ["*"]}, "aws.organizational_unit": {"read": ["*"]}})
++    def test_ou_group_by_pagination_count_uses_unpaged_unique_entities(self):
++        """Test org unit pagination count before page slicing."""
++        unpaged_response = self._costs_org_unit_response()
++        unpaged_data = unpaged_response.json()
++        unique_org_ids = self._unique_org_entity_ids(unpaged_data)
++        self.assertTrue(unique_org_ids)
++
++        limited_response = self._costs_org_unit_response(extra_qs="&filter[limit]=1&filter[offset]=0")
++        limited_data = limited_response.json()
++        meta = limited_data.get("meta", {})
++
++        self.assertEqual(meta.get("count"), len(unique_org_ids))
++        if len(unique_org_ids) > 1:
++            first_day_entities = limited_data.get("data", [{}])[0].get("org_entities", [])
++            self.assertLess(len(first_day_entities), meta.get("count"))
++
++    @RbacPermissions({"aws.account": {"read": ["*"]}, "aws.organizational_unit": {"read": ["*"]}})
++    def test_ou_group_by_filter_limit_offset_pagination(self):
++        """Test that org unit pagination applies the requested limit."""
++        limit = 1
++        response = self._costs_org_unit_response(extra_qs=f"&filter[limit]={limit}&filter[offset]=0")
++        response_data = response.json()
++        meta = response_data.get("meta", {})
++
++        self.assertIn("total", meta)
++        self.assertIn("filter", meta)
++        self.assertIn("count", meta)
++
++        for entry in response_data.get("data", []):
++            org_entities = entry.get("org_entities", [])
++            self.assertLessEqual(len(org_entities), limit)
++
++    @RbacPermissions({"aws.account": {"read": ["*"]}, "aws.organizational_unit": {"read": ["*"]}})
++    def test_ou_group_by_filter_limit_window_changes(self):
++        """Test that changing the offset changes the visible org unit window."""
++        unpaged_data = self._costs_org_unit_response().json()
++        unpaged_ids_by_date = self._org_entity_ids_by_date(unpaged_data)
++        self.assertTrue(any(len(ids) > 1 for ids in unpaged_ids_by_date.values()))
++
++        first_page = self._costs_org_unit_response(extra_qs="&filter[limit]=1&filter[offset]=0").json()
++        second_page = self._costs_org_unit_response(extra_qs="&filter[limit]=1&filter[offset]=1").json()
++        first_ids_by_date = self._org_entity_ids_by_date(first_page)
++        second_ids_by_date = self._org_entity_ids_by_date(second_page)
++
++        for date, unpaged_ids in unpaged_ids_by_date.items():
++            if len(unpaged_ids) > 1:
++                self.assertEqual(first_ids_by_date.get(date), [unpaged_ids[0]])
++                self.assertEqual(second_ids_by_date.get(date), [unpaged_ids[1]])
++                self.assertNotEqual(first_ids_by_date.get(date), second_ids_by_date.get(date))
++
++    @RbacPermissions({"aws.account": {"read": ["*"]}, "aws.organizational_unit": {"read": ["*"]}})
++    def test_ou_group_by_filter_limit_high_offset_pagination(self):
++        """Test that high offset pagination does not return the original full list."""
++        limit = 2
++        offset = 10
++        unpaged_data = self._costs_org_unit_response().json()
++        unpaged_ids_by_date = self._org_entity_ids_by_date(unpaged_data)
++
++        response = self._costs_org_unit_response(extra_qs=f"&filter[limit]={limit}&filter[offset]={offset}")
++        response_data = response.json()
++
++        for entry in response_data.get("data", []):
++            date = entry.get("date")
++            org_entities = entry.get("org_entities", [])
++            expected_len = min(limit, max(len(unpaged_ids_by_date.get(date, [])) - offset, 0))
++            self.assertEqual(len(org_entities), expected_len)
++
++    @RbacPermissions({"aws.account": {"read": ["*"]}, "aws.organizational_unit": {"read": ["*"]}})
++    def test_group_by_org_unit_order_by_cost_asc(self):
++        """Test that ordering by cost=asc orders each day's org units by cost."""
++        response = self._costs_org_unit_response(extra_qs="&order_by[cost]=asc")
++        response_data = response.json()
++
++        for entry in response_data.get("data", []):
++            costs = self._org_entity_costs(entry)
++            self.assertEqual(costs, sorted(costs))
++
++    @RbacPermissions({"aws.account": {"read": ["*"]}, "aws.organizational_unit": {"read": ["*"]}})
++    def test_group_by_org_unit_order_by_cost_desc(self):
++        """Test that ordering by cost=desc orders each day's org units by cost."""
++        response = self._costs_org_unit_response(extra_qs="&order_by[cost]=desc")
++        response_data = response.json()
++
++        for entry in response_data.get("data", []):
++            costs = self._org_entity_costs(entry)
++            self.assertEqual(costs, sorted(costs, reverse=True))
++
++    @RbacPermissions({"aws.account": {"read": ["*"]}, "aws.organizational_unit": {"read": ["*"]}})
++    def test_ou_group_by_pagination_applies_to_non_root_org_unit_when_available(self):
++        """Test the same org unit behavior for a valid non-example org unit."""
++        root_data = self._costs_org_unit_response().json()
++        candidate_ids = sorted(
++            org_id for org_id in self._unique_org_entity_ids(root_data) if org_id and org_id != "R_001"
++        )
++        candidate_id = None
++
++        for org_id in candidate_ids:
++            candidate_response = self._costs_org_unit_response(
++                org_unit_id=org_id,
++                extra_qs="&filter[limit]=1&filter[offset]=0&order_by[cost]=desc",
++            )
++            candidate_data = candidate_response.json()
++            if any(entry.get("org_entities") for entry in candidate_data.get("data", [])):
++                candidate_id = org_id
++                break
++
++        if candidate_id is None:
++            self.skipTest("fixture does not expose a non-root org unit with nested cost entities")
++
++        limited_data = candidate_data
++        unpaged_data = self._costs_org_unit_response(org_unit_id=candidate_id, extra_qs="&order_by[cost]=desc").json()
++
++        for entry in limited_data.get("data", []):
++            org_entities = entry.get("org_entities", [])
++            self.assertLessEqual(len(org_entities), 1)
++            costs = self._org_entity_costs(entry)
++            self.assertEqual(costs, sorted(costs, reverse=True))
++
++        self.assertEqual(
++            limited_data.get("meta", {}).get("count"),
++            len(self._unique_org_entity_ids(unpaged_data)),
++        )
+diff --git a/koku/api/report/test/aws/tests_queries.py b/koku/api/report/test/aws/tests_queries.py
+index 05c031ac6..d0a4ed938 100644
+--- a/koku/api/report/test/aws/tests_queries.py
++++ b/koku/api/report/test/aws/tests_queries.py
+@@ -1315,33 +1315,6 @@ class AWSReportQueryTest(IamTestCase):
+             with self.subTest(org=org):
+                 check_accounts_subous_totals(org)
+ 
+-    def test_group_by_org_unit_all(self):
+-        """Check that the total is correct when grouping by org_unit_id=*."""
+-        with tenant_context(self.tenant):
+-            # grab org_unit_id=* query data
+-            org_group_by_url = "?group_by[org_unit_id]=*"
+-            query_params = self.mocked_query_params(org_group_by_url, AWSCostView, "costs")
+-            handler = AWSReportQueryHandler(query_params)
+-            org_data = handler.execute_query()
+-            # grab the actual totals for the org_unit_id group by
+-            org_cost_total = org_data.get("total").get("cost").get("total").get("value")
+-            org_infra_total = org_data.get("total").get("infrastructure").get("total").get("value")
+-            org_sup_total = org_data.get("total").get("supplementary").get("total").get("value")
+-
+-            # grab query data without group by
+-            overall_url = "?"
+-            query_params = self.mocked_query_params(overall_url, AWSCostView)
+-            handler = AWSReportQueryHandler(query_params)
+-            overall_data = handler.execute_query()
+-            # grab the actual totals for the org_unit_id group by
+-            overall_cost_total = overall_data.get("total").get("cost").get("total").get("value")
+-            overall_infra_total = overall_data.get("total").get("infrastructure").get("total").get("value")
+-            overall_sup_total = overall_data.get("total").get("supplementary").get("total").get("value")
+-
+-            self.assertEqual(org_cost_total, overall_cost_total)
+-            self.assertEqual(org_infra_total, overall_infra_total)
+-            self.assertEqual(org_sup_total, overall_sup_total)
+-
+     def test_filter_org_unit(self):
+         """Check that the total is correct when filtering by org_unit_id."""
+         with tenant_context(self.tenant):
+diff --git a/koku/api/report/test/test_repo_config.py b/koku/api/report/test/test_repo_config.py
+new file mode 100644
+index 000000000..245ea936b
+--- /dev/null
++++ b/koku/api/report/test/test_repo_config.py
+@@ -0,0 +1,40 @@
++
++from pathlib import Path
++import unittest
++
++
++REPO_ROOT = Path(__file__).resolve().parents[4]
++
++
++class RepoConfigTest(unittest.TestCase):
++
++
++    def test_pyup_only_updates_insecure_dependencies(self):
++        pyup_config = REPO_ROOT / ".pyup.yml"
++        update_value = None
++
++        for raw_line in pyup_config.read_text().splitlines():
++            line = raw_line.split("#", 1)[0].rstrip()
++            if line.startswith("update:"):
++                update_value = line.split(":", 1)[1].strip()
++                break
++
++        self.assertEqual(update_value, "insecure")
++
++    def test_unittest_dependency_cache_key_includes_git_ref(self):
++        workflow = REPO_ROOT / ".github" / "workflows" / "unittests.yml"
++        lines = workflow.read_text().splitlines()
++        cache_step = []
++        in_cache_step = False
++
++        for line in lines:
++            if "id: cache-dependencies" in line:
++                in_cache_step = True
++            elif in_cache_step and line.startswith("      - name:"):
++                break
++            if in_cache_step:
++                cache_step.append(line.split("#", 1)[0].strip())
++
++        cache_step_text = " ".join(cache_step)
++        self.assertIn("key:", cache_step_text)
++        self.assertIn("github.ref", cache_step_text)
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,87 @@
++#!/bin/bash
++set -uo pipefail
++cd /testbed
++
++if [ ! -x /testbed/.venv/bin/python ]; then
++    /testbed/.build_env/test_command.sh setup-only
++fi
++
++
++if ! pg_isready -p 15432 -q 2>/dev/null; then
++    pg_ctlcluster 16 main start 2>/dev/null || true
++    sleep 2
++fi
++
++
++su - postgres -c "psql -p 15432 -c \"DO \$\$ BEGIN CREATE USER koku_tester WITH SUPERUSER; EXCEPTION WHEN duplicate_object THEN NULL; END \$\$;\"" 2>/dev/null || true
++su - postgres -c "psql -p 15432 -c \"CREATE DATABASE koku_test OWNER koku_tester;\"" 2>/dev/null || true
++
++
++set +u
++source /testbed/.venv/bin/activate
++set -u
++export DATABASE_SERVICE_NAME=POSTGRES_SQL
++export DATABASE_ENGINE=postgresql
++export DATABASE_NAME=koku_test
++export POSTGRES_SQL_SERVICE_HOST=localhost
++export POSTGRES_SQL_SERVICE_PORT=15432
++export DATABASE_ADMIN=postgres
++export DATABASE_USER=koku_tester
++export DATABASE_PASSWORD=''
++export prometheus_multiproc_dir=/tmp
++export PYTHONPATH=/testbed/koku:/testbed
++
++
++python3 - <<'PY'
++from pathlib import Path
++
++path = Path("/testbed/scripts/insert_aws_org_tree.py")
++text = path.read_text()
++old = """                LOG.info(f"Updating account={act_info.get('account_alias_name')} with delete_timestamp={date}")"""
++new = (
++    '                account_name = act_info.get("account_alias_name") if act_info else account_id\n'
++    '                LOG.info(f"Updating account={account_name} with delete_timestamp={date}")'
++)
++if old in text:
++    path.write_text(text.replace(old, new))
++
++runner_path = Path("/testbed/koku/koku/koku_test_runner.py")
++runner_text = runner_path.read_text()
++for call in (
++    '                    data_loader.load_openshift_data(customer, "ocp_aws_static_data.yml", "OCP-on-AWS")',
++    '                    data_loader.load_openshift_data(customer, "ocp_azure_static_data.yml", "OCP-on-Azure")',
++    '                    data_loader.load_azure_data(customer, "azure_static_data.yml")',
++):
++    runner_text = runner_text.replace(call, f"                    # fixture fixture setup: skipped non-AWS loader {call.strip()!r}")
++runner_path.write_text(runner_text)
++PY
++
++run_django_tests() {
++    su - postgres -c "psql -p 15432 -c \"DROP DATABASE IF EXISTS test_koku_test;\"" 2>/dev/null || true
++    python3 /testbed/koku/manage.py test --noinput -v 2 "$@"
++}
++
++case "${1:-}" in
++  base)
++    run_django_tests \
++      api.report.test.aws.test_views.AWSReportViewTest.test_execute_query_w_group_by_rbac_no_restrictions \
++      api.report.test.aws.test_views.AWSReportViewTest.test_group_by_org_unit_non_costs_reports
++    ;;
++  new)
++    run_django_tests \
++      api.report.test.aws.test_views.AWSReportViewTest.test_group_by_org_unit_wildcard_costs_reports \
++      api.report.test.aws.test_views.AWSReportViewTest.test_ou_group_by_pagination_count_uses_unpaged_unique_entities \
++      api.report.test.aws.test_views.AWSReportViewTest.test_ou_group_by_filter_limit_offset_pagination \
++      api.report.test.aws.test_views.AWSReportViewTest.test_ou_group_by_filter_limit_window_changes \
++      api.report.test.aws.test_views.AWSReportViewTest.test_ou_group_by_filter_limit_high_offset_pagination \
++      api.report.test.aws.test_views.AWSReportViewTest.test_group_by_org_unit_order_by_cost_asc \
++      api.report.test.aws.test_views.AWSReportViewTest.test_group_by_org_unit_order_by_cost_desc \
++      api.report.test.aws.test_views.AWSReportViewTest.test_ou_group_by_pagination_applies_to_non_root_org_unit_when_available \
++      api.report.test.test_repo_config.RepoConfigTest.test_pyup_only_updates_insecure_dependencies \
++      api.report.test.test_repo_config.RepoConfigTest.test_unittest_dependency_cache_key_includes_git_ref
++    ;;
++  *)
++    echo "usage: $0 base|new"
++    exit 2
++    ;;
++esac

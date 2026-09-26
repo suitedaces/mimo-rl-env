@@ -1,0 +1,325 @@
+diff --git a/tests/codespec_scenario_composition_lint.py b/tests/codespec_scenario_composition_lint.py
+new file mode 100644
+index 00000000..291f6136
+--- /dev/null
++++ b/tests/codespec_scenario_composition_lint.py
+@@ -0,0 +1,309 @@
++import logging
++import os
++import subprocess
++import sys
++import unittest
++from xml.etree import ElementTree
++
++
++class ScenarioCompositionLintContract(unittest.TestCase):
++    @classmethod
++    def setUpClass(cls):
++
++
++        sys.modules.setdefault("cElementTree", ElementTree)
++        from bzt.linter import ConfigWarning, ConfigurationLinter
++
++        cls.ConfigWarning = ConfigWarning
++        cls.ConfigurationLinter = ConfigurationLinter
++
++    def lint(self, config, ignored=None, runs=1):
++        linter = self.ConfigurationLinter(
++            config,
++            ignored or [],
++            logging.getLogger("codespec.scenario-composition"),
++        )
++        linter.register_checkers()
++        for _ in range(runs):
++            linter.lint()
++        return linter.get_warnings()
++
++    @staticmethod
++    def warning_facts(warnings, identifiers):
++        return {
++            (warning.identifier, warning.severity, str(warning.path))
++            for warning in warnings
++            if warning.identifier in identifiers
++        }
++
++    def test_linter_imports_without_optional_lxml(self):
++        program = """
++import logging
++import sys
++sys.modules['lxml'] = None
++from bzt.linter import ConfigurationLinter
++linter = ConfigurationLinter(
++    {'execution': [{'scenario': {'script': 'plan.jmx'}}]},
++    [],
++    logging.getLogger('codespec.minimal-install'),
++)
++linter.register_checkers()
++linter.lint()
++assert linter.get_warnings() == []
++"""
++        env = os.environ.copy()
++        env["PYTHONPATH"] = os.getcwd()
++        result = subprocess.run(
++            [sys.executable, "-c", program],
++            cwd=os.getcwd(),
++            env=env,
++            stdout=subprocess.PIPE,
++            stderr=subprocess.PIPE,
++            universal_newlines=True,
++        )
++        self.assertEqual(
++            0,
++            result.returncode,
++            "ConfigurationLinter must work without the optional lxml package",
++        )
++
++    def test_nested_missing_and_invalid_include_targets(self):
++        config = {
++            "execution": [{"scenario": "root"}],
++            "scenarios": {
++                "root": {
++                    "requests": [
++                        {
++                            "transaction": "checkout",
++                            "do": [
++                                {"include-scenario": "missing-login"},
++                                {
++                                    "if": "${needs_cleanup}",
++                                    "then": [{"include-scenario": ""}],
++                                    "else": [{"include-scenario": 17}],
++                                },
++                                {
++                                    "while": "${keep_running}",
++                                    "do": [{"include-scenario": "missing-while-target"}],
++                                },
++                                {
++                                    "foreach": "item in items",
++                                    "do": [{"include-scenario": "missing-foreach-target"}],
++                                },
++                            ],
++                        }
++                    ]
++                }
++            },
++        }
++        warnings = self.lint(config)
++        identifiers = {"undefined-include-scenario", "invalid-include-scenario"}
++        facts = self.warning_facts(warnings, identifiers)
++        self.assertEqual(
++            {
++                (
++                    "undefined-include-scenario",
++                    self.ConfigWarning.ERROR,
++                    "scenarios.root.requests.0.do.0.include-scenario",
++                ),
++                (
++                    "invalid-include-scenario",
++                    self.ConfigWarning.ERROR,
++                    "scenarios.root.requests.0.do.1.then.0.include-scenario",
++                ),
++                (
++                    "invalid-include-scenario",
++                    self.ConfigWarning.ERROR,
++                    "scenarios.root.requests.0.do.1.else.0.include-scenario",
++                ),
++                (
++                    "undefined-include-scenario",
++                    self.ConfigWarning.ERROR,
++                    "scenarios.root.requests.0.do.2.do.0.include-scenario",
++                ),
++                (
++                    "undefined-include-scenario",
++                    self.ConfigWarning.ERROR,
++                    "scenarios.root.requests.0.do.3.do.0.include-scenario",
++                ),
++            },
++            facts,
++        )
++        relevant = [warning for warning in warnings if warning.identifier in identifiers]
++        self.assertEqual(5, len(relevant))
++        missing = [warning for warning in warnings if warning.identifier == "undefined-include-scenario"]
++        self.assertEqual(3, len(missing))
++        missing_messages = "\n".join(warning.message for warning in missing)
++        self.assertIn("missing-login", missing_messages)
++        self.assertIn("missing-while-target", missing_messages)
++        self.assertIn("missing-foreach-target", missing_messages)
++
++    def test_every_cycle_edge_is_reported_in_direct_and_indirect_cycles(self):
++        config = {
++            "execution": [{"scenario": "a"}, {"scenario": "a"}],
++            "scenarios": {
++                "a": {
++                    "requests": [
++                        {"loop": 2, "do": [{"include-scenario": "b"}]},
++                        {"include-scenario": "b"},
++                    ]
++                },
++                "b": {"requests": [{"include-scenario": "c"}]},
++                "c": {"requests": [{"include-scenario": "a"}]},
++                "self": {"requests": [{"include-scenario": "self"}]},
++            },
++        }
++        warnings = self.lint(config)
++        facts = self.warning_facts(warnings, {"recursive-include-scenario"})
++        self.assertEqual(
++            {
++                (
++                    "recursive-include-scenario",
++                    self.ConfigWarning.ERROR,
++                    "scenarios.a.requests.0.do.0.include-scenario",
++                ),
++                (
++                    "recursive-include-scenario",
++                    self.ConfigWarning.ERROR,
++                    "scenarios.a.requests.1.include-scenario",
++                ),
++                (
++                    "recursive-include-scenario",
++                    self.ConfigWarning.ERROR,
++                    "scenarios.b.requests.0.include-scenario",
++                ),
++                (
++                    "recursive-include-scenario",
++                    self.ConfigWarning.ERROR,
++                    "scenarios.c.requests.0.include-scenario",
++                ),
++                (
++                    "recursive-include-scenario",
++                    self.ConfigWarning.ERROR,
++                    "scenarios.self.requests.0.include-scenario",
++                ),
++            },
++            facts,
++        )
++        cycle_warnings = [warning for warning in warnings if warning.identifier == "recursive-include-scenario"]
++        self.assertEqual(5, len(cycle_warnings))
++
++    def test_valid_dag_reuse_and_payload_keys_do_not_warn(self):
++        config = {
++            "execution": [{"scenario": "root"}],
++            "scenarios": {
++                "root": {
++                    "requests": [
++                        {"include-scenario": "left"},
++                        {"include-scenario": "right"},
++                        {"include-scenario": "empty-but-defined"},
++                        {
++                            "url": "https://example.invalid/echo",
++                            "body": {"include-scenario": "payload-value"},
++                        },
++                    ]
++                },
++                "left": {"requests": [{"include-scenario": "leaf"}]},
++                "right": {
++                    "requests": [
++                        {"include-scenario": "leaf"},
++                        {"include-scenario": "leaf"},
++                    ]
++                },
++                "leaf": {"requests": ["https://example.invalid/"]},
++                "empty-but-defined": {},
++            },
++        }
++        warnings = self.lint(config)
++        include_ids = {
++            "undefined-include-scenario",
++            "invalid-include-scenario",
++            "recursive-include-scenario",
++        }
++        self.assertEqual(set(), self.warning_facts(warnings, include_ids))
++
++    def test_inline_execution_scenarios_are_checked(self):
++        config = {
++            "execution": [
++                {
++                    "scenario": {
++                        "requests": [
++                            {
++                                "once": [
++                                    {"include-scenario": "missing-inline-target"},
++                                ]
++                            }
++                        ]
++                    }
++                }
++            ],
++            "scenarios": {},
++        }
++        warnings = self.lint(config)
++        facts = self.warning_facts(warnings, {"undefined-include-scenario"})
++        self.assertEqual(
++            {
++                (
++                    "undefined-include-scenario",
++                    self.ConfigWarning.ERROR,
++                    "execution.0.scenario.requests.0.once.0.include-scenario",
++                )
++            },
++            facts,
++        )
++
++    def test_new_warning_ids_honor_ignore_filter(self):
++        config = {
++            "execution": [{"scenario": "root"}],
++            "scenarios": {
++                "root": {
++                    "requests": [
++                        {"include-scenario": "absent"},
++                        {"include-scenario": "root"},
++                    ]
++                }
++            },
++        }
++        warnings = self.lint(config, ignored=["undefined-include-scenario"])
++        ids = [warning.identifier for warning in warnings]
++        self.assertNotIn("undefined-include-scenario", ids)
++        self.assertEqual(1, ids.count("recursive-include-scenario"))
++
++    def test_repeated_lint_replaces_findings_instead_of_duplicating(self):
++        config = {
++            "execution": [{"scenario": "root"}],
++            "scenarios": {
++                "root": {"requests": [{"include-scenario": "absent"}]},
++            },
++        }
++        once = self.lint(config, runs=1)
++        twice = self.lint(config, runs=2)
++        once_facts = sorted(
++            (warning.identifier, warning.severity, str(warning.path), warning.message)
++            for warning in once
++        )
++        twice_facts = sorted(
++            (warning.identifier, warning.severity, str(warning.path), warning.message)
++            for warning in twice
++        )
++        self.assertEqual(once_facts, twice_facts)
++        self.assertEqual(1, len([fact for fact in twice_facts if fact[0] == "undefined-include-scenario"]))
++
++    def test_existing_typo_and_execution_reference_diagnostics_remain(self):
++        config = {
++            "execution": [
++                {
++                    "concurency": 4,
++                    "scenario": "not-defined",
++                }
++            ],
++            "scenarios": {},
++        }
++        warnings = self.lint(config)
++        facts = {(warning.identifier, str(warning.path)) for warning in warnings}
++        self.assertIn(("possible-typo", "execution.0.concurency"), facts)
++        self.assertIn(("undefined-scenario", "execution.0.scenario"), facts)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,5 @@
++#!/bin/bash
++set -euo pipefail
++
++
++python tests/codespec_scenario_composition_lint.py -v

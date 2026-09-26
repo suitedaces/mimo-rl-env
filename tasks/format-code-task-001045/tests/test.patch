@@ -1,0 +1,162 @@
+diff --git a/zds/notification/api/tests_bulk_read.py b/zds/notification/api/tests_bulk_read.py
+new file mode 100644
+index 000000000..1975a5076
+--- /dev/null
++++ b/zds/notification/api/tests_bulk_read.py
+@@ -0,0 +1,147 @@
++from django.contrib.contenttypes.models import ContentType
++from django.core.cache import caches
++from django.urls import reverse
++from rest_framework import status
++from rest_framework.test import APIClient, APITestCase
++from rest_framework_extensions.settings import extensions_api_settings
++
++from zds.member.tests.factories import ProfileFactory
++from zds.notification.models import Notification, Subscription
++
++
++class NotificationBulkReadAPITest(APITestCase):
++    def setUp(self):
++        self.owner = ProfileFactory().user
++        self.other = ProfileFactory().user
++        self.client = APIClient()
++        self.client.force_authenticate(self.owner)
++        self.object_id = 100
++        caches[extensions_api_settings.DEFAULT_USE_CACHE].clear()
++
++    def make_notification(self, user, *, title="A notification", is_read=False):
++        content_type = ContentType.objects.get_for_model(self.owner.__class__)
++        self.object_id += 1
++        subscription = Subscription.objects.create(user=user, content_type=content_type, object_id=self.object_id)
++        return Notification.objects.create(
++            subscription=subscription,
++            content_type=content_type,
++            object_id=self.object_id,
++            sender=self.other,
++            title=title,
++            url="/notifications/example/",
++            is_read=is_read,
++        )
++
++    def mark_read_url(self):
++        return "/api/notifications/mark-read/"
++
++    def test_list_reports_global_unread_count_without_changing_its_envelope(self):
++        self.make_notification(self.owner, title="first unread")
++        self.make_notification(self.owner, title="second unread")
++        self.make_notification(self.owner, title="already read", is_read=True)
++        self.make_notification(self.other, title="foreign unread")
++
++        response = self.client.get(reverse("api:notification:list") + "?is_read=true&page_size=1")
++        self.assertEqual(response.status_code, status.HTTP_200_OK)
++        self.assertIn("unread_count", response.data)
++        self.assertEqual(response.data["unread_count"], 2)
++        self.assertEqual(response.data["count"], 1)
++        self.assertEqual(len(response.data["results"]), 1)
++        self.assertIn("next", response.data)
++        self.assertIn("previous", response.data)
++
++    def test_list_cache_is_invalidated_by_notification_saves_and_deletes(self):
++        first = self.make_notification(self.owner)
++        initial = self.client.get(reverse("api:notification:list"))
++        self.assertEqual(initial.data["count"], 1)
++        self.assertIn("unread_count", initial.data)
++        self.assertEqual(initial.data["unread_count"], 1)
++
++        second = self.make_notification(self.owner)
++        after_save = self.client.get(reverse("api:notification:list"))
++        self.assertEqual(after_save.data["count"], 2)
++        self.assertEqual(after_save.data["unread_count"], 2)
++
++        first.delete()
++        after_delete = self.client.get(reverse("api:notification:list"))
++        self.assertEqual(after_delete.data["count"], 1)
++        self.assertEqual(after_delete.data["unread_count"], 1)
++        self.assertEqual(after_delete.data["results"][0]["id"], second.pk)
++
++    def test_bulk_mark_read_updates_owned_notifications_and_invalidates_list_cache(self):
++        first = self.make_notification(self.owner, title="first")
++        second = self.make_notification(self.owner, title="second")
++
++        before = self.client.get(reverse("api:notification:list") + "?is_read=false")
++        self.assertEqual(before.status_code, status.HTTP_200_OK)
++        self.assertEqual(before.data["count"], 2)
++
++        response = self.client.post(self.mark_read_url(), {"ids": [first.pk, second.pk]}, format="json")
++        self.assertEqual(response.status_code, status.HTTP_200_OK)
++        self.assertEqual(response.data, {"updated": 2})
++
++        after = self.client.get(reverse("api:notification:list") + "?is_read=false")
++        self.assertEqual(after.status_code, status.HTTP_200_OK)
++        self.assertEqual(after.data["count"], 0)
++        self.assertEqual(after.data["unread_count"], 0)
++        self.assertEqual(
++            self.client.get(reverse("api:notification:list") + "?is_read=true").data["count"],
++            2,
++        )
++
++    def test_bulk_mark_read_does_not_touch_other_users_and_is_idempotent(self):
++        owned = self.make_notification(self.owner)
++        unselected = self.make_notification(self.owner)
++        foreign = self.make_notification(self.other)
++
++        response = self.client.post(
++            self.mark_read_url(), {"ids": [owned.pk, owned.pk, foreign.pk, 999999]}, format="json"
++        )
++        self.assertEqual(response.status_code, status.HTTP_200_OK)
++        self.assertEqual(response.data, {"updated": 1})
++        self.assertTrue(Notification.objects.get(pk=owned.pk).is_read)
++        self.assertFalse(Notification.objects.get(pk=unselected.pk).is_read)
++        self.assertFalse(Notification.objects.get(pk=foreign.pk).is_read)
++
++        repeated = self.client.post(self.mark_read_url(), {"ids": [owned.pk]}, format="json")
++        self.assertEqual(repeated.status_code, status.HTTP_200_OK)
++        self.assertEqual(repeated.data, {"updated": 0})
++
++    def test_bulk_mark_read_all_affects_only_the_authenticated_users_unread_rows(self):
++        first = self.make_notification(self.owner)
++        second = self.make_notification(self.owner)
++        already_read = self.make_notification(self.owner, is_read=True)
++        foreign = self.make_notification(self.other)
++
++        response = self.client.post(self.mark_read_url(), {"all": True}, format="json")
++        self.assertEqual(response.status_code, status.HTTP_200_OK)
++        self.assertEqual(response.data, {"updated": 2})
++        self.assertTrue(Notification.objects.get(pk=first.pk).is_read)
++        self.assertTrue(Notification.objects.get(pk=second.pk).is_read)
++        self.assertTrue(Notification.objects.get(pk=already_read.pk).is_read)
++        self.assertFalse(Notification.objects.get(pk=foreign.pk).is_read)
++
++    def test_bulk_mark_read_rejects_missing_empty_and_non_list_ids(self):
++        notification = self.make_notification(self.owner)
++        invalid_payloads = (
++            {},
++            {"ids": []},
++            {"ids": str(notification.pk)},
++            {"ids": [notification.pk, "bad"]},
++            {"ids": [0]},
++            {"ids": [-1]},
++            {"ids": [True]},
++            {"ids": [1.5]},
++            {"all": False},
++            {"all": 1},
++            {"all": True, "ids": [notification.pk]},
++        )
++        for payload in invalid_payloads:
++            response = self.client.post(self.mark_read_url(), payload, format="json")
++            self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
++        self.assertFalse(Notification.objects.get(pk=notification.pk).is_read)
++
++    def test_bulk_mark_read_requires_authentication(self):
++        self.client.force_authenticate(user=None)
++        response = self.client.post(self.mark_read_url(), {"ids": [1]}, format="json")
++        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,4 @@
++#!/bin/bash
++set -euo pipefail
++
++python manage.py test zds.notification.api.tests_bulk_read --settings zds.settings.test -v 1

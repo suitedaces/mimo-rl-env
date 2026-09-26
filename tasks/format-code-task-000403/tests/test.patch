@@ -1,0 +1,159 @@
+diff --git a/test_commands.json b/test_commands.json
+new file mode 100644
+index 0000000000..a691d30a48
+--- /dev/null
++++ b/test_commands.json
+@@ -0,0 +1,3 @@
++{
++  "test_commands": ["python -m pytest tests/www/test_views.py::TestDagRunModelView::test_clear_dag_runs_resets_task_instances tests/www/test_views.py::TestDagRunModelView::test_clear_dag_runs_only_clears_selected tests/www/test_views.py::TestDagRunModelView::test_clear_dag_runs_multiple_selected -v"]
++}
+diff --git a/tests/www/test_views.py b/tests/www/test_views.py
+index 761208efed..05dddec237 100644
+--- a/tests/www/test_views.py
++++ b/tests/www/test_views.py
+@@ -2845,6 +2845,132 @@ class TestDagRunModelView(TestBase):
+         resp = self.client.get('/dagrun/list', follow_redirects=True)
+         self.check_content_in_response("{&#34;include&#34;: &#34;me&#34;}", resp)
+ 
++    def _create_dagrun_with_tis(self, run_id, execution_date, ti_state=State.SUCCESS):
++        """Helper: create a DagRun + TaskInstances on example_bash_operator."""
++        dag = self.app.dag_bag.get_dag("example_bash_operator")
++        dr = dag.create_dagrun(
++            run_type=DagRunType.MANUAL,
++            run_id=run_id,
++            execution_date=execution_date,
++            start_date=execution_date,
++            state=State.SUCCESS,
++        )
++        for task in dag.tasks:
++            ti = TaskInstance(task=task, execution_date=execution_date)
++            ti.state = ti_state
++            self.session.merge(ti)
++        self.session.commit()
++        return dr
++
++    def _ti_states(self, dag_id, execution_date):
++        return [
++            ti.state for ti in self.session.query(TaskInstance).filter(
++                TaskInstance.dag_id == dag_id,
++                TaskInstance.execution_date == execution_date,
++            ).all()
++        ]
++
++    def _cleanup_clear_action_db(self):
++        self.session.query(TaskInstance).filter(
++            TaskInstance.dag_id == 'example_bash_operator'
++        ).delete()
++        self.clear_table(models.DagRun)
++        self.session.commit()
++
++    def test_clear_dag_runs_resets_task_instances(self):
++        """Submitting the 'clear' bulk action resets task instance states to None."""
++        self._cleanup_clear_action_db()
++        try:
++            exec_date = timezone.datetime(2020, 1, 1)
++            dr = self._create_dagrun_with_tis(
++                'test_clear_dr', exec_date, ti_state=State.SUCCESS,
++            )
++            ti_count = len(self.app.dag_bag.get_dag("example_bash_operator").tasks)
++            self.assertGreater(ti_count, 0)
++
++            resp = self.client.post(
++                '/dagrun/action_post',
++                data={'action': 'clear', 'rowid': [str(dr.id)]},
++                follow_redirects=True,
++            )
++            self.assertEqual(resp.status_code, 200)
++
++            states = self._ti_states('example_bash_operator', exec_date)
++            self.assertEqual(len(states), ti_count)
++            for s in states:
++                self.assertIsNone(s)
++        finally:
++            self._cleanup_clear_action_db()
++
++    def test_clear_dag_runs_only_clears_selected(self):
++        """Clear only affects DagRuns whose row IDs are submitted, not unselected ones."""
++        self._cleanup_clear_action_db()
++        try:
++            exec_date_1 = timezone.datetime(2020, 1, 1)
++            exec_date_2 = timezone.datetime(2020, 1, 2)
++            exec_date_3 = timezone.datetime(2020, 1, 3)
++            dr1 = self._create_dagrun_with_tis(
++                'test_clear_only_1', exec_date_1, ti_state=State.SUCCESS,
++            )
++            self._create_dagrun_with_tis(
++                'test_clear_only_2', exec_date_2, ti_state=State.SUCCESS,
++            )
++            dr3 = self._create_dagrun_with_tis(
++                'test_clear_only_3', exec_date_3, ti_state=State.SUCCESS,
++            )
++
++
++            resp = self.client.post(
++                '/dagrun/action_post',
++                data={'action': 'clear', 'rowid': [str(dr1.id), str(dr3.id)]},
++                follow_redirects=True,
++            )
++            self.assertEqual(resp.status_code, 200)
++
++            states_1 = self._ti_states('example_bash_operator', exec_date_1)
++            states_2 = self._ti_states('example_bash_operator', exec_date_2)
++            states_3 = self._ti_states('example_bash_operator', exec_date_3)
++
++            self.assertTrue(states_1)
++            self.assertTrue(states_2)
++            self.assertTrue(states_3)
++            for s in states_1:
++                self.assertIsNone(s)
++            for s in states_3:
++                self.assertIsNone(s)
++
++            for s in states_2:
++                self.assertEqual(s, State.SUCCESS)
++        finally:
++            self._cleanup_clear_action_db()
++
++    def test_clear_dag_runs_multiple_selected(self):
++        """Bulk-clearing several selected DagRuns clears every one of them."""
++        self._cleanup_clear_action_db()
++        try:
++            exec_date_1 = timezone.datetime(2021, 6, 1)
++            exec_date_2 = timezone.datetime(2021, 6, 2)
++            dr1 = self._create_dagrun_with_tis(
++                'test_clear_multi_1', exec_date_1, ti_state=State.SUCCESS,
++            )
++            dr2 = self._create_dagrun_with_tis(
++                'test_clear_multi_2', exec_date_2, ti_state=State.FAILED,
++            )
++
++            resp = self.client.post(
++                '/dagrun/action_post',
++                data={'action': 'clear', 'rowid': [str(dr1.id), str(dr2.id)]},
++                follow_redirects=True,
++            )
++            self.assertEqual(resp.status_code, 200)
++
++            for s in self._ti_states('example_bash_operator', exec_date_1):
++                self.assertIsNone(s)
++            for s in self._ti_states('example_bash_operator', exec_date_2):
++                self.assertIsNone(s)
++        finally:
++            self._cleanup_clear_action_db()
++
+ 
+ class TestDecorators(TestBase):
+     EXAMPLE_DAG_DEFAULT_DATE = dates.days_ago(2)
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,8 @@
++#!/usr/bin/env bash
++
++set -uo pipefail
++cd /testbed
++rc=0
++python -m pytest tests/www/test_views.py::TestDagRunModelView::test_clear_dag_runs_resets_task_instances tests/www/test_views.py::TestDagRunModelView::test_clear_dag_runs_only_clears_selected tests/www/test_views.py::TestDagRunModelView::test_clear_dag_runs_multiple_selected -v
++rc=$(( rc | $? ))
++exit $rc

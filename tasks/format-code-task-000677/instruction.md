@@ -1,0 +1,5 @@
+I want a pure `getRoutesForLang(currentLang: string, page: string, isHomepage?: boolean = false)` helper that returns alternate-language route objects for the site's supported languages. It should support exactly English (`en`, label `in english`), Spanish (`es`, label `en español`), and Chinese (`zh`, label `中文`), and it should omit the current language from the returned list.
+
+For `getRoutesForLang("en", "why")`, return `[ { "label": "en español", "lang": "es", "path": "/es/why.html" }, { "label": "中文", "lang": "zh", "path": "/zh/why.html" } ]`. For `getRoutesForLang("es", "resources")`, return `[ { "label": "in english", "lang": "en", "path": "/resources.html" }, { "label": "中文", "lang": "zh", "path": "/zh/resources.html" } ]`.
+
+For homepage calls, `isHomepage=true` should treat the page as `index`, so `getRoutesForLang("zh", "", true)` returns English and Spanish route objects with paths `/index.html` and `/es/index.html`. The function must be deterministic for the same inputs, must not mutate its arguments, and must not perform filesystem or network side effects.

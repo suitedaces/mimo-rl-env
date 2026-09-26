@@ -1,0 +1,271 @@
+diff --git a/packages/jobs/lib/processor/processor.integration.test.ts b/packages/jobs/lib/processor/processor.integration.test.ts
+new file mode 100644
+index 000000000..144128d4e
+--- /dev/null
++++ b/packages/jobs/lib/processor/processor.integration.test.ts
+@@ -0,0 +1,84 @@
++import { beforeEach, describe, expect, it, vi } from 'vitest';
++
++const workerConstructions = vi.hoisted(() => [] as Array<{ orchestratorUrl: string; groupKey: string; maxConcurrency: number }>);
++const workerStarts = vi.hoisted(() => [] as string[]);
++
++vi.mock('./processor.worker.js', () => {
++    return {
++        ProcessorWorker: class ProcessorWorker {
++            private readonly groupKey: string;
++
++            constructor(options: { orchestratorUrl: string; groupKey: string; maxConcurrency: number }) {
++                this.groupKey = options.groupKey;
++                workerConstructions.push(options);
++            }
++
++            start() {
++                workerStarts.push(this.groupKey);
++            }
++        }
++    };
++});
++
++import { Processor } from './processor.js';
++
++const taskFamilyKeys = ['sync', 'action', 'webhook', 'on-event'] as const;
++
++function matchesGroupKeyPattern(pattern: string, value: string): boolean {
++    const parts = pattern.split('*');
++    if (parts.length === 1) {
++        return pattern === value;
++    }
++
++    let cursor = 0;
++    const first = parts[0] ?? '';
++    if (first && !value.startsWith(first)) {
++        return false;
++    }
++    cursor = first.length;
++
++    for (const part of parts.slice(1, -1)) {
++        const next = value.indexOf(part, cursor);
++        if (next === -1) {
++            return false;
++        }
++        cursor = next + part.length;
++    }
++
++    const last = parts[parts.length - 1] ?? '';
++    if (!last) {
++        return true;
++    }
++
++    const next = value.indexOf(last, cursor);
++    return next !== -1 && next + last.length === value.length;
++}
++
++describe('Processor', () => {
++    beforeEach(() => {
++        workerConstructions.length = 0;
++        workerStarts.length = 0;
++    });
++
++    it('default task-family workers request partitioned group keys', () => {
++        const processor = new Processor('http://orchestrator.test');
++
++        processor.start();
++
++        expect(workerStarts).toEqual(workerConstructions.map((worker) => worker.groupKey));
++        expect(workerConstructions).toHaveLength(taskFamilyKeys.length);
++
++        const requestedGroupKeys = workerConstructions.map((worker) => worker.groupKey);
++        expect(new Set(requestedGroupKeys).size).toBe(requestedGroupKeys.length);
++
++        for (const family of taskFamilyKeys) {
++            const matchingPatterns = requestedGroupKeys.filter((groupKey) => {
++                return matchesGroupKeyPattern(groupKey, family) && matchesGroupKeyPattern(groupKey, `${family}:tenantA`);
++            });
++
++            expect(matchingPatterns).toHaveLength(1);
++            expect(matchingPatterns[0]).not.toBe('*');
++            expect(matchesGroupKeyPattern(matchingPatterns[0]!, `other-${family}:tenantA`)).toBe(false);
++        }
++    });
++});
+diff --git a/packages/jobs/lib/processor/processor.worker.types.test.ts b/packages/jobs/lib/processor/processor.worker.types.test.ts
+new file mode 100644
+index 000000000..9766178c2
+--- /dev/null
++++ b/packages/jobs/lib/processor/processor.worker.types.test.ts
+@@ -0,0 +1,24 @@
++import { describe, expect, it } from 'vitest';
++import { ProcessorWorker } from './processor.worker.js';
++
++describe('ProcessorWorker constructor options', () => {
++    it('accepts custom group key strings in constructor options', () => {
++        const customGroupKey = 'tenant-specific-custom-key';
++        const customPattern = `${customGroupKey}*`;
++
++        const patternOptions = {
++            orchestratorUrl: 'http://orchestrator.test',
++            groupKey: customPattern,
++            maxConcurrency: 1
++        } satisfies ConstructorParameters<typeof ProcessorWorker>[0];
++
++        const customOptions = {
++            orchestratorUrl: 'http://orchestrator.test',
++            groupKey: customGroupKey,
++            maxConcurrency: 1
++        } satisfies ConstructorParameters<typeof ProcessorWorker>[0];
++
++        expect(patternOptions.groupKey).toBe(customPattern);
++        expect(customOptions.groupKey).toBe(customGroupKey);
++    });
++});
+diff --git a/packages/scheduler/lib/models/tasks.integration.test.ts b/packages/scheduler/lib/models/tasks.integration.test.ts
+index 0380720fe..2bfc28f32 100644
+--- a/packages/scheduler/lib/models/tasks.integration.test.ts
++++ b/packages/scheduler/lib/models/tasks.integration.test.ts
+@@ -97,6 +97,36 @@ describe('Task', () => {
+         dequeued = (await tasks.dequeue(db, { groupKey: t1.groupKey, limit: 1 })).unwrap();
+         expect(dequeued).toHaveLength(0); // no tasks left
+     });
++    it('should dequeue eligible tasks by group key pattern', async () => {
++        const t0 = await createTask(db, { groupKey: 'A:B' });
++        const t1 = await createTask(db, { groupKey: 'A:B:C' });
++        const t2 = await createTask(db, { groupKey: 'A:B:D' });
++        await createTask(db, { groupKey: 'A:X:Y' });
++        await createTask(db, { groupKey: 'Z:A:B' });
++        await createTask(db, {
++            groupKey: 'A:B:future',
++            startsAfter: new Date(Date.now() + 60_000)
++        });
++
++        const firstBatch = (await tasks.dequeue(db, { groupKey: 'A:B*', limit: 2 })).unwrap();
++        expect(firstBatch).toHaveLength(2);
++        expect(firstBatch.every((task) => task.state === 'STARTED')).toBe(true);
++
++        const secondBatch = (await tasks.dequeue(db, { groupKey: 'A:B*', limit: 10 })).unwrap();
++        expect(secondBatch.every((task) => task.state === 'STARTED')).toBe(true);
++
++        const allDequeuedIds = [...firstBatch, ...secondBatch].map((task) => task.id).sort((a, b) => a.localeCompare(b));
++        expect(allDequeuedIds).toEqual([t0.id, t1.id, t2.id].sort((a, b) => a.localeCompare(b)));
++
++        const teamBlue1 = await createTask(db, { groupKey: 'team:blue:1' });
++        const teamBlue2 = await createTask(db, { groupKey: 'team:blue:2' });
++        await createTask(db, { groupKey: 'team:green:1' });
++
++        const teamBlueDequeued = (await tasks.dequeue(db, { groupKey: 'team:blue*', limit: 10 })).unwrap();
++        expect(teamBlueDequeued.map((task) => task.id).sort((a, b) => a.localeCompare(b))).toEqual(
++            [teamBlue1.id, teamBlue2.id].sort((a, b) => a.localeCompare(b))
++        );
++    });
+     it('should not be dequeued if startsAfter is in the future', async () => {
+         const tomorrow = (() => {
+             const date = new Date();
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,105 @@
++#!/bin/bash
++set -uo pipefail
++cd /testbed
++
++
++if [ ! -d node_modules/vitest ]; then
++    npm ci
++fi
++if [ ! -d packages/utils/dist ]; then
++    fixturea_type_test_backup=""
++    if [ -f packages/jobs/lib/processor/processor.worker.types.test.ts ]; then
++        fixturea_type_test_backup="$(mktemp /tmp/fixturea-type-test.XXXXXX.ts)"
++        mv packages/jobs/lib/processor/processor.worker.types.test.ts "$fixturea_type_test_backup"
++    fi
++    npm run ts-build
++    if [ -n "$fixturea_type_test_backup" ]; then
++        mv "$fixturea_type_test_backup" packages/jobs/lib/processor/processor.worker.types.test.ts
++    fi
++fi
++
++pg_isready -h localhost -p 5432 || pg_ctlcluster 16 main start
++
++export NANGO_DB_USER=postgres
++export NANGO_DB_PASSWORD=nango_test
++export NANGO_DB_HOST=localhost
++export NANGO_DB_PORT=5432
++export NANGO_DB_NAME=postgres
++
++
++mkdir -p .build_env
++if [ ! -f .build_env/setup.ts ]; then
++    cat > .build_env/setup.ts <<'SETUP'
++export async function setup() {
++    process.env['NANGO_DB_PASSWORD'] = 'nango_test';
++    process.env['NANGO_DB_HOST'] = 'localhost';
++    process.env['NANGO_DB_USER'] = 'postgres';
++    process.env['NANGO_DB_PORT'] = '5432';
++    process.env['NANGO_DB_NAME'] = 'postgres';
++    process.env['RECORDS_DATABASE_URL'] = `postgres://postgres:nango_test@localhost:5432/postgres`;
++}
++
++export const teardown = async () => {};
++SETUP
++fi
++
++if [ ! -f .build_env/vite.integration.config.ts ]; then
++    cat > .build_env/vite.integration.config.ts <<'VITECONFIG'
++/// <reference types="vitest" />
++import { defineConfig } from 'vitest/config';
++
++process.env.TZ = 'UTC';
++
++export default defineConfig({
++    test: {
++        include: ['**/*.integration.{test,spec}.?(c|m)[jt]s?(x)'],
++        globalSetup: './.build_env/setup.ts',
++        setupFiles: './tests/setupFiles.ts',
++        testTimeout: 20000,
++        env: {
++            NANGO_ENCRYPTION_KEY: 'RzV4ZGo5RlFKMm0wYWlXdDhxTFhwb3ZrUG5KNGg3TmU=',
++            NANGO_LOGS_ENABLED: 'false',
++            FLAG_PLAN_ENABLED: 'true',
++            ORCHESTRATOR_SERVICE_URL: 'http://orchestrator'
++        },
++        fileParallelism: false,
++        pool: 'forks',
++        poolOptions: {
++            forks: {
++                singleFork: true
++            }
++        }
++    }
++});
++VITECONFIG
++fi
++
++cat > .build_env/tsconfig.fixturea.json <<'TSCONFIG'
++{
++  "extends": "../packages/jobs/tsconfig.json",
++  "compilerOptions": {
++    "noEmit": true,
++    "rootDir": "../packages/jobs/lib"
++  },
++  "include": [
++    "../packages/jobs/lib/**/*"
++  ]
++}
++TSCONFIG
++
++case "${1:-}" in
++    base)
++        npx vitest run --config .build_env/vite.integration.config.ts packages/scheduler/lib/models/tasks.integration.test.ts
++        ;;
++    new)
++        npx vitest run --config .build_env/vite.integration.config.ts \
++            packages/scheduler/lib/models/tasks.integration.test.ts \
++            packages/jobs/lib/processor/processor.integration.test.ts \
++            packages/jobs/lib/processor/processor.worker.types.test.ts &&
++        npx tsc --project .build_env/tsconfig.fixturea.json --noEmit
++        ;;
++    *)
++        echo "usage: $0 base|new"
++        exit 2
++        ;;
++esac

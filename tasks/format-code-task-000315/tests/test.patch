@@ -1,0 +1,323 @@
+diff --git a/usercase-test-coderl/test_run_job_lifecycle.py b/usercase-test-coderl/test_run_job_lifecycle.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/test_run_job_lifecycle.py
+@@ -0,0 +1,295 @@
++from __future__ import annotations
++
++from datetime import datetime, timedelta, timezone
++from typing import Any
++
++import anyio
++import pytest
++
++from apscheduler import (
++    AsyncScheduler,
++    Job,
++    JobAdded,
++    JobCancelled,
++    JobDeadlineMissed,
++    JobReleased,
++    JobOutcome,
++    JobResult,
++    RunState,
++    Scheduler,
++    current_job,
++)
++from apscheduler.datastores.memory import MemoryDataStore
++
++
++pytestmark = pytest.mark.anyio
++
++def add(left: int, right: int) -> int:
++    return left + right
++
++
++def greet(*, name: str) -> str:
++    return f"Hello, {name}!"
++
++
++def selected_executor() -> str:
++    return current_job.get().executor
++
++
++def raise_value_error() -> None:
++    raise ValueError("boom literal")
++
++
++def raise_cancelled() -> None:
++    raise anyio.get_cancelled_exc_class()()
++
++
++class DeadlineResultDataStore(MemoryDataStore):
++
++
++    async def add_job(self, job: Job) -> None:
++        await super().add_job(job)
++        finished_at = datetime.now(timezone.utc)
++        result = JobResult(
++            job_id=job.id,
++            outcome=JobOutcome.missed_start_deadline,
++            finished_at=finished_at,
++            expires_at=finished_at + timedelta(minutes=15),
++        )
++        await super().release_job("deadline-store", job, result)
++
++
++@pytest.fixture
++def anyio_backend() -> str:
++    return "asyncio"
++
++
++async def test_async_run_job_positional_one_off_lifecycle() -> None:
++
++
++
++
++    seen_events: list[Any] = []
++
++    async with AsyncScheduler() as scheduler:
++        assert scheduler.state is RunState.stopped
++        assert await scheduler.get_jobs() == []
++
++        scheduler.subscribe(seen_events.append)
++        await scheduler.start_in_background()
++        assert scheduler.state is RunState.started
++
++        result = await scheduler.run_job(add, args=[2, 3])
++        assert result == 5
++        assert await scheduler.get_jobs() == []
++
++
++        job_added_events = [
++            event for event in seen_events if isinstance(event, JobAdded)
++        ]
++        job_released_events = [
++            event for event in seen_events if isinstance(event, JobReleased)
++        ]
++        assert len(job_added_events) == 1
++        assert len(job_released_events) == 1
++        assert job_released_events[0].job_id == job_added_events[0].job_id
++
++    assert scheduler.state is RunState.stopped
++
++
++async def test_async_run_job_keyword_arguments() -> None:
++
++
++
++
++    async with AsyncScheduler() as scheduler:
++        await scheduler.start_in_background()
++
++        result = await scheduler.run_job(greet, kwargs={"name": "Ada"})
++        assert result == "Hello, Ada!"
++        assert await scheduler.get_jobs() == []
++
++
++async def test_async_run_job_executor_override_selects_named_executor() -> None:
++
++
++
++
++    async with AsyncScheduler() as scheduler:
++        await scheduler.start_in_background()
++
++        async_executor = await scheduler.run_job(
++            selected_executor, job_executor="async"
++        )
++        thread_executor = await scheduler.run_job(
++            selected_executor, job_executor="threadpool"
++        )
++
++        assert async_executor == "async"
++        assert thread_executor == "threadpool"
++        assert await scheduler.get_jobs() == []
++
++
++async def test_async_run_job_raises_original_task_exception() -> None:
++
++
++
++
++    async with AsyncScheduler() as scheduler:
++        await scheduler.start_in_background()
++
++        with pytest.raises(ValueError, match="^boom literal$"):
++            await scheduler.run_job(raise_value_error)
++
++        assert await scheduler.get_jobs() == []
++
++
++async def test_async_run_job_raises_job_deadline_missed_for_recorded_outcome() -> None:
++
++
++
++
++    async with AsyncScheduler(data_store=DeadlineResultDataStore()) as scheduler:
++        with pytest.raises(JobDeadlineMissed):
++            await scheduler.run_job(add, args=[1, 2])
++
++        assert await scheduler.get_jobs() == []
++
++
++async def test_async_run_job_raises_job_cancelled_for_cancelled_job() -> None:
++
++
++
++
++    async with AsyncScheduler() as scheduler:
++        await scheduler.start_in_background()
++
++        with pytest.raises(JobCancelled):
++            await scheduler.run_job(raise_cancelled)
++
++        assert await scheduler.get_jobs() == []
++
++
++async def test_async_run_job_before_initialized_raises_initialized_only_error() -> None:
++
++
++
++
++    scheduler = AsyncScheduler()
++
++
++
++    with pytest.raises(RuntimeError):
++        await scheduler.run_job(add, args=[1, 2])
++
++
++async def test_async_scheduler_instances_keep_independent_run_job_state() -> None:
++
++
++
++
++    async with AsyncScheduler(identity="a") as scheduler_a:
++        async with AsyncScheduler(identity="b") as scheduler_b:
++            assert scheduler_a.state is RunState.stopped
++            assert scheduler_b.state is RunState.stopped
++            assert await scheduler_a.get_jobs() == []
++            assert await scheduler_b.get_jobs() == []
++
++            await scheduler_a.start_in_background()
++            assert scheduler_a.state is RunState.started
++            assert scheduler_b.state is RunState.stopped
++
++            result = await scheduler_a.run_job(add, args=[4, 6])
++            assert result == 10
++            assert scheduler_a.state is RunState.started
++            assert scheduler_b.state is RunState.stopped
++            assert await scheduler_a.get_jobs() == []
++            assert await scheduler_b.get_jobs() == []
++
++
++async def test_async_scheduler_context_cleanup_is_idempotent() -> None:
++
++
++
++
++    scheduler = AsyncScheduler()
++    await scheduler.__aenter__()
++    await scheduler.start_in_background()
++    result = await scheduler.run_job(add, args=[3, 4])
++    assert result == 7
++    assert scheduler.state is RunState.started
++
++    await scheduler.__aexit__(None, None, None)
++
++
++    assert scheduler.state is RunState.stopped
++
++
++def test_sync_run_job_blocks_and_returns_value() -> None:
++
++
++
++
++    with Scheduler() as scheduler:
++        assert scheduler.state is RunState.stopped
++        assert scheduler.get_jobs() == []
++
++        scheduler.start_in_background()
++        assert scheduler.state is RunState.started
++        result = scheduler.run_job(add, args=[7, 8])
++        assert result == 15
++        assert scheduler.get_jobs() == []
++
++    assert scheduler.state is RunState.stopped
++
++
++def test_sync_run_job_keyword_arguments_and_executor_override() -> None:
++
++
++
++
++    with Scheduler() as scheduler:
++        scheduler.start_in_background()
++
++        greeting = scheduler.run_job(greet, kwargs={"name": "Ada"})
++        executor = scheduler.run_job(selected_executor, job_executor="threadpool")
++
++        assert greeting == "Hello, Ada!"
++        assert executor == "threadpool"
++        assert scheduler.get_jobs() == []
++
++
++def test_sync_scheduler_context_cleanup_is_idempotent() -> None:
++
++
++
++
++    scheduler = Scheduler()
++    scheduler.__enter__()
++    scheduler.start_in_background()
++    result = scheduler.run_job(add, args=[5, 6])
++    assert result == 11
++    assert scheduler.state is RunState.started
++
++    scheduler.__exit__(None, None, None)
++
++
++    assert scheduler.state is RunState.stopped
++
++
++def test_repeated_sync_run_job_sessions_do_not_leak_background_threads() -> None:
++
++
++
++
++
++
++
++    for _ in range(5):
++        with Scheduler() as scheduler:
++            scheduler.start_in_background()
++            result = scheduler.run_job(add, args=[1, 1])
++            assert result == 2
++            assert scheduler.get_jobs() == []
++
++        assert scheduler.state is RunState.stopped
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,18 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++
++cd /workspace/repo
++
++export PYTHONPATH="/workspace/repo/src${PYTHONPATH:+:${PYTHONPATH}}"
++export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
++exec python -m pytest -p anyio.pytest_plugin /workspace/repo/usercase-test-coderl/test_run_job_lifecycle.py -v

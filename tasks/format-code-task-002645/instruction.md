@@ -1,0 +1,9 @@
+I want Restyle to provide built-in spacing shorthand props for the standard spacing restyle function set. The public API should export `spacingShorthand` and `SpacingShorthandProps<Theme extends BaseTheme>` from the package, so I can pass `spacingShorthand` into `composeRestyleFunctions` or `createRestyleComponent` and type my components with the matching prop type.
+
+`SpacingShorthandProps` should include `m`, `mt`, `mr`, `mb`, `ml`, `mx`, `my`, `ms`, `me`, `p`, `pt`, `pr`, `pb`, `pl`, `px`, `py`, `ps`, `pe`, `g`, `rg`, and `cg`. Each shorthand prop should accept responsive values whose concrete values are keys from `theme.spacing`, just like the long-form spacing props.
+
+At runtime, each shorthand should resolve through `theme.spacing` and write the corresponding React Native style property: `m` to `margin`, `mt` to `marginTop`, `mr` to `marginRight`, `mb` to `marginBottom`, `ml` to `marginLeft`, `mx` to `marginHorizontal`, `my` to `marginVertical`, `ms` to `marginStart`, `me` to `marginEnd`, `p` to `padding`, `pt` to `paddingTop`, `pr` to `paddingRight`, `pb` to `paddingBottom`, `pl` to `paddingLeft`, `px` to `paddingHorizontal`, `py` to `paddingVertical`, `ps` to `paddingStart`, `pe` to `paddingEnd`, `g` to `gap`, `rg` to `rowGap`, and `cg` to `columnGap`.
+
+For example, with `theme.spacing.s = 8`, composing `spacingShorthand` and building styles from `{m: 's', px: 's', rg: 's'}` should produce a style containing `{margin: 8, paddingHorizontal: 8, rowGap: 8}`. With a responsive theme where `theme.spacing.s = 8` and `theme.spacing.m = 16`, `{mt: {phone: 's', tablet: 'm'}}` should resolve to `marginTop: 8` on the phone breakpoint and `marginTop: 16` on the tablet breakpoint.
+
+The default components from `createBox` and `createText` should include these shorthand spacing props in their public prop types and should apply them to the rendered React Native style.

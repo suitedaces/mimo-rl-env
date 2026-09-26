@@ -1,0 +1,3 @@
+After https://github.com/libp2p/go-libp2p/pull/1574, the `Network` is now responsible for emitting such events. However, only `Swarm` was updated to emit them, and the only second implementation, `mocknet` was not. There are projects in the ecosystem that uses `mockent` and for whom updating to v0.27 will break tests because of this.
+
+Additionally, the tests that depend on `swarm/testing` will break as well due to the reason @vyzo mentioned in [here](https://github.com/libp2p/go-libp2p/pull/1574#discussion_r884115720). The user now has two instantiate the EventBus themselves and pass two both the host constructor and the `GenSwarm`, but if I understand correctly this is part of a larger issue https://github.com/libp2p/go-libp2p/issues/1993.

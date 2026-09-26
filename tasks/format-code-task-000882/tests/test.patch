@@ -1,0 +1,507 @@
+diff --git a/usercase-test-coderl/stats_stateful.test.js b/usercase-test-coderl/stats_stateful.test.js
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/stats_stateful.test.js
+@@ -0,0 +1,466 @@
++const http = require('http')
++
++const Stats = require('/workspace/repo/envoy-curses/src/stats.js')
++
++function makeLog() {
++  return {
++    errors: [],
++    debugMessages: [],
++    error(message) {
++      this.errors.push(message)
++    },
++    debug(message) {
++      this.debugMessages.push(message)
++    },
++  }
++}
++
++function expectUnknownSeriesError(log, statName) {
++
++  expect(log.errors.length).toBe(1)
++  expect(log.errors[0]).toEqual(expect.stringContaining('unknown'))
++  expect(log.errors[0]).toEqual(expect.stringContaining(statName))
++}
++
++function sleep(ms) {
++  return new Promise(resolve => setTimeout(resolve, ms))
++}
++
++function withFakeNow(isoTimestamp, fn) {
++  const RealDate = Date
++
++  function FakeDate(...args) {
++    if (this instanceof FakeDate) {
++      if (args.length === 0) {
++        return new RealDate(isoTimestamp)
++      }
++      return new RealDate(...args)
++    }
++    return RealDate(...args)
++  }
++
++  FakeDate.now = () => new RealDate(isoTimestamp).getTime()
++  FakeDate.parse = RealDate.parse
++  FakeDate.UTC = RealDate.UTC
++  FakeDate.prototype = RealDate.prototype
++  global.Date = FakeDate
++
++  return Promise.resolve()
++    .then(fn)
++    .finally(() => {
++      global.Date = RealDate
++    })
++}
++
++function waitForUpdated(stats, action) {
++  return new Promise((resolve, reject) => {
++    const timer = setTimeout(() => reject(new Error('timed out waiting for updated')), 1000)
++    stats.once('updated', () => {
++      clearTimeout(timer)
++      resolve()
++    })
++    action()
++  })
++}
++
++function makeStatsServer(bodies) {
++  let requestIndex = 0
++  const server = http.createServer((req, res) => {
++    const body = bodies[Math.min(requestIndex, bodies.length - 1)]
++    requestIndex++
++    res.statusCode = 200
++    res.end(body)
++  })
++
++  return new Promise(resolve => {
++    server.listen(0, '127.0.0.1', () => {
++      resolve({
++        uri: `http://127.0.0.1:${server.address().port}/stats`,
++        requests: () => requestIndex,
++        close: () => new Promise(done => server.close(done)),
++      })
++    })
++  })
++}
++
++describe('Stats stateful model acceptance', () => {
++  test('constructor requires statsURI and applies default options', async () => {
++
++
++    let caught = null
++    try {
++      new Stats({log: makeLog()})
++    } catch (err) {
++      caught = err
++    }
++
++    expect(caught.constructor).toBe(Error)
++    expect(caught.message).toBe('Stats ctor: statsURI is required')
++
++    const bodies = []
++    const fakeTimes = []
++    const expectedGaugeValues = []
++    const expectedGaugeTimes = []
++    for (let i = 0; i < 20; i++) {
++      bodies.push(`server.uptime: ${i}\nserver.memory_allocated: ${100 + i}\ncluster.demo.upstream_rq_total: ${7 + i}`)
++      const seconds = String(i).padStart(2, '0')
++      fakeTimes.push(`2020-01-01T09:00:${seconds}Z`)
++      if (i < 19) {
++        expectedGaugeValues.push(100 + i)
++        expectedGaugeTimes.push(`09:00:${seconds}`)
++      }
++    }
++    const server = await makeStatsServer(bodies)
++    const realSetInterval = global.setInterval
++    const scheduledIntervals = []
++
++    global.setInterval = (fn, ms) => {
++      scheduledIntervals.push({fn: fn, ms: ms})
++      return 4242
++    }
++
++    try {
++      const stats = new Stats({
++        statsURI: server.uri,
++        log: makeLog(),
++      })
++
++      expect(stats.getStatsTable(/^server\./)).toEqual([
++        ['Stat Name', 'Stat Value'],
++      ])
++      expect(Array.from(stats.getStatNames('cluster.demo.')).sort()).toEqual([])
++
++      await withFakeNow(fakeTimes[0], () => {
++        return waitForUpdated(stats, () => stats.start())
++      })
++
++
++      expect(scheduledIntervals.length).toBe(1)
++      expect(scheduledIntervals[0].ms).toBe(1000)
++
++      for (let i = 1; i < fakeTimes.length; i++) {
++        await withFakeNow(fakeTimes[i], () => {
++          return waitForUpdated(stats, () => stats.pollStats())
++        })
++      }
++
++
++      expect(stats.getSeriesAsGauge('server.memory_allocated')).toEqual({
++        x: expectedGaugeTimes,
++        y: expectedGaugeValues,
++      })
++    } finally {
++      global.setInterval = realSetInterval
++      await server.close()
++    }
++  })
++
++  test('pollStats parses colon-delimited stats and refreshes current table state', async () => {
++
++
++    const server = await makeStatsServer([
++      'server.uptime: 10\nserver.memory_allocated: 100\ncluster.demo.upstream_rq_total: 7',
++    ])
++
++    try {
++      const stats = new Stats({
++        statsURI: server.uri,
++        log: makeLog(),
++        bufferSize: 4,
++        pollingInterval: 250,
++      })
++      let updatedCount = 0
++      stats.on('updated', () => {
++        updatedCount++
++      })
++
++      await withFakeNow('2020-01-01T09:10:11Z', () => {
++        return waitForUpdated(stats, () => stats.pollStats())
++      })
++
++      expect(updatedCount).toBe(1)
++      expect(stats.getCurrentStatValue('server.uptime')).toBe(10)
++      expect(stats.getStatsTable(/^server\./)).toEqual([
++        ['Stat Name', 'Stat Value'],
++        ['server.uptime', '10'],
++        ['server.memory_allocated', '100'],
++      ])
++      expect(Array.from(stats.getStatNames('cluster.demo.')).sort()).toEqual([
++        'upstream_rq_total',
++      ])
++    } finally {
++      await server.close()
++    }
++  })
++
++  test('counter and gauge series traverse stored circular samples with literal timestamps', async () => {
++
++
++    const server = await makeStatsServer([
++      'server.uptime: 10\nserver.memory_allocated: 100\ncluster.demo.upstream_rq_total: 7',
++      'server.uptime: 20\nserver.memory_allocated: 130\ncluster.demo.upstream_rq_total: 12',
++      'server.uptime: 30\nserver.memory_allocated: 125\ncluster.demo.upstream_rq_total: 20',
++      'server.uptime: 40\nserver.memory_allocated: 140\ncluster.demo.upstream_rq_total: 30',
++    ])
++
++    try {
++      const stats = new Stats({
++        statsURI: server.uri,
++        log: makeLog(),
++        bufferSize: 4,
++        pollingInterval: 250,
++      })
++      const fakeTimes = [
++        '2020-01-01T09:10:11Z',
++        '2020-01-01T09:10:12Z',
++        '2020-01-01T09:10:13Z',
++        '2020-01-01T09:10:14Z',
++      ]
++
++      for (let i = 0; i < fakeTimes.length; i++) {
++        await withFakeNow(fakeTimes[i], () => {
++          return waitForUpdated(stats, () => stats.pollStats())
++        })
++      }
++
++      expect(stats.getCurrentStatValue('server.uptime')).toBe(40)
++      expect(stats.getSeries('cluster.demo.upstream_rq_total')).toEqual({
++        x: ['09:10:12', '09:10:13'],
++        y: [5, 8],
++      })
++      expect(stats.getSeriesAsGauge('server.memory_allocated')).toEqual({
++        x: ['09:10:11', '09:10:12', '09:10:13'],
++        y: [100, 130, 125],
++      })
++    } finally {
++      await server.close()
++    }
++  })
++
++  test('unknown stat lookups log errors and return literal miss values', async () => {
++
++
++    const currentLog = makeLog()
++    const currentStats = new Stats({
++      statsURI: 'http://127.0.0.1:65535/stats',
++      log: currentLog,
++      bufferSize: 4,
++    })
++
++    expect(currentStats.getCurrentStatValue('missing.stat')).toBe('err - missing.stat')
++    expectUnknownSeriesError(currentLog, 'missing.stat')
++
++    const counterLog = makeLog()
++    const counterStats = new Stats({
++      statsURI: 'http://127.0.0.1:65535/stats',
++      log: counterLog,
++      bufferSize: 4,
++    })
++
++    expect(counterStats.getSeries('missing.stat')).toBe(null)
++    expectUnknownSeriesError(counterLog, 'missing.stat')
++
++    const gaugeLog = makeLog()
++    const gaugeStats = new Stats({
++      statsURI: 'http://127.0.0.1:65535/stats',
++      log: gaugeLog,
++      bufferSize: 4,
++    })
++
++    expect(gaugeStats.getSeriesAsGauge('missing.stat')).toBe(null)
++    expectUnknownSeriesError(gaugeLog, 'missing.stat')
++  })
++
++  test('failed fetches are logged and do not emit updated', async () => {
++
++
++    const log = makeLog()
++    const stats = new Stats({
++      statsURI: 'ftp://127.0.0.1/stats',
++      log: log,
++      bufferSize: 4,
++    })
++    let updatedCount = 0
++    stats.on('updated', () => {
++      updatedCount++
++    })
++
++    stats.pollStats()
++    await sleep(50)
++
++    expect(updatedCount).toBe(0)
++
++    expect(log.errors.length).toBe(1)
++    expect(log.errors[0]).toMatch(/^Error polling stats: .+/)
++  })
++
++  test('start performs an immediate poll and schedules interval polling', async () => {
++
++
++    const server = await makeStatsServer([
++      'server.uptime: 10\nserver.memory_allocated: 100\ncluster.demo.upstream_rq_total: 7',
++      'server.uptime: 11\nserver.memory_allocated: 105\ncluster.demo.upstream_rq_total: 8',
++    ])
++    const realSetInterval = global.setInterval
++    const scheduledIntervals = []
++
++    global.setInterval = (fn, ms) => {
++      scheduledIntervals.push({fn: fn, ms: ms})
++      return 4242
++    }
++
++    try {
++      const stats = new Stats({
++        statsURI: server.uri,
++        log: makeLog(),
++        bufferSize: 4,
++        pollingInterval: 25,
++      })
++      let updatedCount = 0
++      stats.on('updated', () => {
++        updatedCount++
++      })
++
++      await withFakeNow('2020-01-01T08:00:01Z', () => {
++        return waitForUpdated(stats, () => stats.start())
++      })
++
++      expect(updatedCount).toBe(1)
++      expect(scheduledIntervals.length).toBe(1)
++      expect(scheduledIntervals[0].ms).toBe(25)
++      expect(stats.getCurrentStatValue('server.uptime')).toBe(10)
++
++      await withFakeNow('2020-01-01T08:00:02Z', () => {
++        return waitForUpdated(stats, () => scheduledIntervals[0].fn())
++      })
++
++      expect(updatedCount).toBe(2)
++      expect(stats.getCurrentStatValue('server.uptime')).toBe(11)
++      expect(server.requests()).toBe(2)
++    } finally {
++      global.setInterval = realSetInterval
++      await server.close()
++    }
++  })
++
++  test('two Stats instances keep independent in-memory samples', async () => {
++
++
++    const serverA = await makeStatsServer([
++      'server.uptime: 1\nserver.memory_allocated: 10\ncluster.demo.upstream_rq_total: 3',
++      'server.uptime: 2\nserver.memory_allocated: 20\ncluster.demo.upstream_rq_total: 4',
++    ])
++    const serverB = await makeStatsServer([
++      'server.uptime: 100\nserver.memory_allocated: 1000\ncluster.demo.upstream_rq_total: 30',
++    ])
++
++    try {
++      const statsA = new Stats({
++        statsURI: serverA.uri,
++        log: makeLog(),
++        bufferSize: 4,
++      })
++      const statsB = new Stats({
++        statsURI: serverB.uri,
++        log: makeLog(),
++        bufferSize: 4,
++      })
++
++      await withFakeNow('2020-01-01T07:00:01Z', () => {
++        return waitForUpdated(statsA, () => statsA.pollStats())
++      })
++      await withFakeNow('2020-01-01T07:00:02Z', () => {
++        return waitForUpdated(statsA, () => statsA.pollStats())
++      })
++      await withFakeNow('2020-01-01T07:00:03Z', () => {
++        return waitForUpdated(statsB, () => statsB.pollStats())
++      })
++
++      expect(statsA.getCurrentStatValue('server.uptime')).toBe(2)
++      expect(statsB.getCurrentStatValue('server.uptime')).toBe(100)
++      expect(statsA.getStatsTable(/^server\./)).toEqual([
++        ['Stat Name', 'Stat Value'],
++        ['server.uptime', '2'],
++        ['server.memory_allocated', '20'],
++      ])
++      expect(statsB.getStatsTable(/^server\./)).toEqual([
++        ['Stat Name', 'Stat Value'],
++        ['server.uptime', '100'],
++        ['server.memory_allocated', '1000'],
++      ])
++    } finally {
++      await serverA.close()
++      await serverB.close()
++    }
++  })
++
++  test('updated event listeners observe each refreshed model update', async () => {
++
++
++    const server = await makeStatsServer([
++      'server.uptime: 5\nserver.memory_allocated: 50\ncluster.demo.upstream_rq_total: 9',
++      'server.uptime: 6\nserver.memory_allocated: 55\ncluster.demo.upstream_rq_total: 10',
++    ])
++
++    try {
++      const stats = new Stats({
++        statsURI: server.uri,
++        log: makeLog(),
++        bufferSize: 4,
++      })
++      let updatedCount = 0
++      const listener = () => {
++        updatedCount++
++      }
++      stats.on('updated', listener)
++
++      await withFakeNow('2020-01-01T06:00:01Z', () => {
++        return waitForUpdated(stats, () => stats.pollStats())
++      })
++
++      expect(updatedCount).toBe(1)
++      expect(stats.getCurrentStatValue('server.uptime')).toBe(5)
++
++      await withFakeNow('2020-01-01T06:00:02Z', () => {
++        return waitForUpdated(stats, () => stats.pollStats())
++      })
++
++
++      expect(updatedCount).toBe(2)
++      expect(stats.getCurrentStatValue('server.uptime')).toBe(6)
++    } finally {
++      await server.close()
++    }
++  })
++
++  test('repeated construct-poll cycles refresh independent in-memory models', async () => {
++
++
++    const server = await makeStatsServer([
++      'server.uptime: 1\nserver.memory_allocated: 2\ncluster.demo.upstream_rq_total: 3',
++    ])
++
++    try {
++      for (let i = 0; i < 5; i++) {
++        const stats = new Stats({
++          statsURI: server.uri,
++          log: makeLog(),
++          bufferSize: 4,
++          pollingInterval: 1000,
++        })
++        await withFakeNow('2020-01-01T05:00:01Z', () => {
++          return waitForUpdated(stats, () => stats.pollStats())
++        })
++
++        expect(stats.getCurrentStatValue('server.uptime')).toBe(1)
++        expect(stats.getStatsTable(/^server\./)).toEqual([
++          ['Stat Name', 'Stat Value'],
++          ['server.uptime', '1'],
++          ['server.memory_allocated', '2'],
++        ])
++      }
++    } finally {
++      await server.close()
++    }
++  })
++})
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,31 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++
++cd /workspace/repo/envoy-curses
++
++if [ ! -d node_modules ]; then
++  echo "envoy-curses/node_modules is missing; dependencies must be preinstalled for offline test execution" >&2
++  exit 1
++fi
++
++if [ ! -x ./node_modules/.bin/jest ]; then
++  echo "envoy-curses local Jest binary is missing; dependencies must be preinstalled for offline test execution" >&2
++  exit 1
++fi
++
++export npm_config_audit=false
++export npm_config_fund=false
++export npm_config_offline=true
++export NO_UPDATE_NOTIFIER=1
++
++exec ./node_modules/.bin/jest --rootDir /workspace/repo /workspace/repo/usercase-test-coderl/stats_stateful.test.js --runInBand

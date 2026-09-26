@@ -1,0 +1,327 @@
+diff --git a/usercase-test-coderl/usecase.sh b/usercase-test-coderl/usecase.sh
+new file mode 100755
+--- /dev/null
++++ b/usercase-test-coderl/usecase.sh
+@@ -0,0 +1,300 @@
++#!/usr/bin/env bash
++
++set -u
++export LANG=C LC_ALL=C TZ=UTC
++
++TMPROOT=$(mktemp -d)
++trap 'rm -rf "$TMPROOT"' EXIT
++
++fail() {
++  echo "FAIL: $*" >&2
++  exit 1
++}
++
++( cd /workspace/repo && go build -ldflags='-s' -o="$TMPROOT/asdf" ./cmd/asdf ) \
++  || fail "build"
++BIN="$TMPROOT/asdf"
++
++setup_case() {
++  local name=$1
++  CASE_DIR="$TMPROOT/$name"
++  HOME="$CASE_DIR/home"
++  ASDF_DATA_DIR="$CASE_DIR/data"
++  ASDF_CONFIG_FILE="$CASE_DIR/asdfrc"
++  export HOME ASDF_DATA_DIR ASDF_CONFIG_FILE
++  mkdir -p "$HOME" "$ASDF_DATA_DIR/plugins/dummy/bin" "$ASDF_DATA_DIR/installs/dummy" "$ASDF_DATA_DIR/shims"
++  : >"$ASDF_CONFIG_FILE"
++  cd "$CASE_DIR" || fail "cd $CASE_DIR"
++}
++
++install_dummy_version() {
++  local version=$1
++  local install_dir="$ASDF_DATA_DIR/installs/dummy/$version"
++  mkdir -p "$install_dir/bin"
++  cat >"$install_dir/bin/dummy" <<EOF
++#!/usr/bin/env bash
++echo dummy $version
++EOF
++  cat >"$install_dir/bin/other_bin" <<EOF
++#!/usr/bin/env bash
++echo other_bin $version
++EOF
++  chmod +x "$install_dir/bin/dummy" "$install_dir/bin/other_bin"
++}
++
++write_expected() {
++  local file=$1
++  shift
++  printf '%s\n' "$@" >"$file"
++}
++
++assert_empty_file() {
++  local file=$1 label=$2
++  [ ! -s "$file" ] || fail "$label: unexpected content: $(sed -n l "$file")"
++}
++
++assert_file_equals() {
++  local actual=$1 expected=$2 label=$3
++  cmp -s "$actual" "$expected" || fail "$label: got $(sed -n l "$actual")"
++}
++
++assert_nonempty_file() {
++  local file=$1 label=$2
++  [ -s "$file" ] || fail "$label: expected non-empty content"
++}
++
++assert_file_has_line() {
++  local file=$1 line=$2 label=$3
++  grep -Fxq -- "$line" "$file" || fail "$label: missing line '$line'; got $(sed -n l "$file")"
++}
++
++assert_file_contains_text() {
++  local file=$1 text=$2 label=$3
++  grep -Fq -- "$text" "$file" || fail "$label: missing text '$text'; got $(sed -n l "$file")"
++}
++
++assert_file_lacks_text() {
++  local file=$1 text=$2 label=$3
++  ! grep -Fq -- "$text" "$file" || fail "$label: unexpected text '$text'; got $(sed -n l "$file")"
++}
++
++assert_file_contains_ordered_lines() {
++  local file=$1 label=$2
++  shift 2
++  local expected=("$@")
++  local idx=0 line
++
++  while IFS= read -r line && [ "$idx" -lt "${#expected[@]}" ]; do
++    if [ "$line" = "${expected[$idx]}" ]; then
++      idx=$((idx + 1))
++    fi
++  done <"$file"
++
++  [ "$idx" -eq "${#expected[@]}" ] || fail "$label: missing ordered lines; got $(sed -n l "$file")"
++}
++
++assert_shim_advertises_only() {
++  local shim=$1 version=$2 label=$3
++  [ -f "$shim" ] || fail "$label: missing shim $shim"
++  grep -qx "# asdf-plugin: dummy $version" "$shim" || fail "$label: missing dummy $version metadata"
++  ! grep -q "1.0.0" "$shim" || fail "$label: removed version still advertised"
++}
++
++
++
++
++setup_case f1_success_full_lifecycle
++install_dummy_version 1.0.0
++"$BIN" reshim dummy >setup_out 2>setup_err || fail "F1 setup reshim: $(sed -n l setup_err)"
++[ -f "$ASDF_DATA_DIR/shims/dummy" ] || fail "F1 setup missing dummy shim"
++[ -f "$ASDF_DATA_DIR/shims/other_bin" ] || fail "F1 setup missing other_bin shim"
++cat >"$ASDF_DATA_DIR/plugins/dummy/bin/uninstall" <<'EOF'
++#!/usr/bin/env bash
++echo "custom uninstall"
++printf 'callback stderr %s %s %s\n' "$ASDF_INSTALL_TYPE" "$ASDF_INSTALL_VERSION" "$ASDF_INSTALL_PATH" >&2
++EOF
++chmod +x "$ASDF_DATA_DIR/plugins/dummy/bin/uninstall"
++cat >"$ASDF_CONFIG_FILE" <<'EOF'
++pre_asdf_uninstall_dummy = echo pre_asdf_uninstall_dummy $1
++post_asdf_uninstall_dummy = echo post_asdf_uninstall_dummy $1
++EOF
++"$BIN" uninstall dummy 1.0.0 >out 2>err; ec=$?
++
++required_out=(
++  "pre_asdf_uninstall_dummy 1.0.0" \
++  "custom uninstall" \
++  "post_asdf_uninstall_dummy 1.0.0"
++)
++[ "$ec" -eq 0 ] || fail "F1 exit $ec; want 0"
++assert_file_contains_ordered_lines out "F1 stdout" "${required_out[@]}"
++
++assert_file_has_line err "callback stderr version 1.0.0 $ASDF_DATA_DIR/installs/dummy/1.0.0" "F1 stderr"
++[ ! -d "$ASDF_DATA_DIR/installs/dummy/1.0.0" ] || fail "F1 install directory still exists"
++[ ! -e "$ASDF_DATA_DIR/shims/dummy" ] || fail "F1 dummy shim still exists"
++[ ! -e "$ASDF_DATA_DIR/shims/other_bin" ] || fail "F1 other_bin shim still exists"
++
++
++
++
++setup_case f2_no_callback_refresh_remaining
++install_dummy_version 1.0.0
++install_dummy_version 1.1.0
++"$BIN" reshim dummy >setup_out 2>setup_err || fail "F2 setup reshim: $(sed -n l setup_err)"
++grep -q "1.0.0" "$ASDF_DATA_DIR/shims/dummy" || fail "F2 setup dummy shim did not advertise 1.0.0"
++grep -q "1.1.0" "$ASDF_DATA_DIR/shims/dummy" || fail "F2 setup dummy shim did not advertise 1.1.0"
++"$BIN" uninstall dummy 1.0.0 >out 2>err; ec=$?
++[ "$ec" -eq 0 ] || fail "F2 exit $ec; want 0"
++
++[ -f out ] || fail "F2 stdout capture missing"
++
++[ -f err ] || fail "F2 stderr capture missing"
++[ ! -d "$ASDF_DATA_DIR/installs/dummy/1.0.0" ] || fail "F2 1.0.0 install directory still exists"
++[ -d "$ASDF_DATA_DIR/installs/dummy/1.1.0" ] || fail "F2 1.1.0 install directory was removed"
++assert_shim_advertises_only "$ASDF_DATA_DIR/shims/dummy" "1.1.0" "F2 dummy shim"
++assert_shim_advertises_only "$ASDF_DATA_DIR/shims/other_bin" "1.1.0" "F2 other_bin shim"
++
++
++
++
++setup_case f3_missing_args
++"$BIN" uninstall >out_no_tool 2>err_no_tool; ec_no_tool=$?
++"$BIN" uninstall dummy >out_no_version 2>err_no_version; ec_no_version=$?
++write_expected expected_missing "No plugin given"
++[ "$ec_no_tool" -ne 0 ] || fail "F3 no-tool exit was zero"
++[ "$ec_no_version" -ne 0 ] || fail "F3 no-version exit was zero"
++
++[ -f out_no_tool ] || fail "F3 no-tool stdout capture missing"
++
++[ -f out_no_version ] || fail "F3 no-version stdout capture missing"
++
++assert_file_has_line err_no_tool "No plugin given" "F3 no-tool stderr"
++
++assert_file_has_line err_no_version "No plugin given" "F3 no-version stderr"
++
++
++
++
++setup_case f4_latest_rejected
++"$BIN" uninstall dummy latest >out 2>err; ec=$?
++write_expected expected_err "'latest' is a special version value that cannot be used for uninstall command"
++[ "$ec" -ne 0 ] || fail "F4 exit was zero"
++
++[ -f out ] || fail "F4 stdout capture missing"
++
++assert_file_has_line err "'latest' is a special version value that cannot be used for uninstall command" "F4 stderr"
++
++
++
++
++setup_case f5_not_installed
++"$BIN" uninstall dummy 9.9.9 >out 2>err; ec=$?
++write_expected expected_err "No such version"
++[ "$ec" -ne 0 ] || fail "F5 exit was zero"
++
++[ -f out ] || fail "F5 stdout capture missing"
++
++assert_file_has_line err "No such version" "F5 stderr"
++
++
++
++
++setup_case f6_config_load_failure
++install_dummy_version 1.0.0
++printf '[\n' >"$ASDF_CONFIG_FILE"
++"$BIN" uninstall dummy 1.0.0 >out 2>err; ec=$?
++write_expected expected_err "unclosed section: ["
++[ "$ec" -ne 0 ] || fail "F6 exit was zero"
++
++[ -f out ] || fail "F6 stdout capture missing"
++
++assert_nonempty_file err "F6 stderr"
++[ -d "$ASDF_DATA_DIR/installs/dummy/1.0.0" ] || fail "F6 install directory should remain"
++
++
++
++
++setup_case f7_pre_hook_failure
++install_dummy_version 1.0.0
++cat >"$CASE_DIR/failing-pre-hook" <<'EOF'
++#!/usr/bin/env bash
++echo hook stdout before failure
++echo hook stderr detail >&2
++exit 37
++EOF
++chmod +x "$CASE_DIR/failing-pre-hook"
++printf 'pre_asdf_uninstall_dummy = %s $1\n' "$CASE_DIR/failing-pre-hook" >"$ASDF_CONFIG_FILE"
++"$BIN" uninstall dummy 1.0.0 >out 2>err; ec=$?
++write_expected expected_out "hook stdout before failure"
++write_expected expected_err "hook stderr detail" "exit status 37"
++[ "$ec" -ne 0 ] || fail "F7 exit was zero"
++
++assert_file_has_line out "hook stdout before failure" "F7 stdout"
++
++assert_file_has_line err "hook stderr detail" "F7 stderr"
++assert_file_contains_text err "37" "F7 stderr"
++[ -d "$ASDF_DATA_DIR/installs/dummy/1.0.0" ] || fail "F7 install directory should remain"
++
++
++
++
++setup_case f8_callback_failure
++install_dummy_version 1.0.0
++cat >"$ASDF_DATA_DIR/plugins/dummy/bin/uninstall" <<'EOF'
++#!/usr/bin/env bash
++echo callback before failure
++echo callback err detail >&2
++exit 42
++EOF
++chmod +x "$ASDF_DATA_DIR/plugins/dummy/bin/uninstall"
++printf 'post_asdf_uninstall_dummy = echo should not run\n' >"$ASDF_CONFIG_FILE"
++"$BIN" uninstall dummy 1.0.0 >out 2>err; ec=$?
++write_expected expected_out "callback before failure"
++write_expected expected_err "callback err detail" "exit status 42"
++[ "$ec" -ne 0 ] || fail "F8 exit was zero"
++
++assert_file_has_line out "callback before failure" "F8 stdout"
++
++assert_file_has_line err "callback err detail" "F8 stderr"
++assert_file_contains_text err "42" "F8 stderr"
++assert_file_lacks_text out "should not run" "F8 stdout"
++assert_file_lacks_text err "should not run" "F8 stderr"
++[ -d "$ASDF_DATA_DIR/installs/dummy/1.0.0" ] || fail "F8 install directory should remain"
++
++
++
++
++setup_case f9_remove_failure
++"$BIN" uninstall dummy path:/proc/self >out 2>err; ec=$?
++write_expected expected_err "openfdat /proc/self: operation not permitted"
++[ "$ec" -ne 0 ] || fail "F9 exit was zero"
++
++[ -f out ] || fail "F9 stdout capture missing"
++
++assert_file_contains_text err "/proc/self" "F9 stderr"
++
++
++
++
++setup_case f10_post_hook_failure
++install_dummy_version 1.0.0
++cat >"$CASE_DIR/failing-post-hook" <<'EOF'
++#!/usr/bin/env bash
++echo post hook stdout before failure
++echo post hook stderr detail >&2
++exit 38
++EOF
++chmod +x "$CASE_DIR/failing-post-hook"
++printf 'post_asdf_uninstall_dummy = %s $1\n' "$CASE_DIR/failing-post-hook" >"$ASDF_CONFIG_FILE"
++"$BIN" uninstall dummy 1.0.0 >out 2>err; ec=$?
++write_expected expected_out "post hook stdout before failure"
++write_expected expected_err "post hook stderr detail" "exit status 38"
++[ "$ec" -ne 0 ] || fail "F10 exit was zero"
++
++assert_file_has_line out "post hook stdout before failure" "F10 stdout"
++
++assert_file_has_line err "post hook stderr detail" "F10 stderr"
++assert_file_contains_text err "38" "F10 stderr"
++[ ! -d "$ASDF_DATA_DIR/installs/dummy/1.0.0" ] || fail "F10 install directory should have been removed before post hook failure"
++
++echo "PASS"
++exit 0
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,17 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++
++
++export GOTOOLCHAIN=local
++export GOPROXY=off
++export GOSUMDB=off
++set -e
++cd /workspace/repo
++exec bash /workspace/repo/usercase-test-coderl/usecase.sh

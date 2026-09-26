@@ -1,0 +1,438 @@
+diff --git a/usercase-test-coderl/test_edu_rerank_context.py b/usercase-test-coderl/test_edu_rerank_context.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/test_edu_rerank_context.py
+@@ -0,0 +1,412 @@
++
++
++
++import builtins
++import json
++import os
++import re
++import socket
++import subprocess
++import sys
++from pathlib import Path
++
++sys.path.insert(0, "/workspace/repo")
++
++from experiments.LongBench.edu_rerank_example import process_context_with_edu_rerank
++
++
++def spec_token_count(text):
++    try:
++        import tiktoken
++
++        tokenizer = tiktoken.get_encoding("cl100k_base")
++        return len(tokenizer.encode(text, disallowed_special=()))
++    except Exception:
++        return len(text) // 4
++
++
++def expected_success_stats(original_text, filtered_text):
++    orig_tokens = spec_token_count(original_text)
++    new_tokens = spec_token_count(filtered_text)
++    return {
++        "orig_tokens": orig_tokens,
++        "new_tokens": new_tokens,
++        "ratio": round(new_tokens / orig_tokens, 4) if orig_tokens else 0.0,
++    }
++
++
++def expected_fallback_stats(original_text):
++    orig_tokens = spec_token_count(original_text)
++    return {"orig_tokens": orig_tokens, "new_tokens": orig_tokens, "ratio": 1.0}
++
++
++def assert_success_result(actual, original_text, expected_text):
++
++    assert actual == (expected_text, expected_success_stats(original_text, expected_text))
++
++
++def assert_fallback_result(actual, original_text):
++
++    assert actual == (original_text, expected_fallback_stats(original_text))
++
++
++class FakeProcessor:
++    def __init__(self, parsed_data, filtered_text):
++        self.parsed_data = parsed_data
++        self.filtered_text = filtered_text
++        self.parse_paths = []
++        self.semantic_calls = []
++
++    def parse_file(self, file_path):
++        self.parse_paths.append(file_path)
++        return self.parsed_data
++
++    def semantic_filter(self, parsed_data, query, top_k_per_level=3):
++        self.semantic_calls.append(
++            {
++                "parsed_data": parsed_data,
++                "query": query,
++                "top_k_per_level": top_k_per_level,
++            }
++        )
++        return self.filtered_text
++
++
++def test_success_returns_filtered_text_stats_and_custom_top_k(tmp_path):
++
++
++
++
++    parsed = {"sentences": [{"text": "Chapter 2: Methods", "level": 1}]}
++    processor = FakeProcessor(parsed, "Chapter 2: Methods")
++    temp_dir = tmp_path / "declared-temp"
++
++    context = "Chapter 1: Introduction\nChapter 2: Methods\nChapter 3: Results"
++    actual = process_context_with_edu_rerank(
++        processor,
++        context,
++        "What methods are mentioned?",
++        temp_dir=str(temp_dir),
++        top_k_per_level=5,
++    )
++
++    assert_success_result(actual, context, "Chapter 2: Methods")
++    assert len(processor.parse_paths) == 1
++    parse_path = Path(processor.parse_paths[0])
++
++    assert parse_path.is_relative_to(temp_dir)
++    assert parse_path.suffix == ".txt"
++    assert not parse_path.exists()
++
++    assert not list(temp_dir.rglob("*.txt"))
++    assert processor.semantic_calls == [
++        {
++            "parsed_data": {"sentences": [{"text": "Chapter 2: Methods", "level": 1}]},
++            "query": "What methods are mentioned?",
++            "top_k_per_level": 5,
++        }
++    ]
++
++
++def test_success_uses_default_top_k_per_level(tmp_path):
++
++
++
++
++    processor = FakeProcessor({"markdown": "# One\n# Two"}, "Default top-k text")
++
++    context = "Intro paragraph.\nDetails paragraph."
++    actual = process_context_with_edu_rerank(
++        processor,
++        context,
++        "Which paragraph?",
++        temp_dir=str(tmp_path / "temp"),
++    )
++
++    assert_success_result(actual, context, "Default top-k text")
++    assert processor.semantic_calls == [
++        {
++            "parsed_data": {"markdown": "# One\n# Two"},
++            "query": "Which paragraph?",
++            "top_k_per_level": 3,
++        }
++    ]
++
++
++def test_empty_context_returns_zero_stats_without_processor_calls(tmp_path):
++
++
++
++
++    processor = FakeProcessor({"sentences": [{"text": "unused"}]}, "unused")
++    temp_dir = tmp_path / "temp"
++
++    actual = process_context_with_edu_rerank(
++        processor,
++        "",
++        "Any query",
++        temp_dir=str(temp_dir),
++        top_k_per_level=7,
++    )
++
++    assert actual == ("", {"orig_tokens": 0, "new_tokens": 0, "ratio": 0.0})
++    assert processor.parse_paths == []
++    assert processor.semantic_calls == []
++
++    assert not list(temp_dir.rglob("*.txt"))
++
++
++def test_parse_none_falls_back_to_original_context(tmp_path):
++
++
++
++
++    processor = FakeProcessor(None, "ignored")
++
++    context = "Alpha beta gamma delta epsilon."
++    actual = process_context_with_edu_rerank(
++        processor,
++        context,
++        "Need gamma",
++        temp_dir=str(tmp_path / "temp"),
++        top_k_per_level=2,
++    )
++
++    assert_fallback_result(actual, context)
++    assert len(processor.parse_paths) == 1
++    assert processor.semantic_calls == []
++
++    assert not list((tmp_path / "temp").rglob("*.txt"))
++
++
++def test_empty_semantic_filter_falls_back_to_original_context(tmp_path):
++
++
++
++
++    processor = FakeProcessor({"sentences": [{"text": "Only sentence", "level": 1}]}, "")
++
++    context = "Keep this original context because filtering fails."
++    actual = process_context_with_edu_rerank(
++        processor,
++        context,
++        "Need answer",
++        temp_dir=str(tmp_path / "temp"),
++        top_k_per_level=4,
++    )
++
++    assert_fallback_result(actual, context)
++    assert processor.semantic_calls == [
++        {
++            "parsed_data": {"sentences": [{"text": "Only sentence", "level": 1}]},
++            "query": "Need answer",
++            "top_k_per_level": 4,
++        }
++    ]
++
++
++def test_temp_file_write_failure_falls_back_without_processor_calls(tmp_path, monkeypatch):
++
++
++
++
++    processor = FakeProcessor({"sentences": [{"text": "Should not parse", "level": 1}]}, "Should not filter")
++    temp_dir = tmp_path / "temp"
++    real_open = builtins.open
++
++    def fail_declared_temp_write(path, mode="r", *args, **kwargs):
++        if str(path).startswith(str(temp_dir)) and "w" in mode:
++            raise OSError("blocked write for acceptance test")
++        return real_open(path, mode, *args, **kwargs)
++
++    monkeypatch.setattr(builtins, "open", fail_declared_temp_write)
++
++    context = "Writable path is denied by open."
++    actual = process_context_with_edu_rerank(
++        processor,
++        context,
++        "Need fallback",
++        temp_dir=str(temp_dir),
++        top_k_per_level=3,
++    )
++
++    assert_fallback_result(actual, context)
++    assert processor.parse_paths == []
++    assert processor.semantic_calls == []
++
++    assert not list(temp_dir.rglob("*.txt"))
++
++
++def test_running_module_directly_prints_demo_output(tmp_path):
++
++
++
++
++    stub_pkg = tmp_path / "deeplang_parse"
++    stub_pkg.mkdir()
++    (stub_pkg / "__init__.py").write_text("", encoding="utf-8")
++    env = os.environ.copy()
++    env["PYTHONPATH"] = f"{tmp_path}:/workspace/repo:{env.get('PYTHONPATH', '')}"
++
++    completed = subprocess.run(
++        [sys.executable, "/workspace/repo/experiments/LongBench/edu_rerank_example.py"],
++        text=True,
++        stdout=subprocess.PIPE,
++        stderr=subprocess.PIPE,
++        check=True,
++        env=env,
++    )
++
++    stdout = completed.stdout
++
++    assert stdout.strip()
++    assert re.search(r"original.*token.*\d", stdout, re.IGNORECASE | re.DOTALL)
++    assert re.search(r"filtered.*token.*\d", stdout, re.IGNORECASE | re.DOTALL)
++    assert re.search(r"compression.*ratio.*[0-9]", stdout, re.IGNORECASE | re.DOTALL)
++    assert "filtered text" in stdout.lower()
++
++    assert "traceback" not in completed.stderr.lower()
++
++
++def test_empty_context_with_default_arguments_returns_zero_stats_without_processor_calls(tmp_path, monkeypatch):
++    processor = FakeProcessor({"sentences": [{"text": "unused"}]}, "unused")
++
++    monkeypatch.chdir(tmp_path)
++    actual = process_context_with_edu_rerank(processor, "", "Empty context")
++
++
++    assert actual == ("", {"orig_tokens": 0, "new_tokens": 0, "ratio": 0.0})
++    assert processor.parse_paths == []
++    assert processor.semantic_calls == []
++
++
++def test_referential_transparency_same_input_same_result(tmp_path):
++    processor = FakeProcessor({"sentences": [{"text": "Chapter 2: Methods", "level": 1}]}, "Chapter 2: Methods")
++    context = "Chapter 1: Introduction\nChapter 2: Methods\nChapter 3: Results"
++    first = process_context_with_edu_rerank(
++        processor,
++        context,
++        "What methods are mentioned?",
++        temp_dir=str(tmp_path / "first"),
++        top_k_per_level=5,
++    )
++    second = process_context_with_edu_rerank(
++        processor,
++        context,
++        "What methods are mentioned?",
++        temp_dir=str(tmp_path / "second"),
++        top_k_per_level=5,
++    )
++
++    assert_success_result(first, context, "Chapter 2: Methods")
++    assert_success_result(second, context, "Chapter 2: Methods")
++    assert first == second
++
++
++def test_preserves_caller_visible_text_inputs_and_passes_filter_arguments(tmp_path):
++    parsed = {"sentences": [{"text": "Stable node", "level": 2, "meta": {"ids": [1, 2]}}]}
++    processor = FakeProcessor(parsed, "Stable node")
++    context = "Stable context for mutation guard."
++    query = "Stable?"
++
++    actual = process_context_with_edu_rerank(
++        processor,
++        context,
++        query,
++        temp_dir=str(tmp_path / "temp"),
++        top_k_per_level=3,
++    )
++
++    assert_success_result(actual, context, "Stable node")
++    assert context == "Stable context for mutation guard."
++    assert query == "Stable?"
++
++    assert processor.semantic_calls == [
++        {"parsed_data": parsed, "query": query, "top_k_per_level": 3}
++    ]
++
++
++def test_no_global_state_matches_fresh_python_process(tmp_path):
++    processor = FakeProcessor({"sentences": [{"text": "Chapter 2: Methods", "level": 1}]}, "Chapter 2: Methods")
++    context = "Chapter 1: Introduction\nChapter 2: Methods\nChapter 3: Results"
++    in_process = process_context_with_edu_rerank(
++        processor,
++        context,
++        "What methods are mentioned?",
++        temp_dir=str(tmp_path / "in-process"),
++        top_k_per_level=5,
++    )
++
++    script = r'''
++import json
++import os
++import sys
++import tempfile
++sys.path.insert(0, "/workspace/repo")
++from experiments.LongBench.edu_rerank_example import process_context_with_edu_rerank
++
++class FakeProcessor:
++    def parse_file(self, file_path):
++        return {"sentences": [{"text": "Chapter 2: Methods", "level": 1}]}
++    def semantic_filter(self, parsed_data, query, top_k_per_level=3):
++        return "Chapter 2: Methods"
++
++with tempfile.TemporaryDirectory() as temp_dir:
++    result = process_context_with_edu_rerank(
++        FakeProcessor(),
++        "Chapter 1: Introduction\nChapter 2: Methods\nChapter 3: Results",
++        "What methods are mentioned?",
++        temp_dir=os.path.join(temp_dir, "fresh"),
++        top_k_per_level=5,
++    )
++print(json.dumps(result, sort_keys=True))
++'''
++    completed = subprocess.run(
++        [sys.executable, "-c", script],
++        text=True,
++        stdout=subprocess.PIPE,
++        stderr=subprocess.PIPE,
++        check=True,
++    )
++
++    assert_success_result(in_process, context, "Chapter 2: Methods")
++
++    assert json.loads(completed.stdout) == [
++        "Chapter 2: Methods",
++        expected_success_stats(context, "Chapter 2: Methods"),
++    ]
++
++    assert "traceback" not in completed.stderr.lower()
++
++
++def test_no_undeclared_side_effects_outside_declared_temp_dir(tmp_path, monkeypatch):
++    temp_dir = tmp_path / "declared-temp"
++    temp_dir.mkdir()
++    cwd = tmp_path / "cwd"
++    cwd.mkdir()
++    before = sorted(p.relative_to(cwd).as_posix() for p in cwd.rglob("*"))
++
++    def block_network(*args, **kwargs):
++        raise AssertionError("network access is not declared by the query")
++
++    monkeypatch.setattr(socket, "socket", block_network)
++    old_cwd = os.getcwd()
++    try:
++        os.chdir(cwd)
++        processor = FakeProcessor({"sentences": [{"text": "Stable node", "level": 1}]}, "Stable node")
++        actual = process_context_with_edu_rerank(
++            processor,
++            "Side effect guard context.",
++            "Guard?",
++            temp_dir=str(temp_dir),
++            top_k_per_level=3,
++        )
++    finally:
++        os.chdir(old_cwd)
++
++    after = sorted(p.relative_to(cwd).as_posix() for p in cwd.rglob("*"))
++    assert_success_result(actual, "Side effect guard context.", "Stable node")
++    assert before == []
++    assert after == []
++
++    assert not list(temp_dir.rglob("*.txt"))
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,16 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++cd /workspace/repo
++export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
++export TIKTOKEN_CACHE_DIR=/opt/coderl_tiktoken_cache
++exec python -m pytest /workspace/repo/usercase-test-coderl/test_edu_rerank_context.py -v

@@ -1,0 +1,383 @@
+diff --git a/internal/util/template_file_codespec_test.go b/internal/util/template_file_codespec_test.go
+new file mode 100644
+index 00000000..418260f7
+--- /dev/null
++++ b/internal/util/template_file_codespec_test.go
+@@ -0,0 +1,366 @@
++package util
++
++import (
++	"errors"
++	"io/ioutil"
++	"os"
++	"path/filepath"
++	"reflect"
++	"strings"
++	"sync"
++	"testing"
++	"text/template"
++)
++
++var receiveOnlyErrorChannelType = reflect.TypeOf((<-chan error)(nil))
++
++
++
++func codespecStatementStyleCallsStillCompile(dir string, tmpl *template.Template, wg *sync.WaitGroup, data interface{}) {
++	TemplateFileAndOverwrite(dir, "overwrite.txt", tmpl, wg, data)
++	TemplateFileIfDoesNotExist(dir, "create.txt", tmpl, wg, data)
++}
++
++func requireCompletionChannel(t *testing.T, name string, fn interface{}) {
++	t.Helper()
++	typ := reflect.TypeOf(fn)
++	if typ.NumOut() != 1 {
++		t.Fatalf("%s must return one completion result; got %d results", name, typ.NumOut())
++	}
++	if typ.Out(0) != receiveOnlyErrorChannelType {
++		t.Fatalf("%s must return <-chan error; got %s", name, typ.Out(0))
++	}
++}
++
++func callTemplateHelper(t *testing.T, fn interface{}, dir, name string, tmpl *template.Template, wg *sync.WaitGroup, data interface{}) <-chan error {
++	t.Helper()
++	requireCompletionChannel(t, runtimeName(fn), fn)
++	results := reflect.ValueOf(fn).Call([]reflect.Value{
++		reflect.ValueOf(dir),
++		reflect.ValueOf(name),
++		reflect.ValueOf(tmpl),
++		reflect.ValueOf(wg),
++		reflect.ValueOf(data),
++	})
++	completion, ok := results[0].Interface().(<-chan error)
++	if !ok || completion == nil {
++		t.Fatalf("%s returned a nil or incompatible completion channel", runtimeName(fn))
++	}
++	return completion
++}
++
++func runtimeName(fn interface{}) string {
++	if reflect.ValueOf(fn).Pointer() == reflect.ValueOf(TemplateFileAndOverwrite).Pointer() {
++		return "TemplateFileAndOverwrite"
++	}
++	return "TemplateFileIfDoesNotExist"
++}
++
++func completedError(t *testing.T, wg *sync.WaitGroup, completion <-chan error) error {
++	t.Helper()
++	wg.Wait()
++
++	var err error
++	select {
++	case value, ok := <-completion:
++		if !ok {
++			t.Fatal("completion channel closed without reporting a result")
++		}
++		err = value
++	default:
++		t.Fatal("wait group completed before a result was available")
++	}
++
++	select {
++	case _, ok := <-completion:
++		if ok {
++			t.Fatal("completion channel reported more than one result")
++		}
++	default:
++		t.Fatal("completion channel was not closed after reporting its result")
++	}
++	return err
++}
++
++func readFile(t *testing.T, path string) string {
++	t.Helper()
++	contents, err := ioutil.ReadFile(path)
++	if err != nil {
++		t.Fatalf("read %s: %v", path, err)
++	}
++	return string(contents)
++}
++
++func TestCodespecCompletionAndExistingFileContract(t *testing.T) {
++	requireCompletionChannel(t, "TemplateFileAndOverwrite", TemplateFileAndOverwrite)
++	requireCompletionChannel(t, "TemplateFileIfDoesNotExist", TemplateFileIfDoesNotExist)
++
++	dir := t.TempDir()
++	target := filepath.Join(dir, "owned.txt")
++	if err := ioutil.WriteFile(target, []byte("user-owned"), 0600); err != nil {
++		t.Fatal(err)
++	}
++
++	executed := false
++	tmpl := template.Must(template.New("must-not-run").Funcs(template.FuncMap{
++		"unexpected": func() string {
++			executed = true
++			return "replaced"
++		},
++	}).Parse("{{unexpected}}"))
++
++	var wg sync.WaitGroup
++	completion := callTemplateHelper(t, TemplateFileIfDoesNotExist, dir, "owned.txt", tmpl, &wg, "unused")
++	if err := completedError(t, &wg, completion); err != nil {
++		t.Fatalf("skipping an existing file returned an error: %v", err)
++	}
++	if executed {
++		t.Fatal("create-only helper executed its template for an existing destination")
++	}
++	if got := readFile(t, target); got != "user-owned" {
++		t.Fatalf("existing destination changed: got %q", got)
++	}
++}
++
++func TestCodespecRenderBeforePublication(t *testing.T) {
++	dir := t.TempDir()
++	target := filepath.Join(dir, "service.go")
++	if err := ioutil.WriteFile(target, []byte("old-version"), 0600); err != nil {
++		t.Fatal(err)
++	}
++
++	observed := ""
++	tmpl := template.Must(template.New("observe-existing").Funcs(template.FuncMap{
++		"observe": func() string {
++			observed = readFile(t, target)
++			return "new-version"
++		},
++	}).Parse("{{observe}}"))
++
++	var wg sync.WaitGroup
++	completion := callTemplateHelper(t, TemplateFileAndOverwrite, dir, "service.go", tmpl, &wg, "unused")
++	if err := completedError(t, &wg, completion); err != nil {
++		t.Fatalf("successful overwrite returned an error: %v", err)
++	}
++	if observed != "old-version" {
++		t.Fatalf("destination was changed before rendering completed: template observed %q", observed)
++	}
++	if got := readFile(t, target); got != "new-version" {
++		t.Fatalf("published content = %q, want %q", got, "new-version")
++	}
++	info, err := os.Stat(target)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if got := info.Mode().Perm(); got != 0600 {
++		t.Fatalf("overwrite changed destination permissions: got %04o, want 0600", got)
++	}
++
++	newTarget := filepath.Join(dir, "new.txt")
++	existedDuringRender := false
++	createTemplate := template.Must(template.New("observe-new").Funcs(template.FuncMap{
++		"observe": func() string {
++			_, statErr := os.Lstat(newTarget)
++			existedDuringRender = statErr == nil
++			return "created"
++		},
++	}).Parse("{{observe}}"))
++
++	completion = callTemplateHelper(t, TemplateFileIfDoesNotExist, dir, "new.txt", createTemplate, &wg, "unused")
++	if err := completedError(t, &wg, completion); err != nil {
++		t.Fatalf("successful creation returned an error: %v", err)
++	}
++	if existedDuringRender {
++		t.Fatal("new destination was visible before rendering completed")
++	}
++	if got := readFile(t, newTarget); got != "created" {
++		t.Fatalf("created content = %q, want %q", got, "created")
++	}
++	info, err = os.Stat(newTarget)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if got := info.Mode().Perm(); got != 0644 {
++		t.Fatalf("new destination permissions = %04o, want 0644", got)
++	}
++}
++
++func TestCodespecRenderFailureLeavesNoPartialOutput(t *testing.T) {
++	dir := t.TempDir()
++	target := filepath.Join(dir, "existing.txt")
++	if err := ioutil.WriteFile(target, []byte("original"), 0640); err != nil {
++		t.Fatal(err)
++	}
++
++	boom := errors.New("codespec render exploded")
++	badTemplate := template.Must(template.New("partial-then-error").Funcs(template.FuncMap{
++		"fail": func() (string, error) { return "", boom },
++	}).Parse("partial-content{{fail}}"))
++
++	var wg sync.WaitGroup
++	completion := callTemplateHelper(t, TemplateFileAndOverwrite, dir, "existing.txt", badTemplate, &wg, "unused")
++	err := completedError(t, &wg, completion)
++	if err == nil || !strings.Contains(err.Error(), boom.Error()) {
++		t.Fatalf("render failure = %v, want an error containing %q", err, boom.Error())
++	}
++	if got := readFile(t, target); got != "original" {
++		t.Fatalf("failed render changed existing destination to %q", got)
++	}
++	info, statErr := os.Stat(target)
++	if statErr != nil {
++		t.Fatal(statErr)
++	}
++	if got := info.Mode().Perm(); got != 0640 {
++		t.Fatalf("failed render changed destination permissions: got %04o", got)
++	}
++
++	completion = callTemplateHelper(t, TemplateFileIfDoesNotExist, dir, "absent.txt", badTemplate, &wg, "unused")
++	err = completedError(t, &wg, completion)
++	if err == nil || !strings.Contains(err.Error(), boom.Error()) {
++		t.Fatalf("create render failure = %v, want an error containing %q", err, boom.Error())
++	}
++	if _, statErr := os.Lstat(filepath.Join(dir, "absent.txt")); !os.IsNotExist(statErr) {
++		t.Fatalf("failed creation left a destination behind: %v", statErr)
++	}
++	entries, readErr := ioutil.ReadDir(dir)
++	if readErr != nil {
++		t.Fatal(readErr)
++	}
++	if len(entries) != 1 || entries[0].Name() != "existing.txt" {
++		t.Fatalf("failed renders left temporary artifacts: %v", entryNames(entries))
++	}
++}
++
++func entryNames(entries []os.FileInfo) []string {
++	names := make([]string, 0, len(entries))
++	for _, entry := range entries {
++		names = append(names, entry.Name())
++	}
++	return names
++}
++
++func TestCodespecRejectsUnsafeDestinations(t *testing.T) {
++	root := t.TempDir()
++	output := filepath.Join(root, "output")
++	if err := os.Mkdir(output, 0755); err != nil {
++		t.Fatal(err)
++	}
++	tmpl := template.Must(template.New("payload").Parse("payload"))
++
++	invalidNames := []string{"", ".", "..", "nested/file.txt", "../escaped.txt", filepath.Join(root, "absolute.txt")}
++	helpers := []interface{}{TemplateFileAndOverwrite, TemplateFileIfDoesNotExist}
++	for _, helper := range helpers {
++		for _, name := range invalidNames {
++			var wg sync.WaitGroup
++			completion := callTemplateHelper(t, helper, output, name, tmpl, &wg, "unused")
++			if err := completedError(t, &wg, completion); err == nil {
++				t.Errorf("%s accepted unsafe file name %q", runtimeName(helper), name)
++			}
++		}
++	}
++	if _, err := os.Lstat(filepath.Join(root, "escaped.txt")); !os.IsNotExist(err) {
++		t.Fatalf("unsafe name wrote outside output directory: %v", err)
++	}
++	entries, err := ioutil.ReadDir(output)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(entries) != 0 {
++		t.Fatalf("unsafe names created output entries: %v", entryNames(entries))
++	}
++
++	outside := filepath.Join(root, "outside")
++	if err := os.Mkdir(outside, 0755); err != nil {
++		t.Fatal(err)
++	}
++	linkedOutput := filepath.Join(root, "linked-output")
++	if err := os.Symlink(outside, linkedOutput); err != nil {
++		t.Fatal(err)
++	}
++	for index, helper := range helpers {
++		var wg sync.WaitGroup
++		name := []string{"overwrite-escape.txt", "create-escape.txt"}[index]
++		completion := callTemplateHelper(t, helper, linkedOutput, name, tmpl, &wg, "unused")
++		if err := completedError(t, &wg, completion); err == nil {
++			t.Fatalf("%s accepted a symlinked output directory", runtimeName(helper))
++		}
++
++		completion = callTemplateHelper(t, helper, filepath.Join(linkedOutput, "nested"), name, tmpl, &wg, "unused")
++		if err := completedError(t, &wg, completion); err == nil {
++			t.Fatalf("%s accepted an output directory with a symlinked ancestor", runtimeName(helper))
++		}
++	}
++	outsideEntries, err := ioutil.ReadDir(outside)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(outsideEntries) != 0 {
++		t.Fatalf("template helper followed output-directory symlink: %v", entryNames(outsideEntries))
++	}
++
++	linkedChild := filepath.Join(linkedOutput, "child")
++	if err := CreateDirIfDoesNotExist(linkedChild); err == nil {
++		t.Fatal("CreateDirIfDoesNotExist accepted a symlinked ancestor")
++	}
++	if err := CreateDirIfDoesNotExist(linkedOutput); err == nil {
++		t.Fatal("CreateDirIfDoesNotExist accepted a symlink as its target")
++	}
++	if _, err := os.Lstat(filepath.Join(outside, "child")); !os.IsNotExist(err) {
++		t.Fatalf("CreateDirIfDoesNotExist modified a symlink target: %v", err)
++	}
++	regularFile := filepath.Join(root, "not-a-directory")
++	if err := ioutil.WriteFile(regularFile, []byte("x"), 0644); err != nil {
++		t.Fatal(err)
++	}
++	if err := CreateDirIfDoesNotExist(regularFile); err == nil {
++		t.Fatal("CreateDirIfDoesNotExist accepted an existing regular file")
++	}
++	for _, helper := range helpers {
++		var wg sync.WaitGroup
++		completion := callTemplateHelper(t, helper, regularFile, "child.txt", tmpl, &wg, "unused")
++		if err := completedError(t, &wg, completion); err == nil {
++			t.Fatalf("%s accepted a regular file as its output directory", runtimeName(helper))
++		}
++	}
++	if got := readFile(t, regularFile); got != "x" {
++		t.Fatalf("failed directory setup changed regular file to %q", got)
++	}
++	realNested := filepath.Join(root, "real", "nested")
++	if err := CreateDirIfDoesNotExist(realNested); err != nil {
++		t.Fatalf("creating real nested directories failed: %v", err)
++	}
++	if info, err := os.Stat(realNested); err != nil || !info.IsDir() {
++		t.Fatalf("real nested directory was not created: info=%v err=%v", info, err)
++	}
++	if err := CreateDirIfDoesNotExist(realNested); err != nil {
++		t.Fatalf("existing real directory was rejected: %v", err)
++	}
++}
++
++func TestCodespecConcurrentResultsRemainIndependent(t *testing.T) {
++	dir := t.TempDir()
++	goodTemplate := template.Must(template.New("good").Parse("good-{{.}}"))
++	badTemplate := template.Must(template.New("bad").Funcs(template.FuncMap{
++		"fail": func() (string, error) { return "", errors.New("independent failure") },
++	}).Parse("bad{{fail}}"))
++
++	var wg sync.WaitGroup
++	goodResult := callTemplateHelper(t, TemplateFileAndOverwrite, dir, "good.txt", goodTemplate, &wg, "result")
++	badResult := callTemplateHelper(t, TemplateFileAndOverwrite, dir, "bad.txt", badTemplate, &wg, "unused")
++	if goodResult == badResult {
++		t.Fatal("concurrent invocations shared a completion channel")
++	}
++	wg.Wait()
++	if err := completedError(t, &wg, goodResult); err != nil {
++		t.Fatalf("successful concurrent render inherited another render's error: %v", err)
++	}
++	if err := completedError(t, &wg, badResult); err == nil || !strings.Contains(err.Error(), "independent failure") {
++		t.Fatalf("failed concurrent render reported %v", err)
++	}
++	if got := readFile(t, filepath.Join(dir, "good.txt")); got != "good-result" {
++		t.Fatalf("successful concurrent output = %q", got)
++	}
++	if _, err := os.Lstat(filepath.Join(dir, "bad.txt")); !os.IsNotExist(err) {
++		t.Fatalf("failed concurrent render published output: %v", err)
++	}
++}
+
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,5 @@
++#!/bin/bash
++set -euo pipefail
++
++
++env GO111MODULE=off GOPROXY=off GOSUMDB=off go test ./internal/util -run '^TestCodespec' -count=1

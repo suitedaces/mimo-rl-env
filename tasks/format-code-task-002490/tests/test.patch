@@ -1,0 +1,262 @@
+diff --git a/pkg/utils/rql_test.go b/pkg/utils/rql_test.go
+new file mode 100644
+index 00000000..41198e0c
+--- /dev/null
++++ b/pkg/utils/rql_test.go
+@@ -0,0 +1,236 @@
++package utils
++
++import (
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/doug-martin/goqu/v9"
++	_ "github.com/doug-martin/goqu/v9/dialect/postgres"
++	"github.com/raystack/salt/rql"
++	"github.com/stretchr/testify/assert"
++)
++
++
++
++type record struct {
++	ID        string    `rql:"name=id,type=string"`
++	Name      string    `rql:"name=name,type=string"`
++	Email     string    `rql:"name=email,type=string"`
++	Activity  string    `rql:"name=activity,type=string"`
++	Status    string    `rql:"name=status,type=string"`
++	Verified  bool      `rql:"name=verified,type=bool"`
++	Age       int       `rql:"name=age,type=number"`
++	CreatedAt time.Time `rql:"name=created_at,type=datetime"`
++}
++
++func dialect() goqu.DialectWrapper {
++	return goqu.Dialect("postgres")
++}
++
++func base() *goqu.SelectDataset {
++	return dialect().From("records")
++}
++
++func sqlOf(t *testing.T, ds *goqu.SelectDataset) string {
++	t.Helper()
++	sql, _, err := ds.ToSQL()
++	assert.NoError(t, err)
++	return sql
++}
++
++func preparedOf(t *testing.T, ds *goqu.SelectDataset) (string, []interface{}) {
++	t.Helper()
++	sql, args, err := ds.Prepared(true).ToSQL()
++	assert.NoError(t, err)
++	return sql, args
++}
++
++
++
++
++func caseInsensitiveMatch(sql string) bool {
++	upper := strings.ToUpper(sql)
++	if strings.Contains(upper, "ILIKE") {
++		return true
++	}
++	return (strings.Contains(upper, "LOWER") || strings.Contains(upper, "UPPER")) && strings.Contains(upper, "LIKE")
++}
++
++
++
++func TestPaginationDefaults(t *testing.T) {
++	ds, page := AddRQLPaginationInQuery(base(), &rql.Query{})
++
++	assert.Equal(t, 50, page.Limit)
++	assert.Equal(t, 0, page.Offset)
++	assert.Contains(t, sqlOf(t, ds), "LIMIT 50")
++}
++
++func TestPaginationDefaultLimitOnNonPositive(t *testing.T) {
++	_, page := AddRQLPaginationInQuery(base(), &rql.Query{Limit: 0, Offset: 0})
++	assert.Equal(t, 50, page.Limit)
++
++	_, page2 := AddRQLPaginationInQuery(base(), &rql.Query{Limit: -3})
++	assert.Equal(t, 50, page2.Limit)
++}
++
++func TestPaginationPassthrough(t *testing.T) {
++	ds, page := AddRQLPaginationInQuery(base(), &rql.Query{Limit: 5, Offset: 10})
++
++	assert.Equal(t, 5, page.Limit)
++	assert.Equal(t, 10, page.Offset)
++
++	sql := sqlOf(t, ds)
++	assert.Contains(t, sql, "LIMIT 5")
++	assert.Contains(t, sql, "OFFSET 10")
++}
++
++
++
++func TestFilterUnsupportedColumnIsRejected(t *testing.T) {
++	_, err := AddRQLFiltersInQuery(base(),
++		&rql.Query{Filters: []rql.Filter{{Name: "secret", Operator: "eq", Value: "x"}}},
++		[]string{"status", "activity"}, record{})
++	assert.Error(t, err)
++}
++
++func TestFilterSupportedColumnEq(t *testing.T) {
++	ds, err := AddRQLFiltersInQuery(base(),
++		&rql.Query{Filters: []rql.Filter{{Name: "status", Operator: "eq", Value: "subscribed"}}},
++		[]string{"status"}, record{})
++	assert.NoError(t, err)
++
++	sql := sqlOf(t, ds)
++	assert.Contains(t, sql, `"status"`)
++	assert.Contains(t, sql, "subscribed")
++}
++
++func TestFilterInSplitsCommaSeparatedValues(t *testing.T) {
++	ds, err := AddRQLFiltersInQuery(base(),
++		&rql.Query{Filters: []rql.Filter{{Name: "activity", Operator: "in", Value: "waitlist,newsletter,signup"}}},
++		[]string{"activity"}, record{})
++	assert.NoError(t, err)
++
++
++
++	_, args := preparedOf(t, ds)
++	assert.Contains(t, args, "waitlist")
++	assert.Contains(t, args, "newsletter")
++	assert.Contains(t, args, "signup")
++}
++
++func TestFilterLikeIsCaseInsensitive(t *testing.T) {
++	ds, err := AddRQLFiltersInQuery(base(),
++		&rql.Query{Filters: []rql.Filter{{Name: "name", Operator: "like", Value: "%news%"}}},
++		[]string{"name"}, record{})
++	assert.NoError(t, err)
++
++	assert.True(t, caseInsensitiveMatch(sqlOf(t, ds)), "like should be a case-insensitive match")
++}
++
++func TestFilterNotLikeIsNegatedCaseInsensitive(t *testing.T) {
++	ds, err := AddRQLFiltersInQuery(base(),
++		&rql.Query{Filters: []rql.Filter{{Name: "name", Operator: "notlike", Value: "%news%"}}},
++		[]string{"name"}, record{})
++	assert.NoError(t, err)
++
++	sql := sqlOf(t, ds)
++	assert.True(t, caseInsensitiveMatch(sql), "notlike should be a case-insensitive match")
++	assert.Contains(t, strings.ToUpper(sql), "NOT")
++}
++
++func TestFilterNumberComparison(t *testing.T) {
++	ds, err := AddRQLFiltersInQuery(base(),
++		&rql.Query{Filters: []rql.Filter{{Name: "age", Operator: "gt", Value: 18}}},
++		[]string{"age"}, record{})
++	assert.NoError(t, err)
++
++	sql := sqlOf(t, ds)
++	assert.Contains(t, sql, `"age"`)
++	assert.Contains(t, sql, ">")
++	assert.Contains(t, sql, "18")
++}
++
++func TestFilterBoolComparison(t *testing.T) {
++	ds, err := AddRQLFiltersInQuery(base(),
++		&rql.Query{Filters: []rql.Filter{{Name: "verified", Operator: "eq", Value: true}}},
++		[]string{"verified"}, record{})
++	assert.NoError(t, err)
++
++	sql := sqlOf(t, ds)
++	assert.Contains(t, sql, `"verified"`)
++	assert.Contains(t, strings.ToUpper(sql), "TRUE")
++}
++
++func TestMultipleFiltersAreAllApplied(t *testing.T) {
++	ds, err := AddRQLFiltersInQuery(base(),
++		&rql.Query{Filters: []rql.Filter{
++			{Name: "activity", Operator: "eq", Value: "waitlist"},
++			{Name: "status", Operator: "eq", Value: "unsubscribed"},
++		}},
++		[]string{"activity", "status"}, record{})
++	assert.NoError(t, err)
++
++	sql := sqlOf(t, ds)
++	assert.Contains(t, sql, `"activity"`)
++	assert.Contains(t, sql, `"status"`)
++	assert.Contains(t, sql, "waitlist")
++	assert.Contains(t, sql, "unsubscribed")
++}
++
++
++
++func TestSearchEmptyIsNoOp(t *testing.T) {
++	ds, err := AddRQLSearchInQuery(base(), &rql.Query{Search: ""}, []string{"name", "email"})
++	assert.NoError(t, err)
++	assert.False(t, caseInsensitiveMatch(sqlOf(t, ds)), "empty search should add no match clause")
++}
++
++func TestSearchMatchesAcrossColumns(t *testing.T) {
++	ds, err := AddRQLSearchInQuery(base(), &rql.Query{Search: "newslet"}, []string{"name", "email"})
++	assert.NoError(t, err)
++
++	sql := sqlOf(t, ds)
++	assert.True(t, caseInsensitiveMatch(sql), "search should be a case-insensitive match")
++	assert.Contains(t, sql, "name")
++	assert.Contains(t, sql, "email")
++	assert.Contains(t, sql, "newslet")
++}
++
++
++
++func TestGroupEmptyIsNoOp(t *testing.T) {
++	ds, err := AddGroupInQuery(base(), &rql.Query{}, []string{"status", "activity"})
++	assert.NoError(t, err)
++	assert.NotContains(t, strings.ToUpper(sqlOf(t, ds)), "GROUP BY")
++}
++
++func TestGroupUnsupportedColumnIsRejected(t *testing.T) {
++	_, err := AddGroupInQuery(base(), &rql.Query{GroupBy: []string{"secret"}}, []string{"status", "activity"})
++	assert.Error(t, err)
++}
++
++func TestGroupSingleColumn(t *testing.T) {
++	ds, err := AddGroupInQuery(base(), &rql.Query{GroupBy: []string{"status"}}, []string{"status", "activity"})
++	assert.NoError(t, err)
++
++	upper := strings.ToUpper(sqlOf(t, ds))
++	assert.Contains(t, upper, "GROUP BY")
++	assert.Contains(t, upper, "COUNT")
++	assert.Contains(t, sqlOf(t, ds), "status")
++}
++
++func TestGroupTwoColumnsCombineWithCommaSeparator(t *testing.T) {
++	ds, err := AddGroupInQuery(base(), &rql.Query{GroupBy: []string{"status", "activity"}}, []string{"status", "activity"})
++	assert.NoError(t, err)
++
++	sql := sqlOf(t, ds)
++	upper := strings.ToUpper(sql)
++	assert.Contains(t, upper, "GROUP BY")
++	assert.Contains(t, upper, "COUNT")
++	assert.Contains(t, sql, "status")
++	assert.Contains(t, sql, "activity")
++
++	assert.Contains(t, sql, "','")
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,15 @@
++#!/usr/bin/env bash
++
++
++
++set -euo pipefail
++HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++cd /testbed
++
++
++
++
++go test ./pkg/utils/ -run '^(TestAppendIfUnique|TestBuildToken)$' -count=1 -v
++
++
++go test ./pkg/utils/ -run '^(TestPagination.*|TestFilter.*|TestMultipleFiltersAreAllApplied|TestSearch.*|TestGroup.*)$' -count=1 -v

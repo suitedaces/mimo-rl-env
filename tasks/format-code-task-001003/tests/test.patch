@@ -1,0 +1,279 @@
+diff --git a/test/keyring-synth.test.js b/test/keyring-synth.test.js
+new file mode 100644
+index 0000000..713af59
+--- /dev/null
++++ b/test/keyring-synth.test.js
+@@ -0,0 +1,223 @@
++'use strict'
++
++const crypto = require('crypto')
++const { test } = require('tap')
++const fastifyFactory = require('fastify')
++const parseSetCookie = require('set-cookie-parser')
++const plugin = require('..')
++const { Signer, sign, unsign } = require('../signer')
++
++function expectedTaggedValue (value, keyId, secret, algorithm = 'sha256') {
++  const digest = crypto
++    .createHmac(algorithm, secret)
++    .update(`${value}.${keyId}`)
++    .digest('base64')
++    .replace(/=/g, '')
++  return `${value}.${digest}~${keyId}`
++}
++
++function makeKeyringSigner (t, keyring, algorithm) {
++  let signer
++  t.doesNotThrow(() => {
++    signer = new Signer(keyring, algorithm)
++  }, 'Signer accepts a keyring configuration')
++  return signer
++}
++
++test('keyring signing has a stable authenticated wire format', async (t) => {
++  const keyring = {
++    primary: 'release_2026',
++    keys: {
++      release_2026: 'primary-secret-material',
++      release_2025: Buffer.from('retired-secret-material')
++    }
++  }
++  const signer = makeKeyringSigner(t, keyring)
++  if (!signer) return
++
++  const value = 'account.42~dark-mode'
++  const signed = signer.sign(value)
++  t.equal(
++    signed,
++    expectedTaggedValue(value, 'release_2026', keyring.keys.release_2026),
++    'the primary key ID and the key ID authenticated by the MAC are observable in the tag'
++  )
++  t.same(signer.unsign(signed), {
++    valid: true,
++    renew: false,
++    value
++  }, 'values containing periods and tildes round-trip without being truncated')
++
++  const sha512Signer = makeKeyringSigner(t, keyring, 'sha512')
++  if (!sha512Signer) return
++  t.equal(
++    sha512Signer.sign('algorithm-check'),
++    expectedTaggedValue('algorithm-check', 'release_2026', keyring.keys.release_2026, 'sha512'),
++    'the configured HMAC algorithm also applies to keyring signatures'
++  )
++})
++
++test('keyring rotation reports renewal based on the authenticated key ID', async (t) => {
++  const keys = {
++    current: 'current-secret',
++    retired: Buffer.from('retired-secret')
++  }
++  const currentSigner = makeKeyringSigner(t, { primary: 'current', keys })
++  const retiredSigner = makeKeyringSigner(t, { primary: 'retired', keys })
++  if (!currentSigner || !retiredSigner) return
++
++  t.same(currentSigner.unsign(currentSigner.sign('current.value')), {
++    valid: true,
++    renew: false,
++    value: 'current.value'
++  }, 'a tag from the primary key is current')
++  t.same(currentSigner.unsign(retiredSigner.sign('retired.value')), {
++    valid: true,
++    renew: true,
++    value: 'retired.value'
++  }, 'a valid tag from a configured non-primary key requests renewal')
++})
++
++test('unknown and tampered keyring tags are rejected without fallback', async (t) => {
++  const keyring = {
++    primary: 'live',
++    keys: {
++      live: 'shared-looking-secret',
++      old: 'other-secret'
++    }
++  }
++  const signer = makeKeyringSigner(t, keyring)
++  if (!signer) return
++
++  const unknownId = expectedTaggedValue('unknown-id', 'missing', keyring.keys.live)
++  t.same(signer.unsign(unknownId), {
++    valid: false,
++    renew: false,
++    value: null
++  }, 'an unknown key ID is invalid even when a configured key could verify its MAC material')
++
++  const valid = signer.sign('sensitive.value')
++  const changedId = valid.replace(/~live$/, '~old')
++  const changedMac = valid.replace(/\.([^.]*)~live$/, (match, mac) => `.${mac[0] === 'A' ? 'B' : 'A'}${mac.slice(1)}~live`)
++  for (const candidate of [changedId, changedMac, 'value.not-a-mac~live', 'value.signature~bad.id']) {
++    t.same(signer.unsign(candidate), {
++      valid: false,
++      renew: false,
++      value: null
++    }, `rejects invalid tagged input: ${candidate}`)
++  }
++})
++
++test('legacy signatures remain readable and are marked for tagged renewal', async (t) => {
++  const keys = {
++    newest: 'newest-secret',
++    previous: 'previous-secret'
++  }
++  const signer = makeKeyringSigner(t, { primary: 'newest', keys })
++  if (!signer) return
++
++  for (const [label, legacy] of [
++    ['primary', sign('legacy.primary.value~suffix', keys.newest)],
++    ['retired', sign('legacy.retired.value~suffix', keys.previous)]
++  ]) {
++    t.same(signer.unsign(legacy), {
++      valid: true,
++      renew: true,
++      value: `legacy.${label}.value~suffix`
++    }, `a legacy ${label} key signature is accepted and migrated`)
++  }
++
++  t.same(signer.unsign(sign('legacy.invalid', 'unconfigured-secret')), {
++    valid: false,
++    renew: false,
++    value: null
++  }, 'an unverifiable legacy signature stays invalid')
++})
++
++test('invalid keyring configurations fail at construction', async (t) => {
++  const invalid = [
++    { primary: 'current', keys: {} },
++    { primary: 'missing', keys: { current: 'secret' } },
++    { primary: 'bad.id', keys: { 'bad.id': 'secret' } },
++    { primary: 'current', keys: { current: 'secret', 'bad.id': 'retired-secret' } },
++    { primary: 'current', keys: { current: 42 } },
++    { keys: { current: 'secret' } }
++  ]
++
++  for (const keyring of invalid) {
++    t.throws(() => new Signer(keyring), TypeError, `rejects ${JSON.stringify(keyring)}`)
++  }
++})
++
++test('Fastify decorators and signed response cookies use keyrings end to end', async (t) => {
++  const keys = {
++    active: 'active-plugin-secret',
++    retired: 'retired-plugin-secret'
++  }
++  const oldSigner = makeKeyringSigner(t, { primary: 'retired', keys })
++  if (!oldSigner) return
++
++  const app = fastifyFactory()
++  t.teardown(() => app.close())
++  app.register(plugin, { secret: { primary: 'active', keys } })
++  app.get('/', (request, reply) => {
++    const generated = reply.signCookie('decorator.value')
++    reply
++      .setCookie('session', 'response.value', { signed: true, path: '/' })
++      .send({
++        instance: app.unsignCookie(generated),
++        request: request.unsignCookie(generated),
++        reply: reply.unsignCookie(oldSigner.sign('rotated.value'))
++      })
++  })
++
++  const response = await app.inject({ method: 'GET', url: '/' })
++  t.equal(response.statusCode, 200)
++  t.same(response.json(), {
++    instance: { valid: true, renew: false, value: 'decorator.value' },
++    request: { valid: true, renew: false, value: 'decorator.value' },
++    reply: { valid: true, renew: true, value: 'rotated.value' }
++  })
++
++  const cookies = parseSetCookie.parse(response.headers['set-cookie'])
++  t.equal(cookies.length, 1)
++  t.equal(cookies[0].name, 'session')
++  t.equal(
++    cookies[0].value,
++    expectedTaggedValue('response.value', 'active', keys.active),
++    'signed response cookies use the configured primary key and tagged format'
++  )
++})
++
++test('legacy arrays, low-level helpers, and custom plugin signers remain compatible', async (t) => {
++  const arraySigner = new Signer(['first-secret', 'second-secret'])
++  const legacy = arraySigner.sign('legacy-array')
++  t.equal(legacy, sign('legacy-array', 'first-secret'))
++  t.same(unsign(legacy, ['first-secret', 'second-secret']), {
++    valid: true,
++    renew: false,
++    value: 'legacy-array'
++  })
++
++  const customSigner = {
++    sign: value => `custom:${value}`,
++    unsign: input => input.startsWith('custom:')
++      ? { valid: true, renew: false, value: input.slice(7) }
++      : { valid: false, renew: false, value: null }
++  }
++  const app = fastifyFactory()
++  t.teardown(() => app.close())
++  app.register(plugin, { secret: customSigner })
++  app.get('/', (request, reply) => {
++    reply.setCookie('custom', 'payload', { signed: true }).send({
++      result: request.unsignCookie('custom:request-value')
++    })
++  })
++
++  const response = await app.inject({ method: 'GET', url: '/' })
++  t.same(response.json(), {
++    result: { valid: true, renew: false, value: 'request-value' }
++  })
++  const cookies = parseSetCookie.parse(response.headers['set-cookie'])
++  t.equal(cookies[0].value, 'custom:payload')
++})
+diff --git a/types/keyring-synth.test-d.ts b/types/keyring-synth.test-d.ts
+new file mode 100644
+index 0000000..bc66c87
+--- /dev/null
++++ b/types/keyring-synth.test-d.ts
+@@ -0,0 +1,32 @@
++import fastify from 'fastify'
++import cookie, {
++  Signer,
++  SignerFactory,
++  SignerKeyring
++} from '..'
++import { expectAssignable, expectError, expectType } from 'tsd'
++
++const keyring: SignerKeyring = {
++  primary: 'current',
++  keys: {
++    current: 'current-secret',
++    previous: Buffer.from('previous-secret')
++  }
++}
++
++const signer = new Signer(keyring, 'sha512')
++expectType<string>(signer.sign('value'))
++expectType<{ valid: boolean; renew: boolean; value: string | null }>(
++  signer.unsign('signed-value')
++)
++
++expectAssignable<SignerFactory>(cookie.signerFactory)
++expectType<{ sign: (value: string) => string; unsign: (input: string) => { valid: boolean; renew: boolean; value: string | null } }>(
++  cookie.signerFactory(keyring)
++)
++
++const app = fastify()
++app.register(cookie, { secret: keyring })
++
++expectError<SignerKeyring>({ primary: 'current', keys: { current: 42 } })
++expectError(app.register(cookie, { secret: { primary: 'current', keys: { current: 42 } } }))
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,7 @@
++#!/bin/bash
++set -euo pipefail
++
++
++./node_modules/.bin/tap --no-coverage test/keyring-synth.test.js
++./node_modules/.bin/tap --no-coverage test/signer.test.js
++./node_modules/.bin/tsd --files types/keyring-synth.test-d.ts

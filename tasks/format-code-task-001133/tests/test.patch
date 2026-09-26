@@ -1,0 +1,218 @@
+diff --git a/core/test/lib/manifest-id-codespec-test.js b/core/test/lib/manifest-id-codespec-test.js
+new file mode 100644
+index 000000000..3f9a0b7a1
+--- /dev/null
++++ b/core/test/lib/manifest-id-codespec-test.js
+@@ -0,0 +1,197 @@
++/**
++ * @license Copyright 2026 The Lighthouse Authors. All Rights Reserved.
++ * Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with the License. You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0
++ * Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the specific language governing permissions and limitations under the License.
++ */
++
++import assert from 'assert/strict';
++
++import {ManifestValues} from '../../computed/manifest-values.js';
++import defaultConfig from '../../config/default-config.js';
++import {parseManifest} from '../../lib/manifest-parser.js';
++
++const MANIFEST_URL = 'https://example.com/assets/manifest.webmanifest';
++const DOCUMENT_URL = 'https://example.com/app/index.html#document-fragment';
++
++function parse(input) {
++  return parseManifest(JSON.stringify(input), MANIFEST_URL, DOCUMENT_URL);
++}
++
++function getIdentity(input) {
++  const manifest = parse(input);
++  assert.ok(manifest.value, 'manifest should parse');
++  assert.ok(manifest.value.id, 'parsed manifest should expose its normalized id member');
++  return manifest.value.id;
++}
++
++async function getHasIdCheck(input) {
++  const WebAppManifest = parse(input);
++  const result = await ManifestValues.request(
++    {WebAppManifest, InstallabilityErrors: {errors: []}},
++    {computedCache: new Map()}
++  );
++  assert.equal(result.isParseFailure, false);
++  const check = result.allChecks.find(item => item.id === 'hasId');
++  assert.ok(check, 'ManifestValues should expose a hasId check');
++  return check;
++}
++
++async function getConfiguredAudit() {
++  const auditEntry = defaultConfig.audits.find(audit => {
++    if (typeof audit === 'string') return audit.endsWith('manifest-id');
++    if (audit.implementation?.meta?.id === 'manifest-id') return true;
++    return audit.path?.endsWith('manifest-id');
++  });
++  assert.ok(auditEntry, 'manifest-id should be available in the default audit list');
++  const AuditClass = typeof auditEntry === 'object' && auditEntry.implementation ?
++    auditEntry.implementation :
++    (await import(`../../audits/${typeof auditEntry === 'string' ? auditEntry : auditEntry.path}.js`))
++      .default;
++  assert.equal(AuditClass.meta.id, 'manifest-id');
++  assert.deepEqual(AuditClass.meta.supportedModes, ['navigation']);
++  return AuditClass;
++}
++
++function makeArtifacts(input) {
++  return {
++    WebAppManifest: typeof input === 'string' ?
++      parseManifest(input, MANIFEST_URL, DOCUMENT_URL) : parse(input),
++    InstallabilityErrors: {errors: []},
++  };
++}
++
++describe('Web App Manifest identity contract', () => {
++  describe('manifest id parsing', () => {
++    it('resolves relative ids against start_url and removes only the fragment', () => {
++      const id = getIdentity({
++        start_url: '/app/home?source=manifest#launch',
++        id: 'profile?tenant=1#details',
++      });
++
++      assert.equal(id.raw, 'profile?tenant=1#details');
++      assert.equal(id.value, 'https://example.com/app/profile?tenant=1');
++      assert.equal(id.warning, undefined);
++    });
++
++    it('uses a fragment-free start_url when id is omitted', () => {
++      const id = getIdentity({start_url: '/app/home?source=manifest#launch'});
++      const documentDefault = getIdentity({});
++
++      assert.equal(id.raw, undefined);
++      assert.equal(id.value, 'https://example.com/app/home?source=manifest');
++      assert.equal(id.warning, undefined);
++      assert.equal(documentDefault.value, 'https://example.com/app/index.html');
++    });
++
++    it('accepts an explicitly empty id as the start_url identity', () => {
++      const id = getIdentity({
++        start_url: '/app/home?source=manifest#launch',
++        id: '',
++      });
++
++      assert.equal(id.raw, '');
++      assert.equal(id.value, 'https://example.com/app/home?source=manifest');
++      assert.equal(id.warning, undefined);
++    });
++
++    it('falls back with a type-specific warning for a non-string id', () => {
++      const id = getIdentity({start_url: '/app/home#launch', id: 42});
++
++      assert.equal(id.raw, 42);
++      assert.equal(id.value, 'https://example.com/app/home');
++      assert.match(id.warning || '', /string/i);
++    });
++
++    it('falls back with an invalid-id warning for a malformed URL', () => {
++      const id = getIdentity({start_url: '/app/home#launch', id: 'https://[invalid'});
++
++      assert.equal(id.raw, 'https://[invalid');
++      assert.equal(id.value, 'https://example.com/app/home');
++      assert.match(id.warning || '', /invalid.*id|id.*invalid/i);
++    });
++
++    it('falls back with a same-origin warning for cross-origin ids', () => {
++      const invalidIds = [
++        'https://other.example/app/home',
++        'http://example.com/app/home',
++        'https://example.com:8443/app/home',
++      ];
++      for (const rawId of invalidIds) {
++        const id = getIdentity({start_url: '/app/home#launch', id: rawId});
++        assert.equal(id.raw, rawId);
++        assert.equal(id.value, 'https://example.com/app/home');
++        assert.match(id.warning || '', /same.?origin/i);
++      }
++    });
++  });
++
++  describe('ManifestValues identity check', () => {
++    it('passes only for an explicit, valid id, including an empty string', async () => {
++      const valid = await getHasIdCheck({start_url: '/app/home', id: 'profile'});
++      const explicitEmpty = await getHasIdCheck({start_url: '/app/home', id: ''});
++      const omitted = await getHasIdCheck({start_url: '/app/home'});
++      const invalid = await getHasIdCheck({start_url: '/app/home', id: 42});
++
++      assert.equal(valid.passing, true);
++      assert.equal(explicitEmpty.passing, true);
++      assert.equal(omitted.passing, false);
++      assert.equal(invalid.passing, false);
++      assert.match(valid.failureText, /id/i);
++    });
++  });
++
++  describe('manifest-id audit', () => {
++    it('is registered as a zero-weight PWA optimized audit', async () => {
++      const AuditClass = await getConfiguredAudit();
++      assert.equal(AuditClass.meta.id, 'manifest-id');
++      const auditRef = defaultConfig.categories.pwa.auditRefs.find(ref => ref.id === 'manifest-id');
++      assert.ok(auditRef);
++      assert.equal(auditRef.weight, 0);
++      assert.equal(auditRef.group, 'pwa-optimized');
++    });
++
++    it('passes explicit valid ids, including the empty-string identity', async () => {
++      const AuditClass = await getConfiguredAudit();
++      const context = {computedCache: new Map()};
++
++      const relativeResult = await AuditClass.audit(
++        makeArtifacts({start_url: '/app/home', id: 'profile'}), context
++      );
++      const emptyResult = await AuditClass.audit(
++        makeArtifacts({start_url: '/app/home', id: ''}), {computedCache: new Map()}
++      );
++      assert.equal(relativeResult.score, 1);
++      assert.equal(emptyResult.score, 1);
++    });
++
++    it('fails omitted and invalid ids', async () => {
++      const AuditClass = await getConfiguredAudit();
++      const omittedResult = await AuditClass.audit(
++        makeArtifacts({start_url: '/app/home'}), {computedCache: new Map()}
++      );
++      const invalidResult = await AuditClass.audit(
++        makeArtifacts({start_url: '/app/home', id: 'https://other.example/app'}),
++        {computedCache: new Map()}
++      );
++
++      assert.equal(omittedResult.score, 0);
++      assert.equal(invalidResult.score, 0);
++    });
++
++    it('fails missing and unparseable manifests with an explanation', async () => {
++      const AuditClass = await getConfiguredAudit();
++      const missingResult = await AuditClass.audit(
++        {WebAppManifest: null, InstallabilityErrors: {errors: []}},
++        {computedCache: new Map()}
++      );
++      const invalidResult = await AuditClass.audit(
++        makeArtifacts('{not json'), {computedCache: new Map()}
++      );
++
++      assert.equal(missingResult.score, 0);
++      assert.match(missingResult.explanation || '', /manifest/i);
++      assert.equal(invalidResult.score, 0);
++      assert.match(invalidResult.explanation || '', /manifest|pars/i);
++    });
++  });
++});
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,10 @@
++#!/bin/bash
++set -euo pipefail
++
++
++node node_modules/mocha/bin/mocha.js \
++  --require core/test/test-env/mocha-setup.js \
++  core/test/lib/manifest-id-codespec-test.js \
++  core/test/lib/manifest-parser-test.js \
++  core/test/computed/manifest-values-test.js \
++  core/test/config/default-config-test.js

@@ -1,0 +1,467 @@
+diff --git a/usercase-test-coderl/fixtures/photo.jpg b/usercase-test-coderl/fixtures/photo.jpg
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/fixtures/photo.jpg
+@@ -0,0 +1,1 @@
++fixture photo fixture
+diff --git a/usercase-test-coderl/transport_test.go b/usercase-test-coderl/transport_test.go
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/transport_test.go
+@@ -0,0 +1,431 @@
++package usercase_test_coderl
++
++import (
++	"errors"
++	"fmt"
++	"io/ioutil"
++	"mime"
++	"net/http"
++	"net/http/httptest"
++	"net/url"
++	"os"
++	"strings"
++	"sync"
++	"sync/atomic"
++	"testing"
++
++	"github.com/yanzay/tbot/v2"
++)
++
++const (
++	token    = "TOKEN"
++	fixtures = "/workspace/repo/usercase-test-coderl/fixtures"
++)
++
++
++
++
++
++func TestFormOnlyMethodsPostAndDecodeTypedResults(t *testing.T) {
++
++
++	var mu sync.Mutex
++	seen := make([]string, 0, 2)
++
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		body, err := ioutil.ReadAll(r.Body)
++		if err != nil {
++			t.Fatalf("read body: %v", err)
++		}
++		if err := r.Body.Close(); err != nil {
++			t.Fatalf("close request body: %v", err)
++		}
++
++		mu.Lock()
++		defer mu.Unlock()
++		switch len(seen) {
++		case 0:
++			assertString(t, "getMe method", r.Method, "POST")
++			assertString(t, "getMe path", r.URL.Path, "/botTOKEN/getMe")
++
++			assertFormContentType(t, "getMe content-type", r.Header.Get("Content-Type"), true)
++			assertString(t, "getMe body", string(body), "")
++			seen = append(seen, "getMe")
++			fmt.Fprint(w, `{"ok":true,"result":{"id":1,"is_bot":true,"first_name":"Bot"}}`)
++		case 1:
++			assertString(t, "sendMessage method", r.Method, "POST")
++			assertString(t, "sendMessage path", r.URL.Path, "/botTOKEN/sendMessage")
++
++			assertFormContentType(t, "sendMessage content-type", r.Header.Get("Content-Type"), false)
++
++			assertURLEncodedBody(t, "sendMessage body", string(body), map[string]string{
++				"chat_id": "123",
++				"text":    "hello",
++			})
++			seen = append(seen, "sendMessage")
++			fmt.Fprint(w, `{"ok":true,"result":{"message_id":7,"chat":{"id":123},"text":"hello"}}`)
++		default:
++			t.Fatalf("unexpected extra request %d to %s", len(seen)+1, r.URL.Path)
++		}
++	}))
++	defer server.Close()
++
++	client := tbot.NewClient(token, server.Client(), server.URL)
++
++	me, err := client.GetMe()
++	if err != nil {
++		t.Fatalf("GetMe error = %v", err)
++	}
++	assertInt(t, "GetMe ID", me.ID, 1)
++	assertBool(t, "GetMe IsBot", me.IsBot, true)
++	assertString(t, "GetMe FirstName", me.FirstName, "Bot")
++
++	msg, err := client.SendMessage("123", "hello")
++	if err != nil {
++		t.Fatalf("SendMessage error = %v", err)
++	}
++	assertInt(t, "SendMessage MessageID", msg.MessageID, 7)
++	assertString(t, "SendMessage Chat.ID", msg.Chat.ID, "123")
++	assertString(t, "SendMessage Text", msg.Text, "hello")
++	assertInt(t, "request count", len(seen), 2)
++}
++
++func TestTelegramErrorEnvelopeReturnsDescription(t *testing.T) {
++
++
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		assertString(t, "path", r.URL.Path, "/botTOKEN/sendMessage")
++		fmt.Fprint(w, `{"ok":false,"error_code":400,"description":"Bad Request: chat not found"}`)
++	}))
++	defer server.Close()
++
++	client := tbot.NewClient(token, server.Client(), server.URL)
++	msg, err := client.SendMessage("123", "hello")
++	if err == nil {
++		t.Fatal("SendMessage error = nil")
++	}
++	assertString(t, "telegram error text", err.Error(), "Bad Request: chat not found")
++
++	assertNoPartialMessage(t, "partial message", msg)
++}
++
++func TestMalformedEnvelopeReturnsDecodeError(t *testing.T) {
++
++
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		assertString(t, "path", r.URL.Path, "/botTOKEN/getMe")
++		fmt.Fprint(w, `{not-json`)
++	}))
++	defer server.Close()
++
++	client := tbot.NewClient(token, server.Client(), server.URL)
++	me, err := client.GetMe()
++	if err == nil {
++		t.Fatal("GetMe error = nil")
++	}
++
++	assertNoPartialUser(t, "partial user", me)
++}
++
++func TestHTTPTransportFailureReturnsError(t *testing.T) {
++
++
++	client := tbot.NewClient(token, &http.Client{Transport: failingRoundTripper{}}, "https://example.invalid")
++
++	me, err := client.GetMe()
++	if err == nil {
++		t.Fatal("GetMe error = nil")
++	}
++
++	assertNoPartialUser(t, "partial user", me)
++}
++
++func TestSendPhotoFileStreamsMultipartAndDecodesResult(t *testing.T) {
++
++
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		assertString(t, "method", r.Method, "POST")
++		assertString(t, "path", r.URL.Path, "/botTOKEN/sendPhoto")
++		mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
++		if err != nil {
++			t.Fatalf("parse multipart content-type: %v", err)
++		}
++		assertString(t, "multipart media type", mediaType, "multipart/form-data")
++
++		if err := r.ParseMultipartForm(1024 * 1024); err != nil {
++			t.Fatalf("ParseMultipartForm error = %v", err)
++		}
++		assertString(t, "chat_id field", r.MultipartForm.Value["chat_id"][0], "123")
++
++		file, header, err := r.FormFile("photo")
++		if err != nil {
++			t.Fatalf("FormFile(photo) error = %v", err)
++		}
++		defer file.Close()
++		uploaded, err := ioutil.ReadAll(file)
++		if err != nil {
++			t.Fatalf("read uploaded file: %v", err)
++		}
++		assertString(t, "file field filename", header.Filename, "photo.jpg")
++		assertString(t, "file contents", string(uploaded), "fixture photo fixture\n")
++
++		fmt.Fprint(w, `{"ok":true,"result":{"message_id":8,"chat":{"id":123},"caption":"sent photo"}}`)
++	}))
++	defer server.Close()
++
++	oldWD, err := os.Getwd()
++	if err != nil {
++		t.Fatalf("Getwd error = %v", err)
++	}
++	if err := os.Chdir(fixtures); err != nil {
++		t.Fatalf("Chdir fixtures error = %v", err)
++	}
++	defer os.Chdir(oldWD)
++
++	client := tbot.NewClient(token, server.Client(), server.URL)
++	msg, err := client.SendPhotoFile("123", "photo.jpg")
++	if err != nil {
++		t.Fatalf("SendPhotoFile error = %v", err)
++	}
++	assertInt(t, "photo MessageID", msg.MessageID, 8)
++	assertString(t, "photo Chat.ID", msg.Chat.ID, "123")
++	assertString(t, "photo Caption", msg.Caption, "sent photo")
++}
++
++func TestSendPhotoFileOpenFailureReturnsError(t *testing.T) {
++
++
++	client := tbot.NewClient(token, &http.Client{}, "ftp://example.invalid")
++
++	msg, err := client.SendPhotoFile("123", fixtures+"/missing-photo.jpg")
++	if err == nil {
++		t.Fatal("SendPhotoFile error = nil")
++	}
++
++	assertNoPartialMessage(t, "partial message", msg)
++}
++
++func TestSendPhotoFileNon200StatusReturnsError(t *testing.T) {
++
++
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		w.WriteHeader(http.StatusInternalServerError)
++		fmt.Fprint(w, `{"ok":true,"result":{"message_id":99}}`)
++	}))
++	defer server.Close()
++	defer server.CloseClientConnections()
++
++	client := tbot.NewClient(token, server.Client(), server.URL)
++	msg, err := client.SendPhotoFile("123", fixtures+"/photo.jpg")
++	if err == nil {
++		t.Fatal("SendPhotoFile error = nil")
++	}
++
++	assertNoPartialMessage(t, "partial message", msg)
++}
++
++func TestIndependentClientsKeepOwnEndpointState(t *testing.T) {
++
++
++	var mu sync.Mutex
++	aGetMe := 0
++	aSendMessage := 0
++	bGetMe := 0
++
++	serverA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		mu.Lock()
++		defer mu.Unlock()
++		switch r.URL.Path {
++		case "/botALPHA/getMe":
++			aGetMe++
++			fmt.Fprint(w, `{"ok":true,"result":{"id":11,"is_bot":true,"first_name":"Alpha"}}`)
++		case "/botALPHA/sendMessage":
++			aSendMessage++
++			fmt.Fprint(w, `{"ok":true,"result":{"message_id":17,"chat":{"id":123},"text":"from alpha"}}`)
++		default:
++			t.Fatalf("server A unexpected path %q", r.URL.Path)
++		}
++	}))
++	defer serverA.Close()
++
++	serverB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		mu.Lock()
++		defer mu.Unlock()
++		assertString(t, "server B path", r.URL.Path, "/botBETA/getMe")
++		bGetMe++
++		fmt.Fprint(w, `{"ok":true,"result":{"id":22,"is_bot":true,"first_name":"Beta"}}`)
++	}))
++	defer serverB.Close()
++
++	a := tbot.NewClient("ALPHA", serverA.Client(), serverA.URL)
++	b := tbot.NewClient("BETA", serverB.Client(), serverB.URL)
++
++	aUser, err := a.GetMe()
++	if err != nil {
++		t.Fatalf("a.GetMe error = %v", err)
++	}
++	aMsg, err := a.SendMessage("123", "from alpha")
++	if err != nil {
++		t.Fatalf("a.SendMessage error = %v", err)
++	}
++	bUser, err := b.GetMe()
++	if err != nil {
++		t.Fatalf("b.GetMe error = %v", err)
++	}
++
++	assertInt(t, "a user ID", aUser.ID, 11)
++	assertString(t, "a user FirstName", aUser.FirstName, "Alpha")
++	assertInt(t, "a message ID", aMsg.MessageID, 17)
++	assertString(t, "a message Text", aMsg.Text, "from alpha")
++	assertInt(t, "b user ID", bUser.ID, 22)
++	assertString(t, "b user FirstName", bUser.FirstName, "Beta")
++	assertInt(t, "server A getMe count", aGetMe, 1)
++	assertInt(t, "server A sendMessage count", aSendMessage, 1)
++	assertInt(t, "server B getMe count", bGetMe, 1)
++}
++
++func TestRepeatedCallsCleanEachResponseBody(t *testing.T) {
++
++
++	transport := &countingTransport{}
++
++	for i := 0; i < 120; i++ {
++		client := tbot.NewClient(token, &http.Client{Transport: transport}, "https://example.invalid")
++		me, err := client.GetMe()
++		if err != nil {
++			t.Fatalf("GetMe iteration %d error = %v", i, err)
++		}
++		assertInt(t, "loop User ID", me.ID, 1)
++	}
++
++	assertInt64(t, "total response bodies", atomic.LoadInt64(&transport.total), 120)
++
++}
++
++type failingRoundTripper struct{}
++
++func (failingRoundTripper) RoundTrip(*http.Request) (*http.Response, error) {
++	return nil, errors.New("dial blocked")
++}
++
++type countingTransport struct {
++	open  int64
++	total int64
++}
++
++func (t *countingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
++	if req.Method != "POST" {
++		return nil, fmt.Errorf("method %s", req.Method)
++	}
++	if req.URL.String() != "https://example.invalid/botTOKEN/getMe" {
++		return nil, fmt.Errorf("url %s", req.URL.String())
++	}
++	atomic.AddInt64(&t.open, 1)
++	atomic.AddInt64(&t.total, 1)
++	return &http.Response{
++		StatusCode: http.StatusOK,
++		Status:     "200 OK",
++		Header:     make(http.Header),
++		Body:       &countingBody{reader: strings.NewReader(`{"ok":true,"result":{"id":1,"is_bot":true,"first_name":"Bot"}}`), transport: t},
++		Request:    req,
++	}, nil
++}
++
++type countingBody struct {
++	reader    *strings.Reader
++	transport *countingTransport
++	closed    int32
++}
++
++func (b *countingBody) Read(p []byte) (int, error) {
++	return b.reader.Read(p)
++}
++
++func (b *countingBody) Close() error {
++	if atomic.CompareAndSwapInt32(&b.closed, 0, 1) {
++		atomic.AddInt64(&b.transport.open, -1)
++	}
++	return nil
++}
++
++func assertString(t *testing.T, label, got, want string) {
++	t.Helper()
++	if got != want {
++		t.Fatalf("%s = %q, want %q", label, got, want)
++	}
++}
++
++func assertFormContentType(t *testing.T, label, got string, allowEmpty bool) {
++	t.Helper()
++	if allowEmpty && got == "" {
++		return
++	}
++	mediaType, _, err := mime.ParseMediaType(got)
++	if err != nil {
++		t.Fatalf("%s parse error = %v", label, err)
++	}
++	if mediaType != "application/x-www-form-urlencoded" {
++		t.Fatalf("%s = %q, want form media type", label, got)
++	}
++}
++
++func assertURLEncodedBody(t *testing.T, label, body string, want map[string]string) {
++	t.Helper()
++	values, err := url.ParseQuery(body)
++	if err != nil {
++		t.Fatalf("%s parse error = %v", label, err)
++	}
++	if len(values) != len(want) {
++		t.Fatalf("%s field count = %d, want %d (%q)", label, len(values), len(want), body)
++	}
++	for key, wantValue := range want {
++		gotValues, ok := values[key]
++		if !ok {
++			t.Fatalf("%s missing field %q in %q", label, key, body)
++		}
++		if len(gotValues) != 1 || gotValues[0] != wantValue {
++			t.Fatalf("%s[%s] = %q, want [%q]", label, key, gotValues, wantValue)
++		}
++	}
++}
++
++func assertNoPartialUser(t *testing.T, label string, user *tbot.User) {
++	t.Helper()
++	if user == nil {
++		return
++	}
++	if user.ID != 0 || user.IsBot || user.FirstName != "" {
++		t.Fatalf("%s = %+v, want nil or zero-value user", label, user)
++	}
++}
++
++func assertNoPartialMessage(t *testing.T, label string, msg *tbot.Message) {
++	t.Helper()
++	if msg == nil {
++		return
++	}
++	if msg.MessageID != 0 || msg.Chat.ID != "" || msg.Text != "" || msg.Caption != "" {
++		t.Fatalf("%s = %+v, want nil or zero-value message", label, msg)
++	}
++}
++
++func assertInt(t *testing.T, label string, got, want int) {
++	t.Helper()
++	if got != want {
++		t.Fatalf("%s = %d, want %d", label, got, want)
++	}
++}
++
++func assertInt64(t *testing.T, label string, got, want int64) {
++	t.Helper()
++	if got != want {
++		t.Fatalf("%s = %d, want %d", label, got, want)
++	}
++}
++
++func assertBool(t *testing.T, label string, got, want bool) {
++	t.Helper()
++	if got != want {
++		t.Fatalf("%s = %t, want %t", label, got, want)
++	}
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,20 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++
++cd /workspace/repo
++
++
++export GOPROXY=off
++export GOSUMDB=off
++export GOTOOLCHAIN=local
++exec go test -v -count=1 ./usercase-test-coderl/...

@@ -1,0 +1,370 @@
+diff --git a/archive/archive_zstd_behavior_test.go b/archive/archive_zstd_behavior_test.go
+new file mode 100644
+index 00000000..00000000
+--- /dev/null
++++ b/archive/archive_zstd_behavior_test.go
+@@ -0,0 +1,339 @@
++package archive_test
++
++import (
++	"archive/tar"
++	"bytes"
++	"fmt"
++	"io/fs"
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++
++	"github.com/go-kit/kit/log"
++
++	"github.com/meltwater/drone-cache/archive"
++)
++
++var zstdMagic = []byte{0x28, 0xb5, 0x2f, 0xfd}
++
++func TestZstdArchiveFormatCreatesRealCompressedArchiveAndRestoresFiles(t *testing.T) {
++	root := t.TempDir()
++	mount := "cache-data"
++	writeSmallFixture(t, root, mount)
++
++	zstdArchive := archive.FromFormat(log.NewNopLogger(), ".", "zstd")
++
++	var zstdBytes bytes.Buffer
++	withWorkingDir(t, root, func() {
++		written, err := zstdArchive.Create([]string{mount}, &zstdBytes)
++		if err != nil {
++			t.Fatalf("create zstd archive: %v", err)
++		}
++		if written == 0 {
++			t.Fatalf("create zstd archive wrote 0 payload bytes")
++		}
++	})
++
++	assertZstdFrame(t, zstdBytes.Bytes())
++	assertNotPlainTar(t, zstdBytes.Bytes())
++
++	restoreDir := t.TempDir()
++	zstdRestoreArchive := archive.FromFormat(log.NewNopLogger(), ".", "zstd")
++	withWorkingDir(t, restoreDir, func() {
++		if _, err := zstdRestoreArchive.Extract(".", bytes.NewReader(zstdBytes.Bytes())); err != nil {
++			t.Fatalf("extract zstd archive: %v", err)
++		}
++	})
++
++	assertTreeEqual(t, filepath.Join(root, mount), filepath.Join(restoreDir, mount))
++
++	var tarBytes bytes.Buffer
++	tarArchive := archive.FromFormat(log.NewNopLogger(), ".", "tar")
++	withWorkingDir(t, root, func() {
++		if _, err := tarArchive.Create([]string{mount}, &tarBytes); err != nil {
++			t.Fatalf("create tar control archive: %v", err)
++		}
++	})
++	if bytes.HasPrefix(tarBytes.Bytes(), zstdMagic) {
++		t.Fatalf("tar control archive unexpectedly has zstd frame magic")
++	}
++}
++
++func TestZstdCompressionLevelAffectsCreatedArchive(t *testing.T) {
++	root := t.TempDir()
++	mount := "large-cache"
++	writeLargeCompressibleFixture(t, root, mount)
++
++	lowLevelArchive := archive.FromFormat(
++		log.NewNopLogger(),
++		".",
++		"zstd",
++		archive.WithCompressionLevel(1),
++	)
++	highLevelArchive := archive.FromFormat(
++		log.NewNopLogger(),
++		".",
++		"zstd",
++		archive.WithCompressionLevel(19),
++	)
++
++	var lowLevelBytes bytes.Buffer
++	withWorkingDir(t, root, func() {
++		if _, err := lowLevelArchive.Create([]string{mount}, &lowLevelBytes); err != nil {
++			t.Fatalf("create zstd archive at low compression level: %v", err)
++		}
++	})
++
++	var highLevelBytes bytes.Buffer
++	withWorkingDir(t, root, func() {
++		if _, err := highLevelArchive.Create([]string{mount}, &highLevelBytes); err != nil {
++			t.Fatalf("create zstd archive at high compression level: %v", err)
++		}
++	})
++
++	assertZstdFrame(t, lowLevelBytes.Bytes())
++	assertZstdFrame(t, highLevelBytes.Bytes())
++
++	lowRestoreDir := t.TempDir()
++	lowRestoreArchive := archive.FromFormat(log.NewNopLogger(), ".", "zstd")
++	withWorkingDir(t, lowRestoreDir, func() {
++		if _, err := lowRestoreArchive.Extract(".", bytes.NewReader(lowLevelBytes.Bytes())); err != nil {
++			t.Fatalf("extract low-level zstd archive: %v", err)
++		}
++	})
++	highRestoreDir := t.TempDir()
++	highRestoreArchive := archive.FromFormat(log.NewNopLogger(), ".", "zstd")
++	withWorkingDir(t, highRestoreDir, func() {
++		if _, err := highRestoreArchive.Extract(".", bytes.NewReader(highLevelBytes.Bytes())); err != nil {
++			t.Fatalf("extract high-level zstd archive: %v", err)
++		}
++	})
++	assertTreeEqual(t, filepath.Join(lowRestoreDir, mount), filepath.Join(highRestoreDir, mount))
++	assertTreeEqual(t, filepath.Join(root, mount), filepath.Join(highRestoreDir, mount))
++
++	if highLevelBytes.Len() >= lowLevelBytes.Len() {
++		t.Fatalf("zstd compression level did not reduce archive size: level 1=%d bytes, level 19=%d bytes", lowLevelBytes.Len(), highLevelBytes.Len())
++	}
++}
++
++func TestDocumentationMentionsZstdArchiveFormatAndCompressionLevel(t *testing.T) {
++	docs := readRepoFile(t, "..", "DOCS.md")
++	readme := readRepoFile(t, "..", "README.md")
++
++	docsArchiveFormat := windowContainingAll(t, docs, "archive_format", 260, "tar", "gzip", "zstd")
++	assertContainsAll(t, docsArchiveFormat, "DOCS.md archive_format section", "tar", "gzip", "zstd")
++
++	readmeArchiveFormat := windowContainingAll(t, readme, "archive-format", 360, "tar", "gzip", "zstd")
++	assertContainsAll(t, readmeArchiveFormat, "README.md archive-format option", "tar", "gzip", "zstd")
++
++	readmeCompressionLevel := windowContainingAll(t, readme, "compression-level", 520, "gzip", "zstd")
++	assertContainsAll(t, readmeCompressionLevel, "README.md compression-level option", "gzip", "zstd")
++	assertContainsAny(t, readmeCompressionLevel, "README.md zstd compression-level reference", "http", "encoder", "valid", "available", "range")
++}
++
++func assertZstdFrame(t *testing.T, data []byte) {
++	t.Helper()
++	if !bytes.HasPrefix(data, zstdMagic) {
++		t.Fatalf("archive is not a zstd frame: got prefix % x", dataPrefix(data, len(zstdMagic)))
++	}
++}
++
++func assertNotPlainTar(t *testing.T, data []byte) {
++	t.Helper()
++	tr := tar.NewReader(bytes.NewReader(data))
++	if _, err := tr.Next(); err == nil {
++		t.Fatalf("archive can be read directly as tar; zstd format likely fell back to uncompressed tar")
++	}
++}
++
++func writeSmallFixture(t *testing.T, root, mount string) {
++	t.Helper()
++	base := filepath.Join(root, mount)
++	mustMkdirAll(t, filepath.Join(base, "nested", "deeper"))
++	mustWriteFile(t, filepath.Join(base, "alpha.txt"), []byte("alpha\nzstd behavior\n"))
++	mustWriteFile(t, filepath.Join(base, "nested", "beta.txt"), []byte("beta\nrestored content\n"))
++	mustWriteFile(t, filepath.Join(base, "nested", "deeper", "gamma.bin"), bytes.Repeat([]byte{0x00, 0x01, 0x02, 0x03}, 257))
++}
++
++func writeLargeCompressibleFixture(t *testing.T, root, mount string) {
++	t.Helper()
++	base := filepath.Join(root, mount)
++	mustMkdirAll(t, filepath.Join(base, "chunks"))
++	for i := 0; i < 6; i++ {
++		prefix := []byte(fmt.Sprintf("dynamic-file-%d\n", i))
++		body := bytes.Repeat(append(prefix, bytes.Repeat([]byte("zstd-level-sensitive-data-"), 128)...), 1800)
++		mustWriteFile(t, filepath.Join(base, "chunks", fmt.Sprintf("payload-%02d.txt", i)), body)
++	}
++}
++
++func assertTreeEqual(t *testing.T, wantRoot, gotRoot string) {
++	t.Helper()
++	wantEntries := collectTree(t, wantRoot)
++	gotEntries := collectTree(t, gotRoot)
++	if len(wantEntries) != len(gotEntries) {
++		t.Fatalf("tree entry count mismatch for %s and %s: want %d got %d\nwant=%v\ngot=%v", wantRoot, gotRoot, len(wantEntries), len(gotEntries), wantEntries, gotEntries)
++	}
++	for rel, want := range wantEntries {
++		got, ok := gotEntries[rel]
++		if !ok {
++			t.Fatalf("restored tree missing %s", rel)
++		}
++		if want.isDir != got.isDir {
++			t.Fatalf("restored tree type mismatch for %s: want dir=%v got dir=%v", rel, want.isDir, got.isDir)
++		}
++		if !want.isDir && !bytes.Equal(want.content, got.content) {
++			t.Fatalf("restored file content mismatch for %s", rel)
++		}
++	}
++}
++
++type treeEntry struct {
++	isDir   bool
++	content []byte
++}
++
++func collectTree(t *testing.T, root string) map[string]treeEntry {
++	t.Helper()
++	entries := map[string]treeEntry{}
++	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
++		if err != nil {
++			return err
++		}
++		rel, err := filepath.Rel(root, path)
++		if err != nil {
++			return err
++		}
++		if rel == "." {
++			return nil
++		}
++		info, err := d.Info()
++		if err != nil {
++			return err
++		}
++		entry := treeEntry{isDir: info.IsDir()}
++		if !info.IsDir() {
++			entry.content, err = os.ReadFile(path)
++			if err != nil {
++				return err
++			}
++		}
++		entries[filepath.ToSlash(rel)] = entry
++		return nil
++	})
++	if err != nil {
++		t.Fatalf("walk %s: %v", root, err)
++	}
++	return entries
++}
++
++func readRepoFile(t *testing.T, parts ...string) string {
++	t.Helper()
++	content, err := os.ReadFile(filepath.Join(parts...))
++	if err != nil {
++		t.Fatalf("read %s: %v", filepath.Join(parts...), err)
++	}
++	return string(content)
++}
++
++func lowercaseWindow(t *testing.T, text, needle string, size int) string {
++	t.Helper()
++	lower := strings.ToLower(text)
++	index := strings.Index(lower, strings.ToLower(needle))
++	if index < 0 {
++		t.Fatalf("could not find %q in document", needle)
++	}
++	end := index + size
++	if end > len(lower) {
++		end = len(lower)
++	}
++	return lower[index:end]
++}
++
++func windowContainingAll(t *testing.T, text, needle string, size int, required ...string) string {
++	t.Helper()
++	lower := strings.ToLower(text)
++	needle = strings.ToLower(needle)
++	for start := 0; ; {
++		index := strings.Index(lower[start:], needle)
++		if index < 0 {
++			break
++		}
++		index += start
++		end := index + size
++		if end > len(lower) {
++			end = len(lower)
++		}
++		window := lower[index:end]
++		allPresent := true
++		for _, word := range required {
++			if !strings.Contains(window, strings.ToLower(word)) {
++				allPresent = false
++				break
++			}
++		}
++		if allPresent {
++			return window
++		}
++		start = index + len(needle)
++	}
++	t.Fatalf("could not find %q window containing %v", needle, required)
++	return ""
++}
++
++func assertContainsAll(t *testing.T, haystack, label string, needles ...string) {
++	t.Helper()
++	for _, needle := range needles {
++		if !strings.Contains(haystack, strings.ToLower(needle)) {
++			t.Fatalf("%s does not mention %q near the documented option; window=%q", label, needle, haystack)
++		}
++	}
++}
++
++func assertContainsAny(t *testing.T, haystack, label string, needles ...string) {
++	t.Helper()
++	for _, needle := range needles {
++		if strings.Contains(haystack, strings.ToLower(needle)) {
++			return
++		}
++	}
++	t.Fatalf("%s lacks any reference hint from %v; window=%q", label, needles, haystack)
++}
++
++func mustMkdirAll(t *testing.T, path string) {
++	t.Helper()
++	if err := os.MkdirAll(path, 0755); err != nil {
++		t.Fatalf("mkdir %s: %v", path, err)
++	}
++}
++
++func mustWriteFile(t *testing.T, path string, content []byte) {
++	t.Helper()
++	if err := os.WriteFile(path, content, 0644); err != nil {
++		t.Fatalf("write %s: %v", path, err)
++	}
++}
++
++func dataPrefix(data []byte, n int) []byte {
++	if len(data) < n {
++		return data
++	}
++	return data[:n]
++}
++
++func withWorkingDir(t *testing.T, dir string, fn func()) {
++	t.Helper()
++	old, err := os.Getwd()
++	if err != nil {
++		t.Fatalf("get working directory: %v", err)
++	}
++	if err := os.Chdir(dir); err != nil {
++		t.Fatalf("chdir %s: %v", dir, err)
++	}
++	defer func() {
++		if err := os.Chdir(old); err != nil {
++			t.Fatalf("restore working directory %s: %v", old, err)
++		}
++	}()
++	fn()
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,20 @@
++#!/bin/bash
++set -uo pipefail
++cd /testbed
++
++
++dev-switch go 1.23
++
++
++case "${1:-}" in
++  base)
++    go test ./archive/tar ./archive/gzip -count=1
++    ;;
++  new)
++    go test ./archive -run 'Test(Zstd|Documentation)' -count=1 -v
++    ;;
++  *)
++    echo "usage: $0 base|new"
++    exit 2
++    ;;
++esac

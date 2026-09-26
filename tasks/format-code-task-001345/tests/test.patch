@@ -1,0 +1,376 @@
+diff --git a/usercase-test-coderl/test_get_action.py b/usercase-test-coderl/test_get_action.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/test_get_action.py
+@@ -0,0 +1,345 @@
++
++
++
++
++
++
++import contextlib
++import os
++import shutil
++from unittest import mock
++
++from absl import flags
++import pytest
++
++from glazier.lib import beyondcorp
++from glazier.lib import download
++from glazier.lib import file_util
++from glazier.lib.actions import ActionError
++from glazier.lib.actions import Get
++from glazier.lib.actions import ValidationError
++from glazier.lib.actions import pull
++
++
++FIXTURES = "/workspace/repo/usercase-test-coderl/fixtures"
++
++
++class BuildInfo:
++
++  def ReleasePath(self):
++    return "C:/fixture_conf"
++
++  def BinaryPath(self):
++    return "D:/fixture_bin/"
++
++  def Branch(self):
++    return "stable"
++
++  def ActiveConfigPath(self):
++    return ["site", "model"]
++
++
++def setup_module(module):
++  del module
++  with contextlib.suppress(Exception):
++    flags.FLAGS(["fixture-get-action-test"])
++  shutil.rmtree("C:/fixture_conf", ignore_errors=True)
++  shutil.rmtree("D:/fixture_bin", ignore_errors=True)
++  os.makedirs(FIXTURES, exist_ok=True)
++  _write_fixture_tree()
++
++
++@pytest.fixture(autouse=True)
++def no_beyondcorp_probe():
++  with mock.patch.object(
++      beyondcorp.BeyondCorp, "CheckBeyondCorp", autospec=True,
++      return_value=False):
++    yield
++
++
++def _write(path, content):
++  os.makedirs(os.path.dirname(path), exist_ok=True)
++  with open(path, "w", encoding="utf-8") as f:
++    f.write(content)
++
++
++def _write_fixture_tree():
++  _write("C:/fixture_conf/site/model/pkg/tool.ps1", "from config token\n")
++  _write("C:/fixture_conf/site/model/stable/manifest.yaml",
++         "from branch token\n")
++  _write("C:/fixture_conf/site/model/relative/name.bin",
++         "from legacy relative\n")
++  _write("C:/fixture_conf/site/model/#literal.txt",
++         "from escaped hash\n")
++  _write("C:/fixture_conf/site/model/@literal.bin",
++         "from escaped at\n")
++  _write("C:/fixture_conf/site/model/%literal.branch",
++         "from escaped percent\n")
++  _write("D:/fixture_bin/drivers/nic.inf", "from binary token\n")
++  _write("C:/fixture_conf/site/model/hash/payload.txt",
++         "sha verified payload\n")
++  _write("C:/fixture_conf/site/model/nohash/payload.txt",
++         "sha skipped payload\n")
++
++
++def _read(path):
++  with open(path, encoding="utf-8") as f:
++    return f.read()
++
++
++def test_public_get_and_pull_alias_validate_nested_list_shape(tmp_path):
++
++
++
++
++  assert callable(Get)
++  assert callable(pull)
++
++  Get([["#pkg/tool.ps1", str(tmp_path / "valid" / "tool.ps1")]],
++      BuildInfo()).Validate()
++  Get([[
++      "#pkg/tool.ps1",
++      str(tmp_path / "valid-with-sha" / "tool.ps1"),
++      "e49c81e2d2f84e259d40e2fb8192f3bcd198b355184845d76d8f58807d0d78ee",
++  ]], BuildInfo()).Validate()
++  pull([["#pkg/tool.ps1", str(tmp_path / "valid-pull" / "tool.ps1")]],
++       BuildInfo()).Validate()
++
++  invalid_cases = [
++      "String",
++      [[]],
++      [["only-one"]],
++      [["a", "b", "c", "d"]],
++      [[1, "b"]],
++      [["a", 2]],
++      [["a", "b", 3]],
++  ]
++  for bad_args in invalid_cases:
++
++    with pytest.raises(ValidationError) as exc_info:
++      Get(bad_args, BuildInfo()).Validate()
++    assert exc_info.value is not None
++
++
++def test_run_processes_entries_in_order_and_materializes_resolved_sources(tmp_path):
++
++
++
++  destination_root = tmp_path / "ordered"
++  calls = []
++  real_download_file = download.Download.DownloadFile
++
++  def record_then_copy(self, url, save_location, show_progress=False):
++    calls.append((url, save_location, show_progress,
++                  os.path.isdir(os.path.dirname(save_location))))
++    return real_download_file(
++        self, url, save_location, show_progress=show_progress)
++
++  with mock.patch.object(
++      download.Download, "DownloadFile", autospec=True,
++      side_effect=record_then_copy):
++    action = Get([
++        ["#pkg/tool.ps1", str(destination_root / "config" / "tool.ps1")],
++        ["@drivers/nic.inf", str(destination_root / "bin" / "nic.inf")],
++        ["%/manifest.yaml", str(destination_root / "branch" / "manifest.yaml")],
++        ["relative/name.bin", str(destination_root / "relative" / "name.bin")],
++    ], BuildInfo())
++    action.Validate()
++    action.Run()
++
++  assert calls == [
++      ("C:/fixture_conf/site/model/pkg/tool.ps1",
++       str(destination_root / "config" / "tool.ps1"), True, True),
++      ("D:/fixture_bin/drivers/nic.inf",
++       str(destination_root / "bin" / "nic.inf"), True, True),
++      ("C:/fixture_conf/site/model/stable/manifest.yaml",
++       str(destination_root / "branch" / "manifest.yaml"), True, True),
++      ("C:/fixture_conf/site/model/relative/name.bin",
++       str(destination_root / "relative" / "name.bin"), True, True),
++  ]
++  assert _read(destination_root / "config" / "tool.ps1") == (
++      "from config token\n")
++  assert _read(destination_root / "bin" / "nic.inf") == "from binary token\n"
++  assert _read(destination_root / "branch" / "manifest.yaml") == (
++      "from branch token\n")
++  assert _read(destination_root / "relative" / "name.bin") == (
++      "from legacy relative\n")
++
++
++def test_run_keeps_escaped_tokens_literal_then_uses_legacy_relative_path(
++    tmp_path):
++
++
++
++  destination_root = tmp_path / "escaped"
++  action = Get([
++      [r"\#literal.txt", str(destination_root / "hash.txt")],
++      [r"\@literal.bin", str(destination_root / "at.txt")],
++      [r"\%literal.branch", str(destination_root / "percent.txt")],
++  ], BuildInfo())
++  action.Validate()
++  action.Run()
++
++  assert _read(destination_root / "hash.txt") == "from escaped hash\n"
++  assert _read(destination_root / "at.txt") == "from escaped at\n"
++  assert _read(destination_root / "percent.txt") == "from escaped percent\n"
++
++
++def test_run_verifies_non_empty_sha_and_rejects_mismatch(tmp_path):
++
++
++
++  correct_sha = (
++      "fa3cf5a5ffd7d0b80d9b66829651b8e87b0640c85a48ba322795e556b31d37ba")
++
++  ok_dest = tmp_path / "hash-ok" / "payload.txt"
++  Get([["hash/payload.txt", str(ok_dest), correct_sha]], BuildInfo()).Run()
++  assert _read(ok_dest) == "sha verified payload\n"
++
++  bad_dest = tmp_path / "hash-bad" / "payload.txt"
++  with pytest.raises(ActionError) as exc_info:
++    Get([[
++        "hash/payload.txt",
++        str(bad_dest),
++        "0000000000000000000000000000000000000000000000000000000000000000",
++    ]], BuildInfo()).Run()
++
++  assert exc_info.value is not None
++  assert _read(bad_dest) == "sha verified payload\n"
++
++
++def test_run_skips_sha_when_argument_absent_or_empty_string(tmp_path):
++
++
++
++  destination_root = tmp_path / "nohash"
++  with mock.patch.object(
++      download.Download, "VerifyShaHash", autospec=True) as verify_sha:
++    Get([
++        ["nohash/payload.txt", str(destination_root / "absent.txt")],
++        ["nohash/payload.txt", str(destination_root / "empty.txt"), ""],
++    ], BuildInfo()).Run()
++
++  assert _read(destination_root / "absent.txt") == "sha skipped payload\n"
++  assert _read(destination_root / "empty.txt") == "sha skipped payload\n"
++  assert verify_sha.call_args_list == []
++
++
++def test_run_wraps_destination_directory_creation_failure(tmp_path):
++
++
++
++  destination = str(tmp_path / "blocked" / "child" / "out.txt")
++
++  with mock.patch.object(
++      file_util,
++      "CreateDirectories",
++      autospec=True,
++      side_effect=file_util.DirectoryCreationError(
++          str(tmp_path / "blocked" / "child"))):
++    with pytest.raises(ActionError) as exc_info:
++      Get([["#pkg/tool.ps1", destination]], BuildInfo()).Run()
++
++
++  assert destination in str(exc_info.value)
++
++
++def test_run_wraps_transfer_failure_and_prints_debug_info(tmp_path):
++
++
++
++  debug_calls = []
++
++  class FailingDownloader:
++
++    def DownloadFile(self, url, save_location, show_progress=False):
++      del save_location, show_progress
++      raise download.DownloadFailedError(url, 503)
++
++    def PrintDebugInfo(self):
++      debug_calls.append("printed")
++
++  with mock.patch.object(download, "Download", FailingDownloader):
++    with pytest.raises(ActionError) as http_exc:
++      Get([["https://cdn.example/file.dat",
++            str(tmp_path / "http" / "file.dat")]], BuildInfo()).Run()
++
++
++  assert "printed" in debug_calls
++  assert "https://cdn.example/file.dat" in str(http_exc.value)
++
++  debug_calls.clear()
++  with mock.patch.object(download, "Download", FailingDownloader):
++    with pytest.raises(ActionError) as relative_exc:
++      Get([["relative/name.bin",
++            str(tmp_path / "relative" / "file.dat")]], BuildInfo()).Run()
++
++
++  assert "printed" in debug_calls
++  assert "C:/fixture_conf/site/model/relative/name.bin" in str(relative_exc.value)
++
++
++def test_validate_is_out_of_order_guard_before_run(tmp_path):
++
++
++
++  with pytest.raises(ValidationError) as exc_info:
++    Get([["#pkg/tool.ps1"]], BuildInfo()).Validate()
++
++  assert exc_info.value is not None
++
++  destination = tmp_path / "valid-after-guard" / "tool.ps1"
++  action = Get([["#pkg/tool.ps1", str(destination)]], BuildInfo())
++  action.Validate()
++  action.Run()
++  assert _read(destination) == "from config token\n"
++
++
++def test_repeated_validate_and_run_are_idempotent_for_same_destination(tmp_path):
++
++
++
++  destination = tmp_path / "repeat" / "tool.ps1"
++  action = Get([["#pkg/tool.ps1", str(destination)]], BuildInfo())
++  action.Validate()
++  action.Validate()
++  action.Run()
++  assert _read(destination) == "from config token\n"
++  action.Run()
++  assert _read(destination) == "from config token\n"
++
++
++def test_two_action_instances_keep_independent_args_and_destinations(tmp_path):
++
++
++
++  first_dest = tmp_path / "first" / "tool.ps1"
++  second_dest = tmp_path / "second" / "nic.inf"
++  first = Get([["#pkg/tool.ps1", str(first_dest)]], BuildInfo())
++  second = Get([["@drivers/nic.inf", str(second_dest)]], BuildInfo())
++
++  first.Validate()
++  first.Run()
++  assert _read(first_dest) == "from config token\n"
++  assert second_dest.exists() is False
++
++  second.Validate()
++  second.Run()
++  assert _read(first_dest) == "from config token\n"
++  assert _read(second_dest) == "from binary token\n"
++
++
++def test_repeated_construct_use_cleanup_cycles_stay_bounded(tmp_path):
++
++
++
++
++  for index in range(3):
++    cycle_dir = tmp_path / f"cycle-{index:03d}"
++    destination = cycle_dir / "tool.ps1"
++    action = Get([["#pkg/tool.ps1", str(destination)]], BuildInfo())
++    action.Validate()
++    action.Run()
++    assert _read(destination) == "from config token\n"
++    shutil.rmtree(cycle_dir)
++    del action
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,21 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++cd /workspace/repo
++
++
++
++
++export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
++export PIP_NO_INDEX=1
++
++exec /opt/stage4a-get-action-venv/bin/python -m pytest /workspace/repo/usercase-test-coderl/test_get_action.py -v

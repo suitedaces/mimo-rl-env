@@ -1,0 +1,617 @@
+diff --git a/usercase-test-coderl/test_stripe_subscription_lifecycle.py b/usercase-test-coderl/test_stripe_subscription_lifecycle.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/test_stripe_subscription_lifecycle.py
+@@ -0,0 +1,587 @@
++
++
++
++
++
++
++
++
++
++import copy
++import sys
++
++import pytest
++import stripe
++from django.conf import settings
++
++
++sys.path.insert(0, "/workspace")
++
++if not settings.configured:
++    settings.configure(
++        SECRET_KEY="fixture-stripe-subscription-lifecycle",
++        INSTALLED_APPS=[
++            "django.contrib.auth",
++            "django.contrib.contenttypes",
++            "htk",
++        ],
++        DATABASES={
++            "default": {
++                "ENGINE": "django.db.backends.sqlite3",
++                "NAME": ":memory:",
++            }
++        },
++        DEFAULT_AUTO_FIELD="django.db.models.AutoField",
++        USE_TZ=True,
++        TEST=False,
++        ENV_STAGE=False,
++        ENV_PROD=False,
++        HTK_STRIPE_LIVE_MODE=True,
++        HTK_STRIPE_CUSTOMER_MODEL="usercase_test_coderl.StripeCustomerForTest",
++        HTK_STRIPE_PRODUCT_MODEL="usercase_test_coderl.StripeProductForTest",
++        HTK_STRIPE_API_SECRET_KEY_TEST="sk_test_fixture",
++        HTK_STRIPE_API_PUBLIC_KEY_TEST="pk_test_fixture",
++        HTK_STRIPE_API_SECRET_KEY_LIVE="sk_live_fixture",
++        HTK_STRIPE_API_PUBLIC_KEY_LIVE="pk_live_fixture",
++        HTK_STRIPE_API_VERSION="2020-08-27",
++    )
++
++import django
++
++
++django.setup()
++
++from htk.lib.stripe_lib import models as stripe_models  # noqa: E402
++from htk.lib.stripe_lib.models import BaseStripeCustomer  # noqa: E402
++
++
++class StripeCustomerForTest(BaseStripeCustomer):
++    class Meta:
++        app_label = "usercase_test_coderl"
++
++
++class FakeStripeBackend:
++    def __init__(self):
++        self.subscriptions = {}
++        self.calls = []
++        self.next_subscription = 1
++        self.next_invoice = 1
++
++    def create_subscription(self, **kwargs):
++        subscription_number = self.next_subscription
++        subscription_id = f"sub_{subscription_number:03d}"
++        item_id = f"si_{subscription_number:03d}"
++        self.next_subscription += 1
++        subscription = {
++            "id": subscription_id,
++            "customer": kwargs["customer"],
++            "items": {
++                "data": [
++                    {
++                        "id": item_id,
++                        **copy.deepcopy(kwargs["items"][0]),
++                    }
++                ]
++            },
++            "status": "active",
++        }
++        self.subscriptions[subscription_id] = copy.deepcopy(subscription)
++        self.calls.append(("subscription.create", copy.deepcopy(kwargs)))
++        return copy.deepcopy(subscription)
++
++    def retrieve_subscription(self, subscription_id):
++        self.calls.append(("subscription.retrieve", subscription_id))
++        subscription = self.subscriptions.get(subscription_id)
++        return copy.deepcopy(subscription) if subscription is not None else None
++
++    def modify_subscription(self, subscription_id, **kwargs):
++        self.calls.append(
++            ("subscription.modify", subscription_id, copy.deepcopy(kwargs))
++        )
++        subscription = self.subscriptions.get(subscription_id)
++        if subscription is None:
++            return None
++
++        current_item_id = subscription["items"]["data"][0]["id"]
++        replacement_item = {"id": current_item_id}
++        replacement_item.update(copy.deepcopy(kwargs["items"][0]))
++        subscription = {
++            "id": subscription["id"],
++            "customer": subscription["customer"],
++            "items": {"data": [replacement_item]},
++            "status": subscription["status"],
++            "proration_behavior": kwargs["proration_behavior"],
++        }
++        self.subscriptions[subscription_id] = copy.deepcopy(subscription)
++        return copy.deepcopy(subscription)
++
++    def delete_subscription(self, subscription_id):
++        self.calls.append(("subscription.delete", subscription_id))
++        subscription = self.subscriptions.get(subscription_id)
++        if subscription is None:
++            return None
++
++        subscription = copy.deepcopy(subscription)
++        subscription["status"] = "canceled"
++        self.subscriptions[subscription_id] = copy.deepcopy(subscription)
++        return copy.deepcopy(subscription)
++
++    def create_invoice(self, **kwargs):
++        invoice_id = f"in_{self.next_invoice:03d}"
++        self.next_invoice += 1
++        invoice = {
++            "id": invoice_id,
++            "customer": kwargs["customer"],
++            "status": "draft",
++        }
++        self.calls.append(("invoice.create", copy.deepcopy(kwargs)))
++        return invoice
++
++    def pay_invoice(self, invoice_id):
++        self.calls.append(("invoice.pay", invoice_id))
++        return {
++            "id": invoice_id,
++            "status": "paid",
++            "paid": True,
++        }
++
++    def active_subscription_count(self):
++        return sum(
++            1
++            for subscription in self.subscriptions.values()
++            if subscription["status"] != "canceled"
++        )
++
++
++@pytest.fixture
++def stripe_backend(monkeypatch):
++    backend = FakeStripeBackend()
++    monkeypatch.setattr(
++        stripe_models.stripe.Subscription,
++        "create",
++        backend.create_subscription,
++    )
++    monkeypatch.setattr(
++        stripe_models.stripe.Subscription,
++        "retrieve",
++        backend.retrieve_subscription,
++    )
++    monkeypatch.setattr(
++        stripe_models.stripe.Subscription,
++        "modify",
++        backend.modify_subscription,
++    )
++    monkeypatch.setattr(
++        stripe_models.stripe.Subscription,
++        "delete",
++        backend.delete_subscription,
++    )
++    monkeypatch.setattr(
++        stripe_models.stripe.Invoice,
++        "create",
++        backend.create_invoice,
++    )
++    monkeypatch.setattr(
++        stripe_models.stripe.Invoice,
++        "pay",
++        backend.pay_invoice,
++    )
++    return backend
++
++
++def make_customer(stripe_id="cus_fixture", live_mode=False):
++    return StripeCustomerForTest(stripe_id=stripe_id, live_mode=live_mode)
++
++
++def assert_single_item_subscription(subscription, customer_id, item_fields):
++    assert subscription is not None
++    assert subscription["id"]
++    assert subscription["customer"] == customer_id
++    assert len(subscription["items"]["data"]) == 1
++    item = subscription["items"]["data"][0]
++    assert item["id"]
++    for key, value in item_fields.items():
++        assert item[key] == value
++
++
++def assert_call_present(stripe_backend, expected_call):
++    assert expected_call in stripe_backend.calls
++
++
++def assert_no_calls_named(stripe_backend, call_name):
++    assert all(call[0] != call_name for call in stripe_backend.calls)
++
++
++def assert_invoice_created_and_paid(stripe_backend, customer_id, invoice_id="in_001"):
++    create_call = ("invoice.create", {"customer": customer_id})
++    pay_call = ("invoice.pay", invoice_id)
++    assert_call_present(stripe_backend, create_call)
++    assert_call_present(stripe_backend, pay_call)
++    assert stripe_backend.calls.index(create_call) < stripe_backend.calls.index(pay_call)
++
++
++def test_create_subscription_with_price_id_creates_and_pays_invoice(
++    stripe_backend,
++):
++
++
++
++    customer = make_customer()
++
++    subscription = customer.create_subscription("price_basic")
++
++
++    assert_single_item_subscription(subscription, "cus_fixture", {"price": "price_basic"})
++    assert subscription["status"] == "active"
++    assert_call_present(
++        stripe_backend,
++        (
++            "subscription.create",
++            {
++                "customer": "cus_fixture",
++                "items": [{"price": "price_basic"}],
++            },
++        ),
++    )
++    assert_invoice_created_and_paid(stripe_backend, "cus_fixture")
++    assert stripe.api_key == "sk_test_fixture"
++
++
++def test_create_subscription_with_price_data_skips_invoice(stripe_backend):
++
++
++
++    customer = make_customer()
++    price_data = {
++        "currency": "usd",
++        "product": "prod_123",
++        "unit_amount": 2500,
++        "recurring": {"interval": "month"},
++    }
++
++    subscription = customer.create_subscription(price_data, invoice=False)
++
++
++    assert_single_item_subscription(subscription, "cus_fixture", {"price_data": price_data})
++    assert subscription["status"] == "active"
++    assert_call_present(
++        stripe_backend,
++        (
++            "subscription.create",
++            {
++                "customer": "cus_fixture",
++                "items": [{"price_data": price_data}],
++            },
++        ),
++    )
++    assert_no_calls_named(stripe_backend, "invoice.create")
++    assert_no_calls_named(stripe_backend, "invoice.pay")
++
++
++def test_create_subscription_rejects_unsupported_plan_type(stripe_backend):
++
++
++
++    customer = make_customer()
++
++    with pytest.raises(Exception) as excinfo:
++        customer.create_subscription(["price_basic"])
++
++    assert excinfo.type is Exception
++
++    assert "unsupported" in str(excinfo.value).lower()
++    assert "list" in str(excinfo.value).lower()
++    assert stripe_backend.calls == []
++
++
++def test_retrieve_subscription_present_and_missing_id(stripe_backend):
++
++
++
++    customer = make_customer()
++    created = customer.create_subscription("price_basic", invoice=False)
++    subscription_id = created["id"]
++
++
++    retrieved = customer.retrieve_subscription(subscription_id)
++    assert_single_item_subscription(retrieved, "cus_fixture", {"price": "price_basic"})
++    assert retrieved["id"] == subscription_id
++    assert retrieved["status"] == "active"
++    assert customer.retrieve_subscription(None) is None
++    assert_call_present(stripe_backend, ("subscription.retrieve", subscription_id))
++    assert ("subscription.retrieve", None) not in stripe_backend.calls
++
++
++def test_change_subscription_plan_defaults_prorate_and_invoice(
++    stripe_backend,
++):
++
++
++
++    customer = make_customer()
++    created = customer.create_subscription("price_basic", invoice=False)
++    subscription_id = created["id"]
++    item_id = created["items"]["data"][0]["id"]
++
++    updated = customer.change_subscription_plan(subscription_id, "price_pro")
++
++
++    assert_single_item_subscription(updated, "cus_fixture", {"price": "price_pro"})
++    assert updated["id"] == subscription_id
++    assert updated["status"] == "active"
++    assert updated["proration_behavior"] == "create_prorations"
++    assert_call_present(stripe_backend, ("subscription.retrieve", subscription_id))
++    assert_call_present(
++        stripe_backend,
++        (
++            "subscription.modify",
++            subscription_id,
++            {
++                "items": [{"id": item_id, "price": "price_pro"}],
++                "proration_behavior": "create_prorations",
++            },
++        ),
++    )
++    assert_invoice_created_and_paid(stripe_backend, "cus_fixture")
++
++
++def test_change_subscription_plan_without_prorations_or_invoice(
++    stripe_backend,
++):
++
++
++
++    customer = make_customer()
++    created = customer.create_subscription("price_basic", invoice=False)
++    subscription_id = created["id"]
++    item_id = created["items"]["data"][0]["id"]
++
++    updated = customer.change_subscription_plan(
++        subscription_id,
++        "price_team",
++        prorate=False,
++        invoice=False,
++    )
++
++
++    assert_single_item_subscription(updated, "cus_fixture", {"price": "price_team"})
++    assert updated["id"] == subscription_id
++    assert updated["status"] == "active"
++    assert updated["proration_behavior"] == "none"
++    assert_call_present(stripe_backend, ("subscription.retrieve", subscription_id))
++    assert_call_present(
++        stripe_backend,
++        (
++            "subscription.modify",
++            subscription_id,
++            {
++                "items": [{"id": item_id, "price": "price_team"}],
++                "proration_behavior": "none",
++            },
++        ),
++    )
++    assert_no_calls_named(stripe_backend, "invoice.create")
++    assert_no_calls_named(stripe_backend, "invoice.pay")
++
++
++def test_change_subscription_plan_with_price_data(stripe_backend):
++
++
++
++    customer = make_customer()
++    created = customer.create_subscription("price_basic", invoice=False)
++    subscription_id = created["id"]
++    item_id = created["items"]["data"][0]["id"]
++    price_data = {
++        "currency": "usd",
++        "product": "prod_123",
++        "unit_amount": 9000,
++        "recurring": {"interval": "year"},
++    }
++
++    updated = customer.change_subscription_plan(
++        subscription_id,
++        price_data,
++        invoice=False,
++    )
++
++
++    assert_single_item_subscription(updated, "cus_fixture", {"price_data": price_data})
++    assert updated["id"] == subscription_id
++    assert updated["status"] == "active"
++    assert updated["proration_behavior"] == "create_prorations"
++    assert_call_present(stripe_backend, ("subscription.retrieve", subscription_id))
++    assert_call_present(
++        stripe_backend,
++        (
++            "subscription.modify",
++            subscription_id,
++            {
++                "items": [{"id": item_id, "price_data": price_data}],
++                "proration_behavior": "create_prorations",
++            },
++        ),
++    )
++    assert_no_calls_named(stripe_backend, "invoice.create")
++    assert_no_calls_named(stripe_backend, "invoice.pay")
++
++
++def test_change_subscription_plan_missing_subscription_returns_none(
++    stripe_backend,
++):
++
++
++
++    customer = make_customer()
++
++
++    assert customer.change_subscription_plan("sub_missing", "price_pro") is None
++    assert_call_present(stripe_backend, ("subscription.retrieve", "sub_missing"))
++    assert_no_calls_named(stripe_backend, "subscription.modify")
++    assert_no_calls_named(stripe_backend, "invoice.create")
++    assert_no_calls_named(stripe_backend, "invoice.pay")
++
++
++def test_change_subscription_plan_rejects_unsupported_type(stripe_backend):
++
++
++
++    customer = make_customer()
++    created = customer.create_subscription("price_basic", invoice=False)
++    subscription_id = created["id"]
++
++    with pytest.raises(Exception) as excinfo:
++        customer.change_subscription_plan(subscription_id, 42)
++
++    assert excinfo.type is Exception
++
++    assert "unsupported" in str(excinfo.value).lower()
++    assert "int" in str(excinfo.value).lower()
++    assert_no_calls_named(stripe_backend, "subscription.modify")
++    assert_no_calls_named(stripe_backend, "invoice.create")
++    assert_no_calls_named(stripe_backend, "invoice.pay")
++
++
++def test_free_upgrade_or_downgrade_disables_proration_and_invoice(
++    stripe_backend,
++):
++
++
++
++    customer = make_customer()
++    created = customer.create_subscription("price_basic", invoice=False)
++    subscription_id = created["id"]
++    item_id = created["items"]["data"][0]["id"]
++
++    updated = customer.free_upgrade_or_downgrade(subscription_id, "price_free")
++
++
++    assert_single_item_subscription(updated, "cus_fixture", {"price": "price_free"})
++    assert updated["id"] == subscription_id
++    assert updated["status"] == "active"
++    assert updated["proration_behavior"] == "none"
++    assert_call_present(stripe_backend, ("subscription.retrieve", subscription_id))
++    assert_call_present(
++        stripe_backend,
++        (
++            "subscription.modify",
++            subscription_id,
++            {
++                "items": [{"id": item_id, "price": "price_free"}],
++                "proration_behavior": "none",
++            },
++        ),
++    )
++    assert_no_calls_named(stripe_backend, "invoice.create")
++    assert_no_calls_named(stripe_backend, "invoice.pay")
++
++
++def test_cancel_subscription_active_already_canceled_and_missing(
++    stripe_backend,
++):
++
++
++
++    customer = make_customer()
++    created = customer.create_subscription("price_basic", invoice=False)
++    subscription_id = created["id"]
++
++
++    assert customer.cancel_subscription(subscription_id) is True
++    retrieved = customer.retrieve_subscription(subscription_id)
++    assert_single_item_subscription(retrieved, "cus_fixture", {"price": "price_basic"})
++    assert retrieved["id"] == subscription_id
++    assert retrieved["status"] == "canceled"
++    assert customer.cancel_subscription(subscription_id) is True
++    assert customer.cancel_subscription("sub_missing") is False
++    assert_call_present(stripe_backend, ("subscription.delete", subscription_id))
++
++
++def test_live_mode_customer_initializes_live_key(stripe_backend):
++
++
++
++    customer = make_customer(stripe_id="cus_live", live_mode=True)
++
++    subscription = customer.create_subscription("price_live", invoice=False)
++
++
++    assert_single_item_subscription(subscription, "cus_live", {"price": "price_live"})
++    assert subscription["status"] == "active"
++    assert stripe.api_key == "sk_live_fixture"
++    assert_call_present(
++        stripe_backend,
++        (
++            "subscription.create",
++            {
++                "customer": "cus_live",
++                "items": [{"price": "price_live"}],
++            },
++        ),
++    )
++    assert_no_calls_named(stripe_backend, "invoice.create")
++    assert_no_calls_named(stripe_backend, "invoice.pay")
++
++
++def test_two_customers_keep_subscription_state_independent(stripe_backend):
++
++
++
++    customer_a = make_customer(stripe_id="cus_alpha")
++    customer_b = make_customer(stripe_id="cus_beta")
++
++    subscription_a = customer_a.create_subscription("price_alpha", invoice=False)
++    subscription_b = customer_b.create_subscription("price_beta", invoice=False)
++    canceled_a = customer_a.cancel_subscription(subscription_a["id"])
++
++
++    assert_single_item_subscription(subscription_a, "cus_alpha", {"price": "price_alpha"})
++    assert_single_item_subscription(subscription_b, "cus_beta", {"price": "price_beta"})
++    assert subscription_a["id"] != subscription_b["id"]
++    assert subscription_a["status"] == "active"
++    assert subscription_b["status"] == "active"
++    assert canceled_a is True
++    retrieved_a = customer_a.retrieve_subscription(subscription_a["id"])
++    retrieved_b = customer_b.retrieve_subscription(subscription_b["id"])
++    assert_single_item_subscription(retrieved_a, "cus_alpha", {"price": "price_alpha"})
++    assert_single_item_subscription(retrieved_b, "cus_beta", {"price": "price_beta"})
++    assert retrieved_a["status"] == "canceled"
++    assert retrieved_b["status"] == "active"
++
++
++def test_repeated_create_and_cancel_cycles_leave_no_active_subscriptions(
++    stripe_backend,
++):
++
++
++
++    for index in range(100):
++        customer = make_customer(stripe_id=f"cus_cycle_{index:03d}")
++        subscription = customer.create_subscription("price_basic", invoice=False)
++
++        assert subscription["id"]
++        assert customer.cancel_subscription(subscription["id"]) is True
++
++    assert stripe_backend.active_subscription_count() == 0
++
++    assert sum(1 for call in stripe_backend.calls if call[0] == "subscription.create") == 100
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,20 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++
++ln -sfn /workspace/repo /workspace/htk
++cd /workspace/repo
++
++export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
++export PIP_NO_INDEX=1
++export PYTHONPATH="/workspace:/workspace/repo:${PYTHONPATH:-}"
++exec python -m pytest /workspace/repo/usercase-test-coderl/test_stripe_subscription_lifecycle.py -v

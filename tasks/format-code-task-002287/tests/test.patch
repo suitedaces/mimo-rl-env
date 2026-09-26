@@ -1,0 +1,279 @@
+diff --git a/packages/sql-graphql/test/json-column.test.js b/packages/sql-graphql/test/json-column.test.js
+new file mode 100644
+index 000000000..25b2bcd9e
+--- /dev/null
++++ b/packages/sql-graphql/test/json-column.test.js
+@@ -0,0 +1,121 @@
++'use strict'
++
++const { test } = require('tap')
++const fastify = require('fastify')
++const sqlMapper = require('@platformatic/sql-mapper')
++const sqlGraphQL = require('..')
++const { clear, connInfo, isSQLite, isMysql } = require('./helper')
++
++function namedType (type) {
++  let current = type
++  while (current && current.ofType) {
++    current = current.ofType
++  }
++  return current
++}
++
++test('json columns are exposed as non-string GraphQL fields and return object values', { skip: isSQLite || isMysql }, async (t) => {
++  const app = fastify()
++  const firstMetadata = {
++    foo: 'bar',
++    count: 42,
++    nested: { hello: 'world' },
++    items: ['a', 'b']
++  }
++  const firstSettings = {
++    enabled: true,
++    labels: { one: 1 },
++    list: [{ k: 'v' }]
++  }
++  const secondMetadata = {
++    foo: 'baz',
++    count: 7,
++    nested: { hello: 'again' },
++    items: ['x']
++  }
++  const secondSettings = {
++    enabled: false,
++    labels: { two: 2 },
++    list: [{ k: 'w' }]
++  }
++
++  app.register(sqlMapper, {
++    ...connInfo,
++    async onDatabaseLoad (db, sql) {
++      await clear(db, sql)
++      await db.query(sql`CREATE TABLE pages (
++        id SERIAL PRIMARY KEY,
++        title VARCHAR(255) NOT NULL,
++        metadata JSON NOT NULL,
++        settings JSON NOT NULL
++      );`)
++      await db.query(sql`INSERT INTO pages (id, title, metadata, settings)
++        VALUES (1, 'first', ${JSON.stringify(firstMetadata)}, ${JSON.stringify(firstSettings)})`)
++      await db.query(sql`INSERT INTO pages (id, title, metadata, settings)
++        VALUES (2, 'second', ${JSON.stringify(secondMetadata)}, ${JSON.stringify(secondSettings)})`)
++    }
++  })
++  app.register(sqlGraphQL, { graphiql: false })
++  t.teardown(app.close.bind(app))
++
++  await app.ready()
++
++  const introspectionRes = await app.inject({
++    method: 'POST',
++    url: '/graphql',
++    body: {
++      query: `{
++        __type(name: "Page") {
++          fields {
++            name
++            type {
++              kind
++              name
++              ofType {
++                kind
++                name
++                ofType {
++                  kind
++                  name
++                }
++              }
++            }
++          }
++        }
++      }`
++    }
++  })
++  const introspection = introspectionRes.json()
++  t.error(introspection.errors)
++
++  const fields = introspection.data.__type.fields
++  const metadataType = namedType(fields.find(field => field.name === 'metadata').type)
++  const settingsType = namedType(fields.find(field => field.name === 'settings').type)
++  t.notSame(metadataType.name, 'String')
++  t.notSame(settingsType.name, 'String')
++
++  const res = await app.inject({
++    method: 'POST',
++    url: '/graphql',
++    body: {
++      query: `{
++        first: getPageById(id: 1) {
++          id
++          metadata
++          settings
++        }
++        second: getPageById(id: 2) {
++          id
++          metadata
++          settings
++        }
++      }`
++    }
++  })
++  const json = res.json()
++  t.error(json.errors)
++  t.same(json.data.first.metadata, firstMetadata)
++  t.same(json.data.first.settings, firstSettings)
++  t.same(json.data.second.metadata, secondMetadata)
++  t.same(json.data.second.settings, secondSettings)
++})
+diff --git a/packages/sql-json-schema-mapper/test/json-column.test.js b/packages/sql-json-schema-mapper/test/json-column.test.js
+new file mode 100644
+index 000000000..b8bd1e561
+--- /dev/null
++++ b/packages/sql-json-schema-mapper/test/json-column.test.js
+@@ -0,0 +1,42 @@
++'use strict'
++
++const { test } = require('tap')
++const { mapSQLEntityToJSONSchema } = require('..')
++
++test('json SQL fields map to object schema with arbitrary properties', async (t) => {
++  const schema = mapSQLEntityToJSONSchema({
++    fields: {
++      id: {
++        sqlType: 'integer',
++        camelcase: 'id',
++        isNullable: false
++      },
++      title: {
++        sqlType: 'varchar',
++        camelcase: 'title',
++        isNullable: false
++      },
++      metadata: {
++        sqlType: 'json',
++        camelcase: 'metadata',
++        isNullable: false
++      },
++      settings: {
++        sqlType: 'json',
++        camelcase: 'settings',
++        isNullable: true
++      }
++    }
++  })
++
++  t.same(schema.properties.metadata, {
++    type: 'object',
++    additionalProperties: true
++  })
++  t.same(schema.properties.settings, {
++    type: 'object',
++    additionalProperties: true,
++    nullable: true
++  })
++  t.same(schema.properties.title, { type: 'string' })
++})
+diff --git a/packages/sql-openapi/test/json-column.test.js b/packages/sql-openapi/test/json-column.test.js
+new file mode 100644
+index 000000000..a08c2b0e6
+--- /dev/null
++++ b/packages/sql-openapi/test/json-column.test.js
+@@ -0,0 +1,59 @@
++'use strict'
++
++const { test } = require('tap')
++const fastify = require('fastify')
++const sqlMapper = require('@platformatic/sql-mapper')
++const sqlOpenAPI = require('..')
++const { clear, connInfo, isSQLite, isMysql } = require('./helper')
++
++function findSchemaWithProperty (value, propertyName) {
++  if (!value || typeof value !== 'object') {
++    return null
++  }
++  if (value.properties && value.properties[propertyName]) {
++    return value
++  }
++  for (const child of Object.values(value)) {
++    const found = findSchemaWithProperty(child, propertyName)
++    if (found) {
++      return found
++    }
++  }
++  return null
++}
++
++test('OpenAPI documentation describes json columns as object properties', { skip: isSQLite || isMysql }, async (t) => {
++  const app = fastify()
++  app.register(sqlMapper, {
++    ...connInfo,
++    async onDatabaseLoad (db, sql) {
++      await clear(db, sql)
++      await db.query(sql`CREATE TABLE pages (
++        id SERIAL PRIMARY KEY,
++        title VARCHAR(255) NOT NULL,
++        payload JSON
++      );`)
++    }
++  })
++  app.register(sqlOpenAPI)
++  t.teardown(app.close.bind(app))
++
++  await app.ready()
++
++  const res = await app.inject({
++    method: 'GET',
++    url: '/documentation/json'
++  })
++  t.equal(res.statusCode, 200)
++
++  const openapi = res.json()
++  const pageSchema = findSchemaWithProperty(openapi, 'payload')
++  t.ok(pageSchema)
++
++  const payloadSchema = pageSchema.properties.payload
++  t.same(payloadSchema, {
++    type: 'object',
++    additionalProperties: true,
++    nullable: true
++  })
++})
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,34 @@
++#!/bin/bash
++set -uo pipefail
++
++cd /testbed
++
++
++export PATH="/opt/node-20/bin:/usr/lib/postgresql/16/bin:$PATH"
++export DB=postgresql
++
++if [ ! -x /testbed/packages/sql-graphql/node_modules/.bin/tap ] ||
++   [ ! -x /testbed/packages/sql-json-schema-mapper/node_modules/.bin/tap ] ||
++   [ ! -x /testbed/packages/sql-openapi/node_modules/.bin/tap ]; then
++  /opt/node-20/bin/pnpm install --frozen-lockfile=false
++fi
++
++pg_isready -q 2>/dev/null || pg_ctlcluster 16 main start 2>/dev/null || true
++
++
++case "${1:-}" in
++  base)
++    cd /testbed/packages/sql-graphql && npx tap --no-coverage-report --no-check-coverage test/simple.test.js || exit 1
++    cd /testbed/packages/sql-json-schema-mapper && npx tap --no-coverage-report --no-check-coverage test/simple.test.js || exit 1
++    cd /testbed/packages/sql-openapi && npx tap --no-coverage-report --no-check-coverage test/simple.test.js test/order_by.test.js test/where.test.js || exit 1
++    ;;
++  new)
++    cd /testbed/packages/sql-graphql && npx tap --no-coverage-report --no-check-coverage test/json-column.test.js || exit 1
++    cd /testbed/packages/sql-json-schema-mapper && npx tap --no-coverage-report --no-check-coverage test/json-column.test.js || exit 1
++    cd /testbed/packages/sql-openapi && npx tap --no-coverage-report --no-check-coverage test/json-column.test.js || exit 1
++    ;;
++  *)
++    echo "usage: $0 base|new"
++    exit 2
++    ;;
++esac

@@ -1,0 +1,430 @@
+diff --git a/tests/test_service_responses_codespec.py b/tests/test_service_responses_codespec.py
+new file mode 100644
+index 000000000..98cc5dd5a
+--- /dev/null
++++ b/tests/test_service_responses_codespec.py
+@@ -0,0 +1,409 @@
++
++from __future__ import annotations
++
++import asyncio
++import json
++from typing import Any
++from unittest.mock import Mock
++
++import pytest
++
++from homeassistant import core as ha, exceptions
++from homeassistant.components import websocket_api
++from homeassistant.components.websocket_api import commands, const, messages
++from homeassistant.const import EVENT_CALL_SERVICE
++from homeassistant.helpers.service import (
++    async_get_all_descriptions,
++    async_set_service_schema,
++)
++
++from tests.common import MockUser, async_capture_events
++
++
++def _response_api() -> tuple[type, type[Exception]]:
++
++    supports_response = getattr(ha, "SupportsResponse", None)
++    validation_error = getattr(exceptions, "ServiceValidationError", None)
++    assert supports_response is not None, "homeassistant.core.SupportsResponse is missing"
++    assert validation_error is not None, (
++        "homeassistant.exceptions.ServiceValidationError is missing"
++    )
++    return supports_response, validation_error
++
++
++def test_codespec_response_capability_is_a_stable_public_enum() -> None:
++
++    supports_response, validation_error = _response_api()
++
++    assert {member.name: member.value for member in supports_response} == {
++        "NONE": "none",
++        "OPTIONAL": "optional",
++        "ONLY": "only",
++    }
++    assert issubclass(validation_error, exceptions.HomeAssistantError)
++
++
++async def test_codespec_registration_exposes_response_capability(hass) -> None:
++
++    supports_response, _ = _response_api()
++
++    hass.services.async_register(
++        "codespec",
++        "metadata",
++        lambda call: None,
++        supports_response=supports_response.OPTIONAL,
++    )
++
++    service = hass.services.async_services()["codespec"]["metadata"]
++    assert service.supports_response is supports_response.OPTIONAL
++
++
++async def test_codespec_registration_defaults_to_no_response(hass) -> None:
++
++    supports_response, _ = _response_api()
++
++    hass.services.async_register("codespec", "default", lambda call: None)
++
++    service = hass.services.async_services()["codespec"]["default"]
++    assert service.supports_response is supports_response.NONE
++
++
++@pytest.mark.parametrize("capability_name", ["OPTIONAL", "ONLY"])
++async def test_codespec_coroutine_response_is_returned(hass, capability_name) -> None:
++
++    supports_response, _ = _response_api()
++    payload = {
++        "source": capability_name.lower(),
++        "items": [1, {"ready": False}],
++        "detail": None,
++    }
++
++    async def respond(call):
++        return payload
++
++    hass.services.async_register(
++        "codespec",
++        f"coroutine_{capability_name.lower()}",
++        respond,
++        supports_response=getattr(supports_response, capability_name),
++    )
++
++    result = await hass.services.async_call(
++        "codespec",
++        f"coroutine_{capability_name.lower()}",
++        blocking=True,
++        return_response=True,
++    )
++
++    assert result == payload
++
++
++async def test_codespec_callback_response_is_returned(hass) -> None:
++
++    supports_response, _ = _response_api()
++    payload = {"handler": "callback", "count": 0}
++
++    @ha.callback
++    def respond(call):
++        return payload
++
++    hass.services.async_register(
++        "codespec",
++        "callback",
++        respond,
++        supports_response=supports_response.OPTIONAL,
++    )
++
++    assert (
++        await hass.services.async_call(
++            "codespec", "callback", blocking=True, return_response=True
++        )
++        == payload
++    )
++
++
++async def test_codespec_executor_response_is_returned(hass) -> None:
++
++    supports_response, _ = _response_api()
++    payload = {"handler": "executor", "enabled": True}
++
++    def respond(call):
++        return payload
++
++    hass.services.async_register(
++        "codespec",
++        "executor",
++        respond,
++        supports_response=supports_response.OPTIONAL,
++    )
++
++    assert (
++        await hass.services.async_call(
++            "codespec", "executor", blocking=True, return_response=True
++        )
++        == payload
++    )
++
++
++async def test_codespec_unrequested_optional_response_keeps_legacy_result(hass) -> None:
++
++    supports_response, _ = _response_api()
++    calls = []
++
++    async def respond(call):
++        calls.append(call)
++        return {"ignored": "for this call"}
++
++    hass.services.async_register(
++        "codespec",
++        "legacy_result",
++        respond,
++        supports_response=supports_response.OPTIONAL,
++    )
++
++    assert (
++        await hass.services.async_call(
++            "codespec", "legacy_result", blocking=True, return_response=False
++        )
++        is True
++    )
++    assert len(calls) == 1
++    assert (
++        await hass.services.async_call(
++            "codespec", "legacy_result", blocking=False, return_response=False
++        )
++        is None
++    )
++    await hass.async_block_till_done()
++    assert len(calls) == 2
++
++
++@pytest.mark.parametrize(
++    ("capability_name", "return_response"),
++    [("NONE", True), ("ONLY", False)],
++)
++async def test_codespec_capability_mismatch_rejected_before_execution(
++    hass, capability_name, return_response
++) -> None:
++
++    supports_response, validation_error = _response_api()
++    calls = []
++    events = async_capture_events(hass, EVENT_CALL_SERVICE)
++
++    async def respond(call):
++        calls.append(call)
++        return {"unexpected": True}
++
++    service_name = f"mismatch_{capability_name.lower()}"
++    hass.services.async_register(
++        "codespec",
++        service_name,
++        respond,
++        supports_response=getattr(supports_response, capability_name),
++    )
++
++    with pytest.raises(validation_error) as err:
++        await hass.services.async_call(
++            "codespec",
++            service_name,
++            blocking=True,
++            return_response=return_response,
++        )
++
++    assert calls == []
++    assert events == []
++    assert f"codespec.{service_name}" in str(err.value)
++    assert "response" in str(err.value).lower()
++
++
++async def test_codespec_response_request_requires_blocking_call(hass) -> None:
++
++    supports_response, _ = _response_api()
++    calls = []
++    events = async_capture_events(hass, EVENT_CALL_SERVICE)
++
++    async def respond(call):
++        calls.append(call)
++        return {"unexpected": True}
++
++    hass.services.async_register(
++        "codespec",
++        "background",
++        respond,
++        supports_response=supports_response.OPTIONAL,
++    )
++
++    with pytest.raises(ValueError, match="(?i)response.*blocking|blocking.*response"):
++        await hass.services.async_call(
++            "codespec", "background", blocking=False, return_response=True
++        )
++
++    assert calls == []
++    assert events == []
++
++
++async def test_codespec_descriptions_track_reregistration_without_losing_docs(
++    hass,
++) -> None:
++
++    supports_response, _ = _response_api()
++    domain = "codespec"
++    service_name = "described"
++    async_set_service_schema(
++        hass,
++        domain,
++        service_name,
++        {
++            "name": "Described service",
++            "description": "Returns a structured status.",
++            "fields": {"mode": {"description": "Requested mode"}},
++        },
++    )
++
++    hass.services.async_register(
++        domain,
++        service_name,
++        lambda call: None,
++        supports_response=supports_response.OPTIONAL,
++    )
++    first = (await async_get_all_descriptions(hass))[domain][service_name]
++    assert first["supports_response"] == "optional"
++    assert first["name"] == "Described service"
++    assert "mode" in first["fields"]
++
++    hass.services.async_register(
++        domain,
++        service_name,
++        lambda call: None,
++        supports_response=supports_response.NONE,
++    )
++    second = (await async_get_all_descriptions(hass))[domain][service_name]
++    assert second["supports_response"] == "none"
++    assert second["description"] == "Returns a structured status."
++
++
++async def _send_websocket_command(hass, command: dict[str, Any]) -> dict[str, Any]:
++
++    response = hass.loop.create_future()
++
++    def send_message(message):
++        if callable(message):
++            message = message()
++        if not isinstance(message, str):
++            message = messages.message_to_json(message)
++        if not response.done():
++            response.set_result(json.loads(message))
++
++    commands.async_register_commands(hass, websocket_api.async_register_command)
++    connection = websocket_api.ActiveConnection(
++        Mock(), hass, send_message, MockUser(is_owner=True), Mock(id="token")
++    )
++    connection.async_handle(command)
++    return await response
++
++
++async def test_codespec_websocket_returns_requested_response_and_context(hass) -> None:
++
++    supports_response, _ = _response_api()
++    payload = {"status": "ready", "values": [0, False, None]}
++
++    async def respond(call):
++        return payload
++
++    hass.services.async_register(
++        "codespec",
++        "websocket_response",
++        respond,
++        supports_response=supports_response.OPTIONAL,
++    )
++    result = await _send_websocket_command(
++        hass,
++        {
++            "id": 1,
++            "type": "call_service",
++            "domain": "codespec",
++            "service": "websocket_response",
++            "return_response": True,
++        },
++    )
++
++    assert result["success"] is True
++    assert result["result"]["response"] == payload
++    assert result["result"]["context"]["user_id"] is not None
++
++
++async def test_codespec_websocket_default_omits_response(hass) -> None:
++
++    supports_response, _ = _response_api()
++
++    async def respond(call):
++        return {"not": "requested"}
++
++    hass.services.async_register(
++        "codespec",
++        "websocket_legacy",
++        respond,
++        supports_response=supports_response.OPTIONAL,
++    )
++    result = await _send_websocket_command(
++        hass,
++        {
++            "id": 1,
++            "type": "call_service",
++            "domain": "codespec",
++            "service": "websocket_legacy",
++        },
++    )
++
++    assert result["success"] is True
++    assert set(result["result"]) == {"context"}
++
++
++async def test_codespec_websocket_reports_capability_mismatch(hass) -> None:
++
++    supports_response, _ = _response_api()
++    called = False
++
++    async def respond(call):
++        nonlocal called
++        called = True
++        return {"unexpected": True}
++
++    hass.services.async_register(
++        "codespec",
++        "websocket_unsupported",
++        respond,
++        supports_response=supports_response.NONE,
++    )
++    result = await _send_websocket_command(
++        hass,
++        {
++            "id": 1,
++            "type": "call_service",
++            "domain": "codespec",
++            "service": "websocket_unsupported",
++            "return_response": True,
++        },
++    )
++
++    assert result["success"] is False
++    assert result["error"]["code"] == const.ERR_HOME_ASSISTANT_ERROR
++    assert "response" in result["error"]["message"].lower()
++    assert called is False
++
++
++async def test_codespec_websocket_rejects_non_boolean_response_flag(hass) -> None:
++
++    result = await _send_websocket_command(
++        hass,
++        {
++            "id": 1,
++            "type": "call_service",
++            "domain": "codespec",
++            "service": "anything",
++            "return_response": "true",
++        },
++    )
++
++    assert result["success"] is False
++    assert result["error"]["code"] == const.ERR_INVALID_FORMAT
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,10 @@
++#!/bin/bash
++set -euo pipefail
++
++
++.venv/bin/pytest -q \
++  tests/test_service_responses_codespec.py \
++  tests/test_core.py::test_serviceregistry_call_with_blocking_done_in_time \
++  tests/test_core.py::test_serviceregistry_async_service \
++  tests/test_core.py::test_serviceregistry_callback_service \
++  tests/test_core.py::test_serviceregistry_async_service_raise_exception

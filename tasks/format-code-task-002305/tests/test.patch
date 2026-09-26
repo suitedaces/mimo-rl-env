@@ -1,0 +1,381 @@
+diff --git a/usercase-test-coderl/fixtures/sync_ignore_harness.go b/usercase-test-coderl/fixtures/sync_ignore_harness.go
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/fixtures/sync_ignore_harness.go
+@@ -0,0 +1,250 @@
++package main
++
++import (
++	"crypto/md5"
++	"crypto/rand"
++	"crypto/rsa"
++	"crypto/tls"
++	"crypto/x509"
++	"crypto/x509/pkix"
++	"encoding/hex"
++	"encoding/json"
++	"encoding/pem"
++	"fmt"
++	"math/big"
++	"net"
++	"net/http"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"strings"
++	"time"
++)
++
++const dirMime = "application/vnd.google-apps.folder"
++
++func main() {
++	if len(os.Args) < 4 {
++		fmt.Fprintln(os.Stderr, "usage: sync_ignore_harness <scenario> <gdrive-bin> <args...>")
++		os.Exit(2)
++	}
++
++	scenario := os.Args[1]
++	bin := os.Args[2]
++	args := os.Args[3:]
++
++	certPath, cert, key, err := makeCert()
++	if err != nil {
++		fmt.Fprintln(os.Stderr, err)
++		os.Exit(1)
++	}
++	defer os.Remove(certPath)
++
++	proxy, err := startProxy(scenario, cert, key)
++	if err != nil {
++		fmt.Fprintln(os.Stderr, err)
++		os.Exit(1)
++	}
++	defer proxy.Close()
++
++	cmd := exec.Command(bin, args...)
++	cmd.Stdout = os.Stdout
++	cmd.Stderr = os.Stderr
++	cmd.Env = append(os.Environ(),
++		"HTTPS_PROXY=http://"+proxy.Addr().String(),
++		"https_proxy=http://"+proxy.Addr().String(),
++		"SSL_CERT_FILE="+certPath,
++	)
++
++	if err := cmd.Run(); err != nil {
++		if exitErr, ok := err.(*exec.ExitError); ok {
++			os.Exit(exitErr.ExitCode())
++		}
++		fmt.Fprintln(os.Stderr, err)
++		os.Exit(1)
++	}
++}
++
++func startProxy(scenario string, certPEM, keyPEM []byte) (net.Listener, error) {
++	cert, err := tls.X509KeyPair(certPEM, keyPEM)
++	if err != nil {
++		return nil, err
++	}
++
++	ln, err := net.Listen("tcp", "127.0.0.1:0")
++	if err != nil {
++		return nil, err
++	}
++
++	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		if r.Method != http.MethodConnect {
++			http.Error(w, "proxy only supports CONNECT", http.StatusMethodNotAllowed)
++			return
++		}
++
++		hijacker, ok := w.(http.Hijacker)
++		if !ok {
++			http.Error(w, "hijacking not supported", http.StatusInternalServerError)
++			return
++		}
++
++		conn, _, err := hijacker.Hijack()
++		if err != nil {
++			return
++		}
++		fmt.Fprint(conn, "HTTP/1.1 200 Connection Established\r\n\r\n")
++
++		tlsConn := tls.Server(conn, &tls.Config{Certificates: []tls.Certificate{cert}})
++		go func() {
++			defer tlsConn.Close()
++			_ = http.Serve(&oneConnListener{conn: tlsConn}, fakeDriveHandler(scenario))
++		}()
++	})}
++
++	go server.Serve(ln)
++	return ln, nil
++}
++
++func fakeDriveHandler(scenario string) http.Handler {
++	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		w.Header().Set("Content-Type", "application/json")
++		path := strings.TrimPrefix(r.URL.Path, "/drive/v3")
++
++		switch {
++		case r.Method == "GET" && path == "/files/root":
++			writeJSON(w, file("root", "RemoteRoot", dirMime, []string{}, map[string]string{"sync": "true", "syncRoot": "true"}, 0, ""))
++		case r.Method == "GET" && path == "/files":
++			writeJSON(w, map[string]interface{}{"files": remoteFiles(scenario)})
++		case r.Method == "GET" && path == "/about":
++			writeJSON(w, map[string]interface{}{"storageQuota": map[string]string{"limit": "0", "usage": "0"}})
++		default:
++			http.Error(w, "unexpected fake drive request: "+r.Method+" "+r.URL.String(), http.StatusNotFound)
++		}
++	})
++}
++
++func remoteFiles(scenario string) []*driveFile {
++	files := []*driveFile{
++		file("remote-build-dir", "build", dirMime, []string{"root"}, nil, 0, ""),
++		file("remote-src-dir", "src", dirMime, []string{"root"}, nil, 0, ""),
++		file("remote-src-main", "main.go", "text/plain", []string{"remote-src-dir"}, nil, 14, md5Hex("package main\n")),
++		file("remote-readme", "README.md", "text/plain", []string{"root"}, nil, 7, md5Hex("remote\n")),
++	}
++
++	if scenario == "upload_no_ignore" {
++		files = append(files,
++			file("remote-build-app", "app.bin", "application/octet-stream", []string{"remote-build-dir"}, nil, 7, md5Hex("binary\n")),
++			file("remote-debug-log", "debug.log", "text/plain", []string{"root"}, nil, 4, md5Hex("log\n")),
++		)
++	}
++
++	return files
++}
++
++type driveFile struct {
++	Id            string            `json:"id,omitempty"`
++	Name          string            `json:"name,omitempty"`
++	MimeType      string            `json:"mimeType,omitempty"`
++	Parents       []string          `json:"parents,omitempty"`
++	AppProperties map[string]string `json:"appProperties,omitempty"`
++	Size          string            `json:"size,omitempty"`
++	Md5Checksum   string            `json:"md5Checksum,omitempty"`
++	ModifiedTime  string            `json:"modifiedTime,omitempty"`
++}
++
++func file(id, name, mime string, parents []string, props map[string]string, size int64, md5sum string) *driveFile {
++	if props == nil {
++		props = map[string]string{"sync": "true", "syncRootId": "root"}
++	}
++	return &driveFile{
++		Id:            id,
++		Name:          name,
++		MimeType:      mime,
++		Parents:       parents,
++		AppProperties: props,
++		Size:          fmt.Sprint(size),
++		Md5Checksum:   md5sum,
++		ModifiedTime:  "2020-01-02T03:04:05.000Z",
++	}
++}
++
++func md5Hex(s string) string {
++	sum := md5.Sum([]byte(s))
++	return hex.EncodeToString(sum[:])
++}
++
++func writeJSON(w http.ResponseWriter, v interface{}) {
++	if err := json.NewEncoder(w).Encode(v); err != nil {
++		http.Error(w, err.Error(), http.StatusInternalServerError)
++	}
++}
++
++type oneConnListener struct {
++	conn net.Conn
++	used bool
++}
++
++func (l *oneConnListener) Accept() (net.Conn, error) {
++	if l.used {
++		select {}
++	}
++	l.used = true
++	return l.conn, nil
++}
++
++func (l *oneConnListener) Close() error {
++	return nil
++}
++
++func (l *oneConnListener) Addr() net.Addr {
++	return l.conn.LocalAddr()
++}
++
++func makeCert() (string, []byte, []byte, error) {
++	caKey, err := rsa.GenerateKey(rand.Reader, 2048)
++	if err != nil {
++		return "", nil, nil, err
++	}
++	caTemplate := &x509.Certificate{
++		SerialNumber:          big.NewInt(1),
++		Subject:               pkix.Name{CommonName: "fixture fake drive CA"},
++		NotBefore:             time.Now().Add(-time.Hour),
++		NotAfter:              time.Now().Add(time.Hour),
++		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
++		BasicConstraintsValid: true,
++		IsCA:                  true,
++	}
++	caDER, err := x509.CreateCertificate(rand.Reader, caTemplate, caTemplate, &caKey.PublicKey, caKey)
++	if err != nil {
++		return "", nil, nil, err
++	}
++
++	leafKey, err := rsa.GenerateKey(rand.Reader, 2048)
++	if err != nil {
++		return "", nil, nil, err
++	}
++	leafTemplate := &x509.Certificate{
++		SerialNumber: big.NewInt(2),
++		Subject:      pkix.Name{CommonName: "www.googleapis.com"},
++		DNSNames:     []string{"www.googleapis.com"},
++		NotBefore:    time.Now().Add(-time.Hour),
++		NotAfter:     time.Now().Add(time.Hour),
++		KeyUsage:     x509.KeyUsageDigitalSignature,
++		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
++	}
++	leafDER, err := x509.CreateCertificate(rand.Reader, leafTemplate, caTemplate, &leafKey.PublicKey, caKey)
++	if err != nil {
++		return "", nil, nil, err
++	}
++
++	caPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caDER})
++	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: leafDER})
++	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(leafKey)})
++
++	certPath := filepath.Join(os.TempDir(), fmt.Sprintf("fixture-fake-drive-ca-%d.pem", os.Getpid()))
++	if err := os.WriteFile(certPath, caPEM, 0600); err != nil {
++		return "", nil, nil, err
++	}
++
++	return certPath, certPEM, keyPEM, nil
++}
+diff --git a/usercase-test-coderl/usecase.sh b/usercase-test-coderl/usecase.sh
+new file mode 100755
+--- /dev/null
++++ b/usercase-test-coderl/usecase.sh
+@@ -0,0 +1,104 @@
++#!/usr/bin/env bash
++
++set -u
++export LANG=C.UTF-8 LC_ALL=C.UTF-8 TZ=UTC
++
++export GO111MODULE=off GOPATH=/root/go GOPROXY=off GOSUMDB=off
++
++( cd /workspace/repo && go build -o /tmp/gdrive-fixture-coderl . ) \
++    || { echo "FAIL: build gdrive" >&2; exit 1; }
++
++mkdir -p /tmp/gdrive-fixture-coderl-harness
++cp /workspace/repo/usercase-test-coderl/fixtures/sync_ignore_harness.go /tmp/gdrive-fixture-coderl-harness/main.go
++( cd /tmp/gdrive-fixture-coderl-harness && go build -o /tmp/sync-ignore-harness-coderl . ) \
++    || { echo "FAIL: build sync ignore harness" >&2; exit 1; }
++
++BIN=/tmp/gdrive-fixture-coderl
++HARNESS=/tmp/sync-ignore-harness-coderl
++TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
++fail() { echo "FAIL: $*" >&2; exit 1; }
++local_count() {
++    sed -n 's/^Found \([0-9][0-9]*\) local files.*/\1/p' "$1" | head -n 1
++}
++
++make_tree() {
++    root="$1"
++    mkdir -p "$root/build" "$root/src" "$root/docs" "$root/nested"
++    printf 'binary\n' > "$root/build/app.bin"
++    printf 'log\n' > "$root/debug.log"
++    printf 'package main\n' > "$root/src/main.go"
++    printf 'notes\n' > "$root/docs/notes.txt"
++    printf 'secret\n' > "$root/nested/secret.tmp"
++    printf '*.tmp\n' > "$root/nested/.gdriveignore"
++}
++
++
++
++
++"$BIN" help sync upload >"$TMP/help.out" 2>"$TMP/help.err"; ec=$?
++[ "$ec" -eq 0 ] || fail "F_help exit $ec; want 0"
++
++grep -q -- '--dry-run' "$TMP/help.out" || fail "F_help stdout missing --dry-run"
++
++
++
++
++LOCAL="$TMP/upload-no-ignore/local-dir"
++make_tree "$LOCAL"
++"$HARNESS" upload_no_ignore "$BIN" --access-token fake sync upload --dry-run --no-progress "$LOCAL" root >"$TMP/f1.out" 2>"$TMP/f1.err"; ec=$?
++[ "$ec" -eq 0 ] || fail "F1 exit $ec; want 0"
++
++F1_COUNT=$(local_count "$TMP/f1.out")
++[ -n "$F1_COUNT" ] || fail "F1 missing local count: $(cat "$TMP/f1.out")"
++grep -q 'Uploading nested/secret\.tmp' "$TMP/f1.out" || fail "F1 nested .gdriveignore affected planning"
++
++
++
++
++LOCAL="$TMP/upload-root-ignore/local-dir"
++make_tree "$LOCAL"
++printf 'build/\n*.log\n' > "$LOCAL/.gdriveignore"
++"$HARNESS" upload_root_ignore "$BIN" --access-token fake sync upload --dry-run --no-progress "$LOCAL" root >"$TMP/f2.out" 2>"$TMP/f2.err"; ec=$?
++[ "$ec" -eq 0 ] || fail "F2 exit $ec; want 0"
++
++F2_COUNT=$(local_count "$TMP/f2.out")
++[ -n "$F2_COUNT" ] || fail "F2 missing local count: $(cat "$TMP/f2.out")"
++
++[ "$F2_COUNT" -lt "$F1_COUNT" ] || fail "F2 ignored paths counted as local files"
++! grep -qE 'Uploading .*build/app\.bin|Uploading .*debug\.log|Creating directory .*build|Updating .*build/app\.bin|Updating .*debug\.log' "$TMP/f2.out" \
++    || fail "F2 ignored path appeared in upload action lines"
++grep -q 'nested/secret.tmp' "$TMP/f2.out" || fail "F2 subdirectory .gdriveignore affected planning"
++
++
++
++
++LOCAL="$TMP/download-root-ignore/local-dir"
++make_tree "$LOCAL"
++printf 'build/\n*.log\n' > "$LOCAL/.gdriveignore"
++"$HARNESS" download_root_ignore "$BIN" --access-token fake sync download --dry-run --delete-extraneous --keep-remote --no-progress root "$LOCAL" >"$TMP/f3.out" 2>"$TMP/f3.err"; ec=$?
++[ "$ec" -eq 0 ] || fail "F3 exit $ec; want 0"
++
++F3_COUNT=$(local_count "$TMP/f3.out")
++[ -n "$F3_COUNT" ] || fail "F3 missing local count: $(cat "$TMP/f3.out")"
++
++[ "$F3_COUNT" -lt "$F1_COUNT" ] || fail "F3 ignored paths counted in download comparison"
++
++! grep -qE 'Deleting .*build/app\.bin|Deleting .*debug\.log|Conflict detected' "$TMP/f3.out" \
++    || fail "F3 ignored local path became conflict or extraneous action"
++grep -q 'nested/secret.tmp' "$TMP/f3.out" || fail "F3 subdirectory .gdriveignore affected download planning"
++
++
++
++
++LOCAL="$TMP/upload-bad-ignore/local-dir"
++make_tree "$LOCAL"
++rm -f "$LOCAL/.gdriveignore"
++mkdir "$LOCAL/.gdriveignore"
++"$HARNESS" upload_root_ignore "$BIN" --access-token fake sync upload --dry-run --no-progress "$LOCAL" root >"$TMP/f4.out" 2>"$TMP/f4.err"; ec=$?
++[ "$ec" -ne 0 ] || fail "F4 exit $ec; want non-zero"
++cat "$TMP/f4.out" "$TMP/f4.err" > "$TMP/f4.combined"
++
++grep -q '^Failed to prepare ignorer:' "$TMP/f4.combined" || fail "F4 output missing prefix: $(cat "$TMP/f4.combined")"
++
++echo "PASS"
++exit 0
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,12 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++exec bash /workspace/repo/usercase-test-coderl/usecase.sh

@@ -1,0 +1,872 @@
+diff --git a/usercase-test-coderl/test_socks4_proxy.c b/usercase-test-coderl/test_socks4_proxy.c
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/test_socks4_proxy.c
+@@ -0,0 +1,819 @@
++
++
++
++
++
++
++
++
++
++#include "putty.h"
++#include "network.h"
++#include "unix/platform.h"
++
++#include <arpa/inet.h>
++#include <ctype.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <netinet/in.h>
++#include <pthread.h>
++#include <stdarg.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/select.h>
++#include <sys/socket.h>
++#include <sys/time.h>
++#include <unistd.h>
++
++#define ARRAY_LEN(x) (sizeof(x) / sizeof((x)[0]))
++
++static int failures = 0;
++static bool missing_socks4_proxy_impl = false;
++
++static void failf(const char *fmt, ...)
++{
++    va_list ap;
++    failures++;
++    fprintf(stderr, "FAIL: ");
++    va_start(ap, fmt);
++    vfprintf(stderr, fmt, ap);
++    va_end(ap);
++    fputc('\n', stderr);
++}
++
++static void expect_int(const char *label, int actual, int expected)
++{
++    if (actual != expected)
++        failf("%s: got %d expected %d", label, actual, expected);
++}
++
++static void expect_size(const char *label, size_t actual, size_t expected)
++{
++    if (actual != expected)
++        failf("%s: got %zu expected %zu", label, actual, expected);
++}
++
++static void expect_str(const char *label, const char *actual,
++                       const char *expected)
++{
++    if (!actual || strcmp(actual, expected))
++        failf("%s: got %s expected %s", label,
++              actual ? actual : "(null)", expected);
++}
++
++static void expect_null(const char *label, const char *actual)
++{
++    if (actual)
++        failf("%s: got %s expected (null)", label, actual);
++}
++
++static bool contains_ci(const char *haystack, const char *needle)
++{
++    size_t needle_len = strlen(needle);
++    if (needle_len == 0)
++        return true;
++
++    for (const char *p = haystack; *p; p++) {
++        size_t i;
++        for (i = 0; i < needle_len; i++) {
++            if (!p[i])
++                return false;
++            if (tolower((unsigned char)p[i]) !=
++                tolower((unsigned char)needle[i]))
++                break;
++        }
++        if (i == needle_len)
++            return true;
++    }
++
++    return false;
++}
++
++static void expect_str_contains_ci(const char *label, const char *actual,
++                                   const char *needle)
++{
++    if (!actual || !contains_ci(actual, needle))
++        failf("%s: got %s expected substring %s", label,
++              actual ? actual : "(null)", needle);
++}
++
++static void expect_int_at_least(const char *label, int actual, int minimum)
++{
++    if (actual < minimum)
++        failf("%s: got %d expected at least %d", label, actual, minimum);
++}
++
++static void expect_bytes(const char *label, const unsigned char *actual,
++                         const unsigned char *expected, size_t len)
++{
++    if (memcmp(actual, expected, len)) {
++        fprintf(stderr, "FAIL: %s bytes differed\n  got:     ", label);
++        for (size_t i = 0; i < len; i++)
++            fprintf(stderr, "%02x%s", actual[i], i + 1 == len ? "" : " ");
++        fprintf(stderr, "\n  expected:");
++        for (size_t i = 0; i < len; i++)
++            fprintf(stderr, " %02x", expected[i]);
++        fprintf(stderr, "\n");
++        failures++;
++    }
++}
++
++void modalfatalbox(const char *fmt, ...)
++{
++    va_list ap;
++    fprintf(stderr, "FATAL: ");
++    va_start(ap, fmt);
++    vfprintf(stderr, fmt, ap);
++    va_end(ap);
++    fputc('\n', stderr);
++    exit(1);
++}
++
++void nonfatal(const char *fmt, ...)
++{
++}
++
++void timer_change_notify(unsigned long next)
++{
++}
++
++const bool buildinfo_gtk_relevant = false;
++const bool share_can_be_upstream = false;
++const bool share_can_be_downstream = false;
++const char *const appname = "usercase_socks4_proxy";
++const int be_default_protocol = PROT_RAW;
++const struct BackendVtable *const backends[] = { NULL };
++const size_t n_ui_backends = 0;
++
++char *platform_default_s(const char *name) { return NULL; }
++bool platform_default_b(const char *name, bool def) { return def; }
++int platform_default_i(const char *name, int def) { return def; }
++void old_keyfile_warning(void) {}
++bool have_ssh_host_key(const char *hostname, int port, const char *keytype)
++{ return false; }
++int check_stored_host_key(const char *hostname, int port, const char *keytype,
++                          const char *key)
++{ return 1; }
++void store_host_key(Seat *seat, const char *hostname, int port,
++                    const char *keytype, const char *key)
++{
++}
++host_ca_enum *enum_host_ca_start(void) { return NULL; }
++bool enum_host_ca_next(host_ca_enum *handle, strbuf *out) { return false; }
++void enum_host_ca_finish(host_ca_enum *handle) {}
++host_ca *host_ca_load(const char *name) { return NULL; }
++
++typedef struct RecordingPlug {
++    Plug plug;
++    int success_count;
++    int close_count;
++    PlugCloseType last_close_type;
++    char last_close_msg[256];
++    int receive_count;
++    int sent_count;
++} RecordingPlug;
++
++static RecordingPlug *plug_from_public(Plug *plug)
++{
++    return container_of(plug, RecordingPlug, plug);
++}
++
++static void recording_log(Plug *plug, Socket *s, PlugLogType type,
++                          SockAddr *addr, int port, const char *err_msg,
++                          int err_code)
++{
++    RecordingPlug *rp = plug_from_public(plug);
++    if (type == PLUGLOG_CONNECT_SUCCESS)
++        rp->success_count++;
++}
++
++static void recording_closing(Plug *plug, PlugCloseType type,
++                              const char *error_msg)
++{
++    RecordingPlug *rp = plug_from_public(plug);
++    rp->close_count++;
++    rp->last_close_type = type;
++    snprintf(rp->last_close_msg, sizeof(rp->last_close_msg), "%s",
++             error_msg ? error_msg : "");
++}
++
++static void recording_receive(Plug *plug, int urgent, const char *data,
++                              size_t len)
++{
++    RecordingPlug *rp = plug_from_public(plug);
++    rp->receive_count++;
++}
++
++static void recording_sent(Plug *plug, size_t bufsize)
++{
++    RecordingPlug *rp = plug_from_public(plug);
++    rp->sent_count++;
++}
++
++static const PlugVtable recording_plugvt = {
++    .log = recording_log,
++    .closing = recording_closing,
++    .receive = recording_receive,
++    .sent = recording_sent,
++};
++
++static void recording_plug_init(RecordingPlug *rp)
++{
++    memset(rp, 0, sizeof(*rp));
++    rp->plug.vt = &recording_plugvt;
++    rp->last_close_type = PLUGCLOSE_NORMAL;
++}
++
++typedef struct FakeSocksServer {
++    int listen_fd;
++    int port;
++    pthread_t thread;
++    size_t expected_len;
++    unsigned char received[512];
++    size_t received_len;
++    unsigned char reply[8];
++    size_t reply_len;
++    bool hold_until_client_close;
++    bool done;
++    int error_code;
++} FakeSocksServer;
++
++static void *fake_server_thread(void *vctx)
++{
++    FakeSocksServer *srv = (FakeSocksServer *)vctx;
++    int client = accept(srv->listen_fd, NULL, NULL);
++    if (client < 0) {
++        srv->error_code = errno;
++        close(srv->listen_fd);
++        srv->done = true;
++        return NULL;
++    }
++
++    close(srv->listen_fd);
++    srv->listen_fd = -1;
++
++    while (srv->received_len < srv->expected_len) {
++        ssize_t ret = recv(client, srv->received + srv->received_len,
++                           srv->expected_len - srv->received_len, 0);
++        if (ret <= 0) {
++            srv->error_code = ret == 0 ? ECONNRESET : errno;
++            close(client);
++            srv->done = true;
++            return NULL;
++        }
++        srv->received_len += (size_t)ret;
++    }
++
++    if (srv->reply_len) {
++        ssize_t ret = send(client, srv->reply, srv->reply_len, MSG_NOSIGNAL);
++        if (ret != (ssize_t)srv->reply_len)
++            srv->error_code = ret < 0 ? errno : EIO;
++    }
++
++    if (srv->hold_until_client_close) {
++        char discard[256];
++        while (recv(client, discard, sizeof(discard), 0) > 0) {
++        }
++    }
++
++    close(client);
++    srv->done = true;
++    return NULL;
++}
++
++static void start_server(FakeSocksServer *srv, const unsigned char reply[8],
++                         size_t expected_len,
++                         bool hold_until_client_close)
++{
++    struct sockaddr_in sin;
++    socklen_t sinlen = sizeof(sin);
++
++    memset(srv, 0, sizeof(*srv));
++    srv->listen_fd = socket(AF_INET, SOCK_STREAM, 0);
++    if (srv->listen_fd < 0)
++        modalfatalbox("socket: %s", strerror(errno));
++
++    int one = 1;
++    setsockopt(srv->listen_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
++
++    memset(&sin, 0, sizeof(sin));
++    sin.sin_family = AF_INET;
++    sin.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
++    sin.sin_port = htons(0);
++    if (bind(srv->listen_fd, (struct sockaddr *)&sin, sizeof(sin)) < 0)
++        modalfatalbox("bind: %s", strerror(errno));
++    if (listen(srv->listen_fd, 4) < 0)
++        modalfatalbox("listen: %s", strerror(errno));
++    if (getsockname(srv->listen_fd, (struct sockaddr *)&sin, &sinlen) < 0)
++        modalfatalbox("getsockname: %s", strerror(errno));
++
++    srv->port = ntohs(sin.sin_port);
++    srv->expected_len = expected_len;
++    if (reply) {
++        memcpy(srv->reply, reply, 8);
++        srv->reply_len = 8;
++    }
++    srv->hold_until_client_close = hold_until_client_close;
++
++    if (pthread_create(&srv->thread, NULL, fake_server_thread, srv) != 0)
++        modalfatalbox("pthread_create failed");
++}
++
++static void stop_server(FakeSocksServer *srv)
++{
++    if (!srv->done && srv->listen_fd >= 0) {
++
++
++
++
++
++        int wake_fd = socket(AF_INET, SOCK_STREAM, 0);
++        if (wake_fd >= 0) {
++            struct sockaddr_in sin;
++            memset(&sin, 0, sizeof(sin));
++            sin.sin_family = AF_INET;
++            sin.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
++            sin.sin_port = htons(srv->port);
++            connect(wake_fd, (struct sockaddr *)&sin, sizeof(sin));
++            close(wake_fd);
++        }
++    }
++
++    pthread_join(srv->thread, NULL);
++    if (srv->listen_fd >= 0)
++        close(srv->listen_fd);
++    if (missing_socks4_proxy_impl && srv->error_code == ECONNRESET)
++        srv->error_code = 0;
++    expect_int("fake server error_code", srv->error_code, 0);
++    expect_int("fake server done", srv->done ? 1 : 0, 1);
++}
++
++static void close_socket_if_constructed(Socket *sock)
++{
++
++
++
++
++
++
++
++    const char *err = sk_socket_error(sock);
++    if (err && !strcmp(err, "Proxy error: Unknown proxy method"))
++        missing_socks4_proxy_impl = true;
++    else
++        sk_close(sock);
++}
++
++static Conf *proxy_conf(int proxy_port, int proxy_dns, const char *username)
++{
++    Conf *conf = conf_new();
++    conf_set_int(conf, CONF_proxy_type, PROXY_SOCKS4);
++    conf_set_int(conf, CONF_proxy_dns, proxy_dns);
++    conf_set_str(conf, CONF_proxy_host, "127.0.0.1");
++    conf_set_int(conf, CONF_proxy_port, proxy_port);
++    conf_set_str(conf, CONF_proxy_username, username);
++    conf_set_str(conf, CONF_proxy_password, "");
++    conf_set_str(conf, CONF_proxy_exclude_list, "");
++    conf_set_bool(conf, CONF_even_proxy_localhost, true);
++    conf_set_int(conf, CONF_addressfamily, ADDRTYPE_IPV4);
++    return conf;
++}
++
++static unsigned long now_ms(void)
++{
++    struct timeval tv;
++    gettimeofday(&tv, NULL);
++    return (unsigned long)tv.tv_sec * 1000 + (unsigned long)tv.tv_usec / 1000;
++}
++
++static void pump_events_until(bool (*done)(void *), void *ctx,
++                              unsigned long timeout_ms)
++{
++    unsigned long deadline = now_ms() + timeout_ms;
++
++    while (!done(ctx) && now_ms() < deadline) {
++        int fdstate, rwx, maxfd = -1;
++        int fds[256], states[256], nfds = 0;
++        fd_set rfds, wfds, xfds;
++        struct timeval tv;
++
++        while (run_toplevel_callbacks()) {
++        }
++
++        FD_ZERO(&rfds);
++        FD_ZERO(&wfds);
++        FD_ZERO(&xfds);
++        for (int fd = first_fd(&fdstate, &rwx); fd >= 0;
++             fd = next_fd(&fdstate, &rwx)) {
++            if (nfds < (int)ARRAY_LEN(fds)) {
++                fds[nfds] = fd;
++                states[nfds] = rwx;
++                nfds++;
++            }
++            if (rwx & SELECT_R)
++                FD_SET(fd, &rfds);
++            if (rwx & SELECT_W)
++                FD_SET(fd, &wfds);
++            if (rwx & SELECT_X)
++                FD_SET(fd, &xfds);
++            if (fd > maxfd)
++                maxfd = fd;
++        }
++
++        tv.tv_sec = 0;
++        tv.tv_usec = 10000;
++
++        int ret = maxfd >= 0 ?
++            select(maxfd + 1, &rfds, &wfds, &xfds, &tv) : 0;
++        if (ret < 0) {
++            if (errno == EINTR)
++                continue;
++            modalfatalbox("select: %s", strerror(errno));
++        }
++
++        for (int i = 0; i < nfds; i++) {
++            int fd = fds[i];
++            if ((states[i] & SELECT_X) && FD_ISSET(fd, &xfds))
++                select_result(fd, SELECT_X);
++            if ((states[i] & SELECT_R) && FD_ISSET(fd, &rfds))
++                select_result(fd, SELECT_R);
++            if ((states[i] & SELECT_W) && FD_ISSET(fd, &wfds))
++                select_result(fd, SELECT_W);
++        }
++    }
++
++    while (run_toplevel_callbacks()) {
++    }
++
++    if (!done(ctx))
++        failf("timed out waiting for socket session");
++}
++
++typedef struct WaitCtx {
++    RecordingPlug *plug;
++    FakeSocksServer *server;
++    int want_successes;
++    int want_closes;
++} WaitCtx;
++
++static bool wait_done(void *vctx)
++{
++    WaitCtx *ctx = (WaitCtx *)vctx;
++    if (missing_socks4_proxy_impl)
++        return true;
++    return ctx->plug->success_count >= ctx->want_successes &&
++        ctx->plug->close_count >= ctx->want_closes &&
++        (!ctx->server || ctx->server->received_len >= ctx->server->expected_len);
++}
++
++static Socket *connect_via_socks4(FakeSocksServer *srv, Conf *conf,
++                                  const char *host, int port,
++                                  int addressfamily, RecordingPlug *plug,
++                                  char *addrbuf, size_t addrbuflen,
++                                  int *addrtype_out)
++{
++    char *canonical = NULL;
++    SockAddr *addr = name_lookup(host, port, &canonical, conf, addressfamily,
++                                 NULL, "usercase");
++    if (addrbuf)
++        sk_getaddr(addr, addrbuf, addrbuflen);
++    if (addrtype_out)
++        *addrtype_out = sk_addrtype(addr);
++    sfree(canonical);
++    Socket *sock = new_connection(addr, host, port, false, false, false, false,
++                                  &plug->plug, conf, NULL);
++    const char *err = sk_socket_error(sock);
++    if (err && !strcmp(err, "Proxy error: Unknown proxy method"))
++        missing_socks4_proxy_impl = true;
++    return sock;
++}
++
++static void test_ipv4_request_and_success(void)
++{
++
++
++
++
++    const unsigned char reply[8] = { 0, 90, 0, 0, 0, 0, 0, 0 };
++    const unsigned char expected[14] = {
++        0x04, 0x01, 0x00, 0x16, 0xc0, 0x00, 0x02, 0x0a,
++        0x61, 0x6c, 0x69, 0x63, 0x65, 0x00
++    };
++    FakeSocksServer srv;
++    start_server(&srv, reply, 14, true);
++    RecordingPlug plug;
++    recording_plug_init(&plug);
++    Conf *conf = proxy_conf(srv.port, AUTO, "alice");
++    char addrbuf[64];
++    int addrtype = 0;
++
++    Socket *sock = connect_via_socks4(&srv, conf, "192.0.2.10", 22,
++                                      ADDRTYPE_IPV4, &plug,
++                                      addrbuf, sizeof(addrbuf), &addrtype);
++    expect_null("socket_error fresh IPv4", sk_socket_error(sock));
++
++    WaitCtx wait = { &plug, &srv, 1, 0 };
++    pump_events_until(wait_done, &wait, 3000);
++
++    expect_int("IPv4 lookup address type", addrtype, ADDRTYPE_IPV4);
++    expect_str("IPv4 lookup address", addrbuf, "192.0.2.10");
++    expect_size("IPv4 request length", srv.received_len, 14);
++    expect_bytes("IPv4 request", srv.received, expected, 14);
++
++    expect_int_at_least("success count after SOCKS4 success reply",
++                        plug.success_count, 1);
++    expect_int("close count before cleanup", plug.close_count, 0);
++
++    close_socket_if_constructed(sock);
++    stop_server(&srv);
++    conf_free(conf);
++}
++
++static void test_auto_dns_resolves_hostname_locally(void)
++{
++
++
++
++
++    const unsigned char reply[8] = { 0, 90, 0, 0, 0, 0, 0, 0 };
++    const unsigned char expected[14] = {
++        0x04, 0x01, 0x00, 0x50, 0x7f, 0x00, 0x00, 0x01,
++        0x61, 0x6c, 0x69, 0x63, 0x65, 0x00
++    };
++    FakeSocksServer srv;
++    start_server(&srv, reply, 14, true);
++    RecordingPlug plug;
++    recording_plug_init(&plug);
++    Conf *conf = proxy_conf(srv.port, AUTO, "alice");
++    char addrbuf[64];
++    int addrtype = 0;
++
++    Socket *sock = connect_via_socks4(&srv, conf, "localhost", 80,
++                                      ADDRTYPE_IPV4, &plug,
++                                      addrbuf, sizeof(addrbuf), &addrtype);
++
++    WaitCtx wait = { &plug, &srv, 1, 0 };
++    pump_events_until(wait_done, &wait, 3000);
++
++    expect_int("AUTO DNS localhost address type", addrtype, ADDRTYPE_IPV4);
++    expect_str("AUTO DNS localhost address", addrbuf, "127.0.0.1");
++    expect_size("AUTO DNS request length", srv.received_len, 14);
++    expect_bytes("AUTO DNS request", srv.received, expected, 14);
++
++    expect_int_at_least("AUTO DNS success count", plug.success_count, 1);
++
++    close_socket_if_constructed(sock);
++    stop_server(&srv);
++    conf_free(conf);
++}
++
++static void test_forced_dns_uses_socks4a_hostname_field(void)
++{
++
++
++
++
++    const unsigned char reply[8] = { 0, 90, 0, 0, 0, 0, 0, 0 };
++    const unsigned char expected[29] = {
++        0x04, 0x01, 0x01, 0xbb, 0x00, 0x00, 0x00, 0x01,
++        0x61, 0x6c, 0x69, 0x63, 0x65, 0x00,
++        0x74, 0x61, 0x72, 0x67, 0x65, 0x74, 0x2e, 0x65,
++        0x78, 0x61, 0x6d, 0x70, 0x6c, 0x65, 0x00
++    };
++    FakeSocksServer srv;
++    start_server(&srv, reply, 29, true);
++    RecordingPlug plug;
++    recording_plug_init(&plug);
++    Conf *conf = proxy_conf(srv.port, FORCE_ON, "alice");
++    char addrbuf[64];
++    int addrtype = 0;
++
++    Socket *sock = connect_via_socks4(&srv, conf, "target.example", 443,
++                                      ADDRTYPE_UNSPEC, &plug,
++                                      addrbuf, sizeof(addrbuf), &addrtype);
++
++    WaitCtx wait = { &plug, &srv, 1, 0 };
++    pump_events_until(wait_done, &wait, 3000);
++
++    expect_int("FORCE_ON DNS address type", addrtype, ADDRTYPE_NAME);
++    expect_str("FORCE_ON DNS unresolved address", addrbuf, "target.example");
++    expect_size("SOCKS4A request length", srv.received_len, 29);
++    expect_bytes("SOCKS4A request", srv.received, expected, 29);
++
++    expect_int_at_least("SOCKS4A success count", plug.success_count, 1);
++
++    close_socket_if_constructed(sock);
++    stop_server(&srv);
++    conf_free(conf);
++}
++
++static void run_error_reply_fixture(unsigned char version, unsigned char status,
++                                    const char *label, const char *needle1,
++                                    const char *needle2, const char *needle3)
++{
++    const unsigned char expected_request[14] = {
++        0x04, 0x01, 0x00, 0x16, 0xc0, 0x00, 0x02, 0x0a,
++        0x61, 0x6c, 0x69, 0x63, 0x65, 0x00
++    };
++    unsigned char reply[8] = { version, status, 0, 0, 0, 0, 0, 0 };
++    FakeSocksServer srv;
++    start_server(&srv, reply, 14, false);
++    RecordingPlug plug;
++    recording_plug_init(&plug);
++    Conf *conf = proxy_conf(srv.port, AUTO, "alice");
++
++    Socket *sock = connect_via_socks4(&srv, conf, "192.0.2.10", 22,
++                                      ADDRTYPE_IPV4, &plug,
++                                      NULL, 0, NULL);
++
++    WaitCtx wait = { &plug, &srv, 0, 1 };
++    pump_events_until(wait_done, &wait, 3000);
++
++    expect_size("error request length", srv.received_len, 14);
++    expect_bytes("error request", srv.received, expected_request, 14);
++
++    expect_int("error close count", plug.close_count, 1);
++    expect_int("error close type", plug.last_close_type, PLUGCLOSE_ERROR);
++
++    expect_str_contains_ci(label, plug.last_close_msg, needle1);
++    if (needle2)
++        expect_str_contains_ci(label, plug.last_close_msg, needle2);
++    if (needle3)
++        expect_str_contains_ci(label, plug.last_close_msg, needle3);
++
++    close_socket_if_constructed(sock);
++    stop_server(&srv);
++    conf_free(conf);
++}
++
++static void test_bad_reply_errors_are_specific(void)
++{
++
++
++
++
++    run_error_reply_fixture(
++        1, 90, "nonzero reply version error message",
++        "SOCKS", "version", "1");
++    run_error_reply_fixture(
++        0, 91, "status 91 error message",
++        "failure", "connect", NULL);
++    run_error_reply_fixture(
++        0, 92, "status 92 error message",
++        "IDENTD", NULL, NULL);
++    run_error_reply_fixture(
++        0, 93, "status 93 error message",
++        "username", "IDENTD", "agree");
++    run_error_reply_fixture(
++        0, 94, "status 94 error message",
++        "unrecognised", "SOCKS", "94");
++}
++
++static void test_ipv6_target_is_rejected(void)
++{
++
++
++
++
++    FakeSocksServer srv;
++    start_server(&srv, NULL, 0, true);
++    RecordingPlug plug;
++    recording_plug_init(&plug);
++    Conf *conf = proxy_conf(srv.port, AUTO, "alice");
++    char addrbuf[64];
++    int addrtype = 0;
++
++    Socket *sock = connect_via_socks4(&srv, conf, "::1", 22,
++                                      ADDRTYPE_IPV6, &plug,
++                                      addrbuf, sizeof(addrbuf), &addrtype);
++
++    WaitCtx wait = { &plug, &srv, 1, 1 };
++    pump_events_until(wait_done, &wait, 3000);
++
++    expect_int("IPv6 lookup address type", addrtype, ADDRTYPE_IPV6);
++    expect_str("IPv6 lookup address", addrbuf, "::1");
++    expect_size("IPv6 sent request bytes", srv.received_len, 0);
++    expect_int("IPv6 close count", plug.close_count, 1);
++    expect_int("IPv6 close type", plug.last_close_type, PLUGCLOSE_ERROR);
++
++    expect_str_contains_ci("IPv6 close message", plug.last_close_msg,
++                           "SOCKS version 4 does not support IPv6");
++
++    close_socket_if_constructed(sock);
++    stop_server(&srv);
++    conf_free(conf);
++}
++
++static void test_two_instances_keep_independent_negotiation_state(void)
++{
++
++
++
++
++    const unsigned char reply[8] = { 0, 90, 0, 0, 0, 0, 0, 0 };
++    const unsigned char expected_a[12] = {
++        0x04, 0x01, 0x00, 0x16, 0xc0, 0x00, 0x02, 0x0a,
++        0x61, 0x6e, 0x6e, 0x00
++    };
++    const unsigned char expected_b[12] = {
++        0x04, 0x01, 0x08, 0xae, 0xc6, 0x33, 0x64, 0x07,
++        0x62, 0x6f, 0x62, 0x00
++    };
++    FakeSocksServer srv_a, srv_b;
++    start_server(&srv_a, reply, 12, true);
++    start_server(&srv_b, reply, 12, true);
++    RecordingPlug plug_a, plug_b;
++    recording_plug_init(&plug_a);
++    recording_plug_init(&plug_b);
++    Conf *conf_a = proxy_conf(srv_a.port, AUTO, "ann");
++    Conf *conf_b = proxy_conf(srv_b.port, AUTO, "bob");
++
++    Socket *sock_a = connect_via_socks4(&srv_a, conf_a, "192.0.2.10", 22,
++                                        ADDRTYPE_IPV4, &plug_a,
++                                        NULL, 0, NULL);
++    Socket *sock_b = connect_via_socks4(&srv_b, conf_b, "198.51.100.7", 2222,
++                                        ADDRTYPE_IPV4, &plug_b,
++                                        NULL, 0, NULL);
++
++    WaitCtx wait_a = { &plug_a, &srv_a, 1, 0 };
++    WaitCtx wait_b = { &plug_b, &srv_b, 1, 0 };
++    pump_events_until(wait_done, &wait_a, 3000);
++    pump_events_until(wait_done, &wait_b, 3000);
++
++    expect_size("instance a request length", srv_a.received_len, 12);
++    expect_bytes("instance a request", srv_a.received, expected_a, 12);
++
++    expect_int_at_least("instance a success count", plug_a.success_count, 1);
++    expect_size("instance b request length", srv_b.received_len, 12);
++    expect_bytes("instance b request", srv_b.received, expected_b, 12);
++
++    expect_int_at_least("instance b success count", plug_b.success_count, 1);
++
++    close_socket_if_constructed(sock_a);
++    close_socket_if_constructed(sock_b);
++    stop_server(&srv_a);
++    stop_server(&srv_b);
++    conf_free(conf_a);
++    conf_free(conf_b);
++}
++
++static void test_repeated_cleanup_cycles_complete(void)
++{
++
++
++
++
++    const unsigned char reply[8] = { 0, 90, 0, 0, 0, 0, 0, 0 };
++    int completed = 0;
++
++    for (int i = 0; i < 100; i++) {
++        FakeSocksServer srv;
++        start_server(&srv, reply, 14, true);
++        RecordingPlug plug;
++        recording_plug_init(&plug);
++        Conf *conf = proxy_conf(srv.port, AUTO, "alice");
++
++        Socket *sock = connect_via_socks4(&srv, conf, "192.0.2.10", 22,
++                                          ADDRTYPE_IPV4, &plug,
++                                          NULL, 0, NULL);
++        WaitCtx wait = { &plug, &srv, 1, 0 };
++        pump_events_until(wait_done, &wait, 3000);
++
++        expect_int_at_least("leak cycle success count", plug.success_count, 1);
++        close_socket_if_constructed(sock);
++        stop_server(&srv);
++        conf_free(conf);
++        completed++;
++    }
++
++
++    expect_int("repeated cleanup cycles", completed, 100);
++}
++
++int main(void)
++{
++    sk_init();
++    uxsel_init();
++
++#define RUN_TEST(fn) do { fn(); if (missing_socks4_proxy_impl) goto finish; } while (0)
++    RUN_TEST(test_ipv4_request_and_success);
++    RUN_TEST(test_auto_dns_resolves_hostname_locally);
++    RUN_TEST(test_forced_dns_uses_socks4a_hostname_field);
++    RUN_TEST(test_bad_reply_errors_are_specific);
++    RUN_TEST(test_ipv6_target_is_rejected);
++    RUN_TEST(test_two_instances_keep_independent_negotiation_state);
++    RUN_TEST(test_repeated_cleanup_cycles_complete);
++#undef RUN_TEST
++
++finish:
++    sk_cleanup();
++
++    if (failures) {
++        fprintf(stderr, "%d assertion(s) failed\n", failures);
++        return 1;
++    }
++
++    printf("SOCKS4 proxy acceptance tests passed\n");
++    return 0;
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,43 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++
++cd /workspace/repo
++
++BUILD_DIR=/workspace/repo/usercase-test-coderl/build
++TEST_EXE=/workspace/repo/usercase-test-coderl/test_socks4_proxy
++
++cmake -S /workspace/repo -B "$BUILD_DIR" \
++  -DPUTTY_GTK_VERSION=NONE \
++  -DPUTTY_GSSAPI=OFF \
++  >/dev/null
++cmake --build "$BUILD_DIR" --target network eventloop settings crypto utils -j"$(nproc)" >/dev/null
++
++cc -std=c99 -D_GNU_SOURCE -DNO_GSSAPI \
++  -I/workspace/repo \
++  -I/workspace/repo/unix \
++  -I/workspace/repo/charset \
++  -I"$BUILD_DIR" \
++  -I"$BUILD_DIR/CMakeFiles" \
++  -o "$TEST_EXE" \
++  /workspace/repo/usercase-test-coderl/test_socks4_proxy.c \
++  /workspace/repo/proxy/nosshproxy.c \
++  /workspace/repo/stubs/no-rand.c \
++  "$BUILD_DIR/libnetwork.a" \
++  "$BUILD_DIR/libeventloop.a" \
++  "$BUILD_DIR/libsettings.a" \
++  "$BUILD_DIR/libcrypto.a" \
++  "$BUILD_DIR/libutils.a" \
++  "$BUILD_DIR/charset/libcharset.a" \
++  -lpthread
++
++exec "$TEST_EXE"

@@ -1,0 +1,297 @@
+diff --git a/rules/aip0215/foreign_type_reference_behavior_test.go b/rules/aip0215/foreign_type_reference_behavior_test.go
+new file mode 100644
+index 0000000..9e3cc12
+--- /dev/null
++++ b/rules/aip0215/foreign_type_reference_behavior_test.go
+@@ -0,0 +1,270 @@
++package aip0215
++
++import (
++	"os"
++	"strings"
++	"testing"
++
++	"github.com/googleapis/api-linter/lint"
++	"github.com/googleapis/api-linter/rules/internal/testutils"
++	"github.com/jhump/protoreflect/desc"
++)
++
++const foreignTypeReferenceRuleName = "core::0215::foreign-type-reference"
++
++func registeredForeignTypeReferenceRule(t *testing.T) lint.ProtoRule {
++	t.Helper()
++
++	registry := lint.NewRuleRegistry()
++	if err := AddRules(registry); err != nil {
++		t.Fatalf("AddRules() returned error: %v", err)
++	}
++
++	rule, ok := registry[lint.RuleName(foreignTypeReferenceRuleName)]
++	if !ok {
++		t.Fatalf("AddRules() did not register %s", foreignTypeReferenceRuleName)
++	}
++	return rule
++}
++
++func lintForeignTypeReference(t *testing.T, file *desc.FileDescriptor) []lint.Problem {
++	t.Helper()
++	return registeredForeignTypeReferenceRule(t).Lint(file)
++}
++
++func parseCallingAndReference(t *testing.T, callingPkg, referencePkg, referencedMsg string) (*desc.FileDescriptor, *desc.FieldDescriptor) {
++	t.Helper()
++
++	files := testutils.ParseProto3Tmpls(t, map[string]string{
++		"calling.proto": `
++			package {{.CallingPkg}};
++			import "ref.proto";
++			message Caller {
++				{{.ReferencedMsg}} target = 1;
++			}
++		`,
++		"ref.proto": `
++			package {{.ReferencePkg}};
++			message OtherMessage {
++				string value = 1;
++			}
++		`,
++	}, map[string]string{
++		"CallingPkg":    callingPkg,
++		"ReferencePkg":  referencePkg,
++		"ReferencedMsg": referencedMsg,
++	})
++
++	file := files["calling.proto"]
++	return file, file.GetMessageTypes()[0].GetFields()[0]
++}
++
++func assertNoProblems(t *testing.T, problems []lint.Problem) {
++	t.Helper()
++	if len(problems) != 0 {
++		t.Fatalf("got %d problem(s), want none: %#v", len(problems), problems)
++	}
++}
++
++func assertOneProblemForField(t *testing.T, problems []lint.Problem, field *desc.FieldDescriptor) {
++	t.Helper()
++	if len(problems) != 1 {
++		t.Fatalf("got %d problem(s), want one: %#v", len(problems), problems)
++	}
++	if problems[0].Descriptor != field {
++		t.Fatalf("problem descriptor = %v, want offending field %v", problems[0].Descriptor, field)
++	}
++}
++
++func TestForeignTypeReference_FlagsForeignMessagePackage(t *testing.T) {
++	file, field := parseCallingAndReference(
++		t,
++		"foo.bar",
++		"other.api",
++		"other.api.OtherMessage",
++	)
++
++	assertOneProblemForField(
++		t,
++		lintForeignTypeReference(t, file),
++		field,
++	)
++}
++
++func TestForeignTypeReference_FlagsUnversionedSiblingSubpackage(t *testing.T) {
++	file, field := parseCallingAndReference(
++		t,
++		"foo.bar",
++		"foo.bar.sub",
++		"foo.bar.sub.OtherMessage",
++	)
++
++	assertOneProblemForField(
++		t,
++		lintForeignTypeReference(t, file),
++		field,
++	)
++}
++
++func TestForeignTypeReference_AllowsSamePackage(t *testing.T) {
++	file, _ := parseCallingAndReference(
++		t,
++		"same.pkg",
++		"same.pkg",
++		"same.pkg.OtherMessage",
++	)
++
++	assertNoProblems(
++		t,
++		lintForeignTypeReference(t, file),
++	)
++}
++
++func TestForeignTypeReference_AllowsVersionedSiblingSubpackages(t *testing.T) {
++	file, _ := parseCallingAndReference(
++		t,
++		"example.v2.orders",
++		"example.v2.customers",
++		"example.v2.customers.OtherMessage",
++	)
++
++	assertNoProblems(
++		t,
++		lintForeignTypeReference(t, file),
++	)
++}
++
++func TestForeignTypeReference_AllowsComplexVersionedSiblingSubpackages(t *testing.T) {
++	file, _ := parseCallingAndReference(
++		t,
++		"library.v1p1beta1.catalog",
++		"library.v1p1beta1.inventory.records",
++		"library.v1p1beta1.inventory.records.OtherMessage",
++	)
++
++	assertNoProblems(
++		t,
++		lintForeignTypeReference(t, file),
++	)
++}
++
++func TestForeignTypeReference_AllowsCommonGooglePackages(t *testing.T) {
++	for _, tc := range []struct {
++		name          string
++		referencePkg  string
++		referencedMsg string
++	}{
++		{
++			name:          "google api",
++			referencePkg:  "google.api",
++			referencedMsg: "google.api.OtherMessage",
++		},
++		{
++			name:          "google protobuf",
++			referencePkg:  "google.protobuf",
++			referencedMsg: "google.protobuf.OtherMessage",
++		},
++		{
++			name:          "google rpc",
++			referencePkg:  "google.rpc",
++			referencedMsg: "google.rpc.OtherMessage",
++		},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			file, _ := parseCallingAndReference(
++				t,
++				"ordinary.api",
++				tc.referencePkg,
++				tc.referencedMsg,
++			)
++
++			assertNoProblems(
++				t,
++				lintForeignTypeReference(t, file),
++			)
++		})
++	}
++}
++
++func TestForeignTypeReference_AllowsAIPComponentTypePackage(t *testing.T) {
++	for _, tc := range []struct {
++		name          string
++		referencePkg  string
++		referencedMsg string
++	}{
++		{
++			name:          "same product component types",
++			referencePkg:  "library.type",
++			referencedMsg: "library.type.OtherMessage",
++		},
++		{
++			name:          "different product component types",
++			referencePkg:  "payments.accounts.type",
++			referencedMsg: "payments.accounts.type.OtherMessage",
++		},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			file, _ := parseCallingAndReference(
++				t,
++				"ordinary.api",
++				tc.referencePkg,
++				tc.referencedMsg,
++			)
++
++			assertNoProblems(
++				t,
++				lintForeignTypeReference(t, file),
++			)
++		})
++	}
++}
++
++func TestForeignTypeReference_IgnoresNonMessageFields(t *testing.T) {
++	files := testutils.ParseProto3Tmpls(t, map[string]string{
++		"calling.proto": `
++			package ordinary.api;
++			message Caller {
++				enum Kind {
++					KIND_UNSPECIFIED = 0;
++				}
++				string name = 1;
++				int32 count = 2;
++				Kind kind = 3;
++			}
++		`,
++	}, nil)
++
++	assertNoProblems(
++		t,
++		lintForeignTypeReference(t, files["calling.proto"]),
++	)
++}
++
++func TestForeignTypeReference_DocumentationExists(t *testing.T) {
++	content, err := os.ReadFile("../../docs/rules/0215/foreign-type-reference.md")
++	if err != nil {
++		t.Fatalf("ReadFile() returned error: %v", err)
++	}
++
++	doc := string(content)
++	lines := strings.Split(doc, "\n")
++	hasRuleName := false
++	hasPermalink := false
++	for _, line := range lines {
++		switch strings.TrimSpace(line) {
++		case "name: [core, '0215', foreign-type-reference]":
++			hasRuleName = true
++		case "permalink: /215/foreign-type-reference":
++			hasPermalink = true
++		}
++	}
++	if !hasRuleName || !hasPermalink {
++		t.Fatalf("documentation front matter does not identify the foreign-type-reference rule")
++	}
++	if got := strings.Count(doc, "```proto"); got < 2 {
++		t.Fatalf("documentation has %d proto example block(s), want accepted and rejected examples", got)
++	}
++	if !strings.Contains(strings.ToLower(doc), "disable") {
++		t.Fatalf("documentation does not show how to disable the rule")
++	}
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,16 @@
++#!/bin/bash
++set -uo pipefail
++cd /testbed
++
++case "${1:-}" in
++  base)
++    go test ./rules/aip0215/ -run 'Test(AddRules|VersionedPackages)$' -v
++    ;;
++  new)
++    go test ./rules/aip0215/ -run '^TestForeignTypeReference_' -v
++    ;;
++  *)
++    echo "usage: $0 base|new"
++    exit 2
++    ;;
++esac

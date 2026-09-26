@@ -1,0 +1,212 @@
+diff --git a/tests/unit/engines/rag/test_provenance_normalization.py b/tests/unit/engines/rag/test_provenance_normalization.py
+new file mode 100644
+index 00000000..036db7f7
+--- /dev/null
++++ b/tests/unit/engines/rag/test_provenance_normalization.py
+@@ -0,0 +1,196 @@
++from collections.abc import Sequence
++
++import pytest
++from attrs import define, field
++
++from griptape.artifacts import BaseArtifact, ListArtifact, TextArtifact
++from griptape.chunkers import MarkdownChunker, TextChunker
++from griptape.common import Reference
++from griptape.drivers import LocalVectorStoreDriver
++from griptape.engines.rag import RagContext
++from griptape.engines.rag.modules import (
++    BaseRagModule,
++    BaseRetrievalRagModule,
++    FootnotePromptResponseRagModule,
++    TextLoaderRetrievalRagModule,
++)
++from griptape.engines.rag.stages import RetrievalRagStage
++from tests.mocks.mock_embedding_driver import MockEmbeddingDriver
++from tests.mocks.mock_tokenizer import MockTokenizer
++
++
++@define(kw_only=True)
++class _FixedRetrievalModule(BaseRetrievalRagModule):
++    artifacts: list[BaseArtifact] = field()
++
++    def run(self, context: RagContext) -> Sequence[BaseArtifact]:
++        return self.artifacts
++
++
++@define(kw_only=True)
++class _FixedRerankModule(BaseRagModule):
++    artifacts: list[BaseArtifact] = field()
++
++    def run(self, context: RagContext) -> Sequence[BaseArtifact]:
++        return self.artifacts
++
++
++class _FixedLoader:
++    def __init__(self, artifact: TextArtifact):
++        self.artifact = artifact
++
++    def load(self, source: object) -> TextArtifact:
++        return self.artifact
++
++
++def _chunker(max_tokens: int = 8, chunker_type: type[TextChunker] = TextChunker) -> TextChunker:
++    return chunker_type(tokenizer=MockTokenizer(model="codespec-test"), max_tokens=max_tokens)
++
++
++@pytest.mark.parametrize("chunker_type", [TextChunker, MarkdownChunker])
++def test_text_artifact_chunks_keep_independent_source_provenance(chunker_type):
++    reference = Reference(title="Operations manual", source="internal", year="2024")
++    source = TextArtifact(
++        "alpha beta gamma",
++        reference=reference,
++        meta={"location": {"page": 7}},
++        name="operations-manual",
++        encoding="ascii",
++        encoding_error_handler="ignore",
++    )
++
++    chunks = _chunker(chunker_type=chunker_type).chunk(source)
++
++    assert len(chunks) == 3
++    assert [chunk.reference for chunk in chunks] == [reference, reference, reference]
++    assert [chunk.name for chunk in chunks] == ["operations-manual"] * 3
++    assert [chunk.encoding for chunk in chunks] == ["ascii"] * 3
++    assert [chunk.encoding_error_handler for chunk in chunks] == ["ignore"] * 3
++    assert [chunk.meta for chunk in chunks] == [{"location": {"page": 7}}] * 3
++
++    chunks[0].meta["location"]["page"] = 99
++
++    assert source.meta == {"location": {"page": 7}}
++    assert chunks[1].meta == {"location": {"page": 7}}
++    assert chunks[2].meta == {"location": {"page": 7}}
++    assert len({chunk.id for chunk in chunks}) == len(chunks)
++
++
++def test_plain_and_combined_chunk_inputs_do_not_invent_source_provenance():
++    chunker = _chunker()
++
++    plain_chunks = chunker.chunk("alpha beta gamma")
++    combined_chunks = chunker.chunk(ListArtifact([TextArtifact("alpha"), TextArtifact(" beta gamma")]))
++
++    assert all(chunk.reference is None and chunk.meta == {} for chunk in plain_chunks)
++    assert all(chunk.reference is None and chunk.meta == {} for chunk in combined_chunks)
++
++
++def test_loader_retrieval_round_trip_keeps_provenance_available_to_footnotes():
++    reference = Reference(title="Runbook", authors=["Ada"], source="ops", year="2024")
++    module = TextLoaderRetrievalRagModule(
++        loader=_FixedLoader(TextArtifact("rotate the key", reference=reference, meta={"section": "keys"})),
++        chunker=_chunker(max_tokens=100),
++        vector_store_driver=LocalVectorStoreDriver(embedding_driver=MockEmbeddingDriver()),
++        source="ignored",
++    )
++
++    results = list(module.run(RagContext(query="key")))
++    prompt = FootnotePromptResponseRagModule().default_system_template_generator(
++        RagContext(query="key", text_chunks=results), results
++    )
++
++    assert len(results) == 1
++    assert results[0].reference == reference
++    assert results[0].meta == {"section": "keys"}
++    assert reference.id in prompt
++    assert "Runbook" in prompt
++
++
++def test_retrieval_stage_keeps_distinct_sources_and_uses_first_duplicate_before_reranking():
++    first_source = Reference(title="First", id="source-a")
++    second_source = Reference(title="Second", id="source-b")
++    stage = RetrievalRagStage(
++        retrieval_modules=[
++            _FixedRetrievalModule(
++                artifacts=[
++                    TextArtifact("same text", reference=first_source, meta={"winner": "first"}),
++                    TextArtifact("same text", reference=second_source),
++                    TextArtifact("same text", reference=Reference(title="Replacement", id="source-a")),
++                    TextArtifact("plain text", meta={"winner": "first"}),
++                    TextArtifact("plain text", meta={"winner": "last"}),
++                ]
++            )
++        ]
++    )
++
++    result = stage.run(RagContext(query="same"))
++
++    assert [(artifact.value, artifact.reference.id if artifact.reference else None) for artifact in result.text_chunks] == [
++        ("same text", "source-a"),
++        ("same text", "source-b"),
++        ("plain text", None),
++    ]
++    assert result.text_chunks[0].meta == {"winner": "first"}
++    assert result.text_chunks[2].meta == {"winner": "first"}
++
++
++def test_reranked_results_are_normalized_before_zero_or_positive_limit():
++    source_a = Reference(title="A", id="source-a")
++    source_b = Reference(title="B", id="source-b")
++    reranked = [
++        TextArtifact("same text", reference=source_b),
++        TextArtifact("same text", reference=Reference(title="A replacement", id="source-a")),
++        TextArtifact("same text", reference=source_b, meta={"duplicate": True}),
++        TextArtifact("plain text"),
++        TextArtifact("plain text", meta={"duplicate": True}),
++    ]
++    retrieval = _FixedRetrievalModule(artifacts=[TextArtifact("seed", reference=source_a)])
++    reranker = _FixedRerankModule(artifacts=reranked)
++
++    limited = RetrievalRagStage(retrieval_modules=[retrieval], rerank_module=reranker, max_chunks=3).run(
++        RagContext(query="same")
++    )
++    one = RetrievalRagStage(retrieval_modules=[retrieval], rerank_module=reranker, max_chunks=1).run(
++        RagContext(query="same")
++    )
++    empty = RetrievalRagStage(retrieval_modules=[retrieval], rerank_module=reranker, max_chunks=0).run(
++        RagContext(query="same")
++    )
++
++    assert [(artifact.value, artifact.reference.id if artifact.reference else None) for artifact in limited.text_chunks] == [
++        ("same text", "source-b"),
++        ("same text", "source-a"),
++        ("plain text", None),
++    ]
++    assert [(artifact.value, artifact.reference.id if artifact.reference else None) for artifact in one.text_chunks] == [
++        ("same text", "source-b"),
++    ]
++    assert empty.text_chunks == []
++
++
++def test_retrieval_stage_rejects_negative_max_chunks():
++    with pytest.raises(ValueError, match="max_chunks"):
++        RetrievalRagStage(retrieval_modules=[], max_chunks=-1)
++
++
++def test_reference_lists_deduplicate_by_reference_id_with_first_source_winning():
++    first = Reference(id="shared-source", title="Canonical title")
++    replacement = Reference(id="shared-source", title="Replacement title")
++    distinct = Reference(id="second-source", title="Second title")
++    context = RagContext(
++        query="test",
++        text_chunks=[
++            TextArtifact("one", reference=first),
++            TextArtifact("two", reference=replacement),
++            TextArtifact("three", reference=distinct),
++        ],
++    )
++
++    references = context.get_references()
++    prompt = FootnotePromptResponseRagModule().default_system_template_generator(context, context.text_chunks)
++
++    assert references == [first, distinct]
++    assert prompt.count("Canonical title") == 1
++    assert "Replacement title" not in prompt
++    assert prompt.count("Second title") == 1
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,5 @@
++#!/bin/bash
++set -euo pipefail
++
++
++pytest -q tests/unit/engines/rag/test_provenance_normalization.py

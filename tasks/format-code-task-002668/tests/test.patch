@@ -1,0 +1,185 @@
+diff --git a/sktime/forecasting/tests/test_structural.py b/sktime/forecasting/tests/test_structural.py
+index 01e6233c4..d6957db49 100644
+--- a/sktime/forecasting/tests/test_structural.py
++++ b/sktime/forecasting/tests/test_structural.py
+@@ -183,3 +183,158 @@ def test_result_consistency_exog(structure_params=structure_params, levels=level
+         y_pred_base = result.forecast(steps=n_test, exog=X_test)
+         assert_series_equal(left=y_pred_forecaster, right=y_pred_base)
+         assert len(fh) == y_pred_forecaster.shape[0]
++
++
++
++
++
++
++
++def _fit_airline_forecaster():
++    y = load_airline()
++    forecaster = UnobservedComponents(level="local linear trend")
++    forecaster.fit(y)
++    return forecaster, y
++
++
++def test_pred_int_capability_tag():
++    """Forecaster should advertise probabilistic prediction capability."""
++    forecaster = UnobservedComponents(level="local linear trend")
++    assert forecaster.get_tag("capability:pred_int") is True
++
++
++def test_predict_interval_returns_dataframe():
++    """predict_interval must return a pandas DataFrame, not raise NotImplemented."""
++    forecaster, _ = _fit_airline_forecaster()
++    pred_int = forecaster.predict_interval(fh=[1, 2, 3], coverage=0.9)
++    assert isinstance(pred_int, pd.DataFrame)
++    assert pred_int.shape == (3, 2)
++
++
++def test_predict_interval_columns_structure():
++    """Column index is a 3-level MultiIndex: (var, coverage, lower/upper)."""
++    forecaster, _ = _fit_airline_forecaster()
++    pred_int = forecaster.predict_interval(fh=[1, 2, 3], coverage=0.9)
++    assert isinstance(pred_int.columns, pd.MultiIndex)
++    assert pred_int.columns.nlevels == 3
++    cols = list(pred_int.columns)
++    assert cols == [
++        ("Coverage", 0.9, "lower"),
++        ("Coverage", 0.9, "upper"),
++    ]
++
++
++def test_predict_interval_multiple_coverages_preserves_order():
++    """Multiple coverage values produce columns in the same input order."""
++    forecaster, _ = _fit_airline_forecaster()
++    pred_int = forecaster.predict_interval(fh=[1, 2, 3], coverage=[0.5, 0.9])
++    cols = list(pred_int.columns)
++    assert cols == [
++        ("Coverage", 0.5, "lower"),
++        ("Coverage", 0.5, "upper"),
++        ("Coverage", 0.9, "lower"),
++        ("Coverage", 0.9, "upper"),
++    ]
++    assert pred_int.shape == (3, 4)
++
++
++def test_predict_interval_lower_lt_upper():
++    """For every coverage, lower bound is strictly below upper bound."""
++    forecaster, _ = _fit_airline_forecaster()
++    pred_int = forecaster.predict_interval(fh=[1, 2, 3], coverage=[0.5, 0.9])
++    for c in [0.5, 0.9]:
++        lower = pred_int[("Coverage", c, "lower")].values
++        upper = pred_int[("Coverage", c, "upper")].values
++        assert np.all(lower < upper)
++
++
++def test_predict_interval_wider_with_higher_coverage():
++    """Higher nominal coverage must yield wider intervals."""
++    forecaster, _ = _fit_airline_forecaster()
++    pred_int = forecaster.predict_interval(fh=[1, 2, 3], coverage=[0.5, 0.9, 0.99])
++    w50 = (
++        pred_int[("Coverage", 0.5, "upper")].values
++        - pred_int[("Coverage", 0.5, "lower")].values
++    )
++    w90 = (
++        pred_int[("Coverage", 0.9, "upper")].values
++        - pred_int[("Coverage", 0.9, "lower")].values
++    )
++    w99 = (
++        pred_int[("Coverage", 0.99, "upper")].values
++        - pred_int[("Coverage", 0.99, "lower")].values
++    )
++    assert np.all(w50 < w90)
++    assert np.all(w90 < w99)
++
++
++def test_predict_interval_index_matches_fh():
++    """Row index of the returned interval forecast must equal the absolute fh."""
++    forecaster, y = _fit_airline_forecaster()
++    pred_int = forecaster.predict_interval(fh=[1, 2, 3], coverage=0.9)
++    expected_index = pd.period_range(start=y.index[-1] + 1, periods=3, freq="M")
++    assert len(pred_int.index) == 3
++    assert list(pred_int.index) == list(expected_index)
++
++
++def test_predict_interval_matches_statsmodels():
++    """Values must match statsmodels' summary_frame mean_ci_lower / mean_ci_upper."""
++    forecaster, y = _fit_airline_forecaster()
++    pred_int = forecaster.predict_interval(fh=[1, 2, 3], coverage=0.9)
++    model = _UnobservedComponents(level="local linear trend", endog=y)
++    result = model.fit(disp=0)
++    pred = result.get_prediction(start=y.index[-1] + 1, end=y.index[-1] + 3)
++    sf = pred.summary_frame(alpha=0.1)
++    np.testing.assert_allclose(
++        pred_int[("Coverage", 0.9, "lower")].values,
++        sf["mean_ci_lower"].values,
++    )
++    np.testing.assert_allclose(
++        pred_int[("Coverage", 0.9, "upper")].values,
++        sf["mean_ci_upper"].values,
++    )
++
++
++def test_predict_interval_with_exogenous_X():
++    """predict_interval must accept and use exogenous X for out-of-sample forecasts."""
++    np.random.seed(42)
++    n = 50
++    idx = pd.RangeIndex(n)
++    X = pd.DataFrame({"x": np.random.randn(n)}, index=idx)
++    y = pd.Series(
++        np.cumsum(np.random.randn(n)) + X["x"].values * 5.0,
++        index=idx,
++    )
++    n_train = 40
++    y_tr, X_tr = y[:n_train], X[:n_train]
++    X_te = X[n_train:]
++    forecaster = UnobservedComponents(level="local level", mle_regression=False)
++    forecaster.fit(y_tr, X=X_tr)
++    fh = list(range(1, len(X_te) + 1))
++    pred_int = forecaster.predict_interval(fh=fh, X=X_te, coverage=0.9)
++    assert pred_int.shape == (len(X_te), 2)
++
++
++    X_te_zero = X_te * 0.0
++    pred_int_zero = forecaster.predict_interval(fh=fh, X=X_te_zero, coverage=0.9)
++    assert not np.allclose(
++        pred_int[("Coverage", 0.9, "lower")].values,
++        pred_int_zero[("Coverage", 0.9, "lower")].values,
++    )
++    assert not np.allclose(
++        pred_int[("Coverage", 0.9, "upper")].values,
++        pred_int_zero[("Coverage", 0.9, "upper")].values,
++    )
++
++
++def test_predict_interval_subset_fh():
++    """Non-contiguous fh selection: row index must be exactly the requested fh."""
++    forecaster, y = _fit_airline_forecaster()
++    pred_int = forecaster.predict_interval(fh=[1, 3, 5], coverage=0.9)
++    expected = [
++        y.index[-1] + 1,
++        y.index[-1] + 3,
++        y.index[-1] + 5,
++    ]
++    assert list(pred_int.index) == expected
++    assert pred_int.shape == (3, 2)
+diff --git a/test_commands.json b/test_commands.json
+new file mode 100644
+index 000000000..5cbb67a72
+--- /dev/null
++++ b/test_commands.json
+@@ -0,0 +1,3 @@
++{
++  "test_commands": ["python -m pytest sktime/forecasting/tests/test_structural.py -v"]
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,8 @@
++#!/usr/bin/env bash
++
++set -uo pipefail
++cd /testbed
++rc=0
++python -m pytest sktime/forecasting/tests/test_structural.py -v
++rc=$(( rc | $? ))
++exit $rc

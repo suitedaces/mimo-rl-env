@@ -1,0 +1,438 @@
+diff --git a/usercase-test-coderl/test_async_result_dependency_tree.py b/usercase-test-coderl/test_async_result_dependency_tree.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/test_async_result_dependency_tree.py
+@@ -0,0 +1,408 @@
++
++
++
++
++
++
++import pytest
++
++from celery import Celery, states
++from celery.exceptions import IncompleteStream
++from celery.utils.graph import GraphFormatter
++
++
++class RequestWithChildren:
++    def __init__(self, children):
++        self.children = children
++
++
++def make_app(name):
++    app = Celery(name, broker="memory://", backend="cache+memory://")
++    app.conf.result_serializer = "json"
++    app.conf.accept_content = ["json"]
++    return app
++
++
++def store_success(app, task_id, value, children=None):
++    request = RequestWithChildren(children or [])
++    app.backend.store_result(task_id, value, states.SUCCESS, request=request)
++
++
++def collect_ids(result, **kwargs):
++    return [(handle.id, value) for handle, value in result.collect(**kwargs)]
++
++
++def dependency_ids(result, **kwargs):
++    return [(parent and parent.id, node.id) for parent, node in result.iterdeps(**kwargs)]
++
++
++def graph_edges(graph):
++    return {
++        (node.id, child.id)
++        for node in graph
++        for child in graph[node]
++    }
++
++
++def test_iterdeps_and_collect_walk_ready_children_breadth_first():
++
++
++
++    app = make_app("fixture-ready-children")
++    for task_id, value in [
++        ("s3-child0", 0),
++        ("s3-child1", 1),
++        ("s3-child2", 2),
++    ]:
++        store_success(app, task_id, value)
++    children = [
++        app.AsyncResult("s3-child0"),
++        app.AsyncResult("s3-child1"),
++        app.AsyncResult("s3-child2"),
++    ]
++    store_success(app, "s3-root", "root-value", children=children)
++
++    root = app.AsyncResult("s3-root")
++
++    assert dependency_ids(root) == [
++        (None, "s3-root"),
++        ("s3-root", "s3-child0"),
++        ("s3-root", "s3-child1"),
++        ("s3-root", "s3-child2"),
++    ]
++    assert collect_ids(root, disable_sync_subtasks=False) == [
++        ("s3-root", "root-value"),
++        ("s3-child0", 0),
++        ("s3-child1", 1),
++        ("s3-child2", 2),
++    ]
++
++    assert [node_id for _, node_id in dependency_ids(root)][1:] == [
++        "s3-child0", "s3-child1", "s3-child2",
++    ]
++
++
++def test_get_leaf_returns_last_result_value_from_simple_chain():
++
++
++
++    app = make_app("fixture-chain-leaf")
++    store_success(app, "s3-chain-leaf", 2)
++    store_success(
++        app,
++        "s3-chain-middle",
++        1,
++        children=[app.AsyncResult("s3-chain-leaf")],
++    )
++    store_success(
++        app,
++        "s3-chain-root",
++        "chain-root-value",
++        children=[app.AsyncResult("s3-chain-middle")],
++    )
++
++    root = app.AsyncResult("s3-chain-root")
++
++    assert dependency_ids(root) == [
++        (None, "s3-chain-root"),
++        ("s3-chain-root", "s3-chain-middle"),
++        ("s3-chain-middle", "s3-chain-leaf"),
++    ]
++    assert root.get_leaf() == 2
++
++
++def test_nested_ready_tree_uses_breadth_first_order_for_collect_and_leaf():
++
++
++
++    app = make_app("fixture-nested-ready")
++    store_success(app, "s3-aa", "AA")
++    store_success(app, "s3-bb", "BB")
++    store_success(app, "s3-a", "A", children=[app.AsyncResult("s3-aa")])
++    store_success(app, "s3-b", "B", children=[app.AsyncResult("s3-bb")])
++    store_success(
++        app,
++        "s3-bf-root",
++        "ROOT",
++        children=[app.AsyncResult("s3-a"), app.AsyncResult("s3-b")],
++    )
++
++    root = app.AsyncResult("s3-bf-root")
++
++    assert dependency_ids(root) == [
++        (None, "s3-bf-root"),
++        ("s3-bf-root", "s3-a"),
++        ("s3-bf-root", "s3-b"),
++        ("s3-a", "s3-aa"),
++        ("s3-b", "s3-bb"),
++    ]
++    assert collect_ids(root, disable_sync_subtasks=False) == [
++        ("s3-bf-root", "ROOT"),
++        ("s3-a", "A"),
++        ("s3-b", "B"),
++        ("s3-aa", "AA"),
++        ("s3-bb", "BB"),
++    ]
++    assert root.get_leaf() == "BB"
++
++
++def test_strict_iterdeps_raises_specific_incomplete_stream_for_pending_root():
++
++
++
++    app = make_app("fixture-pending-root")
++    root = app.AsyncResult("s3-pending-root")
++
++    stream = root.iterdeps()
++    parent, node = next(stream)
++
++    assert (parent and parent.id, node.id) == (None, "s3-pending-root")
++
++    assert root.ready() is False
++    with pytest.raises(IncompleteStream):
++        next(stream)
++
++
++def test_intermediate_true_yields_incomplete_node_without_descending_branch():
++
++
++
++    app = make_app("fixture-intermediate-started")
++    store_success(app, "s3-hidden-grandchild", "hidden-value")
++    app.backend.store_result(
++        "s3-started-parent",
++        "not-ready-yet",
++        states.STARTED,
++        request=RequestWithChildren([app.AsyncResult("s3-hidden-grandchild")]),
++    )
++    store_success(app, "s3-ready-sibling-2", "ready-value")
++    store_success(
++        app,
++        "s3-root-started-child",
++        "root-value",
++        children=[
++            app.AsyncResult("s3-started-parent"),
++            app.AsyncResult("s3-ready-sibling-2"),
++        ],
++    )
++
++    root = app.AsyncResult("s3-root-started-child")
++    started = app.AsyncResult("s3-started-parent")
++
++
++    assert started.ready() is False
++    assert dependency_ids(root, intermediate=True) == [
++        (None, "s3-root-started-child"),
++        ("s3-root-started-child", "s3-started-parent"),
++        ("s3-root-started-child", "s3-ready-sibling-2"),
++    ]
++    assert "s3-hidden-grandchild" not in [
++        node_id for _, node_id in dependency_ids(root, intermediate=True)
++    ]
++
++    strict_stream = root.iterdeps()
++    parent, node = next(strict_stream)
++    assert (parent and parent.id, node.id) == (None, "s3-root-started-child")
++    parent, node = next(strict_stream)
++    assert (parent and parent.id, node.id) == (
++        "s3-root-started-child",
++        "s3-started-parent",
++    )
++    with pytest.raises(IncompleteStream):
++        next(strict_stream)
++
++
++def test_build_graph_records_all_arcs_edges_and_default_formatter():
++
++
++
++    app = make_app("fixture-graph-default")
++    store_success(app, "s3-graph-aa", "AA")
++    store_success(app, "s3-graph-bb", "BB")
++    store_success(app, "s3-graph-a", "A", children=[app.AsyncResult("s3-graph-aa")])
++    store_success(app, "s3-graph-b", "B", children=[app.AsyncResult("s3-graph-bb")])
++    store_success(
++        app,
++        "s3-graph-root",
++        "ROOT",
++        children=[app.AsyncResult("s3-graph-a"), app.AsyncResult("s3-graph-b")],
++    )
++
++    graph = app.AsyncResult("s3-graph-root").build_graph()
++
++    assert type(graph).__name__ == "DependencyGraph"
++    assert len(graph) == 5
++
++    assert {node.id for node in graph} == {
++        "s3-graph-root",
++        "s3-graph-a",
++        "s3-graph-b",
++        "s3-graph-aa",
++        "s3-graph-bb",
++    }
++    assert graph_edges(graph) == {
++        ("s3-graph-root", "s3-graph-a"),
++        ("s3-graph-root", "s3-graph-b"),
++        ("s3-graph-a", "s3-graph-aa"),
++        ("s3-graph-b", "s3-graph-bb"),
++    }
++
++    assert graph.formatter.root == "s3-graph-root"
++
++
++def test_build_graph_accepts_custom_formatter_and_intermediate_tree():
++
++
++
++    app = make_app("fixture-graph-custom")
++    store_success(app, "s3-custom-hidden", "hidden-value")
++    app.backend.store_result(
++        "s3-custom-started",
++        "started-value",
++        states.STARTED,
++        request=RequestWithChildren([app.AsyncResult("s3-custom-hidden")]),
++    )
++    store_success(app, "s3-custom-ready", "ready-value")
++    store_success(
++        app,
++        "s3-custom-root",
++        "root-value",
++        children=[app.AsyncResult("s3-custom-started"), app.AsyncResult("s3-custom-ready")],
++    )
++
++    custom_formatter = GraphFormatter(root="s3-custom-format-root", shape="diamond")
++    graph = app.AsyncResult("s3-custom-root").build_graph(
++        intermediate=True,
++        formatter=custom_formatter,
++    )
++
++
++    assert {node.id for node in graph} == {
++        "s3-custom-root",
++        "s3-custom-started",
++        "s3-custom-ready",
++    }
++    assert graph_edges(graph) == {
++        ("s3-custom-root", "s3-custom-started"),
++        ("s3-custom-root", "s3-custom-ready"),
++    }
++
++    assert graph.formatter.root == "s3-custom-format-root"
++
++
++def test_graph_property_builds_default_graph_once_and_caches_it():
++
++
++
++    app = make_app("fixture-graph-cache")
++    store_success(app, "s3-cache-child", "cache-child-value")
++    store_success(
++        app,
++        "s3-cache-root",
++        "cache-root-value",
++        children=[app.AsyncResult("s3-cache-child")],
++    )
++    root = app.AsyncResult("s3-cache-root")
++
++    first_graph = root.graph
++    second_graph = root.graph
++
++    assert (first_graph is second_graph) is True
++    assert len(first_graph) == 2
++
++    assert {node.id for node in first_graph} == {"s3-cache-root", "s3-cache-child"}
++    assert graph_edges(first_graph) == {("s3-cache-root", "s3-cache-child")}
++    assert first_graph.formatter.root == "s3-cache-root"
++
++
++def test_two_async_result_instances_observe_independent_backend_state():
++
++
++
++    app = make_app("fixture-instance-independence")
++    a = app.AsyncResult("s3-independent-a")
++    b = app.AsyncResult("s3-independent-b")
++
++
++    assert dependency_ids(a, intermediate=True) == [(None, "s3-independent-a")]
++    assert dependency_ids(b, intermediate=True) == [(None, "s3-independent-b")]
++
++    store_success(app, "s3-independent-a-child", "a-child-value")
++    store_success(
++        app,
++        "s3-independent-a",
++        "A-root",
++        children=[app.AsyncResult("s3-independent-a-child")],
++    )
++
++    assert dependency_ids(a) == [
++        (None, "s3-independent-a"),
++        ("s3-independent-a", "s3-independent-a-child"),
++    ]
++    assert collect_ids(a, disable_sync_subtasks=False) == [
++        ("s3-independent-a", "A-root"),
++        ("s3-independent-a-child", "a-child-value"),
++    ]
++    assert dependency_ids(b, intermediate=True) == [(None, "s3-independent-b")]
++
++    assert b.ready() is False
++
++
++def test_collect_passes_get_options_to_each_result_handle(monkeypatch):
++
++
++
++    app = make_app("fixture-collect-get-options")
++    store_success(app, "s3-options-child", "child-value")
++    store_success(
++        app,
++        "s3-options-root",
++        "root-value",
++        children=[app.AsyncResult("s3-options-child")],
++    )
++    root = app.AsyncResult("s3-options-root")
++    original_get = type(root).get
++    calls = []
++
++    def recording_get(self, **kwargs):
++        calls.append((self.id, dict(kwargs)))
++        return original_get(self, **kwargs)
++
++    monkeypatch.setattr(type(root), "get", recording_get)
++
++
++    get_options = {"timeout": 0.01, "disable_sync_subtasks": False}
++    assert collect_ids(root, **get_options) == [
++        ("s3-options-root", "root-value"),
++        ("s3-options-child", "child-value"),
++    ]
++    assert calls == [
++        ("s3-options-root", get_options),
++        ("s3-options-child", get_options),
++    ]
++
++
++def test_repeated_result_tree_sessions_keep_dependency_trees_isolated():
++
++
++
++    app = make_app("fixture-repeated-trees")
++    observed = []
++    expected = []
++
++    for index in range(120):
++        root_id = f"s3-leak-root-{index}"
++        child_id = f"s3-leak-child-{index}"
++        store_success(app, child_id, index)
++        store_success(app, root_id, f"root-{index}", children=[app.AsyncResult(child_id)])
++
++        root = app.AsyncResult(root_id)
++        expected_tree = [
++            (root_id, f"root-{index}"),
++            (child_id, index),
++        ]
++        observed.append(collect_ids(root, disable_sync_subtasks=False))
++        expected.append(expected_tree)
++
++
++    assert observed == expected
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,20 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++
++cd /workspace/repo
++
++export PIP_DISABLE_PIP_VERSION_CHECK=1
++export PIP_NO_INDEX=1
++export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
++
++exec python -m pytest /workspace/repo/usercase-test-coderl/test_async_result_dependency_tree.py -v

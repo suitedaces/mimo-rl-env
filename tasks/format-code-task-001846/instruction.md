@@ -1,0 +1,7 @@
+I want grid widgets to let me assign stretch factors to rows and columns after creating a grid. On an existing *tui.Grid, I need SetColumnStretch(col int, stretch int) and SetRowStretch(row int, stretch int).
+
+A stretch value greater than zero means that row or column is eligible to receive extra space on that axis, and multiple positive stretch factors divide remaining space by repeated factor increments. For example, a bordered 3-column, 1-row grid resized to 24x3 with SetColumnStretch(0, 1), SetColumnStretch(1, 2), and SetColumnStretch(2, 1) should draw columns with inner widths 5, 10, and 5. With factors 3, 2, and 1 in a bordered 3-column grid resized to 34x3, the inner widths should be 15, 10, and 5.
+
+Columns or rows with zero or unset stretch should not receive weighted extra space while another positive factor exists. In a 19x3 bordered 3-column grid with only column 1 set to 2 and column 2 set to 1, column 0 should have width 0 while columns 1 and 2 have widths 10 and 5. Explicit zero should behave like unset: in a 34x3 bordered 4-column grid with factors 0, 1, 2, and 0, the two middle columns receive the visible extra space while the zero-stretch edge columns stay at their minimum clipped width.
+
+The row method should apply the same rules vertically. These methods should update only the receiver grid's later layout calculations, so callers can set factors, then resize or repaint the same grid and observe the configured proportions without sharing stretch settings with other Grid instances.

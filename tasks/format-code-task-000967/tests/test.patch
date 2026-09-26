@@ -1,0 +1,272 @@
+diff --git a/tests/components/voip/test_caller_network_policy_codespec.py b/tests/components/voip/test_caller_network_policy_codespec.py
+new file mode 100644
+index 00000000000..76ce89ddbcc
+--- /dev/null
++++ b/tests/components/voip/test_caller_network_policy_codespec.py
+@@ -0,0 +1,257 @@
++
++
++from __future__ import annotations
++
++from unittest.mock import Mock, patch
++
++from voip_utils import CallInfo
++
++from homeassistant.components.voip import DOMAIN
++from homeassistant.components.voip.voip import HassVoipDatagramProtocol
++from homeassistant.config_entries import ConfigEntryState
++from homeassistant.core import HomeAssistant
++from homeassistant.data_entry_flow import FlowResultType
++from homeassistant.helpers import device_registry as dr
++from homeassistant.helpers import entity_registry as er
++
++from tests.common import MockConfigEntry
++
++CONF_ALLOWED_NETWORKS = "allowed_networks"
++CONF_BLOCKED_NETWORKS = "blocked_networks"
++
++
++def _call_from(address: str) -> CallInfo:
++
++    return CallInfo(
++        caller_ip=address,
++        caller_sip_port=5060,
++        caller_rtp_port=5004,
++        server_ip="192.0.2.1",
++        headers={"user-agent": "Policy verifier phone"},
++    )
++
++
++async def _setup_policy_entry(
++    hass: HomeAssistant, options: dict[str, list[str]] | None = None
++) -> MockConfigEntry:
++
++    entry = MockConfigEntry(domain=DOMAIN, data={}, options=options or {})
++    entry.add_to_hass(hass)
++    with patch(
++        "homeassistant.components.voip._create_sip_server", return_value=Mock()
++    ):
++        assert await hass.config_entries.async_setup(entry.entry_id)
++        await hass.async_block_till_done()
++    assert entry.state is ConfigEntryState.LOADED
++    return entry
++
++
++def _protocol(hass: HomeAssistant) -> HassVoipDatagramProtocol:
++
++    return HassVoipDatagramProtocol(hass, hass.data[DOMAIN].devices)
++
++
++async def _set_allow_switch(
++    hass: HomeAssistant, caller_ip: str, enabled: bool
++) -> None:
++
++    entity_id = er.async_get(hass).async_get_entity_id(
++        "switch", DOMAIN, f"{caller_ip}-allow_call"
++    )
++    assert entity_id is not None
++    await hass.services.async_call(
++        "switch",
++        "turn_on" if enabled else "turn_off",
++        {"entity_id": entity_id},
++        blocking=True,
++    )
++
++
++async def test_codespec_options_normalize_and_preserve_order(
++    hass: HomeAssistant,
++) -> None:
++
++    entry = MockConfigEntry(
++        domain=DOMAIN,
++        data={},
++        options={CONF_ALLOWED_NETWORKS: ["192.0.2.0/24"]},
++    )
++    entry.add_to_hass(hass)
++
++    result = await hass.config_entries.options.async_init(entry.entry_id)
++    assert result["type"] == FlowResultType.FORM
++    assert result["step_id"] == "init"
++    defaults = result["data_schema"]({})
++    assert defaults == {
++        CONF_ALLOWED_NETWORKS: ["192.0.2.0/24"],
++        CONF_BLOCKED_NETWORKS: [],
++    }
++
++    result = await hass.config_entries.options.async_configure(
++        result["flow_id"],
++        user_input={
++            CONF_ALLOWED_NETWORKS: [
++                "192.0.2.7",
++                "192.0.2.7/32",
++                "2001:0db8:0000::1/64",
++            ],
++            CONF_BLOCKED_NETWORKS: [
++                "198.51.100.12",
++                "198.51.100.12/32",
++                "2001:db8:ffff::1/48",
++            ],
++        },
++    )
++
++    assert result["type"] == FlowResultType.CREATE_ENTRY
++    assert entry.options == {
++        CONF_ALLOWED_NETWORKS: ["192.0.2.7/32", "2001:db8::/64"],
++        CONF_BLOCKED_NETWORKS: [
++            "198.51.100.12/32",
++            "2001:db8:ffff::/48",
++        ],
++    }
++
++
++async def test_codespec_options_reject_each_invalid_list(
++    hass: HomeAssistant,
++) -> None:
++
++    entry = MockConfigEntry(
++        domain=DOMAIN,
++        data={},
++        options={
++            CONF_ALLOWED_NETWORKS: ["192.0.2.0/24"],
++            CONF_BLOCKED_NETWORKS: ["198.51.100.0/24"],
++        },
++    )
++    entry.add_to_hass(hass)
++    original_options = dict(entry.options)
++
++    result = await hass.config_entries.options.async_init(entry.entry_id)
++    result = await hass.config_entries.options.async_configure(
++        result["flow_id"],
++        user_input={
++            CONF_ALLOWED_NETWORKS: ["192.0.2.0/24", "not-a-network"],
++            CONF_BLOCKED_NETWORKS: ["198.51.100.0/24"],
++        },
++    )
++    assert result["type"] == FlowResultType.FORM
++    assert result["errors"] == {CONF_ALLOWED_NETWORKS: "invalid_network"}
++    assert entry.options == original_options
++
++    result = await hass.config_entries.options.async_configure(
++        result["flow_id"],
++        user_input={
++            CONF_ALLOWED_NETWORKS: ["192.0.2.0/24"],
++            CONF_BLOCKED_NETWORKS: ["2001:db8::/48", "still-not-a-network"],
++        },
++    )
++    assert result["type"] == FlowResultType.FORM
++    assert result["errors"] == {CONF_BLOCKED_NETWORKS: "invalid_network"}
++    assert entry.options == original_options
++
++
++async def test_codespec_policy_precedence_and_enrollment(
++    hass: HomeAssistant,
++) -> None:
++
++    await _setup_policy_entry(
++        hass,
++        {
++            CONF_ALLOWED_NETWORKS: ["192.0.2.0/24", "2001:db8::/32"],
++            CONF_BLOCKED_NETWORKS: [
++                "192.0.2.128/25",
++                "2001:db8:dead::/48",
++            ],
++        },
++    )
++    protocol = _protocol(hass)
++    registry = dr.async_get(hass)
++
++    outside = _call_from("198.51.100.20")
++    assert not protocol.is_valid_call(outside)
++    assert registry.async_get_device({(DOMAIN, outside.caller_ip)}) is None
++
++    blocked_v4 = _call_from("192.0.2.200")
++    assert not protocol.is_valid_call(blocked_v4)
++    assert registry.async_get_device({(DOMAIN, blocked_v4.caller_ip)}) is None
++
++    blocked_v6 = _call_from("2001:db8:dead::5")
++    assert not protocol.is_valid_call(blocked_v6)
++    assert registry.async_get_device({(DOMAIN, blocked_v6.caller_ip)}) is None
++
++    admitted = _call_from("192.0.2.20")
++    assert not protocol.is_valid_call(admitted)
++    await hass.async_block_till_done()
++    assert registry.async_get_device({(DOMAIN, admitted.caller_ip)}) is not None
++    await _set_allow_switch(hass, admitted.caller_ip, True)
++    assert protocol.is_valid_call(admitted)
++
++    admitted_v6 = _call_from("2001:db8:beef::7")
++    assert not protocol.is_valid_call(admitted_v6)
++    await hass.async_block_till_done()
++    assert registry.async_get_device({(DOMAIN, admitted_v6.caller_ip)}) is not None
++
++
++async def test_codespec_empty_allow_list_retains_legacy_behavior(
++    hass: HomeAssistant,
++) -> None:
++
++    await _setup_policy_entry(hass)
++    protocol = _protocol(hass)
++    registry = dr.async_get(hass)
++    caller = _call_from("203.0.113.44")
++
++    assert not protocol.is_valid_call(caller)
++    await hass.async_block_till_done()
++    assert registry.async_get_device({(DOMAIN, caller.caller_ip)}) is not None
++
++    await _set_allow_switch(hass, caller.caller_ip, True)
++    assert protocol.is_valid_call(caller)
++
++
++async def test_codespec_block_list_applies_when_allow_list_is_empty(
++    hass: HomeAssistant,
++) -> None:
++
++    await _setup_policy_entry(
++        hass,
++        {CONF_ALLOWED_NETWORKS: [], CONF_BLOCKED_NETWORKS: ["203.0.113.0/24"]},
++    )
++    protocol = _protocol(hass)
++    registry = dr.async_get(hass)
++    blocked = _call_from("203.0.113.9")
++    assert not protocol.is_valid_call(blocked)
++    assert registry.async_get_device({(DOMAIN, blocked.caller_ip)}) is None
++
++
++async def test_codespec_saved_options_apply_live_without_deleting_devices(
++    hass: HomeAssistant,
++) -> None:
++
++    entry = await _setup_policy_entry(hass)
++    caller = _call_from("203.0.113.55")
++    protocol = _protocol(hass)
++    assert not protocol.is_valid_call(caller)
++    await hass.async_block_till_done()
++    await _set_allow_switch(hass, caller.caller_ip, True)
++    assert protocol.is_valid_call(caller)
++
++    with patch(
++        "homeassistant.components.voip._create_sip_server", return_value=Mock()
++    ):
++        result = await hass.config_entries.options.async_init(entry.entry_id)
++        result = await hass.config_entries.options.async_configure(
++            result["flow_id"],
++            user_input={
++                CONF_ALLOWED_NETWORKS: ["192.0.2.0/24"],
++                CONF_BLOCKED_NETWORKS: [],
++            },
++        )
++        assert result["type"] == FlowResultType.CREATE_ENTRY
++        await hass.async_block_till_done()
++
++    assert entry.state is ConfigEntryState.LOADED
++    assert dr.async_get(hass).async_get_device({(DOMAIN, caller.caller_ip)}) is not None
++    assert not _protocol(hass).is_valid_call(caller)
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,4 @@
++#!/bin/bash
++set -euo pipefail
++
++exec .venv/bin/pytest -q tests/components/voip/test_caller_network_policy_codespec.py

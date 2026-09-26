@@ -1,0 +1,274 @@
+diff --git a/app-shell-odd/src/system-update/__tests__/release-manifest-resilience.codespec.test.ts b/app-shell-odd/src/system-update/__tests__/release-manifest-resilience.codespec.test.ts
+new file mode 100644
+index 0000000000..7200056b91
+--- /dev/null
++++ b/app-shell-odd/src/system-update/__tests__/release-manifest-resilience.codespec.test.ts
+@@ -0,0 +1,255 @@
++import path from 'path'
++import fse from 'fs-extra'
++import tempy from 'tempy'
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++
++import * as Http from '../../http'
++import * as Dirs from '../directories'
++import {
++  downloadAndCacheReleaseManifest,
++  getCachedReleaseManifest,
++  getReleaseSet,
++} from '../release-manifest'
++
++import type { ReleaseManifest } from '../types'
++
++vi.mock('../../http')
++vi.mock('../directories')
++vi.mock('../../log')
++
++const MANIFEST_URL = 'https://updates.example.test/releases.json'
++const VALID_MANIFEST = {
++  production: {
++    '8.1.0': {
++      fullImage: 'https://updates.example.test/8.1.0/full.zip',
++      system: 'https://updates.example.test/8.1.0/system.zip',
++      version: 'https://updates.example.test/8.1.0/VERSION.json',
++      releaseNotes: 'https://updates.example.test/8.1.0/notes.md',
++      checksum: 'sha256:extension-field-is-preserved',
++    },
++    '8.0.0': {
++      fullImage: 'https://updates.example.test/8.0.0/full.zip',
++      system: 'https://updates.example.test/8.0.0/system.zip',
++      version: 'https://updates.example.test/8.0.0/VERSION.json',
++    },
++  },
++  generatedAt: 'fixture metadata is preserved',
++}
++
++describe('release manifest validation and fallback', () => {
++  let tempDir: string
++  let cachePath: string
++
++  beforeEach(() => {
++    tempDir = tempy.directory()
++    cachePath = path.join(tempDir, 'releases.json')
++    vi.mocked(Dirs.getManifestCacheDir).mockReturnValue(cachePath)
++    vi.mocked(Http.fetchJson).mockResolvedValue(VALID_MANIFEST)
++  })
++
++  afterEach(async () => {
++    vi.resetAllMocks()
++    await fse.remove(tempDir)
++  })
++
++  it('accepts, returns, and caches a valid manifest without stripping extensions', async () => {
++    await expect(
++      downloadAndCacheReleaseManifest(MANIFEST_URL)
++    ).resolves.toEqual(VALID_MANIFEST)
++    await expect(fse.readJson(cachePath)).resolves.toEqual(VALID_MANIFEST)
++  })
++
++  it('uses a valid cached manifest when the request fails', async () => {
++    await fse.outputJson(cachePath, VALID_MANIFEST)
++    vi.mocked(Http.fetchJson).mockRejectedValue(new Error('offline'))
++
++    await expect(
++      downloadAndCacheReleaseManifest(MANIFEST_URL)
++    ).resolves.toEqual(VALID_MANIFEST)
++  })
++
++  it('accepts an empty production map', async () => {
++    const emptyManifest = { production: {} }
++    await fse.outputJson(cachePath, emptyManifest)
++
++    await expect(getCachedReleaseManifest()).resolves.toEqual(emptyManifest)
++  })
++
++  it.each([
++    ['a null document', null],
++    ['an array document', []],
++    ['a missing production map', { metadata: 'only' }],
++    ['an array production value', { production: [] }],
++    [
++      'an invalid semantic version key',
++      {
++        production: {
++          newest: VALID_MANIFEST.production['8.1.0'],
++        },
++      },
++    ],
++    [
++      'a missing required release URL',
++      {
++        production: {
++          '8.1.0': {
++            fullImage: 'https://updates.example.test/full.zip',
++            version: 'https://updates.example.test/VERSION.json',
++          },
++        },
++      },
++    ],
++    [
++      'a blank required release URL',
++      {
++        production: {
++          '8.1.0': {
++            fullImage: 'https://updates.example.test/full.zip',
++            system: '   ',
++            version: 'https://updates.example.test/VERSION.json',
++          },
++        },
++      },
++    ],
++    [
++      'a non-string optional release-notes URL',
++      {
++        production: {
++          '8.1.0': {
++            fullImage: 'https://updates.example.test/full.zip',
++            system: 'https://updates.example.test/system.zip',
++            version: 'https://updates.example.test/VERSION.json',
++            releaseNotes: false,
++          },
++        },
++      },
++    ],
++    [
++      'a blank optional release-notes URL',
++      {
++        production: {
++          '8.1.0': {
++            fullImage: 'https://updates.example.test/full.zip',
++            system: 'https://updates.example.test/system.zip',
++            version: 'https://updates.example.test/VERSION.json',
++            releaseNotes: ' ',
++          },
++        },
++      },
++    ],
++  ])('rejects %s when loading the cache', async (_name, invalidManifest) => {
++    await fse.outputJson(cachePath, invalidManifest)
++
++    await expect(getCachedReleaseManifest()).rejects.toThrow()
++  })
++
++  it('falls back without replacing the cache when the download is malformed', async () => {
++    await fse.outputJson(cachePath, VALID_MANIFEST)
++    vi.mocked(Http.fetchJson).mockResolvedValue({
++      production: {
++        '9.0.0': {
++          fullImage: 'https://updates.example.test/9.0.0/full.zip',
++          system: '',
++          version: 'https://updates.example.test/9.0.0/VERSION.json',
++        },
++      },
++    })
++
++    await expect(
++      downloadAndCacheReleaseManifest(MANIFEST_URL)
++    ).resolves.toEqual(VALID_MANIFEST)
++    await expect(fse.readJson(cachePath)).resolves.toEqual(VALID_MANIFEST)
++  })
++
++  it('rejects when neither the downloaded document nor the cache is valid', async () => {
++    await fse.outputJson(cachePath, { production: null })
++    vi.mocked(Http.fetchJson).mockResolvedValue({ production: { bad: {} } })
++
++    await expect(
++      downloadAndCacheReleaseManifest(MANIFEST_URL)
++    ).rejects.toThrow()
++  })
++
++  it('looks up valid release entries and returns null otherwise', () => {
++    expect(getReleaseSet(VALID_MANIFEST as ReleaseManifest, '8.1.0')).toEqual(
++      VALID_MANIFEST.production['8.1.0']
++    )
++    expect(getReleaseSet(VALID_MANIFEST as ReleaseManifest, '8.2.0')).toBeNull()
++    expect(
++      getReleaseSet(
++        ({
++          production: {
++            '8.2.0': {
++              fullImage: 'https://updates.example.test/full.zip',
++              system: '',
++              version: 'https://updates.example.test/VERSION.json',
++            },
++          },
++        } as unknown) as ReleaseManifest,
++        '8.2.0'
++      )
++    ).toBeNull()
++  })
++})
++
++describe('system update channel selection', () => {
++  const loadUpdateModule = async (
++    channel: 'latest' | 'beta' | 'alpha',
++    manifest: unknown
++  ) => {
++    vi.resetModules()
++    vi.doMock('../../config', () => ({
++      getConfig: () => ({ channel }),
++    }))
++    vi.doMock('../release-manifest', () => ({
++      downloadAndCacheReleaseManifest: () => Promise.resolve(manifest),
++      getCachedReleaseManifest: vi.fn(),
++      getReleaseSet: vi.fn(),
++    }))
++    vi.doMock('../../systemd', () => ({ default: {} }))
++    return import('../../update')
++  }
++
++  afterEach(() => {
++    vi.resetModules()
++    vi.clearAllMocks()
++    vi.unmock('../../config')
++    vi.unmock('../release-manifest')
++    vi.unmock('../../systemd')
++  })
++
++  it('selects the highest stable version for the latest channel', async () => {
++    const Update = await loadUpdateModule('latest', {
++      production: {
++        '8.0.0-rc.1': VALID_MANIFEST.production['8.1.0'],
++        '7.5.0': VALID_MANIFEST.production['8.1.0'],
++        '7.4.0-beta.9': VALID_MANIFEST.production['8.1.0'],
++      },
++    })
++
++    await expect(Update.updateLatestVersion()).resolves.toBe('7.5.0')
++  })
++
++  it('matches beta as an exact prerelease identifier', async () => {
++    const betaUpdate = await loadUpdateModule('beta', {
++      production: {
++        '9.0.0-alphabeta.1': VALID_MANIFEST.production['8.1.0'],
++        '8.0.0-beta.3': VALID_MANIFEST.production['8.1.0'],
++        '7.0.0-beta.8': VALID_MANIFEST.production['8.1.0'],
++      },
++    })
++    await expect(betaUpdate.updateLatestVersion()).resolves.toBe('8.0.0-beta.3')
++  })
++
++  it('matches alpha as an exact prerelease identifier', async () => {
++    const alphaUpdate = await loadUpdateModule('alpha', {
++      production: {
++        '9.0.0-prealpha.1': VALID_MANIFEST.production['8.1.0'],
++        '8.0.0-alpha.2': VALID_MANIFEST.production['8.1.0'],
++      },
++    })
++    await expect(alphaUpdate.updateLatestVersion()).resolves.toBe(
++      '8.0.0-alpha.2'
++    )
++  })
++})
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,8 @@
++#!/bin/bash
++set -euo pipefail
++
++
++./node_modules/.bin/vitest run \
++  app-shell-odd/src/system-update/__tests__/release-manifest-resilience.codespec.test.ts \
++  app-shell-odd/src/system-update/__tests__/release-manifest.test.ts \
++  --config vitest.config.ts

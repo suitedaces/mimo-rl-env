@@ -1,0 +1,272 @@
+diff --git a/sign/cosi/verify_hardening_test.go b/sign/cosi/verify_hardening_test.go
+new file mode 100644
+index 00000000..90dfc55c
+--- /dev/null
++++ b/sign/cosi/verify_hardening_test.go
+@@ -0,0 +1,249 @@
++package cosi
++
++import (
++	"testing"
++
++	"github.com/dedis/kyber"
++	"github.com/dedis/kyber/util/key"
++)
++
++type hardeningAcceptAllPolicy struct{}
++
++func (hardeningAcceptAllPolicy) Check(*Mask) bool { return true }
++
++func makeHardeningSignature(t *testing.T, enabled []int) ([]kyber.Point, []byte, []byte) {
++	t.Helper()
++	n := 3
++	message := []byte("cosi hardening")
++	publics := make([]kyber.Point, n)
++	privates := make([]kyber.Scalar, n)
++	for i := 0; i < n; i++ {
++		kp := key.NewKeyPair(testSuite)
++		publics[i], privates[i] = kp.Public, kp.Private
++	}
++	mask, err := NewMask(testSuite, publics, nil)
++	if err != nil {
++		t.Fatal(err)
++	}
++	for _, i := range enabled {
++		if err := mask.SetBit(i, true); err != nil {
++			t.Fatal(err)
++		}
++	}
++	vs := make([]kyber.Scalar, len(enabled))
++	commitments := make([]kyber.Point, len(enabled))
++	for i := range enabled {
++		vs[i], commitments[i] = Commit(testSuite)
++	}
++	commitment, maskBytes, err := AggregateCommitments(testSuite, commitments, func() [][]byte {
++		out := make([][]byte, len(enabled))
++		for i, participant := range enabled {
++			m, e := NewMask(testSuite, publics, publics[participant])
++			if e != nil {
++				t.Fatal(e)
++			}
++			out[i] = m.Mask()
++		}
++		return out
++	}())
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err := mask.SetMask(maskBytes); err != nil {
++		t.Fatal(err)
++	}
++	challenge, err := Challenge(testSuite, commitment, mask.AggregatePublic, message)
++	if err != nil {
++		t.Fatal(err)
++	}
++	responses := make([]kyber.Scalar, len(enabled))
++	for i, participant := range enabled {
++		responses[i], err = Response(testSuite, privates[participant], vs[i], challenge)
++		if err != nil {
++			t.Fatal(err)
++		}
++	}
++	response, err := AggregateResponses(testSuite, responses)
++	if err != nil {
++		t.Fatal(err)
++	}
++	sig, err := Sign(testSuite, commitment, response, mask)
++	if err != nil {
++		t.Fatal(err)
++	}
++	return publics, message, sig
++}
++
++func callVerifyNoPanic(suite Suite, publics []kyber.Point, message, sig []byte, policy Policy) (err error, panicked bool) {
++	defer func() {
++		if r := recover(); r != nil {
++			panicked = true
++		}
++	}()
++	err = Verify(suite, publics, message, sig, policy)
++	return
++}
++
++func callSetBitNoPanic(m *Mask, i int, enable bool) (err error, panicked bool) {
++	defer func() {
++		if r := recover(); r != nil {
++			panicked = true
++		}
++	}()
++	err = m.SetBit(i, enable)
++	return
++}
++
++func callIndexEnabledNoPanic(m *Mask, i int) (enabled bool, err error, panicked bool) {
++	defer func() {
++		if r := recover(); r != nil {
++			panicked = true
++		}
++	}()
++	enabled, err = m.IndexEnabled(i)
++	return
++}
++
++func makeZeroParticipantSignature(t *testing.T, mask []byte) []byte {
++	t.Helper()
++	r := testSuite.Scalar().Pick(testSuite.RandomStream())
++	v := testSuite.Point().Mul(r, nil)
++	vb, err := v.MarshalBinary()
++	if err != nil {
++		t.Fatal(err)
++	}
++	rb, err := r.MarshalBinary()
++	if err != nil {
++		t.Fatal(err)
++	}
++	sig := append(append([]byte(nil), vb...), rb...)
++	return append(sig, mask...)
++}
++
++func TestVerifyRejectsMalformedLengthsAndCanonicalMask(t *testing.T) {
++	publics, message, sig := makeHardeningSignature(t, []int{0, 1, 2})
++	if err := Verify(testSuite, publics, message, sig, nil); err != nil {
++		t.Fatalf("valid signature rejected: %v", err)
++	}
++	for length := 0; length < len(sig); length++ {
++		err, panicked := callVerifyNoPanic(testSuite, publics, message, sig[:length], nil)
++		if panicked {
++			t.Errorf("truncated signature of length %d panicked", length)
++		} else if err == nil {
++			t.Errorf("truncated signature of length %d was accepted", length)
++		}
++	}
++	withHighBit := makeZeroParticipantSignature(t, []byte{0x80})
++	if err := Verify(testSuite, publics, message, withHighBit, hardeningAcceptAllPolicy{}); err == nil {
++		t.Fatal("signature with an out-of-range participation bit accepted")
++	}
++	withExtra := makeZeroParticipantSignature(t, []byte{0, 0})
++	if err := Verify(testSuite, publics, message, withExtra, hardeningAcceptAllPolicy{}); err == nil {
++		t.Fatal("signature with an oversized mask accepted")
++	}
++}
++
++func TestRosterValidationAtPublicEntryPoints(t *testing.T) {
++	kp := key.NewKeyPair(testSuite)
++	cases := []struct {
++		name    string
++		publics []kyber.Point
++	}{
++		{name: "empty", publics: []kyber.Point{}},
++		{name: "nil entry", publics: []kyber.Point{nil}},
++		{name: "duplicate", publics: []kyber.Point{kp.Public, kp.Public}},
++	}
++	message := []byte("invalid roster")
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			if _, err := NewMask(testSuite, tc.publics, nil); err == nil {
++				t.Error("NewMask accepted an invalid public-key roster")
++			}
++			mask := make([]byte, (len(tc.publics)+7)/8)
++			sig := makeZeroParticipantSignature(t, mask)
++			err, panicked := callVerifyNoPanic(testSuite, tc.publics, message, sig, hardeningAcceptAllPolicy{})
++			if panicked {
++				t.Error("Verify panicked for an invalid public-key roster")
++			} else if err == nil {
++				t.Error("Verify accepted an invalid public-key roster")
++			}
++		})
++	}
++}
++
++func TestMaskRejectsNegativeIndices(t *testing.T) {
++	publics, _, _ := makeHardeningSignature(t, []int{0, 1, 2})
++	m, err := NewMask(testSuite, publics, nil)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err := m.SetBit(1, true); err != nil {
++		t.Fatal(err)
++	}
++	before := m.Mask()
++	aggregateBefore := testSuite.Point().Set(m.AggregatePublic)
++	if err, panicked := callSetBitNoPanic(m, -1, true); panicked {
++		t.Error("SetBit panicked for a negative index")
++	} else if err == nil {
++		t.Error("SetBit accepted a negative index")
++	}
++	if enabled, err, panicked := callIndexEnabledNoPanic(m, -1); panicked {
++		t.Error("IndexEnabled panicked for a negative index")
++	} else if err == nil || enabled {
++		t.Error("IndexEnabled accepted a negative index")
++	}
++	if err, panicked := callSetBitNoPanic(m, len(publics), true); panicked {
++		t.Error("SetBit panicked for an out-of-range index")
++	} else if err == nil {
++		t.Error("SetBit accepted an out-of-range index")
++	}
++	if enabled, err, panicked := callIndexEnabledNoPanic(m, len(publics)); panicked {
++		t.Error("IndexEnabled panicked for an out-of-range index")
++	} else if err == nil || enabled {
++		t.Error("IndexEnabled accepted an out-of-range index")
++	}
++	if got := m.Mask(); len(got) != len(before) || got[0] != before[0] || m.CountEnabled() != 1 || !m.AggregatePublic.Equal(aggregateBefore) {
++		t.Fatal("rejected negative index changed mask state")
++	}
++	if err := m.SetMask([]byte{0x82}); err == nil {
++		t.Error("SetMask accepted an out-of-range participation bit")
++	}
++	if got := m.Mask(); len(got) != len(before) || got[0] != before[0] || m.CountEnabled() != 1 || !m.AggregatePublic.Equal(aggregateBefore) {
++		t.Fatal("rejected non-canonical mask changed mask state")
++	}
++	if err := m.SetMask([]byte{0x02, 0x00}); err == nil {
++		t.Error("SetMask accepted the wrong number of bytes")
++	}
++	if got := m.Mask(); len(got) != len(before) || got[0] != before[0] || m.CountEnabled() != 1 || !m.AggregatePublic.Equal(aggregateBefore) {
++		t.Fatal("rejected wrong-length mask changed mask state")
++	}
++}
++
++func TestThresholdPolicyRejectsInvalidThresholds(t *testing.T) {
++	publics, _, _ := makeHardeningSignature(t, []int{0, 1, 2})
++	m, err := NewMask(testSuite, publics, nil)
++	if err != nil {
++		t.Fatal(err)
++	}
++	for _, threshold := range []int{-1, 0, 4} {
++		if NewThresholdPolicy(threshold).Check(m) {
++			t.Errorf("invalid threshold %d authorized a roster of size %d", threshold, len(publics))
++		}
++	}
++	if err := m.SetBit(0, true); err != nil {
++		t.Fatal(err)
++	}
++	if !NewThresholdPolicy(1).Check(m) {
++		t.Fatal("valid threshold policy rejected a sufficient mask")
++	}
++}
++
++func TestVerifyAcceptsThresholdSignature(t *testing.T) {
++	publics, message, sig := makeHardeningSignature(t, []int{0, 1})
++	if err := Verify(testSuite, publics, message, sig, NewThresholdPolicy(2)); err != nil {
++		t.Fatalf("valid threshold signature rejected: %v", err)
++	}
++	if err := Verify(testSuite, publics, message, sig, nil); err == nil {
++		t.Fatal("incomplete signature accepted by the default complete policy")
++	}
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,12 @@
++#!/bin/bash
++set -euo pipefail
++
++
++SYNTH_GOPATH="$(mktemp -d)"
++mkdir -p "${SYNTH_GOPATH}/src/github.com/dedis" "${SYNTH_GOPATH}/src/golang.org/x"
++ln -s "$(pwd)" "${SYNTH_GOPATH}/src/github.com/dedis/kyber"
++ln -s /root/go/pkg/mod/github.com/dedis/fixbuf@v1.0.2 "${SYNTH_GOPATH}/src/github.com/dedis/fixbuf"
++ln -s /root/go/pkg/mod/github.com/dedis/protobuf@v1.0.11 "${SYNTH_GOPATH}/src/github.com/dedis/protobuf"
++ln -s /root/go/pkg/mod/golang.org/x/crypto@v0.0.0-20210921155107-089bfa567519 "${SYNTH_GOPATH}/src/golang.org/x/crypto"
++ln -s /root/go/pkg/mod/golang.org/x/sys@v0.0.0-20210615035016-665e8c7367d1 "${SYNTH_GOPATH}/src/golang.org/x/sys"
++GO111MODULE=off GOPATH="${SYNTH_GOPATH}:/root/go" go test github.com/dedis/kyber/sign/cosi

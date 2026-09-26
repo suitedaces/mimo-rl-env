@@ -1,0 +1,203 @@
+diff --git a/tests/unit/lib/remote_invoke/test_sns_remote_invoke_codespec.py b/tests/unit/lib/remote_invoke/test_sns_remote_invoke_codespec.py
+new file mode 100644
+index 000000000..0bc9d72ff
+--- /dev/null
++++ b/tests/unit/lib/remote_invoke/test_sns_remote_invoke_codespec.py
+@@ -0,0 +1,188 @@
++import json
++import unittest
++from unittest.mock import Mock, patch
++
++from botocore.exceptions import ClientError, ParamValidationError
++
++from samcli.commands.remote.remote_invoke_context import RemoteInvokeContext
++from samcli.lib.remote_invoke.exceptions import ErrorBotoApiCallException, InvalidResourceBotoParameterException
++from samcli.lib.remote_invoke.remote_invoke_executor_factory import RemoteInvokeExecutorFactory
++from samcli.lib.remote_invoke.remote_invoke_executors import RemoteInvokeExecutionInfo, RemoteInvokeOutputFormat
++from samcli.lib.utils.cloudformation import CloudFormationResourceSummary
++
++
++SNS_TOPIC = "AWS::SNS::Topic"
++TOPIC_ARN = "arn:aws:sns:us-east-1:123456789012:orders"
++
++
++class RecordingConsumer:
++    def __init__(self):
++        self.values = []
++
++    def consume(self, value):
++        self.values.append(value)
++
++
++def create_executor(client, output_format):
++    response_consumer = RecordingConsumer()
++    log_consumer = RecordingConsumer()
++    client_provider = Mock(return_value=client)
++    summary = CloudFormationResourceSummary(SNS_TOPIC, "OrdersTopic", TOPIC_ARN)
++    executor = RemoteInvokeExecutorFactory(client_provider).create_remote_invoke_executor(
++        summary, output_format, response_consumer, log_consumer
++    )
++    return executor, response_consumer, log_consumer, client_provider
++
++
++class TestSnsRemoteInvokeExecution(unittest.TestCase):
++    def test_text_output_publishes_payload_and_shows_message_id(self):
++        client = Mock()
++        client.publish.return_value = {"MessageId": "mid", "ResponseMetadata": {"HTTPStatusCode": 200}}
++        executor, responses, _, client_provider = create_executor(client, RemoteInvokeOutputFormat.TEXT)
++
++        self.assertIsNotNone(executor)
++        client_provider.assert_called_once_with("sns")
++        executor.execute(
++            RemoteInvokeExecutionInfo(
++                payload="hello",
++                payload_file=None,
++                parameters={"Subject": "Order", "TopicArn": "ignored", "Message": "ignored"},
++                output_format=RemoteInvokeOutputFormat.TEXT,
++            )
++        )
++
++        client.publish.assert_called_once_with(Message="hello", Subject="Order", TopicArn=TOPIC_ARN)
++        self.assertEqual(json.loads(responses.values[0].response), {"MessageId": "mid"})
++
++    def test_json_output_preserves_full_service_response_and_defaults_empty_event(self):
++        client = Mock()
++        service_response = {"MessageId": "mid", "SequenceNumber": "42", "ResponseMetadata": {"RequestId": "r"}}
++        client.publish.return_value = service_response
++        executor, responses, _, _ = create_executor(client, RemoteInvokeOutputFormat.JSON)
++
++        self.assertIsNotNone(executor)
++        executor.execute(
++            RemoteInvokeExecutionInfo(
++                payload=None, payload_file=None, parameters={}, output_format=RemoteInvokeOutputFormat.JSON
++            )
++        )
++
++        client.publish.assert_called_once_with(Message="{}", TopicArn=TOPIC_ARN)
++        self.assertEqual(json.loads(responses.values[0].response), service_response)
++
++    def test_message_attributes_are_decoded_before_publish(self):
++        client = Mock()
++        client.publish.return_value = {"MessageId": "mid"}
++        executor, _, _, _ = create_executor(client, RemoteInvokeOutputFormat.JSON)
++        attributes = {"Trace": {"DataType": "String", "StringValue": "abc"}}
++
++        self.assertIsNotNone(executor)
++        executor.execute(
++            RemoteInvokeExecutionInfo(
++                payload="notice",
++                payload_file=None,
++                parameters={"MessageAttributes": json.dumps(attributes), "MessageStructure": "json"},
++                output_format=RemoteInvokeOutputFormat.JSON,
++            )
++        )
++
++        client.publish.assert_called_once_with(
++            Message="notice", MessageAttributes=attributes, MessageStructure="json", TopicArn=TOPIC_ARN
++        )
++
++    def test_invalid_message_attributes_fail_before_publish(self):
++        client = Mock()
++        executor, _, _, _ = create_executor(client, RemoteInvokeOutputFormat.JSON)
++        self.assertIsNotNone(executor)
++        invalid_attributes = RemoteInvokeExecutionInfo(
++            payload="notice",
++            payload_file=None,
++            parameters={"MessageAttributes": "not-json"},
++            output_format=RemoteInvokeOutputFormat.JSON,
++        )
++        with self.assertRaises(InvalidResourceBotoParameterException):
++            executor.execute(invalid_attributes)
++        client.publish.assert_not_called()
++
++    def test_parameter_validation_uses_invalid_parameter_exception(self):
++        client = Mock()
++        executor, _, _, _ = create_executor(client, RemoteInvokeOutputFormat.JSON)
++        self.assertIsNotNone(executor)
++        request = RemoteInvokeExecutionInfo(
++            payload="notice", payload_file=None, parameters={}, output_format=RemoteInvokeOutputFormat.JSON
++        )
++        client.publish.side_effect = ParamValidationError(report="bad parameter")
++        with self.assertRaises(InvalidResourceBotoParameterException):
++            executor.execute(request)
++
++    def test_client_error_uses_api_call_exception(self):
++        client = Mock()
++        executor, _, _, _ = create_executor(client, RemoteInvokeOutputFormat.JSON)
++        self.assertIsNotNone(executor)
++        request = RemoteInvokeExecutionInfo(
++            payload="notice", payload_file=None, parameters={}, output_format=RemoteInvokeOutputFormat.JSON
++        )
++        client.publish.side_effect = ClientError({"Error": {"Code": "AccessDenied"}}, "Publish")
++        with self.assertRaises(ErrorBotoApiCallException):
++            executor.execute(request)
++
++
++class TestSnsRemoteInvokeResourceResolution(unittest.TestCase):
++    def test_sns_arn_resolves_without_cloudformation_lookup(self):
++        context = RemoteInvokeContext(Mock(), Mock(), stack_name=None, resource_id=TOPIC_ARN)
++
++        self.assertEqual(context.resource_summary.resource_type, SNS_TOPIC)
++        self.assertEqual(context.resource_summary.physical_resource_id, TOPIC_ARN)
++
++    @patch("samcli.commands.remote.remote_invoke_context.get_resource_summaries")
++    def test_stack_with_single_sns_topic_selects_the_topic(self, get_summaries):
++        topic = CloudFormationResourceSummary(SNS_TOPIC, "OrdersTopic", TOPIC_ARN)
++
++        def filter_like_cloudformation(*args, **kwargs):
++            return {"OrdersTopic": topic} if SNS_TOPIC in kwargs.get("resource_types", args[3]) else {}
++
++        get_summaries.side_effect = filter_like_cloudformation
++        context = RemoteInvokeContext(Mock(), Mock(), stack_name="app", resource_id=None)
++
++        self.assertEqual(context.resource_summary, topic)
++
++    @patch("samcli.commands.remote.remote_invoke_context.get_resource_summaries")
++    def test_adding_sns_does_not_displace_existing_stack_priority(self, get_summaries):
++        topic = CloudFormationResourceSummary(SNS_TOPIC, "OrdersTopic", TOPIC_ARN)
++        existing_types = [
++            "AWS::Lambda::Function",
++            "AWS::StepFunctions::StateMachine",
++            "AWS::SQS::Queue",
++            "AWS::Kinesis::Stream",
++        ]
++
++        for resource_type in existing_types:
++            with self.subTest(resource_type=resource_type):
++                existing = CloudFormationResourceSummary(resource_type, "ExistingResource", "physical-id")
++                get_summaries.return_value = {"OrdersTopic": topic, "ExistingResource": existing}
++                context = RemoteInvokeContext(Mock(), Mock(), stack_name="app", resource_id=None)
++                self.assertEqual(context.resource_summary, existing)
++
++    def test_existing_remote_invoke_resource_types_still_have_executors(self):
++        client = Mock()
++        client.get_function_url_config.side_effect = ClientError({"Error": {"Code": "NotFound"}}, "GetFunctionUrlConfig")
++        factory = RemoteInvokeExecutorFactory(lambda service: client)
++        existing_types = [
++            "AWS::Lambda::Function",
++            "AWS::StepFunctions::StateMachine",
++            "AWS::SQS::Queue",
++            "AWS::Kinesis::Stream",
++        ]
++
++        for resource_type in existing_types:
++            with self.subTest(resource_type=resource_type):
++                summary = CloudFormationResourceSummary(resource_type, "Resource", "physical-id")
++                self.assertIsNotNone(
++                    factory.create_remote_invoke_executor(
++                        summary, RemoteInvokeOutputFormat.TEXT, RecordingConsumer(), RecordingConsumer()
++                    )
++                )
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,4 @@
++#!/bin/bash
++set -euo pipefail
++
++PYTHONWARNINGS=ignore ./.venv/bin/pytest -q tests/unit/lib/remote_invoke/test_sns_remote_invoke_codespec.py

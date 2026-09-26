@@ -1,0 +1,158 @@
+diff --git a/node/api/metrics_resource_contract_test.go b/node/api/metrics_resource_contract_test.go
+new file mode 100644
+index 00000000..2de31704
+--- /dev/null
++++ b/node/api/metrics_resource_contract_test.go
+@@ -0,0 +1,142 @@
++package api
++
++import (
++	"context"
++	"errors"
++	"net/http"
++	"net/http/httptest"
++	"os"
++	"strings"
++	"testing"
++
++	"github.com/gorilla/mux"
++	dto "github.com/prometheus/client_model/go"
++	"github.com/prometheus/common/expfmt"
++	"github.com/virtual-kubelet/virtual-kubelet/node/api/statsv1alpha1"
++	"gotest.tools/assert"
++)
++
++type contractServeMux struct{ router *mux.Router }
++
++func (m contractServeMux) Handle(path string, h http.Handler) { m.router.Handle(path, h) }
++
++func contractMetricFamilies() []*dto.MetricFamily {
++	str := func(v string) *string { return &v }
++	flt := func(v float64) *float64 { return &v }
++	integer := func(v int64) *int64 { return &v }
++	return []*dto.MetricFamily{
++		{
++			Name: str("container_cpu_usage_seconds_total"),
++			Help: str("Cumulative cpu time consumed by the container in core-seconds"),
++			Type: dto.MetricType_COUNTER.Enum(),
++			Metric: []*dto.Metric{{
++				Label:       []*dto.LabelPair{{Name: str("pod"), Value: str("demo")}, {Name: str("container"), Value: str("app")}},
++				Counter:     &dto.Counter{Value: flt(12.5)},
++				TimestampMs: integer(1700000000123),
++			}},
++		},
++		{
++			Name:   str("node_memory_working_set_bytes"),
++			Help:   str("Working set memory in bytes"),
++			Type:   dto.MetricType_GAUGE.Enum(),
++			Metric: []*dto.Metric{{Gauge: &dto.Gauge{Value: flt(4096)}}},
++		},
++	}
++}
++
++func TestHandlePodMetricsResourceUsesPrometheusTextContract(t *testing.T) {
++	h := HandlePodMetricsResource(func(context.Context) ([]*dto.MetricFamily, error) {
++		return contractMetricFamilies(), nil
++	})
++	r := httptest.NewRequest(http.MethodGet, MetricsResourceRouteSuffix, nil)
++	w := httptest.NewRecorder()
++	h(w, r)
++
++	assert.Equal(t, w.Code, http.StatusOK)
++	assert.Assert(t, strings.Contains(w.Header().Get("Content-Type"), "text/plain"))
++	assert.Assert(t, strings.Contains(w.Header().Get("Content-Type"), "version=0.0.4"))
++	body := w.Body.String()
++	assert.Assert(t, strings.HasPrefix(body, "# HELP "))
++	assert.Assert(t, !strings.HasPrefix(strings.TrimSpace(body), "["))
++
++	families, err := (&expfmt.TextParser{}).TextToMetricFamilies(strings.NewReader(body))
++	assert.NilError(t, err)
++	assert.Equal(t, len(families), 2)
++	cpu := families["container_cpu_usage_seconds_total"]
++	assert.Assert(t, cpu != nil)
++	assert.Equal(t, cpu.GetType(), dto.MetricType_COUNTER)
++	assert.Equal(t, cpu.Metric[0].GetCounter().GetValue(), 12.5)
++	assert.Equal(t, cpu.Metric[0].GetTimestampMs(), int64(1700000000123))
++	labels := map[string]string{}
++	for _, label := range cpu.Metric[0].Label {
++		labels[label.GetName()] = label.GetValue()
++	}
++	assert.Equal(t, labels["pod"], "demo")
++	assert.Equal(t, labels["container"], "app")
++}
++
++func TestPodHandlerRoutesMetricsAndPreservesSummaryJSON(t *testing.T) {
++	metrics := func(context.Context) ([]*dto.MetricFamily, error) { return contractMetricFamilies()[:1], nil }
++	summary := func(context.Context) (*statsv1alpha1.Summary, error) {
++		return &statsv1alpha1.Summary{Node: statsv1alpha1.NodeStats{NodeName: "virtual-node"}}, nil
++	}
++	router := PodHandler(PodHandlerConfig{GetMetricsResource: metrics, GetStatsSummary: summary}, false)
++
++	for _, path := range []string{"/metrics/resource", "/metrics/resource/"} {
++		w := httptest.NewRecorder()
++		router.ServeHTTP(w, httptest.NewRequest(http.MethodGet, path, nil))
++		assert.Equal(t, w.Code, http.StatusOK)
++		assert.Assert(t, strings.Contains(w.Header().Get("Content-Type"), "text/plain"))
++		assert.Assert(t, strings.Contains(w.Header().Get("Content-Type"), "version=0.0.4"))
++		assert.Assert(t, strings.HasPrefix(w.Body.String(), "# HELP "))
++	}
++
++	w := httptest.NewRecorder()
++	router.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/stats/summary", nil))
++	assert.Equal(t, w.Code, http.StatusOK)
++	assert.Assert(t, strings.Contains(w.Body.String(), `"nodeName":"virtual-node"`))
++}
++
++func TestAttachPodMetricsRoutesSeparatesEndpoints(t *testing.T) {
++	metrics := func(context.Context) ([]*dto.MetricFamily, error) { return contractMetricFamilies()[:1], nil }
++	summary := func(context.Context) (*statsv1alpha1.Summary, error) {
++		return &statsv1alpha1.Summary{Node: statsv1alpha1.NodeStats{NodeName: "attached-node"}}, nil
++	}
++	router := mux.NewRouter()
++	AttachPodMetricsRoutes(PodMetricsConfig{GetStatsSummary: summary, GetMetricsResource: metrics}, contractServeMux{router: router})
++
++	w := httptest.NewRecorder()
++	router.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/metrics/resource", nil))
++	assert.Equal(t, w.Code, http.StatusOK)
++	assert.Assert(t, strings.HasPrefix(w.Body.String(), "# HELP "))
++
++	w = httptest.NewRecorder()
++	router.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/stats/summary", nil))
++	assert.Equal(t, w.Code, http.StatusOK)
++	assert.Assert(t, strings.Contains(w.Body.String(), `"nodeName":"attached-node"`))
++}
++
++func TestHandlePodMetricsResourceErrorsAndNilHandler(t *testing.T) {
++	failing := HandlePodMetricsResource(func(context.Context) ([]*dto.MetricFamily, error) {
++		return nil, errors.New("provider unavailable")
++	})
++	w := httptest.NewRecorder()
++	failing(w, httptest.NewRequest(http.MethodGet, MetricsResourceRouteSuffix, nil))
++	assert.Equal(t, w.Code, http.StatusInternalServerError)
++	assert.Assert(t, strings.Contains(w.Body.String(), "provider unavailable"))
++
++	nilHandler := HandlePodMetricsResource(nil)
++	w = httptest.NewRecorder()
++	nilHandler(w, httptest.NewRequest(http.MethodGet, MetricsResourceRouteSuffix, nil))
++	assert.Equal(t, w.Code, http.StatusNotImplemented)
++}
++
++func TestMetricsProposalDocumentsWireFormat(t *testing.T) {
++	b, err := os.ReadFile("../../docs/proposals/MetricsUpdateProposal.md")
++	assert.NilError(t, err)
++	doc := string(b)
++	assert.Assert(t, strings.Contains(doc, "/metrics/resource"))
++	lower := strings.ToLower(doc)
++	assert.Assert(t, strings.Contains(lower, "prometheus text exposition") || strings.Contains(lower, "prometheus text format") || strings.Contains(lower, "prometheus exposition format"))
++	assert.Assert(t, strings.Contains(doc, "/stats/summary"))
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,5 @@
++#!/bin/bash
++set -euo pipefail
++
++
++go test ./node/api -run 'Test(HandlePodMetricsResource|PodHandlerRoutes|AttachPodMetricsRoutes|MetricsProposal)' -count=1

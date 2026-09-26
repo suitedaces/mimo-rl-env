@@ -1,0 +1,277 @@
+diff --git a/ddtrace/tracer/w3c_baggage_codespec_test.go b/ddtrace/tracer/w3c_baggage_codespec_test.go
+new file mode 100644
+index 000000000..5878deb71
+--- /dev/null
++++ b/ddtrace/tracer/w3c_baggage_codespec_test.go
+@@ -0,0 +1,261 @@
++
++
++
++
++
++package tracer_test
++
++import (
++	"fmt"
++	"net/http"
++	"strings"
++	"testing"
++
++	"github.com/DataDog/dd-trace-go/v2/ddtrace"
++	"github.com/DataDog/dd-trace-go/v2/ddtrace/tracer"
++)
++
++const codespecTraceparent = "00-12345678901234567890123456789012-1234567890123456-01"
++
++func codespecPropagator(t *testing.T, extractStyle, injectStyle string) tracer.Propagator {
++	t.Helper()
++	t.Setenv("DD_TRACE_PROPAGATION_STYLE", "")
++	t.Setenv("DD_PROPAGATION_STYLE_EXTRACT", "")
++	t.Setenv("DD_PROPAGATION_STYLE_INJECT", "")
++	t.Setenv("DD_TRACE_PROPAGATION_STYLE_EXTRACT", extractStyle)
++	t.Setenv("DD_TRACE_PROPAGATION_STYLE_INJECT", injectStyle)
++	return tracer.NewPropagator(nil)
++}
++
++func codespecBaggage(ctx ddtrace.SpanContext) map[string]string {
++	got := make(map[string]string)
++	ctx.ForeachBaggageItem(func(k, v string) bool {
++		got[k] = v
++		return true
++	})
++	return got
++}
++
++func codespecExtract(t *testing.T, p tracer.Propagator, carrier interface{}) ddtrace.SpanContext {
++	t.Helper()
++	ctx, err := p.Extract(carrier)
++	if err != nil {
++		t.Fatalf("Extract returned an error: %v", err)
++	}
++	return ctx
++}
++
++func TestCodeSpecW3CBaggageRoundTripEncoding(t *testing.T) {
++	p := codespecPropagator(t, "tracecontext", "tracecontext")
++	in := http.Header{}
++	in.Set("Traceparent", codespecTraceparent)
++	in.Set("Baggage", "account=alpha%20team,opaque=a%2Cb%3Bc%3D1;vendor=meta,plus=a+b,unicode=caf%C3%A9")
++
++	ctx := codespecExtract(t, p, tracer.HTTPHeadersCarrier(in))
++	want := map[string]string{
++		"account": "alpha team",
++		"opaque":  "a,b;c=1",
++		"plus":    "a+b",
++		"unicode": "caf\u00e9",
++	}
++	if got := codespecBaggage(ctx); !codespecMapsEqual(got, want) {
++		t.Fatalf("extracted baggage = %#v, want %#v", got, want)
++	}
++
++	out := http.Header{}
++	if err := p.Inject(ctx, tracer.HTTPHeadersCarrier(out)); err != nil {
++		t.Fatalf("Inject returned an error: %v", err)
++	}
++	const wantHeader = "account=alpha%20team,opaque=a%2Cb%3Bc%3D1,plus=a%2Bb,unicode=caf%C3%A9"
++	if got := out.Get("Baggage"); got != wantHeader {
++		t.Fatalf("Baggage header = %q, want %q", got, wantHeader)
++	}
++	for key := range want {
++		if got := out.Get(tracer.DefaultBaggageHeaderPrefix + key); got != "" {
++			t.Errorf("tracecontext-only injection unexpectedly wrote legacy header for %q: %q", key, got)
++		}
++	}
++}
++
++func TestCodeSpecW3CBaggageRepeatedFieldsAndRecovery(t *testing.T) {
++	p := codespecPropagator(t, "tracecontext", "tracecontext")
++	in := http.Header{}
++	in.Set("Traceparent", codespecTraceparent)
++	in.Add("Baggage", "dup=first, good = value ; prop=one, =empty, bad key=nope")
++	in.Add("Baggage", "dup=second, broken=%ZZ, tail=ok")
++
++	ctx := codespecExtract(t, p, tracer.HTTPHeadersCarrier(in))
++	want := map[string]string{"dup": "first", "good": "value", "tail": "ok"}
++	if got := codespecBaggage(ctx); !codespecMapsEqual(got, want) {
++		t.Fatalf("extracted baggage = %#v, want valid members %#v", got, want)
++	}
++}
++
++func TestCodeSpecW3CBaggageMixedStylePrecedence(t *testing.T) {
++	p := codespecPropagator(t, "datadog,tracecontext", "datadog,tracecontext")
++	in := http.Header{}
++	in.Set("X-Datadog-Trace-Id", "123")
++	in.Set("X-Datadog-Parent-Id", "456")
++	in.Set("X-Datadog-Sampling-Priority", "1")
++	in.Set("Traceparent", codespecTraceparent)
++	in.Set("Baggage", "shared=standard,w3c=present")
++	in.Set("Ot-Baggage-Shared", "legacy")
++	in.Set("Ot-Baggage-Old", "kept")
++
++	ctx := codespecExtract(t, p, tracer.HTTPHeadersCarrier(in))
++	if ctx.TraceID() != 123 || ctx.SpanID() != 456 {
++		t.Fatalf("configured trace precedence changed: got trace/span %d/%d, want 123/456", ctx.TraceID(), ctx.SpanID())
++	}
++	want := map[string]string{"old": "kept", "shared": "standard", "w3c": "present"}
++	if got := codespecBaggage(ctx); !codespecMapsEqual(got, want) {
++		t.Fatalf("mixed-style baggage = %#v, want %#v", got, want)
++	}
++
++	out := http.Header{}
++	if err := p.Inject(ctx, tracer.HTTPHeadersCarrier(out)); err != nil {
++		t.Fatalf("Inject returned an error: %v", err)
++	}
++	if got, want := out.Get("Baggage"), "old=kept,shared=standard,w3c=present"; got != want {
++		t.Errorf("standard Baggage header = %q, want %q", got, want)
++	}
++	for key, wantValue := range want {
++		if got := out.Get(tracer.DefaultBaggageHeaderPrefix + key); got != wantValue {
++			t.Errorf("legacy baggage header %q = %q, want %q", key, got, wantValue)
++		}
++	}
++}
++
++func TestCodeSpecW3CBaggageStyleIsolation(t *testing.T) {
++	p := codespecPropagator(t, "datadog", "datadog")
++	in := tracer.TextMapCarrier{
++		"x-datadog-trace-id":  "123",
++		"x-datadog-parent-id": "456",
++		"baggage":             "standard=ignored",
++		"ot-baggage-legacy":   "kept",
++	}
++	ctx := codespecExtract(t, p, in)
++	if got, want := codespecBaggage(ctx), map[string]string{"legacy": "kept"}; !codespecMapsEqual(got, want) {
++		t.Fatalf("Datadog-only extraction baggage = %#v, want %#v", got, want)
++	}
++	out := tracer.TextMapCarrier{}
++	if err := p.Inject(ctx, out); err != nil {
++		t.Fatalf("Inject returned an error: %v", err)
++	}
++	if _, ok := out["baggage"]; ok {
++		t.Errorf("Datadog-only injection unexpectedly wrote a W3C baggage header: %#v", out)
++	}
++	if got := out["ot-baggage-legacy"]; got != "kept" {
++		t.Errorf("legacy baggage header = %q, want kept", got)
++	}
++}
++
++func TestCodeSpecW3CBaggageExtractionLimits(t *testing.T) {
++	t.Run("8192-byte-boundary", func(t *testing.T) {
++		p := codespecPropagator(t, "tracecontext", "tracecontext")
++		atLimit := "edge=" + strings.Repeat("x", 8192-len("edge="))
++		ctx := codespecExtract(t, p, tracer.TextMapCarrier{
++			"traceparent": codespecTraceparent,
++			"baggage":     atLimit,
++		})
++		if got := codespecBaggage(ctx)["edge"]; len(got) != 8192-len("edge=") {
++			t.Fatalf("8192-byte baggage value length = %d, want %d", len(got), 8192-len("edge="))
++		}
++
++		ctx = codespecExtract(t, p, tracer.TextMapCarrier{
++			"traceparent":    codespecTraceparent,
++			"baggage":        atLimit + "x",
++			"ot-baggage-old": "kept",
++		})
++		if got, want := codespecBaggage(ctx), map[string]string{"old": "kept"}; !codespecMapsEqual(got, want) {
++			t.Fatalf("over-limit extraction baggage = %#v, want %#v", got, want)
++		}
++	})
++
++	t.Run("64-member-boundary", func(t *testing.T) {
++		p := codespecPropagator(t, "tracecontext", "tracecontext")
++		members := make([]string, 65)
++		for i := range members {
++			members[i] = fmt.Sprintf("k%02d=v", i)
++		}
++		ctx := codespecExtract(t, p, tracer.TextMapCarrier{
++			"traceparent": codespecTraceparent,
++			"baggage":     strings.Join(members, ","),
++		})
++		got := codespecBaggage(ctx)
++		if len(got) != 64 || got["k63"] != "v" {
++			t.Fatalf("member-limited baggage has %d entries and k63=%q, want 64 entries through k63", len(got), got["k63"])
++		}
++		if _, ok := got["k64"]; ok {
++			t.Error("65th baggage member was not ignored")
++		}
++	})
++}
++
++func TestCodeSpecW3CBaggageInjectionLimitsAndValidation(t *testing.T) {
++	t.Run("count-and-key-validation", func(t *testing.T) {
++		p := codespecPropagator(t, "tracecontext", "tracecontext")
++		in := tracer.TextMapCarrier{
++			"traceparent":        codespecTraceparent,
++			"ot-baggage-bad key": "nope",
++		}
++		members := make([]string, 65)
++		for i := range members {
++			key := fmt.Sprintf("k%02d", i)
++			in["ot-baggage-"+key] = "v"
++			members[i] = key + "=v"
++		}
++		ctx := codespecExtract(t, p, in)
++		out := tracer.TextMapCarrier{}
++		if err := p.Inject(ctx, out); err != nil {
++			t.Fatalf("Inject returned an error: %v", err)
++		}
++		if got, want := out["baggage"], strings.Join(members[:64], ","); got != want {
++			t.Fatalf("count-limited Baggage header = %q, want %q", got, want)
++		}
++		if strings.Contains(out["baggage"], "bad key") || strings.Contains(out["baggage"], "k64=") {
++			t.Errorf("Baggage header contains an invalid or excess member: %q", out["baggage"])
++		}
++	})
++
++	t.Run("oversized-item-does-not-hide-later-item", func(t *testing.T) {
++		p := codespecPropagator(t, "tracecontext", "tracecontext")
++		ctx := codespecExtract(t, p, tracer.TextMapCarrier{
++			"traceparent":           codespecTraceparent,
++			"ot-baggage-a-oversize": strings.Repeat("x", 8192),
++			"ot-baggage-z-small":    "ok",
++		})
++		out := tracer.TextMapCarrier{}
++		if err := p.Inject(ctx, out); err != nil {
++			t.Fatalf("Inject returned an error: %v", err)
++		}
++		if got, want := out["baggage"], "z-small=ok"; got != want {
++			t.Fatalf("Baggage header = %q, want %q", got, want)
++		}
++	})
++
++	t.Run("empty-baggage-omits-header", func(t *testing.T) {
++		p := codespecPropagator(t, "tracecontext", "tracecontext")
++		ctx := codespecExtract(t, p, tracer.TextMapCarrier{
++			"traceparent": codespecTraceparent,
++		})
++		out := tracer.TextMapCarrier{}
++		if err := p.Inject(ctx, out); err != nil {
++			t.Fatalf("Inject returned an error: %v", err)
++		}
++		if _, ok := out["baggage"]; ok {
++			t.Errorf("empty context produced a baggage header: %#v", out)
++		}
++	})
++}
++
++func codespecMapsEqual(a, b map[string]string) bool {
++	if len(a) != len(b) {
++		return false
++	}
++	for k, v := range a {
++		if b[k] != v {
++			return false
++		}
++	}
++	return true
++}
+
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,4 @@
++#!/bin/bash
++set -euo pipefail
++
++go test ./ddtrace/tracer -run '^(TestCodeSpecW3CBaggage.*|TestW3CExtractsBaggage|TestPropagationDefaults)$' -count=1

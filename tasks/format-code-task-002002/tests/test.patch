@@ -1,0 +1,327 @@
+diff --git a/usercase-test-coderl/fixtures/sitecustomize.py b/usercase-test-coderl/fixtures/sitecustomize.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/fixtures/sitecustomize.py
+@@ -0,0 +1,109 @@
++import builtins
++import ipaddress
++import socket
++import sys
++import types
++
++builtins.unce = False
++
++
++
++_orig_getaddrinfo = socket.getaddrinfo
++_orig_socket_connect = socket.socket.connect
++_orig_create_connection = socket.create_connection
++
++
++def _is_local_host(host):
++    if host in (None, "", "localhost"):
++        return True
++    try:
++        return ipaddress.ip_address(host).is_loopback
++    except ValueError:
++        return False
++
++
++def _host_from_address(address):
++    if isinstance(address, tuple) and address:
++        return address[0]
++    return None
++
++
++def _reject_remote(host):
++    if not _is_local_host(host):
++        raise RuntimeError(f"isolated offline: remote network disabled for {host!r}")
++
++
++def _offline_getaddrinfo(host, *args, **kwargs):
++    _reject_remote(host)
++    return _orig_getaddrinfo(host, *args, **kwargs)
++
++
++def _offline_connect(self, address):
++    _reject_remote(_host_from_address(address))
++    return _orig_socket_connect(self, address)
++
++
++def _offline_create_connection(address, *args, **kwargs):
++    _reject_remote(_host_from_address(address))
++    return _orig_create_connection(address, *args, **kwargs)
++
++
++socket.getaddrinfo = _offline_getaddrinfo
++socket.socket.connect = _offline_connect
++socket.create_connection = _offline_create_connection
++
++PNG = (
++    b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01"
++    b"\x00\x00\x00\x01\x08\x02\x00\x00\x00\x90wS\xde"
++    b"\x00\x00\x00\x0cIDATx\x9cc```\x00\x00\x00\x04\x00\x01"
++    b"\xf6\x178U\x00\x00\x00\x00IEND\xaeB`\x82"
++)
++
++
++def fake_search(number, sources=None, **kwargs):
++    return {
++        "title": "Fixture Title",
++        "number": number,
++        "actor": "Fixture Actor",
++        "director": "Fixture Director",
++        "release": "2020-01-02",
++        "studio": "Fixture Studio",
++        "source": "fixture",
++        "runtime": "88",
++        "outline": "Fixture outline.",
++        "label": "Fixture Label",
++        "series": "Fixture Series",
++        "year": "2020",
++        "cover": "http://fixture.invalid/cover.png",
++        "cover_small": "",
++        "trailer": "",
++        "extrafanart": "",
++        "imagecut": 0,
++        "tag": ["FixtureTag"],
++        "actor_photo": {},
++        "website": "http://fixture.invalid/movie",
++    }
++
++
++api = types.ModuleType("scrapinglib.api")
++api.search = fake_search
++api.getSupportedSources = lambda: "fixture"
++
++pkg = types.ModuleType("scrapinglib")
++pkg.__path__ = []
++pkg.search = fake_search
++pkg.getSupportedSources = api.getSupportedSources
++
++sys.modules["scrapinglib"] = pkg
++sys.modules["scrapinglib.api"] = api
++
++
++def fake_get_html(url, *args, **kwargs):
++    if kwargs.get("return_type") == "content" or (len(args) >= 3 and args[2] == "content"):
++        return PNG
++    return "fixture"
++
++
++import ADC_function
++
++ADC_function.get_html = fake_get_html
+diff --git a/usercase-test-coderl/usecase.sh b/usercase-test-coderl/usecase.sh
+new file mode 100755
+--- /dev/null
++++ b/usercase-test-coderl/usecase.sh
+@@ -0,0 +1,184 @@
++#!/usr/bin/env bash
++
++set -u
++export LANG=C.UTF-8 LC_ALL=C.UTF-8 TZ=UTC
++
++REPO=/workspace/repo
++ENTRY="$REPO/Movie_Data_Capture.py"
++PYTHON=${PYTHON:-python}
++FIXTURES="$REPO/usercase-test-coderl/fixtures"
++export PYTHONPATH="$FIXTURES:$REPO${PYTHONPATH:+:$PYTHONPATH}"
++
++fail() { echo "FAIL: $*" >&2; exit 1; }
++
++( cd "$REPO" && PYTHONWARNINGS="ignore::SyntaxWarning" "$PYTHON" - <<'PY'
++from pathlib import Path
++
++for name in ("Movie_Data_Capture.py", "core.py", "config.py", "ADC_function.py", "scraper.py"):
++    compile(Path(name).read_text(encoding="utf-8"), name, "exec")
++PY
++) \
++    || fail "build"
++
++TMP=$(mktemp -d)
++trap 'rm -rf "$TMP"' EXIT
++
++prepare_case() {
++    local name=$1
++    mkdir -p "$TMP/$name/media"
++    cp "$REPO/config.ini" "$TMP/$name/config.ini"
++}
++
++run_mdc() {
++    local case_dir=$1
++    local movie=$2
++    local mode=$3
++    local link_mode=$4
++    local sub_types=$5
++
++    (
++        cd "$case_dir" && \
++        PYTHONDONTWRITEBYTECODE=1 \
++        PYTHONWARNINGS="ignore::SyntaxWarning" \
++        "$PYTHON" "$ENTRY" "$case_dir/media/$movie" \
++            -m "$mode" -n ABP-123 -L "$link_mode" -a -o "" \
++            -C "common:success_output_folder=$case_dir/output;failed_output_folder=$case_dir/failed;del_empty_folder=0;download_only_missing_images=0;sleep=0;nfo_skip_days=0" \
++            -C "Name_Rule:location_rule=number;naming_rule=number;image_naming_with_number=1" \
++            -C "media:sub_type=$sub_types" \
++            -C "watermark:switch=0" \
++            -C "extrafanart:switch=0" \
++            -C "storyline:switch=0" \
++            -C "trailer:switch=0" \
++            -C "actor_photo:download_for_kodi=0" \
++            >out 2>err
++    )
++    return $?
++}
++
++assert_clean_success() {
++    local label=$1
++    local ec=$2
++    [ "$ec" -eq 0 ] || fail "$label exit $ec; want 0"
++    [ ! -s err ] || fail "$label unexpected stderr: $(cat err)"
++}
++
++assert_file_text() {
++    local label=$1
++    local path=$2
++    local expected=$3
++    [ -f "$path" ] || fail "$label missing file $path"
++    [ "$(cat "$path")" = "$expected" ] || fail "$label content mismatch for $path"
++}
++
++
++
++
++prepare_case f1
++printf video > "$TMP/f1/media/ABP-123.mp4"
++printf f1-sub > "$TMP/f1/media/ABP-123.srt"
++cd "$TMP/f1"
++run_mdc "$TMP/f1" ABP-123.mp4 1 0 ".srt"; ec=$?
++assert_clean_success F1 "$ec"
++grep -Fxq "[+]Sub Moved!        ABP-123.srt" out || fail "F1 missing exact moved line"
++assert_file_text F1 "$TMP/f1/output/ABP-123/ABP-123.mp4" video
++assert_file_text F1 "$TMP/f1/output/ABP-123/ABP-123.srt" f1-sub
++[ ! -e "$TMP/f1/media/ABP-123.srt" ] || fail "F1 subtitle should be moved from source"
++
++
++
++
++prepare_case f2
++printf video > "$TMP/f2/media/ABP-123.mp4"
++printf f2-sub > "$TMP/f2/media/ABP-123.srt"
++cd "$TMP/f2"
++run_mdc "$TMP/f2" ABP-123.mp4 1 1 ".srt"; ec=$?
++assert_clean_success F2 "$ec"
++grep -Fxq "[+]Sub Copied!       ABP-123.srt" out || fail "F2 missing exact copied line"
++assert_file_text F2 "$TMP/f2/output/ABP-123/ABP-123.srt" f2-sub
++assert_file_text F2 "$TMP/f2/media/ABP-123.srt" f2-sub
++
++
++
++
++prepare_case f3
++printf video > "$TMP/f3/media/ABP-123.mp4"
++printf f3-zh-sub > "$TMP/f3/media/ABP-123.zh.srt"
++cd "$TMP/f3"
++run_mdc "$TMP/f3" ABP-123.mp4 1 0 ".srt"; ec=$?
++assert_clean_success F3 "$ec"
++
++grep -Fq "[+]Sub Moved!" out || fail "F3 missing moved subtitle signal"
++grep -Fq "ABP-123.zh.srt" out || fail "F3 missing preserved multi-suffix subtitle name"
++assert_file_text F3 "$TMP/f3/output/ABP-123/ABP-123.zh.srt" f3-zh-sub
++[ ! -e "$TMP/f3/media/ABP-123.zh.srt" ] || fail "F3 multi-suffix subtitle should be moved from source"
++
++
++
++
++prepare_case f4
++printf video > "$TMP/f4/media/ABP-123-CD2.mp4"
++printf cd1-sub > "$TMP/f4/media/ABP-123-CD1.srt"
++printf cd2-sub > "$TMP/f4/media/ABP-123-CD2.srt"
++cd "$TMP/f4"
++run_mdc "$TMP/f4" ABP-123-CD2.mp4 1 0 ".srt"; ec=$?
++assert_clean_success F4 "$ec"
++
++grep -Fq "[+]Sub Moved!" out || fail "F4 missing moved subtitle signal"
++grep -Fq "ABP-123-CD2.srt" out || fail "F4 missing matching CD2 subtitle name"
++assert_file_text F4 "$TMP/f4/output/ABP-123/ABP-123-CD2.mp4" video
++assert_file_text F4 "$TMP/f4/output/ABP-123/ABP-123-CD2.srt" cd2-sub
++assert_file_text F4 "$TMP/f4/media/ABP-123-CD1.srt" cd1-sub
++[ ! -e "$TMP/f4/output/ABP-123/ABP-123-CD1.srt" ] || fail "F4 should not carry mismatched CD1 subtitle"
++[ ! -e "$TMP/f4/media/ABP-123-CD2.srt" ] || fail "F4 matching CD2 subtitle should be moved from source"
++
++
++
++
++prepare_case f5
++printf video > "$TMP/f5/media/ABP-123.mp4"
++printf f5-sub > "$TMP/f5/media/ABP-123.srt"
++cd "$TMP/f5"
++run_mdc "$TMP/f5" ABP-123.mp4 2 0 ".srt"; ec=$?
++assert_clean_success F5 "$ec"
++
++grep -Fq "[+]Sub Moved!" out || fail "F5 missing organizing moved subtitle signal"
++grep -Fq "ABP-123.srt" out || fail "F5 missing organizing subtitle name"
++assert_file_text F5 "$TMP/f5/output/ABP-123/ABP-123.mp4" video
++assert_file_text F5 "$TMP/f5/output/ABP-123/ABP-123.srt" f5-sub
++[ ! -e "$TMP/f5/media/ABP-123.srt" ] || fail "F5 subtitle should be moved from source"
++
++
++
++
++prepare_case f6
++printf video > "$TMP/f6/media/ABP-123.mp4"
++printf text-sub > "$TMP/f6/media/ABP-123.txt"
++printf wrong-base > "$TMP/f6/media/ABP-1234.srt"
++cd "$TMP/f6"
++run_mdc "$TMP/f6" ABP-123.mp4 1 0 ".srt"; ec=$?
++assert_clean_success F6 "$ec"
++
++! grep -Fq "[+]Sub Moved!" out || fail "F6 should not print a subtitle moved line"
++! grep -Fq "[+]Sub Copied!" out || fail "F6 should not print a subtitle copied line"
++assert_file_text F6 "$TMP/f6/output/ABP-123/ABP-123.mp4" video
++[ ! -e "$TMP/f6/output/ABP-123/ABP-123.srt" ] || fail "F6 should not create ABP-123.srt"
++assert_file_text F6 "$TMP/f6/media/ABP-123.txt" text-sub
++assert_file_text F6 "$TMP/f6/media/ABP-1234.srt" wrong-base
++
++
++
++
++prepare_case f7
++printf video > "$TMP/f7/media/ABP-123.mp4"
++printf f7-ass-sub > "$TMP/f7/media/ABP-123.ass"
++cd "$TMP/f7"
++run_mdc "$TMP/f7" ABP-123.mp4 1 0 ".ass"; ec=$?
++assert_clean_success F7 "$ec"
++
++grep -Fq "[+]Sub Moved!" out || fail "F7 missing moved subtitle signal for allowed non-srt suffix"
++grep -Fq "ABP-123.ass" out || fail "F7 missing allowed non-srt subtitle name"
++assert_file_text F7 "$TMP/f7/output/ABP-123/ABP-123.ass" f7-ass-sub
++[ ! -e "$TMP/f7/media/ABP-123.ass" ] || fail "F7 allowed non-srt subtitle should be moved from source"
++
++echo "PASS"
++exit 0
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,19 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++
++export PYTHON="${PYTHON:-/usr/local/bin/python}"
++export PYTHONNOUSERSITE=1
++export PIP_NO_INDEX=1
++export PIP_DISABLE_PIP_VERSION_CHECK=1
++export UV_OFFLINE=1
++export NPM_CONFIG_OFFLINE=true
++set -e
++cd /workspace/repo
++exec bash /workspace/repo/usercase-test-coderl/usecase.sh

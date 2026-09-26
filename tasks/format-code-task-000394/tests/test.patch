@@ -1,0 +1,273 @@
+diff --git a/usercase-test-coderl/usecase.sh b/usercase-test-coderl/usecase.sh
+new file mode 100755
+--- /dev/null
++++ b/usercase-test-coderl/usecase.sh
+@@ -0,0 +1,251 @@
++#!/usr/bin/env bash
++
++set -u
++export LANG=C.UTF-8 LC_ALL=C.UTF-8 TZ=UTC
++export PYTHONPATH=/workspace/repo/src
++export ANSIBLE_FORCE_COLOR=0
++export NO_COLOR=1
++
++
++
++PYTHON=${PYTHON:-/usr/bin/python}
++export PIP_DISABLE_PIP_VERSION_CHECK=1
++export PIP_NO_INDEX=1
++export UV_OFFLINE=1
++
++( cd /workspace/repo && "$PYTHON" -m molecule --help >/dev/null 2>&1 ) \
++    || { echo "FAIL: molecule CLI is not runnable" >&2; exit 1; }
++BIN=("$PYTHON" -m molecule)
++
++TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
++fail() { echo "FAIL: $*" >&2; exit 1; }
++
++assert_file_exact() {
++    local file=$1 expected=$2 label=$3
++    [ -f "$file" ] || fail "$label: missing $file"
++    local actual
++    actual=$(cat "$file")
++    [ "$actual" = "$expected" ] || fail "$label: got [$actual], want [$expected]"
++}
++
++assert_file_lines_unordered() {
++    local file=$1 expected=$2 label=$3
++    [ -f "$file" ] || fail "$label: missing $file"
++    local actual_sorted expected_sorted
++    actual_sorted=$(LC_ALL=C sort "$file")
++    expected_sorted=$(printf '%s\n' "$expected" | LC_ALL=C sort)
++    [ "$actual_sorted" = "$expected_sorted" ] || fail "$label: got sorted [$actual_sorted], want sorted [$expected_sorted]"
++}
++
++assert_no_run_log() {
++    local file=$1 label=$2
++    [ ! -e "$file" ] || fail "$label: expected no executed scenarios, got [$(cat "$file")]"
++}
++
++assert_err_has() {
++    local pattern=$1 file=$2 label=$3
++    grep -qE "$pattern" "$file" || fail "$label: stderr did not match $pattern; got [$(cat "$file")]"
++}
++
++assert_output_lacks() {
++    local pattern=$1 label=$2
++    ! grep -qE "$pattern" out err || fail "$label: output unexpectedly matched $pattern; stdout [$(cat out)] stderr [$(cat err)]"
++}
++
++assert_name_not_reported_missing() {
++    local name_pattern=$1 label=$2
++    local error_pattern='not found|glob failed|missing|No such'
++    assert_output_lacks "(($name_pattern).*($error_pattern))|(($error_pattern).*($name_pattern))" "$label"
++}
++
++assert_no_action_or_report_entry() {
++    local scenario=$1 step=$2 label=$3
++    ! grep -qE "$scenario > $step|^$scenario[[:space:]]*:" out err || fail "$label: excluded scenario produced action output or report entry; stdout [$(cat out)] stderr [$(cat err)]"
++}
++
++write_scenario() {
++    local root=$1 name=$2
++    mkdir -p "$root/$name"
++    cat >"$root/$name/molecule.yml" <<EOF
++---
++dependency:
++  name: shell
++  command: "printf '%s\\n' \"\$MOLECULE_SCENARIO_NAME\" >> \"\$MOLECULE_PROJECT_DIRECTORY/ran.log\""
++driver:
++  name: default
++platforms: []
++provisioner:
++  name: ansible
++scenario:
++  name: $name
++  test_sequence:
++    - dependency
++verifier:
++  name: ansible
++EOF
++}
++
++make_plain_project() {
++    local dir=$1
++    mkdir -p "$dir"
++    for scenario in default skipped experimental db_primary db_replica; do
++        write_scenario "$dir/molecule" "$scenario"
++    done
++}
++
++make_collection_project() {
++    local dir=$1
++    mkdir -p "$dir"
++    cat >"$dir/galaxy.yml" <<'EOF'
++namespace: acme
++name: demo
++version: 1.0.0
++readme: README.md
++authors: [Tester]
++EOF
++    : >"$dir/README.md"
++    for scenario in default skipped db_primary appliance_vlans/merged appliance_vlans/replaced; do
++        write_scenario "$dir/extensions/molecule" "$scenario"
++    done
++}
++
++run_molecule() {
++    rm -f ran.log out err
++    "${BIN[@]}" "$@" >out 2>err
++    ec=$?
++}
++
++
++
++
++F1="$TMP/f1"
++make_plain_project "$F1"
++cd "$F1" || exit 1
++run_molecule dependency --all --exclude skipped
++[ "$ec" -eq 0 ] || fail "F1 exit $ec; want 0"
++
++assert_file_lines_unordered ran.log $'db_primary\ndb_replica\ndefault\nexperimental' "F1 ran.log"
++
++assert_no_action_or_report_entry 'skipped' 'dependency' "F1"
++
++
++
++
++F2="$TMP/f2"
++make_plain_project "$F2"
++cd "$F2" || exit 1
++run_molecule dependency -s default -s experimental --exclude experimental
++[ "$ec" -eq 0 ] || fail "F2 exit $ec; want 0"
++assert_file_exact ran.log 'default' "F2 ran.log"
++
++assert_no_action_or_report_entry 'experimental' 'dependency' "F2"
++
++
++
++
++F3="$TMP/f3"
++make_plain_project "$F3"
++cd "$F3" || exit 1
++run_molecule dependency --all --exclude 'db_*'
++[ "$ec" -eq 0 ] || fail "F3 exit $ec; want 0"
++
++assert_file_lines_unordered ran.log $'default\nexperimental\nskipped' "F3 ran.log"
++
++assert_no_action_or_report_entry 'db_primary' 'dependency' "F3 db_primary"
++assert_no_action_or_report_entry 'db_replica' 'dependency' "F3 db_replica"
++
++
++
++
++F4="$TMP/f4"
++make_collection_project "$F4"
++cd "$F4" || exit 1
++run_molecule dependency --all --exclude 'appliance_*/*'
++[ "$ec" -eq 0 ] || fail "F4 exit $ec; want 0"
++
++assert_file_lines_unordered ran.log $'db_primary\ndefault\nskipped' "F4 ran.log"
++
++assert_no_action_or_report_entry 'appliance_vlans/merged' 'dependency' "F4 nested merged"
++assert_no_action_or_report_entry 'appliance_vlans/replaced' 'dependency' "F4 nested replaced"
++
++
++
++
++F5="$TMP/f5"
++make_collection_project "$F5"
++cd "$F5" || exit 1
++run_molecule dependency --all --exclude 'appliance_vlans/merged'
++[ "$ec" -eq 0 ] || fail "F5 exit $ec; want 0"
++
++assert_file_lines_unordered ran.log $'appliance_vlans/replaced\ndb_primary\ndefault\nskipped' "F5 ran.log"
++
++assert_no_action_or_report_entry 'appliance_vlans/merged' 'dependency' "F5 exact nested"
++
++
++
++
++F6="$TMP/f6"
++make_plain_project "$F6"
++cd "$F6" || exit 1
++run_molecule dependency --all --exclude skipped -e db_primary --exclude does_not_exist
++[ "$ec" -eq 0 ] || fail "F6 exit $ec; want 0"
++
++assert_file_lines_unordered ran.log $'db_replica\ndefault\nexperimental' "F6 ran.log"
++
++assert_name_not_reported_missing 'does_not_exist' "F6 nonexistent exclude was reported as an error"
++
++assert_no_action_or_report_entry 'skipped' 'dependency' "F6 skipped"
++assert_no_action_or_report_entry 'db_primary' 'dependency' "F6 db_primary"
++
++
++
++
++F7="$TMP/f7"
++make_plain_project "$F7"
++cd "$F7" || exit 1
++run_molecule dependency -s default --exclude does_not_exist
++[ "$ec" -eq 0 ] || fail "F7 exit $ec; want 0"
++assert_file_exact ran.log 'default' "F7 ran.log"
++
++assert_name_not_reported_missing 'does_not_exist' "F7 nonexistent exclude caused missing-scenario error"
++
++
++
++
++F8="$TMP/f8"
++make_plain_project "$F8"
++cd "$F8" || exit 1
++run_molecule dependency -s default -s experimental --exclude default --exclude experimental
++[ "$ec" -eq 0 ] || fail "F8 exit $ec; want 0"
++assert_no_run_log ran.log "F8"
++
++assert_name_not_reported_missing 'default|experimental' "F8 excluded explicit targets reported as missing"
++
++
++
++
++F9="$TMP/f9"
++make_plain_project "$F9"
++cd "$F9" || exit 1
++run_molecule dependency -s missing
++[ "$ec" -ne 0 ] || fail "F9 expected non-zero exit for missing explicit target"
++assert_no_run_log ran.log "F9"
++
++grep -q 'missing' out err || fail "F9 missing scenario error did not mention requested target; stdout [$(cat out)] stderr [$(cat err)]"
++
++
++
++
++for cmd in test create converge check destroy dependency cleanup prepare idempotence side-effect syntax verify reset; do
++    "${BIN[@]}" "$cmd" --help >out 2>err
++    ec=$?
++    [ "$ec" -eq 0 ] || fail "F10 $cmd --help exit $ec; want 0"
++    help_text=$(cat out err)
++
++    grep -q -- '--exclude' <<<"$help_text" || fail "F10 $cmd help missing --exclude"
++    grep -q -- '-e' <<<"$help_text" || fail "F10 $cmd help missing -e"
++    grep -Eiq 'multiple|repeat|more than once' <<<"$help_text" || fail "F10 $cmd help missing repeatable indication"
++done
++
++echo "PASS"
++exit 0
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,12 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++exec bash /workspace/repo/usercase-test-coderl/usecase.sh

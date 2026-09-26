@@ -1,0 +1,259 @@
+diff --git a/server/superdesk/io/rss_ingest_test.py b/server/superdesk/io/rss_ingest_test.py
+new file mode 100644
+index 000000000..04f91f5fc
+--- /dev/null
++++ b/server/superdesk/io/rss_ingest_test.py
+@@ -0,0 +1,213 @@
++# -*- coding: utf-8; -*-
++
++
++
++
++
++
++
++
++
++
++import importlib
++import unittest
++from datetime import datetime, timezone
++from unittest import mock
++from unittest.mock import MagicMock
++
++import superdesk.errors as errors
++from superdesk.errors import IngestApiError, ParserError
++from superdesk.io import providers, allowed_providers
++
++
++
++
++
++RSS_FEED = b"""<?xml version="1.0" encoding="UTF-8"?>
++<rss version="2.0">
++  <channel>
++    <title>Example News</title>
++    <link>http://news.example.com/</link>
++    <description>Example feed</description>
++    <item>
++      <guid>urn:news:item-1</guid>
++      <title>First headline</title>
++      <description>First summary</description>
++      <pubDate>Wed, 25 Feb 2015 17:11:11 GMT</pubDate>
++    </item>
++    <item>
++      <guid>urn:news:item-2</guid>
++      <title>Second headline</title>
++      <description>Second summary</description>
++      <pubDate>Wed, 25 Feb 2015 10:00:00 GMT</pubDate>
++    </item>
++  </channel>
++</rss>"""
++
++
++ITEM_1_TIME = datetime(2015, 2, 25, 17, 11, 11)
++ITEM_2_TIME = datetime(2015, 2, 25, 10, 0, 0)
++
++FEED_URL = 'http://news.example.com/rss'
++
++
++
++
++REQUESTS_TARGET = 'requests.sessions.Session.request'
++
++
++def load_rss_provider():
++
++
++    from settings import INSTALLED_APPS
++    for app in INSTALLED_APPS:
++        if app == 'superdesk.io' or app.startswith('superdesk.io.'):
++            importlib.import_module(app)
++    return providers.get('rss')
++
++
++def fake_response(ok=True, status_code=200, content=b'', reason='OK'):
++    return MagicMock(ok=ok, status_code=status_code, content=content,
++                     reason=reason)
++
++
++def call_url(call):
++    args, kwargs = call
++    if 'url' in kwargs:
++        return kwargs['url']
++
++    return args[1] if len(args) > 1 else args[0]
++
++
++def call_auth(call):
++    _, kwargs = call
++    return kwargs.get('auth')
++
++
++def to_naive_utc(dt):
++    if dt.tzinfo is not None:
++        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
++    return dt
++
++
++class RssProviderRegistrationTestCase(unittest.TestCase):
++    def test_provider_is_registered_under_rss(self):
++        service = load_rss_provider()
++        self.assertIsNotNone(
++            service, "No ingest provider registered under type 'rss'.")
++        self.assertIn('rss', providers)
++
++    def test_rss_is_an_allowed_provider(self):
++        load_rss_provider()
++        self.assertIn('rss', allowed_providers)
++
++
++class RssUpdateTestCase(unittest.TestCase):
++    def setUp(self):
++        self.service = load_rss_provider()
++        if self.service is None:
++            self.fail("No ingest provider registered under type 'rss'.")
++
++
++        errors.notifiers = []
++
++    def _update(self, provider):
++        with mock.patch(REQUESTS_TARGET) as req:
++            req.return_value = fake_response(content=RSS_FEED)
++            result = self.service.update(provider)
++        return result, req
++
++
++
++    def test_fetches_configured_url(self):
++        _, req = self._update({'config': {'url': FEED_URL}})
++        self.assertTrue(req.called)
++        self.assertEqual(call_url(req.call_args), FEED_URL)
++
++    def test_sends_basic_auth_when_required(self):
++        _, req = self._update({'config': {
++            'url': FEED_URL,
++            'auth_required': True,
++            'username': 'johndoe',
++            'password': 'secret',
++        }})
++        self.assertEqual(call_auth(req.call_args), ('johndoe', 'secret'))
++
++    def test_does_not_send_auth_when_not_required(self):
++        _, req = self._update({'config': {'url': FEED_URL}})
++        self.assertIsNone(call_auth(req.call_args))
++
++
++
++    def test_result_is_single_batch_of_items(self):
++        result, _ = self._update({'config': {'url': FEED_URL}})
++        self.assertEqual(len(result), 1)
++        self.assertIsInstance(result[0], list)
++
++    def test_returns_all_entries_when_no_last_updated(self):
++        result, _ = self._update({'config': {'url': FEED_URL}})
++        guids = [item['guid'] for item in result[0]]
++        self.assertEqual(guids, ['urn:news:item-1', 'urn:news:item-2'])
++
++    def test_only_returns_entries_newer_than_last_updated(self):
++        result, _ = self._update({
++            'config': {'url': FEED_URL},
++            'last_updated': datetime(2015, 2, 25, 14, 0, 0),
++        })
++        guids = [item['guid'] for item in result[0]]
++        self.assertEqual(guids, ['urn:news:item-1'])
++
++    def test_returns_no_items_when_feed_is_up_to_date(self):
++        result, _ = self._update({
++            'config': {'url': FEED_URL},
++            'last_updated': datetime(2015, 2, 26, 0, 0, 0),
++        })
++        self.assertEqual(result[0], [])
++
++
++
++    def test_builds_item_fields_from_entry(self):
++        result, _ = self._update({'config': {'url': FEED_URL}})
++        item = result[0][0]
++        self.assertEqual(item['guid'], 'urn:news:item-1')
++        self.assertEqual(item['type'], 'text')
++        self.assertEqual(item['headline'], 'First headline')
++        self.assertEqual(item['abstract'], 'First summary')
++        self.assertEqual(to_naive_utc(item['firstcreated']), ITEM_1_TIME)
++        self.assertEqual(to_naive_utc(item['versioncreated']), ITEM_1_TIME)
++
++
++
++    def _expect_api_error(self, status_code, expected_code):
++        provider = {'config': {'url': FEED_URL}, 'name': 'TestProvider'}
++        with mock.patch(REQUESTS_TARGET) as req:
++            req.return_value = fake_response(
++                ok=False, status_code=status_code, reason='boom')
++            with self.assertRaises(IngestApiError) as ctx:
++                self.service.update(provider)
++        self.assertEqual(ctx.exception.code, expected_code)
++
++    def test_raises_auth_error_on_401(self):
++        self._expect_api_error(401, 4007)
++
++    def test_raises_auth_error_on_403(self):
++        self._expect_api_error(403, 4007)
++
++    def test_raises_not_found_error_on_404(self):
++        self._expect_api_error(404, 4006)
++
++    def test_raises_general_error_on_500(self):
++        self._expect_api_error(500, 4000)
++
++    def test_raises_general_error_on_other_status(self):
++        self._expect_api_error(418, 4000)
++
++    def test_wraps_other_failures_as_parser_error(self):
++        provider = {'config': {'url': FEED_URL}, 'name': 'TestProvider'}
++        with mock.patch(REQUESTS_TARGET, side_effect=ValueError('boom')):
++            with self.assertRaises(ParserError):
++                self.service.update(provider)
++
++
++if __name__ == '__main__':
++    unittest.main()
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,35 @@
++#!/usr/bin/env bash
++
++
++
++
++set -euo pipefail
++HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++cd /testbed
++
++
++
++
++
++
++PY=/testbed/.venv/bin/python
++if [ ! -f /testbed/.venv/pyvenv.cfg ]; then
++    cat > /testbed/.venv/pyvenv.cfg <<'CFG'
++home = /root/.pyenv/versions/3.6.15/bin
++include-system-site-packages = false
++version = 3.6.15
++CFG
++fi
++
++cd /testbed/server
++
++
++"$PY" -m pytest -q \
++    superdesk/io/nitf_tests.py \
++    superdesk/io/afp_tests.py \
++    superdesk/io/wenn_parser_test.py \
++    superdesk/io/zczc_parser_test.py \
++    superdesk/io/anpa_tests.py
++
++
++"$PY" -m pytest -q superdesk/io/rss_ingest_test.py

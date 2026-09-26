@@ -1,0 +1,9 @@
+Add a public measurement-key remapping protocol so callers can safely rename result keys on individual measurements or on an assembled circuit before serialization or execution. Today callers have to find and rebuild every measurement themselves, which is especially error-prone for wrapped operations and for swaps such as `{'a': 'b', 'b': 'a'}`.
+
+Expose `cirq.with_measurement_key_mapping(val, key_map, default=...)` from the top-level package. It must dispatch to `val._with_measurement_key_mapping_(key_map)`. When the method returns a value other than `NotImplemented`, return it. If the method is missing or returns `NotImplemented`, return an explicitly supplied default; without a default, raise a `TypeError` that identifies `with_measurement_key_mapping`.
+
+Support this protocol on measurement gates and on the public composition types needed to transform whole circuits: gate operations, controlled operations, moments, and circuits. A key map is simultaneous: each original key is looked up exactly once, so mapping `a -> b` and `b -> c` changes original `a` to `b`, not `c`. Keys absent from the map remain unchanged.
+
+Remapping must be functional rather than mutating the input. A remapped `MeasurementGate` keeps its qubit count and invert mask. Gate operations keep their qubits, controlled operations keep their controls, and non-measurement operations remain equivalent. Moments retain operation ordering and non-measurement operations. Circuits retain their moment structure and device while remapping every contained measurement; the source circuit remains unchanged.
+
+The renamed keys must be visible through the existing public consumers, including `measurement_key` and circuit QASM output: QASM generated from the remapped circuit must declare and reference the new keys and no longer reference replaced keys. Existing `measurement_key` / `is_measurement` behavior and ordinary measurement-gate protocol behavior must continue to work.

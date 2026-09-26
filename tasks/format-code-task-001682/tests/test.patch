@@ -1,0 +1,521 @@
+diff --git a/usercase-test-coderl/deposit-auto-lifecycle.test.js b/usercase-test-coderl/deposit-auto-lifecycle.test.js
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/deposit-auto-lifecycle.test.js
+@@ -0,0 +1,485 @@
++import { assert } from "chai"
++
++import Deposit from "../src/Deposit.js"
++import BitcoinHelpers, { BitcoinNetwork } from "../src/BitcoinHelpers.js"
++import EthereumHelpers from "../src/EthereumHelpers.js"
++
++
++
++
++
++
++const PUBLIC_KEY_X =
++  "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
++const PUBLIC_KEY_Y =
++  "483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8"
++
++const ORIGINALS = {
++  getExistingEvent: EthereumHelpers.getExistingEvent,
++  getEvent: EthereumHelpers.getEvent,
++  sendSafely: EthereumHelpers.sendSafely,
++  readEventFromTransaction: EthereumHelpers.readEventFromTransaction,
++  findOrWaitFor: BitcoinHelpers.Transaction.findOrWaitFor,
++  waitForConfirmations: BitcoinHelpers.Transaction.waitForConfirmations,
++  getSPVProof: BitcoinHelpers.Transaction.getSPVProof
++}
++const ORIGINAL_CONSOLE_DEBUG = console.debug
++
++function restoreHelpers() {
++  EthereumHelpers.getExistingEvent = ORIGINALS.getExistingEvent
++  EthereumHelpers.getEvent = ORIGINALS.getEvent
++  EthereumHelpers.sendSafely = ORIGINALS.sendSafely
++  EthereumHelpers.readEventFromTransaction = ORIGINALS.readEventFromTransaction
++  BitcoinHelpers.Transaction.findOrWaitFor = ORIGINALS.findOrWaitFor
++  BitcoinHelpers.Transaction.waitForConfirmations =
++    ORIGINALS.waitForConfirmations
++  BitcoinHelpers.Transaction.getSPVProof = ORIGINALS.getSPVProof
++}
++
++function installSuccessfulFundingStubs() {
++  EthereumHelpers.getExistingEvent = async (_web3, _contract, eventName) =>
++    eventName === "RegisteredPubkey"
++      ? {
++          returnValues: {
++            _signingGroupPubkeyX: PUBLIC_KEY_X,
++            _signingGroupPubkeyY: PUBLIC_KEY_Y
++          }
++        }
++      : null
++  EthereumHelpers.getEvent = async () => ({ event: "unused" })
++
++  BitcoinHelpers.Transaction.findOrWaitFor = async (_address, expectedValue) => {
++    return {
++      transactionID: `btc-tx-${expectedValue}`,
++      outputPosition: 2,
++      value: expectedValue
++    }
++  }
++
++  BitcoinHelpers.Transaction.waitForConfirmations = async (
++    transactionID,
++    requiredConfirmations,
++    handler
++  ) => {
++    handler({
++      transactionID,
++      confirmations: requiredConfirmations,
++      requiredConfirmations
++    })
++    return true
++  }
++
++  BitcoinHelpers.Transaction.getSPVProof = async () => {
++    return {
++      parsedTransaction: {
++        version: "01000000",
++        txInVector: "01aa",
++        txOutVector: "02bb",
++        locktime: "00000000"
++      },
++      merkleProof: "abcd",
++      chainHeaders: "ffff",
++      txInBlockIndex: 7
++    }
++  }
++}
++
++function makeBoundMethod(methodName, args = []) {
++  return {
++    methodName,
++    args,
++    encodeABI: () => `encoded:${methodName}:${args.length}`
++  }
++}
++
++function makeDeposit({
++  address = "0x1111111111111111111111111111111111111111",
++  lotSize = 1000000,
++  requiredConfirmations = 6
++} = {}) {
++  const calls = {
++    proofArgs: [],
++    approveAndCallArgs: [],
++    unqualifiedDepositToTbtcArgs: []
++  }
++
++  const factory = {
++    config: {
++      bitcoinNetwork: BitcoinNetwork.TESTNET,
++      web3: { eth: {} }
++    },
++    constants: () => ({
++      methods: {
++        getTxProofDifficultyFactor: () => ({
++          call: async () => String(requiredConfirmations)
++        })
++      }
++    }),
++    vendingMachine: () => ({
++      options: { address: "0x2222222222222222222222222222222222222222" },
++      methods: {
++        unqualifiedDepositToTbtc: (...args) => {
++          calls.unqualifiedDepositToTbtcArgs.push(args)
++          return makeBoundMethod("unqualifiedDepositToTbtc", args)
++        }
++      }
++    }),
++    depositToken: () => ({
++      methods: {
++        approveAndCall: (...args) => {
++          calls.approveAndCallArgs.push(args)
++          return makeBoundMethod("approveAndCall", args)
++        }
++      }
++    }),
++    fundingScript: () => ({
++      options: { address: "0x3333333333333333333333333333333333333333" }
++    }),
++    token: () => ({
++      options: {
++        address: "0x4444444444444444444444444444444444444444",
++        jsonInterface: []
++      }
++    }),
++    system: () => ({
++      options: { address: "0x5555555555555555555555555555555555555555" }
++    })
++  }
++
++  const contract = {
++    options: { address },
++    deployedAtBlock: 12,
++    methods: {
++      inActive: () => ({ call: async () => true }),
++      lotSizeSatoshis: () => ({ call: async () => String(lotSize) }),
++      provideBTCFundingProof: (...args) => {
++        calls.proofArgs.push(args)
++        return makeBoundMethod("provideBTCFundingProof", args)
++      }
++    }
++  }
++
++  const keepContract = {
++    options: { address: "0x6666666666666666666666666666666666666666" }
++  }
++
++  return { deposit: new Deposit(factory, contract, keepContract), calls }
++}
++
++function proofArgsAsLiterals(args) {
++  return args.map(value => (Buffer.isBuffer(value) ? value.toString("hex") : value))
++}
++
++function assertPromiseLike(value, name) {
++  assert.exists(value, `${name} should exist`)
++  assert.isFunction(value.then, `${name} should be a promise`)
++}
++
++function assertAutoSubmitState(state) {
++
++  assert.containsAllKeys(state, [
++    "fundingTransaction",
++    "fundingConfirmations",
++    "proofTransaction"
++  ])
++  assertPromiseLike(state.fundingTransaction, "fundingTransaction")
++  assertPromiseLike(state.fundingConfirmations, "fundingConfirmations")
++  assertPromiseLike(state.proofTransaction, "proofTransaction")
++}
++
++function assertAutoMintState(state) {
++
++  assert.containsAllKeys(state, [
++    "fundingTransaction",
++    "fundingConfirmations",
++    "mintedTBTC"
++  ])
++  assertPromiseLike(state.fundingTransaction, "fundingTransaction")
++  assertPromiseLike(state.fundingConfirmations, "fundingConfirmations")
++  assertPromiseLike(state.mintedTBTC, "mintedTBTC")
++}
++
++describe("Deposit automatic funding lifecycle acceptance", () => {
++  before(() => {
++    console.debug = () => {}
++  })
++
++  after(() => {
++    console.debug = ORIGINAL_CONSOLE_DEBUG
++  })
++
++  afterEach(() => {
++    restoreHelpers()
++  })
++
++  it("autoSubmit returns funding, confirmation, and proof promises that resolve through proof submission", async () => {
++
++
++    installSuccessfulFundingStubs()
++    const { deposit, calls } = makeDeposit()
++    EthereumHelpers.sendSafely = async boundMethod => ({
++      transactionHash: "0xproof",
++      status: true,
++      methodName: boundMethod.methodName,
++      argumentCount: boundMethod.args.length
++    })
++
++    const state = deposit.autoSubmit()
++
++    assertAutoSubmitState(state)
++    assert.deepEqual(await state.fundingTransaction, {
++      transactionID: "btc-tx-1000000",
++      outputPosition: 2,
++      value: 1000000
++    })
++    assert.deepEqual(await state.fundingConfirmations, {
++      transaction: {
++        transactionID: "btc-tx-1000000",
++        outputPosition: 2,
++        value: 1000000
++      },
++      requiredConfirmations: 6
++    })
++
++
++    await state.proofTransaction
++    assert.lengthOf(calls.proofArgs, 1)
++    assert.deepEqual(proofArgsAsLiterals(calls.proofArgs[0]), [
++      "01000000",
++      "01aa",
++      "02bb",
++      "00000000",
++      2,
++      "abcd",
++      7,
++      "ffff"
++    ])
++  })
++
++  it("autoMint returns funding, confirmation, and minted amount promises for the qualify-and-mint path", async () => {
++
++
++    installSuccessfulFundingStubs()
++    const { deposit, calls } = makeDeposit({
++      lotSize: 2000000,
++      requiredConfirmations: 9
++    })
++    EthereumHelpers.sendSafely = async boundMethod => ({
++      transactionHash: "0xmint",
++      status: true,
++      methodName: boundMethod.methodName,
++      argumentCount: boundMethod.args.length
++    })
++    EthereumHelpers.readEventFromTransaction = () => ({
++      value: "42000000000000000000"
++    })
++
++    const state = deposit.autoMint()
++
++    assertAutoMintState(state)
++    assert.deepEqual(await state.fundingTransaction, {
++      transactionID: "btc-tx-2000000",
++      outputPosition: 2,
++      value: 2000000
++    })
++    assert.deepEqual(await state.fundingConfirmations, {
++      transaction: {
++        transactionID: "btc-tx-2000000",
++        outputPosition: 2,
++        value: 2000000
++      },
++      requiredConfirmations: 9
++    })
++    assert.equal((await state.mintedTBTC).toString(), "42")
++
++
++    assert.lengthOf(calls.unqualifiedDepositToTbtcArgs, 1)
++    assert.equal(
++      calls.unqualifiedDepositToTbtcArgs[0][0],
++      "0x1111111111111111111111111111111111111111"
++    )
++    assert.lengthOf(calls.unqualifiedDepositToTbtcArgs[0], 9)
++    assert.deepEqual(calls.approveAndCallArgs[0].slice(0, 2), [
++      "0x3333333333333333333333333333333333333333",
++      "0x1111111111111111111111111111111111111111"
++    ])
++    assert.isString(calls.approveAndCallArgs[0][2])
++  })
++
++  it("emits proof submission failures through the existing error handler", async () => {
++
++
++    installSuccessfulFundingStubs()
++    const { deposit } = makeDeposit()
++    const submittedError = new TypeError("proof submission rejected")
++    const errors = []
++    deposit.onError(err => {
++      errors.push(err)
++    })
++    EthereumHelpers.sendSafely = async () => {
++      throw submittedError
++    }
++
++    const state = deposit.autoSubmit()
++
++
++
++    await state.proofTransaction.catch(() => undefined)
++    assert.lengthOf(errors, 1)
++    assert.strictEqual(errors[0], submittedError)
++  })
++
++  it("keeps one shared auto-submission state when autoSubmit starts first", async () => {
++
++
++    installSuccessfulFundingStubs()
++    const { deposit } = makeDeposit()
++    EthereumHelpers.sendSafely = async boundMethod => ({
++      transactionHash: "0xproof",
++      status: true,
++      methodName: boundMethod.methodName,
++      argumentCount: boundMethod.args.length
++    })
++
++    const first = deposit.autoSubmit()
++    const second = deposit.autoSubmit()
++    const third = deposit.autoMint()
++
++    assert.equal(second, first)
++    assert.equal(third, first)
++    assertAutoSubmitState(third)
++
++    await third.proofTransaction
++  })
++
++  it("keeps one shared auto-submission state when autoMint starts first", async () => {
++
++
++    installSuccessfulFundingStubs()
++    const { deposit } = makeDeposit({
++      lotSize: 2000000,
++      requiredConfirmations: 9
++    })
++    EthereumHelpers.sendSafely = async boundMethod => ({
++      transactionHash: "0xmint",
++      status: true,
++      methodName: boundMethod.methodName,
++      argumentCount: boundMethod.args.length
++    })
++    EthereumHelpers.readEventFromTransaction = () => ({
++      value: "42000000000000000000"
++    })
++
++    const first = deposit.autoMint()
++    const second = deposit.autoMint()
++    const third = deposit.autoSubmit()
++
++    assert.equal(second, first)
++    assert.equal(third, first)
++    assertAutoMintState(third)
++    assert.equal((await third.mintedTBTC).toString(), "42")
++  })
++
++  it("does not let two deposits share auto-submission state", async () => {
++
++
++    installSuccessfulFundingStubs()
++    const a = makeDeposit({ address: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" })
++    const b = makeDeposit({ address: "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" })
++    EthereumHelpers.sendSafely = async boundMethod => ({
++      transactionHash: boundMethod.methodName === "approveAndCall" ? "0xmint" : "0xproof",
++      status: true,
++      methodName: boundMethod.methodName,
++      argumentCount: boundMethod.args.length
++    })
++    EthereumHelpers.readEventFromTransaction = () => ({
++      value: "42000000000000000000"
++    })
++
++    const aState = a.deposit.autoSubmit()
++    const bState = b.deposit.autoMint()
++
++    assertAutoSubmitState(aState)
++    assertAutoMintState(bState)
++
++    await aState.proofTransaction
++    assert.equal((await bState.mintedTBTC).toString(), "42")
++  })
++
++  it("exposes automatic lifecycle methods on Deposit instances", () => {
++
++
++    installSuccessfulFundingStubs()
++    const { deposit } = makeDeposit()
++
++
++
++    assert.isFunction(deposit.autoSubmit)
++    assert.isFunction(deposit.autoMint)
++  })
++
++  it("repeated autoSubmit calls are idempotent and do not throw", async () => {
++
++
++    installSuccessfulFundingStubs()
++    const { deposit } = makeDeposit()
++    EthereumHelpers.sendSafely = async boundMethod => ({
++      transactionHash: "0xproof",
++      status: true,
++      methodName: boundMethod.methodName,
++      argumentCount: boundMethod.args.length
++    })
++
++    const first = deposit.autoSubmit()
++    const second = deposit.autoSubmit()
++
++    assert.equal(second, first)
++
++    await second.proofTransaction
++  })
++
++  it("does not restart monitoring or duplicate submission across repeated calls", async () => {
++
++
++    installSuccessfulFundingStubs()
++    const originalFindOrWaitFor = BitcoinHelpers.Transaction.findOrWaitFor
++    const originalWaitForConfirmations =
++      BitcoinHelpers.Transaction.waitForConfirmations
++    let findCalls = 0
++    let confirmationWaitCalls = 0
++    const sendCalls = []
++    BitcoinHelpers.Transaction.findOrWaitFor = async (...args) => {
++      findCalls++
++      return originalFindOrWaitFor(...args)
++    }
++    BitcoinHelpers.Transaction.waitForConfirmations = async (...args) => {
++      confirmationWaitCalls++
++      return originalWaitForConfirmations(...args)
++    }
++    EthereumHelpers.sendSafely = async boundMethod => ({
++      transactionHash: "0xproof",
++      status: true,
++      methodName: boundMethod.methodName,
++      argumentCount: boundMethod.args.length,
++      sent: sendCalls.push(boundMethod)
++    })
++
++    const { deposit, calls } = makeDeposit()
++    const first = deposit.autoSubmit()
++
++
++
++    for (let i = 0; i < 120; i++) {
++      const state = deposit.autoSubmit()
++      assert.equal(state, first)
++    }
++
++    await first.proofTransaction
++
++    assert.equal(findCalls, 1)
++    assert.equal(confirmationWaitCalls, 1)
++    assert.lengthOf(calls.proofArgs, 1)
++    assert.lengthOf(sendCalls, 1)
++    assert.equal(sendCalls[0].methodName, "provideBTCFundingProof")
++  })
++})
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,26 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++
++cd /workspace/repo
++
++export npm_config_offline=true
++export npm_config_audit=false
++export npm_config_fund=false
++
++MOCHA=/workspace/repo/node_modules/.bin/mocha
++if [ ! -x "$MOCHA" ]; then
++  echo "Missing local mocha binary at $MOCHA; dependencies must be preinstalled." >&2
++  exit 1
++fi
++
++exec "$MOCHA" --timeout 10000 /workspace/repo/usercase-test-coderl/deposit-auto-lifecycle.test.js

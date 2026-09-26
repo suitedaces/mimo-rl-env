@@ -1,0 +1,145 @@
+diff --git a/tests/banditml_pkg/banditml/serving/test_sklearn_predictor_support.py b/tests/banditml_pkg/banditml/serving/test_sklearn_predictor_support.py
+new file mode 100644
+index 0000000..995cb95
+--- /dev/null
++++ b/tests/banditml_pkg/banditml/serving/test_sklearn_predictor_support.py
+@@ -0,0 +1,128 @@
++import json
++import os
++import tempfile
++import unittest
++
++import numpy as np
++import pandas as pd
++from sklearn.linear_model import LogisticRegression, Ridge
++
++from banditml_pkg.banditml.preprocessing import preprocessor
++from banditml_pkg.banditml.serving.predictor import BanditPredictor
++from utils import model_constructors
++
++
++EXPERIMENT = {
++    "features": {
++        "age": {"type": "N"},
++        "decision": {"type": "C", "possible_values": ["left", "right"]},
++    },
++    "product_sets": {},
++}
++
++
++def prepared_training_data(binary=False):
++    rows = []
++    for age, decision in enumerate(["left", "right", "left", "right", "left", "right"]):
++        reward = int(age >= 3) if binary else float(age * 2 + (decision == "right"))
++        rows.append(
++            {
++                "context": json.dumps({"age": age}),
++                "decision": decision,
++                "immediate_reward": json.dumps({"reward": reward}),
++                "delayed_reward": json.dumps(
++                    {"left": {"reward": 0}, "right": {"reward": 0}}
++                ),
++            }
++        )
++    raw = pd.DataFrame(rows)
++    return preprocessor.preprocess_data(
++        raw, {"reward": 1}, EXPERIMENT, shuffle_data=False
++    )
++
++
++def make_predictor(model, data, reward_type):
++    return BanditPredictor(
++        experiment_params=EXPERIMENT,
++        float_feature_order=data["float_feature_order"],
++        id_feature_order=data["id_feature_order"],
++        id_feature_str_to_int_map=data["id_feature_str_to_int_map"],
++        transforms=data["transforms"],
++        imputers=data["imputers"],
++        model=model,
++        reward_type=reward_type,
++    )
++
++
++class TestSklearnPredictorSupport(unittest.TestCase):
++    def assert_serves_estimator(self, model, reward_type, binary=False):
++        data = prepared_training_data(binary=binary)
++        model.fit(data["X_float"], data["y"])
++        predictor = make_predictor(model, data, reward_type)
++        context = {"age": 2}
++
++        prepared = predictor.preprocess_input(context)
++        if binary:
++            expected = model.predict_proba(prepared["X_float"])[:, 1]
++        else:
++            expected = model.predict(prepared["X_float"])
++        try:
++            served = predictor.predict(context)
++        except Exception as exc:
++            self.fail("sklearn estimator could not be served: %r" % (exc,))
++
++        self.assertEqual(served["ids"], ["left", "right"])
++        self.assertEqual(np.asarray(served["scores"]).shape, (2, 1))
++        np.testing.assert_allclose(np.asarray(served["scores"]).ravel(), expected)
++
++    def test_regression_estimators_are_scored(self):
++        self.assert_serves_estimator(Ridge(alpha=1.0), "regression")
++        self.assert_serves_estimator(
++            model_constructors.build_gbdt("regression", 0.1, 8, 2), "regression"
++        )
++        self.assert_serves_estimator(
++            model_constructors.build_random_forest("regression", 8, 2), "regression"
++        )
++
++    def test_binary_estimators_return_positive_class_scores(self):
++        self.assert_serves_estimator(
++            LogisticRegression(penalty="l2"), "binary", binary=True
++        )
++        self.assert_serves_estimator(
++            model_constructors.build_gbdt("binary", 0.1, 8, 2), "binary", binary=True
++        )
++        self.assert_serves_estimator(
++            model_constructors.build_random_forest("binary", 8, 2), "binary", binary=True
++        )
++
++    def test_sklearn_regression_round_trip(self):
++        data = prepared_training_data()
++        model = Ridge(alpha=1.0).fit(data["X_float"], data["y"])
++        predictor = make_predictor(model, data, "regression")
++        context = {"age": 4}
++        before = predictor.predict(context)
++        with tempfile.TemporaryDirectory() as directory:
++            config_path = os.path.join(directory, "model.json")
++            model_path = os.path.join(directory, "model.bin")
++            predictor.config_to_file(config_path)
++            predictor.model_to_file(model_path)
++            restored = BanditPredictor.predictor_from_file(config_path, model_path)
++            after = restored.predict(context)
++        np.testing.assert_allclose(after["scores"], before["scores"])
++        self.assertEqual(after["ids"], before["ids"])
++
++    def test_sklearn_binary_round_trip(self):
++        data = prepared_training_data(binary=True)
++        model = LogisticRegression(penalty="l2").fit(data["X_float"], data["y"])
++        predictor = make_predictor(model, data, "binary")
++        context = {"age": 1}
++        before = predictor.predict(context)
++        with tempfile.TemporaryDirectory() as directory:
++            config_path = os.path.join(directory, "model.json")
++            model_path = os.path.join(directory, "model.bin")
++            predictor.config_to_file(config_path)
++            predictor.model_to_file(model_path)
++            restored = BanditPredictor.predictor_from_file(config_path, model_path)
++            after = restored.predict(context)
++        np.testing.assert_allclose(after["scores"], before["scores"])
++        self.assertEqual(after["ids"], before["ids"])
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,6 @@
++#!/bin/bash
++set -euo pipefail
++
++PYTHONPATH=. pytest -q \
++  tests/banditml_pkg/banditml/serving/test_sklearn_predictor_support.py \
++  tests/banditml_pkg/banditml/serving/test_predictor.py::TestPredictor::test_same_predictions_country_as_categorical

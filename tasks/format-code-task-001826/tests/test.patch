@@ -1,0 +1,638 @@
+diff --git a/usercase-test-coderl/fixtures/fake_app_server.go b/usercase-test-coderl/fixtures/fake_app_server.go
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/fixtures/fake_app_server.go
+@@ -0,0 +1,135 @@
++package main
++
++import (
++	"context"
++	"flag"
++	"fmt"
++	"io"
++	"net"
++	"os"
++	"strings"
++	"sync"
++
++	appb "github.com/luizalabs/teresa/pkg/protobuf/app"
++	"google.golang.org/grpc"
++	"google.golang.org/grpc/codes"
++	"google.golang.org/grpc/metadata"
++	"google.golang.org/grpc/status"
++)
++
++type appServer struct {
++	appb.AppServer
++
++	logPath string
++	mu      sync.Mutex
++}
++
++func (s *appServer) logDelete(ctx context.Context, name string) error {
++	token := ""
++	if md, ok := metadata.FromIncomingContext(ctx); ok {
++		if values := md.Get("token"); len(values) > 0 {
++			token = values[0]
++		}
++	}
++
++	s.mu.Lock()
++	defer s.mu.Unlock()
++
++	f, err := os.OpenFile(s.logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
++	if err != nil {
++		return err
++	}
++	defer f.Close()
++	_, err = fmt.Fprintf(f, "DELETE name=%s token=%s\n", name, token)
++	return err
++}
++
++func (s *appServer) Delete(ctx context.Context, req *appb.DeleteRequest) (*appb.Empty, error) {
++	if err := s.logDelete(ctx, req.Name); err != nil {
++		return nil, status.Error(codes.Unknown, err.Error())
++	}
++
++	switch req.Name {
++	case "missing":
++		return nil, status.Error(codes.NotFound, "App not found")
++	case "denied":
++		return nil, status.Error(codes.PermissionDenied, "Permission Denied")
++	default:
++		return &appb.Empty{}, nil
++	}
++}
++
++func (s *appServer) Create(context.Context, *appb.CreateRequest) (*appb.Empty, error) {
++	return nil, status.Error(codes.Unimplemented, "Create not implemented")
++}
++
++func (s *appServer) Logs(*appb.LogsRequest, appb.App_LogsServer) error {
++	return status.Error(codes.Unimplemented, "Logs not implemented")
++}
++
++func (s *appServer) Info(context.Context, *appb.InfoRequest) (*appb.InfoResponse, error) {
++	return nil, status.Error(codes.Unimplemented, "Info not implemented")
++}
++
++func (s *appServer) SetEnv(context.Context, *appb.SetEnvRequest) (*appb.Empty, error) {
++	return nil, status.Error(codes.Unimplemented, "SetEnv not implemented")
++}
++
++func (s *appServer) UnsetEnv(context.Context, *appb.UnsetEnvRequest) (*appb.Empty, error) {
++	return nil, status.Error(codes.Unimplemented, "UnsetEnv not implemented")
++}
++
++func (s *appServer) List(context.Context, *appb.Empty) (*appb.ListResponse, error) {
++	return nil, status.Error(codes.Unimplemented, "List not implemented")
++}
++
++func (s *appServer) SetAutoscale(context.Context, *appb.SetAutoscaleRequest) (*appb.Empty, error) {
++	return nil, status.Error(codes.Unimplemented, "SetAutoscale not implemented")
++}
++
++func (s *appServer) SetReplicas(context.Context, *appb.SetReplicasRequest) (*appb.Empty, error) {
++	return nil, status.Error(codes.Unimplemented, "SetReplicas not implemented")
++}
++
++func (s *appServer) DeletePods(context.Context, *appb.DeletePodsRequest) (*appb.Empty, error) {
++	return nil, status.Error(codes.Unimplemented, "DeletePods not implemented")
++}
++
++func (s *appServer) SetSecret(context.Context, *appb.SetSecretRequest) (*appb.Empty, error) {
++	return nil, status.Error(codes.Unimplemented, "SetSecret not implemented")
++}
++
++func (s *appServer) UnsetSecret(context.Context, *appb.UnsetEnvRequest) (*appb.Empty, error) {
++	return nil, status.Error(codes.Unimplemented, "UnsetSecret not implemented")
++}
++
++func (s *appServer) ChangeTeam(context.Context, *appb.ChangeTeamRequest) (*appb.Empty, error) {
++	return nil, status.Error(codes.Unimplemented, "ChangeTeam not implemented")
++}
++
++func (s *appServer) SetVHosts(context.Context, *appb.SetVHostsRequest) (*appb.Empty, error) {
++	return nil, status.Error(codes.Unimplemented, "SetVHosts not implemented")
++}
++
++func main() {
++	logPath := flag.String("log", "", "path where Delete RPC calls are recorded")
++	flag.Parse()
++	if strings.TrimSpace(*logPath) == "" {
++		fmt.Fprintln(os.Stderr, "missing --log")
++		os.Exit(2)
++	}
++
++	listener, err := net.Listen("tcp", "127.0.0.1:0")
++	if err != nil {
++		fmt.Fprintln(os.Stderr, err)
++		os.Exit(1)
++	}
++
++	grpcServer := grpc.NewServer()
++	appb.RegisterAppServer(grpcServer, &appServer{logPath: *logPath})
++	fmt.Println(listener.Addr().String())
++	if err := grpcServer.Serve(listener); err != nil && err != grpc.ErrServerStopped && err != io.EOF {
++		fmt.Fprintln(os.Stderr, err)
++		os.Exit(1)
++	}
++}
+diff --git a/usercase-test-coderl/fixtures/server_delete_probe.go b/usercase-test-coderl/fixtures/server_delete_probe.go
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/fixtures/server_delete_probe.go
+@@ -0,0 +1,142 @@
++package main
++
++import (
++	"bytes"
++	"context"
++	"errors"
++	"fmt"
++	"io"
++	"io/ioutil"
++
++	appb "github.com/luizalabs/teresa/pkg/protobuf/app"
++	srvapp "github.com/luizalabs/teresa/pkg/server/app"
++	"github.com/luizalabs/teresa/pkg/server/auth"
++	"github.com/luizalabs/teresa/pkg/server/database"
++	"github.com/luizalabs/teresa/pkg/server/team"
++	"google.golang.org/grpc/status"
++)
++
++type probeK8s struct {
++	namespaceAnnotationErr error
++	namespaceLabelErr      error
++	deleteNamespaceErr     error
++	isNotFoundErr          bool
++	namespaces             map[string]struct{}
++}
++
++func (p *probeK8s) NamespaceAnnotation(namespace, annotation string) (string, error) {
++	if p.namespaceAnnotationErr != nil {
++		return "", p.namespaceAnnotationErr
++	}
++	return fmt.Sprintf(`{"name":%q,"team":"luizalabs","processType":"web","protocol":"http"}`, namespace), nil
++}
++
++func (p *probeK8s) NamespaceLabel(namespace, label string) (string, error) {
++	return "luizalabs", p.namespaceLabelErr
++}
++
++func (p *probeK8s) DeleteNamespace(namespace string) error {
++	delete(p.namespaces, namespace)
++	return p.deleteNamespaceErr
++}
++
++func (p *probeK8s) IsNotFound(error) bool      { return p.isNotFoundErr }
++func (p *probeK8s) IsAlreadyExists(error) bool { return false }
++func (p *probeK8s) IsInvalid(error) bool       { return false }
++func (p *probeK8s) IsUnknown(error) bool       { return false }
++
++func (p *probeK8s) PodList(string, *srvapp.PodListOptions) ([]*srvapp.Pod, error) {
++	return nil, nil
++}
++func (p *probeK8s) PodLogs(string, string, *srvapp.LogOptions) (io.ReadCloser, error) {
++	return ioutil.NopCloser(bytes.NewBufferString("")), nil
++}
++func (p *probeK8s) CreateNamespace(*srvapp.App, string) error { return nil }
++func (p *probeK8s) CreateQuota(*srvapp.App) error             { return nil }
++func (p *probeK8s) GetSecret(string, string) (map[string][]byte, error) {
++	return map[string][]byte{}, nil
++}
++func (p *probeK8s) CreateOrUpdateSecret(string, string, map[string][]byte) error { return nil }
++func (p *probeK8s) CreateOrUpdateAutoscale(*srvapp.App) error                    { return nil }
++func (p *probeK8s) AddressList(string) ([]*srvapp.Address, error)                { return nil, nil }
++func (p *probeK8s) Status(string) (*srvapp.Status, error)                        { return nil, nil }
++func (p *probeK8s) Autoscale(string) (*srvapp.Autoscale, error)                  { return nil, nil }
++func (p *probeK8s) Limits(string, string) (*srvapp.Limits, error)                { return nil, nil }
++func (p *probeK8s) SetNamespaceAnnotations(string, map[string]string) error      { return nil }
++func (p *probeK8s) SetNamespaceLabels(string, map[string]string) error           { return nil }
++func (p *probeK8s) DeleteDeployEnvVars(string, string, []string) error           { return nil }
++func (p *probeK8s) DeleteCronJobEnvVars(string, string, []string) error          { return nil }
++func (p *probeK8s) CreateOrUpdateDeployEnvVars(string, string, []*srvapp.EnvVar) error {
++	return nil
++}
++func (p *probeK8s) CreateOrUpdateCronJobEnvVars(string, string, []*srvapp.EnvVar) error {
++	return nil
++}
++func (p *probeK8s) CreateOrUpdateDeploySecretEnvVars(string, string, string, []string) error {
++	return nil
++}
++func (p *probeK8s) CreateOrUpdateCronJobSecretEnvVars(string, string, string, []string) error {
++	return nil
++}
++func (p *probeK8s) NamespaceListByLabel(string, string) ([]string, error) { return nil, nil }
++func (p *probeK8s) DeploySetReplicas(string, string, int32) error         { return nil }
++func (p *probeK8s) DeletePod(string, string) error                        { return nil }
++func (p *probeK8s) HasIngress(string, string) (bool, error)               { return false, nil }
++func (p *probeK8s) IngressEnabled() bool                                  { return false }
++func (p *probeK8s) UpdateIngress(string, string, []string) error          { return nil }
++func (p *probeK8s) CreateOrUpdateDeploySecretFile(string, string, string) error {
++	return nil
++}
++func (p *probeK8s) CreateOrUpdateCronJobSecretFile(string, string, string) error {
++	return nil
++}
++func (p *probeK8s) DeleteDeploySecrets(string, string, []string, []string) error { return nil }
++func (p *probeK8s) DeleteCronJobSecrets(string, string, []string, []string) error {
++	return nil
++}
++func (p *probeK8s) SuspendCronJob(string, string) error { return nil }
++func (p *probeK8s) ResumeCronJob(string, string) error  { return nil }
++
++func main() {
++	user := &database.User{Email: "teresa@luizalabs.com"}
++	tops := team.NewFakeOperations()
++	tops.(*team.FakeOperations).Storage["luizalabs"] = &database.Team{
++		Name:  "luizalabs",
++		Users: []database.User{*user},
++	}
++
++	kops := &probeK8s{namespaces: map[string]struct{}{"teresa": {}}}
++	ops := srvapp.NewOperations(tops, kops, nil)
++	err := ops.Delete(user, "teresa")
++	_, exists := kops.namespaces["teresa"]
++	fmt.Printf("operations-success error=%v namespace_exists=%t\n", err, exists)
++
++	deniedK8s := &probeK8s{namespaces: map[string]struct{}{"teresa": {}}}
++	deniedOps := srvapp.NewOperations(team.NewFakeOperations(), deniedK8s, nil)
++	deniedErr := deniedOps.Delete(user, "teresa")
++	_, deniedExists := deniedK8s.namespaces["teresa"]
++	fmt.Printf("operations-permission error=%s namespace_exists=%t\n", status.Convert(deniedErr).Message(), deniedExists)
++
++	missingK8s := &probeK8s{
++		namespaceLabelErr: errors.New("missing namespace"),
++		isNotFoundErr:     true,
++		namespaces:        map[string]struct{}{},
++	}
++	missingOps := srvapp.NewOperations(tops, missingK8s, nil)
++	missingErr := missingOps.Delete(user, "missing")
++	fmt.Printf("operations-not-found error=%s\n", status.Convert(missingErr).Message())
++
++	fake := srvapp.NewFakeOperations()
++	fake.Storage["foo"] = &srvapp.App{Name: "foo"}
++	service := srvapp.NewService(fake)
++	ctx := context.WithValue(context.Background(), "user", &database.User{Email: "gopher@luizalabs.com"})
++	_, serviceErr := service.Delete(ctx, &appb.DeleteRequest{Name: "foo"})
++	_, serviceExists := fake.Storage["foo"]
++	fmt.Printf("service-success error=%v storage_exists=%t\n", serviceErr, serviceExists)
++
++	fake.Storage["foo"] = &srvapp.App{Name: "foo"}
++	badCtx := context.WithValue(context.Background(), "user", &database.User{Email: "bad-user@luizalabs.com"})
++	_, serviceDeniedErr := service.Delete(badCtx, &appb.DeleteRequest{Name: "foo"})
++	_, serviceDeniedExists := fake.Storage["foo"]
++	fmt.Printf("service-permission error=%s storage_exists=%t auth_match=%t\n", status.Convert(serviceDeniedErr).Message(), serviceDeniedExists, serviceDeniedErr == auth.ErrPermissionDenied)
++}
+diff --git a/usercase-test-coderl/usecase.sh b/usercase-test-coderl/usecase.sh
+new file mode 100755
+--- /dev/null
++++ b/usercase-test-coderl/usecase.sh
+@@ -0,0 +1,323 @@
++#!/usr/bin/env bash
++
++set -u
++export LANG=C LC_ALL=C TZ=UTC TERM=dumb NO_COLOR=1
++
++TMP=$(mktemp -d)
++SERVER_PID=""
++CLIENT_CMD_DIR="/workspace/repo/pkg/client/cmd"
++CLIENT_DISABLED_DIR="$TMP/disabled-client-cmd"
++
++restore_client_cmd_sources() {
++	for name in build.go deploy.go; do
++		if [ -f "$CLIENT_DISABLED_DIR/$name" ]; then
++			mv "$CLIENT_DISABLED_DIR/$name" "$CLIENT_CMD_DIR/$name"
++		fi
++	done
++	if [ -f "$TMP/created-coderl-cluster-helper" ]; then
++		rm -f "$CLIENT_CMD_DIR/coderl_cluster_name.go"
++	fi
++}
++
++trap 'if [ -n "$SERVER_PID" ]; then kill "$SERVER_PID" 2>/dev/null || true; wait "$SERVER_PID" 2>/dev/null || true; fi; restore_client_cmd_sources; rm -rf "$TMP"' EXIT
++
++fail() {
++	echo "FAIL: $*" >&2
++	exit 1
++}
++
++assert_file_eq() {
++	local file=$1
++	local expected=$2
++	local label=$3
++	printf "%s" "$expected" > "$TMP/expected"
++	if ! cmp -s "$TMP/expected" "$file"; then
++		echo "FAIL: $label" >&2
++		echo "got:" >&2
++		sed -n l "$file" >&2
++		echo "want:" >&2
++		sed -n l "$TMP/expected" >&2
++		exit 1
++	fi
++}
++
++assert_file_grep() {
++	local file=$1
++	local pattern=$2
++	local label=$3
++	grep -qE "$pattern" "$file" || fail "$label"
++}
++
++assert_file_grep_i() {
++	local file=$1
++	local pattern=$2
++	local label=$3
++	grep -qiE "$pattern" "$file" || fail "$label"
++}
++
++assert_file_contains() {
++	local file=$1
++	local expected=$2
++	local label=$3
++	grep -Fq -- "$expected" "$file" || fail "$label"
++}
++
++assert_file_not_contains() {
++	local file=$1
++	local unexpected=$2
++	local label=$3
++	if grep -Fq -- "$unexpected" "$file"; then
++		fail "$label"
++	fi
++}
++
++assert_file_nonempty() {
++	local file=$1
++	local label=$2
++	[ -s "$file" ] || fail "$label"
++}
++
++
++
++mkdir -p "$CLIENT_DISABLED_DIR"
++for name in build.go deploy.go; do
++	mv "$CLIENT_CMD_DIR/$name" "$CLIENT_DISABLED_DIR/$name" || fail "disable unrelated client source $name"
++done
++if ! grep -q 'func getCurrentClusterName' "$CLIENT_CMD_DIR"/*.go; then
++	cat >"$CLIENT_CMD_DIR/coderl_cluster_name.go" <<'EOF'
++package cmd
++
++import "github.com/luizalabs/teresa/pkg/client"
++
++func getCurrentClusterName() (string, error) {
++	cfg, err := client.ReadConfigFile(cfgFile)
++	if err != nil {
++		return "", err
++	}
++	if cfg.CurrentCluster == "" {
++		return "", client.ErrInvalidConfigFile
++	}
++	return cfg.CurrentCluster, nil
++}
++EOF
++	touch "$TMP/created-coderl-cluster-helper"
++fi
++
++( cd /workspace/repo && go build -mod=vendor -o "$TMP/teresa" ./cmd/client ) >"$TMP/build-client.out" 2>"$TMP/build-client.err" \
++	|| { cat "$TMP/build-client.out" "$TMP/build-client.err" >&2; fail "build teresa client"; }
++restore_client_cmd_sources
++( cd /workspace/repo && go build -mod=vendor -o "$TMP/fake_app_server" ./usercase-test-coderl/fixtures/fake_app_server.go ) >"$TMP/build-fake-server.out" 2>"$TMP/build-fake-server.err" \
++	|| { cat "$TMP/build-fake-server.out" "$TMP/build-fake-server.err" >&2; fail "build fake app server"; }
++( cd /workspace/repo && go build -mod=vendor -o "$TMP/server_delete_probe" ./usercase-test-coderl/fixtures/server_delete_probe.go ) >"$TMP/build-server-probe.out" 2>"$TMP/build-server-probe.err" \
++	|| { cat "$TMP/build-server-probe.out" "$TMP/build-server-probe.err" >&2; fail "build server delete probe"; }
++
++BIN="$TMP/teresa"
++FAKE_SERVER="$TMP/fake_app_server"
++SERVER_PROBE="$TMP/server_delete_probe"
++SERVER_LOG="$TMP/rpc.log"
++SERVER_ADDR_FILE="$TMP/server.addr"
++SERVER_ERR="$TMP/server.err"
++
++"$FAKE_SERVER" --log "$SERVER_LOG" >"$SERVER_ADDR_FILE" 2>"$SERVER_ERR" &
++SERVER_PID=$!
++for _ in $(seq 1 50); do
++	[ -s "$SERVER_ADDR_FILE" ] && break
++	sleep 0.1
++done
++[ -s "$SERVER_ADDR_FILE" ] || fail "fake app server did not start: $(cat "$SERVER_ERR" 2>/dev/null || true)"
++SERVER_ADDR=$(cat "$SERVER_ADDR_FILE")
++
++CFG="$TMP/config.yaml"
++cat >"$CFG" <<EOF
++clusters:
++  acceptance:
++    server: $SERVER_ADDR
++    token: acceptance-token
++    tls: false
++    insecure: false
++current_cluster: acceptance
++EOF
++
++cd "$TMP" || fail "cd temp dir"
++
++run_interactive_delete() {
++	local answers=$1
++	ANSWERS="$answers" BIN="$BIN" CFG="$CFG" OUT="$TMP/out" ERR="$TMP/err" python3 - <<'PY'
++import os
++import select
++import subprocess
++import sys
++import time
++
++answers = os.environ["ANSWERS"].split("|") if os.environ["ANSWERS"] else []
++proc = subprocess.Popen(
++    [os.environ["BIN"], "--config", os.environ["CFG"], "app", "delete", "foo"],
++    stdin=subprocess.PIPE,
++    stdout=subprocess.PIPE,
++    stderr=subprocess.PIPE,
++)
++out = b""
++prompts = [b"(yes/NO) ", b"Please re type the app name: "]
++try:
++    for index, answer in enumerate(answers):
++        want = prompts[index]
++        deadline = time.time() + 5
++        while want not in out and time.time() < deadline:
++            readable, _, _ = select.select([proc.stdout], [], [], 0.1)
++            if readable:
++                chunk = os.read(proc.stdout.fileno(), 1)
++                if not chunk:
++                    break
++                out += chunk
++        proc.stdin.write((answer + "\n").encode())
++        proc.stdin.flush()
++except BrokenPipeError:
++    pass
++
++try:
++    remaining, err = proc.communicate(timeout=5)
++except subprocess.TimeoutExpired:
++    proc.kill()
++    remaining, err = proc.communicate()
++    open(os.environ["OUT"], "wb").write(out + remaining)
++    open(os.environ["ERR"], "wb").write(err)
++    sys.exit(124)
++
++open(os.environ["OUT"], "wb").write(out + remaining)
++open(os.environ["ERR"], "wb").write(err)
++sys.exit(proc.returncode)
++PY
++}
++
++
++
++
++"$BIN" app --help >out 2>err; ec=$?
++[ "$ec" -eq 0 ] || fail "F1 app help exit $ec; want 0"
++
++assert_file_grep out '(^|[[:space:]])delete([[:space:]]|$)' "F1 app help missing delete command"
++assert_file_contains out "Delete app" "F1 app help missing delete description"
++"$BIN" app delete --help >out 2>err; ec=$?
++[ "$ec" -eq 0 ] || fail "F1 delete help exit $ec; want 0"
++
++assert_file_contains out "teresa app delete <name>" "F1 delete help missing <name> usage"
++assert_file_grep out '(^|[[:space:]])--no-input([[:space:]]|$)' "F1 delete help missing --no-input"
++
++
++
++
++: >"$SERVER_LOG"
++"$BIN" --config "$CFG" app delete foo --no-input >out 2>err; ec=$?
++[ "$ec" -eq 0 ] || fail "F2 exit $ec; want 0"
++
++assert_file_not_contains out "Are you sure you want to delete" "F2 no-input should skip first prompt"
++assert_file_not_contains out "Please re type the app name" "F2 no-input should skip second prompt"
++assert_file_contains out "The app foo will be deleted in a few minutes" "F2 success message"
++assert_file_eq "$SERVER_LOG" $'DELETE name=foo token=acceptance-token\n' "F2 delete RPC log"
++
++
++
++
++: >"$SERVER_LOG"
++run_interactive_delete "yes|foo"; ec=$?
++[ "$ec" -eq 0 ] || fail "F3 exit $ec; want 0"
++
++assert_file_contains out "Are you sure you want to delete foo on acceptance? (yes/NO) " "F3 first prompt"
++assert_file_contains out "Please re type the app name: " "F3 second prompt"
++assert_file_contains out "The app foo will be deleted in a few minutes" "F3 success message"
++assert_file_eq "$SERVER_LOG" $'DELETE name=foo token=acceptance-token\n' "F3 delete RPC log"
++
++
++
++
++: >"$SERVER_LOG"
++printf 'no\n' | "$BIN" --config "$CFG" app delete foo >out 2>err; ec=$?
++[ "$ec" -eq 0 ] || fail "F4 exit $ec; want 0"
++
++assert_file_contains out "Are you sure you want to delete foo on acceptance? (yes/NO) " "F4 first prompt"
++assert_file_not_contains out "Please re type the app name" "F4 should not ask second prompt"
++assert_file_contains out "Delete process aborted!" "F4 abort message"
++assert_file_eq "$SERVER_LOG" "" "F4 should not send Delete RPC"
++
++
++
++
++: >"$SERVER_LOG"
++run_interactive_delete "yes|bar"; ec=$?
++[ "$ec" -eq 0 ] || fail "F5 exit $ec; want 0"
++
++assert_file_contains out "Are you sure you want to delete foo on acceptance? (yes/NO) " "F5 first prompt"
++assert_file_contains out "Please re type the app name: " "F5 second prompt"
++assert_file_contains out "Delete process aborted!" "F5 abort message"
++assert_file_not_contains out "will be deleted" "F5 should not print success"
++assert_file_eq "$SERVER_LOG" "" "F5 should not send Delete RPC"
++
++
++
++
++: >"$SERVER_LOG"
++"$BIN" --config "$CFG" app delete missing --no-input >out 2>err; ec=$?
++[ "$ec" -ne 0 ] || fail "F6 exit $ec; want non-zero"
++
++assert_file_nonempty err "F6 missing stderr error"
++assert_file_grep_i err 'not found' "F6 missing app-not-found error"
++assert_file_not_contains out "will be deleted" "F6 should not print success"
++assert_file_eq "$SERVER_LOG" $'DELETE name=missing token=acceptance-token\n' "F6 delete RPC log"
++
++
++
++
++: >"$SERVER_LOG"
++"$BIN" --config "$CFG" app delete denied --no-input >out 2>err; ec=$?
++[ "$ec" -ne 0 ] || fail "F7 exit $ec; want non-zero"
++
++assert_file_nonempty err "F7 missing stderr error"
++assert_file_grep_i err 'permission' "F7 missing permission-denied error"
++assert_file_not_contains out "will be deleted" "F7 should not print success"
++assert_file_eq "$SERVER_LOG" $'DELETE name=denied token=acceptance-token\n' "F7 delete RPC log"
++
++
++
++
++: >"$SERVER_LOG"
++"$BIN" --config "$TMP/no-such-config.yaml" app delete foo --no-input >out 2>err; ec=$?
++[ "$ec" -ne 0 ] || fail "F8 exit $ec; want non-zero"
++
++assert_file_not_contains out "Are you sure you want to delete" "F8 prompted after config failure"
++assert_file_nonempty err "F8 missing stderr error"
++assert_file_eq "$SERVER_LOG" "" "F8 should not send Delete RPC"
++
++
++
++
++cat >bad-connection.yaml <<'EOF'
++clusters:
++  acceptance:
++    server: 127.0.0.1:1
++    token: acceptance-token
++    tls: false
++    insecure: false
++current_cluster: acceptance
++EOF
++: >"$SERVER_LOG"
++"$BIN" --config "$TMP/bad-connection.yaml" app delete foo --no-input >out 2>err; ec=$?
++[ "$ec" -ne 0 ] || fail "F9 exit $ec; want non-zero"
++
++assert_file_not_contains out "Are you sure you want to delete" "F9 prompted after connection failure"
++assert_file_nonempty err "F9 missing stderr error"
++assert_file_eq "$SERVER_LOG" "" "F9 should not send Delete RPC to fixture server"
++
++
++
++
++"$SERVER_PROBE" >out 2>err; ec=$?
++[ "$ec" -eq 0 ] || fail "F10 exit $ec; want 0"
++
++assert_file_grep out '^operations-success error=<nil> namespace_exists=false$' "F10 successful namespace deletion"
++assert_file_grep out '^operations-permission error=.*Permission Denied.* namespace_exists=true$' "F10 permission preserves namespace"
++assert_file_grep out '^operations-not-found error=.*App not found$' "F10 app-not-found error"
++assert_file_grep out '^service-success error=<nil> storage_exists=false$' "F10 service deletes app"
++assert_file_grep out '^service-permission error=.*Permission Denied.* storage_exists=true auth_match=true$' "F10 service permission behavior"
++
++echo "PASS"
++exit 0
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,18 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++
++export GOPROXY=off
++export GOSUMDB=off
++export GONOSUMDB='*'
++export GOFLAGS="${GOFLAGS:-} -mod=vendor"
++export AWS_EC2_METADATA_DISABLED=true
++set -e
++cd /workspace/repo
++exec bash /workspace/repo/usercase-test-coderl/usecase.sh

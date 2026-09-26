@@ -1,0 +1,267 @@
+diff --git a/ckan/tests/cli/test_recursive_config_loader_codespec.py b/ckan/tests/cli/test_recursive_config_loader_codespec.py
+new file mode 100644
+index 0000000000..67b5789256
+--- /dev/null
++++ b/ckan/tests/cli/test_recursive_config_loader_codespec.py
+@@ -0,0 +1,247 @@
++# -*- coding: utf-8 -*-
++
++import os
++import textwrap
++
++import pytest
++
++from ckan.cli import CKANConfigLoader
++from ckan.exceptions import CkanConfigurationException
++
++
++def _write_config(path, content):
++    path.parent.mkdir(parents=True, exist_ok=True)
++    path.write_text(textwrap.dedent(content).strip() + "\n")
++    return path
++
++
++@pytest.fixture
++def codespec_three_level_config(tmp_path):
++    base = _write_config(
++        tmp_path / "base" / "base.ini",
++        """
++        [DEFAULT]
++        precedence_default = base-default
++        base_default = %(here)s/base-default
++
++        [app:main]
++        use = egg:ckan
++        precedence_app = base-app
++        base_marker = base
++        base_only = %(here)s/base-app
++        """,
++    )
++    middle = _write_config(
++        tmp_path / "middle" / "middle.ini",
++        """
++        [DEFAULT]
++        precedence_default = middle-default
++        middle_default = %(here)s/middle-default
++
++        [app:main]
++        use = config:../base/base.ini
++        precedence_app = middle-app
++        middle_marker = middle
++        middle_only = %(here)s/middle-app
++        """,
++    )
++    leaf = _write_config(
++        tmp_path / "leaf.ini",
++        """
++        [DEFAULT]
++        precedence_default = leaf-default
++        leaf_default = %(here)s/leaf-default
++
++        [app:main]
++        use = config:middle/middle.ini
++        precedence_app = leaf-app
++        leaf_marker = leaf
++        leaf_only = %(here)s/leaf-app
++        """,
++    )
++
++    return CKANConfigLoader(str(leaf)).get_config(), leaf, middle, base
++
++
++def test_codespec_three_level_chain_and_relative_references(
++    codespec_three_level_config,
++):
++    config, _leaf, _middle, _base = codespec_three_level_config
++
++    assert config["leaf_marker"] == "leaf"
++    assert config["middle_marker"] == "middle"
++    assert config["base_marker"] == "base"
++
++
++def test_codespec_application_values_use_child_precedence(
++    codespec_three_level_config,
++):
++    config, _leaf, _middle, _base = codespec_three_level_config
++
++    assert config["precedence_app"] == "leaf-app"
++
++
++def test_codespec_each_file_has_its_own_here_interpolation(
++    codespec_three_level_config,
++):
++    config, leaf, middle, base = codespec_three_level_config
++
++    assert config["leaf_only"] == os.path.join(str(leaf.parent), "leaf-app")
++    assert config["middle_only"] == os.path.join(str(middle.parent), "middle-app")
++    assert config["base_only"] == os.path.join(str(base.parent), "base-app")
++
++
++def test_codespec_defaults_accumulate_with_declaring_file_interpolation(
++    codespec_three_level_config,
++):
++    config, leaf, middle, base = codespec_three_level_config
++
++    assert config["leaf_default"] == os.path.join(str(leaf.parent), "leaf-default")
++    assert config["middle_default"] == os.path.join(
++        str(middle.parent), "middle-default"
++    )
++    assert config["base_default"] == os.path.join(str(base.parent), "base-default")
++
++    global_conf = config["global_conf"]
++    assert global_conf["leaf_default"] == config["leaf_default"]
++    assert global_conf["middle_default"] == config["middle_default"]
++    assert global_conf["base_default"] == config["base_default"]
++
++
++def test_codespec_default_conflicts_use_farthest_ancestor(
++    codespec_three_level_config,
++):
++    config, _leaf, _middle, _base = codespec_three_level_config
++
++    assert config["precedence_default"] == "base-default"
++    assert config["global_conf"]["precedence_default"] == "base-default"
++
++
++def test_codespec_root_and_terminal_metadata(codespec_three_level_config):
++    config, leaf, _middle, base = codespec_three_level_config
++    global_conf = config["global_conf"]
++
++    assert global_conf["here"] == str(base.parent)
++    assert global_conf["__file__"] == str(leaf.resolve())
++    assert config["__file__"] == str(leaf.resolve())
++
++
++def test_codespec_absolute_parent_reference_is_supported(tmp_path):
++    base = _write_config(
++        tmp_path / "elsewhere" / "base.ini",
++        """
++        [app:main]
++        use = egg:ckan
++        inherited = yes
++        """,
++    )
++    leaf = _write_config(
++        tmp_path / "leaf.ini",
++        """
++        [app:main]
++        use = config:{}
++        local = yes
++        """.format(base),
++    )
++
++    config = CKANConfigLoader(str(leaf)).get_config()
++
++    assert config["local"] == "yes"
++    assert config["inherited"] == "yes"
++
++
++def test_codespec_missing_nested_parent_reports_both_paths(tmp_path):
++    missing = tmp_path / "base" / "missing.ini"
++    middle = _write_config(
++        tmp_path / "middle" / "middle.ini",
++        """
++        [app:main]
++        use = config:../base/missing.ini
++        middle = yes
++        """,
++    )
++    leaf = _write_config(
++        tmp_path / "leaf.ini",
++        """
++        [app:main]
++        use = config:middle/middle.ini
++        leaf = yes
++        """,
++    )
++
++    with pytest.raises(CkanConfigurationException) as error:
++        CKANConfigLoader(str(leaf))
++
++    message = str(error.value).lower()
++    assert "not found" in message
++    assert str(middle.resolve()) in str(error.value)
++    assert str(missing.resolve()) in str(error.value)
++
++
++def test_codespec_empty_parent_reference_is_rejected(tmp_path):
++    leaf = _write_config(
++        tmp_path / "leaf.ini",
++        """
++        [app:main]
++        use = config:
++        local = yes
++        """,
++    )
++
++    with pytest.raises(CkanConfigurationException) as error:
++        CKANConfigLoader(str(leaf))
++
++    message = str(error.value).lower()
++    assert "config" in message
++    assert "empty" in message
++    assert str(leaf.resolve()) in str(error.value)
++
++
++def test_codespec_direct_cycle_reports_the_chain(tmp_path):
++    leaf = _write_config(
++        tmp_path / "leaf.ini",
++        """
++        [app:main]
++        use = config:leaf.ini
++        """,
++    )
++
++    with pytest.raises(CkanConfigurationException) as error:
++        CKANConfigLoader(str(leaf))
++
++    message = str(error.value).lower()
++    assert "circular" in message
++    assert str(leaf.resolve()) in str(error.value)
++
++
++def test_codespec_indirect_cycle_reports_every_file(tmp_path):
++    first = _write_config(
++        tmp_path / "first.ini",
++        """
++        [app:main]
++        use = config:second.ini
++        """,
++    )
++    second = _write_config(
++        tmp_path / "second.ini",
++        """
++        [app:main]
++        use = config:nested/third.ini
++        """,
++    )
++    third = _write_config(
++        tmp_path / "nested" / "third.ini",
++        """
++        [app:main]
++        use = config:../first.ini
++        """,
++    )
++
++    with pytest.raises(CkanConfigurationException) as error:
++        CKANConfigLoader(str(first))
++
++    message = str(error.value).lower()
++    assert "circular" in message
++    assert str(first.resolve()) in str(error.value)
++    assert str(second.resolve()) in str(error.value)
++    assert str(third.resolve()) in str(error.value)
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,9 @@
++#!/bin/bash
++set -euo pipefail
++
++
++pytest -q --confcutdir=ckan/tests \
++  ckan/tests/cli/test_recursive_config_loader_codespec.py \
++  ckan/tests/cli/test_cli.py::test_ckan_config_loader_parse_file \
++  ckan/tests/cli/test_cli.py::test_ckan_config_loader_parse_two_files \
++  --disable-warnings

@@ -1,0 +1,285 @@
+diff --git a/usercase-test-coderl/usecase.sh b/usercase-test-coderl/usecase.sh
+new file mode 100755
+--- /dev/null
++++ b/usercase-test-coderl/usecase.sh
+@@ -0,0 +1,256 @@
++#!/usr/bin/env bash
++
++set -u
++export LANG=C LC_ALL=C TZ=UTC
++
++export GO111MODULE=off GOPROXY=off GOSUMDB=off GONOSUMDB='*' GOTOOLCHAIN=local
++export GOFLAGS=
++
++TMP=$(mktemp -d)
++trap 'rm -rf "$TMP"' EXIT
++fail() { echo "FAIL: $*" >&2; exit 1; }
++
++( cd /workspace/repo && go build -o "$TMP/gosaic" . ) \
++    || { echo "FAIL: build" >&2; exit 1; }
++BIN="$TMP/gosaic"
++
++command -v sqlite3 >/dev/null 2>&1 || fail "sqlite3 is required"
++
++make_fixture_program() {
++    cat > "$TMP/mkfixtures.go" <<'GO'
++package main
++
++import (
++	"bytes"
++	"image"
++	"image/color"
++	"image/jpeg"
++	"image/png"
++	"os"
++	"path/filepath"
++)
++
++func fill(w, h int, c color.RGBA) *image.RGBA {
++	img := image.NewRGBA(image.Rect(0, 0, w, h))
++	for y := 0; y < h; y++ {
++		for x := 0; x < w; x++ {
++			img.SetRGBA(x, y, c)
++		}
++	}
++	return img
++}
++
++func writePNG(path string, w, h int, c color.RGBA) {
++	f, err := os.Create(path)
++	if err != nil {
++		panic(err)
++	}
++	defer f.Close()
++	if err := png.Encode(f, fill(w, h, c)); err != nil {
++		panic(err)
++	}
++}
++
++func exifSegment(orientation byte) []byte {
++	payload := []byte{
++		'E', 'x', 'i', 'f', 0, 0,
++		'I', 'I', 42, 0, 8, 0, 0, 0,
++		1, 0,
++		0x12, 0x01, 3, 0, 1, 0, 0, 0, orientation, 0, 0, 0,
++		0, 0, 0, 0,
++	}
++	length := len(payload) + 2
++	seg := []byte{0xff, 0xe1, byte(length >> 8), byte(length)}
++	return append(seg, payload...)
++}
++
++func writeJPEG(path string, w, h int, c color.RGBA, orientation int) {
++	var b bytes.Buffer
++	if err := jpeg.Encode(&b, fill(w, h, c), &jpeg.Options{Quality: 90}); err != nil {
++		panic(err)
++	}
++	data := b.Bytes()
++	if orientation >= 0 {
++		data = append(append(append([]byte{}, data[:2]...), exifSegment(byte(orientation))...), data[2:]...)
++	}
++	if err := os.WriteFile(path, data, 0644); err != nil {
++		panic(err)
++	}
++}
++
++func main() {
++	root := os.Args[1]
++	mode := os.Args[2]
++
++	switch mode {
++	case "main":
++		os.MkdirAll(filepath.Join(root, "tiles", "nested"), 0755)
++		writePNG(filepath.Join(root, "tiles", "a_square.png"), 2, 2, color.RGBA{255, 0, 0, 255})
++		b, err := os.ReadFile(filepath.Join(root, "tiles", "a_square.png"))
++		if err != nil {
++			panic(err)
++		}
++		if err := os.WriteFile(filepath.Join(root, "tiles", "aa_square_duplicate.png"), b, 0644); err != nil {
++			panic(err)
++		}
++		writeJPEG(filepath.Join(root, "tiles", "b_orient5.jpg"), 3, 5, color.RGBA{0, 255, 0, 255}, 5)
++		writeJPEG(filepath.Join(root, "tiles", "c_orient6.jpg"), 3, 5, color.RGBA{0, 200, 50, 255}, 6)
++		writeJPEG(filepath.Join(root, "tiles", "d_orient7.jpeg"), 7, 4, color.RGBA{0, 0, 255, 255}, 7)
++		writeJPEG(filepath.Join(root, "tiles", "e_orient8.jpeg"), 7, 4, color.RGBA{20, 40, 200, 255}, 8)
++		writeJPEG(filepath.Join(root, "tiles", "f_zero_orientation.jpg"), 6, 4, color.RGBA{255, 255, 0, 255}, 0)
++		writeJPEG(filepath.Join(root, "tiles", "nested", "g_plain.jpeg"), 10, 6, color.RGBA{255, 0, 255, 255}, -1)
++		if err := os.WriteFile(filepath.Join(root, "tiles", "nested", "ignored.txt"), []byte("not an image"), 0644); err != nil {
++			panic(err)
++		}
++	case "stdin":
++		os.MkdirAll(filepath.Join(root, "stdin", "sub"), 0755)
++		writePNG(filepath.Join(root, "stdin", "one.png"), 1, 3, color.RGBA{10, 20, 30, 255})
++		writeJPEG(filepath.Join(root, "stdin", "sub", "two.jpg"), 2, 1, color.RGBA{40, 50, 60, 255}, -1)
++	case "errors":
++		os.MkdirAll(filepath.Join(root, "errtiles"), 0755)
++		writePNG(filepath.Join(root, "errtiles", "good.png"), 3, 1, color.RGBA{1, 2, 3, 255})
++		if err := os.WriteFile(filepath.Join(root, "errtiles", "bad.png"), []byte("not really a png"), 0644); err != nil {
++			panic(err)
++		}
++	default:
++		panic("unknown fixture mode")
++	}
++}
++GO
++}
++
++strip_log_prefix() {
++    sed -E 's/^GOSAIC: [0-9]{4}\/[0-9]{2}\/[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2} //'
++}
++
++output_contains() {
++    local base="$1"
++    local needle="$2"
++    grep -Fq "$needle" "$base/out" || grep -Fq "$needle" "$base/err"
++}
++
++assert_gidx_row() {
++    local db="$1"
++    local path="$2"
++    local md5="$3"
++    local width="$4"
++    local height="$5"
++    local orientation="$6"
++    local actual
++
++    actual=$(sqlite3 -separator '|' "$db" "select md5sum,width,height,orientation from gidx where path = '$path';")
++    [ "$actual" = "$md5|$width|$height|$orientation" ] || fail "metadata for $path differs: $actual"
++}
++
++make_fixture_program
++
++
++
++
++F1="$TMP/f1"
++mkdir -p "$F1"
++go run "$TMP/mkfixtures.go" "$F1" main || fail "F1 fixture setup"
++DB1="$F1/gosaic.sqlite3"
++"$BIN" --dsn "sqlite3://$DB1" --workers 1 index "$F1/tiles" >"$F1/out" 2>"$F1/err"; ec=$?
++[ "$ec" -eq 0 ] || fail "F1 exit $ec; want 0"
++
++output_contains "$F1" 'Indexing 8 images...' || fail "F1 missing indexing count: $(cat "$F1/out" "$F1/err")"
++
++
++SQUARE_COUNT=$(sqlite3 "$DB1" "select count(*) from gidx where md5sum = 'dcbfc6cd70daef3188f5439f9f3429d7';")
++[ "$SQUARE_COUNT" = "1" ] || fail "F1 square duplicate content count $SQUARE_COUNT; want 1"
++SQUARE_PATH=$(sqlite3 "$DB1" "select path from gidx where md5sum = 'dcbfc6cd70daef3188f5439f9f3429d7';")
++case "$SQUARE_PATH" in
++    "$F1/tiles/a_square.png"|"$F1/tiles/aa_square_duplicate.png") ;;
++    *) fail "F1 duplicate content stored unexpected path: $SQUARE_PATH" ;;
++esac
++assert_gidx_row "$DB1" "$SQUARE_PATH" "dcbfc6cd70daef3188f5439f9f3429d7" 2 2 1
++assert_gidx_row "$DB1" "$F1/tiles/b_orient5.jpg" "e865e1b59ac7d52f0e979fbe17792923" 5 3 5
++assert_gidx_row "$DB1" "$F1/tiles/c_orient6.jpg" "a95c8c7e3b2de60db8e37a4d5f4abda1" 5 3 6
++assert_gidx_row "$DB1" "$F1/tiles/d_orient7.jpeg" "6f1cdd2357085f8ba3cd37d29a9b0f56" 4 7 7
++assert_gidx_row "$DB1" "$F1/tiles/e_orient8.jpeg" "9ee6eb5ca0365af67878f0a39bde02ff" 4 7 8
++assert_gidx_row "$DB1" "$F1/tiles/f_zero_orientation.jpg" "70769f947335910a4e3704c22631f7c1" 6 4 1
++assert_gidx_row "$DB1" "$F1/tiles/nested/g_plain.jpeg" "e9dca4e53539e756cbdfa5d9206a79fc" 10 6 1
++
++GIDX_COUNT=$(sqlite3 "$DB1" 'select count(*) from gidx;')
++[ "$GIDX_COUNT" = "7" ] || fail "F1 gidx count $GIDX_COUNT; want 7"
++ASPECT_COUNT=$(sqlite3 "$DB1" 'select count(*) from aspects;')
++[ "$ASPECT_COUNT" = "4" ] || fail "F1 aspect count $ASPECT_COUNT; want 4"
++NON_ABS=$(sqlite3 "$DB1" "select count(*) from gidx where substr(path, 1, 1) != '/';")
++[ "$NON_ABS" = "0" ] || fail "F1 stored a non-absolute path"
++BAD_ASPECT_RATIOS=$(sqlite3 "$DB1" 'select count(*) from gidx join aspects on aspects.id = gidx.aspect_id where aspects.columns * gidx.height != aspects.rows * gidx.width;')
++[ "$BAD_ASPECT_RATIOS" = "0" ] || fail "F1 aspect rows do not match indexed dimensions"
++REUSED_5X3=$(sqlite3 "$DB1" "select count(distinct aspect_id) from gidx where path in ('$F1/tiles/b_orient5.jpg', '$F1/tiles/c_orient6.jpg', '$F1/tiles/nested/g_plain.jpeg');")
++[ "$REUSED_5X3" = "1" ] || fail "F1 did not reuse the 5:3 aspect record"
++REUSED_4X7=$(sqlite3 "$DB1" "select count(distinct aspect_id) from gidx where path in ('$F1/tiles/d_orient7.jpeg', '$F1/tiles/e_orient8.jpeg');")
++[ "$REUSED_4X7" = "1" ] || fail "F1 did not reuse the 4:7 aspect record"
++
++"$BIN" --dsn "sqlite3://$DB1" --workers 1 index --list >"$F1/listout" 2>"$F1/listerr"; ec=$?
++[ "$ec" -eq 0 ] || fail "F1 list exit $ec; want 0"
++
++cat "$F1/listout" "$F1/listerr" | strip_log_prefix | sed '/^$/d' >"$F1/listpaths"
++LIST_COUNT=$(wc -l <"$F1/listpaths" | tr -d ' ')
++[ "$LIST_COUNT" = "7" ] || fail "F1 list count $LIST_COUNT; want 7: $(cat "$F1/listpaths")"
++UNIQUE_LIST_COUNT=$(sort "$F1/listpaths" | uniq | wc -l | tr -d ' ')
++[ "$UNIQUE_LIST_COUNT" = "7" ] || fail "F1 list contains duplicate paths: $(cat "$F1/listpaths")"
++for p in \
++    "$F1/tiles/b_orient5.jpg" \
++    "$F1/tiles/c_orient6.jpg" \
++    "$F1/tiles/d_orient7.jpeg" \
++    "$F1/tiles/e_orient8.jpeg" \
++    "$F1/tiles/f_zero_orientation.jpg" \
++    "$F1/tiles/nested/g_plain.jpeg"
++do
++    grep -Fxq "$p" "$F1/listpaths" || fail "F1 list missing $p: $(cat "$F1/listpaths")"
++done
++SQUARE_LIST_COUNT=$(grep -Fx -e "$F1/tiles/a_square.png" -e "$F1/tiles/aa_square_duplicate.png" "$F1/listpaths" | wc -l | tr -d ' ')
++[ "$SQUARE_LIST_COUNT" = "1" ] || fail "F1 list should include exactly one duplicate-content path: $(cat "$F1/listpaths")"
++
++
++
++
++F2="$TMP/f2"
++mkdir -p "$F2"
++go run "$TMP/mkfixtures.go" "$F2" stdin || fail "F2 fixture setup"
++DB2="$F2/gosaic.sqlite3"
++printf '%s\n%s\n' "$F2/stdin/one.png" "$F2/stdin/sub" | "$BIN" --dsn "sqlite3://$DB2" --workers 1 index >"$F2/out" 2>"$F2/err"; ec=$?
++[ "$ec" -eq 0 ] || fail "F2 exit $ec; want 0"
++
++output_contains "$F2" 'Indexing 2 images...' || fail "F2 missing indexing count: $(cat "$F2/out" "$F2/err")"
++ACTUAL_ROWS=$(sqlite3 -separator '|' "$DB2" 'select path,md5sum,width,height,orientation from gidx order by path;')
++EXPECTED_ROWS="$F2/stdin/one.png|edd7d1b2b9b212fcd7ff7b7480b38cdb|1|3|1
++$F2/stdin/sub/two.jpg|b24d08565c5707482524485aec38c6f3|2|1|1"
++[ "$ACTUAL_ROWS" = "$EXPECTED_ROWS" ] || fail "F2 database rows differ: $ACTUAL_ROWS"
++
++
++
++
++F3="$TMP/f3"
++mkdir -p "$F3"
++DB3="$F3/gosaic.sqlite3"
++"$BIN" --dsn "sqlite3://$DB3" --workers 1 index >"$F3/out" 2>"$F3/err"; ec=$?
++[ "$ec" -eq 1 ] || fail "F3 exit $ec; want 1"
++
++output_contains "$F3" 'Must specify paths to index' || fail "F3 missing fatal message: $(cat "$F3/out" "$F3/err")"
++
++
++
++
++F4="$TMP/f4"
++mkdir -p "$F4"
++go run "$TMP/mkfixtures.go" "$F4" errors || fail "F4 fixture setup"
++DB4="$F4/gosaic.sqlite3"
++"$BIN" --dsn "sqlite3://$DB4" --workers 1 index "$F4/does-not-exist" "$F4/errtiles" >"$F4/out" 2>"$F4/err"; ec=$?
++[ "$ec" -eq 0 ] || fail "F4 exit $ec; want 0"
++
++cat "$F4/out" "$F4/err" >"$F4/all"
++grep -Fi 'error' "$F4/all" | grep -Fq "$F4/does-not-exist" || fail "F4 missing missing-path error: $(cat "$F4/all")"
++grep -Fi 'error' "$F4/all" | grep -Fq "$F4/errtiles/bad.png" || fail "F4 missing bad-image error: $(cat "$F4/all")"
++
++grep -Fq 'Indexing ' "$F4/all" || fail "F4 missing indexing progress line: $(cat "$F4/all")"
++ACTUAL_ROWS=$(sqlite3 -separator '|' "$DB4" 'select path,md5sum,width,height,orientation from gidx order by path;')
++EXPECTED_ROWS="$F4/errtiles/good.png|f360ad15c1e137a8195e2014ff6dfcb7|3|1|1"
++[ "$ACTUAL_ROWS" = "$EXPECTED_ROWS" ] || fail "F4 database rows differ: $ACTUAL_ROWS"
++
++echo "PASS"
++exit 0
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,19 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++
++export GO111MODULE=off
++export GOPROXY=off
++export GOSUMDB=off
++export GONOSUMDB='*'
++export GOTOOLCHAIN=local
++export GOFLAGS=
++set -e
++cd /workspace/repo
++exec bash /workspace/repo/usercase-test-coderl/usecase.sh

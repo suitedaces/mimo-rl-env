@@ -1,0 +1,245 @@
+diff --git a/pkg/skaffold/build/custom/dependencies_test.go b/pkg/skaffold/build/custom/dependencies_test.go
+index 9845c937d..f0d4d5e45 100644
+--- a/pkg/skaffold/build/custom/dependencies_test.go
++++ b/pkg/skaffold/build/custom/dependencies_test.go
+@@ -18,6 +18,9 @@ package custom
+ 
+ import (
+ 	"context"
++	"fmt"
++	"io/ioutil"
++	"os"
+ 	"path/filepath"
+ 	"testing"
+ 
+@@ -58,6 +61,84 @@ func TestGetDependenciesDockerfile(t *testing.T) {
+ 	testutil.CheckErrorAndDeepEqual(t, false, err, expected, deps)
+ }
+ 
++func TestGetDependenciesCommandJSONOutput(t *testing.T) {
++	tests := []struct {
++		description string
++		output      string
++		expected    []string
++	}{
++		{
++			description: "source and asset files",
++			output:      `["src/a.go","assets/b.txt"]`,
++			expected:    []string{"src/a.go", "assets/b.txt"},
++		},
++		{
++			description: "different dependency names",
++			output:      `["another.yaml","dir/third.txt"]`,
++			expected:    []string{"another.yaml", "dir/third.txt"},
++		},
++		{
++			description: "third valid dependency set",
++			output:      `["cmd/generated.txt","pkg/fourth.go"]`,
++			expected:    []string{"cmd/generated.txt", "pkg/fourth.go"},
++		},
++	}
++
++	for _, test := range tests {
++		t.Run(test.description, func(t *testing.T) {
++			command := dependencyCommandScript(t, fmt.Sprintf("printf '%%s\n' '%s'\n", test.output))
++			customArtifact := &latest.CustomArtifact{
++				Dependencies: &latest.CustomDependencies{
++					Command: command,
++				},
++			}
++
++			deps, err := GetDependencies(context.Background(), "", customArtifact, nil)
++
++			testutil.CheckErrorAndDeepEqual(t, false, err, test.expected, deps)
++		})
++	}
++}
++
++func TestGetDependenciesCommandInvalidOutput(t *testing.T) {
++	tests := []struct {
++		description string
++		output      string
++	}{
++		{description: "not json", output: `not-json`},
++		{description: "json object", output: `{"path":"a"}`},
++		{description: "array with non-string element", output: `["ok", 1]`},
++	}
++
++	for _, test := range tests {
++		t.Run(test.description, func(t *testing.T) {
++			command := dependencyCommandScript(t, fmt.Sprintf("printf '%%s\n' '%s'\n", test.output))
++			customArtifact := &latest.CustomArtifact{
++				Dependencies: &latest.CustomDependencies{
++					Command: command,
++				},
++			}
++
++			_, err := GetDependencies(context.Background(), "", customArtifact, nil)
++
++			testutil.CheckError(t, true, err)
++		})
++	}
++}
++
++func TestGetDependenciesCommandFailure(t *testing.T) {
++	command := dependencyCommandScript(t, "echo dependency failure >&2\nexit 17\n")
++	customArtifact := &latest.CustomArtifact{
++		Dependencies: &latest.CustomDependencies{
++			Command: command,
++		},
++	}
++
++	_, err := GetDependencies(context.Background(), "", customArtifact, nil)
++
++	testutil.CheckErrorContains(t, command, err)
++}
++
+ func TestGetDependenciesPaths(t *testing.T) {
+ 	tmpDir, cleanup := testutil.NewTempDir(t)
+ 	defer cleanup()
+@@ -109,3 +190,17 @@ func TestGetDependenciesPaths(t *testing.T) {
+ func stringPointer(s string) *string {
+ 	return &s
+ }
++
++func dependencyCommandScript(t *testing.T, body string) string {
++	t.Helper()
++	dir, err := ioutil.TempDir("", "skaffold-dependency-command")
++	if err != nil {
++		t.Fatalf("creating temp dir: %v", err)
++	}
++	path := filepath.Join(dir, "deps.sh")
++	if err := ioutil.WriteFile(path, []byte("#!/bin/sh\n"+body), 0755); err != nil {
++		os.RemoveAll(dir)
++		t.Fatalf("writing dependency command: %v", err)
++	}
++	return path
++}
+diff --git a/pkg/skaffold/schema/latest/custom_dependencies_public_surface_test.go b/pkg/skaffold/schema/latest/custom_dependencies_public_surface_test.go
+new file mode 100644
+index 000000000..f08b513d3
+--- /dev/null
++++ b/pkg/skaffold/schema/latest/custom_dependencies_public_surface_test.go
+@@ -0,0 +1,60 @@
++package latest
++
++import (
++	"bytes"
++	"encoding/json"
++	"io/ioutil"
++	"path/filepath"
++	"testing"
++)
++
++func TestCustomDependenciesCommandSchema(t *testing.T) {
++	schemaBytes, err := ioutil.ReadFile(filepath.Join(repoRootForPublicSurfaceTest(), "docs", "content", "en", "schemas", "v1beta10.json"))
++	if err != nil {
++		t.Fatalf("reading schema: %v", err)
++	}
++
++	var schema struct {
++		Definitions map[string]struct {
++			Properties map[string]struct {
++				Type        string `json:"type"`
++				Description string `json:"description"`
++			} `json:"properties"`
++		} `json:"definitions"`
++	}
++	if err := json.NewDecoder(bytes.NewReader(schemaBytes)).Decode(&schema); err != nil {
++		t.Fatalf("parsing schema: %v", err)
++	}
++
++	commandProperty, ok := schema.Definitions["CustomDependencies"].Properties["command"]
++	if !ok {
++		t.Fatalf("CustomDependencies schema does not expose command property")
++	}
++	if commandProperty.Type != "string" {
++		t.Fatalf("command schema type = %q, expected string", commandProperty.Type)
++	}
++	description := bytes.ToLower([]byte(commandProperty.Description))
++	for _, required := range []string{"command", "json", "array"} {
++		if !bytes.Contains(description, []byte(required)) {
++			t.Fatalf("command schema description %q does not describe %q", commandProperty.Description, required)
++		}
++	}
++}
++
++func TestCustomDependenciesCommandDocumentation(t *testing.T) {
++	docBytes, err := ioutil.ReadFile(filepath.Join(repoRootForPublicSurfaceTest(), "docs", "content", "en", "docs", "how-tos", "builders", "_index.md"))
++	if err != nil {
++		t.Fatalf("reading custom builder docs: %v", err)
++	}
++	doc := bytes.ToLower(docBytes)
++
++	for _, required := range []string{"command", "dependenc", "json", "array"} {
++		if !bytes.Contains(doc, []byte(required)) {
++			t.Fatalf("custom builder docs do not describe command dependency JSON array contract; missing %q", required)
++		}
++	}
++}
++
++func repoRootForPublicSurfaceTest() string {
++	return filepath.Clean(filepath.Join("..", "..", "..", ".."))
++}
+diff --git a/pkg/skaffold/schema/validation/validation_test.go b/pkg/skaffold/schema/validation/validation_test.go
+index 80911f318..6fb3e4b1d 100644
+--- a/pkg/skaffold/schema/validation/validation_test.go
++++ b/pkg/skaffold/schema/validation/validation_test.go
+@@ -388,6 +388,20 @@ func TestValidateCustomDependencies(t *testing.T) {
+ 				Ignore: []string{"ignoreme"},
+ 			},
+ 			expectedErrors: 1,
++		}, {
++			description: "ignore in conjunction with paths",
++			dependencies: &latest.CustomDependencies{
++				Paths:  []string{"src/**"},
++				Ignore: []string{"third_party/**"},
++			},
++			expectedErrors: 0,
++		}, {
++			description: "ignore in conjunction with command",
++			dependencies: &latest.CustomDependencies{
++				Command: "./deps.sh",
++				Ignore:  []string{"ignoreme"},
++			},
++			expectedErrors: 1,
+ 		},
+ 	}
+ 
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,32 @@
++#!/bin/bash
++set -euo pipefail
++
++cd /testbed
++
++
++
++dev-switch go 1.23
++
++
++mkdir -p /root/go/src/github.com/GoogleContainerTools
++ln -sf /testbed /root/go/src/github.com/GoogleContainerTools/skaffold
++
++
++cd /root/go/src/github.com/GoogleContainerTools/skaffold
++
++
++case "${1:-}" in
++  base)
++    GO111MODULE=off go test -v ./pkg/skaffold/build/custom/ -run '^(TestGetDependenciesDockerfile|TestGetDependenciesPaths)$'
++    GO111MODULE=off go test -v ./pkg/skaffold/schema/validation/ -run '^TestValidateCustomDependencies/(no_errors|ignore_in_conjunction_with_dockerfile)$'
++    ;;
++  new)
++    GO111MODULE=off go test -v ./pkg/skaffold/build/custom/ -run '^TestGetDependenciesCommand(JSONOutput|InvalidOutput|Failure)$'
++    GO111MODULE=off go test -v ./pkg/skaffold/schema/validation/ -run '^TestValidateCustomDependencies/(ignore_in_conjunction_with_paths|ignore_in_conjunction_with_command)$'
++    GO111MODULE=off go test -v ./pkg/skaffold/schema/latest/ -run '^TestCustomDependenciesCommand(Schema|Documentation)$'
++    ;;
++  *)
++    echo "usage: $0 base|new"
++    exit 2
++    ;;
++esac

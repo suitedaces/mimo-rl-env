@@ -1,0 +1,196 @@
+diff --git a/ets_qdisc_integration_test.go b/ets_qdisc_integration_test.go
+new file mode 100644
+index 0000000..c6cdfd6
+--- /dev/null
++++ b/ets_qdisc_integration_test.go
+@@ -0,0 +1,180 @@
++package tc
++
++import (
++	"errors"
++	"reflect"
++	"testing"
++	"time"
++
++	"github.com/florianl/go-tc/internal/unix"
++	"github.com/google/go-cmp/cmp"
++	"github.com/mdlayher/netlink"
++)
++
++
++
++type etsQdiscConn struct {
++	last    netlink.Message
++	request []byte
++	dumps   int
++}
++
++func (c *etsQdiscConn) Close() error                             { return nil }
++func (c *etsQdiscConn) JoinGroup(uint32) error                   { return nil }
++func (c *etsQdiscConn) LeaveGroup(uint32) error                  { return nil }
++func (c *etsQdiscConn) SetOption(netlink.ConnOption, bool) error { return nil }
++func (c *etsQdiscConn) SetReadDeadline(time.Time) error          { return nil }
++
++func (c *etsQdiscConn) Send(m netlink.Message) (netlink.Message, error) {
++	c.last = m
++	if m.Header.Type != netlink.HeaderType(unix.RTM_GETQDISC) {
++		c.request = append(c.request[:0], m.Data...)
++	}
++	return m, nil
++}
++
++func (c *etsQdiscConn) Receive() ([]netlink.Message, error) {
++	if c.last.Header.Type != netlink.HeaderType(unix.RTM_GETQDISC) || len(c.request) == 0 {
++		return nil, nil
++	}
++	var attrs []netlink.Attribute
++	ad, err := netlink.NewAttributeDecoder(c.request[20:])
++	if err != nil {
++		return nil, err
++	}
++	for ad.Next() {
++		attrs = append(attrs, netlink.Attribute{Type: ad.Type(), Data: ad.Bytes()})
++	}
++	if err := ad.Err(); err != nil {
++		return nil, err
++	}
++	var ordered []netlink.Attribute
++	firstType := uint16(tcaKind)
++	if c.dumps%2 == 1 {
++		firstType = tcaOptions
++	}
++	for _, attr := range attrs {
++		if attr.Type == firstType {
++			ordered = append(ordered, attr)
++		}
++	}
++	for _, attr := range attrs {
++		if attr.Type != firstType {
++			ordered = append(ordered, attr)
++		}
++	}
++	encoded, err := netlink.MarshalAttributes(ordered)
++	if err != nil {
++		return nil, err
++	}
++	c.dumps++
++	return []netlink.Message{{
++		Header: netlink.Header{Type: netlink.HeaderType(unix.RTM_NEWQDISC), Sequence: c.last.Header.Sequence, PID: c.last.Header.PID},
++		Data:   append(append([]byte(nil), c.request[:20]...), encoded...),
++	}}, nil
++}
++
++var _ tcConn = (*etsQdiscConn)(nil)
++
++func setPublicETSField(t *testing.T, attr *Attribute, ets *Ets) {
++	t.Helper()
++	field := reflect.ValueOf(attr).Elem().FieldByName("Ets")
++	if !field.IsValid() {
++		t.Fatalf("Attribute does not expose an Ets field")
++	}
++	wantType := reflect.TypeOf((*Ets)(nil))
++	if field.Type() != wantType {
++		t.Fatalf("Attribute.Ets has type %v, want %v", field.Type(), wantType)
++	}
++	field.Set(reflect.ValueOf(ets))
++}
++
++func publicETSField(t *testing.T, attr *Attribute) *Ets {
++	t.Helper()
++	field := reflect.ValueOf(attr).Elem().FieldByName("Ets")
++	if !field.IsValid() {
++		t.Fatalf("Attribute does not expose an Ets field")
++	}
++	ets, ok := field.Interface().(*Ets)
++	if !ok {
++		t.Fatalf("Attribute.Ets has type %v, want *Ets", field.Type())
++	}
++	return ets
++}
++
++func TestETSQdiscPublicRoundTripAndOperations(t *testing.T) {
++	quanta := []uint32{4500, 3000, 2500}
++	prioMap := []uint8{0, 1, 1, 1, 2, 3, 4, 5}
++	want := Object{
++		Msg:       Msg{Family: unix.AF_UNSPEC, Ifindex: 7, Handle: 0x10000, Parent: HandleRoot},
++		Attribute: Attribute{Kind: "ets"},
++	}
++	wantEts := &Ets{NBands: uint8Ptr(0), NStrict: uint8Ptr(3), Quanta: &quanta, PrioMap: &prioMap}
++	setPublicETSField(t, &want.Attribute, wantEts)
++
++	conn := &etsQdiscConn{}
++	tc := &Tc{con: conn}
++	qd := tc.Qdisc()
++	if err := qd.Add(&want); err != nil {
++		t.Fatalf("Add(ets) failed: %v", err)
++	}
++	if err := qd.Replace(&want); err != nil {
++		t.Fatalf("Replace(ets) failed: %v", err)
++	}
++	if err := qd.Change(&want); err != nil {
++		t.Fatalf("Change(ets) failed: %v", err)
++	}
++	if err := qd.Link(&want); err != nil {
++		t.Fatalf("Link(ets) failed: %v", err)
++	}
++
++	for i := 0; i < 2; i++ {
++		got, err := qd.Get()
++		if err != nil {
++			t.Fatalf("Get(ets) failed: %v", err)
++		}
++		if len(got) != 1 {
++			t.Fatalf("Get(ets) returned %d objects, want 1", len(got))
++		}
++		if diff := cmp.Diff(want.Msg, got[0].Msg); diff != "" {
++			t.Fatalf("ETS qdisc message did not round-trip (-want +got):\n%s", diff)
++		}
++		if got[0].Kind != "ets" {
++			t.Fatalf("Get returned kind %q, want ets", got[0].Kind)
++		}
++		if diff := cmp.Diff(wantEts, publicETSField(t, &got[0].Attribute)); diff != "" {
++			t.Fatalf("ETS options did not round-trip (-want +got):\n%s", diff)
++		}
++	}
++
++	if err := qd.Delete(&Object{Msg: want.Msg, Attribute: Attribute{Kind: "ets"}}); err != nil {
++		t.Fatalf("Delete(ets) failed: %v", err)
++	}
++}
++
++func TestETSQdiscValidationAndCompatibility(t *testing.T) {
++	conn := &etsQdiscConn{}
++	qd := (&Tc{con: conn}).Qdisc()
++
++	cases := []struct {
++		name string
++		obj  *Object
++		want error
++	}{
++		{name: "missing options", obj: &Object{Msg: Msg{Ifindex: 1}, Attribute: Attribute{Kind: "ets"}}, want: ErrNoArg},
++		{name: "invalid device", obj: &Object{Msg: Msg{}, Attribute: Attribute{Kind: "ets"}}, want: ErrInvalidDev},
++		{name: "unknown kind", obj: &Object{Msg: Msg{Ifindex: 1}, Attribute: Attribute{Kind: "not-a-qdisc"}}, want: ErrNotImplemented},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			if err := qd.Add(tc.obj); !errors.Is(err, tc.want) {
++				t.Fatalf("Add returned %v, want %v", err, tc.want)
++			}
++		})
++	}
++
++
++	if err := qd.Add(&Object{Msg: Msg{Ifindex: 1}, Attribute: Attribute{Kind: "qfq"}}); err != nil {
++		t.Fatalf("parameterless qfq compatibility broke: %v", err)
++	}
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,5 @@
++#!/bin/bash
++set -euo pipefail
++
++
++go test -vet=off -run '^TestETSQdisc' .

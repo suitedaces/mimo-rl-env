@@ -1,0 +1,309 @@
+diff --git a/test/api/render_workflow_public_test.py b/test/api/render_workflow_public_test.py
+new file mode 100644
+index 0000000..d18db4c
+--- /dev/null
++++ b/test/api/render_workflow_public_test.py
+@@ -0,0 +1,290 @@
++
++
++from pathlib import Path
++
++import pytest
++from click.testing import CliRunner
++
++import sqlfluff
++import sqlfluff.api as public_api
++from sqlfluff.cli.commands import cli
++from sqlfluff.core.errors import SQLBaseError
++
++
++def _public_render():
++    render = getattr(sqlfluff, "render", None)
++    assert callable(render), "sqlfluff.render() must be publicly available"
++    return render
++
++
++def _public_templating_error():
++    error = getattr(sqlfluff, "APITemplatingError", None)
++    assert error is not None, "sqlfluff.APITemplatingError must be publicly available"
++    return error
++
++
++def _write_config(path: Path, contents: str) -> Path:
++    path.write_text(contents, encoding="utf-8")
++    return path
++
++
++def test_render_public_exports_are_consistent():
++
++    render = _public_render()
++    error = _public_templating_error()
++
++    assert getattr(public_api, "render", None) is render
++    assert getattr(public_api, "APITemplatingError", None) is error
++    assert "render" in sqlfluff.__all__
++    assert "APITemplatingError" in sqlfluff.__all__
++    assert "render" in public_api.__all__
++    assert "APITemplatingError" in public_api.__all__
++
++
++@pytest.mark.parametrize(
++    "source, expected",
++    [
++        ("SELEC !!! this is not valid SQL", "SELEC !!! this is not valid SQL"),
++        ("SELECT\r\n1\rFROM tbl", "SELECT\n1\nFROM tbl"),
++    ],
++)
++def test_render_api_only_templates_and_normalizes_newlines(source, expected):
++
++    assert _public_render()(source) == expected
++
++
++def test_render_api_ignores_ambient_config_but_loads_config_path(
++    tmp_path, monkeypatch
++):
++
++    ambient_config = """\
++[sqlfluff]
++dialect = ansi
++templater = placeholder
++
++[sqlfluff:templater:placeholder]
++param_style = colon
++item = ambient_value
++"""
++    explicit_config = """\
++[sqlfluff]
++dialect = ansi
++templater = placeholder
++
++[sqlfluff:templater:placeholder]
++param_style = colon
++item = explicit_value
++"""
++    _write_config(tmp_path / ".sqlfluff", ambient_config)
++    explicit_path = _write_config(tmp_path / "render.cfg", explicit_config)
++    monkeypatch.chdir(tmp_path)
++
++    render = _public_render()
++    assert render("SELECT :item") == "SELECT :item"
++    assert render("SELECT :item", config_path=str(explicit_path)) == (
++        "SELECT explicit_value"
++    )
++
++
++def test_render_api_explicit_templater_overrides_config_selection(tmp_path):
++
++    config_path = _write_config(
++        tmp_path / "render.cfg",
++        """\
++[sqlfluff]
++dialect = ansi
++templater = jinja
++
++[sqlfluff:templater:jinja:context]
++item = jinja_value
++
++[sqlfluff:templater:placeholder]
++param_style = colon
++item = placeholder_value
++""",
++    )
++
++    rendered = _public_render()(
++        "SELECT :item, '{{ item }}'",
++        templater="placeholder",
++        config_path=str(config_path),
++    )
++    assert rendered == "SELECT placeholder_value, '{{ item }}'"
++
++
++@pytest.mark.parametrize(
++    "source, description_fragment",
++    [
++        ("SELECT {{ missing_name }}", "Undefined jinja template variable"),
++        ("SELECT {{", "Failure to parse jinja template"),
++    ],
++)
++def test_render_api_wraps_reported_templating_violations(
++    source, description_fragment
++):
++
++    with pytest.raises(_public_templating_error()) as caught:
++        _public_render()(source)
++
++    assert len(caught.value.violations) == 1
++    violation = caught.value.violations[0]
++    assert isinstance(violation, SQLBaseError)
++    assert violation.rule_code() == "TMP"
++    assert description_fragment in violation.desc()
++    assert str(caught.value).startswith("Found 1 issues while templating string.")
++    assert violation.desc() in str(caught.value)
++
++
++def test_render_api_wraps_templater_raised_errors(tmp_path):
++
++    config_path = _write_config(
++        tmp_path / "placeholder.cfg",
++        """\
++[sqlfluff]
++dialect = ansi
++templater = placeholder
++
++[sqlfluff:templater:placeholder]
++param_style = colon
++""",
++    )
++
++    with pytest.raises(_public_templating_error()) as caught:
++        _public_render()("SELECT :not_configured", config_path=str(config_path))
++
++    assert len(caught.value.violations) == 1
++    violation = caught.value.violations[0]
++    assert isinstance(violation, SQLBaseError)
++    assert violation.rule_code() == "TMP"
++    assert "not_configured" in violation.desc()
++    assert violation.desc() in str(caught.value)
++
++
++def test_render_cli_discovers_target_file_config_and_preserves_exact_output(tmp_path):
++
++    _write_config(
++        tmp_path / ".sqlfluff",
++        """\
++[sqlfluff]
++dialect = ansi
++templater = placeholder
++
++[sqlfluff:templater:placeholder]
++param_style = colon
++relation = configured_relation
++""",
++    )
++    sql_path = tmp_path / "query.sql"
++    sql_path.write_text("SELECT * FROM :relation", encoding="utf-8")
++
++    result = CliRunner().invoke(cli, ["render", str(sql_path)])
++
++    assert result.exit_code == 0, result.output
++    assert result.stdout == "SELECT * FROM configured_relation"
++    assert result.stderr == ""
++
++
++def test_render_cli_extra_config_overrides_discovered_config(tmp_path):
++
++    local_config = """\
++[sqlfluff]
++dialect = ansi
++templater = placeholder
++
++[sqlfluff:templater:placeholder]
++param_style = colon
++relation = local_relation
++"""
++    extra_config = local_config.replace("local_relation", "extra_relation")
++    _write_config(tmp_path / ".sqlfluff", local_config)
++    extra_path = _write_config(tmp_path / "extra.cfg", extra_config)
++    sql_path = tmp_path / "query.sql"
++    sql_path.write_text("SELECT * FROM :relation", encoding="utf-8")
++
++    result = CliRunner().invoke(
++        cli, ["render", "--config", str(extra_path), str(sql_path)]
++    )
++
++    assert result.exit_code == 0, result.output
++    assert result.stdout == "SELECT * FROM extra_relation"
++    assert result.stderr == ""
++
++
++def test_render_cli_templater_option_has_highest_precedence(tmp_path):
++
++    _write_config(
++        tmp_path / ".sqlfluff",
++        """\
++[sqlfluff]
++dialect = ansi
++templater = jinja
++
++[sqlfluff:templater:jinja:context]
++item = jinja_value
++
++[sqlfluff:templater:placeholder]
++param_style = colon
++item = placeholder_value
++""",
++    )
++    sql_path = tmp_path / "query.sql"
++    sql_path.write_text("SELECT :item, '{{ item }}'", encoding="utf-8")
++
++    result = CliRunner().invoke(
++        cli, ["render", "--templater", "placeholder", str(sql_path)]
++    )
++
++    assert result.exit_code == 0, result.output
++    assert result.stdout == "SELECT placeholder_value, '{{ item }}'"
++    assert result.stderr == ""
++
++
++def test_render_cli_supports_stdin_with_explicit_config(tmp_path):
++
++    config_path = _write_config(
++        tmp_path / "stdin.cfg",
++        """\
++[sqlfluff]
++dialect = ansi
++templater = jinja
++
++[sqlfluff:templater:jinja:context]
++relation = stdin_relation
++""",
++    )
++
++    result = CliRunner().invoke(
++        cli,
++        ["render", "--config", str(config_path), "-"],
++        input="SELECT * FROM {{ relation }}",
++    )
++
++    assert result.exit_code == 0, result.output
++    assert result.stdout == "SELECT * FROM stdin_relation"
++    assert result.stderr == ""
++
++
++def test_render_cli_failure_emits_diagnostic_without_partial_sql(tmp_path):
++
++    _write_config(
++        tmp_path / ".sqlfluff",
++        """\
++[sqlfluff]
++dialect = ansi
++templater = jinja
++""",
++    )
++    sql_path = tmp_path / "broken.sql"
++    sql_path.write_text(
++        "SELECT * FROM {{ missing_relation }}", encoding="utf-8"
++    )
++
++    result = CliRunner().invoke(cli, ["render", str(sql_path)])
++
++    assert result.exit_code == 1
++    assert result.stdout == ""
++    assert "TMP" in result.stderr
++    assert "L:" in result.stderr and "P:" in result.stderr
++    assert "Undefined jinja template variable" in result.stderr
++    assert "missing_relation" in result.stderr
++    assert "SELECT * FROM" not in result.stderr
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,8 @@
++#!/bin/bash
++set -euo pipefail
++
++
++pytest -q \
++  test/api/render_workflow_public_test.py \
++  test/api/classes_test.py \
++  test/core/templaters/placeholder_test.py

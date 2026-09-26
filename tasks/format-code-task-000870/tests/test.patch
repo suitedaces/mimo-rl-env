@@ -1,0 +1,599 @@
+diff --git a/usercase-test-coderl/test_ocr_graphic_matching.py b/usercase-test-coderl/test_ocr_graphic_matching.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/test_ocr_graphic_matching.py
+@@ -0,0 +1,560 @@
++
++
++
++
++
++
++
++
++
++
++import gc
++from pathlib import Path
++from typing import List, Optional, Sequence, Tuple
++from unittest.mock import MagicMock
++
++import PIL.Image
++import yaml
++
++from sciencebeam_parser.document.layout_document import (
++    LayoutBlock,
++    LayoutDocument,
++    LayoutGraphic,
++    LayoutLineMeta,
++    LayoutPage,
++    LayoutPageCoordinates,
++    LayoutPageMeta,
++)
++from sciencebeam_parser.document.semantic_document import (
++    SemanticFigure,
++    SemanticGraphic,
++    SemanticLabel,
++    SemanticRawFigure,
++    SemanticTable,
++    iter_by_semantic_type_recursively,
++)
++from sciencebeam_parser.ocr_models.ocr_model import (
++    OpticalCharacterRecognitionModel,
++    SimpleOpticalCharacterRecognitionModelResult,
++)
++from sciencebeam_parser.processors.fulltext.api import (
++    FullTextProcessor,
++    FullTextProcessorConfig,
++    load_models,
++)
++from sciencebeam_parser.processors.fulltext.models import FullTextModels
++from sciencebeam_parser.processors.graphic_matching import (
++    OpticalCharacterRecognitionGraphicMatcher,
++)
++from sciencebeam_parser.resources.default_config import DEFAULT_CONFIG_FILE
++
++
++PAGE_META = LayoutPageMeta.for_coordinates(LayoutPageCoordinates(
++    x=0,
++    y=0,
++    width=400,
++    height=600,
++    page_number=1,
++))
++LINE_META = LayoutLineMeta(line_id=1, page_meta=PAGE_META)
++GRAPHIC_COORDINATES = LayoutPageCoordinates(
++    x=300,
++    y=500,
++    width=40,
++    height=40,
++    page_number=1,
++)
++
++
++class RecordingOcrModel:
++    def __init__(self, text_results: Sequence[str]):
++        self.text_results = list(text_results)
++        self.image_sizes: List[Tuple[int, int]] = []
++        self.call_count = 0
++
++    def predict_single(self, image):
++        self.image_sizes.append(image.size)
++        if self.call_count < len(self.text_results):
++            text = self.text_results[self.call_count]
++        else:
++            text = self.text_results[-1]
++        self.call_count += 1
++        return SimpleOpticalCharacterRecognitionModelResult(text)
++
++
++def _block(text: str, coordinates: LayoutPageCoordinates) -> LayoutBlock:
++    return LayoutBlock.for_text(text, coordinates=coordinates, line_meta=LINE_META)
++
++
++def _write_png(path: Path, size: Tuple[int, int] = (10, 10)) -> Path:
++    PIL.Image.new('RGB', size, (0, 1, 2)).save(path)
++    return path
++
++
++def _semantic_graphic(
++    local_file_path: Optional[Path] = None,
++    graphic_type: Optional[str] = None,
++    coordinates: LayoutPageCoordinates = GRAPHIC_COORDINATES,
++) -> SemanticGraphic:
++    return SemanticGraphic(layout_graphic=LayoutGraphic(
++        coordinates=coordinates,
++        local_file_path=str(local_file_path) if local_file_path else None,
++        graphic_type=graphic_type,
++        page_meta=PAGE_META,
++    ))
++
++
++def _figure(
++    label_text: str,
++    coordinates: Optional[LayoutPageCoordinates] = None
++) -> SemanticFigure:
++    return SemanticFigure([
++        SemanticLabel(layout_block=_block(
++            label_text,
++            coordinates or LayoutPageCoordinates(
++                x=10,
++                y=10,
++                width=80,
++                height=20,
++                page_number=1,
++            ),
++        ))
++    ])
++
++
++def _table(label_text: str) -> SemanticTable:
++    return SemanticTable([
++        SemanticLabel(layout_block=_block(
++            label_text,
++            LayoutPageCoordinates(x=10, y=40, width=80, height=20, page_number=1),
++        ))
++    ])
++
++
++def _snapshot_graphic_match_result(result, ocr_model: RecordingOcrModel):
++    return {
++        'matches': len(result.graphic_matches),
++        'unmatched': len(result.unmatched_graphics),
++        'matched_labels': [
++            match.candidate_semantic_content.get_text_by_type(SemanticLabel)
++            for match in result.graphic_matches
++        ],
++        'ocr_call_count': ocr_model.call_count,
++    }
++
++
++def _fd_count() -> int:
++    return len(list(Path('/proc/self/fd').iterdir()))
++
++
++class FakeSegmentationLabelResult:
++    def __init__(self, body_document: LayoutDocument):
++        self.body_document = body_document
++
++    def get_filtered_document_by_label(self, label: str) -> LayoutDocument:
++        if label == '<body>':
++            return self.body_document
++        return LayoutDocument(pages=[])
++
++
++class FakeSegmentationModel:
++    def __init__(self, body_document: LayoutDocument):
++        self.body_document = body_document
++
++    def get_label_layout_document_result(self, layout_document, app_features_context):
++        return FakeSegmentationLabelResult(self.body_document)
++
++
++class FakeFullTextModel:
++    def __init__(self, raw_figure_block: LayoutBlock):
++        self.raw_figure_block = raw_figure_block
++
++    def predict_labels_for_layout_document(self, layout_document, app_features_context):
++        return ['fulltext-labels']
++
++    def iter_entity_layout_blocks_for_labeled_layout_tokens(self, labeled_layout_tokens):
++        return [('<figure>', self.raw_figure_block)]
++
++    def update_section_with_entity_blocks(self, parent_section, entity_blocks, section_type):
++        for tag, block in entity_blocks:
++            assert tag == '<figure>'
++            parent_section.add_content(SemanticRawFigure(layout_block=block))
++
++
++class FakeFigureModel:
++    def __init__(self, figures: Sequence[SemanticFigure]):
++        self.figures = list(figures)
++
++    def predict_labels_for_layout_documents(self, layout_documents, app_features_context):
++        return [['figure-labels']]
++
++    def iter_semantic_content_for_labeled_layout_tokens(self, labeled_layout_tokens):
++        assert labeled_layout_tokens == ['figure-labels']
++        return list(self.figures)
++
++
++def _fulltext_models_for_figures(
++    raw_figure_block: LayoutBlock,
++    figures: Sequence[SemanticFigure],
++    ocr_model: RecordingOcrModel,
++) -> FullTextModels:
++    body_document = LayoutDocument(pages=[LayoutPage(
++        blocks=[raw_figure_block],
++        meta=PAGE_META,
++    )])
++    return FullTextModels(
++        segmentation_model=FakeSegmentationModel(body_document),
++        header_model=MagicMock(name='header_model'),
++        name_header_model=MagicMock(name='name_header_model'),
++        name_citation_model=MagicMock(name='name_citation_model'),
++        affiliation_address_model=MagicMock(name='affiliation_address_model'),
++        fulltext_model=FakeFullTextModel(raw_figure_block),
++        figure_model=FakeFigureModel(figures),
++        table_model=MagicMock(name='table_model'),
++        reference_segmenter_model=MagicMock(name='reference_segmenter_model'),
++        citation_model=MagicMock(name='citation_model'),
++        ocr_model=ocr_model,
++    )
++
++
++def test_load_models_populates_ocr_model_only_when_fulltext_config_enables_it():
++
++
++
++
++    app_config = yaml.safe_load(Path(DEFAULT_CONFIG_FILE).read_text(encoding='utf-8'))
++
++    default_config = FullTextProcessorConfig.from_app_config(app_config)
++
++    enabled_models = load_models(
++        app_config=app_config,
++        app_context=MagicMock(name='AppContext'),
++        fulltext_processor_config=default_config._replace(use_ocr_model=True),
++    )
++
++
++    assert isinstance(enabled_models.ocr_model, OpticalCharacterRecognitionModel)
++
++
++def test_ocr_matcher_matches_exact_abbreviated_and_multiline_figure_labels(tmp_path: Path):
++
++
++
++
++    image_path = _write_png(tmp_path / 'figure.png')
++    semantic_graphic = _semantic_graphic(image_path)
++    ocr_model = RecordingOcrModel([
++        'Figure 1',
++        'Fig 1',
++        'Figure 1',
++        'F 1',
++        'Other\nFigure 1\nMore',
++    ])
++    matcher = OpticalCharacterRecognitionGraphicMatcher(ocr_model=ocr_model)
++
++    snapshots = []
++    for candidate in [
++        _figure('Figure 1'),
++        _figure('Figure 1'),
++        _figure('Figure 2'),
++        _figure('Figure 1'),
++        _figure('Figure 1'),
++    ]:
++        snapshots.append(_snapshot_graphic_match_result(
++            matcher.get_graphic_matches([semantic_graphic], [candidate]),
++            ocr_model,
++        ))
++
++    assert snapshots == [
++        {'matches': 1, 'unmatched': 0, 'matched_labels': ['Figure 1'], 'ocr_call_count': 1},
++        {'matches': 1, 'unmatched': 0, 'matched_labels': ['Figure 1'], 'ocr_call_count': 2},
++        {'matches': 0, 'unmatched': 1, 'matched_labels': [], 'ocr_call_count': 3},
++        {'matches': 0, 'unmatched': 1, 'matched_labels': [], 'ocr_call_count': 4},
++        {'matches': 1, 'unmatched': 0, 'matched_labels': ['Figure 1'], 'ocr_call_count': 5},
++    ]
++    assert ocr_model.image_sizes == [(10, 10), (10, 10), (10, 10), (10, 10), (10, 10)]
++
++
++def test_ocr_matcher_matches_table_labels(tmp_path: Path):
++
++
++
++
++    image_path = _write_png(tmp_path / 'table.png')
++    ocr_model = RecordingOcrModel(['Table 1'])
++    result = OpticalCharacterRecognitionGraphicMatcher(
++        ocr_model=ocr_model
++    ).get_graphic_matches(
++        semantic_graphic_list=[_semantic_graphic(image_path)],
++        candidate_semantic_content_list=[_table('Table 1')],
++    )
++
++    assert {
++        'matches': len(result.graphic_matches),
++        'unmatched': len(result.unmatched_graphics),
++        'matched_types': [
++            type(match.candidate_semantic_content).__name__
++            for match in result.graphic_matches
++        ],
++        'matched_labels': [
++            match.candidate_semantic_content.get_text_by_type(SemanticLabel)
++            for match in result.graphic_matches
++        ],
++        'ocr_call_count': ocr_model.call_count,
++    } == {
++        'matches': 1,
++        'unmatched': 0,
++        'matched_types': ['SemanticTable'],
++        'matched_labels': ['Table 1'],
++        'ocr_call_count': 1,
++    }
++
++
++def test_ocr_matcher_scales_large_non_svg_image_before_prediction(tmp_path: Path):
++
++
++
++
++    image_path = _write_png(tmp_path / 'large.png', size=(200, 100))
++    ocr_model = RecordingOcrModel(['Figure 1'])
++    result = OpticalCharacterRecognitionGraphicMatcher(
++        ocr_model=ocr_model,
++        max_resolution=50,
++    ).get_graphic_matches(
++        semantic_graphic_list=[_semantic_graphic(image_path)],
++        candidate_semantic_content_list=[_figure('Figure 1')],
++    )
++
++    assert _snapshot_graphic_match_result(result, ocr_model) == {
++        'matches': 1,
++        'unmatched': 0,
++        'matched_labels': ['Figure 1'],
++        'ocr_call_count': 1,
++    }
++    assert ocr_model.image_sizes == [(50, 25)]
++
++
++def test_ocr_matcher_leaves_missing_path_and_svg_graphics_unmatched_without_ocr(tmp_path: Path):
++
++
++
++
++    svg_path = _write_png(tmp_path / 'svg.png')
++    missing_path_graphic = _semantic_graphic(local_file_path=None)
++    svg_graphic = _semantic_graphic(local_file_path=svg_path, graphic_type='svg')
++    ocr_model = RecordingOcrModel(['Figure 1'])
++    result = OpticalCharacterRecognitionGraphicMatcher(
++        ocr_model=ocr_model
++    ).get_graphic_matches(
++        semantic_graphic_list=[
++            missing_path_graphic,
++            svg_graphic,
++        ],
++        candidate_semantic_content_list=[_figure('Figure 1')],
++    )
++
++    assert len(result.graphic_matches) == 0
++    assert len(result.unmatched_graphics) == 2
++
++    assert {id(graphic) for graphic in result.unmatched_graphics} == {
++        id(missing_path_graphic),
++        id(svg_graphic),
++    }
++    assert ocr_model.call_count == 0
++    assert ocr_model.image_sizes == []
++
++
++def test_ocr_matcher_ignores_missing_local_file_path_before_matching():
++
++
++
++
++    semantic_graphic = _semantic_graphic(local_file_path=None)
++    ocr_model = RecordingOcrModel(['Figure 1'])
++    matcher = OpticalCharacterRecognitionGraphicMatcher(ocr_model=ocr_model)
++
++    result = matcher.get_graphic_matches(
++        semantic_graphic_list=[semantic_graphic],
++        candidate_semantic_content_list=[_figure('Figure 1')],
++    )
++
++
++    assert len(result.graphic_matches) == 0
++    assert list(result.unmatched_graphics) == [semantic_graphic]
++    assert ocr_model.call_count == 0
++
++
++def test_matcher_instances_keep_independent_ocr_state(tmp_path: Path):
++
++
++
++
++    image_a_path = _write_png(tmp_path / 'a.png')
++    image_b_path = _write_png(tmp_path / 'b.png')
++    ocr_model_a = RecordingOcrModel(['Figure 1'])
++    ocr_model_b = RecordingOcrModel(['Figure 2'])
++    matcher_a = OpticalCharacterRecognitionGraphicMatcher(ocr_model=ocr_model_a)
++    matcher_b = OpticalCharacterRecognitionGraphicMatcher(ocr_model=ocr_model_b)
++
++    result_a = matcher_a.get_graphic_matches(
++        semantic_graphic_list=[_semantic_graphic(image_a_path)],
++        candidate_semantic_content_list=[_figure('Figure 1')],
++    )
++    assert _snapshot_graphic_match_result(result_a, ocr_model_a) == {
++        'matches': 1,
++        'unmatched': 0,
++        'matched_labels': ['Figure 1'],
++        'ocr_call_count': 1,
++    }
++    assert ocr_model_b.call_count == 0
++
++    result_b = matcher_b.get_graphic_matches(
++        semantic_graphic_list=[_semantic_graphic(image_b_path)],
++        candidate_semantic_content_list=[_figure('Figure 2')],
++    )
++    assert _snapshot_graphic_match_result(result_b, ocr_model_b) == {
++        'matches': 1,
++        'unmatched': 0,
++        'matched_labels': ['Figure 2'],
++        'ocr_call_count': 1,
++    }
++    assert [ocr_model_a.call_count, ocr_model_b.call_count] == [1, 1]
++
++
++def test_same_matcher_can_reopen_image_on_repeated_calls(tmp_path: Path):
++
++
++
++
++    image_path = _write_png(tmp_path / 'repeat.png')
++    ocr_model = RecordingOcrModel(['Figure 1', 'Figure 1'])
++    matcher = OpticalCharacterRecognitionGraphicMatcher(ocr_model=ocr_model)
++
++    snapshots = []
++    for _ in range(2):
++        snapshots.append(_snapshot_graphic_match_result(
++            matcher.get_graphic_matches(
++                semantic_graphic_list=[_semantic_graphic(image_path)],
++                candidate_semantic_content_list=[_figure('Figure 1')],
++            ),
++            ocr_model,
++        ))
++
++    assert snapshots == [
++        {'matches': 1, 'unmatched': 0, 'matched_labels': ['Figure 1'], 'ocr_call_count': 1},
++        {'matches': 1, 'unmatched': 0, 'matched_labels': ['Figure 1'], 'ocr_call_count': 2},
++    ]
++    assert ocr_model.image_sizes == [(10, 10), (10, 10)]
++
++
++def test_fulltext_processor_uses_ocr_after_bounding_box_matching(tmp_path: Path):
++
++
++
++
++    near_path = _write_png(tmp_path / 'near.png')
++    far_path = _write_png(tmp_path / 'far.png')
++    figure_1_label_block = _block(
++        'Figure 1',
++        LayoutPageCoordinates(x=10, y=10, width=80, height=20, page_number=1),
++    )
++    figure_2_label_block = _block(
++        'Figure 2',
++        LayoutPageCoordinates(x=10, y=200, width=80, height=20, page_number=1),
++    )
++    raw_figure_block = _block(
++        'raw figure text',
++        LayoutPageCoordinates(x=10, y=10, width=80, height=210, page_number=1),
++    )
++    near_graphic = LayoutGraphic(
++        coordinates=LayoutPageCoordinates(x=10, y=10, width=80, height=20, page_number=1),
++        local_file_path=str(near_path),
++        page_meta=PAGE_META,
++    )
++    far_graphic = LayoutGraphic(
++        coordinates=LayoutPageCoordinates(x=300, y=500, width=40, height=40, page_number=1),
++        local_file_path=str(far_path),
++        page_meta=PAGE_META,
++    )
++    layout_document = LayoutDocument(pages=[LayoutPage(
++        blocks=[raw_figure_block],
++        graphics=[near_graphic, far_graphic],
++        meta=PAGE_META,
++    )])
++    ocr_model = RecordingOcrModel(['Figure 2'])
++    fulltext_models = _fulltext_models_for_figures(
++        raw_figure_block=raw_figure_block,
++        figures=[
++            SemanticFigure([SemanticLabel(layout_block=figure_1_label_block)]),
++            SemanticFigure([SemanticLabel(layout_block=figure_2_label_block)]),
++        ],
++        ocr_model=ocr_model,
++    )
++
++    semantic_document = FullTextProcessor(
++        fulltext_models,
++        FullTextProcessorConfig(
++            extract_front=False,
++            extract_acknowledgements=False,
++            extract_back_sections=False,
++            extract_references=False,
++            extract_citation_fields=False,
++            extract_figure_fields=True,
++            extract_table_fields=False,
++            extract_graphic_bounding_boxes=True,
++            use_ocr_model=True,
++            max_graphic_distance=0.01,
++        ),
++    ).get_semantic_document_for_layout_document(layout_document=layout_document)
++
++    figure_graphic_file_names_by_label = {}
++    for figure in iter_by_semantic_type_recursively(
++        [semantic_document.body_section, semantic_document.back_section],
++        SemanticFigure,
++    ):
++        graphics = list(figure.iter_by_type(SemanticGraphic))
++        figure_graphic_file_names_by_label[
++        figure.get_text_by_type(SemanticLabel)
++    ] = [
++            Path(graphic.layout_graphic.local_file_path).name
++            for graphic in graphics
++        ]
++    all_graphics = list(iter_by_semantic_type_recursively(
++        [semantic_document.body_section, semantic_document.back_section],
++        SemanticGraphic,
++    ))
++
++
++    assert figure_graphic_file_names_by_label == {
++        'Figure 1': ['near.png'],
++        'Figure 2': ['far.png'],
++    }
++    assert len(all_graphics) == 2
++    assert ocr_model.call_count == 1
++    assert ocr_model.image_sizes == [(10, 10)]
++
++
++def test_repeated_ocr_matcher_cycles_do_not_leak_image_file_descriptors(tmp_path: Path):
++
++
++
++
++    image_path = _write_png(tmp_path / 'leak-floor.png')
++    gc.collect()
++    fd_count_before = _fd_count()
++
++    for _ in range(120):
++        ocr_model = RecordingOcrModel(['Figure 1'])
++        matcher = OpticalCharacterRecognitionGraphicMatcher(ocr_model=ocr_model)
++        result = matcher.get_graphic_matches(
++            semantic_graphic_list=[_semantic_graphic(image_path)],
++            candidate_semantic_content_list=[_figure('Figure 1')],
++        )
++        assert len(result.graphic_matches) == 1
++        assert len(result.unmatched_graphics) == 0
++        assert ocr_model.call_count == 1
++        del matcher
++        del ocr_model
++
++    gc.collect()
++    assert _fd_count() <= fd_count_before + 3
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,29 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++
++cd /workspace/repo
++export PYTHONPATH=/workspace/repo
++export TF_CPP_MIN_LOG_LEVEL="${TF_CPP_MIN_LOG_LEVEL:-3}"
++export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
++export PIP_NO_INDEX=1
++export HF_HUB_OFFLINE=1
++export TRANSFORMERS_OFFLINE=1
++
++if [[ -x /workspace/repo/.venv/bin/python ]]; then
++  PYTHON_BIN=/workspace/repo/.venv/bin/python
++else
++  echo "error: required offline Python venv missing at /workspace/repo/.venv" >&2
++  exit 1
++fi
++
++exec "$PYTHON_BIN" -m pytest -p no:cacheprovider /workspace/repo/usercase-test-coderl/test_ocr_graphic_matching.py -v

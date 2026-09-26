@@ -1,0 +1,816 @@
+diff --git a/usercase-test-coderl/fetch-from-api.test.js b/usercase-test-coderl/fetch-from-api.test.js
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/fetch-from-api.test.js
+@@ -0,0 +1,779 @@
++'use strict'
++
++
++
++
++const childProcess = require('child_process')
++const http = require('http')
++const test = require('ava')
++const { promisify } = require('util')
++
++const mql = require('@microlink/mql')
++const { fetchFromApi } = mql
++const execFile = promisify(childProcess.execFile)
++
++const listen = server =>
++  new Promise(resolve => {
++    server.listen(0, '127.0.0.1', () => {
++      resolve(`http://127.0.0.1:${server.address().port}/`)
++    })
++  })
++
++const close = server => new Promise(resolve => server.close(resolve))
++
++const withServer = async (handler, fn) => {
++  const server = http.createServer(handler)
++  const endpoint = await listen(server)
++  try {
++    return await fn(endpoint)
++  } finally {
++    await close(server)
++  }
++}
++
++const jsonResponse = (res, statusCode, body, extraHeaders = {}) => {
++  const text = JSON.stringify(body)
++  res.sendDate = false
++  res.statusCode = statusCode
++  res.setHeader('connection', 'close')
++  res.setHeader('content-type', 'application/json')
++  res.setHeader('content-length', Buffer.byteLength(text))
++  for (const [key, value] of Object.entries(extraHeaders)) {
++    res.setHeader(key, value)
++  }
++  res.end(text)
++}
++
++const headersToObject = headers => {
++  if (!headers) return {}
++  const entries =
++    typeof headers.entries === 'function'
++      ? Array.from(headers.entries())
++      : Object.entries(headers)
++
++  return Object.fromEntries(
++    entries.map(([key, value]) => [
++      String(key).toLowerCase(),
++      Array.isArray(value) ? value.join(', ') : String(value)
++    ])
++  )
++}
++
++const assertHeadersInclude = (t, headers, expected) => {
++  const actual = headersToObject(headers)
++
++  for (const [key, value] of Object.entries(expected)) {
++    t.is(actual[key.toLowerCase()], value)
++  }
++}
++
++const normalizeSuccess = value => ({
++  status: value.status,
++  data: value.data,
++  response: {
++    url: value.response.url,
++    body: value.response.body,
++    headers: headersToObject(value.response.headers),
++    statusCode: value.response.statusCode
++  }
++})
++
++const normalizeArrayBuffer = value => ({
++  url: value.url,
++  body: Array.from(new Uint8Array(value.body)),
++  headers: headersToObject(value.headers),
++  statusCode: value.statusCode
++})
++
++const assertFatalClientError = (t, error, { apiUrl, statusCode, headers, usefulIncludes }) => {
++
++  t.is(error.status, 'error')
++  t.is(error.code, 'EFATALCLIENT')
++  t.is(error.url, apiUrl)
++  t.is(error.statusCode, statusCode)
++  t.true(typeof error.data?.url === 'string')
++  t.true(error.data.url.length > 0)
++  if (usefulIncludes) t.true(error.data.url.includes(usefulIncludes))
++  assertHeadersInclude(t, error.headers, headers)
++}
++
++test.serial('json success includes parsed payload and response metadata', async t => {
++
++
++
++
++  await withServer((req, res) => {
++    jsonResponse(
++      res,
++      200,
++      { status: 'success', data: { title: 'Example' } },
++      { 'x-case': 'json-success' }
++    )
++  }, async endpoint => {
++    const apiUrl = `${endpoint}?url=https%3A%2F%2Fexample.com`
++    const actual = normalizeSuccess(
++      await fetchFromApi(apiUrl, { responseType: 'json', retry: 0 })
++    )
++
++
++    t.deepEqual({
++      status: actual.status,
++      data: actual.data,
++      response: {
++        url: actual.response.url,
++        body: actual.response.body,
++        statusCode: actual.response.statusCode
++      }
++    }, {
++      status: 'success',
++      data: { title: 'Example' },
++      response: {
++        url: apiUrl,
++        body: { status: 'success', data: { title: 'Example' } },
++        statusCode: 200
++      }
++    })
++    assertHeadersInclude(t, actual.response.headers, {
++      'content-type': 'application/json',
++      'x-case': 'json-success'
++    })
++  })
++})
++
++test.serial('arrayBuffer success returns raw response metadata', async t => {
++
++
++
++
++  await withServer((req, res) => {
++    const body = Buffer.from([0, 1, 2, 250, 255])
++    res.sendDate = false
++    res.statusCode = 200
++    res.setHeader('connection', 'close')
++    res.setHeader('content-type', 'application/octet-stream')
++    res.setHeader('content-length', body.length)
++    res.setHeader('x-case', 'array-buffer')
++    res.end(body)
++  }, async endpoint => {
++    const apiUrl = `${endpoint}binary?url=https%3A%2F%2Fexample.com`
++    const value = await fetchFromApi(apiUrl, {
++      responseType: 'arrayBuffer',
++      retry: 0
++    })
++    t.true(value.body instanceof ArrayBuffer)
++    const actual = normalizeArrayBuffer(value)
++
++
++    t.deepEqual({
++      url: actual.url,
++      body: actual.body,
++      statusCode: actual.statusCode
++    }, {
++      url: apiUrl,
++      body: [0, 1, 2, 250, 255],
++      statusCode: 200
++    })
++    assertHeadersInclude(t, actual.headers, {
++      'content-type': 'application/octet-stream',
++      'x-case': 'array-buffer'
++    })
++  })
++})
++
++test.serial('hooks and retry options are passed through', async t => {
++
++
++
++
++  let attempts = 0
++
++  await withServer((req, res) => {
++    attempts += 1
++    if (attempts === 1) {
++      jsonResponse(
++        res,
++        500,
++        {
++          status: 'error',
++          data: { url: 'try again' },
++          code: 'ERETRYME',
++          message: 'retry me'
++        },
++        { 'x-case': 'retry-first' }
++      )
++      return
++    }
++
++    jsonResponse(
++      res,
++      200,
++      {
++        status: 'success',
++        data: { attempt: attempts, hookHeader: req.headers['x-hooked'] }
++      },
++      { 'x-case': 'retry-success' }
++    )
++  }, async endpoint => {
++    const apiUrl = `${endpoint}retry?url=https%3A%2F%2Fexample.com`
++    let beforeRetryCount = 0
++    const afterResponseStatuses = []
++
++    const actual = normalizeSuccess(
++      await fetchFromApi(apiUrl, {
++        responseType: 'json',
++        hooks: {
++          beforeRequest: [
++            ({ request }) => {
++              request.headers.set('x-hooked', 'from-before-request')
++            }
++          ],
++          afterResponse: [
++            ({ response }) => {
++              afterResponseStatuses.push(response.status)
++              return response
++            }
++          ],
++          beforeRetry: [
++            () => {
++              beforeRetryCount += 1
++            }
++          ]
++        },
++        retry: { limit: 1, statusCodes: [500], methods: ['get'] }
++      })
++    )
++
++    t.is(beforeRetryCount, 1)
++
++    t.deepEqual([...afterResponseStatuses].sort((a, b) => a - b), [200, 500])
++    t.is(attempts, 2)
++
++    t.deepEqual({
++      status: actual.status,
++      data: actual.data,
++      response: {
++        url: actual.response.url,
++        body: actual.response.body,
++        statusCode: actual.response.statusCode
++      }
++    }, {
++      status: 'success',
++      data: { attempt: 2, hookHeader: 'from-before-request' },
++      response: {
++        url: apiUrl,
++        body: {
++          status: 'success',
++          data: { attempt: 2, hookHeader: 'from-before-request' }
++        },
++        statusCode: 200
++      }
++    })
++    assertHeadersInclude(t, actual.response.headers, {
++      'content-type': 'application/json',
++      'x-case': 'retry-success'
++    })
++  })
++})
++
++test.serial('omitted timeout is disabled', async t => {
++
++
++
++
++  await withServer((req, res) => {
++    setTimeout(() => {
++      jsonResponse(
++        res,
++        200,
++        { status: 'success', data: { waited: true } },
++        { 'x-case': 'timeout-disabled' }
++      )
++    }, 11050)
++  }, async endpoint => {
++    const apiUrl = `${endpoint}slow?url=https%3A%2F%2Fexample.com`
++    const actual = normalizeSuccess(
++      await fetchFromApi(apiUrl, { responseType: 'json', retry: 0 })
++    )
++
++
++    t.deepEqual({
++      status: actual.status,
++      data: actual.data,
++      response: {
++        url: actual.response.url,
++        body: actual.response.body,
++        statusCode: actual.response.statusCode
++      }
++    }, {
++      status: 'success',
++      data: { waited: true },
++      response: {
++        url: apiUrl,
++        body: { status: 'success', data: { waited: true } },
++        statusCode: 200
++      }
++    })
++    assertHeadersInclude(t, actual.response.headers, {
++      'content-type': 'application/json',
++      'x-case': 'timeout-disabled'
++    })
++  })
++})
++
++test.serial('json api error is normalized as MicrolinkError with fields preserved', async t => {
++
++
++
++
++  await withServer((req, res) => {
++    jsonResponse(
++      res,
++      422,
++      {
++        status: 'fail',
++        data: { url: 'URL is not valid', nested: { reason: 'fixture' } },
++        code: 'EINVALURL',
++        message: 'URL is not valid',
++        more: 'https://microlink.io/einvalurl',
++        url: 'https://example.com/bad'
++      },
++      { 'x-case': 'json-error' }
++    )
++  }, async endpoint => {
++    const apiUrl = `${endpoint}err?url=https%3A%2F%2Fexample.com%2Fbad`
++    const error = await t.throwsAsync(
++      fetchFromApi(apiUrl, { responseType: 'json', retry: 0 }),
++      { instanceOf: mql.MicrolinkError }
++    )
++
++
++    t.deepEqual({
++      status: error.status,
++      data: error.data,
++      code: error.code,
++      more: error.more,
++      url: error.url,
++      statusCode: error.statusCode
++    }, {
++      status: 'fail',
++      data: { url: 'URL is not valid', nested: { reason: 'fixture' } },
++      code: 'EINVALURL',
++      more: 'https://microlink.io/einvalurl',
++      url: apiUrl,
++      statusCode: 422
++    })
++    t.true(error.message.includes('URL is not valid'))
++    assertHeadersInclude(t, error.headers, {
++      'content-type': 'application/json',
++      'x-case': 'json-error'
++    })
++  })
++})
++
++test.serial('plain text api error becomes fatal client error', async t => {
++
++
++
++
++  await withServer((req, res) => {
++    const body = '503 Service Unavailable'
++    res.sendDate = false
++    res.statusCode = 503
++    res.setHeader('connection', 'close')
++    res.setHeader('content-type', 'text/plain')
++    res.setHeader('content-length', Buffer.byteLength(body))
++    res.setHeader('x-case', 'plain-text-error')
++    res.end(body)
++  }, async endpoint => {
++    const apiUrl = `${endpoint}plain?url=https%3A%2F%2Fexample.com`
++    const error = await t.throwsAsync(
++      fetchFromApi(apiUrl, { responseType: 'json', retry: 0 }),
++      { instanceOf: mql.MicrolinkError }
++    )
++
++
++    assertFatalClientError(t, error, {
++      apiUrl,
++      statusCode: 503,
++      usefulIncludes: '503 Service Unavailable',
++      headers: {
++        'content-type': 'text/plain',
++        'x-case': 'plain-text-error'
++      }
++    })
++  })
++})
++
++test.serial('empty api error becomes fatal client error', async t => {
++
++
++
++
++  await withServer((req, res) => {
++    res.sendDate = false
++    res.statusCode = 500
++    res.setHeader('connection', 'close')
++    res.setHeader('content-length', '0')
++    res.setHeader('x-case', 'empty-error')
++    res.end()
++  }, async endpoint => {
++    const apiUrl = `${endpoint}empty?url=https%3A%2F%2Fexample.com`
++    const error = await t.throwsAsync(
++      fetchFromApi(apiUrl, { responseType: 'json', retry: 0 }),
++      { instanceOf: mql.MicrolinkError }
++    )
++
++
++    assertFatalClientError(t, error, {
++      apiUrl,
++      statusCode: 500,
++      headers: { 'x-case': 'empty-error' }
++    })
++  })
++})
++
++test.serial('unreadable api error becomes fatal client error', async t => {
++
++
++
++
++  await withServer((req, res) => {
++    const body = Buffer.from('not-gzip-data')
++    res.sendDate = false
++    res.statusCode = 500
++    res.setHeader('connection', 'close')
++    res.setHeader('content-encoding', 'gzip')
++    res.setHeader('content-type', 'application/json')
++    res.setHeader('content-length', body.length)
++    res.setHeader('x-case', 'unreadable-error')
++    res.end(body)
++  }, async endpoint => {
++    const apiUrl = `${endpoint}unreadable?url=https%3A%2F%2Fexample.com`
++    const error = await t.throwsAsync(
++      fetchFromApi(apiUrl, { responseType: 'json', retry: 0 }),
++      { instanceOf: mql.MicrolinkError }
++    )
++
++
++    assertFatalClientError(t, error, {
++      apiUrl,
++      statusCode: 500,
++      headers: {
++        'content-encoding': 'gzip',
++        'content-type': 'application/json',
++        'x-case': 'unreadable-error'
++      }
++    })
++  })
++})
++
++test.serial('transport failure becomes fatal client error without status code', async t => {
++
++
++
++
++  const server = http.createServer((req, res) => res.end())
++  const endpoint = await listen(server)
++  await close(server)
++
++  const apiUrl = `${endpoint}closed?url=https%3A%2F%2Fexample.com`
++  const error = await t.throwsAsync(
++    fetchFromApi(apiUrl, { responseType: 'json', retry: 0 }),
++    { instanceOf: mql.MicrolinkError }
++  )
++
++  assertFatalClientError(t, error, {
++    apiUrl,
++    statusCode: undefined,
++    headers: {}
++  })
++})
++
++test.serial('referential transparency for identical input', async t => {
++  await withServer((req, res) => {
++    jsonResponse(
++      res,
++      200,
++      { status: 'success', data: { id: 'same-input' } },
++      { 'x-case': 'referential' }
++    )
++  }, async endpoint => {
++    const apiUrl = `${endpoint}same?url=https%3A%2F%2Fexample.com`
++    const opts = { responseType: 'json', retry: 0 }
++    const first = normalizeSuccess(await fetchFromApi(apiUrl, opts))
++    const second = normalizeSuccess(await fetchFromApi(apiUrl, opts))
++
++
++    t.deepEqual({
++      status: first.status,
++      data: first.data,
++      response: {
++        url: first.response.url,
++        body: first.response.body,
++        statusCode: first.response.statusCode
++      }
++    }, {
++      status: 'success',
++      data: { id: 'same-input' },
++      response: {
++        url: apiUrl,
++        body: { status: 'success', data: { id: 'same-input' } },
++        statusCode: 200
++      }
++    })
++    assertHeadersInclude(t, first.response.headers, {
++      'content-type': 'application/json',
++      'x-case': 'referential'
++    })
++    t.deepEqual(second, first)
++  })
++})
++
++test.serial('does not mutate caller inputs', async t => {
++  await withServer((req, res) => {
++    jsonResponse(
++      res,
++      200,
++      { status: 'success', data: { header: req.headers['x-mutable'] } },
++      { 'x-case': 'no-mutation' }
++    )
++  }, async endpoint => {
++    const apiUrl = `${endpoint}mutate?url=https%3A%2F%2Fexample.com`
++    const opts = {
++      responseType: 'json',
++      retry: { limit: 0, statusCodes: [500] },
++      headers: { 'x-mutable': 'keep-me' }
++    }
++    const before = JSON.parse(JSON.stringify(opts))
++
++    const actual = normalizeSuccess(await fetchFromApi(apiUrl, opts))
++
++
++    t.is(actual.data.header, before.headers['x-mutable'])
++
++    t.deepEqual({
++      status: actual.status,
++      data: actual.data,
++      response: {
++        url: actual.response.url,
++        body: actual.response.body,
++        statusCode: actual.response.statusCode
++      }
++    }, {
++      status: 'success',
++      data: { header: 'keep-me' },
++      response: {
++        url: apiUrl,
++        body: { status: 'success', data: { header: 'keep-me' } },
++        statusCode: 200
++      }
++    })
++    assertHeadersInclude(t, actual.response.headers, {
++      'content-type': 'application/json',
++      'x-case': 'no-mutation'
++    })
++  })
++})
++
++test.serial('same input returns the same value in a fresh process', async t => {
++  await withServer((req, res) => {
++    jsonResponse(
++      res,
++      200,
++      { status: 'success', data: { process: 'fresh' } },
++      { 'x-case': 'fresh-process' }
++    )
++  }, async endpoint => {
++    const apiUrl = `${endpoint}fresh?url=https%3A%2F%2Fexample.com`
++    const inProcess = normalizeSuccess(
++      await fetchFromApi(apiUrl, { responseType: 'json', retry: 0 })
++    )
++    const script = `
++      const { fetchFromApi } = require('@microlink/mql')
++      const headersToObject = headers => {
++        if (!headers) return {}
++        const entries = typeof headers.entries === 'function'
++          ? Array.from(headers.entries())
++          : Object.entries(headers)
++        return Object.fromEntries(entries.map(([key, value]) => [
++          String(key).toLowerCase(),
++          Array.isArray(value) ? value.join(', ') : String(value)
++        ]))
++      }
++      fetchFromApi(process.env.API_URL, { responseType: 'json', retry: 0 })
++        .then(value => {
++          process.stdout.write(JSON.stringify({
++            status: value.status,
++            data: value.data,
++            response: {
++              url: value.response.url,
++              body: value.response.body,
++              headers: headersToObject(value.response.headers),
++              statusCode: value.response.statusCode
++            }
++          }))
++          process.exit(0)
++        })
++        .catch(error => {
++          console.error(error)
++          process.exit(1)
++        })
++    `
++    const { stdout } = await execFile(
++      process.execPath,
++      ['-e', script],
++      {
++        cwd: '/workspace/repo',
++        env: { ...process.env, API_URL: apiUrl },
++        encoding: 'utf8'
++      }
++    )
++    const freshProcess = JSON.parse(stdout)
++
++    const expected = {
++      status: 'success',
++      data: { process: 'fresh' },
++      response: {
++        url: apiUrl,
++        body: { status: 'success', data: { process: 'fresh' } },
++        statusCode: 200
++      }
++    }
++
++    t.deepEqual({
++      status: inProcess.status,
++      data: inProcess.data,
++      response: {
++        url: inProcess.response.url,
++        body: inProcess.response.body,
++        statusCode: inProcess.response.statusCode
++      }
++    }, expected)
++    assertHeadersInclude(t, inProcess.response.headers, {
++      'content-type': 'application/json',
++      'x-case': 'fresh-process'
++    })
++
++    t.deepEqual({
++      status: freshProcess.status,
++      data: freshProcess.data,
++      response: {
++        url: freshProcess.response.url,
++        body: freshProcess.response.body,
++        statusCode: freshProcess.response.statusCode
++      }
++    }, expected)
++    assertHeadersInclude(t, freshProcess.response.headers, {
++      'content-type': 'application/json',
++      'x-case': 'fresh-process'
++    })
++  })
++})
++
++test.serial('does not perform undeclared side effects beyond the API request', async t => {
++  const script = `
++    const fs = require('fs')
++    const http = require('http')
++    const os = require('os')
++    const path = require('path')
++    const { fetchFromApi } = require('@microlink/mql')
++
++    const listen = server =>
++      new Promise(resolve => {
++        server.listen(0, '127.0.0.1', () => {
++          resolve(\`http://127.0.0.1:\${server.address().port}/\`)
++        })
++      })
++    const close = server => new Promise(resolve => server.close(resolve))
++    const headersToObject = headers => {
++      if (!headers) return {}
++      const entries = typeof headers.entries === 'function'
++        ? Array.from(headers.entries())
++        : Object.entries(headers)
++      return Object.fromEntries(entries.map(([key, value]) => [
++        String(key).toLowerCase(),
++        Array.isArray(value) ? value.join(', ') : String(value)
++      ]))
++    }
++
++    ;(async () => {
++      let requestCount = 0
++      const server = http.createServer((req, res) => {
++        requestCount += 1
++        const text = JSON.stringify({ status: 'success', data: { sideEffects: false } })
++        res.sendDate = false
++        res.statusCode = 200
++        res.setHeader('connection', 'close')
++        res.setHeader('content-type', 'application/json')
++        res.setHeader('content-length', Buffer.byteLength(text))
++        res.setHeader('x-case', 'side-effects')
++        res.end(text)
++      })
++      const endpoint = await listen(server)
++      const apiUrl = \`\${endpoint}side-effects?url=https%3A%2F%2Fexample.com\`
++      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'mql-fetch-from-api-'))
++      const oldCwd = process.cwd()
++
++      try {
++        process.chdir(tmpDir)
++        const before = fs.readdirSync(tmpDir).sort()
++        const value = await fetchFromApi(apiUrl, { responseType: 'json', retry: 0 })
++        const after = fs.readdirSync(tmpDir).sort()
++        process.stdout.write(JSON.stringify({
++          apiUrl,
++          requestCount,
++          before,
++          after,
++          actual: {
++            status: value.status,
++            data: value.data,
++            response: {
++              url: value.response.url,
++              body: value.response.body,
++              headers: headersToObject(value.response.headers),
++              statusCode: value.response.statusCode
++            }
++          }
++        }))
++      } finally {
++        process.chdir(oldCwd)
++        fs.rmSync(tmpDir, { recursive: true, force: true })
++        await close(server)
++      }
++    })().then(() => process.exit(0)).catch(error => {
++      console.error(error)
++      process.exit(1)
++    })
++  `
++
++  const { stdout } = await execFile(process.execPath, ['-e', script], {
++    cwd: '/workspace/repo',
++    encoding: 'utf8'
++  })
++  const result = JSON.parse(stdout)
++
++
++  t.is(result.requestCount, 1)
++
++  t.deepEqual({
++    status: result.actual.status,
++    data: result.actual.data,
++    response: {
++      url: result.actual.response.url,
++      body: result.actual.response.body,
++      statusCode: result.actual.response.statusCode
++    }
++  }, {
++    status: 'success',
++    data: { sideEffects: false },
++    response: {
++      url: result.apiUrl,
++      body: { status: 'success', data: { sideEffects: false } },
++      statusCode: 200
++    }
++  })
++  assertHeadersInclude(t, result.actual.response.headers, {
++    'content-type': 'application/json',
++    'x-case': 'side-effects'
++  })
++})
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,27 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++
++cd /workspace/repo
++
++export NO_UPDATE_NOTIFIER=1
++export npm_config_offline=true
++export npm_config_audit=false
++export npm_config_fund=false
++export npm_config_update_notifier=false
++
++if [ ! -x /workspace/repo/node_modules/.bin/ava ]; then
++  echo "Missing local AVA binary at /workspace/repo/node_modules/.bin/ava" >&2
++  exit 1
++fi
++
++exec /workspace/repo/node_modules/.bin/ava /workspace/repo/usercase-test-coderl/fetch-from-api.test.js --verbose --timeout=2m

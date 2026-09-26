@@ -1,0 +1,458 @@
+diff --git a/usercase-test-coderl/page_text_drawing.test.ts b/usercase-test-coderl/page_text_drawing.test.ts
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/page_text_drawing.test.ts
+@@ -0,0 +1,423 @@
++import {
++  BlendMode,
++  PDFArray,
++  PDFDict,
++  PDFDocument,
++  PDFName,
++  PDFRawStream,
++  PDFStream,
++  StandardFonts,
++  decodePDFRawStream,
++  degrees,
++  grayscale,
++  rgb,
++} from 'src/index';
++
++const ascii = (bytes: Uint8Array) => Buffer.from(bytes).toString('latin1');
++
++const savedPdfAscii = async (pdfDoc: PDFDocument) =>
++  ascii(await pdfDoc.save({ useObjectStreams: false }));
++
++const pageContent = async (pdfDoc: PDFDocument, pageIndex = 0) => {
++  const saved = await pdfDoc.save({ useObjectStreams: false });
++  const loaded = await PDFDocument.load(saved);
++  const page = loaded.getPages()[pageIndex];
++  const contents = page.node.Contents();
++  const streams: PDFStream[] = [];
++
++  if (contents instanceof PDFArray) {
++    for (let idx = 0; idx < contents.size(); idx++) {
++      streams.push(contents.lookup(idx, PDFStream));
++    }
++  } else if (contents instanceof PDFStream) {
++    streams.push(contents);
++  }
++
++  return streams
++    .map((stream) => {
++      if (stream instanceof PDFRawStream) {
++        return ascii(decodePDFRawStream(stream).decode());
++      }
++      return ascii(stream.getContents());
++    })
++    .join('\n---stream---\n');
++};
++
++const normalizeFontNames = (content: string) =>
++  content.replace(/\/GS-\d+/g, '/GS-N');
++
++const pageFontBaseNames = async (pdfDoc: PDFDocument, pageIndex = 0) => {
++  const saved = await pdfDoc.save({ useObjectStreams: false });
++  const loaded = await PDFDocument.load(saved);
++  const page = loaded.getPages()[pageIndex];
++  const fontResources = page.node
++    .Resources()
++    ?.lookupMaybe(PDFName.Font, PDFDict);
++  const fonts = new Map<string, string>();
++
++  if (fontResources) {
++    for (const [key, value] of fontResources.entries()) {
++      const fontDict = loaded.context.lookup(value, PDFDict);
++      const baseFont = fontDict.lookupMaybe(PDFName.of('BaseFont'), PDFName);
++      if (baseFont) fonts.set(key.asString(), baseFont.decodeText());
++    }
++  }
++
++  return fonts;
++};
++
++const numberPattern = '-?\\d+(?:\\.\\d+)?';
++
++const operatorMatrices = (content: string, operator: 'Tm' | 'cm') =>
++  (content.match(
++    new RegExp(
++      `${numberPattern}\\s+${numberPattern}\\s+${numberPattern}\\s+${numberPattern}\\s+${numberPattern}\\s+${numberPattern}\\s+${operator}`,
++      'g',
++    ),
++  ) || []).map((matrix) => matrix.match(new RegExp(numberPattern, 'g'))!.map(Number));
++
++const hasTextMatrixAt = (content: string, x: number, y: number) =>
++  operatorMatrices(content, 'Tm').some(
++    ([, , , , matrixX, matrixY]) => matrixX === x && matrixY === y,
++  ) ||
++  operatorMatrices(content, 'cm').some(
++    ([, , , , matrixX, matrixY]) => matrixX === x && matrixY === y,
++  );
++
++const hasNonIdentityTransformAt = (content: string, x: number, y: number) =>
++  operatorMatrices(content, 'Tm').some(
++    ([a, b, c, d, matrixX, matrixY]) =>
++      matrixX === x &&
++      matrixY === y &&
++      !(a === 1 && b === 0 && c === 0 && d === 1),
++  ) ||
++  operatorMatrices(content, 'cm').some(
++    ([a, b, c, d]) => !(a === 1 && b === 0 && c === 0 && d === 1),
++  );
++
++const hasLineHeightEffect = (
++  content: string,
++  lineHeight: number,
++  x?: number,
++  y?: number,
++) =>
++  content.includes(`${lineHeight} TL`) ||
++  content.includes(`0 -${lineHeight} Td`) ||
++  content.includes(`0 -${lineHeight} TD`) ||
++  (x !== undefined && y !== undefined
++    ? hasTextMatrixAt(content, x, y - lineHeight)
++    : false);
++
++const fontKeysAtSize = (content: string, size: number) => {
++  const keys: string[] = [];
++  const pattern = new RegExp(`(/\\S+)\\s+${size}\\s+Tf`, 'g');
++  let match: RegExpExecArray | null;
++  while ((match = pattern.exec(content))) keys.push(match[1]);
++  return keys;
++};
++
++const expectFontAndSize = async (
++  pdfDoc: PDFDocument,
++  content: string,
++  baseFont: string,
++  size: number,
++  pageIndex = 0,
++) => {
++  const fonts = await pageFontBaseNames(pdfDoc, pageIndex);
++  const usesExpectedFont = fontKeysAtSize(content, size).some(
++    (key) => fonts.get(key) === baseFont,
++  );
++  expect(usesExpectedFont).toBe(true);
++};
++
++const expectTextInOrder = (content: string, hexLines: string[]) => {
++  let previousIndex = -1;
++  for (const hexLine of hexLines) {
++    const nextIndex = content.indexOf(`<${hexLine}>`, previousIndex + 1);
++    expect(nextIndex).toBeGreaterThan(previousIndex);
++    previousIndex = nextIndex;
++  }
++};
++
++const shownHexPayload = (content: string) =>
++  (content.match(/<[0-9A-Fa-f]+>/g) || []).join('');
++
++const countOccurrences = (content: string, needle: string) =>
++  content.split(needle).length - 1;
++
++describe('usercase page-level text drawing and defaults', () => {
++  it('draws explicit positioned text with the implicit Helvetica page font', async () => {
++
++
++
++
++    const pdfDoc = await PDFDocument.create();
++    const page = pdfDoc.addPage([300, 800]);
++
++    page.drawText('Hello', { x: 40, y: 700, size: 18 });
++
++    const content = normalizeFontNames(await pageContent(pdfDoc));
++
++    await expectFontAndSize(pdfDoc, content, 'Helvetica', 18);
++    expect(hasTextMatrixAt(content, 40, 700)).toBe(true);
++    expectTextInOrder(content, ['48656C6C6F']);
++  });
++
++  it('uses current position, default font size, and default line height for later multiline text', async () => {
++
++
++
++
++    const pdfDoc = await PDFDocument.create();
++    const page = pdfDoc.addPage([300, 800]);
++
++    page.moveTo(50, 600);
++    page.setFontSize(12);
++    page.setLineHeight(20);
++    page.drawText('A\nB');
++
++    const content = normalizeFontNames(await pageContent(pdfDoc));
++
++    await expectFontAndSize(pdfDoc, content, 'Helvetica', 12);
++    expect(hasTextMatrixAt(content, 50, 600)).toBe(true);
++    expect(hasLineHeightEffect(content, 20, 50, 600)).toBe(true);
++    expectTextInOrder(content, ['41', '42']);
++  });
++
++  it('lets defaults evolve across calls while explicit options override only one draw', async () => {
++
++
++
++
++    const pdfDoc = await PDFDocument.create();
++    const page = pdfDoc.addPage([300, 800]);
++    const times = await pdfDoc.embedFont(StandardFonts.TimesRoman);
++    const courier = await pdfDoc.embedFont(StandardFonts.Courier);
++
++    page.setFont(times);
++    page.setFontSize(11);
++    page.setFontColor(rgb(1, 0, 0));
++    page.setLineHeight(13);
++    page.drawText('Default', { x: 10, y: 700 });
++    page.drawText('Override', {
++      x: 20,
++      y: 650,
++      font: courier,
++      size: 17,
++      color: grayscale(0.5),
++      lineHeight: 19,
++    });
++    page.drawText('Again', { x: 30, y: 600 });
++
++    const content = normalizeFontNames(await pageContent(pdfDoc));
++
++    expect(content).toContain('1 0 0 rg');
++    expect(content).toContain('0.5 g');
++    await expectFontAndSize(pdfDoc, content, 'Times-Roman', 11);
++    await expectFontAndSize(pdfDoc, content, 'Courier', 17);
++    expect(hasTextMatrixAt(content, 10, 700)).toBe(true);
++    expect(hasTextMatrixAt(content, 20, 650)).toBe(true);
++    expect(hasTextMatrixAt(content, 30, 600)).toBe(true);
++    expectTextInOrder(content, [
++      '44656661756C74',
++      '4F76657272696465',
++      '416761696E',
++    ]);
++  });
++
++  it('applies opacity, blend mode, rotation, skew, max-width wrapping, and supplied word breaks', async () => {
++
++
++
++
++    const pdfDoc = await PDFDocument.create();
++    const page = pdfDoc.addPage([300, 800]);
++
++    page.drawText('AA|BB|CC', {
++      x: 15,
++      y: 720,
++      size: 12,
++      maxWidth: 32,
++      wordBreaks: ['|'],
++      lineHeight: 17,
++      opacity: 0.5,
++      blendMode: BlendMode.Multiply,
++      rotate: degrees(30),
++      xSkew: degrees(10),
++      ySkew: degrees(20),
++    });
++
++    const content = normalizeFontNames(await pageContent(pdfDoc));
++    const saved = await savedPdfAscii(pdfDoc);
++
++    expect(content).toContain('/GS-N gs');
++    expect(saved).toMatch(/\/ca\s+0\.5\b/);
++    expect(saved).toMatch(/\/BM\s*\/Multiply/);
++    await expectFontAndSize(pdfDoc, content, 'Helvetica', 12);
++    expect(hasNonIdentityTransformAt(content, 15, 720)).toBe(true);
++    expect(hasLineHeightEffect(content, 17, 15, 720)).toBe(true);
++    expectTextInOrder(content, ['41417C', '42427C', '4343']);
++  });
++
++  it('normalizes tabs and unicode separators, removes controls, and splits newline boundaries', async () => {
++
++
++
++
++    const pdfDoc = await PDFDocument.create();
++    const page = pdfDoc.addPage([300, 800]);
++
++    page.drawText('A\tB\u2028C\bD\u000BE\nF\fG\rH', {
++      x: 10,
++      y: 700,
++      size: 10,
++    });
++
++    const content = normalizeFontNames(await pageContent(pdfDoc));
++
++    await expectFontAndSize(pdfDoc, content, 'Helvetica', 10);
++    expect(hasTextMatrixAt(content, 10, 700)).toBe(true);
++    expectTextInOrder(content, [
++      '41202020204220202020434445',
++      '46',
++      '47',
++      '48',
++    ]);
++    const shownText = shownHexPayload(content);
++    expect(shownText).not.toContain('08');
++    expect(shownText).not.toContain('0B');
++  });
++
++  it('keeps page default text state independent across separate PDFPage instances', async () => {
++
++
++
++
++    const pdfDoc = await PDFDocument.create();
++    const pageA = pdfDoc.addPage([300, 800]);
++    const pageB = pdfDoc.addPage([300, 800]);
++    const times = await pdfDoc.embedFont(StandardFonts.TimesRoman);
++    const courier = await pdfDoc.embedFont(StandardFonts.Courier);
++
++    pageA.setFont(times);
++    pageA.setFontSize(9);
++    pageA.setFontColor(rgb(1, 0, 0));
++    pageA.setLineHeight(14);
++    pageB.setFont(courier);
++    pageB.setFontSize(16);
++    pageB.setFontColor(rgb(0, 0, 1));
++    pageB.setLineHeight(22);
++    pageA.drawText('PageA', { x: 10, y: 700 });
++    pageB.drawText('PageB', { x: 20, y: 600 });
++
++    const contentA = normalizeFontNames(await pageContent(pdfDoc, 0));
++    const contentB = normalizeFontNames(await pageContent(pdfDoc, 1));
++
++    expect(contentA).toContain('1 0 0 rg');
++    await expectFontAndSize(pdfDoc, contentA, 'Times-Roman', 9, 0);
++    expect(hasTextMatrixAt(contentA, 10, 700)).toBe(true);
++    expectTextInOrder(contentA, ['5061676541']);
++    expect(contentA).not.toContain('<5061676542>');
++    expect(contentB).toContain('0 0 1 rg');
++    await expectFontAndSize(pdfDoc, contentB, 'Courier', 16, 1);
++    expect(hasTextMatrixAt(contentB, 20, 600)).toBe(true);
++    expectTextInOrder(contentB, ['5061676542']);
++    expect(contentB).not.toContain('<5061676541>');
++  });
++
++  it('preserves page text drawing behavior for pages returned by getPages()', async () => {
++
++
++
++
++    const firstDoc = await PDFDocument.create();
++    firstDoc.addPage([300, 800]);
++    const loadedDoc = await PDFDocument.load(
++      await firstDoc.save({ useObjectStreams: false }),
++    );
++    const page = loadedDoc.getPages()[0];
++    const courier = await loadedDoc.embedFont(StandardFonts.Courier);
++
++    page.setFont(courier);
++    page.setFontSize(15);
++    page.setFontColor(rgb(0, 0.5, 0));
++    page.setLineHeight(18);
++    page.drawText('Loaded', { x: 40, y: 500 });
++
++    const content = normalizeFontNames(await pageContent(loadedDoc));
++
++    expect(content).toContain('0 0.5 0 rg');
++    await expectFontAndSize(loadedDoc, content, 'Courier', 15);
++    expect(hasTextMatrixAt(content, 40, 500)).toBe(true);
++    expectTextInOrder(content, ['4C6F61646564']);
++  });
++
++  it('rejects invalid drawText and default-styling inputs with specific TypeError contracts', async () => {
++
++
++
++
++    const pdfDoc = await PDFDocument.create();
++    const page = pdfDoc.addPage([300, 800]);
++
++    expect(() => page.drawText(123 as any)).toThrow(TypeError);
++    expect(() => page.setFont({} as any)).toThrow(TypeError);
++    expect(() => page.setFontSize('12' as any)).toThrow(TypeError);
++    expect(() => page.setFontColor('red' as any)).toThrow(TypeError);
++    expect(() => page.setLineHeight('20' as any)).toThrow(TypeError);
++    expect(() => page.drawText('Bad', { x: '40' as any })).toThrow(TypeError);
++    expect(() => page.drawText('Bad', { y: '700' as any })).toThrow(TypeError);
++    expect(() => page.drawText('Bad', { size: '18' as any })).toThrow(TypeError);
++    expect(() => page.drawText('Bad', { lineHeight: '20' as any })).toThrow(
++      TypeError,
++    );
++    expect(() => page.drawText('Bad', { maxWidth: '50' as any })).toThrow(
++      TypeError,
++    );
++
++    expect(() => page.drawText('Bad', { opacity: 1.5 })).toThrow();
++    expect(() => page.drawText('Bad', { wordBreaks: '|' as any })).toThrow(
++      TypeError,
++    );
++    expect(() => page.drawText('Bad', { blendMode: 'Bad' as any })).toThrow(
++      TypeError,
++    );
++  });
++
++  it('preserves drawn text across repeated save calls', async () => {
++
++
++
++
++    const pdfDoc = await PDFDocument.create();
++    const page = pdfDoc.addPage([300, 800]);
++
++    page.drawText('Stable', { x: 40, y: 700, size: 18 });
++
++    await pdfDoc.save({ useObjectStreams: false });
++    await pdfDoc.save({ useObjectStreams: false });
++    const content = normalizeFontNames(await pageContent(pdfDoc));
++
++    await expectFontAndSize(pdfDoc, content, 'Helvetica', 18);
++    expect(hasTextMatrixAt(content, 40, 700)).toBe(true);
++    expect(countOccurrences(content, '<537461626C65>')).toBe(1);
++  });
++
++  it('supports repeated create/draw/save cycles', async () => {
++
++
++
++
++
++    for (let idx = 0; idx < 10; idx++) {
++      const pdfDoc = await PDFDocument.create();
++      const page = pdfDoc.addPage([300, 800]);
++      page.drawText('Cycle', { x: 40, y: 700, size: 18 });
++      await pdfDoc.save({ useObjectStreams: false });
++      const content = normalizeFontNames(await pageContent(pdfDoc));
++      await expectFontAndSize(pdfDoc, content, 'Helvetica', 18);
++      expect(hasTextMatrixAt(content, 40, 700)).toBe(true);
++      expectTextInOrder(content, ['4379636C65']);
++    }
++  });
++});
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,25 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++
++cd /workspace/repo
++
++if [ ! -x ./node_modules/.bin/jest ]; then
++  echo "Missing local Jest dependency: ./node_modules/.bin/jest" >&2
++  exit 127
++fi
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --expose-gc"
++exec ./node_modules/.bin/jest --config jest.json --runInBand \
++  --roots /workspace/repo/usercase-test-coderl \
++  --testMatch '**/*.test.ts' \
++  /workspace/repo/usercase-test-coderl/page_text_drawing.test.ts

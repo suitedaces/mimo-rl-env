@@ -1,0 +1,192 @@
+diff --git a/turbo/rpchelper/pending_events_codespec_test.go b/turbo/rpchelper/pending_events_codespec_test.go
+new file mode 100644
+index 0000000000..d62ce0619b
+--- /dev/null
++++ b/turbo/rpchelper/pending_events_codespec_test.go
+@@ -0,0 +1,176 @@
++package rpchelper
++
++import (
++	"context"
++	"math/big"
++	"reflect"
++	"testing"
++
++	libcommon "github.com/erigontech/erigon-lib/common"
++	remote "github.com/erigontech/erigon-lib/gointerfaces/remoteproto"
++	txpool "github.com/erigontech/erigon-lib/gointerfaces/txpoolproto"
++	"github.com/erigontech/erigon-lib/log/v3"
++	"github.com/erigontech/erigon-lib/rlp"
++	"github.com/erigontech/erigon/core/types"
++)
++
++func newPendingEventFilters() *Filters {
++	return New(context.Background(), FiltersConfig{}, nil, nil, nil, func() {}, log.New())
++}
++
++func pendingTestLogs() types.Logs {
++	return types.Logs{&types.Log{
++		Address: libcommon.HexToAddress("0x0000000000000000000000000000000000000042"),
++		Topics:  []libcommon.Hash{libcommon.HexToHash("0x01")},
++		Data:    []byte{0xaa, 0xbb},
++	}}
++}
++
++func pendingTestBlock() *types.Block {
++	return types.NewBlock(&types.Header{Difficulty: big.NewInt(1), Number: big.NewInt(42)}, nil, nil, nil, nil)
++}
++
++func encodePending(t *testing.T, value interface{}) []byte {
++	t.Helper()
++	payload, err := rlp.EncodeToBytes(value)
++	if err != nil {
++		t.Fatalf("encode pending payload: %v", err)
++	}
++	return payload
++}
++
++func TestRemotePendingLogsAreDecodedAndBroadcast(t *testing.T) {
++	f := newPendingEventFilters()
++	first, firstID := f.SubscribePendingLogs(1)
++	second, secondID := f.SubscribePendingLogs(1)
++	defer f.UnsubscribePendingLogs(firstID)
++	defer f.UnsubscribePendingLogs(secondID)
++
++	want := pendingTestLogs()
++	f.OnNewEvent(&remote.SubscribeReply{Type: remote.Event_PENDING_LOGS, Data: encodePending(t, want)})
++
++	for name, ch := range map[string]<-chan types.Logs{"first": first, "second": second} {
++		select {
++		case got := <-ch:
++			if !reflect.DeepEqual(got, want) {
++				t.Errorf("%s subscriber got %#v, want %#v", name, got, want)
++			}
++		default:
++			t.Errorf("%s subscriber received no pending logs", name)
++		}
++	}
++}
++
++func TestRemotePendingBlockIsDecodedStoredAndBroadcast(t *testing.T) {
++	f := newPendingEventFilters()
++	ch, id := f.SubscribePendingBlock(1)
++	defer f.UnsubscribePendingBlock(id)
++
++	f.OnNewEvent(&remote.SubscribeReply{Type: remote.Event_PENDING_BLOCK, Data: encodePending(t, pendingTestBlock())})
++
++	select {
++	case got := <-ch:
++		if got == nil || got.NumberU64() != 42 {
++			t.Fatalf("subscriber got block number %v, want 42", got)
++		}
++	default:
++		t.Fatal("subscriber received no pending block")
++	}
++	stored := f.LastPendingBlock()
++	if stored == nil || stored.NumberU64() != 42 {
++		t.Fatalf("LastPendingBlock returned %v, want block 42", stored)
++	}
++}
++
++func TestRemotePendingPayloadErrorsDoNotNotifyOrMutate(t *testing.T) {
++	t.Run("empty", func(t *testing.T) {
++		assertRemotePendingPayloadIgnored(t, nil)
++	})
++	t.Run("malformed", func(t *testing.T) {
++		assertRemotePendingPayloadIgnored(t, []byte{0xff})
++	})
++}
++
++func assertRemotePendingPayloadIgnored(t *testing.T, payload []byte) {
++	t.Helper()
++	f := newPendingEventFilters()
++	logs, logsID := f.SubscribePendingLogs(1)
++	block, blockID := f.SubscribePendingBlock(1)
++	defer f.UnsubscribePendingLogs(logsID)
++	defer f.UnsubscribePendingBlock(blockID)
++
++	f.OnNewEvent(&remote.SubscribeReply{Type: remote.Event_PENDING_LOGS, Data: payload})
++	if len(logs) != 0 {
++		t.Fatalf("invalid remote log payload produced %d notification(s)", len(logs))
++	}
++	f.OnNewEvent(&remote.SubscribeReply{Type: remote.Event_PENDING_BLOCK, Data: payload})
++	if len(block) != 0 {
++		t.Fatalf("invalid remote block payload produced %d notification(s)", len(block))
++	}
++	if got := f.LastPendingBlock(); got != nil {
++		t.Fatalf("invalid remote block changed pending state to %v", got)
++	}
++}
++
++func TestRemoteNilEventIsIgnored(t *testing.T) {
++	f := newPendingEventFilters()
++	defer func() {
++		if r := recover(); r != nil {
++			t.Fatalf("OnNewEvent(nil) panicked: %v", r)
++		}
++	}()
++	f.OnNewEvent(nil)
++}
++
++func TestTxpoolPendingHandlersRejectInvalidPayloads(t *testing.T) {
++	f := newPendingEventFilters()
++	logs, logsID := f.SubscribePendingLogs(2)
++	blocks, blocksID := f.SubscribePendingBlock(2)
++	defer f.UnsubscribePendingLogs(logsID)
++	defer f.UnsubscribePendingBlock(blocksID)
++
++	validBlock := pendingTestBlock()
++	f.HandlePendingLogs(&txpool.OnPendingLogsReply{RplLogs: encodePending(t, pendingTestLogs())})
++	f.HandlePendingBlock(&txpool.OnPendingBlockReply{RplBlock: encodePending(t, validBlock)})
++	if len(logs) != 1 || len(blocks) != 1 {
++		t.Fatalf("valid txpool payloads were not delivered: logs=%d blocks=%d", len(logs), len(blocks))
++	}
++	if got := f.LastPendingBlock(); got == nil || got.NumberU64() != 42 {
++		t.Fatalf("valid txpool block was not stored: %v", got)
++	}
++
++	f.HandlePendingLogs(&txpool.OnPendingLogsReply{RplLogs: []byte{0xff}})
++	if len(logs) != 1 {
++		t.Errorf("invalid txpool log payload produced a notification: logs=%d", len(logs))
++	}
++	f.HandlePendingBlock(&txpool.OnPendingBlockReply{RplBlock: []byte{0xff}})
++	if len(blocks) != 1 {
++		t.Errorf("invalid txpool block payload produced a notification: blocks=%d", len(blocks))
++	}
++	got := f.LastPendingBlock()
++	if got == nil || got.HeaderNoCopy() == nil || got.HeaderNoCopy().Number == nil || got.HeaderNoCopy().Number.Uint64() != 42 {
++		t.Fatalf("invalid txpool block replaced stored block: %v", got)
++	}
++}
++
++func TestTxpoolNilRepliesAreIgnored(t *testing.T) {
++	f := newPendingEventFilters()
++	logs, logsID := f.SubscribePendingLogs(1)
++	blocks, blocksID := f.SubscribePendingBlock(1)
++	defer f.UnsubscribePendingLogs(logsID)
++	defer f.UnsubscribePendingBlock(blocksID)
++
++	call := func(name string, fn func()) {
++		defer func() {
++			if r := recover(); r != nil {
++				t.Errorf("nil %s reply panicked: %v", name, r)
++			}
++		}()
++		fn()
++	}
++	call("logs", func() { f.HandlePendingLogs(nil) })
++	call("block", func() { f.HandlePendingBlock(nil) })
++	if len(logs) != 0 || len(blocks) != 0 || f.LastPendingBlock() != nil {
++		t.Errorf("nil txpool replies changed observable state: logs=%d blocks=%d pending=%v", len(logs), len(blocks), f.LastPendingBlock())
++	}
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,5 @@
++#!/bin/bash
++set -euo pipefail
++
++
++go test ./turbo/rpchelper -run '^Test(RemotePending|RemoteNil|TxpoolPending|TxpoolNil)'

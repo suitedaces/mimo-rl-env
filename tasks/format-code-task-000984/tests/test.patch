@@ -1,0 +1,348 @@
+diff --git a/socorro/unittest/signature/test_offline_replay_codespec.py b/socorro/unittest/signature/test_offline_replay_codespec.py
+new file mode 100644
+index 0000000..93a8501
+--- /dev/null
++++ b/socorro/unittest/signature/test_offline_replay_codespec.py
+@@ -0,0 +1,326 @@
++
++
++
++
++from __future__ import unicode_literals
++
++import copy
++import json
++import os
++import sys
++from StringIO import StringIO
++
++import pytest
++
++from socorro.signature import SignatureGenerator
++from socorro.signature import __main__ as signature_cli
++
++
++class DeterministicReplayRule(object):
++    def predicate(self, raw_crash, processed_crash):
++        return raw_crash.get('enabled', True)
++
++    def action(self, raw_crash, processed_crash, notes):
++        raw_crash.setdefault('nested', {})['visited'] = True
++        processed_crash.setdefault('nested', {})['visited'] = True
++        processed_crash['signature'] = raw_crash.get('next_signature', 'generated')
++        notes.append('deterministic replay rule ran')
++        return True
++
++
++def make_generator():
++    return SignatureGenerator(pipeline=[DeterministicReplayRule()])
++
++
++def run_cli(monkeypatch, capsys, arguments, stdin=''):
++    monkeypatch.setattr(sys, 'argv', ['python -m socorro.signature'] + arguments)
++    monkeypatch.setattr(sys, 'stdin', StringIO(stdin))
++
++    def network_must_not_be_used(*args, **kwargs):
++        raise AssertionError('offline replay attempted an HTTP fetch')
++
++    monkeypatch.setattr(signature_cli, 'fetch', network_must_not_be_used)
++    status = signature_cli.main(arguments)
++    if status is None:
++        status = 0
++    out, err = capsys.readouterr()
++    return status, out, err
++
++
++def parse_json_lines(output):
++    return [json.loads(line) for line in output.splitlines() if line.strip()]
++
++
++def write_lines(path, values):
++    path.write('\n'.join(values) + '\n')
++
++
++def replay_record(crash_id=None, old_signature='old'):
++    record = {
++        'raw_crash': {},
++        'processed_crash': {'signature': old_signature},
++    }
++    if crash_id is not None:
++        record['crash_id'] = crash_id
++    return record
++
++
++def test_compare_reports_result_and_does_not_mutate_inputs():
++    raw_crash = {
++        'uuid': 'raw-id',
++        'enabled': True,
++        'next_signature': 'new signature',
++        'nested': {'raw': ['kept']},
++    }
++    processed_crash = {
++        'crash_id': 'processed-id',
++        'signature': 'old signature',
++        'nested': {'processed': ['kept']},
++    }
++    original_raw = copy.deepcopy(raw_crash)
++    original_processed = copy.deepcopy(processed_crash)
++
++    result = make_generator().compare(raw_crash, processed_crash, crash_id='explicit-id')
++
++    assert result == {
++        'crash_id': 'explicit-id',
++        'old_signature': 'old signature',
++        'new_signature': 'new signature',
++        'changed': True,
++        'notes': ['deterministic replay rule ran'],
++    }
++    assert raw_crash == original_raw
++    assert processed_crash == original_processed
++
++
++def test_compare_id_precedence_preserves_explicit_empty_values():
++    generator = make_generator()
++
++    explicit = generator.compare(
++        {'uuid': 'raw-id'},
++        {'crash_id': 'processed-id', 'signature': 'old'},
++        crash_id='',
++    )
++    raw = generator.compare(
++        {'uuid': 'raw-id'},
++        {'crash_id': 'processed-id', 'signature': 'old'},
++    )
++    raw_empty = generator.compare(
++        {'uuid': ''},
++        {'crash_id': 'processed-id', 'signature': 'old'},
++    )
++    processed = generator.compare({}, {'crash_id': 'processed-id', 'signature': 'old'})
++    processed_empty = generator.compare({}, {'crash_id': '', 'signature': 'old'})
++    missing = generator.compare({}, {'signature': 'old'})
++
++    assert explicit['crash_id'] == ''
++    assert raw['crash_id'] == 'raw-id'
++    assert raw_empty['crash_id'] == ''
++    assert processed['crash_id'] == 'processed-id'
++    assert processed_empty['crash_id'] == ''
++    assert missing['crash_id'] is None
++
++
++def test_compare_uses_empty_old_signature_and_reports_unchanged():
++    result = make_generator().compare(
++        {'next_signature': ''},
++        {},
++    )
++
++    assert result['old_signature'] == ''
++    assert result['new_signature'] == ''
++    assert result['changed'] is False
++
++
++def test_cli_replays_repeated_files_in_input_order_as_json_lines(
++    tmpdir, monkeypatch, capsys
++):
++    first_path = tmpdir.join('first.ndjson')
++    second_path = tmpdir.join('second.ndjson')
++    write_lines(first_path, [
++        '',
++        json.dumps(replay_record('first', 'old')),
++        json.dumps({
++            'raw_crash': {'uuid': 'raw-second'},
++            'processed_crash': {'signature': 'EMPTY: no crashing thread identified'},
++        }),
++    ])
++    write_lines(second_path, [json.dumps({
++        'raw_crash': {'OOMAllocationSize': '123'},
++        'processed_crash': {'crash_id': 'processed-third', 'signature': 'old'},
++    })])
++
++    status, out, err = run_cli(
++        monkeypatch,
++        capsys,
++        ['--input', str(first_path), '--input', str(second_path), '--format', 'json'],
++    )
++    rows = parse_json_lines(out)
++
++    assert status == 0
++    assert err == ''
++    assert [row['crash_id'] for row in rows] == [
++        'first', 'raw-second', 'processed-third'
++    ]
++    assert [row['changed'] for row in rows] == [True, False, True]
++    assert set(rows[0]) == {
++        'crash_id', 'old_signature', 'new_signature', 'changed', 'notes'
++    }
++    assert rows[0]['old_signature'] == 'old'
++    assert rows[0]['new_signature'] == 'EMPTY: no crashing thread identified'
++    assert isinstance(rows[0]['notes'], list)
++    assert rows[2]['new_signature'] == 'OOM | small'
++
++
++def test_cli_different_only_filters_after_comparison_and_keeps_empty_id(
++    tmpdir, monkeypatch, capsys
++):
++    input_path = tmpdir.join('filter.ndjson')
++    unchanged = replay_record('unchanged', 'EMPTY: no crashing thread identified')
++    changed = replay_record(None, 'old')
++    changed['crash_id'] = ''
++    write_lines(input_path, [json.dumps(unchanged), json.dumps(changed)])
++
++    status, out, err = run_cli(
++        monkeypatch,
++        capsys,
++        ['--input', str(input_path), '--format', 'json', '--different-only'],
++    )
++    rows = parse_json_lines(out)
++
++    assert status == 0
++    assert err == ''
++    assert len(rows) == 1
++    assert rows[0]['crash_id'] == ''
++    assert rows[0]['changed'] is True
++
++
++def test_cli_reports_bad_lines_but_continues_valid_records(
++    tmpdir, monkeypatch, capsys
++):
++    input_path = tmpdir.join('mixed.ndjson')
++    write_lines(input_path, [
++        json.dumps(replay_record('before')),
++        '{broken json',
++        json.dumps([]),
++        json.dumps({'raw_crash': {}, 'crash_id': 'missing-processed'}),
++        '',
++        json.dumps(replay_record('after')),
++    ])
++
++    status, out, err = run_cli(
++        monkeypatch,
++        capsys,
++        ['--input', str(input_path), '--format', 'json'],
++    )
++    rows = parse_json_lines(out)
++
++    assert status == 1
++    assert [row['crash_id'] for row in rows] == ['before', 'after']
++    assert '%s:2' % input_path.basename in err
++    assert '%s:3' % input_path.basename in err
++    assert '%s:4' % input_path.basename in err
++    assert 'Traceback' not in err
++
++
++def test_cli_validates_record_member_types_and_continues(
++    tmpdir, monkeypatch, capsys
++):
++    input_path = tmpdir.join('types.ndjson')
++    write_lines(input_path, [
++        json.dumps({'raw_crash': [], 'processed_crash': {}}),
++        json.dumps({'raw_crash': {}, 'processed_crash': [], 'crash_id': 'bad'}),
++        json.dumps({'raw_crash': {}, 'processed_crash': {}, 'crash_id': 27}),
++        json.dumps(replay_record('valid')),
++    ])
++
++    status, out, err = run_cli(
++        monkeypatch,
++        capsys,
++        ['--input', str(input_path), '--format', 'json'],
++    )
++
++    assert status == 1
++    assert [row['crash_id'] for row in parse_json_lines(out)] == ['valid']
++    assert '%s:1' % input_path.basename in err
++    assert '%s:2' % input_path.basename in err
++    assert '%s:3' % input_path.basename in err
++
++
++def test_cli_supports_explicit_stdin_and_rejects_ids_with_input(
++    monkeypatch, capsys
++):
++    record = replay_record('stdin-record')
++    status, out, err = run_cli(
++        monkeypatch,
++        capsys,
++        ['--input', '-', '--format', 'json'],
++        stdin=json.dumps(record) + '\n',
++    )
++
++    assert status == 0
++    assert err == ''
++    assert [row['crash_id'] for row in parse_json_lines(out)] == ['stdin-record']
++
++    monkeypatch.setattr(
++        sys,
++        'argv',
++        ['python -m socorro.signature', '--input', '-', 'remote-crash-id'],
++    )
++    with pytest.raises(SystemExit) as exc_info:
++        signature_cli.main(['--input', '-', 'remote-crash-id'])
++    assert exc_info.value.code == 2
++
++
++def test_cli_unreadable_source_is_a_clean_error_and_other_sources_continue(
++    tmpdir, monkeypatch, capsys
++):
++    missing_path = os.path.join(str(tmpdir), 'does-not-exist.ndjson')
++    valid_path = tmpdir.join('valid.ndjson')
++    write_lines(valid_path, [json.dumps(replay_record('still-ran'))])
++
++    status, out, err = run_cli(
++        monkeypatch,
++        capsys,
++        ['--input', missing_path, '--input', str(valid_path), '--format', 'json'],
++    )
++
++    assert status == 1
++    assert [row['crash_id'] for row in parse_json_lines(out)] == ['still-ran']
++    assert missing_path in err
++    assert 'Traceback' not in err
++
++
++def test_cli_remote_crash_id_mode_keeps_text_output(monkeypatch, capsys):
++    class Response(object):
++        status_code = 200
++        content = ''
++
++        def __init__(self, payload):
++            self.payload = payload
++
++        def json(self):
++            return copy.deepcopy(self.payload)
++
++    payloads = {
++        '/RawCrash/': {'uuid': 'remote-id'},
++        '/ProcessedCrash/': {'crash_id': 'remote-id', 'signature': 'old signature'},
++    }
++
++    def fake_fetch(endpoint, crash_id, api_token=None):
++        assert crash_id == 'remote-id'
++        return Response(payloads[endpoint])
++
++    monkeypatch.setattr(signature_cli, 'fetch', fake_fetch)
++    monkeypatch.setattr(
++        sys,
++        'argv',
++        ['python -m socorro.signature', 'remote-id'],
++    )
++    status = signature_cli.main(['remote-id'])
++    if status is None:
++        status = 0
++    out, err = capsys.readouterr()
++
++    assert status == 0
++    assert err == ''
++    assert 'Crash id: remote-id' in out
++    assert 'Original: old signature' in out
++    assert 'New:      EMPTY: no crashing thread identified' in out
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,8 @@
++#!/bin/bash
++set -euo pipefail
++
++
++pytest -q \
++  socorro/unittest/signature/test_offline_replay_codespec.py \
++  socorro/unittest/signature/test_signature_generator.py \
++  socorro/unittest/signature/test_rules.py

@@ -1,0 +1,7 @@
+High-traffic FastCGI deployments currently have no way to tune the accept queue for the socket that Supervisor creates before starting the worker group. Add a `socket_backlog` option to each `[fcgi-program:<name>]` section and carry it through the public socket configuration and manager lifecycle.
+
+The option is a decimal integer greater than zero. It must be accepted for both `unix://` and `tcp://` FastCGI socket URLs, including values produced by Supervisor's normal `%(ENV_NAME)s` configuration expansion. If the option is omitted, behavior remains the current system default: the socket listens with `socket.SOMAXCONN`. Invalid, non-numeric, zero, and negative values must fail while parsing the FastCGI section instead of reaching socket creation.
+
+The resulting Unix and TCP socket configuration objects must expose a `get_backlog()` accessor returning the effective integer. When a FastCGI socket is prepared, `SocketManager` must pass that effective value to `listen()`. Socket-config implementations supplied by existing callers that do not expose the new accessor remain valid and continue to use `socket.SOMAXCONN`.
+
+Treat preparation as a recoverable lifecycle operation: if binding succeeds but `listen()` raises, close the newly-created socket, leave the manager unprepared with no outstanding reference, and allow a later `get_socket()` attempt to prepare it successfully. Existing URL parsing and Unix ownership/mode behavior must continue to work alongside the new option.

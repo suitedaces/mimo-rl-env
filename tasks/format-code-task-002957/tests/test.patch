@@ -1,0 +1,289 @@
+diff --git a/config-reloader/config/config_namespace_selector_test.go b/config-reloader/config/config_namespace_selector_test.go
+new file mode 100644
+index 0000000..ef93105
+--- /dev/null
++++ b/config-reloader/config/config_namespace_selector_test.go
+@@ -0,0 +1,36 @@
++
++
++
++package config
++
++import (
++	"testing"
++
++	"github.com/stretchr/testify/assert"
++)
++
++
++
++func TestNamespaceSelectorFlagParsedToConfigField(t *testing.T) {
++	cfg := &Config{}
++	err := cfg.ParseFlags([]string{
++		"--datasource=default",
++		"--id=test",
++		"--namespace-selector=team=infra,tier=prod",
++	})
++	assert.Nil(t, err)
++	assert.Equal(t, "team=infra,tier=prod", cfg.NamespaceSelector)
++
++	assert.Nil(t, cfg.Validate())
++}
++
++
++func TestNamespaceSelectorFlagDefaultsToEmpty(t *testing.T) {
++	cfg := &Config{}
++	err := cfg.ParseFlags([]string{
++		"--datasource=default",
++		"--id=test",
++	})
++	assert.Nil(t, err)
++	assert.Equal(t, "", cfg.NamespaceSelector)
++}
+diff --git a/config-reloader/datasource/kube_informer_namespace_selector_test.go b/config-reloader/datasource/kube_informer_namespace_selector_test.go
+new file mode 100644
+index 0000000..2a6a06a
+--- /dev/null
++++ b/config-reloader/datasource/kube_informer_namespace_selector_test.go
+@@ -0,0 +1,217 @@
++package datasource
++
++import (
++	"context"
++	"sort"
++	"testing"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/vmware/kube-fluentd-operator/config-reloader/config"
++	corev1 "k8s.io/api/core/v1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/client-go/informers"
++	testclient "k8s.io/client-go/kubernetes/fake"
++)
++
++
++
++func addLabeledNamespace(factory informers.SharedInformerFactory, name string, labels map[string]string) {
++	factory.Core().V1().Namespaces().Informer().GetIndexer().Add(
++		&corev1.Namespace{
++			ObjectMeta: metav1.ObjectMeta{
++				Name:   name,
++				Labels: labels,
++			},
++		},
++	)
++}
++
++
++
++
++func buildCfg(t *testing.T, args []string) *config.Config {
++	t.Helper()
++	cfg := &config.Config{}
++	if err := cfg.ParseFlags(args); err != nil {
++		t.Fatalf("ParseFlags(%v) failed: %v", args, err)
++	}
++	if err := cfg.Validate(); err != nil {
++		t.Fatalf("Validate() failed for args %v: %v", args, err)
++	}
++	return cfg
++}
++
++
++
++func TestDiscoverNamespacesByLabelSelectorSingleKey(t *testing.T) {
++	assert := assert.New(t)
++
++	cfg := buildCfg(t, []string{
++		"--datasource=default",
++		"--id=test",
++		"--namespace-selector=team=infra",
++	})
++
++	clientset := testclient.NewSimpleClientset()
++	factory := informers.NewSharedInformerFactory(clientset, 0)
++
++	addLabeledNamespace(factory, "ns-infra", map[string]string{"team": "infra"})
++	addLabeledNamespace(factory, "ns-other", map[string]string{"team": "other"})
++	addLabeledNamespace(factory, "ns-unlabeled", nil)
++
++	ds := &kubeInformerConnection{
++		client:  clientset,
++		cfg:     cfg,
++		nslist:  factory.Core().V1().Namespaces().Lister(),
++		cmlist:  factory.Core().V1().ConfigMaps().Lister(),
++		podlist: factory.Core().V1().Pods().Lister(),
++	}
++
++	namespaces, err := ds.discoverNamespaces(context.Background())
++	assert.NoError(err)
++	sort.Strings(namespaces)
++	assert.Equal([]string{"ns-infra"}, namespaces,
++		"only the namespace whose labels match team=infra should be returned")
++}
++
++
++
++func TestDiscoverNamespacesByLabelSelectorMultipleKeys(t *testing.T) {
++	assert := assert.New(t)
++
++	cfg := buildCfg(t, []string{
++		"--datasource=default",
++		"--id=test",
++		"--namespace-selector=team=infra,tier=prod",
++	})
++
++	clientset := testclient.NewSimpleClientset()
++	factory := informers.NewSharedInformerFactory(clientset, 0)
++
++	addLabeledNamespace(factory, "ns-match", map[string]string{"team": "infra", "tier": "prod"})
++	addLabeledNamespace(factory, "ns-partial-1", map[string]string{"team": "infra"})
++	addLabeledNamespace(factory, "ns-partial-2", map[string]string{"team": "infra", "tier": "dev"})
++	addLabeledNamespace(factory, "ns-other", map[string]string{"team": "other", "tier": "prod"})
++
++	ds := &kubeInformerConnection{
++		client:  clientset,
++		cfg:     cfg,
++		nslist:  factory.Core().V1().Namespaces().Lister(),
++		cmlist:  factory.Core().V1().ConfigMaps().Lister(),
++		podlist: factory.Core().V1().Pods().Lister(),
++	}
++
++	namespaces, err := ds.discoverNamespaces(context.Background())
++	assert.NoError(err)
++	sort.Strings(namespaces)
++	assert.Equal([]string{"ns-match"}, namespaces,
++		"only namespaces matching ALL of team=infra,tier=prod should be returned")
++}
++
++
++
++
++
++func TestDiscoverNamespacesSelectorBypassesConfigmapDiscovery(t *testing.T) {
++	assert := assert.New(t)
++
++	cfg := buildCfg(t, []string{
++		"--datasource=default",
++		"--id=test",
++		"--default-configmap=fluentd-config",
++		"--namespace-selector=team=infra",
++	})
++
++	clientset := testclient.NewSimpleClientset()
++	factory := informers.NewSharedInformerFactory(clientset, 0)
++
++
++	addLabeledNamespace(factory, "ns-infra", map[string]string{"team": "infra"})
++	addLabeledNamespace(factory, "ns-other", map[string]string{"team": "other"})
++
++	ds := &kubeInformerConnection{
++		client:  clientset,
++		cfg:     cfg,
++		nslist:  factory.Core().V1().Namespaces().Lister(),
++		cmlist:  factory.Core().V1().ConfigMaps().Lister(),
++		podlist: factory.Core().V1().Pods().Lister(),
++	}
++
++	namespaces, err := ds.discoverNamespaces(context.Background())
++	assert.NoError(err)
++	sort.Strings(namespaces)
++	assert.Equal([]string{"ns-infra"}, namespaces,
++		"namespace-selector path must select labeled namespaces even when they have no configmap")
++}
++
++
++
++
++func TestDiscoverNamespacesExplicitListTakesPrecedenceOverSelector(t *testing.T) {
++	assert := assert.New(t)
++
++	cfg := buildCfg(t, []string{
++		"--datasource=default",
++		"--id=test",
++		"--namespaces=ns-a",
++		"--namespaces=ns-b",
++		"--namespace-selector=team=infra",
++	})
++
++	clientset := testclient.NewSimpleClientset()
++	factory := informers.NewSharedInformerFactory(clientset, 0)
++
++
++
++	addLabeledNamespace(factory, "ns-a", map[string]string{"team": "other"})
++	addLabeledNamespace(factory, "ns-b", nil)
++
++	ds := &kubeInformerConnection{
++		client:  clientset,
++		cfg:     cfg,
++		nslist:  factory.Core().V1().Namespaces().Lister(),
++		cmlist:  factory.Core().V1().ConfigMaps().Lister(),
++		podlist: factory.Core().V1().Pods().Lister(),
++	}
++
++	namespaces, err := ds.discoverNamespaces(context.Background())
++	assert.NoError(err)
++	sort.Strings(namespaces)
++	assert.Equal([]string{"ns-a", "ns-b"}, namespaces,
++		"--namespaces explicit list must be returned as-is regardless of --namespace-selector")
++}
++
++
++
++
++
++func TestDiscoverNamespacesSelectorExcludesNonMatching(t *testing.T) {
++	assert := assert.New(t)
++
++	cfg := buildCfg(t, []string{
++		"--datasource=default",
++		"--id=test",
++		"--namespace-selector=team=infra",
++	})
++
++	clientset := testclient.NewSimpleClientset()
++	factory := informers.NewSharedInformerFactory(clientset, 0)
++
++
++	addLabeledNamespace(factory, "ns1", map[string]string{"team": "other"})
++	addLabeledNamespace(factory, "ns2", map[string]string{"app": "web"})
++	addLabeledNamespace(factory, "ns3", nil)
++
++	ds := &kubeInformerConnection{
++		client:  clientset,
++		cfg:     cfg,
++		nslist:  factory.Core().V1().Namespaces().Lister(),
++		cmlist:  factory.Core().V1().ConfigMaps().Lister(),
++		podlist: factory.Core().V1().Pods().Lister(),
++	}
++
++	namespaces, err := ds.discoverNamespaces(context.Background())
++	assert.NoError(err)
++	assert.Equal([]string{}, namespaces,
++		"no namespace matches the selector, so the result must be empty")
++}
+diff --git a/test_commands.json b/test_commands.json
+new file mode 100644
+index 0000000..379821f
+--- /dev/null
++++ b/test_commands.json
+@@ -0,0 +1,5 @@
++{
++  "test_commands": [
++    "cd config-reloader && go test -run 'NamespaceSelector|DiscoverNamespaces' ./datasource/... ./config/..."
++  ]
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,8 @@
++#!/usr/bin/env bash
++
++set -uo pipefail
++cd /testbed
++rc=0
++cd config-reloader && go test -run 'NamespaceSelector|DiscoverNamespaces' ./datasource/... ./config/...
++rc=$(( rc | $? ))
++exit $rc

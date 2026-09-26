@@ -1,0 +1,380 @@
+diff --git a/usercase-test-coderl/test_public_query.py b/usercase-test-coderl/test_public_query.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/test_public_query.py
+@@ -0,0 +1,343 @@
++
++
++import pytest
++import requests
++from urllib.parse import urlparse
++
++import krakenex
++
++
++class SpyResponse:
++    def __init__(self, marker, body, status_code=200):
++        self.marker = marker
++        self.body = body
++        self.status_code = status_code
++        self.json_kwargs = None
++        self.json_calls = 0
++
++    def json(self, **kwargs):
++        self.json_calls += 1
++        self.json_kwargs = dict(kwargs)
++        return self.body
++
++    def raise_for_status(self):
++        raise requests.HTTPError(f"{self.status_code} Server Error: captured")
++
++
++class SpySession:
++    def __init__(self, responses):
++        self.responses = list(responses)
++        self.calls = []
++        self.close_calls = 0
++
++
++    def request(self, method, url, params=None, data=None, headers=None, timeout=None):
++        payload = params if method == "GET" else data
++        self.calls.append((method, url, payload, headers, timeout))
++        return self.responses.pop(0)
++
++    def get(self, url, params=None, headers=None, timeout=None):
++        return self.request(
++            "GET", url, params=params, headers=headers, timeout=timeout
++        )
++
++    def post(self, url, data=None, headers=None, timeout=None):
++        return self.request(
++            "POST", url, data=data, headers=headers, timeout=timeout
++        )
++
++    def close(self):
++        self.close_calls += 1
++
++
++class CountedSession(SpySession):
++    active = 0
++    constructed = 0
++
++    @classmethod
++    def reset_counts(cls):
++        cls.active = 0
++        cls.constructed = 0
++
++    def __init__(self, responses):
++        super().__init__(responses)
++        type(self).active += 1
++        type(self).constructed += 1
++        self.closed = False
++
++    def close(self):
++        super().close()
++        if not self.closed:
++            type(self).active -= 1
++            self.closed = True
++
++
++class CloseEnforcingSession(SpySession):
++    def __init__(self, responses):
++        super().__init__(responses)
++        self.closed = False
++
++    def get(self, url, params=None, headers=None, timeout=None):
++        if self.closed:
++            raise RuntimeError("session is closed")
++        return super().get(url, params=params, headers=headers, timeout=timeout)
++
++    def close(self):
++        super().close()
++        self.closed = True
++
++
++def assert_get_call(call, urlpath, params, timeout):
++
++    assert call[0] == "GET"
++    assert urlparse(call[1]).path == urlpath
++    assert call[2] == params
++    assert call[4] == timeout
++
++
++def test_time_then_depth_public_queries_use_get_store_response_and_return_json():
++
++
++
++
++    api = krakenex.API()
++    time_response = SpyResponse(
++        "time-response",
++        {"error": [], "result": {"unixtime": 1700000000}},
++    )
++    depth_response = SpyResponse(
++        "depth-response",
++        {
++            "error": [],
++            "result": {
++                "XXBTZUSD": {
++                    "asks": [["42000.0", "1.25", 1700000001]],
++                    "bids": [["41990.0", "0.75", 1700000002]],
++                }
++            },
++        },
++    )
++    api.session = SpySession([time_response, depth_response])
++
++
++    assert hasattr(api, "response")
++
++    time_body = api.query_public("Time")
++
++
++    assert time_body == time_response.body
++    assert time_response.json_calls == 1
++    assert api.response is time_response
++
++    assert api.response is time_response
++    assert len(api.session.calls) == 1
++    assert_get_call(
++        api.session.calls[0],
++        "/0/public/Time",
++        {},
++        None,
++    )
++
++    assert "API-Key" not in (api.session.calls[0][3] or {})
++    assert "API-Sign" not in (api.session.calls[0][3] or {})
++
++    depth_body = api.query_public(
++        "Depth", {"pair": "XXBTZUSD", "count": "10"}, timeout=5
++    )
++
++
++    assert depth_body == depth_response.body
++    assert depth_response.json_calls == 1
++    assert api.response is depth_response
++
++    assert api.response is depth_response
++    assert len(api.session.calls) == 2
++    assert_get_call(
++        api.session.calls[0],
++        "/0/public/Time",
++        {},
++        None,
++    )
++    assert_get_call(
++        api.session.calls[1],
++        "/0/public/Depth",
++        {"pair": "XXBTZUSD", "count": "10"},
++        5,
++    )
++
++
++def test_ohlc_public_query_uses_get_with_url_parameters():
++
++
++
++
++    api = krakenex.API()
++    ohlc_response = SpyResponse(
++        "ohlc-response",
++        {
++            "error": [],
++            "result": {
++                "XXBTZUSD": [[1700000000, "42000.0", "42100.0", "41900.0"]]
++            },
++        },
++    )
++    api.session = SpySession([ohlc_response])
++
++    body = api.query_public(
++        "OHLC", {"pair": "XXBTZUSD", "since": "1700000000"}
++    )
++
++
++    assert body == ohlc_response.body
++    assert ohlc_response.json_calls == 1
++    assert api.response is ohlc_response
++
++    assert api.response is ohlc_response
++    assert len(api.session.calls) == 1
++    assert_get_call(
++        api.session.calls[0],
++        "/0/public/OHLC",
++        {"pair": "XXBTZUSD", "since": "1700000000"},
++        None,
++    )
++
++
++def test_public_query_returns_decoded_json_and_stores_raw_response():
++
++
++
++
++    api = krakenex.API()
++    response = SpyResponse(
++        "bad-status-response",
++        {"error": ["EGeneral:Internal error"]},
++
++        status_code=200,
++    )
++    api.session = SpySession([response])
++
++
++    body = api.query_public("Time")
++    assert body == response.body
++    assert response.json_calls == 1
++    assert api.response is response
++
++    assert api.response is response
++    assert len(api.session.calls) == 1
++    assert_get_call(
++        api.session.calls[0],
++        "/0/public/Time",
++        {},
++        None,
++    )
++
++
++def test_two_api_instances_keep_independent_response_state():
++
++
++
++
++    a = krakenex.API()
++    b = krakenex.API()
++    a_depth = SpyResponse("a-depth-response", {"error": [], "result": {"a": 1}})
++    b_time = SpyResponse("b-time-response", {"error": [], "result": {"b": 2}})
++    a.session = SpySession([a_depth])
++    b.session = SpySession([b_time])
++
++
++    assert hasattr(a, "response")
++    assert hasattr(b, "response")
++
++    assert a.query_public("Depth", {"pair": "XXBTZUSD", "count": "10"}) == a_depth.body
++    assert a_depth.json_calls == 1
++    assert a.response is a_depth
++
++    assert a.response is a_depth
++    assert len(a.session.calls) == 1
++    assert_get_call(
++        a.session.calls[0],
++        "/0/public/Depth",
++        {"pair": "XXBTZUSD", "count": "10"},
++        None,
++    )
++
++    assert getattr(b, "response", None) is not a_depth
++
++    assert len(b.session.calls) == 0
++
++    assert b.query_public("Time") == b_time.body
++    assert b_time.json_calls == 1
++
++    assert b.response is b_time
++    assert a.response is a_depth
++    assert len(b.session.calls) == 1
++    assert_get_call(
++        b.session.calls[0],
++        "/0/public/Time",
++        {},
++        None,
++    )
++
++
++def test_public_query_works_on_an_api_session():
++
++
++
++
++    api = krakenex.API()
++    response = SpyResponse("time-response", {"error": [], "result": {"ok": True}})
++    session = SpySession([response])
++    api.session = session
++
++
++    assert api.query_public("Time") == response.body
++    assert response.json_calls == 1
++    assert api.response is response
++
++    assert len(session.calls) == 1
++    assert_get_call(session.calls[0], "/0/public/Time", {}, None)
++
++
++def test_public_query_passes_parameters_and_timeout():
++
++
++
++
++    api = krakenex.API()
++    response = SpyResponse("depth-response", {"error": [], "result": {"ok": True}})
++    session = SpySession([response])
++    api.session = session
++
++
++    assert api.query_public("Depth", {"pair": "XXBTZUSD", "count": "10"}, timeout=5) == response.body
++    assert response.json_calls == 1
++    assert api.response is response
++    assert len(session.calls) == 1
++    assert_get_call(
++        session.calls[0],
++        "/0/public/Depth",
++        {"pair": "XXBTZUSD", "count": "10"},
++        5,
++    )
++
++
++def test_public_queries_support_multiple_methods():
++
++
++
++
++
++    cases = [
++        ("Time", {}, "/0/public/Time"),
++        ("Depth", {"pair": "XXBTZUSD"}, "/0/public/Depth"),
++        ("OHLC", {"pair": "XXBTZUSD"}, "/0/public/OHLC"),
++    ]
++    for method, params, url in cases:
++        api = krakenex.API()
++        response = SpyResponse(method, {"error": [], "result": {method: True}})
++        api.session = SpySession([response])
++        assert api.query_public(method, params) == response.body
++        assert response.json_calls == 1
++        assert api.response is response
++        assert len(api.session.calls) == 1
++        assert_get_call(api.session.calls[0], url, params, None)
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,27 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++export PIP_CONFIG_FILE=/dev/null
++export PIP_DISABLE_PIP_VERSION_CHECK=1
++export PIP_FIND_LINKS=
++export PIP_NO_INDEX=1
++export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
++set -e
++cd /workspace/repo
++set -euo pipefail
++
++cd /workspace/repo
++
++python - <<'PY'
++import krakenex
++import pytest
++import requests
++PY
++
++exec python -m pytest -p no:cacheprovider /workspace/repo/usercase-test-coderl/test_public_query.py -v

@@ -1,0 +1,203 @@
+diff --git a/pkg/linter/inline_suppression_codespec_test.go b/pkg/linter/inline_suppression_codespec_test.go
+new file mode 100644
+index 00000000..db3e9ec5
+--- /dev/null
++++ b/pkg/linter/inline_suppression_codespec_test.go
+@@ -0,0 +1,187 @@
++package linter_test
++
++import (
++	"context"
++	"path/filepath"
++	"sort"
++	"testing"
++
++	"github.com/open-policy-agent/opa/ast"
++
++	"github.com/styrainc/regal/internal/parse"
++	regaltest "github.com/styrainc/regal/internal/test"
++	"github.com/styrainc/regal/pkg/linter"
++	"github.com/styrainc/regal/pkg/report"
++	"github.com/styrainc/regal/pkg/rules"
++)
++
++func TestCodespecInlineSuppressionStandaloneTargets(t *testing.T) {
++	policy := `package p
++
++# regal ignore:prefer-snake-case, use-assignment-operator
++
++# rationale for the exception
++default firstCamel = true
++
++# regal ignore:all
++default secondCamel = true
++
++default thirdCamel = true
++or := 1
++`
++
++	rep := codespecLintOne(t, policy, false,
++		"prefer-snake-case", "use-assignment-operator", "rule-shadows-builtin")
++
++	codespecAssertTitles(t, rep,
++		"prefer-snake-case", "rule-shadows-builtin", "use-assignment-operator")
++}
++
++func TestCodespecInlineSuppressionSameLineAndExactRecognition(t *testing.T) {
++	policy := `package p
++
++camelCase := true # regal ignore:prefer-snake-case
++directive_text := "# regal ignore-file:all"
++
++# explanation mentioning regal ignore:prefer-snake-case
++otherCamel := true
++
++# Regal ignore:prefer-snake-case
++lastCamel := true
++`
++
++	rep := codespecLintOne(t, policy, false, "prefer-snake-case")
++
++	codespecAssertTitles(t, rep, "prefer-snake-case", "prefer-snake-case")
++}
++
++func TestCodespecInlineSuppressionFileScopeAcrossRuleEngines(t *testing.T) {
++	policy := `package p
++
++allow=true
++
++# regal ignore-file:opa-fmt, acme-corp-package
++`
++
++	rep := codespecLintOne(t, policy, true, "opa-fmt", "acme-corp-package")
++
++	codespecAssertTitles(t, rep)
++	if rep.Summary.NumViolations != 0 || rep.Summary.FilesFailed != 0 {
++		t.Fatalf("suppressed diagnostics must not remain in the summary: %+v", rep.Summary)
++	}
++}
++
++func TestCodespecInlineSuppressionFileWildcardAndSelection(t *testing.T) {
++	t.Run("all is a wildcard", func(t *testing.T) {
++		policy := `package p
++
++# regal ignore-file:all
++default camelCase = true
++`
++
++		rep := codespecLintOne(t, policy, false,
++			"opa-fmt", "prefer-snake-case", "use-assignment-operator")
++		codespecAssertTitles(t, rep)
++	})
++
++	t.Run("named file suppression leaves other rules visible", func(t *testing.T) {
++		policy := `package p
++
++# regal ignore-file:prefer-snake-case
++camelCase := true
++or := 1
++`
++
++		rep := codespecLintOne(t, policy, false,
++			"prefer-snake-case", "rule-shadows-builtin")
++		codespecAssertTitles(t, rep, "rule-shadows-builtin")
++	})
++}
++
++func TestCodespecInlineSuppressionPointDirectiveDoesNotHideFileDiagnostic(t *testing.T) {
++	policy := `package p
++
++# regal ignore:opa-fmt
++allow=true
++`
++
++	rep := codespecLintOne(t, policy, false, "opa-fmt")
++
++	codespecAssertTitles(t, rep, "opa-fmt")
++}
++
++func TestCodespecInlineSuppressionIsolatedFilesAndSummary(t *testing.T) {
++	contents := map[string]string{
++		"suppressed.rego": `package suppressed
++
++# regal ignore-file:all
++camelCase := true
++`,
++		"visible.rego": `package visible
++
++camelCase := true
++`,
++	}
++	modules := make(map[string]*ast.Module, len(contents))
++	for name, content := range contents {
++		modules[name] = parse.MustParseModule(content)
++	}
++
++	regal := linter.NewLinter().
++		WithAddedBundle(regaltest.GetRegalBundle(t)).
++		WithDisableAll(true).
++		WithEnabledRules("prefer-snake-case")
++
++	rep, err := regal.Lint(context.Background(), rules.NewInput(contents, modules))
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	codespecAssertTitles(t, rep, "prefer-snake-case")
++	if got := rep.Violations[0].Location.File; got != "visible.rego" {
++		t.Fatalf("suppression leaked to another file: got violation in %q", got)
++	}
++	want := report.Summary{FilesScanned: 2, FilesFailed: 1, FilesSkipped: 0, NumViolations: 1}
++	if rep.Summary != want {
++		t.Fatalf("unexpected summary after suppression: want %+v, got %+v", want, rep.Summary)
++	}
++}
++
++func codespecLintOne(t *testing.T, policy string, customRule bool, enabled ...string) report.Report {
++	t.Helper()
++
++	regal := linter.NewLinter().
++		WithAddedBundle(regaltest.GetRegalBundle(t)).
++		WithDisableAll(true).
++		WithEnabledRules(enabled...)
++	if customRule {
++		regal = regal.WithCustomRules([]string{filepath.Join("testdata", "custom.rego")})
++	}
++
++	rep, err := regal.Lint(context.Background(), regaltest.InputPolicy("p.rego", policy))
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	return rep
++}
++
++func codespecAssertTitles(t *testing.T, rep report.Report, want ...string) {
++	t.Helper()
++
++	got := make([]string, 0, len(rep.Violations))
++	for _, violation := range rep.Violations {
++		got = append(got, violation.Title)
++	}
++	sort.Strings(got)
++	sort.Strings(want)
++
++	if len(got) != len(want) {
++		t.Fatalf("unexpected violation titles: want %v, got %v", want, got)
++	}
++	for i := range want {
++		if got[i] != want[i] {
++			t.Fatalf("unexpected violation titles: want %v, got %v", want, got)
++		}
++	}
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,5 @@
++#!/bin/bash
++set -euo pipefail
++
++
++go test ./pkg/linter -run '^(TestCodespecInlineSuppression.*|TestLintWithUserConfigTable)$' -count=1

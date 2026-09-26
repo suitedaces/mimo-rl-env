@@ -1,0 +1,276 @@
+diff --git a/pkg/cortex/modules_test.go b/pkg/cortex/modules_test.go
+index 7316e07274..77f5ea8e37 100644
+--- a/pkg/cortex/modules_test.go
++++ b/pkg/cortex/modules_test.go
+@@ -232,3 +232,58 @@ func Test_setupModuleManager(t *testing.T) {
+ 		}
+ 	}
+ }
++
++func TestInitResourceMonitorRejectsUnsupportedResource(t *testing.T) {
++	tests := map[string][]string{
++		"single unsupported resource":              {"definitely-unsupported-resource-a"},
++		"different unsupported resource":           {"definitely-unsupported-resource-b"},
++		"unsupported resource after supported one": {"heap", "definitely-unsupported-resource-c"},
++	}
++
++	errorMessages := map[string]string{}
++	for name, resources := range tests {
++		t.Run(name, func(t *testing.T) {
++			cortex := &Cortex{
++				Server: &server.Server{},
++				Cfg: Config{
++					MonitoredResources: resources,
++				},
++			}
++
++			svc, err := cortex.initResourceMonitor()
++			require.Nil(t, svc)
++			require.Error(t, err)
++			require.NotEmpty(t, err.Error())
++			errorMessages[name] = err.Error()
++		})
++	}
++
++	require.NotEqual(
++		t,
++		errorMessages["single unsupported resource"],
++		errorMessages["different unsupported resource"],
++		"error should identify which unsupported monitored resource caused the failure",
++	)
++}
++
++func TestInitResourceMonitorSkipsUnsetOrEffectivelyEmptyResources(t *testing.T) {
++	tests := map[string][]string{
++		"unset":             nil,
++		"effectively-empty": {""},
++	}
++
++	for name, resources := range tests {
++		t.Run(name, func(t *testing.T) {
++			cortex := &Cortex{
++				Server: &server.Server{},
++				Cfg: Config{
++					MonitoredResources: resources,
++				},
++			}
++
++			svc, err := cortex.initResourceMonitor()
++			require.NoError(t, err)
++			require.Nil(t, svc)
++		})
++	}
++}
+diff --git a/pkg/util/limiter/resource_based_limiter_test.go b/pkg/util/limiter/resource_based_limiter_test.go
+new file mode 100644
+index 0000000000..9c1c9b4af9
+--- /dev/null
++++ b/pkg/util/limiter/resource_based_limiter_test.go
+@@ -0,0 +1,90 @@
++package limiter
++
++import (
++	"fmt"
++	"testing"
++
++	"github.com/prometheus/client_golang/prometheus"
++	dto "github.com/prometheus/client_model/go"
++	"github.com/stretchr/testify/require"
++
++	"github.com/cortexproject/cortex/pkg/util/resource"
++)
++
++func TestResourceBasedLimiterLimitMetricHasResourceLabelForEachResource(t *testing.T) {
++	tests := []struct {
++		component string
++		cpuLimit  float64
++		heapLimit float64
++	}{
++		{component: "ingester", cpuLimit: 0.61, heapLimit: 0.73},
++		{component: "store-gateway", cpuLimit: 0.42, heapLimit: 0.88},
++	}
++
++	for _, tc := range tests {
++		t.Run(tc.component, func(t *testing.T) {
++			registry := prometheus.NewRegistry()
++			limits := map[resource.Type]float64{
++				resource.CPU:  tc.cpuLimit,
++				resource.Heap: tc.heapLimit,
++			}
++
++			_, err := NewResourceBasedLimiter(&mockMonitor{}, limits, registry, tc.component)
++			require.NoError(t, err)
++
++			metrics, err := registry.Gather()
++			require.NoError(t, err)
++
++			require.InDelta(t, tc.cpuLimit, findLimitMetric(t, metrics, tc.component, "cpu"), 0.000001)
++			require.InDelta(t, tc.heapLimit, findLimitMetric(t, metrics, tc.component, "heap"), 0.000001)
++		})
++	}
++}
++
++func findLimitMetric(t *testing.T, families []*dto.MetricFamily, component, monitoredResource string) float64 {
++	t.Helper()
++
++	for _, family := range families {
++		if family.GetName() != "cortex_resource_based_limiter_limit" {
++			continue
++		}
++
++		for _, metric := range family.GetMetric() {
++			if labelValue(metric, "component") == component && hasLabelValue(metric, monitoredResource) {
++				require.NotNil(t, metric.GetGauge(), "limit metric for component=%s monitored resource=%s should be a gauge", component, monitoredResource)
++				return metric.GetGauge().GetValue()
++			}
++		}
++	}
++
++	require.FailNow(t, fmt.Sprintf("missing limit metric for component=%s monitored resource=%s", component, monitoredResource))
++	return 0
++}
++
++func labelValue(metric *dto.Metric, name string) string {
++	for _, label := range metric.GetLabel() {
++		if label.GetName() == name {
++			return label.GetValue()
++		}
++	}
++	return ""
++}
++
++func hasLabelValue(metric *dto.Metric, value string) bool {
++	for _, label := range metric.GetLabel() {
++		if label.GetValue() == value {
++			return true
++		}
++	}
++	return false
++}
++
++type mockMonitor struct{}
++
++func (m *mockMonitor) GetCPUUtilization() float64 {
++	return 0
++}
++
++func (m *mockMonitor) GetHeapUtilization() float64 {
++	return 0
++}
+diff --git a/pkg/util/resource/monitor_test.go b/pkg/util/resource/monitor_test.go
+new file mode 100644
+index 0000000000..e99a3327a1
+--- /dev/null
++++ b/pkg/util/resource/monitor_test.go
+@@ -0,0 +1,50 @@
++package resource
++
++import (
++	"context"
++	"math"
++	"runtime"
++	"testing"
++	"time"
++
++	"github.com/prometheus/client_golang/prometheus"
++	"github.com/stretchr/testify/require"
++)
++
++func TestResourceMonitorRecordsHeapUtilizationWithoutPanic(t *testing.T) {
++	m, err := NewMonitor(map[Type]float64{
++		Heap: float64(64 * 1024 * 1024),
++	}, prometheus.NewRegistry())
++	require.NoError(t, err)
++
++	buf := make([]byte, 16*1024*1024)
++	for i := 0; i < len(buf); i += 4096 {
++		buf[i] = byte(i)
++	}
++
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++
++	require.NoError(t, m.StartAsync(ctx))
++	require.NoError(t, m.AwaitRunning(ctx))
++
++	deadline := time.Now().Add(2 * time.Second)
++	var heapUtilization float64
++	for time.Now().Before(deadline) {
++		heapUtilization = m.GetHeapUtilization()
++		if !math.IsNaN(heapUtilization) && !math.IsInf(heapUtilization, 0) && heapUtilization > 0 {
++			break
++		}
++		time.Sleep(20 * time.Millisecond)
++	}
++
++	m.StopAsync()
++	stopCtx, stopCancel := context.WithTimeout(context.Background(), 2*time.Second)
++	defer stopCancel()
++	require.NoError(t, m.AwaitTerminated(stopCtx))
++
++	require.True(t, !math.IsNaN(heapUtilization) && !math.IsInf(heapUtilization, 0), "heap utilization should be finite")
++	require.Greater(t, heapUtilization, float64(0), "heap utilization should be recorded")
++
++	runtime.KeepAlive(buf)
++}
+diff --git a/pkg/util/resource/scanner_test.go b/pkg/util/resource/scanner_test.go
+index 0e632d21e7..52b1b20ca0 100644
+--- a/pkg/util/resource/scanner_test.go
++++ b/pkg/util/resource/scanner_test.go
+@@ -1,6 +1,8 @@
+ package resource
+ 
+ import (
++	"math"
++	"runtime"
+ 	"testing"
+ 
+ 	"github.com/stretchr/testify/require"
+@@ -12,3 +14,26 @@ func Test_NoopScanner(t *testing.T) {
+ 	require.NoError(t, err)
+ 	require.Zero(t, val)
+ }
++
++func TestHeapScannerReportsHeapUsageAtRealisticMagnitude(t *testing.T) {
++	scanner, err := newHeapScanner()
++	require.NoError(t, err)
++
++	const allocationSize = 32 * 1024 * 1024
++	buf := make([]byte, allocationSize)
++	for i := 0; i < len(buf); i += 4096 {
++		buf[i] = byte(i)
++	}
++
++	value, err := scanner.scan()
++	require.NoError(t, err)
++	require.True(t, !math.IsNaN(value) && !math.IsInf(value, 0), "heap scan should return a finite value, got %v", value)
++	require.Greater(
++		t,
++		value,
++		float64(8*1024*1024),
++		"heap scan should reflect real heap usage, not zero or a fixed small sentinel",
++	)
++
++	runtime.KeepAlive(buf)
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,16 @@
++#!/bin/bash
++set -uo pipefail
++cd /testbed
++
++case "${1:-}" in
++  base)
++    go test -v -count=1 ./pkg/util/resource ./pkg/util/limiter ./pkg/cortex -run 'Test_NoopScanner|TestResponseSizeLimiter_AddDataBytes|TestRateLimiter_RecheckPeriod|TestRateLimiter_AllowN|TestQueryLimiter_AddSeries_ShouldReturnNoErrorOnLimitNotExceeded|TestQueryLimiter_AddSeriers_ShouldReturnErrorOnLimitExceeded|TestQueryLimiter_AddSeriesBatch_ShouldReturnErrorOnLimitExceeded|TestQueryLimiter_AddChunkBytes|TestQueryLimiter_AddDataBytes|TestAPIConfig|TestCortex_InitRulerStorage|Test_setupModuleManager'
++    ;;
++  new)
++    go test -v -count=1 ./pkg/util/resource ./pkg/util/limiter ./pkg/cortex -run 'Test(HeapScannerReportsHeapUsageAtRealisticMagnitude|ResourceMonitorRecordsHeapUtilizationWithoutPanic|ResourceBasedLimiterLimitMetricHasResourceLabelForEachResource|InitResourceMonitorRejectsUnsupportedResource|InitResourceMonitorSkipsUnsetOrEffectivelyEmptyResources)$'
++    ;;
++  *)
++    echo "usage: $0 base|new" >&2
++    exit 2
++    ;;
++esac

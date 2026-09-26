@@ -1,0 +1,409 @@
+diff --git a/f5/bigip/test/test_collection_pagination_contract.py b/f5/bigip/test/test_collection_pagination_contract.py
+new file mode 100644
+index 0000000..a818f08
+--- /dev/null
++++ b/f5/bigip/test/test_collection_pagination_contract.py
+@@ -0,0 +1,388 @@
++from f5.bigip import exceptions
++from f5.bigip.ltm import LTM
++from f5.bigip.ltm.nat import NAT
++from f5.bigip.ltm.nat import NATCollection
++from f5.bigip.resource import UnregisteredKind
++from f5.bigip.rest_collection import RESTInterfaceCollection
++
++import pytest
++
++
++APPLIANCE = 'https://bigip.example'
++
++
++class FakeResponse(object):
++    def __init__(self, payload):
++        self.payload = payload
++
++    def json(self):
++        return self.payload
++
++
++class RoutedSession(object):
++    def __init__(self, routes, events=None, reject_repeated_urls=False):
++        self.routes = routes
++        self.events = events if events is not None else []
++        self.reject_repeated_urls = reject_repeated_urls
++        self.counts = {}
++
++    def get(self, url, *args, **kwargs):
++        self.events.append(('get', url, args, kwargs))
++        self.counts[url] = self.counts.get(url, 0) + 1
++        if self.reject_repeated_urls and self.counts[url] > 1:
++            raise AssertionError('continuation URL requested twice: %s' % url)
++        result = self.routes[url]
++        if isinstance(result, Exception):
++            raise result
++        return FakeResponse(result)
++
++
++class FakeBigIP(object):
++    def __init__(self, session):
++        self._meta_data = {
++            'bigip': self,
++            'hostname': 'bigip.example',
++            'uri': APPLIANCE + '/mgmt/tm/',
++            'icr_session': session,
++        }
++
++
++def nat_item(name, kind='tm:ltm:nat:natstate'):
++    return {
++        'kind': kind,
++        'name': name,
++        'generation': 1,
++        'selfLink': 'https://localhost/mgmt/tm/ltm/nat/~Common~%s' % name,
++    }
++
++
++def nat_collection(routes, **session_kwargs):
++    session = RoutedSession(routes, **session_kwargs)
++    collection = NATCollection(LTM(FakeBigIP(session)))
++    return collection, session
++
++
++def test_codespec_single_page_collection_behavior_is_unchanged():
++    nat_url = APPLIANCE + '/mgmt/tm/ltm/nat/'
++    nat_routes = {nat_url: {'items': [nat_item('only')]}}
++    resource_collection, resource_session = nat_collection(nat_routes)
++
++    resources = resource_collection.get_collection()
++
++    assert len(resources) == 1
++    assert isinstance(resources[0], NAT)
++    assert resources[0].name == 'only'
++    assert [event[1] for event in resource_session.events] == [nat_url]
++
++    ltm_url = APPLIANCE + '/mgmt/tm/ltm/'
++    ltm_routes = {ltm_url: {'items': [{'reference': 'only'}]}}
++    organizing_session = RoutedSession(ltm_routes)
++    organizing_collection = LTM(FakeBigIP(organizing_session))
++
++    assert organizing_collection.get_collection() == [{'reference': 'only'}]
++    assert [event[1] for event in organizing_session.events] == [ltm_url]
++
++
++def test_codespec_resource_collection_walks_all_links_and_hydrates_each_page():
++    first = APPLIANCE + '/mgmt/tm/ltm/nat/'
++    second = APPLIANCE + '/mgmt/tm/ltm/nat/?$skip=1'
++    third = APPLIANCE + '/mgmt/tm/ltm/nat/?$skip=2'
++    beta_uri = APPLIANCE + '/mgmt/tm/ltm/nat/~Common~beta/'
++    routes = {
++        first: {
++            'items': [nat_item('alpha')],
++            'nextLink': 'https://localhost/mgmt/tm/ltm/nat/?$skip=1',
++        },
++        second: {
++            'items': [],
++            'nextLink': '/mgmt/tm/ltm/nat/?$skip=2',
++        },
++        third: {
++            'items': [nat_item('beta'), nat_item('alpha')],
++        },
++        beta_uri: nat_item('beta'),
++    }
++    collection, session = nat_collection(routes)
++
++    resources = collection.get_collection()
++
++    assert [resource.name for resource in resources] == [
++        'alpha', 'beta', 'alpha']
++    assert all(isinstance(resource, NAT) for resource in resources)
++    assert [event[1] for event in session.events] == [first, second, third]
++
++    resources[1].refresh()
++    assert session.events[-1][1] == beta_uri
++
++
++def test_codespec_organizing_collection_keeps_raw_order_past_empty_page():
++    first = APPLIANCE + '/mgmt/tm/ltm/'
++    second = APPLIANCE + '/mgmt/tm/ltm/?$skip=1'
++    third = APPLIANCE + '/mgmt/tm/ltm/?$skip=2'
++    routes = {
++        first: {
++            'items': [{'reference': 'first'}],
++            'nextLink': '/mgmt/tm/ltm/?$skip=1',
++        },
++        second: {
++            'nextLink': 'https://localhost/mgmt/tm/ltm/?$skip=2',
++        },
++        third: {
++            'items': [{'reference': 'second'}, {'reference': 'first'}],
++        },
++    }
++    session = RoutedSession(routes)
++    collection = LTM(FakeBigIP(session))
++
++    assert collection.get_collection() == [
++        {'reference': 'first'},
++        {'reference': 'second'},
++        {'reference': 'first'},
++    ]
++    assert [event[1] for event in session.events] == [first, second, third]
++
++
++def test_codespec_kindless_items_remain_raw_across_resource_pages():
++    first = APPLIANCE + '/mgmt/tm/ltm/nat/'
++    second = APPLIANCE + '/mgmt/tm/ltm/nat/?$skip=1'
++    raw_item = {'name': 'server-summary', 'count': 2}
++    routes = {
++        first: {
++            'items': [raw_item],
++            'nextLink': '/mgmt/tm/ltm/nat/?$skip=1',
++        },
++        second: {
++            'items': [nat_item('typed')],
++        },
++    }
++    collection, session = nat_collection(routes)
++
++    results = collection.get_collection()
++
++    assert results[0] == raw_item
++    assert isinstance(results[0], dict)
++    assert isinstance(results[1], NAT)
++    assert [event[1] for event in session.events] == [first, second]
++
++
++def test_codespec_unregistered_kind_on_later_page_is_not_ignored():
++    first = APPLIANCE + '/mgmt/tm/ltm/nat/'
++    second = APPLIANCE + '/mgmt/tm/ltm/nat/?$skip=1'
++    routes = {
++        first: {
++            'items': [nat_item('valid')],
++            'nextLink': '/mgmt/tm/ltm/nat/?$skip=1',
++        },
++        second: {
++            'items': [nat_item('alien', kind='tm:ltm:alien:alienstate')],
++        },
++    }
++    collection, unused_session = nat_collection(routes)
++
++    with pytest.raises(UnregisteredKind):
++        collection.get_collection()
++
++
++class LaterPageFailure(Exception):
++    pass
++
++
++def test_codespec_organizing_collection_later_failure_propagates():
++    first = APPLIANCE + '/mgmt/tm/ltm/'
++    second = APPLIANCE + '/mgmt/tm/ltm/?$skip=1'
++    failure = LaterPageFailure('organizing page failed')
++    routes = {
++        first: {
++            'items': [{'reference': 'first'}],
++            'nextLink': '/mgmt/tm/ltm/?$skip=1',
++        },
++        second: failure,
++    }
++    session = RoutedSession(routes)
++    collection = LTM(FakeBigIP(session))
++
++    with pytest.raises(LaterPageFailure) as raised:
++        collection.get_collection()
++    assert raised.value is failure
++
++
++def test_codespec_later_page_transport_failure_propagates():
++    first = APPLIANCE + '/mgmt/tm/ltm/nat/'
++    second = APPLIANCE + '/mgmt/tm/ltm/nat/?$skip=1'
++    failure = LaterPageFailure('second page failed')
++    routes = {
++        first: {
++            'items': [nat_item('valid')],
++            'nextLink': '/mgmt/tm/ltm/nat/?$skip=1',
++        },
++        second: failure,
++    }
++    collection, unused_session = nat_collection(routes)
++
++    with pytest.raises(LaterPageFailure) as raised:
++        collection.get_collection()
++    assert raised.value is failure
++
++
++def test_codespec_resource_collection_rejects_normalized_link_cycle():
++    first = APPLIANCE + '/mgmt/tm/ltm/nat/'
++    routes = {
++        first: {
++            'items': [nat_item('valid')],
++            'nextLink': 'https://localhost/mgmt/tm/ltm/nat/',
++        },
++    }
++    collection, session = nat_collection(
++        routes, reject_repeated_urls=True)
++    pagination_error = getattr(exceptions, 'PaginationLoop', None)
++
++    assert pagination_error is not None, 'PaginationLoop must be public'
++    assert issubclass(pagination_error, exceptions.BigIPException)
++    with pytest.raises(pagination_error) as raised:
++        collection.get_collection()
++    assert first in str(raised.value)
++    assert session.counts[first] == 1
++
++
++def test_codespec_organizing_collection_rejects_normalized_link_cycle():
++    first = APPLIANCE + '/mgmt/tm/ltm/'
++    routes = {
++        first: {
++            'items': [{'reference': 'first'}],
++            'nextLink': 'https://localhost/mgmt/tm/ltm/',
++        },
++    }
++    session = RoutedSession(routes, reject_repeated_urls=True)
++    collection = LTM(FakeBigIP(session))
++    pagination_error = getattr(exceptions, 'PaginationLoop', None)
++
++    assert pagination_error is not None, 'PaginationLoop must be public'
++    assert issubclass(pagination_error, exceptions.BigIPException)
++    with pytest.raises(pagination_error) as raised:
++        collection.get_collection()
++    assert first in str(raised.value)
++    assert session.counts[first] == 1
++
++
++class LegacyBigIP(object):
++    def __init__(self, session):
++        self.icr_session = session
++
++
++class RecordingLegacyCollection(RESTInterfaceCollection):
++    def __init__(self, session, events, delete_results=None):
++        self.bigip = LegacyBigIP(session)
++        self.base_uri = APPLIANCE + '/mgmt/tm/ltm/pool/'
++        self.events = events
++        self.delete_results = delete_results or {}
++
++    def delete(self, name=None, folder='Common', timeout=30):
++        self.events.append(('delete', name, folder, timeout))
++        return self.delete_results.get(name, True)
++
++
++def test_codespec_delete_all_snapshots_pages_then_deletes_matches_in_order():
++    events = []
++    first = APPLIANCE + '/mgmt/tm/ltm/pool/'
++    second = APPLIANCE + '/mgmt/tm/ltm/pool/?$skip=2'
++    routes = {
++        first: {
++            'items': [
++                {'name': 'keep-one'},
++                {'name': 'ignore-one'},
++            ],
++            'nextLink': 'https://localhost/mgmt/tm/ltm/pool/?$skip=2',
++        },
++        second: {
++            'items': [
++                {'name': 'keep-two'},
++                {'name': 'ignore-two'},
++            ],
++        },
++    }
++    session = RoutedSession(routes, events=events)
++    collection = RecordingLegacyCollection(session, events)
++
++    assert collection.delete_all(
++        folder='Tenant', startswith='keep-', timeout=17) is True
++    assert events[:2][0][0:2] == ('get', first)
++    assert events[:2][1][0:2] == ('get', second)
++    assert events[2:] == [
++        ('delete', 'keep-one', 'Tenant', 17),
++        ('delete', 'keep-two', 'Tenant', 17),
++    ]
++    assert events[0][3]['params'] == {
++        '$select': 'name,selfLink',
++        '$filter': 'partition eq Tenant',
++    }
++    assert events[0][3]['timeout'] == 17
++    assert events[1][2] == ()
++    assert events[1][3]['timeout'] == 17
++    assert not events[1][3].get('params')
++
++
++def test_codespec_delete_all_stops_after_first_failed_delete():
++    events = []
++    first = APPLIANCE + '/mgmt/tm/ltm/pool/'
++    second = APPLIANCE + '/mgmt/tm/ltm/pool/?$skip=1'
++    routes = {
++        first: {
++            'items': [{'name': 'keep-one'}],
++            'nextLink': '/mgmt/tm/ltm/pool/?$skip=1',
++        },
++        second: {
++            'items': [{'name': 'keep-two'}, {'name': 'keep-three'}],
++        },
++    }
++    session = RoutedSession(routes, events=events)
++    collection = RecordingLegacyCollection(
++        session, events, delete_results={'keep-two': False})
++
++    assert collection.delete_all(startswith='keep-') is False
++    assert [event[1] for event in events if event[0] == 'get'] == [
++        first, second]
++    assert [event[1] for event in events if event[0] == 'delete'] == [
++        'keep-one', 'keep-two']
++
++
++def test_codespec_delete_all_later_page_failure_prevents_deletion():
++    events = []
++    first = APPLIANCE + '/mgmt/tm/ltm/pool/'
++    second = APPLIANCE + '/mgmt/tm/ltm/pool/?$skip=1'
++    failure = LaterPageFailure('delete discovery failed')
++    routes = {
++        first: {
++            'items': [{'name': 'keep-one'}],
++            'nextLink': '/mgmt/tm/ltm/pool/?$skip=1',
++        },
++        second: failure,
++    }
++    session = RoutedSession(routes, events=events)
++    collection = RecordingLegacyCollection(session, events)
++
++    with pytest.raises(LaterPageFailure) as raised:
++        collection.delete_all(startswith='keep-')
++    assert raised.value is failure
++    assert [event for event in events if event[0] == 'delete'] == []
++
++
++def test_codespec_delete_all_rejects_cycle_before_any_delete():
++    events = []
++    first = APPLIANCE + '/mgmt/tm/ltm/pool/'
++    routes = {
++        first: {
++            'items': [{'name': 'keep-one'}],
++            'nextLink': 'https://localhost/mgmt/tm/ltm/pool/',
++        },
++    }
++    session = RoutedSession(
++        routes, events=events, reject_repeated_urls=True)
++    collection = RecordingLegacyCollection(session, events)
++    pagination_error = getattr(exceptions, 'PaginationLoop', None)
++
++    assert pagination_error is not None, 'PaginationLoop must be public'
++    assert issubclass(pagination_error, exceptions.BigIPException)
++    with pytest.raises(pagination_error) as raised:
++        collection.delete_all(startswith='keep-')
++    assert first in str(raised.value)
++    assert [event for event in events if event[0] == 'delete'] == []
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,10 @@
++#!/bin/bash
++set -euo pipefail
++
++
++py.test -q \
++  f5/bigip/test/test_collection_pagination_contract.py \
++  f5/bigip/test/test_REST_interface_collections.py::test_delete_all \
++  f5/bigip/test/test_REST_interface_collections.py::test_delete_all_startswith \
++  f5/bigip/test/test_REST_interface_collections.py::test_delete_all_fail \
++  f5/bigip/test/test_REST_interface_collections.py::test_delete_all_http_error

@@ -1,0 +1,512 @@
+diff --git a/usercase-test-coderl/test_q3.py b/usercase-test-coderl/test_q3.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/test_q3.py
+@@ -0,0 +1,484 @@
++
++
++
++from __future__ import annotations
++
++import asyncio
++import copy
++import json
++import socket
++import subprocess
++import sys
++import textwrap
++from pathlib import Path
++
++import numpy as np
++import pytest
++import xarray as xr
++import zarr
++from obspec_utils.registry import ObjectStoreRegistry
++from obstore.store import LocalStore
++
++from virtualizarr.parsers import ZarrParser
++
++
++def _registry_for(path: Path) -> tuple[LocalStore, ObjectStoreRegistry]:
++    store = LocalStore(prefix=str(path))
++    registry = ObjectStoreRegistry({path.as_uri(): store})
++    return store, registry
++
++
++def _parse(path: Path, parser: ZarrParser | None = None):
++    _, registry = _registry_for(path)
++    return (parser or ZarrParser())(url=path.as_uri(), registry=registry)
++
++
++def _manifest_dict(manifest_store, variable: str) -> dict:
++    vds = manifest_store.to_virtual_dataset(loadable_variables=[])
++    return vds[variable].data.manifest.dict()
++
++
++def _manifest_grid(manifest_store, variable: str) -> tuple[int, ...]:
++    vds = manifest_store.to_virtual_dataset(loadable_variables=[])
++    return vds[variable].data.manifest.shape_chunk_grid
++
++
++def _query_dataset() -> xr.Dataset:
++    return xr.Dataset(
++        {"data": (("x", "y"), np.arange(36, dtype="float32").reshape(6, 6))}
++    )
++
++
++def _write_dense_store(path: Path, zarr_format: int) -> xr.Dataset:
++    ds = _query_dataset()
++    ds.to_zarr(
++        path,
++        encoding={"data": {"chunks": (2, 2)}},
++        consolidated=False,
++        zarr_format=zarr_format,
++    )
++    return ds
++
++
++def _expected_v3_dense_manifest(path: Path) -> dict:
++    base = path.as_uri()
++    return {
++        f"{i}.{j}": {
++            "path": f"{base}/data/c/{i}/{j}",
++            "offset": 0,
++            "length": 25,
++        }
++        for i in range(3)
++        for j in range(3)
++    }
++
++
++def _expected_v2_dense_manifest(path: Path) -> dict:
++    base = path.as_uri()
++    return {
++        f"{i}.{j}": {
++            "path": f"{base}/data/{i}.{j}",
++            "offset": 0,
++            "length": 32,
++        }
++        for i in range(3)
++        for j in range(3)
++    }
++
++
++def _write_sparse_store(path: Path) -> None:
++    group = zarr.group(store=path, overwrite=True, zarr_format=3)
++    array = group.create_array(
++        "data",
++        shape=(30, 30),
++        chunks=(10, 10),
++        dtype="float32",
++        fill_value=np.nan,
++        dimension_names=("x", "y"),
++    )
++    array[0:10, 0:10] = 1.0
++    array[10:20, 10:20] = 2.0
++    array[20:30, 20:30] = 3.0
++
++
++def _expected_tree() -> xr.DataTree:
++    return xr.DataTree.from_dict(
++        {
++            "/": xr.Dataset(
++                {
++                    "air": (("x",), np.arange(4, dtype="float32")),
++                    "root_only": (("x",), np.arange(4, dtype="float32") + 10),
++                }
++            ),
++            "/group_a": xr.Dataset(
++                {
++                    "air": (("y",), np.arange(6, dtype="float32") + 20),
++                    "temp": (("y",), np.arange(6, dtype="float32") + 30),
++                }
++            ),
++            "/group_a/nested": xr.Dataset(
++                {"deep": (("z",), np.arange(8, dtype="float32") + 40)}
++            ),
++        }
++    )
++
++
++def _write_tree_store(path: Path) -> xr.DataTree:
++    tree = _expected_tree()
++    tree.to_zarr(path, consolidated=False, zarr_format=3)
++    return tree
++
++
++def test_zarr_v3_dense_manifest_and_xarray_roundtrip(tmp_path: Path) -> None:
++
++
++
++    path = tmp_path / "dense_v3.zarr"
++    expected_ds = _write_dense_store(path, zarr_format=3)
++
++    manifest_store = _parse(path)
++
++    assert _manifest_dict(manifest_store, "data") == _expected_v3_dense_manifest(path)
++    with xr.open_dataset(
++        manifest_store, engine="zarr", consolidated=False, zarr_format=3
++    ) as actual:
++        xr.testing.assert_identical(actual, expected_ds)
++
++
++def test_zarr_v2_dense_manifest_uses_dot_keys_and_reads_as_v3(tmp_path: Path) -> None:
++
++
++
++    path = tmp_path / "dense_v2.zarr"
++    expected_ds = _write_dense_store(path, zarr_format=2)
++
++    manifest_store = _parse(path)
++
++    assert _manifest_dict(manifest_store, "data") == _expected_v2_dense_manifest(path)
++    with xr.open_dataset(
++        manifest_store, engine="zarr", consolidated=False, zarr_format=3
++    ) as actual:
++        xr.testing.assert_identical(actual, expected_ds)
++
++
++def test_parent_registry_prefix_preserves_nested_store_urls(tmp_path: Path) -> None:
++
++
++
++    parent = tmp_path / "bucket_root"
++    path = parent / "foo" / "bar.zarr"
++    path.parent.mkdir(parents=True)
++    expected_ds = xr.Dataset(
++        {"temp": (("x", "y"), np.arange(12, dtype="float32").reshape(3, 4))}
++    )
++    expected_ds.to_zarr(path, consolidated=False, zarr_format=3)
++    registry = ObjectStoreRegistry({parent.as_uri(): LocalStore(prefix=str(parent))})
++
++    manifest_store = ZarrParser()(url=path.as_uri(), registry=registry)
++
++    assert _manifest_dict(manifest_store, "temp") == {
++        "0.0": {
++            "path": f"{path.as_uri()}/temp/c/0/0",
++            "offset": 0,
++            "length": 57,
++        }
++    }
++    with xr.open_dataset(
++        manifest_store, engine="zarr", consolidated=False, zarr_format=3
++    ) as actual:
++        xr.testing.assert_identical(actual, expected_ds)
++
++
++def test_parser_recurses_from_root_into_nested_groups(tmp_path: Path) -> None:
++
++
++
++    path = tmp_path / "tree.zarr"
++    expected = _write_tree_store(path)
++
++    manifest_store = _parse(path)
++
++    with xr.open_datatree(
++        manifest_store, engine="zarr", consolidated=False, zarr_format=3
++    ) as actual:
++        xr.testing.assert_identical(actual, expected)
++
++
++def test_parser_group_argument_uses_nested_group_as_root(tmp_path: Path) -> None:
++
++
++
++    path = tmp_path / "tree_group.zarr"
++    _write_tree_store(path)
++    expected = xr.Dataset({"deep": (("z",), np.arange(8, dtype="float32") + 40)})
++
++    manifest_store = _parse(path, parser=ZarrParser(group="group_a/nested"))
++
++    with xr.open_dataset(
++        manifest_store, engine="zarr", consolidated=False, zarr_format=3
++    ) as actual:
++        xr.testing.assert_identical(actual, expected)
++
++
++def test_skip_variables_removes_matching_arrays_across_hierarchy(tmp_path: Path) -> None:
++
++
++
++    path = tmp_path / "tree_skip.zarr"
++    _write_tree_store(path)
++    expected = xr.DataTree.from_dict(
++        {
++            "/": xr.Dataset(
++                {"root_only": (("x",), np.arange(4, dtype="float32") + 10)}
++            ),
++            "/group_a": xr.Dataset(
++                {"temp": (("y",), np.arange(6, dtype="float32") + 30)}
++            ),
++            "/group_a/nested": xr.Dataset(
++                {"deep": (("z",), np.arange(8, dtype="float32") + 40)}
++            ),
++        }
++    )
++
++    manifest_store = _parse(path, parser=ZarrParser(skip_variables=["air"]))
++
++    with xr.open_datatree(
++        manifest_store, engine="zarr", consolidated=False, zarr_format=3
++    ) as actual:
++        xr.testing.assert_identical(actual, expected)
++
++
++def test_sparse_store_keeps_only_initialized_chunks_and_fill_values(
++    tmp_path: Path,
++) -> None:
++
++
++
++    path = tmp_path / "sparse.zarr"
++    _write_sparse_store(path)
++    base = path.as_uri()
++    expected_manifest = {
++        "0.0": {"path": f"{base}/data/c/0/0", "offset": 0, "length": 21},
++        "1.1": {"path": f"{base}/data/c/1/1", "offset": 0, "length": 21},
++        "2.2": {"path": f"{base}/data/c/2/2", "offset": 0, "length": 21},
++    }
++    expected_values = np.full((30, 30), np.nan, dtype="float32")
++    expected_values[0:10, 0:10] = 1.0
++    expected_values[10:20, 10:20] = 2.0
++    expected_values[20:30, 20:30] = 3.0
++
++    manifest_store = _parse(path)
++
++    assert _manifest_dict(manifest_store, "data") == expected_manifest
++    assert _manifest_grid(manifest_store, "data") == (3, 3)
++    with xr.open_dataset(
++        manifest_store, engine="zarr", consolidated=False, zarr_format=3
++    ) as actual:
++        np.testing.assert_equal(actual["data"].values, expected_values)
++
++
++def test_scalar_initialized_and_uninitialized_manifests(tmp_path: Path) -> None:
++
++
++
++    initialized = tmp_path / "scalar_init.zarr"
++    group = zarr.group(store=initialized, overwrite=True, zarr_format=3)
++    array = group.create_array("scalar", shape=(), dtype="int8")
++    array[()] = 42
++
++    initialized_store = _parse(initialized)
++    initialized_manifest = _manifest_dict(initialized_store, "scalar")
++
++    assert list(initialized_manifest.values()) == [
++        {
++            "path": f"{initialized.as_uri()}/scalar/c",
++            "offset": 0,
++            "length": 10,
++        }
++    ]
++    assert _manifest_grid(initialized_store, "scalar") == ()
++
++    uninitialized = tmp_path / "scalar_uninit.zarr"
++    group = zarr.group(store=uninitialized, overwrite=True, zarr_format=3)
++    group.create_array("scalar", shape=(), dtype="int8")
++
++    uninitialized_store = _parse(uninitialized)
++    assert _manifest_dict(uninitialized_store, "scalar") == {}
++    assert _manifest_grid(uninitialized_store, "scalar") == ()
++
++
++def test_sharded_v3_arrays_use_shard_grid_and_roundtrip(tmp_path: Path) -> None:
++
++
++
++    path = tmp_path / "sharded.zarr"
++    expected_ds = xr.Dataset(
++        {
++            "data": (
++                ("x", "y"),
++                np.arange(12 * 12, dtype="float32").reshape(12, 12),
++            )
++        }
++    )
++    expected_ds.to_zarr(
++        path,
++        encoding={"data": {"chunks": (3, 3), "shards": (6, 6)}},
++        consolidated=False,
++        zarr_format=3,
++    )
++    base = path.as_uri()
++    expected_manifest = {
++        "0.0": {"path": f"{base}/data/c/0/0", "offset": 0, "length": 248},
++        "0.1": {"path": f"{base}/data/c/0/1", "offset": 0, "length": 248},
++        "1.0": {"path": f"{base}/data/c/1/0", "offset": 0, "length": 248},
++        "1.1": {"path": f"{base}/data/c/1/1", "offset": 0, "length": 248},
++    }
++
++    manifest_store = _parse(path)
++
++    assert _manifest_dict(manifest_store, "data") == expected_manifest
++    assert _manifest_grid(manifest_store, "data") == (2, 2)
++    with xr.open_dataset(
++        manifest_store, engine="zarr", consolidated=False, zarr_format=3
++    ) as actual:
++        xr.testing.assert_identical(actual, expected_ds)
++
++
++def test_parser_call_inside_running_event_loop_returns_manifest(
++    tmp_path: Path,
++) -> None:
++
++
++
++    path = tmp_path / "loop.zarr"
++    _write_dense_store(path, zarr_format=3)
++    _, registry = _registry_for(path)
++    expected = _expected_v3_dense_manifest(path)
++
++    async def call_parser_inside_loop() -> dict:
++        manifest_store = ZarrParser()(url=path.as_uri(), registry=registry)
++        return _manifest_dict(manifest_store, "data")
++
++    actual = asyncio.run(call_parser_inside_loop())
++
++    assert actual == expected
++
++
++def test_registry_miss_surfaces_specific_resolution_error(tmp_path: Path) -> None:
++
++
++
++    path = tmp_path / "missing_registry.zarr"
++    _write_dense_store(path, zarr_format=3)
++
++
++    with pytest.raises(ValueError):
++        ZarrParser()(url=path.as_uri(), registry=ObjectStoreRegistry({}))
++
++
++def test_rectilinear_chunk_grid_raises_not_implemented(tmp_path: Path) -> None:
++
++
++
++    path = tmp_path / "rectilinear.zarr"
++    with zarr.config.set({"array.rectilinear_chunks": True}):
++        group = zarr.group(store=path, overwrite=True, zarr_format=3)
++        group.create_array(
++            "data",
++            shape=(2, 3),
++            dtype="float32",
++            chunks=((2, 1), (3, 1)),
++        )
++
++        with pytest.raises(NotImplementedError):
++            _parse(path)
++
++
++def test_parser_is_referentially_transparent_for_same_input(tmp_path: Path) -> None:
++    path = tmp_path / "referential.zarr"
++    _write_dense_store(path, zarr_format=3)
++    expected = _expected_v3_dense_manifest(path)
++
++    first = _manifest_dict(_parse(path), "data")
++    second = _manifest_dict(_parse(path), "data")
++
++    assert first == expected
++    assert second == expected
++    assert first == second
++
++
++def test_parser_has_no_global_state_across_fresh_process(tmp_path: Path) -> None:
++    path = tmp_path / "fresh_process.zarr"
++    _write_dense_store(path, zarr_format=3)
++    expected = _expected_v3_dense_manifest(path)
++
++    in_process = _manifest_dict(_parse(path), "data")
++    script = textwrap.dedent(
++        f"""
++        import json
++        import sys
++        from pathlib import Path
++
++        sys.path.insert(0, "/workspace/repo")
++        from obspec_utils.registry import ObjectStoreRegistry
++        from obstore.store import LocalStore
++        from virtualizarr.parsers import ZarrParser
++
++        path = Path({str(path)!r})
++        registry = ObjectStoreRegistry({{path.as_uri(): LocalStore(prefix=str(path))}})
++        manifest_store = ZarrParser()(url=path.as_uri(), registry=registry)
++        vds = manifest_store.to_virtual_dataset(loadable_variables=[])
++        print(json.dumps(vds["data"].data.manifest.dict(), sort_keys=True))
++        """
++    )
++    proc = subprocess.run(
++        [sys.executable, "-c", script],
++        check=True,
++        capture_output=True,
++        text=True,
++    )
++    fresh_process = json.loads(proc.stdout)
++
++    assert in_process == expected
++    assert fresh_process == expected
++
++
++def test_parser_does_not_mutate_registry_or_store_inputs(tmp_path: Path) -> None:
++    path = tmp_path / "no_mutation.zarr"
++    _write_dense_store(path, zarr_format=3)
++    store, registry = _registry_for(path)
++    before = copy.deepcopy(
++        {
++            "registry_keys": sorted((key.scheme, key.netloc) for key in registry.map),
++            "store_prefix": str(store.prefix),
++        }
++    )
++
++    _ = ZarrParser()(url=path.as_uri(), registry=registry)
++
++    after = {
++        "registry_keys": sorted((key.scheme, key.netloc) for key in registry.map),
++        "store_prefix": str(store.prefix),
++    }
++    assert after == before
++
++
++def test_parser_only_reads_existing_local_objects(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    path = tmp_path / "no_side_effects.zarr"
++    _write_dense_store(path, zarr_format=3)
++    _, registry = _registry_for(path)
++    monkeypatch.chdir(tmp_path)
++
++    def fail_socket(*args, **kwargs):
++        raise AssertionError("ZarrParser must not open network sockets for a local store")
++
++    monkeypatch.setattr(socket, "getaddrinfo", fail_socket)
++    monkeypatch.setattr(socket.socket, "connect", fail_socket)
++    before = sorted(str(p.relative_to(tmp_path)) for p in tmp_path.rglob("*"))
++
++    _ = ZarrParser()(url=path.as_uri(), registry=registry)
++
++    after = sorted(str(p.relative_to(tmp_path)) for p in tmp_path.rglob("*"))
++    assert after == before
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,18 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++cd /workspace/repo
++
++export PIP_NO_INDEX=1
++export PIP_DISABLE_PIP_VERSION_CHECK=1
++export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
++exec python -m pytest -p pytest_asyncio.plugin -p pytest_timeout /workspace/repo/usercase-test-coderl/test_q3.py -v

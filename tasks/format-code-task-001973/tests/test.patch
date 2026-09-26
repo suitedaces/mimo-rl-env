@@ -1,0 +1,385 @@
+diff --git a/usercase-test-coderl/test_reporter_list_state.py b/usercase-test-coderl/test_reporter_list_state.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/test_reporter_list_state.py
+@@ -0,0 +1,356 @@
++import warnings
++
++import pytest
++import torch
++
++from homura.reporters import ReporterList
++
++
++
++
++
++
++
++
++
++
++def _plain(value):
++    if torch.is_tensor(value):
++        if value.nelement() == 1:
++            return float(value.item())
++        return value.tolist()
++    if isinstance(value, dict):
++        return {k: _plain(v) for k, v in value.items()}
++    return value
++
++
++def _calls_named(calls, name):
++    return [call for call in calls if call[0] == name]
++
++
++class RecordingBackend:
++    def __init__(self):
++        self.calls = []
++
++    @staticmethod
++    def _plain(value):
++        return _plain(value)
++
++    def add_scalar(self, key, value, step=None):
++        self.calls.append(("add_scalar", key, self._plain(value), step))
++
++    def add_scalars(self, key, value, step=None):
++        self.calls.append(
++            ("add_scalars", key, {k: self._plain(v) for k, v in value.items()}, step)
++        )
++
++    def add_text(self, key, text, step=None):
++        self.calls.append(("add_text", key, text, step))
++
++    def add_figure(self, key, figure, step=None):
++        self.calls.append(("add_figure", key, figure, step))
++
++    def add_histogram(self, key, value, step=None, bins="tensorflow"):
++        self.calls.append(("add_histogram", key, self._plain(value), step, bins))
++
++    def add_image(self, key, image, step=None, normalize=False):
++
++        self.calls.append(("add_image", key, self._plain(image), step))
++
++    def flush(self):
++        self.calls.append(("flush",))
++
++
++class FlushOnlyBackend:
++    def flush(self):
++        pass
++
++
++@pytest.fixture(autouse=True)
++def clear_reporter_history():
++    ReporterList([]).exit()
++    yield
++    ReporterList([]).exit()
++
++
++def test_weighted_average_history_and_scalar_backend():
++
++
++
++    backend = RecordingBackend()
++    reporter = ReporterList([backend])
++
++    for value, batch_size in zip(
++        [5.0, 20.0, 30.0, 1.0, 4.0, 8.0],
++        [32, 32, 32, 32, 32, 10],
++    ):
++        reporter.set_batch_size(batch_size)
++        reporter.add_value(
++            "loss",
++            torch.tensor(value),
++            is_averaged=True,
++            reduction="average",
++            no_sync=False,
++        )
++
++    reporter.report(step=None, mode="")
++
++    expected_loss = (
++        sum(v * b for v, b in zip([5.0, 20.0, 30.0, 1.0, 4.0, 8.0], [32, 32, 32, 32, 32, 10]))
++        / sum([32, 32, 32, 32, 32, 10])
++    )
++
++    assert _plain(reporter.history["loss"][-1]) == pytest.approx(expected_loss)
++    assert _plain(reporter.history("loss")[-1]) == pytest.approx(expected_loss)
++    scalar_calls = _calls_named(backend.calls, "add_scalar")
++    assert len(scalar_calls) == 1
++    _, key, value, step = scalar_calls[0]
++    assert key == "loss"
++    assert value == pytest.approx(expected_loss)
++    assert step is None
++    assert backend.calls.count(("flush",)) == 1
++
++
++def test_aliases_sum_mode_and_second_report_noop():
++
++
++
++    backend = RecordingBackend()
++    reporter = ReporterList([backend])
++
++    reporter.set_batch_size(2)
++    reporter.add("examples", 3, is_averaged=False, reduction="sum")
++    reporter.set_batch_size(4)
++    reporter("examples", 7, is_averaged=False, reduction="sum")
++    reporter.report(step=12, mode="train")
++    reporter.report(step=13, mode="train")
++
++    assert reporter.history["examples/train"] == [10]
++    assert reporter.history("examples/train") == [10]
++
++    assert _calls_named(backend.calls, "add_scalar") == [
++        ("add_scalar", "examples/train", 10, 12),
++    ]
++    assert backend.calls.count(("flush",)) == 1
++
++
++def test_callable_reduction_gets_values_and_result_is_reported():
++
++
++
++    backend = RecordingBackend()
++    reporter = ReporterList([backend])
++    reducer_inputs = []
++
++    def reducer(values):
++        reducer_inputs.append(list(values))
++        return values[0] * 100 + values[-1]
++
++    reporter.set_batch_size(1)
++    reporter.add_value("custom", 2, is_averaged=False, reduction=reducer)
++    reporter.set_batch_size(1)
++    reporter.add_value("custom", 5, is_averaged=False, reduction=reducer)
++    reporter.report(step=3, mode="")
++
++    assert reducer_inputs == [[2, 5]]
++    assert reporter.history["custom"] == [205]
++
++    assert _calls_named(backend.calls, "add_scalar") == [
++        ("add_scalar", "custom", 205, 3),
++    ]
++    assert backend.calls.count(("flush",)) == 1
++
++
++def test_dictionary_values_are_reduced_and_reported_as_grouped_scalars():
++
++
++
++    backend = RecordingBackend()
++    reporter = ReporterList([backend])
++
++    reporter.set_batch_size(2)
++    reporter.add_value(
++        "scores",
++        {"top1": torch.tensor(1.5), "top5": 4},
++        is_averaged=False,
++        reduction="sum",
++    )
++    reporter.set_batch_size(3)
++    reporter.add_value(
++        "scores",
++        {"top1": torch.tensor(2.5), "top5": 6},
++        is_averaged=False,
++        reduction="sum",
++    )
++    reporter.report(step=9, mode="eval")
++
++
++    assert _plain(reporter.history["scores/eval"][-1]) == {
++        "top1": pytest.approx(4.0),
++        "top5": 10,
++    }
++    assert _calls_named(backend.calls, "add_scalars") == [
++        ("add_scalars", "scores/eval", {"top1": 4.0, "top5": 10}, 9),
++    ]
++    assert backend.calls.count(("flush",)) == 1
++
++
++def test_tensor_results_dispatch_single_element_and_vector_shapes():
++
++
++
++    backend = RecordingBackend()
++    reporter = ReporterList([backend])
++
++    reporter.set_batch_size(1)
++    reporter.add_value("one", torch.tensor([3.5]), is_averaged=False, reduction="sum")
++    reporter.set_batch_size(1)
++    reporter.add_value(
++        "vector",
++        torch.tensor([1.0, 2.0, 4.0]),
++        is_averaged=False,
++        reduction="sum",
++    )
++    reporter.report(step=4, mode="")
++
++
++    assert _plain(reporter.history["one"][-1]) == pytest.approx(3.5)
++    assert _plain(reporter.history["vector"][-1]) == pytest.approx([1.0, 2.0, 4.0])
++    assert _calls_named(backend.calls, "add_scalar") == [
++        ("add_scalar", "one", 3.5, 4),
++    ]
++    vector_calls = _calls_named(backend.calls, "add_scalars")
++    assert len(vector_calls) == 1
++    _, key, values, step = vector_calls[0]
++    assert key == "vector"
++    assert {str(k): v for k, v in values.items()} == pytest.approx(
++        {"0": 1.0, "1": 2.0, "2": 4.0}
++    )
++    assert step == 4
++    assert backend.calls.count(("flush",)) == 1
++
++
++def test_artifacts_forward_to_backends_and_missing_support_warns():
++
++
++
++    backend = RecordingBackend()
++    reporter = ReporterList([backend])
++    figure = object()
++
++    reporter.add_text("note", "hello", step=2)
++    reporter.add_figure("fig", figure, step=3)
++    reporter.add_histogram("hist", torch.tensor([1.0, 2.0, 3.0]), step=4, bins="fd")
++    reporter.add_image(
++        "img",
++        torch.tensor([[2.0, 4.0], [6.0, 10.0]]),
++        step=5,
++        normalize=True,
++    )
++
++
++    assert ("add_text", "note", "hello", 2) in backend.calls
++    assert ("add_figure", "fig", figure, 3) in backend.calls
++    assert ("add_histogram", "hist", [1.0, 2.0, 3.0], 4, "fd") in backend.calls
++    image_calls = _calls_named(backend.calls, "add_image")
++    assert len(image_calls) == 1
++    _, key, image, step = image_calls[0]
++    assert key == "img"
++    assert [v for row in image for v in row] == pytest.approx([0.0, 0.25, 0.5, 1.0], abs=1e-4)
++    assert min(min(row) for row in image) == pytest.approx(0.0, abs=1e-6)
++    assert max(max(row) for row in image) == pytest.approx(1.0, abs=1e-4)
++    assert step == 5
++
++    unsupported = ReporterList([FlushOnlyBackend()])
++    with warnings.catch_warnings(record=True) as caught:
++        warnings.simplefilter("always")
++        unsupported.add_text("missing", "hello", step=1)
++
++
++    assert len(caught) >= 1
++    assert any(issubclass(w.category, Warning) for w in caught)
++
++
++def test_invalid_reduction_string_raises_value_error():
++
++
++
++    reporter = ReporterList([RecordingBackend()])
++    reporter.set_batch_size(1)
++
++    with pytest.raises(ValueError):
++        reporter.add_value("loss", 1, reduction="median")
++
++
++def test_default_add_after_batch_size_records_weighted_average():
++
++
++
++    reporter = ReporterList([RecordingBackend()])
++
++    reporter.set_batch_size(4)
++    reporter.add_value("loss", torch.tensor(1.0))
++    reporter.report()
++
++
++    assert _plain(reporter.history["loss"][-1]) == pytest.approx(1.0)
++
++
++def test_exit_is_idempotent_and_clears_history():
++
++
++
++    reporter = ReporterList([RecordingBackend()])
++    reporter.set_batch_size(1)
++    reporter.add_value("loss", 3, is_averaged=False, reduction="sum")
++    reporter.report(step=1)
++
++    assert reporter.history["loss"] == [3]
++    reporter.exit()
++    assert dict(reporter.history) == {}
++    reporter.exit()
++    assert dict(reporter.history) == {}
++
++
++def test_instances_keep_pending_epoch_values_independent():
++
++
++
++    backend_a = RecordingBackend()
++    backend_b = RecordingBackend()
++    reporter_a = ReporterList([backend_a])
++    reporter_b = ReporterList([backend_b])
++
++    reporter_a.set_batch_size(1)
++    reporter_a.add_value("pending", 10, is_averaged=False, reduction="sum")
++    reporter_b.set_batch_size(1)
++    reporter_b.add_value("pending", 4, is_averaged=False, reduction="sum")
++    reporter_b.report(step=22)
++
++    assert reporter_b.history["pending"] == [4]
++
++    assert _calls_named(backend_b.calls, "add_scalar") == [
++        ("add_scalar", "pending", 4, 22),
++    ]
++    assert backend_b.calls.count(("flush",)) == 1
++    assert backend_a.calls == []
++
++
++def test_exit_leak_floor_keeps_public_history_bounded_over_many_cycles():
++
++
++
++    max_history_keys_after_exit = 0
++
++    for i in range(120):
++        reporter = ReporterList([RecordingBackend()])
++        reporter.set_batch_size(1)
++        reporter.add_value(f"cycle_{i}", i, is_averaged=False, reduction="sum")
++        reporter.report(step=i)
++        reporter.exit()
++        max_history_keys_after_exit = max(
++            max_history_keys_after_exit,
++            len(reporter.history),
++        )
++
++    assert max_history_keys_after_exit == 0
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,19 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++
++export PYTHONPATH="/workspace/repo${PYTHONPATH:+:${PYTHONPATH}}"
++export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
++export PIP_NO_INDEX=1
++export PIP_DISABLE_PIP_VERSION_CHECK=1
++
++exec python -m pytest /workspace/repo/usercase-test-coderl/test_reporter_list_state.py -v

@@ -1,0 +1,531 @@
+diff --git a/usercase-test-coderl/fixtures/run_st2_key_load.py b/usercase-test-coderl/fixtures/run_st2_key_load.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/fixtures/run_st2_key_load.py
+@@ -0,0 +1,81 @@
++#!/usr/bin/env python3
++import json
++import os
++import sys
++from urllib.parse import urlparse
++
++
++REPO = "/workspace/repo"
++for rel in ["st2client", "st2common", "st2api"]:
++    path = os.path.join(REPO, rel)
++    if path not in sys.path:
++        sys.path.insert(0, path)
++
++os.environ["ST2_CLI_SKIP_CONFIG"] = "1"
++os.environ.setdefault("ST2_API_URL", "http://127.0.0.1:9101/v1")
++os.environ.setdefault("ST2_AUTH_URL", "http://127.0.0.1:9100")
++os.environ.setdefault("ST2_STREAM_URL", "http://127.0.0.1:9102")
++os.environ.setdefault("ST2_BASE_URL", "http://127.0.0.1")
++os.environ["ST2_AUTH_TOKEN"] = "acceptance-token"
++
++import requests
++
++
++CALLS_PATH = os.environ.get("ST2_ACCEPTANCE_CALLS")
++ORIGINAL_SESSION_REQUEST = requests.sessions.Session.request
++
++
++class FakeResponse(object):
++    status_code = 200
++    reason = "OK"
++    headers = {}
++
++    def __init__(self, text):
++        self.text = text
++        self.content = text
++
++    def json(self):
++        return json.loads(self.text)
++
++    def raise_for_status(self):
++        return None
++
++
++def fake_put(url, data=None, **kwargs):
++    if not is_loopback_url(url):
++        raise RuntimeError("isolated offline guard blocked remote PUT: %s" % url)
++
++    payload = json.loads(data or "{}")
++    call = {
++        "url": url,
++        "payload": payload,
++        "headers": kwargs.get("headers", {}),
++    }
++    if CALLS_PATH:
++        with open(CALLS_PATH, "a") as fp:
++            fp.write(json.dumps(call, sort_keys=True) + "\n")
++    return FakeResponse(json.dumps(payload, sort_keys=True))
++
++
++def is_loopback_url(url):
++    parsed = urlparse(url)
++    return parsed.hostname in ("localhost", "127.0.0.1", "0.0.0.0", "::1")
++
++
++def offline_guarded_request(session, method, url, **kwargs):
++
++    if not is_loopback_url(url):
++        raise RuntimeError("isolated offline guard blocked remote %s: %s" % (method, url))
++
++    if method.upper() == "PUT":
++        return fake_put(url, data=kwargs.get("data"), headers=kwargs.get("headers", {}))
++
++    return ORIGINAL_SESSION_REQUEST(session, method, url, **kwargs)
++
++
++requests.sessions.Session.request = offline_guarded_request
++requests.put = fake_put
++
++from st2client.shell import Shell
++
++sys.exit(Shell().run(sys.argv[1:]))
+diff --git a/usercase-test-coderl/usecase.sh b/usercase-test-coderl/usecase.sh
+new file mode 100755
+--- /dev/null
++++ b/usercase-test-coderl/usecase.sh
+@@ -0,0 +1,423 @@
++#!/usr/bin/env bash
++
++set -u
++export LANG=C.UTF-8 LC_ALL=C.UTF-8 TZ=UTC COLUMNS=120
++
++REPO=/workspace/repo
++RUNNER="$REPO/usercase-test-coderl/fixtures/run_st2_key_load.py"
++PYTHONPATH="$REPO/st2client:$REPO/st2common:$REPO/st2api${PYTHONPATH:+:$PYTHONPATH}"
++export PYTHONPATH
++
++python3 - <<'PY' || { echo "FAIL: python import check" >&2; exit 1; }
++import prettytable, yaml, orjson, requests, six, argcomplete
++import sys
++from urllib.parse import urlparse
++
++original_request = requests.sessions.Session.request
++
++def is_loopback_url(url):
++    return urlparse(url).hostname in ("localhost", "127.0.0.1", "0.0.0.0", "::1")
++
++def offline_guarded_request(session, method, url, **kwargs):
++
++    if not is_loopback_url(url):
++        raise RuntimeError("isolated offline guard blocked remote %s: %s" % (method, url))
++    return original_request(session, method, url, **kwargs)
++
++requests.sessions.Session.request = offline_guarded_request
++sys.path[:0] = ["/workspace/repo/st2client", "/workspace/repo/st2common", "/workspace/repo/st2api"]
++import st2client.shell
++PY
++
++TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
++cd "$TMP" || exit 1
++fail() { echo "FAIL: $*" >&2; exit 1; }
++
++run_cli() {
++    local calls="$1"
++    shift
++    : >"$calls"
++    ST2_ACCEPTANCE_CALLS="$calls" python3 "$RUNNER" "$@" >out 2>err
++    ec=$?
++}
++
++assert_contains_terms() {
++    local actual="$1"
++    shift
++    python3 - "$actual" "$@" <<'PY' || return 1
++import sys
++path, terms = sys.argv[1], sys.argv[2:]
++text = open(path).read()
++missing = [term for term in terms if term not in text]
++if missing:
++    print("missing terms:", missing)
++    print(text)
++    sys.exit(1)
++PY
++}
++
++assert_empty_result_stdout() {
++    local actual="$1"
++    python3 - "$actual" <<'PY' || return 1
++import sys
++text = open(sys.argv[1]).read()
++if not text.strip():
++    print("stdout was empty")
++    sys.exit(1)
++lower = text.lower()
++if not any(word in lower for word in ("no", "none", "empty")):
++    print("stdout did not look like an empty-result output:", text)
++    sys.exit(1)
++PY
++}
++
++assert_json_subset() {
++    local actual="$1"
++    local expected="$2"
++    python3 - "$actual" "$expected" <<'PY' || return 1
++import json
++import sys
++
++actual_path, expected_path = sys.argv[1:3]
++actual = json.load(open(actual_path))
++expected = json.load(open(expected_path))
++if not isinstance(actual, list):
++    print("actual JSON output is not a list:", actual)
++    sys.exit(1)
++if len(actual) != len(expected):
++    print("actual JSON length:", len(actual), "expected:", len(expected))
++    print(json.dumps(actual, sort_keys=True))
++    sys.exit(1)
++for expected_item in expected:
++    matches = [
++        item for item in actual
++        if isinstance(item, dict)
++        and all(item.get(key) == value for key, value in expected_item.items())
++    ]
++    if not matches:
++        print("missing expected subset:", json.dumps(expected_item, sort_keys=True))
++        print("actual:", json.dumps(actual, sort_keys=True))
++        sys.exit(1)
++PY
++}
++
++assert_yaml_subset() {
++    local actual="$1"
++    local expected="$2"
++    python3 - "$actual" "$expected" <<'PY' || return 1
++import json
++import sys
++import yaml
++
++actual_path, expected_path = sys.argv[1:3]
++actual = yaml.safe_load(open(actual_path))
++expected = json.load(open(expected_path))
++if not isinstance(actual, list):
++    print("actual YAML output is not a list:", actual)
++    sys.exit(1)
++if len(actual) != len(expected):
++    print("actual YAML length:", len(actual), "expected:", len(expected))
++    print(actual)
++    sys.exit(1)
++for expected_item in expected:
++    json_values = expected_item.pop("__json_values__", {})
++    matches = []
++    for item in actual:
++        if not isinstance(item, dict):
++            continue
++        if not all(item.get(key) == value for key, value in expected_item.items()):
++            continue
++        if all(json.loads(item.get(key)) == value for key, value in json_values.items()):
++            matches.append(item)
++    if not matches:
++        print("missing expected subset:", expected_item, "json values:", json_values)
++        print("actual:", actual)
++        sys.exit(1)
++PY
++}
++
++assert_api_calls_match() {
++    local actual="$1"
++    local expected="$2"
++    python3 - "$actual" "$expected" <<'PY' || return 1
++import json
++import sys
++from urllib.parse import urlparse
++
++actual_path, expected_path = sys.argv[1:3]
++with open(actual_path) as fp:
++    actual = [json.loads(line) for line in fp if line.strip()]
++with open(expected_path) as fp:
++    expected = json.load(fp)
++
++if len(actual) != len(expected):
++    print("actual call count:", len(actual), "expected:", len(expected))
++    print("actual:", json.dumps(actual, sort_keys=True))
++    sys.exit(1)
++
++actual_by_name = {}
++for call in actual:
++    name = urlparse(call.get("url", "")).path.rstrip("/").split("/")[-1]
++    actual_by_name[name] = call
++
++for expected_call in expected:
++    name = expected_call["name"]
++    call = actual_by_name.get(name)
++    if not call:
++        print("missing API update for:", name)
++        print("actual:", json.dumps(actual, sort_keys=True))
++        sys.exit(1)
++    payload = call.get("payload", {})
++    for key, value in expected_call.get("payload", {}).items():
++        if payload.get(key) != value:
++            print("payload mismatch for %s.%s: actual=%r expected=%r" % (
++                name, key, payload.get(key), value
++            ))
++            print("actual payload:", json.dumps(payload, sort_keys=True))
++            sys.exit(1)
++    for key, value in expected_call.get("json_payload_values", {}).items():
++        actual_value = payload.get(key)
++        try:
++            decoded = json.loads(actual_value)
++        except Exception as exc:
++            print("payload %s.%s is not JSON: %r (%s)" % (name, key, actual_value, exc))
++            sys.exit(1)
++        if decoded != value:
++            print("JSON payload mismatch for %s.%s: actual=%r expected=%r" % (
++                name, key, decoded, value
++            ))
++            print("actual payload:", json.dumps(payload, sort_keys=True))
++            sys.exit(1)
++PY
++}
++
++
++
++
++cat >single.json <<'JSON'
++{ "name": "kv_name", "value": "super cool value", "scope": "system" }
++JSON
++run_cli calls.json key load single.json
++cat >expected_calls.json <<'JSON'
++[
++  {
++    "name": "kv_name",
++    "payload": {"name": "kv_name", "scope": "system", "value": "super cool value"},
++    "url": "http://127.0.0.1:9101/v1/keys/kv_name"
++  }
++]
++JSON
++[ "$ec" -eq 0 ] || fail "F1 exit $ec; want 0"
++
++assert_contains_terms out name value secret scope user ttl kv_name "super cool value" system || fail "F1 stdout missing required table content"
++[ ! -s err ] || fail "F1 unexpected stderr: $(cat err)"
++
++assert_api_calls_match calls.json expected_calls.json || fail "F1 API update payload mismatch"
++
++
++
++
++cat >list.json <<'JSON'
++[ { "name": "first", "value": "one" }, { "name": "second", "value": "two", "secret": true, "ttl": 100 } ]
++JSON
++run_cli calls.json key load list.json
++cat >expected_calls.json <<'JSON'
++[
++  {
++    "name": "first",
++    "payload": {"name": "first", "value": "one"}
++  },
++  {
++    "name": "second",
++    "payload": {"name": "second", "secret": true, "ttl": 100, "value": "two"}
++  }
++]
++JSON
++[ "$ec" -eq 0 ] || fail "F2 exit $ec; want 0"
++
++assert_contains_terms out name value secret scope user ttl first one second two 100 || fail "F2 stdout missing required table content"
++[ ! -s err ] || fail "F2 unexpected stderr: $(cat err)"
++
++assert_api_calls_match calls.json expected_calls.json || fail "F2 API update payload mismatch"
++
++
++
++
++cat >user_encrypted.yaml <<'YAML'
++name: user_secret
++value: ciphertext
++scope: user
++user: stanley
++encrypted: true
++secret: true
++ttl: 1
++YAML
++run_cli calls.json key load --json user_encrypted.yaml
++cat >expected.out.json <<'JSON'
++[
++  {"name": "user_secret", "scope": "user", "secret": true, "ttl": 1, "user": "stanley", "value": "ciphertext"}
++]
++JSON
++cat >expected_calls.json <<'JSON'
++[
++  {
++    "name": "user_secret",
++    "payload": {"encrypted": true, "name": "user_secret", "scope": "user", "secret": true, "ttl": 1, "user": "stanley", "value": "ciphertext"}
++  }
++]
++JSON
++[ "$ec" -eq 0 ] || fail "F3 exit $ec; want 0"
++
++assert_json_subset out expected.out.json || fail "F3 JSON stdout mismatch"
++[ ! -s err ] || fail "F3 unexpected stderr: $(cat err)"
++
++assert_api_calls_match calls.json expected_calls.json || fail "F3 API update payload mismatch"
++
++
++
++
++cat >convert_many.json <<'JSON'
++[
++  { "name": "obj", "value": { "b": 2, "a": 1 } },
++  { "name": "arr", "value": [1, "two", false] },
++  { "name": "bool", "value": true },
++  { "name": "int", "value": 42 },
++  { "name": "float", "value": 3.5 }
++]
++JSON
++run_cli calls.json key load --convert convert_many.json
++cat >expected_calls.json <<'JSON'
++[
++  {
++    "name": "obj",
++    "payload": {"name": "obj"},
++    "json_payload_values": {"value": {"b": 2, "a": 1}}
++  },
++  {
++    "name": "arr",
++    "payload": {"name": "arr"},
++    "json_payload_values": {"value": [1, "two", false]}
++  },
++  {
++    "name": "bool",
++    "payload": {"name": "bool"},
++    "json_payload_values": {"value": true}
++  },
++  {
++    "name": "int",
++    "payload": {"name": "int"},
++    "json_payload_values": {"value": 42}
++  },
++  {
++    "name": "float",
++    "payload": {"name": "float"},
++    "json_payload_values": {"value": 3.5}
++  }
++]
++JSON
++[ "$ec" -eq 0 ] || fail "F4 exit $ec; want 0"
++
++assert_contains_terms out name value secret scope user ttl obj arr bool int float || fail "F4 stdout missing required table content"
++[ ! -s err ] || fail "F4 unexpected stderr: $(cat err)"
++
++assert_api_calls_match calls.json expected_calls.json || fail "F4 API update payload mismatch"
++
++
++
++
++cat >short_convert.yaml <<'YAML'
++name: short_convert
++value:
++  nested: yes
++YAML
++run_cli calls.json key load --yaml -c short_convert.yaml
++cat >expected.out.json <<'JSON'
++[
++  {"name": "short_convert", "__json_values__": {"value": {"nested": true}}}
++]
++JSON
++cat >expected_calls.json <<'JSON'
++[
++  {
++    "name": "short_convert",
++    "payload": {"name": "short_convert"},
++    "json_payload_values": {"value": {"nested": true}}
++  }
++]
++JSON
++[ "$ec" -eq 0 ] || fail "F5 exit $ec; want 0"
++
++assert_yaml_subset out expected.out.json || fail "F5 YAML stdout mismatch"
++[ ! -s err ] || fail "F5 unexpected stderr: $(cat err)"
++
++assert_api_calls_match calls.json expected_calls.json || fail "F5 API update payload mismatch"
++
++
++
++
++: >empty.yaml
++run_cli calls.json key load empty.yaml
++[ "$ec" -eq 0 ] || fail "F6 exit $ec; want 0"
++
++assert_empty_result_stdout out || fail "F6 should produce empty-result output"
++[ ! -s err ] || fail "F6 unexpected stderr: $(cat err)"
++[ ! -s calls.json ] || fail "F6 should not send API updates: $(cat calls.json)"
++
++
++
++
++run_cli calls.json key load does-not-exist.json
++[ "$ec" -ne 0 ] || fail "F7 expected non-zero exit"
++
++[ ! -s err ] || fail "F7 unexpected stderr: $(cat err)"
++[ ! -s calls.json ] || fail "F7 should not send API updates"
++
++
++
++
++printf '{"name":"bad","value":"x"}\n' >bad.txt
++run_cli calls.json key load bad.txt
++[ "$ec" -ne 0 ] || fail "F8 expected non-zero exit"
++
++[ ! -s err ] || fail "F8 unexpected stderr: $(cat err)"
++[ ! -s calls.json ] || fail "F8 should not send API updates"
++
++
++
++
++printf '{"value":"nameless"}\n' >missing_name.json
++run_cli calls.json key load missing_name.json
++[ "$ec" -ne 0 ] || fail "F9 expected non-zero exit"
++
++[ ! -s err ] || fail "F9 unexpected stderr: $(cat err)"
++[ ! -s calls.json ] || fail "F9 should not send API updates"
++
++
++
++
++printf '{"name":"novalue"}\n' >missing_value.json
++run_cli calls.json key load missing_value.json
++[ "$ec" -ne 0 ] || fail "F10 expected non-zero exit"
++
++[ ! -s err ] || fail "F10 unexpected stderr: $(cat err)"
++[ ! -s calls.json ] || fail "F10 should not send API updates"
++
++
++
++
++printf '{"name":"needs_convert","value":{"x":1}}\n' >needs_convert.json
++run_cli calls.json key load needs_convert.json
++[ "$ec" -ne 0 ] || fail "F11 expected non-zero exit"
++
++python3 - out <<'PY' || fail "F11 stdout should explain conversion requirement: $(cat out)"
++import sys
++text = open(sys.argv[1]).read().lower()
++if ("non-string" not in text and "not a string" not in text) or "convert" not in text or "string" not in text or "file" not in text:
++    print(text)
++    sys.exit(1)
++PY
++[ ! -s err ] || fail "F11 unexpected stderr: $(cat err)"
++[ ! -s calls.json ] || fail "F11 should not send API updates"
++
++echo "PASS"
++exit 0
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,12 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++exec bash /workspace/repo/usercase-test-coderl/usecase.sh

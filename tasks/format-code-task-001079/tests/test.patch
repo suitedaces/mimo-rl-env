@@ -1,0 +1,250 @@
+diff --git a/tests/functional/test_query_engine_fallback_codespec.py b/tests/functional/test_query_engine_fallback_codespec.py
+new file mode 100644
+index 0000000..cd57f31
+--- /dev/null
++++ b/tests/functional/test_query_engine_fallback_codespec.py
+@@ -0,0 +1,232 @@
++from collections.abc import Iterator
++from typing import Any, Optional
++
++import pytest
++
++from ape.api.query import BlockQuery, QueryAPI, QueryType
++from ape.exceptions import QueryEngineError
++from ape.managers.query import QueryManager
++
++
++class ScriptedCodespecEngine(QueryAPI):
++    def __init__(
++        self,
++        name: str,
++        estimate: Optional[int] = None,
++        values: tuple[Any, ...] = (),
++        *,
++        estimate_error: Optional[Exception] = None,
++        call_error: Optional[Exception] = None,
++        iteration_error: Optional[Exception] = None,
++        events: Optional[list[str]] = None,
++        cache_error: Optional[QueryEngineError] = None,
++    ):
++        self.name = name
++        self.estimate = estimate
++        self.values = values
++        self.estimate_error = estimate_error
++        self.call_error = call_error
++        self.iteration_error = iteration_error
++        self.events = events if events is not None else []
++        self.cache_error = cache_error
++        self.cached: list[Any] = []
++
++    def estimate_query(self, query: QueryType) -> Optional[int]:
++        self.events.append(f"estimate:{self.name}")
++        if self.estimate_error:
++            raise self.estimate_error
++
++        return self.estimate
++
++    def perform_query(self, query: QueryType) -> Iterator:
++        self.events.append(f"perform:{self.name}")
++        if self.call_error:
++            raise self.call_error
++
++        def generate():
++            yield from self.values
++            if self.iteration_error:
++                raise self.iteration_error
++
++        return generate()
++
++    def update_cache(self, query: QueryType, result: Iterator):
++        if self.cache_error:
++            raise self.cache_error
++
++        self.cached.extend(result)
++
++
++def make_engine(name: str, *args, **kwargs) -> ScriptedCodespecEngine:
++
++    engine_type = type(f"{name.title()}CodespecEngine", (ScriptedCodespecEngine,), {})
++    return engine_type(name, *args, **kwargs)
++
++
++@pytest.fixture
++def query():
++    return BlockQuery(columns=["number"], start_block=0, stop_block=1)
++
++
++@pytest.fixture
++def manager_for(monkeypatch):
++    def create(*engines):
++        engine_map = {engine.name: engine for engine in engines}
++        monkeypatch.setattr(QueryManager, "engines", property(lambda self: engine_map))
++        return QueryManager()
++
++    return create
++
++
++def test_codespec_automatic_skips_unavailable_and_estimation_errors(query, manager_for):
++    events: list[str] = []
++    unavailable = make_engine("unavailable", None, ("wrong",), events=events)
++    broken_estimate = make_engine(
++        "broken-estimate",
++        estimate_error=QueryEngineError("estimate offline"),
++        values=("wrong",),
++        events=events,
++    )
++    winner = make_engine("winner", 5, ("winner-result",), events=events)
++    manager = manager_for(unavailable, broken_estimate, winner)
++
++    assert list(manager.query(query)) == ["winner-result"]
++    assert [event for event in events if event.startswith("perform:")] == ["perform:winner"]
++
++
++def test_codespec_automatic_order_retries_execution_errors(query, manager_for):
++    events: list[str] = []
++    fastest = make_engine(
++        "fastest", 1, call_error=QueryEngineError("fastest unavailable"), events=events
++    )
++    winner = make_engine("winner", 5, ("winner-result",), events=events)
++    slower = make_engine("slower", 50, ("wrong",), events=events)
++    manager = manager_for(slower, winner, fastest)
++
++    assert list(manager.query(query)) == ["winner-result"]
++    assert [event for event in events if event.startswith("perform:")] == [
++        "perform:fastest",
++        "perform:winner",
++    ]
++
++
++def test_codespec_equal_estimates_keep_registration_order(query, manager_for):
++    events: list[str] = []
++    first = make_engine("first", 7, ("first-result",), events=events)
++    second = make_engine("second", 7, ("second-result",), events=events)
++    manager = manager_for(first, second)
++
++    assert list(manager.query(query)) == ["first-result"]
++    assert "perform:second" not in events
++
++
++def test_codespec_iteration_failure_discards_partial_values(query, manager_for):
++    events: list[str] = []
++    partial = make_engine(
++        "partial",
++        1,
++        ("must-not-leak",),
++        iteration_error=QueryEngineError("stream interrupted"),
++        events=events,
++    )
++    winner = make_engine("winner", 2, ("complete-1", "complete-2"), events=events)
++    manager = manager_for(partial, winner)
++
++    assert list(manager.query(query)) == ["complete-1", "complete-2"]
++    assert [event for event in events if event.startswith("perform:")] == [
++        "perform:partial",
++        "perform:winner",
++    ]
++
++
++def test_codespec_successful_fallback_is_the_only_cache_source(query, manager_for):
++    failed = make_engine(
++        "failed",
++        1,
++        ("partial",),
++        iteration_error=QueryEngineError("failed late"),
++    )
++    winner = make_engine("winner", 2, ("good-1", "good-2"))
++    observer = make_engine("observer", None)
++    manager = manager_for(failed, winner, observer)
++
++    assert list(manager.query(query)) == ["good-1", "good-2"]
++    assert failed.cached == ["good-1", "good-2"]
++    assert observer.cached == ["good-1", "good-2"]
++    assert winner.cached == []
++
++
++def test_codespec_cache_rejection_does_not_change_query_success(query, manager_for):
++    winner = make_engine("winner", 1, ("good",))
++    rejecting_cache = make_engine(
++        "rejecting-cache", None, cache_error=QueryEngineError("cache unavailable")
++    )
++    manager = manager_for(winner, rejecting_cache)
++
++    assert list(manager.query(query)) == ["good"]
++
++
++@pytest.mark.parametrize("failure_phase", ("call", "iteration"))
++def test_codespec_explicit_engine_remains_strict(query, manager_for, failure_phase):
++    events: list[str] = []
++    kwargs = {f"{failure_phase}_error": QueryEngineError("selected failed")}
++    selected = make_engine(
++        "selected",
++        1,
++        events=events,
++        **kwargs,
++    )
++    alternate = make_engine("alternate", 2, ("must-not-run",), events=events)
++    manager = manager_for(selected, alternate)
++
++    with pytest.raises(QueryEngineError, match="selected failed"):
++        list(manager.query(query, engine_to_use="selected"))
++
++    assert "perform:alternate" not in events
++
++
++def test_codespec_explicit_engine_runs_even_without_an_estimate(query, manager_for):
++    selected = make_engine("selected", None, ("explicit-result",))
++    manager = manager_for(selected)
++
++    assert list(manager.query(query, engine_to_use="selected")) == ["explicit-result"]
++
++
++@pytest.mark.parametrize("failure_phase", ("estimate", "call", "iteration"))
++def test_codespec_unexpected_errors_are_not_retried(query, manager_for, failure_phase):
++    events: list[str] = []
++    kwargs = {f"{failure_phase}_error": RuntimeError(f"unexpected {failure_phase} failure")}
++    broken = make_engine("broken", 1, events=events, **kwargs)
++    alternate = make_engine("alternate", 2, ("must-not-run",), events=events)
++    manager = manager_for(broken, alternate)
++
++    with pytest.raises(RuntimeError, match=f"unexpected {failure_phase} failure"):
++        list(manager.query(query))
++
++    assert "perform:alternate" not in events
++
++
++def test_codespec_exhaustion_reports_each_failed_candidate(query, manager_for):
++    first = make_engine(
++        "first-engine", 1, call_error=QueryEngineError("first diagnostic")
++    )
++    second = make_engine(
++        "second-engine", 2, iteration_error=QueryEngineError("second diagnostic")
++    )
++    manager = manager_for(first, second)
++
++    with pytest.raises(QueryEngineError) as err:
++        list(manager.query(query))
++
++    message = str(err.value)
++    assert "first-engine" in message
++    assert "first diagnostic" in message
++    assert "second-engine" in message
++    assert "second diagnostic" in message
++
++
++def test_codespec_no_available_estimates_keeps_existing_error(query, manager_for):
++    manager = manager_for(make_engine("one", None), make_engine("two", None))
++
++    with pytest.raises(QueryEngineError, match="No query engines are available"):
++        list(manager.query(query))
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,7 @@
++#!/bin/bash
++set -euo pipefail
++
++
++pytest -q \
++  tests/functional/test_query_engine_fallback_codespec.py \
++  tests/functional/test_query.py::test_specify_engine

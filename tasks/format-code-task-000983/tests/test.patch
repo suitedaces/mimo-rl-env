@@ -1,0 +1,243 @@
+diff --git a/pkg/client/simple/vfsclientset/codespec_instancegroup_test.go b/pkg/client/simple/vfsclientset/codespec_instancegroup_test.go
+new file mode 100644
+index 0000000000..65bcb8eafa
+--- /dev/null
++++ b/pkg/client/simple/vfsclientset/codespec_instancegroup_test.go
+@@ -0,0 +1,227 @@
++package vfsclientset
++
++import (
++	"context"
++	"reflect"
++	"testing"
++
++	apierrors "k8s.io/apimachinery/pkg/api/errors"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/types"
++	"k8s.io/kops/pkg/apis/kops"
++	"k8s.io/kops/pkg/client/simple"
++	"k8s.io/kops/upup/pkg/fi"
++	"k8s.io/kops/util/pkg/vfs"
++)
++
++func newInstanceGroupTestClient(t *testing.T) (context.Context, simple.Clientset, *kops.Cluster) {
++	t.Helper()
++	vfs.Context.ResetMemfsContext(true)
++	base, err := vfs.Context.BuildVfsPath("memfs://codespec-vfs")
++	if err != nil {
++		t.Fatalf("build test path: %v", err)
++	}
++	return context.Background(), NewVFSClientset(base), &kops.Cluster{ObjectMeta: metav1.ObjectMeta{Name: "demo"}}
++}
++
++func createTestInstanceGroups(t *testing.T, ctx context.Context, client simple.Clientset, cluster *kops.Cluster) {
++	t.Helper()
++	groups := []struct {
++		name string
++		env  string
++	}{
++		{name: "alpha", env: "prod"},
++		{name: "beta", env: "dev"},
++		{name: "gamma", env: "prod"},
++	}
++	for _, group := range groups {
++		ig := &kops.InstanceGroup{
++			ObjectMeta: metav1.ObjectMeta{Name: group.name, Labels: map[string]string{"env": group.env}},
++			Spec:       kops.InstanceGroupSpec{Role: kops.InstanceGroupRoleNode, MinSize: fi.Int32(1)},
++		}
++		if _, err := client.InstanceGroupsFor(cluster).Create(ctx, ig, metav1.CreateOptions{}); err != nil {
++			t.Fatalf("create %s: %v", group.name, err)
++		}
++	}
++}
++
++func instanceGroupNames(list *kops.InstanceGroupList) []string {
++	names := make([]string, 0, len(list.Items))
++	for _, item := range list.Items {
++		names = append(names, item.Name)
++	}
++	return names
++}
++
++func TestVFSInstanceGroupListSelectors(t *testing.T) {
++	ctx, client, cluster := newInstanceGroupTestClient(t)
++	createTestInstanceGroups(t, ctx, client, cluster)
++	groups := client.InstanceGroupsFor(cluster)
++
++	prod, err := groups.List(ctx, metav1.ListOptions{LabelSelector: "env in (prod)"})
++	if err != nil {
++		t.Fatalf("label selector: %v", err)
++	}
++	if got, want := instanceGroupNames(prod), []string{"alpha", "gamma"}; !reflect.DeepEqual(got, want) {
++		t.Fatalf("label selector returned %v, want %v", got, want)
++	}
++	clusterLabeled, err := groups.List(ctx, metav1.ListOptions{LabelSelector: kops.LabelClusterName + "=demo"})
++	if err != nil {
++		t.Fatalf("synthesized cluster label selector: %v", err)
++	}
++	if got, want := instanceGroupNames(clusterLabeled), []string{"alpha", "beta", "gamma"}; !reflect.DeepEqual(got, want) {
++		t.Fatalf("synthesized label selector returned %v, want %v", got, want)
++	}
++
++	byName, err := groups.List(ctx, metav1.ListOptions{LabelSelector: "env=prod", FieldSelector: "metadata.name=gamma"})
++	if err != nil {
++		t.Fatalf("field selector: %v", err)
++	}
++	if got, want := instanceGroupNames(byName), []string{"gamma"}; !reflect.DeepEqual(got, want) {
++		t.Fatalf("field selector returned %v, want %v", got, want)
++	}
++	notBeta, err := groups.List(ctx, metav1.ListOptions{FieldSelector: "metadata.name!=beta"})
++	if err != nil {
++		t.Fatalf("negative field selector: %v", err)
++	}
++	if got, want := instanceGroupNames(notBeta), []string{"alpha", "gamma"}; !reflect.DeepEqual(got, want) {
++		t.Fatalf("negative field selector returned %v, want %v", got, want)
++	}
++
++	if _, err := groups.List(ctx, metav1.ListOptions{LabelSelector: "env in"}); err == nil {
++		t.Fatal("malformed label selector unexpectedly succeeded")
++	}
++	if _, err := groups.List(ctx, metav1.ListOptions{FieldSelector: "metadata.name in (beta)"}); err == nil {
++		t.Fatal("malformed field selector unexpectedly succeeded")
++	}
++}
++
++func TestVFSInstanceGroupPatchSemantics(t *testing.T) {
++	ctx, client, cluster := newInstanceGroupTestClient(t)
++	groups := client.InstanceGroupsFor(cluster)
++	created := &kops.InstanceGroup{
++		ObjectMeta: metav1.ObjectMeta{Name: "worker", Labels: map[string]string{"env": "prod"}},
++		Spec:       kops.InstanceGroupSpec{Role: kops.InstanceGroupRoleNode, MinSize: fi.Int32(1)},
++	}
++	if _, err := groups.Create(ctx, created, metav1.CreateOptions{}); err != nil {
++		t.Fatalf("create: %v", err)
++	}
++
++	metadata, err := groups.Patch(ctx, "worker", types.MergePatchType, []byte(`{"metadata":{"annotations":{"owner":"test"}}}`), metav1.PatchOptions{})
++	if err != nil {
++		t.Fatalf("metadata merge patch: %v", err)
++	}
++	if metadata.Annotations["owner"] != "test" || metadata.Labels["env"] != "prod" || metadata.Spec.MinSize == nil || *metadata.Spec.MinSize != 1 || metadata.Generation != 0 {
++		t.Fatalf("metadata patch did not preserve the object: %#v", metadata)
++	}
++
++	updated, err := groups.Patch(ctx, "worker", types.MergePatchType, []byte(`{"spec":{"minSize":3}}`), metav1.PatchOptions{})
++	if err != nil {
++		t.Fatalf("spec merge patch: %v", err)
++	}
++	if updated.Spec.MinSize == nil || *updated.Spec.MinSize != 3 || updated.Spec.Role != kops.InstanceGroupRoleNode || updated.Annotations["owner"] != "test" || updated.Generation != 1 {
++		t.Fatalf("spec patch did not preserve the object: %#v", updated)
++	}
++
++	jsonPatched, err := groups.Patch(ctx, "worker", types.JSONPatchType, []byte(`[{"op":"add","path":"/metadata/labels/tier","value":"api"}]`), metav1.PatchOptions{})
++	if err != nil {
++		t.Fatalf("json patch: %v", err)
++	}
++	if jsonPatched.Labels["tier"] != "api" || jsonPatched.Generation != 1 {
++		t.Fatalf("json patch returned labels=%v generation=%d", jsonPatched.Labels, jsonPatched.Generation)
++	}
++	persisted, err := groups.Get(ctx, "worker", metav1.GetOptions{})
++	if err != nil {
++		t.Fatalf("get patched object: %v", err)
++	}
++	if persisted.Annotations["owner"] != "test" || persisted.Labels["tier"] != "api" || persisted.Spec.MinSize == nil || *persisted.Spec.MinSize != 3 || persisted.Generation != 1 {
++		t.Fatalf("patch result was not persisted: %#v", persisted)
++	}
++
++	if _, err := groups.Patch(ctx, "worker", types.MergePatchType, []byte(`{"spec":{"minSize":5,"maxSize":1}}`), metav1.PatchOptions{}); err == nil {
++		t.Fatal("invalid spec patch unexpectedly succeeded")
++	}
++	if _, err := groups.Patch(ctx, "worker", types.MergePatchType, []byte(`{"spec":`), metav1.PatchOptions{}); err == nil {
++		t.Fatal("malformed patch unexpectedly succeeded")
++	}
++	if _, err := groups.Patch(ctx, "worker", types.JSONPatchType, []byte(`[{"op":`), metav1.PatchOptions{}); err == nil {
++		t.Fatal("malformed JSON patch unexpectedly succeeded")
++	}
++	if _, err := groups.Patch(ctx, "worker", types.JSONPatchType, []byte(`[{"op":"replace","path":"/metadata/name","value":"renamed"}]`), metav1.PatchOptions{}); err == nil {
++		t.Fatal("rename patch unexpectedly succeeded")
++	}
++	if _, err := groups.Patch(ctx, "worker", types.MergePatchType, []byte(`{"metadata":{"name":"renamed"}}`), metav1.PatchOptions{}); err == nil {
++		t.Fatal("merge rename patch unexpectedly succeeded")
++	}
++	persisted, err = groups.Get(ctx, "worker", metav1.GetOptions{})
++	if err != nil {
++		t.Fatalf("get after rejected patch: %v", err)
++	}
++	if persisted.Name != "worker" || persisted.Spec.MinSize == nil || *persisted.Spec.MinSize != 3 || persisted.Spec.MaxSize != nil || persisted.Generation != 1 {
++		t.Fatalf("rejected patch changed persisted object: %#v", persisted)
++	}
++	listed, err := groups.List(ctx, metav1.ListOptions{})
++	if err != nil || !reflect.DeepEqual(instanceGroupNames(listed), []string{"worker"}) {
++		t.Fatalf("rejected rename changed collection: names=%v err=%v", instanceGroupNames(listed), err)
++	}
++}
++
++func TestVFSInstanceGroupPatchErrors(t *testing.T) {
++	ctx, client, cluster := newInstanceGroupTestClient(t)
++	groups := client.InstanceGroupsFor(cluster)
++	if _, err := groups.Patch(ctx, "missing", types.MergePatchType, []byte(`{"metadata":{"labels":{"x":"y"}}}`), metav1.PatchOptions{}); !apierrors.IsNotFound(err) {
++		t.Fatalf("patch of missing instance group returned %v, want NotFound", err)
++	}
++	existing := &kops.InstanceGroup{ObjectMeta: metav1.ObjectMeta{Name: "worker"}, Spec: kops.InstanceGroupSpec{Role: kops.InstanceGroupRoleNode}}
++	if _, err := groups.Create(ctx, existing, metav1.CreateOptions{}); err != nil {
++		t.Fatalf("create: %v", err)
++	}
++	for _, patchType := range []types.PatchType{types.ApplyPatchType, types.StrategicMergePatchType} {
++		if _, err := groups.Patch(ctx, "worker", patchType, []byte(`{}`), metav1.PatchOptions{}); err == nil {
++			t.Fatalf("unsupported patch type %q unexpectedly succeeded", patchType)
++		}
++	}
++	if _, err := groups.Patch(ctx, "worker", types.MergePatchType, []byte(`{}`), metav1.PatchOptions{}, "status"); err == nil {
++		t.Fatal("patch subresource unexpectedly succeeded")
++	}
++}
++
++func TestVFSInstanceGroupDeleteCollectionSelectors(t *testing.T) {
++	ctx, client, cluster := newInstanceGroupTestClient(t)
++	createTestInstanceGroups(t, ctx, client, cluster)
++	groups := client.InstanceGroupsFor(cluster)
++
++	if err := groups.DeleteCollection(ctx, metav1.DeleteOptions{}, metav1.ListOptions{LabelSelector: "env=prod", FieldSelector: "metadata.name=gamma"}); err != nil {
++		t.Fatalf("delete collection: %v", err)
++	}
++	remaining, err := groups.List(ctx, metav1.ListOptions{})
++	if err != nil {
++		t.Fatalf("list after delete collection: %v", err)
++	}
++	if got, want := instanceGroupNames(remaining), []string{"alpha", "beta"}; !reflect.DeepEqual(got, want) {
++		t.Fatalf("remaining groups %v, want %v", got, want)
++	}
++	if err := groups.DeleteCollection(ctx, metav1.DeleteOptions{}, metav1.ListOptions{LabelSelector: "env=does-not-exist"}); err != nil {
++		t.Fatalf("delete collection with no matches: %v", err)
++	}
++	if _, err := groups.Get(ctx, "alpha", metav1.GetOptions{}); err != nil {
++		t.Fatalf("unmatched group was deleted: %v", err)
++	}
++	if err := groups.DeleteCollection(ctx, metav1.DeleteOptions{}, metav1.ListOptions{LabelSelector: "env in"}); err == nil {
++		t.Fatal("malformed delete selector unexpectedly succeeded")
++	}
++	if err := groups.DeleteCollection(ctx, metav1.DeleteOptions{}, metav1.ListOptions{FieldSelector: "metadata.name in (alpha)"}); err == nil {
++		t.Fatal("malformed delete field selector unexpectedly succeeded")
++	}
++	remaining, err = groups.List(ctx, metav1.ListOptions{})
++	if err != nil || !reflect.DeepEqual(instanceGroupNames(remaining), []string{"alpha", "beta"}) {
++		t.Fatalf("malformed selector changed collection: names=%v err=%v", instanceGroupNames(remaining), err)
++	}
++	if err := groups.DeleteCollection(ctx, metav1.DeleteOptions{}, metav1.ListOptions{}); err != nil {
++		t.Fatalf("delete all: %v", err)
++	}
++	remaining, err = groups.List(ctx, metav1.ListOptions{})
++	if err != nil || len(remaining.Items) != 0 {
++		t.Fatalf("delete all left names=%v err=%v", instanceGroupNames(remaining), err)
++	}
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,5 @@
++#!/bin/bash
++set -euo pipefail
++
++
++go test ./pkg/client/simple/vfsclientset -run '^Test(VFSInstanceGroup|SSHCredentialStore)' -count=1

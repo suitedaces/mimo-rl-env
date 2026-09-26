@@ -1,0 +1,5 @@
+I want notebook cell editors to support splitting the currently edited cell at the cursor. In a live notebook session, the text-editing widget should expose `action_split_cell() -> None`, and the `ctrl+backslash` key binding should invoke that action with the label "Split Cell".
+
+When the focused editor contains `alpha\nbeta\ngamma` and the cursor is immediately before `beta`, calling `action_split_cell()` should leave the current cell containing `alpha\n` and insert a new cell of the same type immediately after it containing `beta\ngamma`. When the cursor is at the start of `print(1)`, the current code cell should become empty and a new code cell immediately after it should contain `print(1)`; when the cursor is at the end of `# title`, the current markdown cell should keep `# title` and the inserted markdown cell should be empty.
+
+The inserted cell must belong to the same notebook as the original, preserve the original cell type, be mounted directly after the split cell, and be linked into the notebook's adjacent-cell ordering so navigation and later structural edits see it between the original cell and the cell that previously followed it.

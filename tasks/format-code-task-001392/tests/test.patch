@@ -1,0 +1,161 @@
+diff --git a/pkg/canary/writer/push_test.go b/pkg/canary/writer/push_test.go
+index ad9848498..49bd08c5d 100644
+--- a/pkg/canary/writer/push_test.go
++++ b/pkg/canary/writer/push_test.go
+@@ -1,6 +1,7 @@
+ package writer
+ 
+ import (
++	"crypto/tls"
+ 	"encoding/base64"
+ 	"fmt"
+ 	"math"
+@@ -42,7 +43,7 @@ func Test_Push(t *testing.T) {
+ 	defer mock.Close()
+ 
+ 	// without TLS
+-	push, err := NewPush(mock.Listener.Addr().String(), "test1", 2*time.Second, config.DefaultHTTPClientConfig, "name", "loki-canary", "stream", "stdout", nil, "", "", "", &backoff, log.NewNopLogger())
++	push, err := NewPush(mock.Listener.Addr().String(), "test1", 2*time.Second, config.DefaultHTTPClientConfig, "name", "loki-canary", "stream", "stdout", false, nil, "", "", "", &backoff, log.NewNopLogger())
+ 	require.NoError(t, err)
+ 	ts, payload := testPayload()
+ 	n, err := push.Write([]byte(payload))
+@@ -52,7 +53,7 @@ func Test_Push(t *testing.T) {
+ 	assertResponse(t, resp, false, labelSet("name", "loki-canary", "stream", "stdout"), ts, payload)
+ 
+ 	// with basic Auth
+-	push, err = NewPush(mock.Listener.Addr().String(), "test1", 2*time.Second, config.DefaultHTTPClientConfig, "name", "loki-canary", "stream", "stdout", nil, "", testUsername, testPassword, &backoff, log.NewNopLogger())
++	push, err = NewPush(mock.Listener.Addr().String(), "test1", 2*time.Second, config.DefaultHTTPClientConfig, "name", "loki-canary", "stream", "stdout", false, nil, "", testUsername, testPassword, &backoff, log.NewNopLogger())
+ 	require.NoError(t, err)
+ 	ts, payload = testPayload()
+ 	n, err = push.Write([]byte(payload))
+@@ -62,7 +63,7 @@ func Test_Push(t *testing.T) {
+ 	assertResponse(t, resp, true, labelSet("name", "loki-canary", "stream", "stdout"), ts, payload)
+ 
+ 	// with custom labels
+-	push, err = NewPush(mock.Listener.Addr().String(), "test1", 2*time.Second, config.DefaultHTTPClientConfig, "name", "loki-canary", "pod", "abc", nil, "", testUsername, testPassword, &backoff, log.NewNopLogger())
++	push, err = NewPush(mock.Listener.Addr().String(), "test1", 2*time.Second, config.DefaultHTTPClientConfig, "name", "loki-canary", "pod", "abc", false, nil, "", testUsername, testPassword, &backoff, log.NewNopLogger())
+ 	require.NoError(t, err)
+ 	ts, payload = testPayload()
+ 	n, err = push.Write([]byte(payload))
+@@ -177,3 +178,99 @@ func testPayload() (time.Time, string) {
+ 
+ 	return ts, payload
+ }
++
++
++
++
++func Test_Push_TLS_Scheme(t *testing.T) {
++	backoffCfg := backoff.Config{
++		MinBackoff: 300 * time.Millisecond,
++		MaxBackoff: 5 * time.Minute,
++		MaxRetries: 10,
++	}
++
++	addr := "loki-internal.alb:443"
++
++	cases := []struct {
++		name       string
++		useTLS     bool
++		withTLSCfg bool
++		wantScheme string
++	}{
++		{
++			name:       "useTLS=true with nil tlsCfg uses https",
++			useTLS:     true,
++			withTLSCfg: false,
++			wantScheme: "https",
++		},
++		{
++			name:       "useTLS=false with nil tlsCfg uses http",
++			useTLS:     false,
++			withTLSCfg: false,
++			wantScheme: "http",
++		},
++	}
++
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			var tlsCfg *tls.Config
++			if tc.withTLSCfg {
++				tlsCfg = &tls.Config{}
++			}
++			push, err := NewPush(
++				addr, "test1", 2*time.Second,
++				config.DefaultHTTPClientConfig,
++				"name", "loki-canary",
++				"stream", "stdout",
++				tc.useTLS,
++				tlsCfg,
++				"",
++				"", "",
++				&backoffCfg,
++				log.NewNopLogger(),
++			)
++			require.NoError(t, err)
++			require.NotNil(t, push)
++
++			wantURL := tc.wantScheme + "://" + addr + pushEndpoint
++			assert.Equal(t, wantURL, push.lokiURL,
++				"useTLS=%v should produce URL with scheme %q",
++				tc.useTLS, tc.wantScheme)
++			assert.True(t, strings.HasPrefix(push.lokiURL, tc.wantScheme+"://"),
++				"lokiURL %q should start with %q://", push.lokiURL, tc.wantScheme)
++		})
++	}
++}
++
++
++
++func Test_Push_IssueRepro_TLSTrueProducesHTTPSURL(t *testing.T) {
++	backoffCfg := backoff.Config{
++		MinBackoff: 300 * time.Millisecond,
++		MaxBackoff: 5 * time.Minute,
++		MaxRetries: 10,
++	}
++
++	push, err := NewPush(
++		"loki-internal.alb:443",
++		"",
++		10*time.Second,
++		config.DefaultHTTPClientConfig,
++		"canary-id", "canary-1234",
++		"source", "stdout",
++		true,
++		nil,
++		"",
++		"LOKI_USER", "LOKI_PASSWORD",
++		&backoffCfg,
++		log.NewNopLogger(),
++	)
++	require.NoError(t, err)
++	require.NotNil(t, push)
++
++	assert.True(t, strings.HasPrefix(push.lokiURL, "https://"),
++		"expected https URL when -tls=true was passed, got %q", push.lokiURL)
++	assert.False(t, strings.HasPrefix(push.lokiURL, "http://"),
++		"URL must NOT be http:// when -tls=true (the original bug)")
++	assert.Equal(t, "https://loki-internal.alb:443/loki/api/v1/push", push.lokiURL)
++}
+diff --git a/test_commands.json b/test_commands.json
+new file mode 100644
+index 000000000..3cc57ef89
+--- /dev/null
++++ b/test_commands.json
+@@ -0,0 +1,3 @@
++{
++  "test_commands": ["go test ./pkg/canary/writer/... -run 'Test_Push' -v"]
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,8 @@
++#!/usr/bin/env bash
++
++set -uo pipefail
++cd /testbed
++rc=0
++go test ./pkg/canary/writer/... -run 'Test_Push' -v
++rc=$(( rc | $? ))
++exit $rc

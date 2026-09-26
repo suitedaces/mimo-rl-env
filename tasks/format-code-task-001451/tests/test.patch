@@ -1,0 +1,313 @@
+diff --git a/internal/sdk/codespec_state_migration_test.go b/internal/sdk/codespec_state_migration_test.go
+new file mode 100644
+index 000000000..9c43ebc29
+--- /dev/null
++++ b/internal/sdk/codespec_state_migration_test.go
+@@ -0,0 +1,297 @@
++package sdk_test
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
++	"github.com/hashicorp/terraform-provider-azurerm/internal/sdk"
++	"github.com/hashicorp/terraform-provider-azurerm/internal/tf/pluginsdk"
++)
++
++type codespecBaseResource struct{}
++
++func (codespecBaseResource) Arguments() map[string]*schema.Schema {
++	return map[string]*schema.Schema{
++		"current_name": {
++			Type:     schema.TypeString,
++			Optional: true,
++		},
++	}
++}
++
++func (codespecBaseResource) Attributes() map[string]*schema.Schema { return nil }
++func (codespecBaseResource) ModelObject() interface{}              { return nil }
++func (codespecBaseResource) ResourceType() string                  { return "azurerm_codespec_migrating" }
++
++func codespecNoopResourceFunc() sdk.ResourceFunc {
++	return sdk.ResourceFunc{
++		Timeout: time.Minute,
++		Func: func(context.Context, sdk.ResourceMetaData) error {
++			return nil
++		},
++	}
++}
++
++func (codespecBaseResource) Create() sdk.ResourceFunc { return codespecNoopResourceFunc() }
++func (codespecBaseResource) Read() sdk.ResourceFunc   { return codespecNoopResourceFunc() }
++func (codespecBaseResource) Delete() sdk.ResourceFunc { return codespecNoopResourceFunc() }
++func (codespecBaseResource) IDValidationFunc() pluginsdk.SchemaValidateFunc {
++	return func(interface{}, string) ([]string, []error) { return nil, nil }
++}
++
++type codespecMigratingResource struct {
++	codespecBaseResource
++	version  int
++	upgrades map[int]pluginsdk.StateUpgrade
++}
++
++func (r codespecMigratingResource) SchemaVersion() int { return r.version }
++func (r codespecMigratingResource) StateUpgrades() map[int]pluginsdk.StateUpgrade {
++	return r.upgrades
++}
++
++type codespecUpgrade struct {
++	snapshot map[string]*pluginsdk.Schema
++	upgrade  pluginsdk.StateUpgraderFunc
++}
++
++func (u codespecUpgrade) Schema() map[string]*pluginsdk.Schema { return u.snapshot }
++func (u codespecUpgrade) UpgradeFunc() pluginsdk.StateUpgraderFunc {
++	return u.upgrade
++}
++
++type codespecContextKey struct{}
++
++func codespecMigrationFixture(t *testing.T) (codespecMigratingResource, []map[string]*pluginsdk.Schema, context.Context, interface{}) {
++	t.Helper()
++
++	snapshots := []map[string]*pluginsdk.Schema{
++		{
++			"legacy_name": {
++				Type:     pluginsdk.TypeString,
++				Optional: true,
++			},
++		},
++		{
++			"name": {
++				Type:     pluginsdk.TypeString,
++				Optional: true,
++			},
++		},
++	}
++
++	ctx := context.WithValue(context.Background(), codespecContextKey{}, "migration-context")
++	metadata := &struct{ marker string }{marker: "migration-metadata"}
++	checkInputs := func(ctx context.Context, meta interface{}) error {
++		if got := ctx.Value(codespecContextKey{}); got != "migration-context" {
++			return fmt.Errorf("migration context was not forwarded: %#v", got)
++		}
++		if meta != metadata {
++			return fmt.Errorf("migration metadata was not forwarded: %#v", meta)
++		}
++		return nil
++	}
++
++	return codespecMigratingResource{
++		version: 2,
++		upgrades: map[int]pluginsdk.StateUpgrade{
++			0: codespecUpgrade{
++				snapshot: snapshots[0],
++				upgrade: func(ctx context.Context, raw map[string]interface{}, meta interface{}) (map[string]interface{}, error) {
++					if err := checkInputs(ctx, meta); err != nil {
++						return nil, err
++					}
++					raw["name"] = raw["legacy_name"]
++					delete(raw, "legacy_name")
++					raw["migration_step"] = 1
++					return raw, nil
++				},
++			},
++			1: codespecUpgrade{
++				snapshot: snapshots[1],
++				upgrade: func(ctx context.Context, raw map[string]interface{}, meta interface{}) (map[string]interface{}, error) {
++					if err := checkInputs(ctx, meta); err != nil {
++						return nil, err
++					}
++					if raw["migration_step"] != 1 {
++						return nil, fmt.Errorf("second migration ran before the first: %#v", raw)
++					}
++					raw["current_name"] = strings.ToUpper(raw["name"].(string))
++					delete(raw, "name")
++					raw["migration_step"] = 2
++					return raw, nil
++				},
++			},
++		},
++	}, snapshots, ctx, metadata
++}
++
++func codespecWrap(resource sdk.Resource) (*schema.Resource, error) {
++	wrapper := sdk.NewResourceWrapper(resource)
++	return wrapper.Resource()
++}
++
++func TestCodespecTypedStateMigrationPublishesProtocolMetadata(t *testing.T) {
++	resource, snapshots, _, _ := codespecMigrationFixture(t)
++	wrapped, err := codespecWrap(resource)
++	if err != nil {
++		t.Fatalf("wrapping migrating resource: %v", err)
++	}
++
++	if got, want := wrapped.SchemaVersion, 2; got != want {
++		t.Fatalf("SchemaVersion = %d, want %d", got, want)
++	}
++	if got, want := len(wrapped.StateUpgraders), 2; got != want {
++		t.Fatalf("len(StateUpgraders) = %d, want %d", got, want)
++	}
++
++	for version, upgrader := range wrapped.StateUpgraders {
++		if got := upgrader.Version; got != version {
++			t.Errorf("StateUpgraders[%d].Version = %d, want %d", version, got, version)
++		}
++		expectedType := (&schema.Resource{Schema: snapshots[version]}).CoreConfigSchema().ImpliedType()
++		if !upgrader.Type.Equals(expectedType) {
++			t.Errorf("StateUpgraders[%d] uses the wrong snapshot type\ngot:  %s\nwant: %s", version, upgrader.Type.FriendlyName(), expectedType.FriendlyName())
++		}
++	}
++}
++
++func TestCodespecTypedStateMigrationDispatchesEachStep(t *testing.T) {
++	resource, _, ctx, metadata := codespecMigrationFixture(t)
++	wrapped, err := codespecWrap(resource)
++	if err != nil {
++		t.Fatalf("wrapping migrating resource: %v", err)
++	}
++	if len(wrapped.StateUpgraders) != 2 {
++		t.Fatalf("len(StateUpgraders) = %d, want 2", len(wrapped.StateUpgraders))
++	}
++
++	state := map[string]interface{}{"legacy_name": "mixedCase"}
++	for version, upgrader := range wrapped.StateUpgraders {
++		state, err = upgrader.Upgrade(ctx, state, metadata)
++		if err != nil {
++			t.Fatalf("running migration %d: %v", version, err)
++		}
++	}
++
++	if got, want := state["current_name"], "MIXEDCASE"; got != want {
++		t.Errorf("current_name = %#v, want %#v", got, want)
++	}
++	if got, want := state["migration_step"], 2; got != want {
++		t.Errorf("migration_step = %#v, want %#v", got, want)
++	}
++	if _, exists := state["legacy_name"]; exists {
++		t.Error("legacy_name remains after the migration chain")
++	}
++	if _, exists := state["name"]; exists {
++		t.Error("intermediate name remains after the migration chain")
++	}
++}
++
++func TestCodespecTypedStateMigrationPropagatesUpgradeErrors(t *testing.T) {
++	wantErr := errors.New("codespec migration failed")
++	resource := codespecMigratingResource{
++		version: 1,
++		upgrades: map[int]pluginsdk.StateUpgrade{
++			0: codespecUpgrade{
++				snapshot: map[string]*pluginsdk.Schema{},
++				upgrade: func(context.Context, map[string]interface{}, interface{}) (map[string]interface{}, error) {
++					return nil, wantErr
++				},
++			},
++		},
++	}
++
++	wrapped, err := codespecWrap(resource)
++	if err != nil {
++		t.Fatalf("wrapping migrating resource: %v", err)
++	}
++	if len(wrapped.StateUpgraders) != 1 {
++		t.Fatalf("len(StateUpgraders) = %d, want 1", len(wrapped.StateUpgraders))
++	}
++	_, err = wrapped.StateUpgraders[0].Upgrade(context.Background(), map[string]interface{}{}, nil)
++	if !errors.Is(err, wantErr) {
++		t.Fatalf("Upgrade error = %v, want %v", err, wantErr)
++	}
++}
++
++func TestCodespecTypedStateMigrationRejectsInvalidDeclarations(t *testing.T) {
++	validUpgrade := codespecUpgrade{
++		snapshot: map[string]*pluginsdk.Schema{},
++		upgrade: func(_ context.Context, raw map[string]interface{}, _ interface{}) (map[string]interface{}, error) {
++			return raw, nil
++		},
++	}
++
++	testCases := map[string]codespecMigratingResource{
++		"negative schema version": {
++			version: -1,
++		},
++		"missing final source version": {
++			version:  2,
++			upgrades: map[int]pluginsdk.StateUpgrade{0: validUpgrade},
++		},
++		"gap and out of range version": {
++			version:  2,
++			upgrades: map[int]pluginsdk.StateUpgrade{0: validUpgrade, 2: validUpgrade},
++		},
++		"upgrade declared for version zero": {
++			version:  0,
++			upgrades: map[int]pluginsdk.StateUpgrade{0: validUpgrade},
++		},
++		"nil upgrade": {
++			version:  1,
++			upgrades: map[int]pluginsdk.StateUpgrade{0: nil},
++		},
++	}
++
++	for name, resource := range testCases {
++		t.Run(name, func(t *testing.T) {
++			panicked := false
++			var err error
++			func() {
++				defer func() {
++					if recover() != nil {
++						panicked = true
++					}
++				}()
++				_, err = codespecWrap(resource)
++			}()
++			if panicked {
++				t.Fatal("ResourceWrapper.Resource panicked; invalid declarations must return an error")
++			}
++			if err == nil {
++				t.Fatal("ResourceWrapper.Resource accepted an invalid state migration declaration")
++			}
++		})
++	}
++}
++
++func TestCodespecTypedStateMigrationPreservesNonMigratingResources(t *testing.T) {
++	wrapped, err := codespecWrap(codespecBaseResource{})
++	if err != nil {
++		t.Fatalf("wrapping ordinary resource: %v", err)
++	}
++	if got := wrapped.SchemaVersion; got != 0 {
++		t.Fatalf("ordinary resource SchemaVersion = %d, want 0", got)
++	}
++	if got := len(wrapped.StateUpgraders); got != 0 {
++		t.Fatalf("ordinary resource has %d state upgraders, want none", got)
++	}
++
++	versionZero, err := codespecWrap(codespecMigratingResource{})
++	if err != nil {
++		t.Fatalf("wrapping an opted-in version-zero resource: %v", err)
++	}
++	if got := versionZero.SchemaVersion; got != 0 {
++		t.Fatalf("version-zero resource SchemaVersion = %d, want 0", got)
++	}
++	if got := len(versionZero.StateUpgraders); got != 0 {
++		t.Fatalf("version-zero resource has %d state upgraders, want none", got)
++	}
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,5 @@
++#!/bin/bash
++set -euo pipefail
++
++
++go test ./internal/sdk -run '^TestCodespecTypedStateMigration' -count=1

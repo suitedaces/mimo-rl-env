@@ -1,0 +1,220 @@
+diff --git a/openapi3filter/zip_body_decoder_test.go b/openapi3filter/zip_body_decoder_test.go
+new file mode 100644
+index 0000000..169f2e8
+--- /dev/null
++++ b/openapi3filter/zip_body_decoder_test.go
+@@ -0,0 +1,187 @@
++package openapi3filter_test
++
++import (
++	"archive/zip"
++	"bytes"
++	"context"
++	"fmt"
++	"net/http"
++	"strings"
++	"testing"
++
++	"github.com/stretchr/testify/require"
++
++	"github.com/getkin/kin-openapi/openapi3"
++	"github.com/getkin/kin-openapi/openapi3filter"
++	"github.com/getkin/kin-openapi/routers/gorillamux"
++)
++
++type zipEntry struct {
++	Name string
++	Body string
++}
++
++func TestValidateApplicationZipRequestBodyUsesDefaultDecoder(t *testing.T) {
++	body := makeZipArchive(t, zipEntry{Name: "entry.txt", Body: "alpha-one"})
++
++	err := validateZipRequestBody(t, `pattern: "^alpha-"`, body)
++	require.NoError(t, err)
++}
++
++func TestValidateApplicationZipRequestBodyUsesDecodedFileContent(t *testing.T) {
++	tests := []struct {
++		name           string
++		schemaFragment string
++		entries        []zipEntry
++		wantErr        bool
++	}{
++		{
++			name:           "alpha content matches alpha schema",
++			schemaFragment: `pattern: "^alpha-"`,
++			entries:        []zipEntry{{Name: "alpha.txt", Body: "alpha-two"}},
++		},
++		{
++			name:           "beta content matches beta schema",
++			schemaFragment: `pattern: "^beta-"`,
++			entries:        []zipEntry{{Name: "beta.txt", Body: "beta-three"}},
++		},
++		{
++			name:           "decoded content is still schema validated",
++			schemaFragment: `pattern: "^beta-"`,
++			entries:        []zipEntry{{Name: "gamma.txt", Body: "gamma-four"}},
++			wantErr:        true,
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			body := makeZipArchive(t, tt.entries...)
++
++			err := validateZipRequestBody(t, tt.schemaFragment, body)
++			if tt.wantErr {
++				require.Error(t, err)
++				return
++			}
++			require.NoError(t, err)
++		})
++	}
++}
++
++func TestZipFileBodyDecoderReadsArchiveContent(t *testing.T) {
++	body := makeZipArchive(t,
++		zipEntry{Name: "first.txt", Body: "first-token"},
++		zipEntry{Name: "second.txt", Body: "second-token"},
++	)
++
++	value, err := openapi3filter.ZipFileBodyDecoder(bytes.NewReader(body), nil, nil, nil)
++	require.NoError(t, err)
++
++	decoded, ok := value.(string)
++	require.True(t, ok, "decoded zip body should be a string")
++	require.Contains(t, decoded, "first-token")
++	require.Contains(t, decoded, "second-token")
++}
++
++func TestInvalidApplicationZipBodyFailsAsZipDecodeError(t *testing.T) {
++	tests := [][]byte{
++		[]byte("not a zip archive"),
++		{0x50, 0x4b, 0x03, 0x04, 0x01},
++	}
++
++	for _, body := range tests {
++		err := validateZipRequestBody(t, `minLength: 1`, body)
++		require.Error(t, err)
++		requireNotUnsupportedZipDecoderError(t, err)
++
++		_, err = openapi3filter.ZipFileBodyDecoder(bytes.NewReader(body), nil, nil, nil)
++		require.Error(t, err)
++	}
++}
++
++func requireNotUnsupportedZipDecoderError(t *testing.T, err error) {
++	t.Helper()
++
++	msg := strings.ToLower(err.Error())
++	require.NotContains(t, msg, "no body decoder")
++	require.False(t,
++		strings.Contains(msg, "unsupported") &&
++			(strings.Contains(msg, "application/zip") ||
++				strings.Contains(msg, "content type") ||
++				strings.Contains(msg, "media type") ||
++				strings.Contains(msg, "decoder")),
++		"error should come from zip decoding, not unsupported application/zip attribution: %v", err)
++	require.False(t,
++		strings.Contains(msg, "missing") && strings.Contains(msg, "decoder"),
++		"error should come from zip decoding, not a missing decoder: %v", err)
++}
++
++func validateZipRequestBody(t *testing.T, schemaFragment string, body []byte) error {
++	t.Helper()
++
++	spec := fmt.Sprintf(`
++openapi: 3.0.0
++info:
++  title: 'Validator'
++  version: 0.0.1
++paths:
++  /zip:
++    post:
++      requestBody:
++        required: true
++        content:
++          application/zip:
++            schema:
++              type: string
++              %s
++      responses:
++        '200':
++          description: OK
++`, schemaFragment)
++
++	loader := openapi3.NewLoader()
++	doc, err := loader.LoadFromData([]byte(spec))
++	require.NoError(t, err)
++	require.NoError(t, doc.Validate(loader.Context))
++
++	router, err := gorillamux.NewRouter(doc)
++	require.NoError(t, err)
++
++	req := newZipRequest(t, body)
++
++	route, pathParams, err := router.FindRoute(req)
++	require.NoError(t, err)
++
++	return openapi3filter.ValidateRequestBody(
++		context.Background(),
++		&openapi3filter.RequestValidationInput{
++			Request:    req,
++			PathParams: pathParams,
++			Route:      route,
++		},
++		route.Operation.RequestBody.Value,
++	)
++}
++
++func newZipRequest(t *testing.T, body []byte) *http.Request {
++	t.Helper()
++
++	req, err := http.NewRequest(http.MethodPost, "/zip", bytes.NewReader(body))
++	require.NoError(t, err)
++	req.Header.Set("Content-Type", "application/zip")
++	return req
++}
++
++func makeZipArchive(t *testing.T, entries ...zipEntry) []byte {
++	t.Helper()
++
++	var body bytes.Buffer
++	zw := zip.NewWriter(&body)
++	for _, entry := range entries {
++		w, err := zw.Create(entry.Name)
++		require.NoError(t, err)
++		_, err = w.Write([]byte(entry.Body))
++		require.NoError(t, err)
++	}
++	require.NoError(t, zw.Close())
++	return body.Bytes()
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,22 @@
++#!/bin/bash
++set -uo pipefail
++cd /testbed
++
++
++
++
++
++new_tests='TestValidateApplicationZipRequestBodyUsesDefaultDecoder|TestValidateApplicationZipRequestBodyUsesDecodedFileContent|TestZipFileBodyDecoderReadsArchiveContent|TestInvalidApplicationZipBodyFailsAsZipDecodeError'
++
++case "${1:-}" in
++  base)
++    go test ./openapi3filter/ -run 'TestValidate(ZipFileUpload|Request|Response|Parameter|Security|Callback|PathItem|Multipart|SetDefault|Issue|OneOf|AnyOf|AllOf|ReadOnly|WriteOnly|Examples|RequestBody|ResponseBody)|TestRegisterAndUnregisterBodyDecoder' -skip "$new_tests" -v
++    ;;
++  new)
++    go test ./openapi3filter/ -run "^(${new_tests})$" -count=1 -v
++    ;;
++  *)
++    echo "usage: $0 base|new"
++    exit 2
++    ;;
++esac

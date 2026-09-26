@@ -1,0 +1,698 @@
+diff --git a/pkg/configauditreport/scanner_owner_test.go b/pkg/configauditreport/scanner_owner_test.go
+new file mode 100644
+index 0000000..bb7d800
+--- /dev/null
++++ b/pkg/configauditreport/scanner_owner_test.go
+@@ -0,0 +1,146 @@
++package configauditreport_test
++
++import (
++	"context"
++	"errors"
++	"io"
++	"testing"
++
++	"github.com/aquasecurity/starboard/pkg/apis/aquasecurity/v1alpha1"
++	"github.com/aquasecurity/starboard/pkg/configauditreport"
++	"github.com/aquasecurity/starboard/pkg/kube"
++	"github.com/aquasecurity/starboard/pkg/starboard"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++	appsv1 "k8s.io/api/apps/v1"
++	corev1 "k8s.io/api/core/v1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/types"
++	k8sfake "k8s.io/client-go/kubernetes/fake"
++	"k8s.io/utils/pointer"
++	"sigs.k8s.io/controller-runtime/pkg/client"
++	ctrlfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
++)
++
++func TestConfigAuditScannerScanResolvesDeploymentOwnerBeforeBuildingScanJob(t *testing.T) {
++	deploy := scannerOwnerDeployment("config-owner", corev1.NamespaceDefault, "7")
++	activeRS := scannerOwnerReplicaSet("config-owner-rs", corev1.NamespaceDefault, "7")
++	kubeClient := ctrlfake.NewClientBuilder().
++		WithScheme(starboard.NewScheme()).
++		WithObjects(deploy, activeRS).
++		Build()
++	plugin := &recordingConfigAuditPlugin{err: errors.New("stop before running scan job")}
++	pluginContext := starboard.NewPluginContext().
++		WithName("owner-test").
++		WithNamespace(starboard.NamespaceName).
++		WithClient(kubeClient).
++		WithServiceAccountName(starboard.ServiceAccountName).
++		Get()
++	scanner := configauditreport.NewScanner(
++		k8sfake.NewSimpleClientset(),
++		kubeClient,
++		plugin,
++		pluginContext,
++		starboard.ConfigData{},
++		kube.ScannerOpts{},
++	)
++
++	_, err := scanner.Scan(context.Background(), kube.Object{
++		Kind:      kube.KindDeployment,
++		Name:      deploy.Name,
++		Namespace: deploy.Namespace,
++	})
++
++	require.Error(t, err)
++	require.NotNil(t, plugin.seenObject)
++	assert.Equal(t, string(kube.KindReplicaSet), plugin.seenObject.GetObjectKind().GroupVersionKind().Kind)
++	assert.Equal(t, activeRS.Name, plugin.seenObject.GetName())
++	assert.Equal(t, activeRS.Namespace, plugin.seenObject.GetNamespace())
++}
++
++type recordingConfigAuditPlugin struct {
++	seenObject client.Object
++	err        error
++}
++
++func (p *recordingConfigAuditPlugin) Init(_ starboard.PluginContext) error {
++	return nil
++}
++
++func (p *recordingConfigAuditPlugin) GetScanJobSpec(_ starboard.PluginContext, obj client.Object) (corev1.PodSpec, []*corev1.Secret, error) {
++	p.seenObject = obj
++	return corev1.PodSpec{}, nil, p.err
++}
++
++func (p *recordingConfigAuditPlugin) ParseConfigAuditReportData(_ starboard.PluginContext, _ io.ReadCloser) (v1alpha1.ConfigAuditReportData, error) {
++	return v1alpha1.ConfigAuditReportData{}, nil
++}
++
++func (p *recordingConfigAuditPlugin) GetContainerName() string {
++	return "scanner"
++}
++
++func (p *recordingConfigAuditPlugin) GetConfigHash(_ starboard.PluginContext) (string, error) {
++	return "plugin-config", nil
++}
++
++func (p *recordingConfigAuditPlugin) SupportsKind(kind kube.Kind) bool {
++	return kind == kube.KindDeployment
++}
++
++func (p *recordingConfigAuditPlugin) IsReady(_ starboard.PluginContext) (bool, error) {
++	return true, nil
++}
++
++func scannerOwnerDeployment(name, namespace, revision string) *appsv1.Deployment {
++	labels := map[string]string{"app": name}
++	return &appsv1.Deployment{
++		TypeMeta: metav1.TypeMeta{APIVersion: "apps/v1", Kind: "Deployment"},
++		ObjectMeta: metav1.ObjectMeta{
++			Name:      name,
++			Namespace: namespace,
++			UID:       types.UID(name + "-uid"),
++			Labels:    labels,
++			Annotations: map[string]string{
++				"deployment.kubernetes.io/revision": revision,
++			},
++		},
++		Spec: appsv1.DeploymentSpec{
++			Selector: &metav1.LabelSelector{MatchLabels: labels},
++			Template: corev1.PodTemplateSpec{
++				ObjectMeta: metav1.ObjectMeta{Labels: labels},
++				Spec: corev1.PodSpec{Containers: []corev1.Container{{
++					Name:  "app",
++					Image: "nginx:1.16",
++				}}},
++			},
++		},
++	}
++}
++
++func scannerOwnerReplicaSet(name, namespace, revision string) *appsv1.ReplicaSet {
++	labels := map[string]string{"app": "config-owner"}
++	return &appsv1.ReplicaSet{
++		TypeMeta: metav1.TypeMeta{APIVersion: "apps/v1", Kind: "ReplicaSet"},
++		ObjectMeta: metav1.ObjectMeta{
++			Name:      name,
++			Namespace: namespace,
++			UID:       types.UID(name + "-uid"),
++			Labels:    labels,
++			Annotations: map[string]string{
++				"deployment.kubernetes.io/revision": revision,
++			},
++		},
++		Spec: appsv1.ReplicaSetSpec{
++			Replicas: pointer.Int32Ptr(1),
++			Selector: &metav1.LabelSelector{MatchLabels: labels},
++			Template: corev1.PodTemplateSpec{
++				ObjectMeta: metav1.ObjectMeta{Labels: labels},
++				Spec: corev1.PodSpec{Containers: []corev1.Container{{
++					Name:  "app",
++					Image: "nginx:1.16",
++				}}},
++			},
++		},
++	}
++}
+diff --git a/pkg/vulnerabilityreport/scanner_owner_chains_test.go b/pkg/vulnerabilityreport/scanner_owner_chains_test.go
+new file mode 100644
+index 0000000..a36f567
+--- /dev/null
++++ b/pkg/vulnerabilityreport/scanner_owner_chains_test.go
+@@ -0,0 +1,358 @@
++package vulnerabilityreport_test
++
++import (
++	"context"
++	"errors"
++	"io"
++	"testing"
++
++	"github.com/aquasecurity/starboard/pkg/apis/aquasecurity/v1alpha1"
++	"github.com/aquasecurity/starboard/pkg/docker"
++	"github.com/aquasecurity/starboard/pkg/kube"
++	"github.com/aquasecurity/starboard/pkg/starboard"
++	"github.com/aquasecurity/starboard/pkg/vulnerabilityreport"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++	appsv1 "k8s.io/api/apps/v1"
++	batchv1 "k8s.io/api/batch/v1"
++	batchv1beta1 "k8s.io/api/batch/v1beta1"
++	corev1 "k8s.io/api/core/v1"
++	apierrors "k8s.io/apimachinery/pkg/api/errors"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/runtime"
++	"k8s.io/apimachinery/pkg/types"
++	k8sfake "k8s.io/client-go/kubernetes/fake"
++	k8stesting "k8s.io/client-go/testing"
++	"k8s.io/utils/pointer"
++	ctrlfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
++)
++
++func TestVulnerabilityScannerScanUsesExpectedOwnersThroughControllerChains(t *testing.T) {
++	ctx := context.Background()
++	namespace := corev1.NamespaceDefault
++	deploy := vulnerabilityChainDeployment("frontend", namespace, "2")
++	staleRS := vulnerabilityChainReplicaSet("frontend-rs-old", namespace, "1", map[string]string{"app": deploy.Name})
++	activeRS := vulnerabilityChainReplicaSet("frontend-rs-current", namespace, "2", map[string]string{"app": deploy.Name})
++	unrelatedRS := vulnerabilityChainReplicaSet("aaa-unrelated-rs-current", namespace, "2", map[string]string{"app": "unrelated"})
++	replicaSetPod := vulnerabilityChainPod("frontend-pod", namespace)
++	replicaSetPod.OwnerReferences = []metav1.OwnerReference{vulnerabilityChainControllerRef("apps/v1", "ReplicaSet", activeRS.Name, activeRS.UID)}
++
++	cronJob := vulnerabilityChainCronJob("nightly", namespace)
++	cronOwnedJob := vulnerabilityChainJob("nightly-123", namespace)
++	cronOwnedJob.OwnerReferences = []metav1.OwnerReference{vulnerabilityChainControllerRef("batch/v1beta1", "CronJob", cronJob.Name, cronJob.UID)}
++	jobPod := vulnerabilityChainPod("nightly-pod", namespace)
++	jobPod.OwnerReferences = []metav1.OwnerReference{vulnerabilityChainControllerRef("batch/v1", "Job", cronOwnedJob.Name, cronOwnedJob.UID)}
++
++	unmanagedJob := vulnerabilityChainJob("manual-job", namespace)
++	unmanagedJobPod := vulnerabilityChainPod("manual-job-pod", namespace)
++	unmanagedJobPod.OwnerReferences = []metav1.OwnerReference{vulnerabilityChainControllerRef("batch/v1", "Job", unmanagedJob.Name, unmanagedJob.UID)}
++
++	unmanagedPod := vulnerabilityChainPod("bare-pod", namespace)
++	customControlledPod := vulnerabilityChainPod("custom-controller-pod", namespace)
++	customControlledPod.OwnerReferences = []metav1.OwnerReference{
++		vulnerabilityChainControllerRef("example.test/v1", "TrainingJob", "custom-owner", types.UID("custom-owner-uid")),
++	}
++
++	testCases := []struct {
++		name         string
++		workload     kube.Object
++		expectedKind string
++		expectedName string
++	}{
++		{
++			name:         "Deployment scan is reported against active ReplicaSet",
++			workload:     kube.Object{Kind: kube.KindDeployment, Name: deploy.Name, Namespace: namespace},
++			expectedKind: string(kube.KindReplicaSet),
++			expectedName: activeRS.Name,
++		},
++		{
++			name:         "ReplicaSet-controlled Pod scan is reported against ReplicaSet",
++			workload:     kube.Object{Kind: kube.KindPod, Name: replicaSetPod.Name, Namespace: namespace},
++			expectedKind: string(kube.KindReplicaSet),
++			expectedName: activeRS.Name,
++		},
++		{
++			name:         "Pod scan through CronJob-owned Job is reported against CronJob",
++			workload:     kube.Object{Kind: kube.KindPod, Name: jobPod.Name, Namespace: namespace},
++			expectedKind: string(kube.KindCronJob),
++			expectedName: cronJob.Name,
++		},
++		{
++			name:         "Job scan through CronJob owner is reported against CronJob",
++			workload:     kube.Object{Kind: kube.KindJob, Name: cronOwnedJob.Name, Namespace: namespace},
++			expectedKind: string(kube.KindCronJob),
++			expectedName: cronJob.Name,
++		},
++		{
++			name:         "Pod scan through unmanaged Job is reported against Job",
++			workload:     kube.Object{Kind: kube.KindPod, Name: unmanagedJobPod.Name, Namespace: namespace},
++			expectedKind: string(kube.KindJob),
++			expectedName: unmanagedJob.Name,
++		},
++		{
++			name:         "unmanaged Pod scan remains reported against Pod",
++			workload:     kube.Object{Kind: kube.KindPod, Name: unmanagedPod.Name, Namespace: namespace},
++			expectedKind: string(kube.KindPod),
++			expectedName: unmanagedPod.Name,
++		},
++		{
++			name:         "custom-controlled Pod scan remains reported against Pod",
++			workload:     kube.Object{Kind: kube.KindPod, Name: customControlledPod.Name, Namespace: namespace},
++			expectedKind: string(kube.KindPod),
++			expectedName: customControlledPod.Name,
++		},
++	}
++
++	for _, tc := range testCases {
++		t.Run(tc.name, func(t *testing.T) {
++			scanner, capturedJob := newCapturingVulnerabilityScanner(t,
++				deploy,
++				staleRS,
++				activeRS,
++				unrelatedRS,
++				replicaSetPod,
++				cronJob,
++				cronOwnedJob,
++				jobPod,
++				unmanagedJob,
++				unmanagedJobPod,
++				unmanagedPod,
++				customControlledPod,
++				&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: namespace}},
++			)
++
++			_, err := scanner.Scan(ctx, tc.workload)
++
++			require.Error(t, err)
++			require.NotNil(t, *capturedJob)
++			assert.Equal(t, tc.expectedKind, (*capturedJob).Labels[starboard.LabelResourceKind])
++			assert.Equal(t, tc.expectedName, (*capturedJob).Labels[starboard.LabelResourceName])
++			assert.Equal(t, namespace, (*capturedJob).Labels[starboard.LabelResourceNamespace])
++		})
++	}
++}
++
++func TestVulnerabilityScannerScanFailsWhenDeploymentActiveChildIsMissing(t *testing.T) {
++	namespace := corev1.NamespaceDefault
++	deploy := vulnerabilityChainDeployment("missing-child", namespace, "99")
++	staleChild := vulnerabilityChainReplicaSet("missing-child-old", namespace, "1", map[string]string{"app": deploy.Name})
++	scanner, capturedJob := newCapturingVulnerabilityScanner(t, deploy, staleChild,
++		&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: namespace}},
++	)
++
++	reports, err := scanner.Scan(context.Background(), kube.Object{
++		Kind:      kube.KindDeployment,
++		Name:      deploy.Name,
++		Namespace: namespace,
++	})
++
++	require.Error(t, err)
++	assert.Empty(t, reports)
++	assert.Nil(t, *capturedJob)
++}
++
++func TestVulnerabilityScannerScanUnsupportedWorkloadKindFailsClearly(t *testing.T) {
++	namespace := corev1.NamespaceDefault
++	configMap := &corev1.ConfigMap{
++		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "ConfigMap"},
++		ObjectMeta: metav1.ObjectMeta{
++			Name:      "not-a-workload",
++			Namespace: namespace,
++		},
++	}
++	scanner, capturedJob := newCapturingVulnerabilityScanner(t, configMap)
++
++	reports, err := scanner.Scan(context.Background(), kube.Object{
++		Kind:      kube.KindConfigMap,
++		Name:      configMap.Name,
++		Namespace: namespace,
++	})
++
++	require.Error(t, err)
++	assert.Empty(t, reports)
++	assert.Nil(t, *capturedJob)
++	assert.NotEmpty(t, err.Error())
++}
++
++func newCapturingVulnerabilityScanner(t *testing.T, objects ...runtime.Object) (*vulnerabilityreport.Scanner, **batchv1.Job) {
++	t.Helper()
++	kubeClient := ctrlfake.NewClientBuilder().
++		WithScheme(starboard.NewScheme()).
++		WithRuntimeObjects(objects...).
++		Build()
++	clientset := k8sfake.NewSimpleClientset()
++	var createdJob *batchv1.Job
++	clientset.PrependReactor("create", "jobs", func(action k8stesting.Action) (bool, runtime.Object, error) {
++		createAction, ok := action.(k8stesting.CreateAction)
++		require.True(t, ok)
++		job, ok := createAction.GetObject().(*batchv1.Job)
++		require.True(t, ok)
++		createdJob = job.DeepCopy()
++		return true, nil, apierrors.NewInternalError(errors.New("stop after capturing scan job"))
++	})
++
++	pluginContext := starboard.NewPluginContext().
++		WithName("owner-test").
++		WithNamespace(starboard.NamespaceName).
++		WithClient(kubeClient).
++		WithServiceAccountName(starboard.ServiceAccountName).
++		Get()
++	scanner := vulnerabilityreport.NewScanner(
++		clientset,
++		kubeClient,
++		&chainVulnerabilityPlugin{},
++		pluginContext,
++		starboard.ConfigData{},
++		kube.ScannerOpts{},
++	)
++	return scanner, &createdJob
++}
++
++type chainVulnerabilityPlugin struct{}
++
++func (p *chainVulnerabilityPlugin) Init(_ starboard.PluginContext) error {
++	return nil
++}
++
++func (p *chainVulnerabilityPlugin) GetScanJobSpec(_ starboard.PluginContext, _ corev1.PodSpec, _ map[string]docker.Auth) (corev1.PodSpec, []*corev1.Secret, error) {
++	return corev1.PodSpec{
++		RestartPolicy: corev1.RestartPolicyNever,
++		Containers: []corev1.Container{{
++			Name:  "scanner",
++			Image: "scanner:latest",
++		}},
++	}, nil, nil
++}
++
++func (p *chainVulnerabilityPlugin) ParseVulnerabilityReportData(_ starboard.PluginContext, _ string, _ io.ReadCloser) (v1alpha1.VulnerabilityReportData, error) {
++	return v1alpha1.VulnerabilityReportData{}, nil
++}
++
++func vulnerabilityChainDeployment(name, namespace, revision string) *appsv1.Deployment {
++	labels := map[string]string{"app": name}
++	return &appsv1.Deployment{
++		TypeMeta: metav1.TypeMeta{APIVersion: "apps/v1", Kind: "Deployment"},
++		ObjectMeta: metav1.ObjectMeta{
++			Name:      name,
++			Namespace: namespace,
++			UID:       types.UID(name + "-uid"),
++			Labels:    labels,
++			Annotations: map[string]string{
++				"deployment.kubernetes.io/revision": revision,
++			},
++		},
++		Spec: appsv1.DeploymentSpec{
++			Selector: &metav1.LabelSelector{MatchLabels: labels},
++			Template: corev1.PodTemplateSpec{
++				ObjectMeta: metav1.ObjectMeta{Labels: labels},
++				Spec: corev1.PodSpec{Containers: []corev1.Container{{
++					Name:  "app",
++					Image: "nginx:1.16",
++				}}},
++			},
++		},
++	}
++}
++
++func vulnerabilityChainReplicaSet(name, namespace, revision string, labels map[string]string) *appsv1.ReplicaSet {
++	return &appsv1.ReplicaSet{
++		TypeMeta: metav1.TypeMeta{APIVersion: "apps/v1", Kind: "ReplicaSet"},
++		ObjectMeta: metav1.ObjectMeta{
++			Name:      name,
++			Namespace: namespace,
++			UID:       types.UID(name + "-uid"),
++			Labels:    labels,
++			Annotations: map[string]string{
++				"deployment.kubernetes.io/revision": revision,
++			},
++		},
++		Spec: appsv1.ReplicaSetSpec{
++			Replicas: pointer.Int32Ptr(1),
++			Selector: &metav1.LabelSelector{MatchLabels: labels},
++			Template: corev1.PodTemplateSpec{
++				ObjectMeta: metav1.ObjectMeta{Labels: labels},
++				Spec: corev1.PodSpec{Containers: []corev1.Container{{
++					Name:  "app",
++					Image: "nginx:1.16",
++				}}},
++			},
++		},
++	}
++}
++
++func vulnerabilityChainPod(name, namespace string) *corev1.Pod {
++	return &corev1.Pod{
++		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Pod"},
++		ObjectMeta: metav1.ObjectMeta{
++			Name:      name,
++			Namespace: namespace,
++			UID:       types.UID(name + "-uid"),
++		},
++		Spec: corev1.PodSpec{
++			RestartPolicy: corev1.RestartPolicyNever,
++			Containers: []corev1.Container{{
++				Name:  "app",
++				Image: "busybox:1.35",
++			}},
++		},
++	}
++}
++
++func vulnerabilityChainJob(name, namespace string) *batchv1.Job {
++	return &batchv1.Job{
++		TypeMeta: metav1.TypeMeta{APIVersion: "batch/v1", Kind: "Job"},
++		ObjectMeta: metav1.ObjectMeta{
++			Name:      name,
++			Namespace: namespace,
++			UID:       types.UID(name + "-uid"),
++		},
++		Spec: batchv1.JobSpec{
++			Template: corev1.PodTemplateSpec{
++				Spec: corev1.PodSpec{
++					RestartPolicy: corev1.RestartPolicyNever,
++					Containers: []corev1.Container{{
++						Name:  "app",
++						Image: "busybox:1.35",
++					}},
++				},
++			},
++		},
++	}
++}
++
++func vulnerabilityChainCronJob(name, namespace string) *batchv1beta1.CronJob {
++	return &batchv1beta1.CronJob{
++		TypeMeta: metav1.TypeMeta{APIVersion: "batch/v1beta1", Kind: "CronJob"},
++		ObjectMeta: metav1.ObjectMeta{
++			Name:      name,
++			Namespace: namespace,
++			UID:       types.UID(name + "-uid"),
++		},
++		Spec: batchv1beta1.CronJobSpec{
++			Schedule: "*/5 * * * *",
++			JobTemplate: batchv1beta1.JobTemplateSpec{
++				Spec: batchv1.JobSpec{
++					Template: corev1.PodTemplateSpec{
++						Spec: corev1.PodSpec{
++							RestartPolicy: corev1.RestartPolicyNever,
++							Containers: []corev1.Container{{
++								Name:  "app",
++								Image: "busybox:1.35",
++							}},
++						},
++					},
++				},
++			},
++		},
++	}
++}
++
++func vulnerabilityChainControllerRef(apiVersion, kind, name string, uid types.UID) metav1.OwnerReference {
++	return metav1.OwnerReference{
++		APIVersion: apiVersion,
++		Kind:       kind,
++		Name:       name,
++		UID:        uid,
++		Controller: pointer.BoolPtr(true),
++	}
++}
+diff --git a/pkg/vulnerabilityreport/scanner_owner_test.go b/pkg/vulnerabilityreport/scanner_owner_test.go
+new file mode 100644
+index 0000000..c35d31a
+--- /dev/null
++++ b/pkg/vulnerabilityreport/scanner_owner_test.go
+@@ -0,0 +1,151 @@
++package vulnerabilityreport_test
++
++import (
++	"context"
++	"errors"
++	"io"
++	"testing"
++
++	"github.com/aquasecurity/starboard/pkg/apis/aquasecurity/v1alpha1"
++	"github.com/aquasecurity/starboard/pkg/docker"
++	"github.com/aquasecurity/starboard/pkg/kube"
++	"github.com/aquasecurity/starboard/pkg/starboard"
++	"github.com/aquasecurity/starboard/pkg/vulnerabilityreport"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++	appsv1 "k8s.io/api/apps/v1"
++	batchv1 "k8s.io/api/batch/v1"
++	corev1 "k8s.io/api/core/v1"
++	apierrors "k8s.io/apimachinery/pkg/api/errors"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/runtime"
++	"k8s.io/apimachinery/pkg/types"
++	k8sfake "k8s.io/client-go/kubernetes/fake"
++	k8stesting "k8s.io/client-go/testing"
++	"k8s.io/utils/pointer"
++	ctrlfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
++)
++
++func TestVulnerabilityScannerScanUsesResolvedOwnerForScanJobLabels(t *testing.T) {
++	deploy := vulnerabilityOwnerDeployment("vuln-owner", corev1.NamespaceDefault, "4")
++	activeRS := vulnerabilityOwnerReplicaSet("vuln-owner-rs", corev1.NamespaceDefault, "4")
++	kubeClient := ctrlfake.NewClientBuilder().
++		WithScheme(starboard.NewScheme()).
++		WithObjects(deploy, activeRS, &corev1.ServiceAccount{
++			ObjectMeta: metav1.ObjectMeta{
++				Name:      "default",
++				Namespace: deploy.Namespace,
++			},
++		}).
++		Build()
++	clientset := k8sfake.NewSimpleClientset()
++	var createdJob *batchv1.Job
++	clientset.PrependReactor("create", "jobs", func(action k8stesting.Action) (bool, runtime.Object, error) {
++		createAction, ok := action.(k8stesting.CreateAction)
++		require.True(t, ok)
++		job, ok := createAction.GetObject().(*batchv1.Job)
++		require.True(t, ok)
++		createdJob = job.DeepCopy()
++		return true, nil, apierrors.NewInternalError(errors.New("stop after capturing scan job"))
++	})
++
++	pluginContext := starboard.NewPluginContext().
++		WithName("owner-test").
++		WithNamespace(starboard.NamespaceName).
++		WithClient(kubeClient).
++		WithServiceAccountName(starboard.ServiceAccountName).
++		Get()
++	scanner := vulnerabilityreport.NewScanner(
++		clientset,
++		kubeClient,
++		&minimalVulnerabilityPlugin{},
++		pluginContext,
++		starboard.ConfigData{},
++		kube.ScannerOpts{},
++	)
++
++	_, err := scanner.Scan(context.Background(), kube.Object{
++		Kind:      kube.KindDeployment,
++		Name:      deploy.Name,
++		Namespace: deploy.Namespace,
++	})
++
++	require.Error(t, err)
++	require.NotNil(t, createdJob)
++	assert.Equal(t, string(kube.KindReplicaSet), createdJob.Labels[starboard.LabelResourceKind])
++	assert.Equal(t, activeRS.Name, createdJob.Labels[starboard.LabelResourceName])
++	assert.Equal(t, activeRS.Namespace, createdJob.Labels[starboard.LabelResourceNamespace])
++}
++
++type minimalVulnerabilityPlugin struct{}
++
++func (p *minimalVulnerabilityPlugin) Init(_ starboard.PluginContext) error {
++	return nil
++}
++
++func (p *minimalVulnerabilityPlugin) GetScanJobSpec(_ starboard.PluginContext, _ corev1.PodSpec, _ map[string]docker.Auth) (corev1.PodSpec, []*corev1.Secret, error) {
++	return corev1.PodSpec{
++		RestartPolicy: corev1.RestartPolicyNever,
++		Containers: []corev1.Container{{
++			Name:  "scanner",
++			Image: "scanner:latest",
++		}},
++	}, nil, nil
++}
++
++func (p *minimalVulnerabilityPlugin) ParseVulnerabilityReportData(_ starboard.PluginContext, _ string, _ io.ReadCloser) (v1alpha1.VulnerabilityReportData, error) {
++	return v1alpha1.VulnerabilityReportData{}, nil
++}
++
++func vulnerabilityOwnerDeployment(name, namespace, revision string) *appsv1.Deployment {
++	labels := map[string]string{"app": name}
++	return &appsv1.Deployment{
++		TypeMeta: metav1.TypeMeta{APIVersion: "apps/v1", Kind: "Deployment"},
++		ObjectMeta: metav1.ObjectMeta{
++			Name:      name,
++			Namespace: namespace,
++			UID:       types.UID(name + "-uid"),
++			Labels:    labels,
++			Annotations: map[string]string{
++				"deployment.kubernetes.io/revision": revision,
++			},
++		},
++		Spec: appsv1.DeploymentSpec{
++			Selector: &metav1.LabelSelector{MatchLabels: labels},
++			Template: corev1.PodTemplateSpec{
++				ObjectMeta: metav1.ObjectMeta{Labels: labels},
++				Spec: corev1.PodSpec{Containers: []corev1.Container{{
++					Name:  "app",
++					Image: "nginx:1.16",
++				}}},
++			},
++		},
++	}
++}
++
++func vulnerabilityOwnerReplicaSet(name, namespace, revision string) *appsv1.ReplicaSet {
++	labels := map[string]string{"app": "vuln-owner"}
++	return &appsv1.ReplicaSet{
++		TypeMeta: metav1.TypeMeta{APIVersion: "apps/v1", Kind: "ReplicaSet"},
++		ObjectMeta: metav1.ObjectMeta{
++			Name:      name,
++			Namespace: namespace,
++			UID:       types.UID(name + "-uid"),
++			Labels:    labels,
++			Annotations: map[string]string{
++				"deployment.kubernetes.io/revision": revision,
++			},
++		},
++		Spec: appsv1.ReplicaSetSpec{
++			Replicas: pointer.Int32Ptr(1),
++			Selector: &metav1.LabelSelector{MatchLabels: labels},
++			Template: corev1.PodTemplateSpec{
++				ObjectMeta: metav1.ObjectMeta{Labels: labels},
++				Spec: corev1.PodSpec{Containers: []corev1.Container{{
++					Name:  "app",
++					Image: "nginx:1.16",
++				}}},
++			},
++		},
++	}
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,20 @@
++#!/usr/bin/env bash
++set -euo pipefail
++cd /testbed
++
++
++
++
++case "${1:-}" in
++  base)
++    go test -v -count=1 ./pkg/kube/ -run '^(TestIsBuiltInWorkload|TestObjectFromLabelsSet|TestContainerImages_AsJSON_And_FromJSON|TestGetPartialObjectFromKindAndNamespacedName|TestGetPodSpec|TestObjectResolver_GetRelatedReplicasetName|TestPartialObjectFromObjectMetadata)$'
++    go test -v -short -count=1 ./itest/starboard/
++    ;;
++  new)
++    go test -v -count=1 ./pkg/kube ./pkg/configauditreport ./pkg/vulnerabilityreport -run 'TestObjectResolver_ReportOwner|TestConfigAuditScannerScanResolvesDeploymentOwnerBeforeBuildingScanJob|TestVulnerabilityScannerScanUsesResolvedOwnerForScanJobLabels'
++    ;;
++  *)
++    echo "usage: $0 base|new"
++    exit 2
++    ;;
++esac

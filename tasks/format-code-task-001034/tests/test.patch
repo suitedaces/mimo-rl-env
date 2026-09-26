@@ -1,0 +1,124 @@
+diff --git a/x/evm/keeper/transient_log_contract_test.go b/x/evm/keeper/transient_log_contract_test.go
+new file mode 100644
+index 00000000..a69f872e
+--- /dev/null
++++ b/x/evm/keeper/transient_log_contract_test.go
+@@ -0,0 +1,109 @@
++package keeper_test
++
++import (
++	"math/big"
++	"testing"
++
++	"github.com/stretchr/testify/require"
++
++	sdk "github.com/cosmos/cosmos-sdk/types"
++	"github.com/ethereum/go-ethereum/common"
++	ethtypes "github.com/ethereum/go-ethereum/core/types"
++	abci "github.com/tendermint/tendermint/abci/types"
++	tmproto "github.com/tendermint/tendermint/proto/tendermint/types"
++	"github.com/tharsis/ethermint/tests"
++	evmtypes "github.com/tharsis/ethermint/x/evm/types"
++)
++
++func TestTransientTransactionIndexIsolatedFromBloom(t *testing.T) {
++	suite := new(KeeperTestSuite)
++	suite.SetT(t)
++	suite.SetupTest()
++	bloomValue := big.NewInt(0x123456)
++	suite.app.EvmKeeper.SetBlockBloomTransient(bloomValue)
++	gotBloom, ok := suite.app.EvmKeeper.GetBlockBloomTransient()
++	require.True(t, ok)
++	require.Equal(t, bloomValue, gotBloom)
++	index, panicked := safeTxIndex(suite)
++	require.False(t, panicked, "reading the transaction index must remain safe after writing bloom state")
++	require.Zero(t, index)
++	suite.app.EvmKeeper.IncreaseTxIndexTransient()
++	index, panicked = safeTxIndex(suite)
++	require.False(t, panicked)
++	require.Equal(t, uint64(1), index)
++	gotBloom, ok = suite.app.EvmKeeper.GetBlockBloomTransient()
++	require.True(t, ok)
++	require.Equal(t, bloomValue, gotBloom)
++	suite.app.EvmKeeper.IncreaseTxIndexTransient()
++	index, panicked = safeTxIndex(suite)
++	require.False(t, panicked)
++	require.Equal(t, uint64(2), index)
++	gotBloom, ok = suite.app.EvmKeeper.GetBlockBloomTransient()
++	require.True(t, ok)
++	require.Equal(t, bloomValue, gotBloom)
++}
++
++func TestAddLogPopulatesStableLocationMetadata(t *testing.T) {
++	suite, addr, tx, _ := newLogFixture(t)
++	blockHash := common.HexToHash("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
++	suite.app.EvmKeeper.IncreaseTxIndexTransient()
++	first := &ethtypes.Log{Address: addr, Topics: []common.Hash{common.HexToHash("0x01")}, Data: []byte{1}}
++	suite.app.EvmKeeper.AddLog(first)
++	second := &ethtypes.Log{Address: addr, Topics: []common.Hash{common.HexToHash("0x02")}, Data: []byte{2}}
++	suite.app.EvmKeeper.AddLog(second)
++	logs := suite.app.EvmKeeper.GetTxLogs(tx.Hash())
++	require.Len(t, logs, 2)
++	require.Equal(t, tx.Hash(), logs[0].TxHash)
++	require.Equal(t, tx.Hash(), logs[1].TxHash)
++	require.Equal(t, blockHash, logs[0].BlockHash)
++	require.Equal(t, uint64(42), logs[0].BlockNumber)
++	require.Equal(t, uint(1), logs[0].TxIndex)
++	require.Equal(t, uint(1), logs[1].TxIndex)
++	require.Equal(t, uint(0), logs[0].Index)
++	require.Equal(t, uint(1), logs[1].Index)
++	require.Equal(t, []byte{1}, logs[0].Data)
++	require.Equal(t, []byte{2}, logs[1].Data)
++}
++
++func TestAddLogAccumulatesAndPersistsBlockBloom(t *testing.T) {
++	suite, addr, _, ctx := newLogFixture(t)
++	suite.app.EvmKeeper.IncreaseTxIndexTransient()
++	suite.app.EvmKeeper.AddLog(&ethtypes.Log{Address: addr, Topics: []common.Hash{common.HexToHash("0x01")}, Data: []byte{1}})
++	suite.app.EvmKeeper.AddLog(&ethtypes.Log{Address: addr, Topics: []common.Hash{common.HexToHash("0x02")}, Data: []byte{2}})
++	transientBloom, ok := suite.app.EvmKeeper.GetBlockBloomTransient()
++	require.True(t, ok)
++	bloom := ethtypes.BytesToBloom(transientBloom.Bytes())
++	require.True(t, ethtypes.BloomLookup(bloom, addr))
++	require.True(t, ethtypes.BloomLookup(bloom, common.HexToHash("0x01")))
++	require.True(t, ethtypes.BloomLookup(bloom, common.HexToHash("0x02")))
++	suite.app.EvmKeeper.EndBlock(ctx, abci.RequestEndBlock{Height: 42})
++	persisted, found := suite.app.EvmKeeper.GetBlockBloom(ctx, 42)
++	require.True(t, found)
++	require.True(t, ethtypes.BloomLookup(persisted, addr))
++	require.True(t, ethtypes.BloomLookup(persisted, common.HexToHash("0x01")))
++	require.True(t, ethtypes.BloomLookup(persisted, common.HexToHash("0x02")))
++}
++
++func newLogFixture(t *testing.T) (*KeeperTestSuite, common.Address, *ethtypes.Transaction, sdk.Context) {
++	suite := new(KeeperTestSuite)
++	suite.SetT(t)
++	suite.SetupTest()
++	addr := tests.GenerateAddress()
++	msg := evmtypes.NewMsgEthereumTx(big.NewInt(1), 0, &suite.address, big.NewInt(1), 100000, big.NewInt(1), []byte("payload"), nil)
++	tx := msg.AsTransaction()
++	txBytes, err := tx.MarshalBinary()
++	require.NoError(t, err)
++	blockHash := common.HexToHash("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
++	ctx := suite.ctx.WithBlockHeader(tmproto.Header{Height: 42, ChainID: "ethermint-1"}).WithHeaderHash(blockHash.Bytes()).WithTxBytes(txBytes)
++	suite.app.EvmKeeper.WithContext(ctx)
++	return suite, addr, tx, ctx
++}
++
++func safeTxIndex(suite *KeeperTestSuite) (index uint64, panicked bool) {
++	defer func() {
++		if recover() != nil {
++			panicked = true
++		}
++	}()
++	return suite.app.EvmKeeper.GetTxIndexTransient(), false
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,4 @@
++#!/bin/bash
++set -euo pipefail
++
++go test ./x/evm/keeper -run 'TestTransientTransactionIndexIsolatedFromBloom|TestAddLogPopulatesStableLocationMetadata|TestAddLogAccumulatesAndPersistsBlockBloom' -count=1

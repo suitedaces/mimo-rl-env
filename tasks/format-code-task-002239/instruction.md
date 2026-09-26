@@ -1,0 +1,9 @@
+I want the Go package `github.com/panjf2000/gnet/v2/pkg/buffer/elastic` to provide a stateful ordered byte buffer with `New(maxStaticBytes int) (*Buffer, error)`. Passing a non-positive `maxStaticBytes` should fail with `github.com/panjf2000/gnet/v2/pkg/errors.ErrNegativeSize`; passing a positive value should return an empty buffer.
+
+The returned `*Buffer` should support `Read([]byte) (int, error)`, `Peek(int) ([][]byte, error)`, `Discard(int) (int, error)`, `Write([]byte) (int, error)`, `Writev([][]byte) (int, error)`, `ReadFrom(io.Reader) (int64, error)`, `WriteTo(io.Writer) (int64, error)`, `Buffered() int`, `IsEmpty() bool`, `Reset(maxStaticBytes int)`, and `Release()`.
+
+Bytes must come back in exactly the order they were accepted, even when writes exceed `maxStaticBytes` and have to be stored beyond the initial static capacity. For example, with `b, _ := elastic.New(4)`, after `b.Write([]byte("abcd"))` and `b.Write([]byte("ef"))`, `b.Buffered()` should be `6`; `b.Peek(-1)` should return slices that concatenate to `"abcdef"` without consuming data; `b.Discard(4)` should return `4`; then reading two bytes should return `"ef"` and leave the buffer empty.
+
+`Writev` should append every slice in order and return the total byte count. For example, after `b.Reset(4)` and `b.Writev([][]byte{[]byte("ab"), []byte("cd"), []byte("ef")})`, `b.Peek(6)` should concatenate to `"abcdef"`, and `b.Peek(7)` should return `io.ErrShortBuffer`.
+
+`ReadFrom` should append bytes read from an `io.Reader` after any existing buffered bytes, and `WriteTo` should write all currently buffered bytes to an `io.Writer` in order while draining them. `Reset(maxStaticBytes)` should clear all buffered data and update the static capacity only when the new value is positive. `Release()` should free the buffer contents so `IsEmpty()` is true and `Buffered()` is zero.

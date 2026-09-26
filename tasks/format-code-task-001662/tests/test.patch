@@ -1,0 +1,219 @@
+diff --git a/hscontrol/mapper/tail_test.go b/hscontrol/mapper/tail_test.go
+index 919ea43c..7268ffe1 100644
+--- a/hscontrol/mapper/tail_test.go
++++ b/hscontrol/mapper/tail_test.go
+@@ -212,6 +212,109 @@ func TestTailNode(t *testing.T) {
+ 	}
+ }
+ 
++func allowedPrefixSet(prefixes []netip.Prefix) map[netip.Prefix]struct{} {
++	ret := make(map[netip.Prefix]struct{}, len(prefixes))
++	for _, prefix := range prefixes {
++		ret[prefix] = struct{}{}
++	}
++
++	return ret
++}
++
++func requireAllowedContains(t *testing.T, node *tailcfg.Node, prefix netip.Prefix) {
++	t.Helper()
++
++	if _, ok := allowedPrefixSet(node.AllowedIPs)[prefix]; !ok {
++		t.Fatalf("AllowedIPs for %q does not contain %s: %v", node.Name, prefix, node.AllowedIPs)
++	}
++}
++
++func requireAllowedDoesNotContain(t *testing.T, node *tailcfg.Node, prefix netip.Prefix) {
++	t.Helper()
++
++	if _, ok := allowedPrefixSet(node.AllowedIPs)[prefix]; ok {
++		t.Fatalf("AllowedIPs for %q unexpectedly contains %s: %v", node.Name, prefix, node.AllowedIPs)
++	}
++}
++
++func mapResponseNode(t *testing.T, node *types.Node, primary *routes.PrimaryRoutes) *tailcfg.Node {
++	t.Helper()
++
++	polMan, err := policy.NewPolicyManager(nil, []types.User{node.User}, types.Nodes{node})
++	require.NoError(t, err)
++
++	m := NewMapper(
++		nil,
++		&types.Config{},
++		nil,
++		nil,
++		polMan,
++		primary,
++	)
++	body, err := m.ReadOnlyMapResponse(tailcfg.MapRequest{}, node)
++	require.NoError(t, err)
++	require.GreaterOrEqual(t, len(body), 4)
++
++	var resp tailcfg.MapResponse
++	require.NoError(t, json.Unmarshal(body[4:], &resp))
++	require.NotNil(t, resp.Node)
++
++	return resp.Node
++}
++
++func routeTestNode(id types.NodeID, name, ip string, routes []netip.Prefix) *types.Node {
++	addr := netip.MustParseAddr(ip)
++
++	return &types.Node{
++		ID:        id,
++		IPv4:      &addr,
++		Hostname:  name,
++		GivenName: name,
++		UserID:    uint(id),
++		User: types.User{
++			Name: name,
++		},
++		ForcedTags: []string{},
++		Hostinfo: &tailcfg.Hostinfo{
++			RoutableIPs: routes,
++		},
++		ApprovedRoutes: routes,
++	}
++}
++
++func TestReadOnlyMapResponseAllowedIPsUsePrimaryAndExitRoutes(t *testing.T) {
++	primarySubnet := netip.MustParsePrefix("192.168.77.0/24")
++	primary := routes.New()
++	primary.SetRoutes(types.NodeID(701), primarySubnet)
++	primary.SetRoutes(types.NodeID(702), primarySubnet)
++
++	primaryOwner := routeTestNode(types.NodeID(701), "primary-owner", "100.64.0.1", []netip.Prefix{primarySubnet})
++	nonPrimaryAdvertiser := routeTestNode(types.NodeID(702), "non-primary-advertiser", "100.64.0.2", []netip.Prefix{primarySubnet})
++	exitAdvertiser := routeTestNode(types.NodeID(703), "exit-advertiser", "100.64.0.3", []netip.Prefix{tsaddr.AllIPv4()})
++
++	primaryTailNode := mapResponseNode(t, primaryOwner, primary)
++	nonPrimaryTailNode := mapResponseNode(t, nonPrimaryAdvertiser, primary)
++	exitTailNode := mapResponseNode(t, exitAdvertiser, primary)
++
++	requireAllowedContains(t, primaryTailNode, netip.MustParsePrefix("100.64.0.1/32"))
++	requireAllowedContains(t, primaryTailNode, primarySubnet)
++	requireAllowedDoesNotContain(t, nonPrimaryTailNode, primarySubnet)
++	requireAllowedContains(t, exitTailNode, tsaddr.AllIPv4())
++	requireAllowedContains(t, exitTailNode, tsaddr.AllIPv6())
++	requireAllowedDoesNotContain(t, exitTailNode, primarySubnet)
++
++	secondPrimarySubnet := netip.MustParsePrefix("10.44.0.0/16")
++	secondPrimary := routes.New()
++	secondPrimary.SetRoutes(types.NodeID(801), secondPrimarySubnet)
++	secondPrimary.SetRoutes(types.NodeID(802), secondPrimarySubnet)
++
++	secondPrimaryOwner := routeTestNode(types.NodeID(801), "second-primary-owner", "100.64.0.11", []netip.Prefix{secondPrimarySubnet})
++	secondPrimaryTailNode := mapResponseNode(t, secondPrimaryOwner, secondPrimary)
++
++	requireAllowedContains(t, secondPrimaryTailNode, netip.MustParsePrefix("100.64.0.11/32"))
++	requireAllowedContains(t, secondPrimaryTailNode, secondPrimarySubnet)
++}
++
+ func TestNodeExpiry(t *testing.T) {
+ 	tp := func(t time.Time) *time.Time {
+ 		return &t
+diff --git a/hscontrol/routes/primary_test.go b/hscontrol/routes/primary_test.go
+index c58337c0..76011d8f 100644
+--- a/hscontrol/routes/primary_test.go
++++ b/hscontrol/routes/primary_test.go
+@@ -15,6 +15,63 @@ func mp(prefix string) netip.Prefix {
+ 	return netip.MustParsePrefix(prefix)
+ }
+ 
++func primaryPrefixSet(prefixes []netip.Prefix) map[netip.Prefix]struct{} {
++	ret := make(map[netip.Prefix]struct{}, len(prefixes))
++	for _, prefix := range prefixes {
++		ret[prefix] = struct{}{}
++	}
++
++	return ret
++}
++
++func assertPrimaryRoutesSet(t *testing.T, got, want []netip.Prefix) {
++	t.Helper()
++
++	if diff := cmp.Diff(primaryPrefixSet(want), primaryPrefixSet(got)); diff != "" {
++		t.Fatalf("PrimaryRoutes set mismatch (-want +got):\n%s", diff)
++	}
++}
++
++func TestPrimaryRoutesSingleAdvertiserBecomesPrimary(t *testing.T) {
++	pr := New()
++	nodeID := types.NodeID(101)
++	subnet := mp("192.168.44.0/24")
++
++	pr.SetRoutes(nodeID, subnet)
++
++	assertPrimaryRoutesSet(t, pr.PrimaryRoutes(nodeID), []netip.Prefix{subnet})
++}
++
++func TestPrimaryRoutesSingleAdvertiserUsesMoreThanOnePrefix(t *testing.T) {
++	pr := New()
++	nodeID := types.NodeID(202)
++	subnet := mp("10.10.0.0/16")
++
++	pr.SetRoutes(nodeID, subnet)
++
++	assertPrimaryRoutesSet(t, pr.PrimaryRoutes(nodeID), []netip.Prefix{subnet})
++}
++
++func TestPrimaryRoutesIgnoreExitOnlyAdvertisers(t *testing.T) {
++	pr := New()
++
++	pr.SetRoutes(types.NodeID(301), mp("0.0.0.0/0"))
++	pr.SetRoutes(types.NodeID(302), mp("::/0"))
++
++	assertPrimaryRoutesSet(t, pr.PrimaryRoutes(types.NodeID(301)), nil)
++	assertPrimaryRoutesSet(t, pr.PrimaryRoutes(types.NodeID(302)), nil)
++}
++
++func TestPrimaryRoutesIgnoreExitRoutesWhenMixedWithSubnetRoutes(t *testing.T) {
++	pr := New()
++	nodeID := types.NodeID(401)
++	subnet := mp("172.20.0.0/16")
++
++	pr.SetRoutes(nodeID, mp("0.0.0.0/0"), subnet, mp("::/0"))
++
++	assertPrimaryRoutesSet(t, pr.PrimaryRoutes(nodeID), []netip.Prefix{subnet})
++}
++
+ func TestPrimaryRoutes(t *testing.T) {
+ 	tests := []struct {
+ 		name           string
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,32 @@
++#!/bin/bash
++set -uo pipefail
++
++cd /testbed
++
++
++
++rm -f /.dockerenv
++
++
++case "${1:-}" in
++  base)
++    go test -v -count=1 -timeout 120s ./hscontrol/util/...
++    ;;
++  new)
++    go test -v -count=1 -timeout 120s ./hscontrol/routes/... \
++      -run 'TestPrimaryRoutes(SingleAdvertiserBecomesPrimary|SingleAdvertiserUsesMoreThanOnePrefix|IgnoreExitOnlyAdvertisers|IgnoreExitRoutesWhenMixedWithSubnetRoutes)$'
++    routes_status=$?
++
++    go test -v -count=1 -timeout 120s ./hscontrol/mapper/... \
++      -run 'TestReadOnlyMapResponseAllowedIPsUsePrimaryAndExitRoutes$'
++    mapper_status=$?
++
++    if [[ "${routes_status}" -ne 0 || "${mapper_status}" -ne 0 ]]; then
++      exit 1
++    fi
++    ;;
++  *)
++    echo "usage: $0 base|new"
++    exit 2
++    ;;
++esac

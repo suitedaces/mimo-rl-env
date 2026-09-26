@@ -1,0 +1,9 @@
+I want the friendship model API to treat a stored friendship row as a bidirectional relationship between two Django users. The library should expose `Friendship.objects.friends_for_user(user)`, returning a list of dictionaries where each item has `friend` set to the other `User` and `friendship` set to the matching `Friendship` record. For example, if there is one row with `from_user=alice` and `to_user=bob`, `friends_for_user(alice)` should include `{"friend": bob, "friendship": that_row}` and `friends_for_user(bob)` should include `{"friend": alice, "friendship": that_row}`.
+
+I also need `Friendship.objects.are_friends(user1, user2) -> bool` to answer true regardless of storage direction. With the same `alice` to `bob` row, both `are_friends(alice, bob)` and `are_friends(bob, alice)` should return `True`; for a user pair with no row in either direction, it should return `False`.
+
+I need `Friendship.objects.remove(user1, user2)` to remove the matching `Friendship` row without the caller knowing which user was stored as `from_user`. If the row is stored as `from_user=alice, to_user=bob`, calling either `remove(alice, bob)` or `remove(bob, alice)` should remove that row from the database.
+
+Please also provide `friend_set_for(user) -> set[User]` as a convenience helper over the manager lookup. For the `alice` to `bob` row, `friend_set_for(alice)` should return `{bob}` and `friend_set_for(bob)` should return `{alice}`.
+
+When a `Friendship` instance is removed through the ORM, any `FriendshipInvitation` rows with the same `from_user` and `to_user` should have `status` set to `"8"` unless they are already marked that way. This cleanup should happen as part of removing the friendship record so callers using `Friendship.objects.remove(...)` or removing the model instance get consistent invitation status updates.

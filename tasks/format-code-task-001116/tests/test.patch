@@ -1,0 +1,124 @@
+diff --git a/test/ecto/multi_read_test.exs b/test/ecto/multi_read_test.exs
+new file mode 100644
+index 00000000..71af4048
+--- /dev/null
++++ b/test/ecto/multi_read_test.exs
+@@ -0,0 +1,108 @@
++defmodule Ecto.MultiReadTest do
++  use ExUnit.Case, async: false
++
++  import Ecto.Query
++
++  alias Ecto.Multi
++  alias Ecto.TestRepo
++
++  defp query(source) do
++    from row in source, select: row.id
++  end
++
++  defp call_multi(fun, args) do
++    assert function_exported?(Multi, fun, length(args)),
++           "expected Ecto.Multi.#{fun}/#{length(args)} to be part of the public API"
++
++    apply(Multi, fun, args)
++  end
++
++  setup do
++    Process.delete(:test_repo_all_results)
++    :ok
++  end
++
++  test "exposes read operations in the canonical operation list" do
++    rows = query("multi_read_rows")
++    multi = call_multi(:all, [Multi.new(), :rows, rows, [prefix: "tenant"]])
++    multi = call_multi(:one, [multi, :row, rows, [timeout: 321]])
++    multi = call_multi(:exists?, [multi, :present, rows, []])
++
++    assert Multi.to_list(multi) == [
++      {:rows, {:all, rows, [prefix: "tenant"]}},
++      {:row, {:one, rows, [timeout: 321]}},
++      {:present, {:exists?, rows, []}}
++    ]
++  end
++
++  test "all returns every row and preserves query options" do
++    Process.put(:test_repo_all_results, {2, [[11], [22]]})
++    rows = query("multi_read_all")
++    multi = call_multi(:all, [Multi.new(), :rows, rows, [prefix: "tenant"]])
++
++    assert {:ok, %{rows: [11, 22]}} = TestRepo.transaction(multi)
++    assert_received {:all, executed}
++    assert executed.prefix == "tenant"
++  end
++
++  test "one returns nil for no rows, the value for one row, and rejects many rows" do
++    rows = query("multi_read_one")
++
++    Process.put(:test_repo_all_results, {0, []})
++    empty = call_multi(:one, [Multi.new(), :row, rows, [prefix: "tenant_one"]])
++    assert {:ok, %{row: nil}} = TestRepo.transaction(empty)
++    assert_received {:all, %{prefix: "tenant_one"}}
++
++    Process.put(:test_repo_all_results, {1, [[42]]})
++    single = call_multi(:one, [Multi.new(), :row, rows, []])
++    assert {:ok, %{row: 42}} = TestRepo.transaction(single)
++
++    Process.put(:test_repo_all_results, {2, [[1], [2]]})
++    many = call_multi(:one, [Multi.new(), :row, rows, []])
++    assert_raise Ecto.MultipleResultsError, fn -> TestRepo.transaction(many) end
++  end
++
++  test "exists? converts the read result into a boolean and limits the query" do
++    rows = query("multi_read_exists")
++
++    Process.put(:test_repo_all_results, {1, [[1]]})
++    present = call_multi(:exists?, [Multi.new(), :present, rows, [prefix: "tenant_exists"]])
++    assert {:ok, %{present: true}} = TestRepo.transaction(present)
++    assert_received {:all, present_query}
++    assert present_query.prefix == "tenant_exists"
++    assert inspect(present_query) =~ "limit: 1"
++    assert inspect(present_query) =~ "select: 1"
++
++    Process.put(:test_repo_all_results, {0, []})
++    absent = call_multi(:exists?, [Multi.new(), :present, rows, []])
++    assert {:ok, %{present: false}} = TestRepo.transaction(absent)
++  end
++
++  test "read operation names remain unique" do
++    rows = query("multi_read_duplicate")
++    multi = call_multi(:all, [Multi.new(), :same, rows, []])
++
++    assert_raise RuntimeError, ~r/:same is already a member of the Ecto\.Multi/, fn ->
++      call_multi(:one, [multi, :same, rows, []])
++    end
++  end
++
++  test "read operations run in order, receive prior changes, and halt after an error" do
++    Process.put(:test_repo_all_results, {1, [[9]]})
++
++    multi = Multi.new() |> Multi.run(:before, fn _repo, _changes -> {:ok, :ready} end)
++    multi = call_multi(:all, [multi, :rows, query("multi_read_order"), []])
++    multi = Multi.run(multi, :after, fn _repo, %{before: before, rows: rows} ->
++        {:ok, {before, rows}}
++      end)
++
++    assert {:ok, %{after: {:ready, [9]}}} = TestRepo.transaction(multi)
++    assert_received {:all, %{from: %{source: {"multi_read_order", nil}}}}
++
++    blocked = Multi.new() |> Multi.run(:stop, fn _repo, _changes -> {:error, :bad} end)
++    blocked = call_multi(:all, [blocked, :never, query("multi_read_blocked"), []])
++
++    assert {:error, :stop, :bad, %{}} = TestRepo.transaction(blocked)
++    refute_received {:all, %{from: %{source: {"multi_read_blocked", nil}}}}
++  end
++end
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,5 @@
++#!/bin/bash
++set -euo pipefail
++
++
++MIX_ENV=test mix test --no-deps-check test/ecto/multi_read_test.exs

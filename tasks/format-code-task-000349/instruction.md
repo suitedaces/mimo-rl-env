@@ -1,0 +1,11 @@
+I want the `image-syncer` root command to load synchronization inputs from user-supplied configuration files before it starts copying registry images.
+
+The CLI should support `image-syncer --images <path>` with an optional `--auth <path>`, and it should also support the deprecated combined form `image-syncer --config <path>`. These files may be JSON, YAML, or YML; paths with any other extension should fail during startup before any registry transfer begins. For example, running `image-syncer --images rules.txt` should exit non-zero and report an initialization error that includes `decode image file rules.txt error: only one of yaml/yml/json format is supported`.
+
+If neither `--config` nor `--images` is provided, startup should fail non-zero with an initialization error that includes `neither config.json nor images.json is provided`. If `--images` is provided without `--auth`, startup should continue and log a warning that no authentication information was found because neither `config.json` nor `auth.json` was provided.
+
+For separate auth files, each auth entry should load `username`, `password`, and `insecure`, and environment variables in usernames and passwords should be expanded. When building transfer tasks, source and destination repositories should receive the auth entry whose configured repository key matches the repository path on a slash boundary; if no auth entry matches, the command should log that access for that repository will be anonymous.
+
+The image rules file should map each source image to either one destination string or a list of destination strings. Environment variables in destination strings should be expanded, duplicate destinations in a list should be collapsed, and each source/destination pair should become a sync task. Empty destination strings, empty destination lists, and destination lists containing non-string values should fail during startup; for an empty destination, the error should include `empty destination is not supported for source: <source>`.
+
+The command should also accept repeatable `--os <value>` and `--arch <value>` filters, ignore empty filter values, and pass the remaining filters into the generated sync tasks. `image-syncer --help` should list `--config`, `--auth`, `--images`, `--os`, and `--arch` alongside the other root command flags and exit 0.

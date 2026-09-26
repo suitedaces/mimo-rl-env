@@ -1,0 +1,416 @@
+diff --git a/usercase-test-coderl/usecase.sh b/usercase-test-coderl/usecase.sh
+new file mode 100755
+--- /dev/null
++++ b/usercase-test-coderl/usecase.sh
+@@ -0,0 +1,387 @@
++#!/usr/bin/env bash
++
++set -u
++export LANG=C.UTF-8 LC_ALL=C.UTF-8 TZ=UTC
++
++fail() { echo "FAIL: $*" >&2; exit 1; }
++
++REPO=/workspace/repo
++FOLDER2LMDB="$REPO/utils/dataset/folder2lmdb.py"
++
++[ -f "$FOLDER2LMDB" ] || fail "missing folder2lmdb entry point"
++
++TMP=$(mktemp -d)
++trap 'rm -rf "$TMP"' EXIT
++cd "$TMP" || fail "cd temp"
++
++mkdir -p "$TMP/pyshim"
++cat > "$TMP/pyshim/sitecustomize.py" <<'PY'
++import pickle
++try:
++    import pyarrow as pa
++    if not hasattr(pa, "serialize"):
++        class _Serialized:
++            def __init__(self, obj):
++                self.obj = obj
++            def to_buffer(self):
++                return pickle.dumps(self.obj)
++        pa.serialize = lambda obj: _Serialized(obj)
++    if not hasattr(pa, "deserialize"):
++        pa.deserialize = lambda buf: pickle.loads(buf)
++except Exception:
++    pass
++PY
++export PYTHONPATH="$TMP/pyshim:$REPO:${PYTHONPATH:-}"
++
++python3 - <<'PY' >deps.out 2>deps.err
++import fire
++import lmdb
++import pyarrow
++import torch
++import torchvision
++import timm
++PY
++ec=$?
++[ "$ec" -eq 0 ] || fail "python dependency import failed: $(cat deps.err)"
++
++SRC_ROOT="$TMP/src_root"
++DATA_ROOT="$TMP/data_root"
++
++python3 - "$SRC_ROOT" "$DATA_ROOT" <<'PY' >img.out 2>img.err
++import sys
++from pathlib import Path
++from PIL import Image
++
++src_root = Path(sys.argv[1])
++data_root = Path(sys.argv[2])
++
++def write_pair(split_dir):
++    (split_dir / "class0").mkdir(parents=True, exist_ok=True)
++    (split_dir / "class1").mkdir(parents=True, exist_ok=True)
++    Image.new("RGB", (2, 2), (255, 0, 0)).save(split_dir / "class0" / "a.png")
++    Image.new("RGB", (2, 2), (0, 255, 0)).save(split_dir / "class1" / "b.png")
++
++write_pair(src_root / "train")
++for parent, split in [
++    ("train_lmdb", "train"),
++    ("val_lmdb", "val"),
++    ("test_lmdb", "test"),
++]:
++    write_pair(data_root / parent / split)
++PY
++ec=$?
++[ "$ec" -eq 0 ] || fail "image fixture setup failed: $(cat img.err)"
++
++
++
++
++python3 "$FOLDER2LMDB" "$SRC_ROOT" --name train --write_frequency 1 >out 2>err
++ec=$?
++[ "$ec" -eq 0 ] || fail "F1 exit $ec; want 0"
++
++grep -Fq "$SRC_ROOT/train" out || fail "F1 stdout did not mention source directory: $(cat out)"
++grep -Fq "$SRC_ROOT/train.lmdb" out || fail "F1 stdout did not mention LMDB path: $(cat out)"
++
++[ "$(grep -Ecx '\[[0-9]+/2\]' out)" -ge 2 ] || fail "F1 stdout missing periodic progress lines: $(cat out)"
++grep -Fxq "Flushing database ..." out || fail "F1 stdout missing flush message: $(cat out)"
++
++! grep -q "Traceback" err || fail "F1 traceback: $(cat err)"
++
++[ -e "$SRC_ROOT/train.lmdb" ] || fail "F1 missing LMDB path"
++[ -f "$SRC_ROOT/train_images_idx.txt" ] || fail "F1 missing sidecar index"
++
++[ "$(wc -l < "$SRC_ROOT/train_images_idx.txt")" -eq 2 ] || fail "F1 sidecar wrong line count: $(cat "$SRC_ROOT/train_images_idx.txt")"
++grep -Fxq "a.png 0" "$SRC_ROOT/train_images_idx.txt" || fail "F1 sidecar missing a.png index: $(cat "$SRC_ROOT/train_images_idx.txt")"
++grep -Fxq "b.png 1" "$SRC_ROOT/train_images_idx.txt" || fail "F1 sidecar missing b.png index: $(cat "$SRC_ROOT/train_images_idx.txt")"
++
++python3 - "$SRC_ROOT/train.lmdb" <<'PY' >out 2>err
++import lmdb
++import os
++import sys
++
++env = lmdb.open(sys.argv[1], subdir=os.path.isdir(sys.argv[1]), readonly=True, lock=False, readahead=False, meminit=False)
++with env.begin(write=False) as txn:
++
++    numeric_keys = []
++    for key, _ in txn.cursor():
++        try:
++            if key.decode("ascii").isdigit():
++                numeric_keys.append(key)
++        except UnicodeDecodeError:
++            pass
++    print("NUMERIC_KEY_COUNT=%d" % len(numeric_keys))
++    print("HAS_METADATA=%s,%s" % (txn.get(b"__keys__") is not None, txn.get(b"__len__") is not None))
++PY
++ec=$?
++EXPECTED_KEYS=$(cat <<'EOF'
++NUMERIC_KEY_COUNT=2
++HAS_METADATA=True,True
++EOF
++)
++[ "$ec" -eq 0 ] || fail "F1 metadata exit $ec; want 0"
++[ "$(cat out)" = "$EXPECTED_KEYS" ] || fail "F1 metadata: $(cat out)"
++[ ! -s err ] || fail "F1 metadata stderr: $(cat err)"
++
++rm -rf "$SRC_ROOT/train"
++
++
++
++
++python3 - "$SRC_ROOT/train.lmdb" <<'PY' >out 2>err
++import importlib
++import inspect
++import sys
++from torchvision import transforms
++
++def open_lmdb_reader(db_path, transform=None, target_transform=None):
++
++    for modname in ("utils.dataset.folder2lmdb", "utils.dataset.dataset", "utils.dataset"):
++        mod = importlib.import_module(modname)
++        for _, obj in vars(mod).items():
++            if inspect.isclass(obj) and "lmdb" in obj.__name__.lower():
++                try:
++                    return obj(db_path, transform, target_transform)
++                except TypeError:
++                    try:
++                        return obj(db_path, transform=transform, target_transform=target_transform)
++                    except TypeError:
++                        pass
++    raise AssertionError("no importable LMDB reader class found")
++
++ds = open_lmdb_reader(sys.argv[1], transforms.Grayscale(num_output_channels=1), lambda t: t + 7)
++print("LEN=%d" % len(ds))
++items = []
++for i in range(len(ds)):
++    arr, target = ds[i]
++    items.append((arr.shape, str(arr.dtype), int(target), int(arr[0][0])))
++print("ITEMS=" + "|".join("%s,%s,%d,%d" % item for item in sorted(items, key=lambda item: item[2])))
++PY
++ec=$?
++EXPECTED_READ=$(cat <<'EOF'
++LEN=2
++ITEMS=(2, 2),uint8,7,76|(2, 2),uint8,8,150
++EOF
++)
++[ "$ec" -eq 0 ] || fail "F2 exit $ec; want 0"
++
++[ "$(cat out)" = "$EXPECTED_READ" ] || fail "F2 stdout: $(cat out)"
++! grep -q "Traceback" err || fail "F2 traceback: $(cat err)"
++
++for spec in "train_lmdb train" "val_lmdb val" "test_lmdb test"; do
++    set -- $spec
++    python3 "$FOLDER2LMDB" "$DATA_ROOT/$1" --name "$2" --write_frequency 1 >setup.out 2>setup.err
++    ec=$?
++    [ "$ec" -eq 0 ] || fail "setup convert $1/$2 failed: $(cat setup.err)"
++done
++rm -rf "$DATA_ROOT/train_lmdb/train" "$DATA_ROOT/val_lmdb/val" "$DATA_ROOT/test_lmdb/test"
++
++
++
++
++python3 - "$DATA_ROOT" <<'PY' >out 2>err
++import sys
++from types import SimpleNamespace
++from utils.dataflow import get_dataset, get_transforms
++
++common = dict(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225],
++              dataset_dir=sys.argv[1], batch_size=4, num_workers=0, train_portion=1)
++lmdb_cfg = SimpleNamespace(dataset="imagenet_lmdb", **common)
++folder_cfg = SimpleNamespace(dataset="imagenet", **common)
++lmdb_transforms = get_transforms(lmdb_cfg)
++folder_transforms = get_transforms(folder_cfg)
++print("TRANSFORMS_EQUAL=%s,%s,%s" % tuple(str(repr(a) == repr(b)) for a, b in zip(lmdb_transforms, folder_transforms)))
++datasets = get_dataset(*lmdb_transforms, lmdb_cfg)
++print("DATASET_COUNT=%d" % len(datasets))
++print("LENS=" + ",".join(str(len(d)) for d in datasets))
++PY
++ec=$?
++EXPECTED_DATAFLOW=$(cat <<EOF
++TRANSFORMS_EQUAL=True,True,True
++DATASET_COUNT=3
++LENS=2,2,2
++EOF
++)
++[ "$ec" -eq 0 ] || fail "F3 exit $ec; want 0"
++
++[ "$(cat out)" = "$EXPECTED_DATAFLOW" ] || fail "F3 stdout: $(cat out)"
++! grep -q "Traceback" err || fail "F3 traceback: $(cat err)"
++
++run_train_lmdb() {
++    local data_root=$1
++    python3 - "$data_root" <<'PY'
++import sys
++import torch
++import torch.nn as nn
++
++sys.path.insert(0, "/workspace/repo")
++torch.nn.Module.cuda = lambda self, *a, **k: self
++torch.Tensor.cuda = lambda self, *a, **k: self
++torch.cuda.synchronize = lambda: None
++torch.nn.DataParallel.cuda = lambda self, *a, **k: self
++
++class TinyModel(nn.Module):
++    default_cfg = {
++        "input_size": (3, 224, 224),
++        "pool_size": None,
++        "crop_pct": 1.0,
++        "interpolation": "bilinear",
++        "mean": (0.485, 0.456, 0.406),
++        "std": (0.229, 0.224, 0.225),
++        "first_conv": "",
++        "classifier": "",
++    }
++    def __init__(self, *args, num_classes=5, **kwargs):
++        super().__init__()
++        self.p = nn.Parameter(torch.zeros(1))
++        self.num_classes = max(int(num_classes), 5)
++    def forward(self, x):
++        return self.p.expand(x.shape[0], self.num_classes)
++
++import train_imagenet
++train_imagenet.get_model = TinyModel
++orig_create_loader = train_imagenet.create_loader
++def cpu_loader(*args, **kwargs):
++    kwargs["use_prefetcher"] = False
++    kwargs["num_workers"] = 0
++    return orig_create_loader(*args, **kwargs)
++train_imagenet.create_loader = cpu_loader
++sys.argv = [
++    "train_imagenet.py", sys.argv[1], "--lmdb", "--epochs", "0",
++    "--workers", "0", "--batch-size", "1", "--no-prefetcher",
++    "--model", "get_model", "--num-classes", "5",
++    "--target_flops", "320",
++    "--config_path", "/workspace/repo/config_file/imagenet_config.yml",
++]
++train_imagenet.main()
++print("TRAIN_MAIN_RETURNED")
++PY
++}
++
++run_validate_lmdb() {
++    local data_root=$1
++    python3 - "$data_root" <<'PY'
++import sys
++import torch
++import torch.nn as nn
++
++sys.path.insert(0, "/workspace/repo")
++torch.nn.Module.cuda = lambda self, *a, **k: self
++torch.Tensor.cuda = lambda self, *a, **k: self
++torch.cuda.synchronize = lambda: None
++torch.nn.DataParallel.cuda = lambda self, *a, **k: self
++
++class TinyModel(nn.Module):
++    default_cfg = {
++        "input_size": (3, 224, 224),
++        "pool_size": None,
++        "crop_pct": 1.0,
++        "interpolation": "bilinear",
++        "mean": (0.485, 0.456, 0.406),
++        "std": (0.229, 0.224, 0.225),
++        "first_conv": "",
++        "classifier": "",
++    }
++    def __init__(self, *args, num_classes=5, **kwargs):
++        super().__init__()
++        self.p = nn.Parameter(torch.zeros(1))
++        self.num_classes = max(int(num_classes), 5)
++    def forward(self, x):
++        return self.p.expand(x.shape[0], self.num_classes)
++
++import validate
++validate.get_model = TinyModel
++orig_create_loader = validate.create_loader
++def cpu_loader(*args, **kwargs):
++    kwargs["use_prefetcher"] = False
++    kwargs["num_workers"] = 0
++    return orig_create_loader(*args, **kwargs)
++validate.create_loader = cpu_loader
++sys.argv = [
++    "validate.py", sys.argv[1], "--lmdb", "--workers", "0",
++    "--batch-size", "1", "--model", "get_model", "--num-classes", "5",
++    "--target_flops", "320",
++    "--config_path", "/workspace/repo/config_file/imagenet_config.yml",
++]
++validate.main()
++print("VALIDATE_MAIN_RETURNED")
++PY
++}
++
++
++
++
++run_train_lmdb "$DATA_ROOT" >out 2>err
++ec=$?
++[ "$ec" -eq 0 ] || fail "F4 exit $ec; want 0; stderr: $(cat err)"
++grep -Fxq "TRAIN_MAIN_RETURNED" out || fail "F4 missing completion marker; stdout: $(cat out)"
++! grep -q "Traceback" err || fail "F4 traceback: $(cat err)"
++
++
++
++
++run_validate_lmdb "$DATA_ROOT" >out 2>err
++ec=$?
++[ "$ec" -eq 0 ] || fail "F5 exit $ec; want 0; stderr: $(cat err)"
++grep -Fxq "VALIDATE_MAIN_RETURNED" out || fail "F5 missing completion marker; stdout: $(cat out)"
++! grep -q "Traceback" err || fail "F5 traceback: $(cat err)"
++
++
++
++
++MISSING_SRC="$TMP/missing_source_root"
++mkdir -p "$MISSING_SRC"
++python3 "$FOLDER2LMDB" "$MISSING_SRC" --name train --write_frequency 1 >out 2>err
++ec=$?
++[ "$ec" -ne 0 ] || fail "F6 exit $ec; want non-zero"
++
++
++
++
++
++rm -f "$DATA_ROOT/train_lmdb/train_images_idx.txt"
++python3 - "$DATA_ROOT/train_lmdb/train.lmdb" <<'PY' >out 2>err
++import importlib
++import inspect
++import sys
++
++def open_lmdb_reader(db_path):
++
++    for modname in ("utils.dataset.folder2lmdb", "utils.dataset.dataset", "utils.dataset"):
++        mod = importlib.import_module(modname)
++        for _, obj in vars(mod).items():
++            if inspect.isclass(obj) and "lmdb" in obj.__name__.lower():
++                try:
++                    return obj(db_path)
++                except TypeError:
++                    pass
++    raise AssertionError("no importable LMDB reader class found")
++
++open_lmdb_reader(sys.argv[1])
++PY
++ec=$?
++[ "$ec" -ne 0 ] || fail "F7 exit $ec; want non-zero"
++
++
++
++
++
++FALLBACK_ROOT="$TMP/fallback_root"
++python3 - "$FALLBACK_ROOT" <<'PY' >out 2>err
++import sys
++from pathlib import Path
++from PIL import Image
++
++root = Path(sys.argv[1])
++(root / "val" / "class0").mkdir(parents=True, exist_ok=True)
++Image.new("RGB", (2, 2), (255, 0, 0)).save(root / "val" / "class0" / "fallback.png")
++PY
++ec=$?
++[ "$ec" -eq 0 ] || fail "F8 fallback image setup failed: $(cat err)"
++run_validate_lmdb "$FALLBACK_ROOT" >out 2>err
++ec=$?
++[ "$ec" -ne 0 ] || fail "F8 exit $ec; want non-zero"
++
++! grep -Fxq "VALIDATE_MAIN_RETURNED" out || fail "F8 unexpectedly completed validation"
++
++echo "PASS"
++exit 0
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,19 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++export PIP_NO_INDEX=1
++export PIP_DISABLE_PIP_VERSION_CHECK=1
++export HF_HUB_OFFLINE=1
++export TRANSFORMERS_OFFLINE=1
++export TORCH_HOME=/workspace/repo/.offline_torch
++export XDG_CACHE_HOME=/workspace/repo/.offline_cache
++set -e
++cd /workspace/repo
++mkdir -p "$TORCH_HOME" "$XDG_CACHE_HOME"
++exec bash /workspace/repo/usercase-test-coderl/usecase.sh

@@ -1,0 +1,9 @@
+I want Numeral.js to support byte quantity formatting and parsing through its existing one-shot public calls: `numeral(input).format(format, roundingFunction?) -> string` for formatting numbers and `numeral(input).value() -> number|null` when the input is a formatted byte string.
+
+A format mask containing `b` should scale using decimal powers of 1000 and append byte suffixes such as `B`, `KB`, `MB`, `GB`, `TB`, and `PB`. A format mask containing `ib` should scale using binary powers of 1024 and append IEC suffixes such as `B`, `KiB`, `MiB`, `GiB`, `TiB`, and `PiB`. If the mask has a space before `b` or `ib`, the output should include a space before the suffix; otherwise the suffix should be adjacent.
+
+Concrete examples I expect: `numeral(100).format('0b')` returns `100B`, `numeral(2000).format('0 b')` returns `2 KB`, `numeral(Math.pow(1024, 2) * 5).format('0ib')` returns `5MiB`, `numeral(Math.pow(1024, 3) * 7.343).format('0.[0] ib')` returns `7.3 GiB`, and `numeral(Math.pow(1000, 4) * 3.1536544).format('0.000b')` returns `3.154TB`. Formatting `null` with `numeral(null).format('0 b')` should produce `0 B`.
+
+Parsing should recognize the same decimal and binary suffixes and return the raw byte count from `.value()`: `numeral('5MB').value()` returns `5000000`, `numeral('2 KiB').value()` returns `2048`, `numeral('7.3 GiB').value()` returns `Math.pow(1024, 3) * 7.3`, and `numeral('3PB').value()` returns `Math.pow(1000, 5) * 3`. Byte suffix detection should avoid colliding with basis-point strings, so input such as `1 BPS` should remain available for the BPS format instead of being claimed as a byte value.
+
+For the same input and format mask, calls should return the same result each time, should not mutate caller-provided values, and should not perform filesystem or network side effects.

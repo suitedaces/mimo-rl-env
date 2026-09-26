@@ -1,0 +1,322 @@
+diff --git a/llms/ernie/erniellm_test.go b/llms/ernie/erniellm_test.go
+new file mode 100644
+index 00000000..66ba0fc9
+--- /dev/null
++++ b/llms/ernie/erniellm_test.go
+@@ -0,0 +1,294 @@
++package ernie_test
++
++import (
++	"context"
++	"io"
++	"net/http"
++	"strings"
++	"sync"
++	"testing"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++
++	"github.com/tmc/langchaingo/llms"
++	"github.com/tmc/langchaingo/llms/ernie"
++)
++
++
++type recordedRequest struct {
++	URL  string
++	Path string
++	Body string
++}
++
++
++
++type mockTransport struct {
++	mu       sync.Mutex
++	requests []recordedRequest
++	handler  func(rec recordedRequest) (int, string)
++}
++
++func (m *mockTransport) RoundTrip(req *http.Request) (*http.Response, error) {
++	var body string
++	if req.Body != nil {
++		b, _ := io.ReadAll(req.Body)
++		body = string(b)
++	}
++	rec := recordedRequest{URL: req.URL.String(), Path: req.URL.Path, Body: body}
++
++	m.mu.Lock()
++	m.requests = append(m.requests, rec)
++	m.mu.Unlock()
++
++	status, respBody := m.handler(rec)
++	return &http.Response{
++		StatusCode: status,
++		Body:       io.NopCloser(strings.NewReader(respBody)),
++		Header:     make(http.Header),
++		Request:    req,
++	}, nil
++}
++
++func (m *mockTransport) snapshot() []recordedRequest {
++	m.mu.Lock()
++	defer m.mu.Unlock()
++	out := make([]recordedRequest, len(m.requests))
++	copy(out, m.requests)
++	return out
++}
++
++func mockClient(handler func(rec recordedRequest) (int, string)) (*http.Client, *mockTransport) {
++	mt := &mockTransport{handler: handler}
++	return &http.Client{Transport: mt}, mt
++}
++
++
++func findRequest(t *testing.T, mt *mockTransport, substr string) recordedRequest {
++	t.Helper()
++	for _, r := range mt.snapshot() {
++		if strings.Contains(r.Path, substr) {
++			return r
++		}
++	}
++	t.Fatalf("no request seen with path containing %q; saw %+v", substr, mt.snapshot())
++	return recordedRequest{}
++}
++
++func TestNewRequiresAuth(t *testing.T) {
++	t.Setenv("ERNIE_API_KEY", "")
++	t.Setenv("ERNIE_SECRET_KEY", "")
++
++
++	_, err := ernie.New()
++	require.Error(t, err)
++
++
++
++	llm, err := ernie.New(ernie.WithAccessToken("tok"))
++	require.NoError(t, err)
++	require.NotNil(t, llm)
++}
++
++func TestCallReturnsResult(t *testing.T) {
++	t.Parallel()
++
++	client, mt := mockClient(func(rec recordedRequest) (int, string) {
++		return http.StatusOK, `{"result":"Hello there"}`
++	})
++
++	llm, err := ernie.New(ernie.WithAccessToken("tok"), ernie.WithHTTPClient(client))
++	require.NoError(t, err)
++
++	got, err := llm.Call(context.Background(), "hi")
++	require.NoError(t, err)
++	assert.Equal(t, "Hello there", got)
++
++
++	rec := findRequest(t, mt, "/chat/")
++	assert.Contains(t, rec.URL, "access_token=tok")
++	assert.Contains(t, rec.Body, "hi")
++}
++
++func TestGenerateMultiplePrompts(t *testing.T) {
++	t.Parallel()
++
++	client, _ := mockClient(func(rec recordedRequest) (int, string) {
++		if strings.Contains(rec.Body, "first") {
++			return http.StatusOK, `{"result":"one"}`
++		}
++		return http.StatusOK, `{"result":"two"}`
++	})
++
++	llm, err := ernie.New(ernie.WithAccessToken("tok"), ernie.WithHTTPClient(client))
++	require.NoError(t, err)
++
++	gens, err := llm.Generate(context.Background(), []string{"first", "second"})
++	require.NoError(t, err)
++	require.Len(t, gens, 2)
++	assert.Equal(t, "one", gens[0].Text)
++	assert.Equal(t, "two", gens[1].Text)
++}
++
++func TestModelPathMapping(t *testing.T) {
++	t.Parallel()
++
++	tests := []struct {
++		name     string
++		opts     []ernie.Option
++		callOpts []llms.CallOption
++		wantPath string
++	}{
++		{
++			name:     "default",
++			wantPath: "/chat/completions",
++		},
++		{
++			name:     "model name option",
++			opts:     []ernie.Option{ernie.WithModelName("ERNIE-Bot-turbo")},
++			wantPath: "/chat/eb-instant",
++		},
++		{
++			name:     "per-call model option",
++			callOpts: []llms.CallOption{llms.WithModel("BLOOMZ-7B")},
++			wantPath: "/chat/bloomz_7b1",
++		},
++		{
++			name:     "llama via model name",
++			opts:     []ernie.Option{ernie.WithModelName("Llama-2-70b-chat")},
++			wantPath: "/chat/llama_2_70b",
++		},
++	}
++
++	for _, tc := range tests {
++		tc := tc
++		t.Run(tc.name, func(t *testing.T) {
++			t.Parallel()
++
++			client, mt := mockClient(func(rec recordedRequest) (int, string) {
++				return http.StatusOK, `{"result":"ok"}`
++			})
++
++			opts := append([]ernie.Option{
++				ernie.WithAccessToken("tok"),
++				ernie.WithHTTPClient(client),
++			}, tc.opts...)
++
++			llm, err := ernie.New(opts...)
++			require.NoError(t, err)
++
++			_, err = llm.Call(context.Background(), "hi", tc.callOpts...)
++			require.NoError(t, err)
++
++			rec := findRequest(t, mt, "/chat/")
++			assert.Contains(t, rec.Path, tc.wantPath)
++		})
++	}
++}
++
++func TestNon2xxIsError(t *testing.T) {
++	t.Parallel()
++
++	client, _ := mockClient(func(rec recordedRequest) (int, string) {
++		return http.StatusInternalServerError, `{"error_msg":"boom"}`
++	})
++
++	llm, err := ernie.New(ernie.WithAccessToken("tok"), ernie.WithHTTPClient(client))
++	require.NoError(t, err)
++
++	_, err = llm.Call(context.Background(), "hi")
++	require.Error(t, err)
++}
++
++func TestStreaming(t *testing.T) {
++	t.Parallel()
++
++	stream := "data: {\"result\":\"Hello\",\"is_end\":false}\n\n" +
++		"data: {\"result\":\" world\",\"is_end\":true}\n\n"
++
++	client, mt := mockClient(func(rec recordedRequest) (int, string) {
++		return http.StatusOK, stream
++	})
++
++	llm, err := ernie.New(ernie.WithAccessToken("tok"), ernie.WithHTTPClient(client))
++	require.NoError(t, err)
++
++	var chunks []string
++	got, err := llm.Call(context.Background(), "hi",
++		llms.WithStreamingFunc(func(_ context.Context, chunk []byte) error {
++			chunks = append(chunks, string(chunk))
++			return nil
++		}),
++	)
++	require.NoError(t, err)
++
++	assert.Equal(t, []string{"Hello", " world"}, chunks)
++	assert.Equal(t, "Hello world", got)
++
++
++	rec := findRequest(t, mt, "/chat/")
++	assert.Contains(t, rec.Body, "\"stream\":true")
++}
++
++func TestCreateEmbedding(t *testing.T) {
++	t.Parallel()
++
++	client, mt := mockClient(func(rec recordedRequest) (int, string) {
++		return http.StatusOK, `{"data":[{"embedding":[0.1,0.2],"index":0},{"embedding":[0.3,0.4],"index":1}]}`
++	})
++
++	llm, err := ernie.New(ernie.WithAccessToken("tok"), ernie.WithHTTPClient(client))
++	require.NoError(t, err)
++
++	embs, err := llm.CreateEmbedding(context.Background(), []string{"a", "b"})
++	require.NoError(t, err)
++	require.Equal(t, [][]float64{{0.1, 0.2}, {0.3, 0.4}}, embs)
++
++	rec := findRequest(t, mt, "/embeddings/")
++	assert.Contains(t, rec.URL, "access_token=tok")
++}
++
++func TestCreateEmbeddingErrorCode(t *testing.T) {
++	t.Parallel()
++
++	client, _ := mockClient(func(rec recordedRequest) (int, string) {
++		return http.StatusOK, `{"error_code":336000,"error_msg":"internal error"}`
++	})
++
++	llm, err := ernie.New(ernie.WithAccessToken("tok"), ernie.WithHTTPClient(client))
++	require.NoError(t, err)
++
++	_, err = llm.CreateEmbedding(context.Background(), []string{"a"})
++	require.Error(t, err)
++}
++
++func TestAKSKTokenExchange(t *testing.T) {
++	t.Setenv("ERNIE_API_KEY", "")
++	t.Setenv("ERNIE_SECRET_KEY", "")
++
++	client, mt := mockClient(func(rec recordedRequest) (int, string) {
++		if strings.Contains(rec.Path, "/oauth/2.0/token") {
++			return http.StatusOK, `{"access_token":"tok-xyz","expires_in":2592000}`
++		}
++		return http.StatusOK, `{"result":"hello"}`
++	})
++
++	llm, err := ernie.New(
++		ernie.WithAKSK("my-ak", "my-sk"),
++		ernie.WithHTTPClient(client),
++	)
++	require.NoError(t, err)
++
++	_, err = llm.Call(context.Background(), "hi")
++	require.NoError(t, err)
++
++
++	tokenReq := findRequest(t, mt, "/oauth/2.0/token")
++	assert.Contains(t, tokenReq.URL, "client_id=my-ak")
++	assert.Contains(t, tokenReq.URL, "client_secret=my-sk")
++
++
++	chatReq := findRequest(t, mt, "/chat/")
++	assert.Contains(t, chatReq.URL, "access_token=tok-xyz")
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,17 @@
++#!/usr/bin/env bash
++
++
++
++set -euo pipefail
++HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++cd /testbed
++
++
++
++export GOFLAGS=-mod=mod
++
++
++go test ./llms/huggingface/internal/huggingfaceclient/
++
++
++go test ./llms/ernie/...

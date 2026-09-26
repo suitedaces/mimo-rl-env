@@ -1,0 +1,580 @@
+diff --git a/tests/components/binary_sensor/test_deconz.py b/tests/components/binary_sensor/test_deconz.py
+new file mode 100644
+index 00000000000..573cce0dbc2
+--- /dev/null
++++ b/tests/components/binary_sensor/test_deconz.py
+@@ -0,0 +1,77 @@
++
++from unittest.mock import Mock, patch
++
++from homeassistant import config_entries
++from homeassistant.components import deconz
++from homeassistant.components.binary_sensor import deconz as deconz_binary_sensor
++
++from tests.common import mock_coro_func
++
++
++SENSORS = {
++    "1": {
++        "id": "sensor-1-id",
++        "name": "Sensor 1 name",
++        "type": "ZHAPresence",
++        "state": {"presence": False},
++        "config": {}
++    },
++    "2": {
++        "id": "sensor-2-id",
++        "name": "Sensor 2 name",
++        "type": "ZHAOpenClose",
++        "state": {"open": True},
++        "config": {}
++    }
++}
++
++
++async def setup_bridge(hass, data):
++
++    from pydeconz import DeconzSession
++
++    entry = Mock()
++    entry.data = {'host': '1.2.3.4', 'port': 80, 'api_key': '1234567890ABCDEF'}
++    bridge = DeconzSession(Mock(), Mock(), **entry.data)
++    with patch('pydeconz.DeconzSession.async_get_state',
++               new=mock_coro_func(data)):
++        await bridge.async_load_parameters()
++
++    hass.data[deconz.DOMAIN] = bridge
++    hass.data[deconz.DATA_DECONZ_ID] = {}
++
++    config_entry = config_entries.ConfigEntry(
++        1, deconz.DOMAIN, 'Mock Title', {'host': 'mock-host'}, 'test')
++    hass.config_entries._entries.append(config_entry)
++    await hass.config_entries.async_forward_entry_setup(
++        config_entry, 'binary_sensor')
++    await hass.async_block_till_done()
++
++
++async def test_no_binary_sensors(hass):
++
++    await setup_bridge(hass, {})
++
++    assert hass.states.async_all() == []
++
++
++async def test_binary_sensors_added_from_config_entry(hass):
++
++    await setup_bridge(hass, {"sensors": SENSORS})
++
++    assert hass.states.get("binary_sensor.sensor_1_name") is not None
++    assert hass.states.get("binary_sensor.sensor_2_name") is not None
++    assert len(hass.states.async_all()) == 2
++
++
++async def test_legacy_setup_platform_does_not_add_binary_sensors(hass):
++
++    added = []
++
++    async def async_add_devices(devices):
++        added.extend(devices)
++
++    await deconz_binary_sensor.async_setup_platform(
++        hass, {}, async_add_devices, discovery_info={"host": "mock-host"})
++
++    assert added == []
+diff --git a/tests/components/deconz/test_init.py b/tests/components/deconz/test_init.py
+index cbc8a373972..64fbe87fd2a 100644
+--- a/tests/components/deconz/test_init.py
++++ b/tests/components/deconz/test_init.py
+@@ -1,9 +1,15 @@
+ """Test deCONZ component setup process."""
+-from unittest.mock import patch
++import logging
++from unittest.mock import Mock, patch
+ 
++from homeassistant import config_entries
+ from homeassistant.setup import async_setup_component
+ from homeassistant.components import deconz
+ 
++from tests.common import mock_coro_func
++
++
++_LOGGER = logging.getLogger(__name__)
+ 
+ async def test_config_with_host_passed_to_config_entry(hass):
+     """Test that configured options for a host are loaded via config entry."""
+@@ -67,3 +73,81 @@ async def test_config_discovery(hass):
+         assert await async_setup_component(hass, deconz.DOMAIN, {}) is True
+     # No flow started
+     assert len(mock_config_entries.flow.mock_calls) == 0
++
++
++async def test_setup_entry_already_registered_bridge(hass, caplog):
++    """Test setup entry doesn't allow more than one instance of deCONZ."""
++    hass.data[deconz.DOMAIN] = True
++    entry = Mock()
++    entry.data = {'host': '1.2.3.4', 'port': 80, 'api_key': '1234567890ABCDEF'}
++
++    with caplog.at_level(logging.ERROR):
++        assert await deconz.async_setup_entry(hass, entry) is False
++
++    assert caplog.records
++
++
++async def test_setup_entry_no_available_bridge(hass):
++    """Test setup entry fails if deCONZ is not available."""
++    entry = Mock()
++    entry.data = {'host': '1.2.3.4', 'port': 80, 'api_key': '1234567890ABCDEF'}
++    with patch('pydeconz.DeconzSession.async_load_parameters',
++               new=mock_coro_func(False)):
++        assert await deconz.async_setup_entry(hass, entry) is False
++
++
++async def test_setup_entry_successful_forwards_supported_platforms(hass):
++    """Test deCONZ setup requests config-entry setup for supported platforms."""
++    entry = Mock()
++    entry.data = {'host': '1.2.3.4', 'port': 80, 'api_key': '1234567890ABCDEF'}
++    forwarded = []
++
++    async def mock_forward_entry_setup(entry_arg, platform):
++        forwarded.append((entry_arg, platform))
++        return True
++
++    with patch.object(hass.config_entries, 'async_forward_entry_setup',
++                      side_effect=mock_forward_entry_setup), \
++        patch('homeassistant.helpers.discovery.async_load_platform') \
++            as mock_discovery_load_platform, \
++        patch('pydeconz.DeconzSession.async_load_parameters',
++              new=mock_coro_func(True)):
++        assert await deconz.async_setup_entry(hass, entry) is True
++        await hass.async_block_till_done()
++
++    forwarded_platforms = [platform for entry_arg, platform in forwarded
++                           if entry_arg is entry]
++    assert sorted(forwarded_platforms) == [
++        'binary_sensor', 'light', 'scene', 'sensor']
++    assert len(forwarded_platforms) == 4
++    assert mock_discovery_load_platform.mock_calls == []
++
++
++async def test_setup_entry_can_create_forwarded_entities(hass):
++    """Test deCONZ setup can reach a real forwarded platform."""
++    data = {
++        "sensors": {
++            "1": {
++                "id": "presence-one-id",
++                "name": "Presence One",
++                "type": "ZHAPresence",
++                "state": {"presence": False},
++                "config": {}
++            }
++        }
++    }
++    entry = config_entries.ConfigEntry(
++        1, deconz.DOMAIN, 'Mock Title',
++        {'host': '1.2.3.4', 'port': 80, 'api_key': '1234567890ABCDEF'},
++        'test')
++    hass.config_entries._entries.append(entry)
++
++    with patch('pydeconz.DeconzSession.async_get_state',
++               new=mock_coro_func(data)), \
++        patch('homeassistant.helpers.discovery.async_load_platform') \
++            as mock_discovery_load_platform:
++        assert await deconz.async_setup_entry(hass, entry) is True
++        await hass.async_block_till_done()
++
++    assert hass.states.get("binary_sensor.presence_one") is not None
++    assert mock_discovery_load_platform.mock_calls == []
+diff --git a/tests/components/light/test_deconz.py b/tests/components/light/test_deconz.py
+new file mode 100644
+index 00000000000..1b62c05e504
+--- /dev/null
++++ b/tests/components/light/test_deconz.py
+@@ -0,0 +1,99 @@
++
++from unittest.mock import Mock, patch
++
++from homeassistant import config_entries
++from homeassistant.components import deconz
++from homeassistant.components import light as light_component
++from homeassistant.components.light import deconz as deconz_light
++from homeassistant import loader
++
++from tests.common import mock_coro_func
++
++
++LIGHTS = {
++    "1": {
++        "id": "Light 1 id",
++        "name": "Light 1 name",
++        "state": {}
++    },
++    "2": {
++        "id": "Light 2 id",
++        "name": "Light 2 name",
++        "state": {}
++    }
++}
++
++
++GROUPS = {
++    "1": {
++        "id": "Group 1 id",
++        "name": "Group 1 name",
++        "state": {},
++        "action": {},
++        "scenes": [],
++        "lights": ["1", "2"]
++    },
++    "2": {
++        "id": "Group 2 id",
++        "name": "Group 2 name",
++        "state": {},
++        "action": {},
++        "scenes": []
++    }
++}
++
++
++async def setup_bridge(hass, data):
++
++    from pydeconz import DeconzSession
++
++    entry = Mock()
++    entry.data = {'host': '1.2.3.4', 'port': 80, 'api_key': '1234567890ABCDEF'}
++    bridge = DeconzSession(Mock(), Mock(), **entry.data)
++    with patch('pydeconz.DeconzSession.async_get_state',
++               new=mock_coro_func(data)):
++        await bridge.async_load_parameters()
++
++    hass.data[deconz.DOMAIN] = bridge
++    hass.data[deconz.DATA_DECONZ_ID] = {}
++
++    config_entry = config_entries.ConfigEntry(
++        1, deconz.DOMAIN, 'Mock Title', {'host': 'mock-host'}, 'test')
++    hass.config_entries._entries.append(config_entry)
++    loader.set_component('light', light_component)
++    await hass.config_entries.async_forward_entry_setup(config_entry, 'light')
++    await hass.async_block_till_done()
++
++
++async def test_no_lights_or_groups(hass):
++
++    await setup_bridge(hass, {})
++
++    assert hass.states.async_all() == []
++
++
++async def test_lights_and_groups_added_from_config_entry(hass):
++
++    await setup_bridge(hass, {"lights": LIGHTS, "groups": GROUPS})
++
++    assert hass.states.get("light.light_1_name") is not None
++    assert hass.states.get("light.light_2_name") is not None
++    assert hass.states.get("light.group_1_name") is not None
++    assert hass.states.get("light.group_2_name") is None
++    assert len([
++        state for state in hass.states.async_all()
++        if state.entity_id.startswith("light.")
++    ]) == 3
++
++
++async def test_legacy_setup_platform_does_not_add_lights(hass):
++
++    added = []
++
++    async def async_add_devices(devices):
++        added.extend(devices)
++
++    await deconz_light.async_setup_platform(
++        hass, {}, async_add_devices, discovery_info={"host": "mock-host"})
++
++    assert added == []
+diff --git a/tests/components/scene/test_deconz.py b/tests/components/scene/test_deconz.py
+new file mode 100644
+index 00000000000..1db5c56dba3
+--- /dev/null
++++ b/tests/components/scene/test_deconz.py
+@@ -0,0 +1,72 @@
++
++from unittest.mock import Mock, patch
++
++from homeassistant import config_entries
++from homeassistant.components import deconz
++from homeassistant.components.scene import deconz as deconz_scene
++
++from tests.common import mock_coro_func
++
++
++GROUPS = {
++    "1": {
++        "id": "Group 1 id",
++        "name": "Group 1 name",
++        "state": {},
++        "action": {},
++        "scenes": [
++            {"id": "1", "name": "Scene 1"},
++            {"id": "2", "name": "Scene 2"}
++        ]
++    }
++}
++
++
++async def setup_bridge(hass, data):
++
++    from pydeconz import DeconzSession
++
++    entry = Mock()
++    entry.data = {'host': '1.2.3.4', 'port': 80, 'api_key': '1234567890ABCDEF'}
++    bridge = DeconzSession(Mock(), Mock(), **entry.data)
++    with patch('pydeconz.DeconzSession.async_get_state',
++               new=mock_coro_func(data)):
++        await bridge.async_load_parameters()
++
++    hass.data[deconz.DOMAIN] = bridge
++    hass.data[deconz.DATA_DECONZ_ID] = {}
++
++    config_entry = config_entries.ConfigEntry(
++        1, deconz.DOMAIN, 'Mock Title', {'host': 'mock-host'}, 'test')
++    hass.config_entries._entries.append(config_entry)
++    await hass.config_entries.async_forward_entry_setup(config_entry, 'scene')
++    await hass.async_block_till_done()
++
++
++async def test_no_scenes(hass):
++
++    await setup_bridge(hass, {})
++
++    assert hass.states.async_all() == []
++
++
++async def test_scenes_added_from_config_entry(hass):
++
++    await setup_bridge(hass, {"groups": GROUPS})
++
++    assert hass.states.get("scene.group_1_name_scene_1") is not None
++    assert hass.states.get("scene.group_1_name_scene_2") is not None
++    assert len(hass.states.async_all()) == 2
++
++
++async def test_legacy_setup_platform_does_not_add_scenes(hass):
++
++    added = []
++
++    async def async_add_devices(devices):
++        added.extend(devices)
++
++    await deconz_scene.async_setup_platform(
++        hass, {}, async_add_devices, discovery_info={"host": "mock-host"})
++
++    assert added == []
+diff --git a/tests/components/sensor/test_deconz.py b/tests/components/sensor/test_deconz.py
+new file mode 100644
+index 00000000000..d72dc4a02eb
+--- /dev/null
++++ b/tests/components/sensor/test_deconz.py
+@@ -0,0 +1,93 @@
++
++from unittest.mock import Mock, patch
++
++from homeassistant import config_entries
++from homeassistant.components import deconz
++from homeassistant.components.sensor import deconz as deconz_sensor
++
++from tests.common import mock_coro_func
++
++
++SENSORS = {
++    "1": {
++        "id": "Sensor 1 id",
++        "name": "Sensor 1 name",
++        "type": "ZHATemperature",
++        "state": {"temperature": 2150},
++        "config": {}
++    },
++    "2": {
++        "id": "Sensor 2 id",
++        "name": "Sensor 2 name",
++        "type": "ZHAPresence",
++        "state": {"presence": False},
++        "config": {}
++    },
++    "3": {
++        "id": "Sensor 3 id",
++        "name": "Sensor 3 name",
++        "type": "ZHASwitch",
++        "state": {"buttonevent": 1000},
++        "config": {}
++    },
++    "4": {
++        "id": "Sensor 4 id",
++        "name": "Sensor 4 name",
++        "type": "ZHASwitch",
++        "state": {"buttonevent": 1000},
++        "config": {"battery": 100}
++    }
++}
++
++
++async def setup_bridge(hass, data):
++
++    from pydeconz import DeconzSession
++
++    entry = Mock()
++    entry.data = {'host': '1.2.3.4', 'port': 80, 'api_key': '1234567890ABCDEF'}
++    bridge = DeconzSession(Mock(), Mock(), **entry.data)
++    with patch('pydeconz.DeconzSession.async_get_state',
++               new=mock_coro_func(data)):
++        await bridge.async_load_parameters()
++
++    hass.data[deconz.DOMAIN] = bridge
++    hass.data[deconz.DATA_DECONZ_ID] = {}
++
++    config_entry = config_entries.ConfigEntry(
++        1, deconz.DOMAIN, 'Mock Title', {'host': 'mock-host'}, 'test')
++    hass.config_entries._entries.append(config_entry)
++    await hass.config_entries.async_forward_entry_setup(config_entry, 'sensor')
++    await hass.async_block_till_done()
++
++
++async def test_no_sensors(hass):
++
++    await setup_bridge(hass, {})
++
++    assert hass.states.async_all() == []
++
++
++async def test_sensors_added_from_config_entry(hass):
++
++    await setup_bridge(hass, {"sensors": SENSORS})
++
++    assert hass.states.get("sensor.sensor_1_name") is not None
++    assert hass.states.get("sensor.sensor_2_name") is None
++    assert hass.states.get("sensor.sensor_3_name") is None
++    assert hass.states.get("sensor.sensor_3_name_battery_level") is None
++    assert hass.states.get("sensor.sensor_4_name_battery_level") is not None
++    assert len(hass.states.async_all()) == 2
++
++
++async def test_legacy_setup_platform_does_not_add_sensors(hass):
++
++    added = []
++
++    async def async_add_devices(devices):
++        added.extend(devices)
++
++    await deconz_sensor.async_setup_platform(
++        hass, {}, async_add_devices, discovery_info={"host": "mock-host"})
++
++    assert added == []
+diff --git a/tests/components/test_config_entry_forwarding.py b/tests/components/test_config_entry_forwarding.py
+new file mode 100644
+index 00000000000..0e1c2fed46a
+--- /dev/null
++++ b/tests/components/test_config_entry_forwarding.py
+@@ -0,0 +1,48 @@
++
++import importlib.machinery
++import sys
++import types
++
++import pytest
++
++from homeassistant import config_entries
++from homeassistant.setup import async_setup_component
++
++
++pytestmark = pytest.mark.parametrize("entity_domain", ["binary_sensor", "sensor", "scene"])
++
++
++async def test_base_entity_component_forwards_config_entries(
++        hass, monkeypatch, entity_domain):
++
++    calls = []
++    integration_domain = "forwarding_probe_{}".format(entity_domain)
++    platform_name = "homeassistant.components.{}.{}".format(
++        entity_domain, integration_domain)
++
++    platform = types.ModuleType(platform_name)
++    platform.__spec__ = importlib.machinery.ModuleSpec(
++        platform_name, None, origin="fixture-test")
++
++    async def async_setup_entry(hass_arg, entry_arg, async_add_entities):
++
++        calls.append((hass_arg, entry_arg, async_add_entities))
++        return True
++
++    platform.async_setup_entry = async_setup_entry
++
++    monkeypatch.setitem(sys.modules, platform_name, platform)
++
++    assert await async_setup_component(hass, entity_domain, {}) is True
++
++    entry = config_entries.ConfigEntry(
++        1, integration_domain, "Forwarding probe", {}, "test")
++    hass.config_entries._entries.append(entry)
++
++    result = await hass.config_entries.async_forward_entry_setup(
++        entry, entity_domain)
++
++    assert result is not False
++    assert len(calls) == 1
++    assert calls[0][0] is hass
++    assert calls[0][1] is entry
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,53 @@
++#!/bin/bash
++set -uo pipefail
++cd /testbed
++
++set +u
++if [ ! -x /testbed/.venv/bin/python ]; then
++  python3 -m venv /testbed/.venv
++fi
++source /testbed/.venv/bin/activate
++set -u
++
++if [ ! -f /testbed/.venv/.stage3_deconz_deps ]; then
++  python -m pip install --upgrade 'pip<24' wheel 'setuptools==57.5.0'
++  python -m pip install \
++    -e . \
++    'Jinja2==2.11.3' \
++    'MarkupSafe==2.0.1' \
++    'PyDispatcher==2.0.5' \
++    'pydeconz==36' \
++    'pytest==3.4.2' \
++    'pytest-aiohttp==0.3.0' \
++    'pytest-timeout==1.2.1' \
++    'requests_mock==1.4' \
++    'pytest-cov==2.5.1' \
++    'pytest-sugar==0.9.1' \
++    'asynctest>=0.11.1' \
++    'mock-open==1.3.1'
++  touch /testbed/.venv/.stage3_deconz_deps
++fi
++
++case "${1:-}" in
++  base)
++    python -m pytest tests/components/deconz/test_init.py -v -k \
++      "test_config_with_host_passed_to_config_entry or test_config_import_from_config_file or test_config_discovery"
++    ;;
++  new)
++    python -m pytest \
++      tests/components/test_config_entry_forwarding.py \
++      tests/components/binary_sensor/test_deconz.py \
++      tests/components/deconz/test_init.py::test_setup_entry_already_registered_bridge \
++      tests/components/deconz/test_init.py::test_setup_entry_no_available_bridge \
++      tests/components/deconz/test_init.py::test_setup_entry_successful_forwards_supported_platforms \
++      tests/components/deconz/test_init.py::test_setup_entry_can_create_forwarded_entities \
++      tests/components/light/test_deconz.py \
++      tests/components/scene/test_deconz.py \
++      tests/components/sensor/test_deconz.py \
++      -v
++    ;;
++  *)
++    echo "usage: $0 base|new"
++    exit 2
++    ;;
++esac

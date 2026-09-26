@@ -1,0 +1,809 @@
+diff --git a/plugins/aws/queue/sqs/sqs_complete_test.go b/plugins/aws/queue/sqs/sqs_complete_test.go
+new file mode 100644
+index 00000000..06ab9585
+--- /dev/null
++++ b/plugins/aws/queue/sqs/sqs_complete_test.go
+@@ -0,0 +1,135 @@
++package sqs_plugin_test
++
++import (
++	"errors"
++	"testing"
++
++	"github.com/aws/aws-sdk-go/service/sqs"
++	"github.com/aws/aws-sdk-go/service/sqs/sqsiface"
++	sqs_plugin "github.com/nitric-dev/membrane/plugins/aws/queue/sqs"
++)
++
++type recordedSQSComplete struct {
++	queueURL string
++	leaseID  string
++}
++
++type recordingSQS struct {
++	sqsiface.SQSAPI
++	queueURLs   []string
++	deleteError error
++	completes   []recordedSQSComplete
++}
++
++func (r *recordingSQS) ListQueues(in *sqs.ListQueuesInput) (*sqs.ListQueuesOutput, error) {
++	urls := make([]*string, 0, len(r.queueURLs))
++	for _, q := range r.queueURLs {
++		q := q
++		urls = append(urls, &q)
++	}
++	return &sqs.ListQueuesOutput{QueueUrls: urls}, nil
++}
++
++func (r *recordingSQS) DeleteMessage(in *sqs.DeleteMessageInput) (*sqs.DeleteMessageOutput, error) {
++	queueURL := ""
++	if in.QueueUrl != nil {
++		queueURL = *in.QueueUrl
++	}
++	leaseID := ""
++	if in.ReceiptHandle != nil {
++		leaseID = *in.ReceiptHandle
++	}
++	r.completes = append(r.completes, recordedSQSComplete{
++		queueURL: queueURL,
++		leaseID:  leaseID,
++	})
++	if r.deleteError != nil {
++		return nil, r.deleteError
++	}
++	return &sqs.DeleteMessageOutput{}, nil
++}
++
++func TestSQSCompleteDeletesKnownQueueMessage(t *testing.T) {
++	cases := []struct {
++		name    string
++		queue   string
++		leaseID string
++	}{
++		{name: "alpha", queue: "alpha-work-items", leaseID: "lease-alpha-7"},
++		{name: "beta", queue: "beta-work-items", leaseID: "lease-beta-9"},
++	}
++
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			client := &recordingSQS{
++				queueURLs: []string{"alpha-work-items", "beta-work-items"},
++			}
++			plugin := sqs_plugin.NewWithClient(client)
++
++			if err := plugin.Complete(tc.queue, tc.leaseID); err != nil {
++				t.Fatalf("Complete returned unexpected error: %v", err)
++			}
++			if got := len(client.completes); got != 1 {
++				t.Fatalf("expected one backend completion, got %d", got)
++			}
++			if client.completes[0].queueURL != tc.queue {
++				t.Fatalf("completion used queue target %q, want %q", client.completes[0].queueURL, tc.queue)
++			}
++			if client.completes[0].leaseID != tc.leaseID {
++				t.Fatalf("completion used lease %q, want %q", client.completes[0].leaseID, tc.leaseID)
++			}
++		})
++	}
++}
++
++func TestSQSCompleteReturnsContextOnDeleteFailure(t *testing.T) {
++	cases := []struct {
++		name         string
++		leaseID      string
++		sentinelText string
++	}{
++		{name: "first sentinel", leaseID: "lease-error-a", sentinelText: "boom-sqs-a"},
++		{name: "second sentinel", leaseID: "lease-error-b", sentinelText: "boom-sqs-b"},
++	}
++
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			client := &recordingSQS{
++				queueURLs:   []string{"error-work-items"},
++				deleteError: errors.New(tc.sentinelText),
++			}
++			plugin := sqs_plugin.NewWithClient(client)
++
++			err := plugin.Complete("error-work-items", tc.leaseID)
++			if err == nil {
++				t.Fatal("expected Complete to return an error")
++			}
++			if got := len(client.completes); got != 1 {
++				t.Fatalf("expected one backend completion attempt, got %d", got)
++			}
++			if client.completes[0].queueURL != "error-work-items" {
++				t.Fatalf("completion used queue target %q, want %q", client.completes[0].queueURL, "error-work-items")
++			}
++			if client.completes[0].leaseID != tc.leaseID {
++				t.Fatalf("completion used lease %q, want %q", client.completes[0].leaseID, tc.leaseID)
++			}
++		})
++	}
++}
++
++func TestSQSCompleteUnknownQueueDoesNotComplete(t *testing.T) {
++	for _, missingQueue := range []string{"missing-work-items", "absent-dead-letter"} {
++		t.Run(missingQueue, func(t *testing.T) {
++			client := &recordingSQS{queueURLs: []string{"known-work-items"}}
++			plugin := sqs_plugin.NewWithClient(client)
++
++			err := plugin.Complete(missingQueue, "lease-for-"+missingQueue)
++			if err == nil {
++				t.Fatal("expected Complete to return an error for an unknown queue")
++			}
++			if got := len(client.completes); got != 0 {
++				t.Fatalf("expected no backend completion for unknown queue, got %d", got)
++			}
++		})
++	}
++}
+diff --git a/plugins/dev/queue/queue_complete_test.go b/plugins/dev/queue/queue_complete_test.go
+new file mode 100644
+index 00000000..f77beed1
+--- /dev/null
++++ b/plugins/dev/queue/queue_complete_test.go
+@@ -0,0 +1,29 @@
++package queue_plugin_test
++
++import (
++	"testing"
++
++	queue_plugin "github.com/nitric-dev/membrane/plugins/dev/queue"
++)
++
++func TestLocalQueueCompleteAlwaysSucceeds(t *testing.T) {
++	plugin, err := queue_plugin.New()
++	if err != nil {
++		t.Fatalf("New returned unexpected error: %v", err)
++	}
++
++	cases := []struct {
++		queue   string
++		leaseID string
++	}{
++		{queue: "local-alpha", leaseID: "lease-local-1"},
++		{queue: "local beta/with spaces", leaseID: "lease-local-2"},
++		{queue: "", leaseID: ""},
++	}
++
++	for _, tc := range cases {
++		if err := plugin.Complete(tc.queue, tc.leaseID); err != nil {
++			t.Fatalf("Complete(%q, %q) returned unexpected error: %v", tc.queue, tc.leaseID, err)
++		}
++	}
++}
+diff --git a/plugins/gcp/queue/pubsub/pubsub_complete_test.go b/plugins/gcp/queue/pubsub/pubsub_complete_test.go
+new file mode 100644
+index 00000000..2e2b06b9
+--- /dev/null
++++ b/plugins/gcp/queue/pubsub/pubsub_complete_test.go
+@@ -0,0 +1,198 @@
++package pubsub_queue_plugin_test
++
++import (
++	"context"
++	"errors"
++	"testing"
++
++	"github.com/googleapis/gax-go/v2"
++	"github.com/nitric-dev/membrane/plugins/gcp/ifaces"
++	pubsub_queue_plugin "github.com/nitric-dev/membrane/plugins/gcp/queue/pubsub"
++	"google.golang.org/api/iterator"
++	"google.golang.org/api/option"
++	pubsubpb "google.golang.org/genproto/googleapis/pubsub/v1"
++)
++
++type recordedPubSubAck struct {
++	subscription string
++	ackIDs       []string
++}
++
++type recordingSubscriber struct {
++	ackError error
++	acks     []recordedPubSubAck
++}
++
++func (r *recordingSubscriber) Close() error {
++	return nil
++}
++
++func (r *recordingSubscriber) Pull(ctx context.Context, req *pubsubpb.PullRequest, opts ...gax.CallOption) (*pubsubpb.PullResponse, error) {
++	return &pubsubpb.PullResponse{}, nil
++}
++
++func (r *recordingSubscriber) Acknowledge(ctx context.Context, req *pubsubpb.AcknowledgeRequest, opts ...gax.CallOption) error {
++	ackIDs := append([]string(nil), req.AckIds...)
++	r.acks = append(r.acks, recordedPubSubAck{
++		subscription: req.Subscription,
++		ackIDs:       ackIDs,
++	})
++	return r.ackError
++}
++
++type fakePubSubClient struct {
++	topics map[string]bool
++}
++
++func (f *fakePubSubClient) Topic(id string) ifaces.Topic {
++	return &fakeTopic{id: id, exists: f.topics[id]}
++}
++
++func (f *fakePubSubClient) Topics(ctx context.Context) ifaces.TopicIterator {
++	return &fakeTopicIterator{}
++}
++
++type fakeTopicIterator struct{}
++
++func (f *fakeTopicIterator) Next() (ifaces.Topic, error) {
++	return nil, iterator.Done
++}
++
++type fakeTopic struct {
++	id     string
++	exists bool
++}
++
++func (f *fakeTopic) String() string {
++	return f.id
++}
++
++func (f *fakeTopic) Publish(ctx context.Context, msg ifaces.Message) ifaces.PublishResult {
++	return fakePublishResult{}
++}
++
++func (f *fakeTopic) Exists(ctx context.Context) (bool, error) {
++	return f.exists, nil
++}
++
++func (f *fakeTopic) Subscriptions(ctx context.Context) ifaces.SubscriptionIterator {
++	if !f.exists {
++		return &fakeSubscriptionIterator{}
++	}
++	return &fakeSubscriptionIterator{subs: []ifaces.Subscription{fakeSubscription{topicID: f.id}}}
++}
++
++func (f *fakeTopic) ID() string {
++	return f.id
++}
++
++type fakeSubscription struct {
++	topicID string
++}
++
++func (f fakeSubscription) ID() string {
++	return f.topicID + "-nitricqueue"
++}
++
++func (f fakeSubscription) String() string {
++	return "projects/fixture/subscriptions/" + f.ID()
++}
++
++type fakeSubscriptionIterator struct {
++	idx  int
++	subs []ifaces.Subscription
++}
++
++func (f *fakeSubscriptionIterator) Next() (ifaces.Subscription, error) {
++	if f.idx >= len(f.subs) {
++		return nil, iterator.Done
++	}
++	sub := f.subs[f.idx]
++	f.idx++
++	return sub, nil
++}
++
++type fakePublishResult struct{}
++
++func (fakePublishResult) Get(ctx context.Context) (string, error) {
++	return "", nil
++}
++
++var _ ifaces.SubscriberClient = (*recordingSubscriber)(nil)
++
++func newPubSubPluginWithRecordingSubscriber(topics []string, subscriber *recordingSubscriber) interface {
++	Complete(queue string, leaseId string) error
++} {
++	topicSet := map[string]bool{}
++	for _, topic := range topics {
++		topicSet[topic] = true
++	}
++	return pubsub_queue_plugin.NewWithClients(&fakePubSubClient{topics: topicSet}, func(ctx context.Context, opts ...option.ClientOption) (ifaces.SubscriberClient, error) {
++		return subscriber, nil
++	})
++}
++
++func TestPubSubCompleteAcknowledgesKnownQueueLease(t *testing.T) {
++	cases := []struct {
++		name    string
++		queue   string
++		leaseID string
++	}{
++		{name: "alpha", queue: "queue-alpha", leaseID: "ack-alpha-7"},
++		{name: "beta", queue: "queue-beta", leaseID: "ack-beta-9"},
++	}
++
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			subscriber := &recordingSubscriber{}
++			plugin := newPubSubPluginWithRecordingSubscriber([]string{"queue-alpha", "queue-beta"}, subscriber)
++
++			if err := plugin.Complete(tc.queue, tc.leaseID); err != nil {
++				t.Fatalf("Complete returned unexpected error: %v", err)
++			}
++			if got := len(subscriber.acks); got != 1 {
++				t.Fatalf("expected one acknowledgement, got %d", got)
++			}
++			wantSubscription := fakeSubscription{topicID: tc.queue}.String()
++			if subscriber.acks[0].subscription != wantSubscription {
++				t.Fatalf("ack subscription %q, want %q", subscriber.acks[0].subscription, wantSubscription)
++			}
++			if got := subscriber.acks[0].ackIDs; len(got) != 1 || got[0] != tc.leaseID {
++				t.Fatalf("ack IDs = %#v, want exactly %#v", got, []string{tc.leaseID})
++			}
++		})
++	}
++}
++
++func TestPubSubCompleteReturnsContextOnAckFailure(t *testing.T) {
++	cases := []struct {
++		name         string
++		leaseID      string
++		sentinelText string
++	}{
++		{name: "first sentinel", leaseID: "ack-error-a", sentinelText: "boom-pubsub-a"},
++		{name: "second sentinel", leaseID: "ack-error-b", sentinelText: "boom-pubsub-b"},
++	}
++
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			subscriber := &recordingSubscriber{ackError: errors.New(tc.sentinelText)}
++			plugin := newPubSubPluginWithRecordingSubscriber([]string{"queue-error"}, subscriber)
++
++			err := plugin.Complete("queue-error", tc.leaseID)
++			if err == nil {
++				t.Fatal("expected Complete to return an error")
++			}
++			if got := len(subscriber.acks); got != 1 {
++				t.Fatalf("expected one acknowledgement attempt, got %d", got)
++			}
++			wantSubscription := fakeSubscription{topicID: "queue-error"}.String()
++			if subscriber.acks[0].subscription != wantSubscription {
++				t.Fatalf("ack subscription %q, want %q", subscriber.acks[0].subscription, wantSubscription)
++			}
++			if got := subscriber.acks[0].ackIDs; len(got) != 1 || got[0] != tc.leaseID {
++				t.Fatalf("ack IDs = %#v, want exactly %#v", got, []string{tc.leaseID})
++			}
++		})
++	}
++}
+diff --git a/plugins/sdk/queue_complete_test.go b/plugins/sdk/queue_complete_test.go
+new file mode 100644
+index 00000000..df67eb0c
+--- /dev/null
++++ b/plugins/sdk/queue_complete_test.go
+@@ -0,0 +1,31 @@
++package sdk_test
++
++import (
++	"testing"
++
++	"github.com/nitric-dev/membrane/plugins/sdk"
++)
++
++type completeContractQueuePlugin struct{}
++
++func (completeContractQueuePlugin) Push(queue string, events []sdk.NitricEvent) (*sdk.PushResponse, error) {
++	return &sdk.PushResponse{}, nil
++}
++
++func (completeContractQueuePlugin) Pop(options sdk.PopOptions) ([]sdk.NitricQueueItem, error) {
++	return nil, nil
++}
++
++func (completeContractQueuePlugin) Complete(queue string, leaseId string) error {
++	return nil
++}
++
++var _ sdk.QueuePlugin = (*completeContractQueuePlugin)(nil)
++
++func TestQueuePluginInterfaceIncludesComplete(t *testing.T) {
++	var plugin sdk.QueuePlugin = &completeContractQueuePlugin{}
++
++	if err := plugin.Complete("contract-queue", "contract-lease"); err != nil {
++		t.Fatalf("Complete returned unexpected error: %v", err)
++	}
++}
+diff --git a/services/queue_grpc_complete_test.go b/services/queue_grpc_complete_test.go
+new file mode 100644
+index 00000000..bc2b3d1a
+--- /dev/null
++++ b/services/queue_grpc_complete_test.go
+@@ -0,0 +1,119 @@
++package services
++
++import (
++	"context"
++	"errors"
++	"testing"
++
++	pb "github.com/nitric-dev/membrane/interfaces/nitric/v1"
++	"github.com/nitric-dev/membrane/plugins/sdk"
++	"google.golang.org/grpc/codes"
++	"google.golang.org/grpc/status"
++)
++
++type recordedPluginComplete struct {
++	queue   string
++	leaseID string
++}
++
++type recordingQueuePlugin struct {
++	completeError error
++	completes     []recordedPluginComplete
++}
++
++func (r *recordingQueuePlugin) Push(queue string, events []sdk.NitricEvent) (*sdk.PushResponse, error) {
++	return &sdk.PushResponse{}, nil
++}
++
++func (r *recordingQueuePlugin) Pop(options sdk.PopOptions) ([]sdk.NitricQueueItem, error) {
++	return nil, nil
++}
++
++func (r *recordingQueuePlugin) Complete(queue string, leaseId string) error {
++	r.completes = append(r.completes, recordedPluginComplete{
++		queue:   queue,
++		leaseID: leaseId,
++	})
++	return r.completeError
++}
++
++var _ sdk.QueuePlugin = (*recordingQueuePlugin)(nil)
++
++func TestQueueServerCompleteDelegatesAndReturnsResponse(t *testing.T) {
++	cases := []struct {
++		name    string
++		queue   string
++		leaseID string
++	}{
++		{name: "alpha", queue: "grpc-alpha", leaseID: "grpc-lease-1"},
++		{name: "beta", queue: "grpc-beta", leaseID: "grpc-lease-2"},
++	}
++
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			plugin := &recordingQueuePlugin{}
++			server := NewQueueServer(plugin)
++
++			resp, err := server.Complete(context.Background(), &pb.CompleteRequest{
++				Queue:   tc.queue,
++				LeaseId: tc.leaseID,
++			})
++			if err != nil {
++				t.Fatalf("Complete returned unexpected error: %v", err)
++			}
++			if resp == nil {
++				t.Fatal("Complete returned nil response on success")
++			}
++			if got := len(plugin.completes); got != 1 {
++				t.Fatalf("expected one plugin Complete call, got %d", got)
++			}
++			if plugin.completes[0].queue != tc.queue {
++				t.Fatalf("plugin saw queue %q, want %q", plugin.completes[0].queue, tc.queue)
++			}
++			if plugin.completes[0].leaseID != tc.leaseID {
++				t.Fatalf("plugin saw lease %q, want %q", plugin.completes[0].leaseID, tc.leaseID)
++			}
++		})
++	}
++}
++
++func TestQueueServerCompletePropagatesPluginError(t *testing.T) {
++	sentinelErr := errors.New("plugin complete failed")
++	plugin := &recordingQueuePlugin{completeError: sentinelErr}
++	server := NewQueueServer(plugin)
++
++	resp, err := server.Complete(context.Background(), &pb.CompleteRequest{
++		Queue:   "grpc-error-queue",
++		LeaseId: "grpc-error-lease",
++	})
++	if err == nil {
++		t.Fatal("expected Complete to return plugin error")
++	}
++	if resp != nil {
++		t.Fatalf("expected nil response on plugin error, got %#v", resp)
++	}
++	if got := len(plugin.completes); got != 1 {
++		t.Fatalf("expected one plugin Complete call, got %d", got)
++	}
++	if !errors.Is(err, sentinelErr) {
++		t.Fatalf("Complete returned error %#v, want plugin sentinel %#v", err, sentinelErr)
++	}
++}
++
++func TestQueueServerCompleteWithoutPluginReturnsRegistrationError(t *testing.T) {
++	server := NewQueueServer(nil)
++
++	resp, err := server.Complete(context.Background(), &pb.CompleteRequest{
++		Queue:   "grpc-unregistered",
++		LeaseId: "grpc-unregistered-lease",
++	})
++	if err == nil {
++		t.Fatal("expected Complete to return an error when no plugin is registered")
++	}
++	if got := status.Code(err); got != codes.Unimplemented {
++		t.Fatalf("Complete returned status %v, want %v", got, codes.Unimplemented)
++	}
++	if resp != nil {
++		t.Fatalf("expected nil response when no plugin is registered, got %#v", resp)
++	}
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,262 @@
++#!/bin/bash
++set -euo pipefail
++
++cd /testbed
++
++
++go mod download
++
++
++ensure_interfaces_stub() {
++  if find interfaces/nitric/v1 -maxdepth 1 -name '*.go' -print -quit 2>/dev/null | grep -q .; then
++    return 0
++  fi
++
++  mkdir -p interfaces/nitric/v1
++  cat > interfaces/nitric/v1/fixture_stub.go <<'GO'
++package v1
++
++import (
++	"context"
++
++	"github.com/golang/protobuf/ptypes/empty"
++	"google.golang.org/protobuf/types/known/structpb"
++)
++
++type AuthServer interface {
++	CreateUser(context.Context, *CreateUserRequest) (*CreateUserResponse, error)
++}
++
++type UnimplementedAuthServer struct{}
++
++type CreateUserRequest struct {
++	Tenant   string
++	Id       string
++	Email    string
++	Password string
++}
++
++func (r *CreateUserRequest) GetTenant() string   { if r == nil { return "" }; return r.Tenant }
++func (r *CreateUserRequest) GetId() string       { if r == nil { return "" }; return r.Id }
++func (r *CreateUserRequest) GetEmail() string    { if r == nil { return "" }; return r.Email }
++func (r *CreateUserRequest) GetPassword() string { if r == nil { return "" }; return r.Password }
++
++type CreateUserResponse struct{}
++
++type DocumentsServer interface {
++	CreateDocument(context.Context, *CreateDocumentRequest) (*empty.Empty, error)
++	GetDocument(context.Context, *GetDocumentRequest) (*GetDocumentReply, error)
++	UpdateDocument(context.Context, *UpdateDocumentRequest) (*empty.Empty, error)
++	DeleteDocument(context.Context, *DeleteDocumentRequest) (*empty.Empty, error)
++}
++
++type UnimplementedDocumentsServer struct{}
++
++type CreateDocumentRequest struct {
++	Collection string
++	Key        string
++	Document   *structpb.Struct
++}
++
++func (r *CreateDocumentRequest) GetCollection() string { if r == nil { return "" }; return r.Collection }
++func (r *CreateDocumentRequest) GetKey() string        { if r == nil { return "" }; return r.Key }
++func (r *CreateDocumentRequest) GetDocument() *structpb.Struct {
++	if r == nil || r.Document == nil {
++		return &structpb.Struct{}
++	}
++	return r.Document
++}
++
++type GetDocumentRequest struct {
++	Collection string
++	Key        string
++}
++
++func (r *GetDocumentRequest) GetCollection() string { if r == nil { return "" }; return r.Collection }
++func (r *GetDocumentRequest) GetKey() string        { if r == nil { return "" }; return r.Key }
++
++type GetDocumentReply struct {
++	Document *structpb.Struct
++}
++
++type UpdateDocumentRequest struct {
++	Collection string
++	Key        string
++	Document   *structpb.Struct
++}
++
++func (r *UpdateDocumentRequest) GetCollection() string { if r == nil { return "" }; return r.Collection }
++func (r *UpdateDocumentRequest) GetKey() string        { if r == nil { return "" }; return r.Key }
++func (r *UpdateDocumentRequest) GetDocument() *structpb.Struct {
++	if r == nil || r.Document == nil {
++		return &structpb.Struct{}
++	}
++	return r.Document
++}
++
++type DeleteDocumentRequest struct {
++	Collection string
++	Key        string
++}
++
++func (r *DeleteDocumentRequest) GetCollection() string { if r == nil { return "" }; return r.Collection }
++func (r *DeleteDocumentRequest) GetKey() string        { if r == nil { return "" }; return r.Key }
++
++type EventingServer interface {
++	Publish(context.Context, *PublishRequest) (*empty.Empty, error)
++	GetTopics(context.Context, *empty.Empty) (*GetTopicsReply, error)
++}
++
++type UnimplementedEventingServer struct{}
++
++type PublishRequest struct {
++	TopicName string
++	Event     *NitricEvent
++}
++
++func (r *PublishRequest) GetTopicName() string { if r == nil { return "" }; return r.TopicName }
++func (r *PublishRequest) GetEvent() *NitricEvent {
++	if r == nil || r.Event == nil {
++		return &NitricEvent{}
++	}
++	return r.Event
++}
++
++type GetTopicsReply struct {
++	Topics []string
++}
++
++type StorageServer interface {
++	Put(context.Context, *PutRequest) (*PutReply, error)
++	Get(context.Context, *GetRequest) (*GetReply, error)
++	Delete(context.Context, *DeleteRequest) (*DeleteReply, error)
++}
++
++type UnimplementedStorageServer struct{}
++
++type PutRequest struct {
++	BucketName string
++	Key        string
++	Body       []byte
++}
++
++func (r *PutRequest) GetBucketName() string { if r == nil { return "" }; return r.BucketName }
++func (r *PutRequest) GetKey() string        { if r == nil { return "" }; return r.Key }
++func (r *PutRequest) GetBody() []byte       { if r == nil { return nil }; return r.Body }
++
++type PutReply struct {
++	Success bool
++}
++
++type GetRequest struct {
++	BucketName string
++	Key        string
++}
++
++func (r *GetRequest) GetBucketName() string { if r == nil { return "" }; return r.BucketName }
++func (r *GetRequest) GetKey() string        { if r == nil { return "" }; return r.Key }
++
++type GetReply struct {
++	Body []byte
++}
++
++type DeleteRequest struct {
++	BucketName string
++	Key        string
++}
++
++func (r *DeleteRequest) GetBucketName() string { if r == nil { return "" }; return r.BucketName }
++func (r *DeleteRequest) GetKey() string        { if r == nil { return "" }; return r.Key }
++
++type DeleteReply struct {
++	Success bool
++}
++
++type QueueServer interface {
++	Push(context.Context, *PushRequest) (*PushResponse, error)
++	Pop(context.Context, *PopRequest) (*PopResponse, error)
++	Complete(context.Context, *CompleteRequest) (*CompleteResponse, error)
++}
++
++type UnimplementedQueueServer struct{}
++
++type NitricEvent struct {
++	RequestId   string
++	PayloadType string
++	Payload     *structpb.Struct
++}
++
++func (e *NitricEvent) GetRequestId() string   { if e == nil { return "" }; return e.RequestId }
++func (e *NitricEvent) GetPayloadType() string { if e == nil { return "" }; return e.PayloadType }
++func (e *NitricEvent) GetPayload() *structpb.Struct {
++	if e == nil || e.Payload == nil {
++		return &structpb.Struct{}
++	}
++	return e.Payload
++}
++
++type FailedMessage struct {
++	Event   *NitricEvent
++	Message string
++}
++
++type PushRequest struct {
++	Queue  string
++	Events []*NitricEvent
++}
++
++func (r *PushRequest) GetQueue() string          { if r == nil { return "" }; return r.Queue }
++func (r *PushRequest) GetEvents() []*NitricEvent { if r == nil { return nil }; return r.Events }
++
++type PushResponse struct {
++	FailedMessages []*FailedMessage
++}
++
++type PopRequest struct {
++	Queue string
++	Depth int32
++}
++
++func (r *PopRequest) GetQueue() string { if r == nil { return "" }; return r.Queue }
++func (r *PopRequest) GetDepth() int32  { if r == nil { return 0 }; return r.Depth }
++
++type PopResponse struct {
++	Items []*NitricQueueItem
++}
++
++type NitricQueueItem struct {
++	Event   *NitricEvent
++	LeaseId string
++}
++
++type CompleteRequest struct {
++	Queue   string
++	LeaseId string
++}
++
++func (r *CompleteRequest) GetQueue() string   { if r == nil { return "" }; return r.Queue }
++func (r *CompleteRequest) GetLeaseId() string { if r == nil { return "" }; return r.LeaseId }
++
++type CompleteResponse struct{}
++GO
++}
++
++case "${1:-}" in
++  base)
++    go test -v -run '^TestSqs$' ./plugins/aws/queue/sqs/ &&
++    go test -v -run '^TestQueue$' ./plugins/dev/queue/ &&
++    go test -v -run '^TestPubsub$' ./plugins/gcp/queue/pubsub/
++    ;;
++  new)
++    ensure_interfaces_stub
++    go test -v -run 'TestQueuePluginInterfaceIncludesComplete' ./plugins/sdk/ &&
++    go test -v -run 'TestSQSComplete' ./plugins/aws/queue/sqs/ &&
++    go test -v -run 'TestLocalQueueCompleteAlwaysSucceeds' ./plugins/dev/queue/ &&
++    go test -v -run 'TestPubSubComplete' ./plugins/gcp/queue/pubsub/ &&
++    go test -v -run 'TestQueueServerComplete' ./services/
++    ;;
++  *)
++    echo "usage: $0 base|new"
++    exit 2
++    ;;
++esac

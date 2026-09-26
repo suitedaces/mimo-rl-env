@@ -1,0 +1,402 @@
+diff --git a/pkg/alertmanager/api_oauth2_test.go b/pkg/alertmanager/api_oauth2_test.go
+new file mode 100644
+index 0000000000..44f3e1e1e0
+--- /dev/null
++++ b/pkg/alertmanager/api_oauth2_test.go
+@@ -0,0 +1,120 @@
++package alertmanager
++
++import (
++	"bytes"
++	"io/ioutil"
++	"net/http"
++	"net/http/httptest"
++	"path/filepath"
++	"testing"
++
++	util_log "github.com/cortexproject/cortex/pkg/util/log"
++	"github.com/stretchr/testify/require"
++	"github.com/weaveworks/common/user"
++)
++
++func postAlertmanagerUserConfigForOAuth2Test(t *testing.T, cfg string) (int, string) {
++	t.Helper()
++
++	am := &MultitenantAlertmanager{
++		store:  prepareInMemoryAlertStore(),
++		logger: util_log.Logger,
++	}
++	req := httptest.NewRequest(http.MethodPost, "http://alertmanager/api/v1/alerts", bytes.NewReader([]byte(cfg)))
++	ctx := user.InjectOrgID(req.Context(), "oauth2-test-tenant")
++	w := httptest.NewRecorder()
++	am.SetUserConfig(w, req.WithContext(ctx))
++
++	resp := w.Result()
++	defer resp.Body.Close()
++	body, err := ioutil.ReadAll(resp.Body)
++	require.NoError(t, err)
++
++	return resp.StatusCode, string(body)
++}
++
++func TestAlertmanagerTenantConfigAcceptsInlineOAuth2(t *testing.T) {
++	t.Parallel()
++
++	cfg := `
++alertmanager_config: |
++  receivers:
++    - name: default-receiver
++      webhook_configs:
++        - url: http://localhost
++          http_config:
++            oauth2:
++              client_id: tenant-client
++              client_secret: inline-secret
++              token_url: http://token.example.test
++
++  route:
++    receiver: 'default-receiver'
++`
++
++	status, body := postAlertmanagerUserConfigForOAuth2Test(t, cfg)
++	if status != http.StatusCreated {
++		t.Fatalf("expected tenant Alertmanager config with inline OAuth2 secret to validate, got status %d body %q", status, body)
++	}
++	if body != "" {
++		t.Fatalf("expected empty response body for accepted config, got %q", body)
++	}
++}
++
++func TestValidateUserConfigRejectsOAuth2ClientSecretFile(t *testing.T) {
++	t.Parallel()
++
++	nonexistentSecretPath := filepath.Join(t.TempDir(), "oauth2-client-secret")
++	tests := []struct {
++		name string
++		cfg  string
++	}{
++		{
++			name: "global http config",
++			cfg: `
++alertmanager_config: |
++  global:
++    http_config:
++      oauth2:
++        client_id: tenant-client
++        token_url: http://token.example.test
++        client_secret_file: ` + nonexistentSecretPath + `
++
++  route:
++    receiver: 'default-receiver'
++  receivers:
++    - name: default-receiver
++`,
++		},
++		{
++			name: "receiver webhook http config",
++			cfg: `
++alertmanager_config: |
++  receivers:
++    - name: default-receiver
++      webhook_configs:
++        - url: http://localhost
++          http_config:
++            oauth2:
++              client_id: tenant-client
++              token_url: http://token.example.test
++              client_secret_file: ` + nonexistentSecretPath + `
++
++  route:
++    receiver: 'default-receiver'
++`,
++		},
++	}
++
++	for _, tc := range tests {
++		tc := tc
++		t.Run(tc.name, func(t *testing.T) {
++			t.Parallel()
++
++			status, body := postAlertmanagerUserConfigForOAuth2Test(t, tc.cfg)
++			if status != http.StatusBadRequest {
++				t.Fatalf("expected OAuth2 client_secret_file to be rejected with HTTP 400, got status %d body %q", status, body)
++			}
++		})
++	}
++}
+diff --git a/vendor/github.com/prometheus/common/config/http_config_oauth2_test.go b/vendor/github.com/prometheus/common/config/http_config_oauth2_test.go
+new file mode 100644
+index 0000000000..94cc741ac8
+--- /dev/null
++++ b/vendor/github.com/prometheus/common/config/http_config_oauth2_test.go
+@@ -0,0 +1,239 @@
++package config
++
++import (
++	"encoding/json"
++	"fmt"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"gopkg.in/yaml.v2"
++)
++
++func decodeHTTPClientConfigForOAuth2Test(t *testing.T, input string) HTTPClientConfig {
++	t.Helper()
++
++	var cfg HTTPClientConfig
++	if err := yaml.Unmarshal([]byte(input), &cfg); err != nil {
++		t.Fatalf("failed to unmarshal HTTP client config: %v", err)
++	}
++	return cfg
++}
++
++func requireOAuth2ValidationError(t *testing.T, input string) {
++	t.Helper()
++
++	var cfg HTTPClientConfig
++	err := yaml.Unmarshal([]byte(input), &cfg)
++	if err == nil {
++		err = cfg.Validate()
++	}
++	if err == nil {
++		t.Fatalf("expected validation error")
++	}
++}
++
++func TestHTTPClientConfigOAuth2ClientCredentialsSendsBearerToken(t *testing.T) {
++	t.Parallel()
++
++	dynamicToken := fmt.Sprintf("oauth2-token-%d", time.Now().UnixNano())
++	var tokenRequests int32
++
++	tokenServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		atomic.AddInt32(&tokenRequests, 1)
++
++		if r.Method != http.MethodPost {
++			t.Fatalf("expected token request to use POST, got %s", r.Method)
++		}
++		if err := r.ParseForm(); err != nil {
++			t.Fatalf("failed to parse token request form: %v", err)
++		}
++
++		clientID, clientSecret, ok := r.BasicAuth()
++		if !ok {
++			clientID = r.Form.Get("client_id")
++			clientSecret = r.Form.Get("client_secret")
++		}
++		if clientID != "tenant-client" || clientSecret != "inline-secret" {
++			http.Error(w, "bad client credentials", http.StatusUnauthorized)
++			return
++		}
++		if got := r.Form.Get("grant_type"); got != "client_credentials" {
++			t.Fatalf("expected grant_type=client_credentials, got %q", got)
++		}
++		if gotScope := r.Form.Get("scope"); !strings.Contains(gotScope, "alerts:write") || !strings.Contains(gotScope, "notifications:send") {
++			t.Fatalf("expected configured scopes in token request, got %q", gotScope)
++		}
++		if got := r.Form.Get("audience"); got != "webhook-service" {
++			t.Fatalf("expected endpoint_params audience to be preserved, got %q", got)
++		}
++
++		w.Header().Set("Content-Type", "application/json")
++		_ = json.NewEncoder(w).Encode(map[string]interface{}{
++			"access_token": dynamicToken,
++			"token_type":   "Bearer",
++			"expires_in":   3600,
++		})
++	}))
++	defer tokenServer.Close()
++
++	var targetAuthorization atomic.Value
++	targetServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		targetAuthorization.Store(r.Header.Get("Authorization"))
++		w.WriteHeader(http.StatusNoContent)
++	}))
++	defer targetServer.Close()
++
++	cfg := decodeHTTPClientConfigForOAuth2Test(t, fmt.Sprintf(`
++oauth2:
++  client_id: tenant-client
++  client_secret: inline-secret
++  token_url: %s
++  scopes:
++    - alerts:write
++    - notifications:send
++  endpoint_params:
++    audience: webhook-service
++`, tokenServer.URL))
++
++	if err := cfg.Validate(); err != nil {
++		t.Fatalf("expected valid OAuth2 HTTP client config, got error: %v", err)
++	}
++
++	rt, err := NewRoundTripperFromConfig(cfg, "oauth2-test")
++	if err != nil {
++		t.Fatalf("failed to build round tripper: %v", err)
++	}
++
++	client := &http.Client{Transport: rt}
++	resp, err := client.Get(targetServer.URL)
++	if err != nil {
++		t.Fatalf("request through OAuth2 HTTP client failed: %v", err)
++	}
++	_ = resp.Body.Close()
++
++	if got := atomic.LoadInt32(&tokenRequests); got < 1 {
++		t.Fatalf("expected at least one token request, got %d", got)
++	}
++
++	gotAuthorization, _ := targetAuthorization.Load().(string)
++	if want := "Bearer " + dynamicToken; gotAuthorization != want {
++		t.Fatalf("expected target request Authorization header %q, got %q", want, gotAuthorization)
++	}
++}
++
++func TestHTTPClientConfigOAuth2RequiredFields(t *testing.T) {
++	t.Parallel()
++
++	tests := []struct {
++		name   string
++		config string
++	}{
++		{
++			name: "missing client id",
++			config: `
++oauth2:
++  client_secret: inline-secret
++  token_url: http://token.example.test
++`,
++		},
++		{
++			name: "missing secret source",
++			config: `
++oauth2:
++  client_id: tenant-client
++  token_url: http://token.example.test
++`,
++		},
++		{
++			name: "missing token url",
++			config: `
++oauth2:
++  client_id: tenant-client
++  client_secret: inline-secret
++`,
++		},
++		{
++			name: "both secret sources",
++			config: `
++oauth2:
++  client_id: tenant-client
++  client_secret: inline-secret
++  client_secret_file: /tmp/secret
++  token_url: http://token.example.test
++`,
++		},
++	}
++
++	for _, tc := range tests {
++		tc := tc
++		t.Run(tc.name, func(t *testing.T) {
++			t.Parallel()
++			requireOAuth2ValidationError(t, tc.config)
++		})
++	}
++}
++
++func TestHTTPClientConfigOAuth2MutuallyExclusiveWithOtherAuth(t *testing.T) {
++	t.Parallel()
++
++	tests := []struct {
++		name   string
++		config string
++	}{
++		{
++			name: "basic auth",
++			config: `
++oauth2:
++  client_id: tenant-client
++  client_secret: inline-secret
++  token_url: http://token.example.test
++basic_auth:
++  username: user
++  password: pass
++`,
++		},
++		{
++			name: "authorization",
++			config: `
++authorization:
++  credentials: bearer-value
++oauth2:
++  token_url: http://token.example.test
++  client_secret: inline-secret
++  client_id: tenant-client
++`,
++		},
++		{
++			name: "bearer token",
++			config: `
++oauth2:
++  client_id: tenant-client
++  client_secret: inline-secret
++  token_url: http://token.example.test
++bearer_token: static-token
++`,
++		},
++		{
++			name: "bearer token file",
++			config: `
++bearer_token_file: /tmp/bearer
++oauth2:
++  client_id: tenant-client
++  client_secret: inline-secret
++  token_url: http://token.example.test
++`,
++		},
++	}
++
++	for _, tc := range tests {
++		tc := tc
++		t.Run(tc.name, func(t *testing.T) {
++			t.Parallel()
++			requireOAuth2ValidationError(t, tc.config)
++		})
++	}
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,26 @@
++#!/bin/bash
++set -uo pipefail
++
++cd /testbed
++
++
++
++
++
++
++
++
++case "${1:-}" in
++  base)
++    go test ./pkg/alertmanager/ -v -count=1 -timeout 120s \
++      -skip '^(TestAlertmanagerTenantConfigAcceptsInlineOAuth2|TestValidateUserConfigRejectsOAuth2ClientSecretFile)$'
++    ;;
++  new)
++    go test github.com/prometheus/common/config ./pkg/alertmanager/ -v -count=1 -timeout 120s \
++      -run '^(TestHTTPClientConfigOAuth2ClientCredentialsSendsBearerToken|TestHTTPClientConfigOAuth2RequiredFields|TestHTTPClientConfigOAuth2MutuallyExclusiveWithOtherAuth|TestAlertmanagerTenantConfigAcceptsInlineOAuth2|TestValidateUserConfigRejectsOAuth2ClientSecretFile)$'
++    ;;
++  *)
++    echo "usage: $0 base|new"
++    exit 2
++    ;;
++esac

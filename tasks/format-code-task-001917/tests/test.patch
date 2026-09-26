@@ -1,0 +1,261 @@
+diff --git a/test/android/gradle-wrapper.test.ts b/test/android/gradle-wrapper.test.ts
+index feea920b..fd6a0f7b 100644
+--- a/test/android/gradle-wrapper.test.ts
++++ b/test/android/gradle-wrapper.test.ts
+@@ -1,11 +1,35 @@
+-import { doesNotThrow, equal, fail, throws } from "node:assert/strict";
++import { doesNotThrow, equal, fail, ok, throws } from "node:assert/strict";
+ import * as nodefs from "node:fs";
++import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
++import { tmpdir } from "node:os";
++import { join } from "node:path";
+ import { afterEach, describe, it } from "node:test";
+ import { configureGradleWrapper } from "../../android/gradle-wrapper.js";
+ 
+ describe("configureGradleWrapper()", () => {
+   const args = process.argv;
+ 
++  const parseGradleWrapperVersion = (wrapper: string): string => {
++    const match = wrapper.match(/^gradle-([0-9.]+)-bin\.zip$/);
++    if (!match) {
++      fail(`Unexpected Gradle wrapper written: ${wrapper}`);
++    }
++    return match[1];
++  };
++
++  const compareVersions = (a: string, b: string): number => {
++    const aParts = a.split(".").map(Number);
++    const bParts = b.split(".").map(Number);
++    const length = Math.max(aParts.length, bParts.length);
++    for (let i = 0; i < length; i++) {
++      const diff = (aParts[i] ?? 0) - (bParts[i] ?? 0);
++      if (diff !== 0) {
++        return diff;
++      }
++    }
++    return 0;
++  };
++
+   afterEach(() => {
+     process.argv = args.slice();
+     delete process.env["RNTA_CONFIGURE_GRADLE_WRAPPER"];
+@@ -110,30 +134,84 @@ describe("configureGradleWrapper()", () => {
+     const warnMock = t.mock.method(console, "warn", () => null);
+ 
+     let written = "";
++    const fixtures: string[] = [];
+     const mockfs = (
+       gradleVersion: string,
+       rnVersion: string
+-    ): typeof nodefs => ({
+-      ...nodefs,
+-      existsSync: () => true,
+-      // @ts-expect-error Type 'string' is not assignable to type 'Buffer'
+-      readFileSync: (p) => {
+-        if (p.toString().endsWith("gradle-wrapper.properties")) {
+-          return `gradle-${gradleVersion}-bin.zip`;
+-        } else if (p.toString().endsWith("package.json")) {
+-          return JSON.stringify({ name: "react-native", version: rnVersion });
+-        }
++    ): [string, typeof nodefs] => {
++      const sourceDir = mkdtempSync(join(tmpdir(), "rnta-gradle-wrapper-"));
++      fixtures.push(sourceDir);
++      mkdirSync(join(sourceDir, "gradle", "wrapper"), { recursive: true });
++      mkdirSync(join(sourceDir, "node_modules", "react-native"), { recursive: true });
++      writeFileSync(
++        join(sourceDir, "node_modules", "react-native", "package.json"),
++        JSON.stringify({ name: "react-native", version: rnVersion })
++      );
+ 
+-        fail(`Unexpected file read: ${p}`);
+-      },
+-      writeFileSync: (_, data) => {
+-        // @ts-expect-error Type 'Uint8Array' is not assignable to type 'string'
+-        written = data;
+-      },
+-    });
++      return [
++        sourceDir,
++        {
++          ...nodefs,
++          existsSync: (p) => p.toString().endsWith("gradle-wrapper.properties"),
++          // @ts-expect-error Type 'string' is not assignable to type 'Buffer'
++          readFileSync: (p, options) => {
++            if (p.toString().endsWith("gradle-wrapper.properties")) {
++              return `gradle-${gradleVersion}-bin.zip`;
++            }
++
++            return nodefs.readFileSync(p, options);
++          },
++          writeFileSync: (_, data) => {
++            // @ts-expect-error Type 'Uint8Array' is not assignable to type 'string'
++            written = data;
++          },
++        },
++      ];
++    };
+ 
+     process.argv.push("run-android");
+ 
++    const bumpedGradleByReactNativeMinor = new Map<string, string>();
++    const newReactNativeCases = [
++      ["8.11.1", "0.78.0", "0.78"],
++      ["8.11.1", "0.78.1", "0.78"],
++      ["8.11.1", "0.79.0", "0.79"],
++      ["8.11.1", "0.79.2", "0.79"],
++      ["8.11.1", "0.80.0", "0.80"],
++      ["8.11.1", "0.80.1", "0.80"],
++    ];
++    for (const [gradleVersion, rnVersion, rnMinor] of newReactNativeCases) {
++      written = "";
++      const [sourceDir, fs] = mockfs(gradleVersion, rnVersion);
++
++      doesNotThrow(() => configureGradleWrapper(sourceDir, fs));
++      equal(warnMock.mock.callCount(), 1);
++      ok(written);
++      const bumpedVersion = parseGradleWrapperVersion(written);
++      ok(compareVersions(bumpedVersion, gradleVersion) > 0);
++
++      const previous = bumpedGradleByReactNativeMinor.get(rnMinor);
++      if (previous === undefined) {
++        bumpedGradleByReactNativeMinor.set(rnMinor, bumpedVersion);
++      } else {
++        equal(bumpedVersion, previous);
++      }
++
++      warnMock.mock.resetCalls();
++    }
++    ok(
++      compareVersions(
++        bumpedGradleByReactNativeMinor.get("0.79") ?? "",
++        bumpedGradleByReactNativeMinor.get("0.78") ?? ""
++      ) > 0
++    );
++    ok(
++      compareVersions(
++        bumpedGradleByReactNativeMinor.get("0.80") ?? "",
++        bumpedGradleByReactNativeMinor.get("0.79") ?? ""
++      ) > 0
++    );
++
+     const cases = [
+       ["8.9", "0.76.0", "gradle-8.11.1-bin.zip"],
+       ["8.9", "0.75.0", "gradle-8.8-bin.zip"],
+@@ -149,9 +227,9 @@ describe("configureGradleWrapper()", () => {
+     ];
+     for (const [gradleVersion, rnVersion, expected] of cases) {
+       written = "";
+-      const fs = mockfs(gradleVersion, rnVersion);
++      const [sourceDir, fs] = mockfs(gradleVersion, rnVersion);
+ 
+-      doesNotThrow(() => configureGradleWrapper("android", fs));
++      doesNotThrow(() => configureGradleWrapper(sourceDir, fs));
+       equal(warnMock.mock.callCount(), 1);
+       equal(
+         warnMock.mock.calls[0].arguments[1],
+@@ -161,31 +239,48 @@ describe("configureGradleWrapper()", () => {
+ 
+       warnMock.mock.resetCalls();
+     }
++
++    for (const fixture of fixtures) {
++      rmSync(fixture, { force: true, recursive: true });
++    }
+   });
+ 
+   it("skips writing if Gradle version is recent enough", () => {
+     let written = "";
++    const fixtures: string[] = [];
+     const mockfs = (
+       gradleVersion: string,
+       rnVersion: string
+-    ): typeof nodefs => ({
+-      ...nodefs,
+-      existsSync: () => true,
+-      // @ts-expect-error Type 'string' is not assignable to type 'Buffer'
+-      readFileSync: (p) => {
+-        if (p.toString().endsWith("gradle-wrapper.properties")) {
+-          return `gradle-${gradleVersion}-bin.zip`;
+-        } else if (p.toString().endsWith("package.json")) {
+-          return JSON.stringify({ name: "react-native", version: rnVersion });
+-        }
++    ): [string, typeof nodefs] => {
++      const sourceDir = mkdtempSync(join(tmpdir(), "rnta-gradle-wrapper-"));
++      fixtures.push(sourceDir);
++      mkdirSync(join(sourceDir, "gradle", "wrapper"), { recursive: true });
++      mkdirSync(join(sourceDir, "node_modules", "react-native"), { recursive: true });
++      writeFileSync(
++        join(sourceDir, "node_modules", "react-native", "package.json"),
++        JSON.stringify({ name: "react-native", version: rnVersion })
++      );
+ 
+-        fail(`Unexpected file read: ${p}`);
+-      },
+-      writeFileSync: (_, data) => {
+-        // @ts-expect-error Type 'Uint8Array' is not assignable to type 'string'
+-        written = data;
+-      },
+-    });
++      return [
++        sourceDir,
++        {
++          ...nodefs,
++          existsSync: (p) => p.toString().endsWith("gradle-wrapper.properties"),
++          // @ts-expect-error Type 'string' is not assignable to type 'Buffer'
++          readFileSync: (p, options) => {
++            if (p.toString().endsWith("gradle-wrapper.properties")) {
++              return `gradle-${gradleVersion}-bin.zip`;
++            }
++
++            return nodefs.readFileSync(p, options);
++          },
++          writeFileSync: (_, data) => {
++            // @ts-expect-error Type 'Uint8Array' is not assignable to type 'string'
++            written = data;
++          },
++        },
++      ];
++    };
+ 
+     process.argv.push("run-android");
+ 
+@@ -202,9 +297,13 @@ describe("configureGradleWrapper()", () => {
+       ["7.5.1", "0.71.0"],
+     ];
+     for (const [gradleVersion, rnVersion] of cases) {
+-      const fs = mockfs(gradleVersion, rnVersion);
+-      doesNotThrow(() => configureGradleWrapper("android", fs));
++      const [sourceDir, fs] = mockfs(gradleVersion, rnVersion);
++      doesNotThrow(() => configureGradleWrapper(sourceDir, fs));
+       equal(written, "");
+     }
++
++    for (const fixture of fixtures) {
++      rmSync(fixture, { force: true, recursive: true });
++    }
+   });
+ });
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,19 @@
++#!/bin/bash
++set -uo pipefail
++
++
++cd /testbed
++
++
++case "${1:-}" in
++  base)
++    node --experimental-transform-types --no-warnings --test --test-name-pattern 'only runs when targeting Android' test/android/gradle-wrapper.test.ts
++    ;;
++  new)
++    node --experimental-transform-types --no-warnings --test --test-name-pattern 'bumps Gradle|skips writing' test/android/gradle-wrapper.test.ts
++    ;;
++  *)
++    echo "usage: $0 base|new"
++    exit 2
++    ;;
++esac

@@ -1,0 +1,365 @@
+diff --git a/delfin/tests/unit/drivers/test_lifecycle_contract.py b/delfin/tests/unit/drivers/test_lifecycle_contract.py
+new file mode 100644
+index 0000000..8d81cc4
+--- /dev/null
++++ b/delfin/tests/unit/drivers/test_lifecycle_contract.py
+@@ -0,0 +1,344 @@
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++from unittest import TestCase, mock
++
++from delfin.common import config  # noqa: F401
++from delfin import exception
++from delfin.drivers import api as driver_api
++from delfin.drivers import driver as driver_base
++from delfin.drivers import manager as driver_manager
++from delfin.drivers.dell_emc.vmax.vmax import VMAXStorageDriver
++from delfin.drivers.huawei.oceanstor.oceanstor import OceanStorDriver
++from delfin.drivers.huawei.oceanstor.rest_client import RestClient
++
++
++ACCESS_INFO = {
++    'storage_id': 'storage-1',
++    'vendor': 'fake_storage',
++    'model': 'fake_driver',
++    'rest': {
++        'host': '10.0.0.1',
++        'port': '8443',
++        'username': 'user',
++        'password': 'pass',
++    },
++    'extra_attributes': {'array_id': '00112233'},
++}
++
++STORAGE = {
++    'id': 'storage-1',
++    'name': 'array',
++    'vendor': 'vendor',
++    'model': 'model',
++    'serial_number': 'serial-1',
++}
++
++
++class MinimalDriver(driver_base.StorageDriver):
++    def get_storage(self, context):
++        return STORAGE.copy()
++
++    def list_storage_pools(self, context):
++        return []
++
++    def list_volumes(self, context):
++        return []
++
++    def add_trap_config(self, context, trap_config):
++        pass
++
++    def remove_trap_config(self, context, trap_config):
++        pass
++
++    def parse_alert(self, context, alert):
++        pass
++
++    def clear_alert(self, context, alert):
++        pass
++
++
++class RecordingDriver(object):
++    def __init__(self, storage=None, close_error=None, get_error=None):
++        self.storage = storage or STORAGE.copy()
++        self.close_error = close_error
++        self.get_error = get_error
++        self.close_calls = 0
++
++    def get_storage(self, context):
++        if self.get_error:
++            raise self.get_error
++        return self.storage.copy()
++
++    def close(self):
++        self.close_calls += 1
++        if self.close_error:
++            raise self.close_error
++
++
++class RecordingManager(object):
++    def __init__(self, candidate):
++        self.candidate = candidate
++        self.updates = []
++
++    def get_driver(self, context, **kwargs):
++        return self.candidate
++
++    def update_driver(self, storage_id, driver):
++        self.updates.append((storage_id, driver))
++
++
++class StorageDriverCloseContractTest(TestCase):
++    def test_default_close_is_available_to_legacy_drivers(self):
++        legacy_driver = MinimalDriver(storage_id='storage-1')
++
++        self.assertIsNone(legacy_driver.close())
++        self.assertIsNone(legacy_driver.close())
++
++    def test_vmax_close_is_idempotent(self):
++        backend = mock.Mock()
++        kwargs = dict(ACCESS_INFO)
++        kwargs['vendor'] = 'dell_emc'
++        kwargs['model'] = 'vmax'
++
++        with mock.patch('PyU4V.U4VConn', return_value=backend):
++            storage_driver = VMAXStorageDriver(**kwargs)
++            storage_driver.close()
++            storage_driver.close()
++
++        backend.close_session.assert_called_once_with()
++
++    def test_oceanstor_close_logs_out_once(self):
++        kwargs = dict(ACCESS_INFO)
++        kwargs['vendor'] = 'huawei'
++        kwargs['model'] = 'oceanstor'
++        response = {'error': {'code': 0, 'description': 'ok'}}
++
++        with mock.patch.object(RestClient, 'login', return_value='device-1'):
++            storage_driver = OceanStorDriver(**kwargs)
++        storage_driver.client.url = ('https://10.0.0.1:8443/'
++                                     'deviceManager/rest/device-1')
++        with mock.patch.object(RestClient, 'do_call',
++                               return_value=response) as do_call:
++            storage_driver.close()
++            storage_driver.close()
++
++        do_call.assert_called_once_with('/sessions', None, 'DELETE')
++
++
++class DriverManagerCloseContractTest(TestCase):
++    def setUp(self):
++        self.manager = driver_manager.DriverManager()
++        self.original_factory = self.manager.driver_factory
++        self.manager.driver_factory = {}
++
++    def tearDown(self):
++        self.manager.driver_factory = self.original_factory
++
++    def test_replace_same_instance_remove_and_repeated_remove(self):
++        first = RecordingDriver()
++        second = RecordingDriver()
++
++        self.manager.update_driver('storage-1', first)
++        self.manager.update_driver('storage-1', first)
++        self.assertEqual(0, first.close_calls)
++
++        self.manager.update_driver('storage-1', second)
++        self.assertIs(second, self.manager.driver_factory['storage-1'])
++        self.assertEqual(1, first.close_calls)
++
++        self.manager.remove_driver('storage-1')
++        self.assertNotIn('storage-1', self.manager.driver_factory)
++        self.assertEqual(1, second.close_calls)
++
++        self.manager.remove_driver('storage-1')
++        self.assertEqual(1, second.close_calls)
++
++    def test_cleanup_errors_do_not_undo_cache_transitions(self):
++        first = RecordingDriver(close_error=RuntimeError('old close failed'))
++        second = RecordingDriver(close_error=RuntimeError('new close failed'))
++        self.manager.update_driver('storage-1', first)
++
++        self.manager.update_driver('storage-1', second)
++        self.assertIs(second, self.manager.driver_factory['storage-1'])
++        self.assertEqual(1, first.close_calls)
++
++        self.manager.remove_driver('storage-1')
++        self.assertNotIn('storage-1', self.manager.driver_factory)
++        self.assertEqual(1, second.close_calls)
++
++
++class DriverAPIOwnershipContractTest(TestCase):
++    def _api_with(self, candidate):
++        api = object.__new__(driver_api.API)
++        api.driver_manager = RecordingManager(candidate)
++        return api
++
++    def test_discovery_validation_failure_closes_candidate(self):
++        original_error = exception.InvalidResults('invalid discovery')
++        candidate = RecordingDriver(close_error=RuntimeError('close failed'))
++        api = self._api_with(candidate)
++
++        with mock.patch.object(
++                driver_api.helper, 'check_storage_repetition',
++                side_effect=original_error):
++            with self.assertRaises(exception.InvalidResults) as caught:
++                api.discover_storage(object(), ACCESS_INFO.copy())
++
++        self.assertIs(original_error, caught.exception)
++        self.assertEqual(1, candidate.close_calls)
++        self.assertEqual([], api.driver_manager.updates)
++
++    def test_discovery_backend_failure_closes_candidate(self):
++        original_error = exception.StorageBackendException('read failed')
++        candidate = RecordingDriver(
++            close_error=RuntimeError('close failed'),
++            get_error=original_error)
++        api = self._api_with(candidate)
++
++        with self.assertRaises(exception.StorageBackendException) as caught:
++            api.discover_storage(object(), ACCESS_INFO.copy())
++
++        self.assertIs(original_error, caught.exception)
++        self.assertEqual(1, candidate.close_calls)
++        self.assertEqual([], api.driver_manager.updates)
++
++    def test_discovery_persistence_failure_closes_candidate(self):
++        original_error = RuntimeError('access info write failed')
++        candidate = RecordingDriver()
++        api = self._api_with(candidate)
++
++        with mock.patch.object(driver_api.helper,
++                               'check_storage_repetition'), \
++                mock.patch.object(driver_api.helper, 'create_access_info',
++                                  side_effect=original_error):
++            with self.assertRaises(RuntimeError) as caught:
++                api.discover_storage(object(), ACCESS_INFO.copy())
++
++        self.assertIs(original_error, caught.exception)
++        self.assertEqual(1, candidate.close_calls)
++        self.assertEqual([], api.driver_manager.updates)
++
++    def test_discovery_storage_write_failure_closes_candidate(self):
++        original_error = RuntimeError('storage write failed')
++        candidate = RecordingDriver()
++        api = self._api_with(candidate)
++
++        with mock.patch.object(driver_api.helper,
++                               'check_storage_repetition'), \
++                mock.patch.object(driver_api.helper, 'create_access_info',
++                                  return_value=ACCESS_INFO.copy()), \
++                mock.patch.object(driver_api.helper, 'create_storage',
++                                  side_effect=original_error):
++            with self.assertRaises(RuntimeError) as caught:
++                api.discover_storage(object(), ACCESS_INFO.copy())
++
++        self.assertIs(original_error, caught.exception)
++        self.assertEqual(1, candidate.close_calls)
++        self.assertEqual([], api.driver_manager.updates)
++
++    def test_successful_discovery_transfers_candidate_ownership(self):
++        candidate = RecordingDriver()
++        api = self._api_with(candidate)
++
++        with mock.patch.object(driver_api.helper,
++                               'check_storage_repetition'), \
++                mock.patch.object(driver_api.helper, 'create_access_info',
++                                  return_value=ACCESS_INFO.copy()), \
++                mock.patch.object(driver_api.helper, 'create_storage',
++                                  return_value=STORAGE.copy()):
++            result = api.discover_storage(object(), ACCESS_INFO.copy())
++
++        self.assertEqual(STORAGE, result)
++        self.assertEqual(0, candidate.close_calls)
++        self.assertEqual([('storage-1', candidate)],
++                         api.driver_manager.updates)
++
++    def test_access_update_validation_failure_closes_candidate(self):
++        original_error = exception.StorageSerialNumberMismatch('mismatch')
++        candidate = RecordingDriver(close_error=RuntimeError('close failed'))
++        api = self._api_with(candidate)
++
++        with mock.patch.object(
++                driver_api.helper, 'check_storage_consistency',
++                side_effect=original_error):
++            with self.assertRaises(
++                    exception.StorageSerialNumberMismatch) as caught:
++                api.update_access_info(object(), ACCESS_INFO.copy())
++
++        self.assertIs(original_error, caught.exception)
++        self.assertEqual(1, candidate.close_calls)
++        self.assertEqual([], api.driver_manager.updates)
++
++    def test_access_update_backend_failure_closes_candidate(self):
++        original_error = exception.StorageBackendException('read failed')
++        candidate = RecordingDriver(get_error=original_error)
++        api = self._api_with(candidate)
++
++        with self.assertRaises(exception.StorageBackendException) as caught:
++            api.update_access_info(object(), ACCESS_INFO.copy())
++
++        self.assertIs(original_error, caught.exception)
++        self.assertEqual(1, candidate.close_calls)
++        self.assertEqual([], api.driver_manager.updates)
++
++    def test_access_info_write_failure_closes_candidate(self):
++        original_error = RuntimeError('access info write failed')
++        candidate = RecordingDriver()
++        api = self._api_with(candidate)
++
++        with mock.patch.object(driver_api.helper,
++                               'check_storage_consistency'), \
++                mock.patch.object(driver_api.helper, 'update_access_info',
++                                  side_effect=original_error):
++            with self.assertRaises(RuntimeError) as caught:
++                api.update_access_info(object(), ACCESS_INFO.copy())
++
++        self.assertIs(original_error, caught.exception)
++        self.assertEqual(1, candidate.close_calls)
++        self.assertEqual([], api.driver_manager.updates)
++
++    def test_access_update_failure_closes_candidate_and_preserves_error(self):
++        original_error = RuntimeError('storage write failed')
++        candidate = RecordingDriver(close_error=RuntimeError('close failed'))
++        api = self._api_with(candidate)
++
++        with mock.patch.object(driver_api.helper,
++                               'check_storage_consistency'), \
++                mock.patch.object(driver_api.helper, 'update_access_info',
++                                  return_value=ACCESS_INFO.copy()), \
++                mock.patch.object(driver_api.helper, 'update_storage',
++                                  side_effect=original_error):
++            with self.assertRaises(RuntimeError) as caught:
++                api.update_access_info(object(), ACCESS_INFO.copy())
++
++        self.assertIs(original_error, caught.exception)
++        self.assertEqual(1, candidate.close_calls)
++        self.assertEqual([], api.driver_manager.updates)
++
++    def test_successful_access_update_transfers_candidate_ownership(self):
++        candidate = RecordingDriver()
++        api = self._api_with(candidate)
++
++        with mock.patch.object(driver_api.helper,
++                               'check_storage_consistency'), \
++                mock.patch.object(driver_api.helper, 'update_access_info',
++                                  return_value=ACCESS_INFO.copy()), \
++                mock.patch.object(driver_api.helper, 'update_storage'):
++            result = api.update_access_info(object(), ACCESS_INFO.copy())
++
++        self.assertEqual(ACCESS_INFO, result)
++        self.assertEqual(0, candidate.close_calls)
++        self.assertEqual([('storage-1', candidate)],
++                         api.driver_manager.updates)
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,10 @@
++#!/bin/bash
++set -euo pipefail
++
++
++python -m unittest -v \
++  delfin.tests.unit.drivers.test_lifecycle_contract \
++  delfin.tests.unit.drivers.test_api.TestDriverAPI.test_discover_storage \
++  delfin.tests.unit.drivers.test_api.TestDriverAPI.test_update_access_info \
++  delfin.tests.unit.drivers.test_api.TestDriverAPI.test_remove_storage \
++  delfin.tests.unit.drivers.dell_emc.vmax.test_vmax.TestVMAXStorageDriver.test_delete

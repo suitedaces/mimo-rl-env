@@ -1,0 +1,245 @@
+diff --git a/env/interpolation_contract_test.go b/env/interpolation_contract_test.go
+new file mode 100644
+index 0000000..5ffca6b
+--- /dev/null
++++ b/env/interpolation_contract_test.go
+@@ -0,0 +1,225 @@
++
++
++
++
++package env_test
++
++import (
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++
++	"github.com/getgauge/gauge/config"
++	gaugeenv "github.com/getgauge/gauge/env"
++)
++
++func TestDependencyAwareEnvironmentInterpolation(t *testing.T) {
++	cleanProcessEnvironment(t)
++	root := t.TempDir()
++	writeProperties(t, root, "qa", `
++QA_ROOT=/srv/qa
++CHAIN=${FORWARD}/v1
++FORWARD=${HOST}/api
++COMBINED=${CHAIN}|${HOST}|${HOST}|${EMPTY}
++HOST=qa.example
++`)
++	writeProperties(t, root, "default", `
++HOST=default.example
++EMPTY=
++FROM_DEFAULT=${QA_ROOT}/default
++DOLLAR_TEXT=keep:$HOME:${NOT-A-NAME}:${UNFINISHED
++`)
++	config.ProjectRoot = root
++
++	if err := gaugeenv.LoadEnv("qa"); err != nil {
++		t.Fatalf("LoadEnv returned an unexpected error: %v", err)
++	}
++
++	assertEnv(t, "HOST", "qa.example")
++	assertEnv(t, "FORWARD", "qa.example/api")
++	assertEnv(t, "CHAIN", "qa.example/api/v1")
++	assertEnv(t, "COMBINED", "qa.example/api/v1|qa.example|qa.example|")
++	assertEnv(t, "FROM_DEFAULT", "/srv/qa/default")
++	assertEnv(t, "DOLLAR_TEXT", "keep:$HOME:${NOT-A-NAME}:${UNFINISHED")
++	if value, ok := os.LookupEnv("EMPTY"); !ok || value != "" {
++		t.Fatalf("EMPTY = %q, present = %v; want a present empty value", value, ok)
++	}
++}
++
++func TestProcessEnvironmentOverridesAreOpaqueAndAuthoritative(t *testing.T) {
++	cleanProcessEnvironment(t)
++	root := t.TempDir()
++	writeProperties(t, root, "qa", `
++HOST=file.example
++URL=${HOST}/v2
++LOCKED=${MISSING_SHOULD_NOT_BE_RESOLVED}
++EMPTY=file-value
++`)
++	config.ProjectRoot = root
++	if err := os.Setenv("HOST", "shell-${UNEXPANDED}"); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.Setenv("LOCKED", "from-shell"); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.Setenv("EMPTY", ""); err != nil {
++		t.Fatal(err)
++	}
++
++	if err := gaugeenv.LoadEnv("qa"); err != nil {
++		t.Fatalf("LoadEnv returned an unexpected error: %v", err)
++	}
++
++	assertEnv(t, "HOST", "shell-${UNEXPANDED}")
++	assertEnv(t, "URL", "shell-${UNEXPANDED}/v2")
++	assertEnv(t, "LOCKED", "from-shell")
++	assertEnv(t, "EMPTY", "")
++}
++
++func TestUndefinedReferenceFailsWithoutPublishingOrChangingActiveEnv(t *testing.T) {
++	cleanProcessEnvironment(t)
++	stableRoot := t.TempDir()
++	writeProperties(t, stableRoot, "stable", "STABLE=ready\n")
++	config.ProjectRoot = stableRoot
++	if err := gaugeenv.LoadEnv(" stable "); err != nil {
++		t.Fatalf("initial LoadEnv returned an unexpected error: %v", err)
++	}
++	if got := gaugeenv.CurrentEnv(); got != "stable" {
++		t.Fatalf("CurrentEnv() = %q after successful load; want %q", got, "stable")
++	}
++
++	brokenRoot := t.TempDir()
++	writeProperties(t, brokenRoot, "broken", `
++PUBLISH_GUARD=must-not-appear
++STABLE=overwritten
++BROKEN_VALUE=prefix-${ABSENT_DEPENDENCY}
++`)
++	config.ProjectRoot = brokenRoot
++	err := gaugeenv.LoadEnv("broken")
++	if err == nil {
++		t.Fatal("LoadEnv succeeded with an undefined property reference")
++	}
++	if !strings.Contains(err.Error(), "ABSENT_DEPENDENCY") {
++		t.Fatalf("undefined-reference error %q does not name ABSENT_DEPENDENCY", err)
++	}
++	if _, ok := os.LookupEnv("PUBLISH_GUARD"); ok {
++		t.Fatal("PUBLISH_GUARD was published despite interpolation failure")
++	}
++	if _, ok := os.LookupEnv("BROKEN_VALUE"); ok {
++		t.Fatal("BROKEN_VALUE was published despite interpolation failure")
++	}
++	assertEnv(t, "STABLE", "ready")
++	if got := gaugeenv.CurrentEnv(); got != "stable" {
++		t.Fatalf("CurrentEnv() = %q after failed load; want previous successful environment %q", got, "stable")
++	}
++}
++
++func TestCyclicReferencesReportCycleMembersAndPublishNothing(t *testing.T) {
++	t.Run("direct", func(t *testing.T) {
++		cleanProcessEnvironment(t)
++		root := t.TempDir()
++		writeProperties(t, root, "direct", `
++DIRECT=${DIRECT}
++DIRECT_GUARD=must-not-appear
++`)
++		config.ProjectRoot = root
++
++		err := gaugeenv.LoadEnv("direct")
++		assertCycleError(t, err, "DIRECT")
++		if _, ok := os.LookupEnv("DIRECT_GUARD"); ok {
++			t.Fatal("DIRECT_GUARD was published despite a direct cycle")
++		}
++	})
++
++	t.Run("indirect", func(t *testing.T) {
++		cleanProcessEnvironment(t)
++		root := t.TempDir()
++		writeProperties(t, root, "indirect", `
++FIRST=${SECOND}
++SECOND=${THIRD}
++THIRD=${FIRST}
++INDIRECT_GUARD=must-not-appear
++`)
++		config.ProjectRoot = root
++
++		err := gaugeenv.LoadEnv("indirect")
++		assertCycleError(t, err, "FIRST", "SECOND", "THIRD")
++		if _, ok := os.LookupEnv("INDIRECT_GUARD"); ok {
++			t.Fatal("INDIRECT_GUARD was published despite an indirect cycle")
++		}
++	})
++}
++
++func TestCurrentEnvTracksNormalizedExplicitSelectionAndPrecedence(t *testing.T) {
++	cleanProcessEnvironment(t)
++	root := t.TempDir()
++	writeProperties(t, root, "blue", "COLOR=blue\nBLUE_ONLY=yes\n")
++	writeProperties(t, root, "green", "COLOR=green\nGREEN_ONLY=yes\n")
++	writeProperties(t, root, "default", "COLOR=default\nDEFAULT_ONLY=yes\n")
++	config.ProjectRoot = root
++
++	if err := gaugeenv.LoadEnv(" blue , green "); err != nil {
++		t.Fatalf("LoadEnv returned an unexpected error: %v", err)
++	}
++
++	if got := gaugeenv.CurrentEnv(); got != "blue,green" {
++		t.Fatalf("CurrentEnv() = %q; want normalized explicit selection %q", got, "blue,green")
++	}
++	assertEnv(t, "COLOR", "blue")
++	assertEnv(t, "BLUE_ONLY", "yes")
++	assertEnv(t, "GREEN_ONLY", "yes")
++	assertEnv(t, "DEFAULT_ONLY", "yes")
++}
++
++func cleanProcessEnvironment(t *testing.T) {
++	t.Helper()
++	originalEnv := append([]string(nil), os.Environ()...)
++	originalRoot := config.ProjectRoot
++	os.Clearenv()
++	t.Cleanup(func() {
++		os.Clearenv()
++		for _, entry := range originalEnv {
++			parts := strings.SplitN(entry, "=", 2)
++			if len(parts) == 2 {
++				_ = os.Setenv(parts[0], parts[1])
++			}
++		}
++		config.ProjectRoot = originalRoot
++	})
++}
++
++func writeProperties(t *testing.T, root, environment, contents string) {
++	t.Helper()
++	dir := filepath.Join(root, "env", environment)
++	if err := os.MkdirAll(dir, 0755); err != nil {
++		t.Fatal(err)
++	}
++	path := filepath.Join(dir, "contract.properties")
++	if err := os.WriteFile(path, []byte(strings.TrimPrefix(contents, "\n")), 0644); err != nil {
++		t.Fatal(err)
++	}
++}
++
++func assertEnv(t *testing.T, name, want string) {
++	t.Helper()
++	if got := os.Getenv(name); got != want {
++		t.Fatalf("%s = %q; want %q", name, got, want)
++	}
++}
++
++func assertCycleError(t *testing.T, err error, members ...string) {
++	t.Helper()
++	if err == nil {
++		t.Fatal("LoadEnv succeeded with cyclic property references")
++	}
++	message := err.Error()
++	if !strings.Contains(strings.ToLower(message), "cyclic") {
++		t.Fatalf("cycle error %q does not identify the failure as cyclic", message)
++	}
++	for _, member := range members {
++		if !strings.Contains(message, member) {
++			t.Fatalf("cycle error %q does not name cycle member %s", message, member)
++		}
++	}
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,9 @@
++#!/bin/bash
++set -euo pipefail
++
++
++GAUGE_TEST_GOPATH="$(mktemp -d)"
++mkdir -p "${GAUGE_TEST_GOPATH}/src/github.com/getgauge"
++ln -s "$(pwd)" "${GAUGE_TEST_GOPATH}/src/github.com/getgauge/gauge"
++cd "${GAUGE_TEST_GOPATH}/src/github.com/getgauge/gauge"
++GO111MODULE=off GOPATH="${GAUGE_TEST_GOPATH}" go test ./env

@@ -1,0 +1,130 @@
+diff --git a/tests/sentry/utils/test_safe_extract_zip_security.py b/tests/sentry/utils/test_safe_extract_zip_security.py
+new file mode 100644
+--- /dev/null
++++ b/tests/sentry/utils/test_safe_extract_zip_security.py
+@@ -0,0 +1,115 @@
++from __future__ import annotations
++
++import io
++import stat
++import warnings
++import zipfile
++from pathlib import Path
++
++import pytest
++
++from sentry.utils.zip import safe_extract_zip
++
++
++def _archive(*members: tuple[str, bytes | str, int | None]) -> io.BytesIO:
++    stream = io.BytesIO()
++    with zipfile.ZipFile(stream, "w") as archive:
++        for name, contents, mode in members:
++            if mode is None:
++                with warnings.catch_warnings():
++                    warnings.simplefilter("ignore", UserWarning)
++                    archive.writestr(name, contents)
++                continue
++            info = zipfile.ZipInfo(name)
++            info.create_system = 3
++            info.external_attr = (mode | stat.S_IFMT(mode)) << 16
++            archive.writestr(info, contents)
++    stream.seek(0)
++    return stream
++
++
++def test_safe_extract_zip_extracts_nested_regular_files(tmp_path: Path) -> None:
++    safe_extract_zip(
++        _archive(("nested/file.txt", b"payload", None), ("nested/", b"", None)),
++        str(tmp_path),
++    )
++
++    assert (tmp_path / "nested/file.txt").read_bytes() == b"payload"
++
++
++def test_safe_extract_zip_accepts_filename_and_open_zipfile(tmp_path: Path) -> None:
++    archive_path = tmp_path / "archive.zip"
++    archive_path.write_bytes(_archive(("file.txt", b"payload", None)).getvalue())
++
++    safe_extract_zip(str(archive_path), str(tmp_path / "from_filename"))
++    assert (tmp_path / "from_filename/file.txt").read_bytes() == b"payload"
++
++    with zipfile.ZipFile(archive_path) as archive:
++        safe_extract_zip(archive, str(tmp_path / "from_open_archive"))
++        assert archive.namelist() == ["file.txt"]
++    assert (tmp_path / "from_open_archive/file.txt").read_bytes() == b"payload"
++
++
++@pytest.mark.parametrize(
++    "member_name",
++    [
++        "../escape.txt",
++        "nested/../../escape.txt",
++        "..\\escape.txt",
++        "nested\\..\\escape.txt",
++        "/absolute.txt",
++        "C:\\absolute.txt",
++    ],
++)
++def test_unsafe_member_rejects_archive_before_writing(
++    tmp_path: Path, member_name: str
++) -> None:
++    destination = tmp_path / "destination"
++    outside = tmp_path / "escape.txt"
++
++    with pytest.raises(ValueError):
++        safe_extract_zip(
++            _archive(("good.txt", b"must not remain", None), (member_name, b"escape", None)),
++            str(destination),
++        )
++
++    assert not (destination / "good.txt").exists()
++    assert not outside.exists()
++
++
++def test_symlink_member_is_rejected_without_creating_output(tmp_path: Path) -> None:
++    symlink_mode = stat.S_IFLNK | 0o777
++
++    with pytest.raises(ValueError):
++        safe_extract_zip(
++            _archive(("link", "target", symlink_mode)),
++            str(tmp_path / "destination"),
++        )
++
++    assert not (tmp_path / "destination").exists()
++
++
++def test_duplicate_member_target_is_rejected_atomically(tmp_path: Path) -> None:
++    with pytest.raises(ValueError):
++        safe_extract_zip(
++            _archive(("same.txt", b"first", None), ("same.txt", b"second", None)),
++            str(tmp_path / "destination"),
++        )
++
++    assert not (tmp_path / "destination").exists()
++
++
++def test_existing_destination_symlink_cannot_escape_root(tmp_path: Path) -> None:
++    destination = tmp_path / "destination"
++    outside = tmp_path / "outside"
++    destination.mkdir()
++    outside.mkdir()
++    (destination / "link").symlink_to(outside, target_is_directory=True)
++
++    with pytest.raises(ValueError):
++        safe_extract_zip(
++            _archive(("link/payload.txt", b"must not escape", None)),
++            str(destination),
++        )
++
++    assert not (outside / "payload.txt").exists()
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,5 @@
++#!/bin/bash
++set -euo pipefail
++
++
++pytest --noconftest -q tests/sentry/utils/test_safe_extract_zip_security.py tests/sentry/utils/test_zip.py

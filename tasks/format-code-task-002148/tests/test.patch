@@ -1,0 +1,193 @@
+diff --git a/openmeter/subscription/patch/phase_patch_contract_test.go b/openmeter/subscription/patch/phase_patch_contract_test.go
+new file mode 100644
+index 000000000..c3cefff73
+--- /dev/null
++++ b/openmeter/subscription/patch/phase_patch_contract_test.go
+@@ -0,0 +1,177 @@
++package patch_test
++
++import (
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++
++	"github.com/openmeterio/openmeter/openmeter/subscription"
++	"github.com/openmeterio/openmeter/openmeter/subscription/patch"
++	"github.com/openmeterio/openmeter/pkg/datetime"
++	"github.com/openmeterio/openmeter/pkg/models"
++)
++
++func mustDuration(t *testing.T, value string) datetime.ISODuration {
++	t.Helper()
++	d, err := datetime.ISODurationString(value).Parse()
++	require.NoError(t, err)
++	return d
++}
++
++func phaseSpec(t *testing.T, key, startAfter, name string) *subscription.SubscriptionPhaseSpec {
++	t.Helper()
++	return &subscription.SubscriptionPhaseSpec{
++		CreateSubscriptionPhasePlanInput: subscription.CreateSubscriptionPhasePlanInput{
++			PhaseKey:   key,
++			StartAfter: mustDuration(t, startAfter),
++			Name:       name,
++		},
++		ItemsByKey: map[string][]*subscription.SubscriptionItemSpec{},
++	}
++}
++
++func baseSpec(t *testing.T) subscription.SubscriptionSpec {
++	activeFrom := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
++	return subscription.SubscriptionSpec{
++		CreateSubscriptionPlanInput:     subscription.CreateSubscriptionPlanInput{BillingCadence: mustDuration(t, "P1M")},
++		CreateSubscriptionCustomerInput: subscription.CreateSubscriptionCustomerInput{ActiveFrom: activeFrom},
++		Phases: map[string]*subscription.SubscriptionPhaseSpec{
++			"base":  phaseSpec(t, "base", "P0D", "Base"),
++			"later": phaseSpec(t, "later", "P3M", "Later"),
++		},
++	}
++}
++
++func TestPatchAddPhasePreservesDefinitionAndShiftsTimeline(t *testing.T) {
++	spec := baseSpec(t)
++	duration := mustDuration(t, "P1M")
++	description := "inserted description"
++	input := subscription.CreateSubscriptionPhaseInput{
++		Duration: &duration,
++		CreateSubscriptionPhasePlanInput: subscription.CreateSubscriptionPhasePlanInput{
++			PhaseKey:    "inserted",
++			StartAfter:  mustDuration(t, "P1M"),
++			Name:        "Inserted",
++			Description: &description,
++			SortHint:    func() *uint8 { v := uint8(7); return &v }(),
++		},
++		CreateSubscriptionPhaseCustomerInput: subscription.CreateSubscriptionPhaseCustomerInput{
++			MetadataModel: models.MetadataModel{Metadata: models.Metadata{"source": "migration"}},
++		},
++	}
++
++	err := (patch.PatchAddPhase{PhaseKey: "inserted", CreateInput: input}).ApplyTo(&spec, subscription.ApplyContext{
++		CurrentTime: spec.ActiveFrom,
++	})
++	require.NoError(t, err)
++
++	inserted, ok := spec.Phases["inserted"]
++	require.True(t, ok)
++	assert.Equal(t, input.PhaseKey, inserted.PhaseKey)
++	assert.Equal(t, input.StartAfter, inserted.StartAfter)
++	assert.Equal(t, input.Name, inserted.Name)
++	assert.Equal(t, input.Description, inserted.Description)
++	assert.Equal(t, input.SortHint, inserted.SortHint)
++	assert.Equal(t, input.Metadata, inserted.Metadata)
++	assert.NotNil(t, inserted.ItemsByKey)
++	assert.Empty(t, inserted.ItemsByKey)
++
++
++	assert.Equal(t, mustDuration(t, "P2M"), spec.Phases["later"].StartAfter)
++}
++
++func TestPatchAddPhaseRejectsPayloadPathMismatch(t *testing.T) {
++	d := mustDuration(t, "P1M")
++	input := subscription.CreateSubscriptionPhaseInput{
++		Duration: &d,
++		CreateSubscriptionPhasePlanInput: subscription.CreateSubscriptionPhasePlanInput{
++			PhaseKey:   "payload-key",
++			StartAfter: mustDuration(t, "P1M"),
++			Name:       "Inserted",
++		},
++	}
++	assert.Error(t, (patch.PatchAddPhase{PhaseKey: "path-key", CreateInput: input}).Validate())
++}
++
++func TestPatchAddPhaseRejectsInvalidDurationForInsertion(t *testing.T) {
++	t.Run("missing duration is allowed when appending", func(t *testing.T) {
++		spec := baseSpec(t)
++		err := (patch.PatchAddPhase{
++			PhaseKey: "final",
++			CreateInput: subscription.CreateSubscriptionPhaseInput{
++				CreateSubscriptionPhasePlanInput: subscription.CreateSubscriptionPhasePlanInput{
++					PhaseKey:   "final",
++					StartAfter: mustDuration(t, "P4M"),
++					Name:       "Final",
++				},
++			},
++		}).ApplyTo(&spec, subscription.ApplyContext{CurrentTime: spec.ActiveFrom})
++		require.NoError(t, err)
++	})
++
++	t.Run("missing duration does not panic and returns an error", func(t *testing.T) {
++		spec := baseSpec(t)
++		var gotErr error
++		assert.NotPanics(t, func() {
++			gotErr = (patch.PatchAddPhase{
++				PhaseKey: "inserted",
++				CreateInput: subscription.CreateSubscriptionPhaseInput{
++					CreateSubscriptionPhasePlanInput: subscription.CreateSubscriptionPhasePlanInput{
++						PhaseKey:   "inserted",
++						StartAfter: mustDuration(t, "P1M"),
++						Name:       "Inserted",
++					},
++				},
++			}).ApplyTo(&spec, subscription.ApplyContext{CurrentTime: spec.ActiveFrom})
++		})
++		assert.Error(t, gotErr)
++	})
++
++	for _, value := range []string{"P0D", "-P1M"} {
++		t.Run("non-positive duration "+value, func(t *testing.T) {
++			input := subscription.CreateSubscriptionPhaseInput{
++				Duration: func() *datetime.ISODuration { d := mustDuration(t, value); return &d }(),
++				CreateSubscriptionPhasePlanInput: subscription.CreateSubscriptionPhasePlanInput{
++					PhaseKey:   "inserted",
++					StartAfter: mustDuration(t, "P1M"),
++					Name:       "Inserted",
++				},
++			}
++			assert.Error(t, (patch.PatchAddPhase{PhaseKey: "inserted", CreateInput: input}).Validate())
++		})
++	}
++}
++
++func TestPatchRemovePhaseShiftModes(t *testing.T) {
++	for _, tc := range []struct {
++		name       string
++		shift      subscription.RemoveSubscriptionPhaseShifting
++		expectedTo string
++	}{
++		{name: "shift next phase backward", shift: subscription.RemoveSubscriptionPhaseShiftNext, expectedTo: "P1M"},
++		{name: "leave next phase in place", shift: subscription.RemoveSubscriptionPhaseShiftPrev, expectedTo: "P3M"},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			spec := baseSpec(t)
++			spec.Phases["middle"] = phaseSpec(t, "middle", "P1M", "Middle")
++			err := (patch.PatchRemovePhase{
++				PhaseKey:    "middle",
++				RemoveInput: subscription.RemoveSubscriptionPhaseInput{Shift: tc.shift},
++			}).ApplyTo(&spec, subscription.ApplyContext{CurrentTime: spec.ActiveFrom})
++			require.NoError(t, err)
++			_, exists := spec.Phases["middle"]
++			assert.False(t, exists)
++			assert.Equal(t, mustDuration(t, tc.expectedTo), spec.Phases["later"].StartAfter)
++		})
++	}
++}
++
++func TestPatchRemovePhaseValidateRejectsUnknownShift(t *testing.T) {
++	err := (patch.PatchRemovePhase{
++		PhaseKey:    "phase",
++		RemoveInput: subscription.RemoveSubscriptionPhaseInput{Shift: subscription.RemoveSubscriptionPhaseShifting(99)},
++	}).Validate()
++	assert.Error(t, err)
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,5 @@
++#!/bin/bash
++set -euo pipefail
++
++
++go test ./openmeter/subscription/patch -run 'TestPatch(AddPhase|RemovePhase)'

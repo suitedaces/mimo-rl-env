@@ -1,0 +1,335 @@
+diff --git a/usercase-test-coderl/st_distance_sphere_test.rb b/usercase-test-coderl/st_distance_sphere_test.rb
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/st_distance_sphere_test.rb
+@@ -0,0 +1,309 @@
++# frozen_string_literal: true
++
++
++
++
++
++require "json"
++gem "minitest", "~> 5.0"
++require "minitest"
++def Minitest.load_plugins; end
++require "minitest/mock"
++require "minitest/autorun"
++require "open3"
++require "rbconfig"
++require "socket"
++require "tmpdir"
++
++$LOAD_PATH.unshift File.expand_path("../lib", __dir__)
++require "activerecord-mysql2rgeo-adapter"
++
++class Place < ActiveRecord::Base
++  self.table_name = "places"
++end
++
++class StDistanceSphereAcceptanceTest < Minitest::Test
++  EWKT_POINT = "SRID=4326;POINT(-72.099 42.099)"
++
++  class FakeMysqlConnection
++    def quote(value)
++      "'#{value.to_s.gsub("'", "''")}'"
++    end
++
++    def quote_table_name(name)
++      "`#{name}`"
++    end
++
++    def quote_column_name(name)
++      "`#{name}`"
++    end
++  end
++
++  def test_table_attribute_receiver_with_ewkt_rhs_returns_distance_sphere_node
++
++
++    receiver = lonlat
++    node = receiver.st_distance_sphere(EWKT_POINT)
++
++
++    assert_distance_sphere_node(node, expression_count: 2, spatial_arguments: [true, true])
++    assert_equal receiver, node.expressions[0]
++    assert_equal EWKT_POINT, node.expressions[1]
++
++
++    sql = sql_for(node)
++    assert_match(/\AST_Distance_Sphere\(/, sql)
++    assert_includes sql, "`places`.`lonlat`"
++    assert_match(/ST_GeomFromText\('POINT\(-72\.099 42\.099\)'.*4326/, sql)
++
++    predicate_sql = sql_for(node.lt(500))
++    assert_match(/\AST_Distance_Sphere\(/, predicate_sql)
++    assert_match(/<\s*'?500'?/, predicate_sql)
++  end
++
++  def test_table_attribute_receiver_with_rgeo_rhs_and_meter_units
++
++
++    receiver = lonlat
++    geom = geographic_factory.point(-71.0, 41.0)
++    node = receiver.st_distance_sphere(geom, :meter)
++
++
++    assert_distance_sphere_node(node, expression_count: 3, spatial_arguments: [true, true, false])
++    assert_equal receiver, node.expressions[0]
++    assert_equal geom, node.expressions[1]
++    assert_equal "meter", node.expressions[2]
++  end
++
++  def test_spatial_constant_receiver_with_ewkt_rhs
++
++
++    geom = geographic_factory.point(-71.0, 41.0)
++    receiver = Arel.spatial(geom)
++    node = receiver.st_distance_sphere(EWKT_POINT)
++
++
++    assert_distance_sphere_node(node, expression_count: 2, spatial_arguments: [true, true])
++    assert_same receiver, node.expressions[0]
++    assert_equal geom, node.expressions[0].delegate
++    assert_equal EWKT_POINT, node.expressions[1]
++
++    sql = sql_for(node)
++    assert_match(/\AST_Distance_Sphere\(/, sql)
++    assert_operator sql.scan(/ST_GeomFromText/).length, :>=, 2
++  end
++
++  def test_spatial_function_receiver_with_ewkt_rhs_and_units
++
++
++    receiver = lonlat.st_length
++    node = receiver.st_distance_sphere(EWKT_POINT, "yard")
++
++
++    assert_distance_sphere_node(node, expression_count: 3, spatial_arguments: [true, true, false])
++    assert_equal receiver, node.expressions[0]
++    assert_equal EWKT_POINT, node.expressions[1]
++    assert_equal "yard", node.expressions[2]
++
++    sql = sql_for(node)
++    assert_match(/\AST_Distance_Sphere\(/, sql)
++    assert_includes sql, "ST_Length"
++  end
++
++  def test_missing_rhs_raises_argument_error
++
++    assert_raises(ArgumentError) { lonlat.st_distance_sphere }
++  end
++
++  def test_referential_transparency_for_same_arguments
++    geom = geographic_factory.point(-71.0, 41.0)
++
++    assert_equal lonlat.st_distance_sphere(geom, :meter), lonlat.st_distance_sphere(geom, :meter)
++  end
++
++  def test_does_not_mutate_receiver_rhs_string_or_geometry
++    rhs = EWKT_POINT.dup
++    geom = geographic_factory.point(-71.0, 41.0)
++    receiver_before = {
++      table: lonlat.relation.name,
++      name: lonlat.name,
++      sql: sql_for(lonlat)
++    }
++    rhs_before = rhs.dup
++    geom_before = { text: geom.as_text, srid: geom.srid }
++
++    lonlat.st_distance_sphere(rhs)
++    lonlat.st_distance_sphere(geom, :meter)
++
++    assert_equal receiver_before, { table: lonlat.relation.name, name: lonlat.name, sql: sql_for(lonlat) }
++    assert_equal rhs_before, rhs
++    assert_equal geom_before, { text: geom.as_text, srid: geom.srid }
++  end
++
++  def test_no_global_state_across_fresh_ruby_process
++    in_process = JSON.generate(attribute_string_summary(lonlat.st_distance_sphere(EWKT_POINT)))
++    script = <<~RUBY
++      require "json"
++      $LOAD_PATH.unshift "/workspace/repo/lib"
++      require "activerecord-mysql2rgeo-adapter"
++
++      class Place < ActiveRecord::Base
++        self.table_name = "places"
++      end
++
++      class FakeMysqlConnection
++        def quote(value)
++          "'\#{value.to_s.gsub("'", "''")}'"
++        end
++
++        def quote_table_name(name)
++          "`\#{name}`"
++        end
++
++        def quote_column_name(name)
++          "`\#{name}`"
++        end
++      end
++
++      visitor = Arel::Visitors::Mysql2Rgeo.new(FakeMysqlConnection.new)
++      node = Place.arel_table[:lonlat].st_distance_sphere("SRID=4326;POINT(-72.099 42.099)")
++      sql = visitor.accept(node, Arel::Collectors::SQLString.new).value
++      predicate_sql = visitor.accept(node.lt(500), Arel::Collectors::SQLString.new).value
++      summary = {
++        class_name: node.class.name,
++        name: node.name,
++        expression_count: node.expressions.length,
++        receiver_table: node.expressions[0].relation.name,
++        receiver_name: node.expressions[0].name,
++        rhs: node.expressions[1],
++        spatial_result: node.spatial_result?,
++        spatial_arguments: (0...node.expressions.length).map { |index| node.spatial_argument?(index) },
++        sql: sql,
++        predicate_sql: predicate_sql
++      }
++      STDOUT.write(JSON.generate(summary))
++    RUBY
++
++    fresh_process, stderr, status = Open3.capture3(RbConfig.ruby, "-I", "/workspace/repo/lib", "-e", script)
++
++    assert status.success?, stderr
++    assert_equal in_process, fresh_process
++  end
++
++  def test_no_filesystem_network_database_or_active_record_config_side_effects
++    before_connection_handler = ActiveRecord::Base.connection_handler.object_id
++    before_configurations = ActiveRecord::Base.configurations
++
++    Dir.mktmpdir do |dir|
++      Dir.chdir(dir) do
++        before_entries = Dir.children(".")
++        socket_error = Class.new(RuntimeError)
++        socket_blocker = proc { raise socket_error, "network access is undeclared" }
++
++        Socket.stub(:tcp, socket_blocker) do
++          TCPSocket.stub(:open, socket_blocker) do
++            lonlat.st_distance_sphere(EWKT_POINT)
++            lonlat.st_distance_sphere(geographic_factory.point(-71.0, 41.0), :meter)
++          end
++        end
++
++        assert_equal before_entries, Dir.children(".")
++      end
++    end
++
++    assert_equal before_connection_handler, ActiveRecord::Base.connection_handler.object_id
++    assert_same before_configurations, ActiveRecord::Base.configurations
++  end
++
++  private
++
++  def lonlat
++    Place.arel_table[:lonlat]
++  end
++
++  def geographic_factory
++    RGeo::Geographic.spherical_factory(srid: 4326)
++  end
++
++  def visitor
++    @visitor ||= Arel::Visitors::Mysql2Rgeo.new(FakeMysqlConnection.new)
++  end
++
++  def sql_for(node)
++    visitor.accept(node, Arel::Collectors::SQLString.new).value
++  end
++
++  def assert_distance_sphere_node(node, expression_count:, spatial_arguments:)
++    assert_instance_of RGeo::ActiveRecord::SpatialNamedFunction, node
++    assert_equal "ST_Distance_Sphere", node.name
++    assert_equal expression_count, node.expressions.length
++    assert_equal false, node.spatial_result?
++    assert_equal spatial_arguments, spatial_arguments(node)
++  end
++
++  def attribute_string_summary(node)
++    {
++      class_name: node.class.name,
++      name: node.name,
++      expression_count: node.expressions.length,
++      receiver_table: node.expressions[0].relation.name,
++      receiver_name: node.expressions[0].name,
++      rhs: node.expressions[1],
++      spatial_result: node.spatial_result?,
++      spatial_arguments: spatial_arguments(node),
++      sql: sql_for(node),
++      predicate_sql: sql_for(node.lt(500))
++    }
++  end
++
++  def attribute_geometry_units_summary(node)
++    {
++      class_name: node.class.name,
++      name: node.name,
++      expression_count: node.expressions.length,
++      receiver_table: node.expressions[0].relation.name,
++      receiver_name: node.expressions[0].name,
++      rhs_class: node.expressions[1].class.name,
++      rhs_text: node.expressions[1].as_text,
++      rhs_srid: node.expressions[1].srid,
++      units: node.expressions[2],
++      spatial_result: node.spatial_result?,
++      spatial_arguments: spatial_arguments(node)
++    }
++  end
++
++  def constant_receiver_summary(node)
++    {
++      class_name: node.class.name,
++      name: node.name,
++      expression_count: node.expressions.length,
++      receiver_class: node.expressions[0].class.name,
++      receiver_text: node.expressions[0].delegate.as_text,
++      receiver_srid: node.expressions[0].delegate.srid,
++      rhs: node.expressions[1],
++      spatial_result: node.spatial_result?,
++      spatial_arguments: spatial_arguments(node),
++      sql: sql_for(node)
++    }
++  end
++
++  def function_receiver_summary(node)
++    {
++      class_name: node.class.name,
++      name: node.name,
++      expression_count: node.expressions.length,
++      receiver_class: node.expressions[0].class.name,
++      receiver_name: node.expressions[0].name,
++      receiver_expression_names: node.expressions[0].expressions.map(&:name),
++      rhs: node.expressions[1],
++      units: node.expressions[2],
++      spatial_result: node.spatial_result?,
++      spatial_arguments: spatial_arguments(node),
++      sql: sql_for(node)
++    }
++  end
++
++  def spatial_arguments(node)
++    (0...node.expressions.length).map { |index| node.spatial_argument?(index) }
++  end
++end
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,16 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++
++cd /workspace/repo
++
++exec ruby -I /workspace/repo/lib /workspace/repo/usercase-test-coderl/st_distance_sphere_test.rb

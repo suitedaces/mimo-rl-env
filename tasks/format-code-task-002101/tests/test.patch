@@ -1,0 +1,506 @@
+diff --git a/usercase-test-coderl/msearch_stateful_test.go b/usercase-test-coderl/msearch_stateful_test.go
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/msearch_stateful_test.go
+@@ -0,0 +1,477 @@
++package usercase_test_coderl
++
++import (
++	"context"
++	"encoding/json"
++	"fmt"
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"net/url"
++	"reflect"
++	"strings"
++	"testing"
++
++	elastic "github.com/olivere/elastic/v7"
++)
++
++func newClient(t *testing.T, serverURL string) *elastic.Client {
++	t.Helper()
++
++	client, err := elastic.NewSimpleClient(elastic.SetURL(serverURL))
++	if err != nil {
++		t.Fatalf("NewSimpleClient() error = %v", err)
++	}
++	return client
++}
++
++func oneResponseBody(took int64, total int64, status int, timedOut bool) string {
++	return fmt.Sprintf(`{"took":%d,"responses":[{"took":5,"timed_out":%t,"hits":{"total":{"value":%d,"relation":"eq"},"hits":[]},"status":%d}]}`,
++		took, timedOut, total, status)
++}
++
++func TestMultiSearchBuildsTwoRequestBatchWithDefaultIndexAndQueryOptions(t *testing.T) {
++
++
++	var gotMethod, gotPath, gotBody string
++	var gotQuery url.Values
++	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		gotMethod = r.Method
++		gotPath = r.URL.Path
++		gotQuery = r.URL.Query()
++		b, err := io.ReadAll(r.Body)
++		if err != nil {
++			t.Fatalf("ReadAll(request body) error = %v", err)
++		}
++		gotBody = string(b)
++		w.Header().Set("Content-Type", "application/json")
++		_, _ = io.WriteString(w, `{"took":17,"responses":[{"took":5,"timed_out":false,"hits":{"total":{"value":2,"relation":"eq"},"hits":[]},"status":200},{"took":7,"timed_out":true,"hits":{"total":{"value":4,"relation":"gte"},"hits":[]},"status":206}]}`)
++	}))
++	defer ts.Close()
++
++	client := newClient(t, ts.URL)
++	req1 := elastic.NewSearchRequest().Source(`{"query":{"match_all":{}},"size":1}`)
++	req2 := elastic.NewSearchRequest().
++		Index("explicit-a", "explicit-b").
++		Routing("r-9").
++		RequestCache(true).
++		Source(`{"query":{"term":{"level":"error"}}}`)
++
++	result, err := client.MultiSearch().
++		Add(req1, req2).
++		Index("logs").
++		Pretty(true).
++		Human(false).
++		ErrorTrace(true).
++		FilterPath("responses.hits", "took").
++		MaxConcurrentSearches(3).
++		PreFilterShardSize(11).
++		Do(context.Background())
++	if err != nil {
++		t.Fatalf("MultiSearch Do() error = %v", err)
++	}
++
++	if gotMethod != "GET" {
++		t.Fatalf("request method = %q, want %q", gotMethod, "GET")
++	}
++	if gotPath != "/_msearch" {
++		t.Fatalf("request path = %q, want %q", gotPath, "/_msearch")
++	}
++	if gotQuery.Get("pretty") != "true" {
++		t.Fatalf("query pretty = %q, want %q", gotQuery.Get("pretty"), "true")
++	}
++	if gotQuery.Get("human") != "false" {
++		t.Fatalf("query human = %q, want %q", gotQuery.Get("human"), "false")
++	}
++	if gotQuery.Get("error_trace") != "true" {
++		t.Fatalf("query error_trace = %q, want %q", gotQuery.Get("error_trace"), "true")
++	}
++	if gotQuery.Get("filter_path") != "responses.hits,took" {
++		t.Fatalf("query filter_path = %q, want %q", gotQuery.Get("filter_path"), "responses.hits,took")
++	}
++	if gotQuery.Get("max_concurrent_searches") != "3" {
++		t.Fatalf("query max_concurrent_searches = %q, want %q", gotQuery.Get("max_concurrent_searches"), "3")
++	}
++	if gotQuery.Get("pre_filter_shard_size") != "11" {
++		t.Fatalf("query pre_filter_shard_size = %q, want %q", gotQuery.Get("pre_filter_shard_size"), "11")
++	}
++
++
++	bodyLines := splitNDJSONLines(t, gotBody, 4)
++	assertHeaderIndices(t, bodyLines[0], []string{"logs"})
++	assertJSONLineEqual(t, bodyLines[1], `{"query":{"match_all":{}},"size":1}`)
++	assertHeaderIndices(t, bodyLines[2], []string{"explicit-a", "explicit-b"})
++	assertJSONLineEqual(t, bodyLines[3], `{"query":{"term":{"level":"error"}}}`)
++	if result.TookInMillis != 17 {
++		t.Fatalf("result TookInMillis = %d, want %d", result.TookInMillis, int64(17))
++	}
++	if len(result.Responses) != 2 {
++		t.Fatalf("len(result.Responses) = %d, want %d", len(result.Responses), 2)
++	}
++	if result.Responses[0].TookInMillis != 5 {
++		t.Fatalf("response[0] TookInMillis = %d, want %d", result.Responses[0].TookInMillis, int64(5))
++	}
++	if result.Responses[0].TotalHits() != 2 {
++		t.Fatalf("response[0] TotalHits() = %d, want %d", result.Responses[0].TotalHits(), int64(2))
++	}
++	if result.Responses[0].Status != 200 {
++		t.Fatalf("response[0] Status = %d, want %d", result.Responses[0].Status, 200)
++	}
++	if result.Responses[1].TookInMillis != 7 {
++		t.Fatalf("response[1] TookInMillis = %d, want %d", result.Responses[1].TookInMillis, int64(7))
++	}
++	if result.Responses[1].TotalHits() != 4 {
++		t.Fatalf("response[1] TotalHits() = %d, want %d", result.Responses[1].TotalHits(), int64(4))
++	}
++	if result.Responses[1].Status != 206 {
++		t.Fatalf("response[1] Status = %d, want %d", result.Responses[1].Status, 206)
++	}
++	if result.Responses[1].TimedOut != true {
++		t.Fatalf("response[1] TimedOut = %t, want %t", result.Responses[1].TimedOut, true)
++	}
++}
++
++func TestMultiSearchHeaderAddsCustomHeader(t *testing.T) {
++
++
++	var gotHeader string
++	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		gotHeader = r.Header.Get("X-Trace")
++		w.Header().Set("Content-Type", "application/json")
++		_, _ = io.WriteString(w, oneResponseBody(3, 1, 200, false))
++	}))
++	defer ts.Close()
++
++	result, err := newClient(t, ts.URL).MultiSearch().
++		Add(elastic.NewSearchRequest().Source(`{"query":{"match_all":{}}}`)).
++		Header("X-Trace", "trace-1").
++		Do(context.Background())
++	if err != nil {
++		t.Fatalf("MultiSearch Do() error = %v", err)
++	}
++
++	if gotHeader != "trace-1" {
++		t.Fatalf("X-Trace header = %q, want %q", gotHeader, "trace-1")
++	}
++	if result.TookInMillis != 3 {
++		t.Fatalf("result TookInMillis = %d, want %d", result.TookInMillis, int64(3))
++	}
++	if len(result.Responses) != 1 {
++		t.Fatalf("len(result.Responses) = %d, want %d", len(result.Responses), 1)
++	}
++}
++
++func TestNewMultiSearchServiceHeadersSetsCustomHeaders(t *testing.T) {
++
++
++	var gotHeader string
++	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		gotHeader = r.Header.Get("X-Bulk")
++		w.Header().Set("Content-Type", "application/json")
++		_, _ = io.WriteString(w, oneResponseBody(4, 8, 201, false))
++	}))
++	defer ts.Close()
++
++	result, err := elastic.NewMultiSearchService(newClient(t, ts.URL)).
++		Add(elastic.NewSearchRequest().Source(`{"query":{"match_all":{}}}`)).
++		Headers(http.Header{"X-Bulk": []string{"bulk-1"}}).
++		Do(context.Background())
++	if err != nil {
++		t.Fatalf("MultiSearch Do() error = %v", err)
++	}
++
++	if gotHeader != "bulk-1" {
++		t.Fatalf("X-Bulk header = %q, want %q", gotHeader, "bulk-1")
++	}
++	if result.Responses[0].TotalHits() != 8 {
++		t.Fatalf("response[0] TotalHits() = %d, want %d", result.Responses[0].TotalHits(), int64(8))
++	}
++	if result.Responses[0].Status != 201 {
++		t.Fatalf("response[0] Status = %d, want %d", result.Responses[0].Status, 201)
++	}
++}
++
++func TestMultiSearchAddRetainsStateAcrossSeparateCallsAndRepeatedDo(t *testing.T) {
++
++
++	var bodies []string
++	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		b, err := io.ReadAll(r.Body)
++		if err != nil {
++			t.Fatalf("ReadAll(request body) error = %v", err)
++		}
++		bodies = append(bodies, string(b))
++		w.Header().Set("Content-Type", "application/json")
++		_, _ = io.WriteString(w, `{"took":9,"responses":[{"took":1,"hits":{"total":{"value":1,"relation":"eq"},"hits":[]},"status":200},{"took":2,"hits":{"total":{"value":2,"relation":"eq"},"hits":[]},"status":200}]}`)
++	}))
++	defer ts.Close()
++
++	service := newClient(t, ts.URL).MultiSearch()
++	service.Add(elastic.NewSearchRequest().Source(`{"query":{"match_all":{}}}`))
++	service.Add(elastic.NewSearchRequest().Source(`{"query":{"term":{"user":"olivere"}}}`))
++
++	first, err := service.Do(context.Background())
++	if err != nil {
++		t.Fatalf("first Do() error = %v", err)
++	}
++	second, err := service.Do(context.Background())
++	if err != nil {
++		t.Fatalf("second Do() error = %v", err)
++	}
++
++	if len(bodies) != 2 {
++		t.Fatalf("captured request bodies = %d, want %d", len(bodies), 2)
++	}
++
++	wantLines := []string{
++		`{}`,
++		`{"query":{"match_all":{}}}`,
++		`{}`,
++		`{"query":{"term":{"user":"olivere"}}}`,
++	}
++	assertNDJSONLinesEqual(t, bodies[0], wantLines)
++	assertNDJSONLinesEqual(t, bodies[1], wantLines)
++	if first.TookInMillis != 9 {
++		t.Fatalf("first TookInMillis = %d, want %d", first.TookInMillis, int64(9))
++	}
++	if second.TookInMillis != 9 {
++		t.Fatalf("second TookInMillis = %d, want %d", second.TookInMillis, int64(9))
++	}
++	if len(second.Responses) != 2 {
++		t.Fatalf("len(second.Responses) = %d, want %d", len(second.Responses), 2)
++	}
++}
++
++func TestMultiSearchServicesKeepIndependentBuilderState(t *testing.T) {
++
++
++	var bodies []string
++	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		b, err := io.ReadAll(r.Body)
++		if err != nil {
++			t.Fatalf("ReadAll(request body) error = %v", err)
++		}
++		bodies = append(bodies, string(b))
++		w.Header().Set("Content-Type", "application/json")
++		_, _ = io.WriteString(w, oneResponseBody(6, 1, 200, false))
++	}))
++	defer ts.Close()
++
++	client := newClient(t, ts.URL)
++	a := client.MultiSearch().Index("logs-a").Add(elastic.NewSearchRequest().Source(`{"query":{"match_all":{}}}`))
++	b := client.MultiSearch().Add(elastic.NewSearchRequest().Source(`{"query":{"term":{"level":"warn"}}}`))
++
++	resultA, err := a.Do(context.Background())
++	if err != nil {
++		t.Fatalf("service a Do() error = %v", err)
++	}
++	resultB, err := b.Do(context.Background())
++	if err != nil {
++		t.Fatalf("service b Do() error = %v", err)
++	}
++
++	if len(bodies) != 2 {
++		t.Fatalf("captured request bodies = %d, want %d", len(bodies), 2)
++	}
++
++	bodyLinesA := splitNDJSONLines(t, bodies[0], 2)
++	assertHeaderIndices(t, bodyLinesA[0], []string{"logs-a"})
++	assertJSONLineEqual(t, bodyLinesA[1], `{"query":{"match_all":{}}}`)
++	assertNDJSONLinesEqual(t, bodies[1], []string{
++		`{}`,
++		`{"query":{"term":{"level":"warn"}}}`,
++	})
++	if resultA.TookInMillis != 6 {
++		t.Fatalf("service a TookInMillis = %d, want %d", resultA.TookInMillis, int64(6))
++	}
++	if resultB.TookInMillis != 6 {
++		t.Fatalf("service b TookInMillis = %d, want %d", resultB.TookInMillis, int64(6))
++	}
++}
++
++func TestMultiSearchDoReturnsTypedBodyBuildError(t *testing.T) {
++
++
++	called := false
++	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		called = true
++		w.WriteHeader(http.StatusInternalServerError)
++	}))
++	defer ts.Close()
++
++	result, err := newClient(t, ts.URL).MultiSearch().
++		Add(elastic.NewSearchRequest().Source(map[string]interface{}{"bad": func() {}})).
++		Do(context.Background())
++
++
++	if err == nil {
++		t.Fatalf("Do() error = nil, want non-nil")
++	}
++	if result != nil {
++		t.Fatalf("Do() result = %#v, want nil", result)
++	}
++	if called != false {
++		t.Fatalf("server called after body build failure = %t, want %t", called, false)
++	}
++}
++
++func TestMultiSearchDoReturnsElasticErrorOnHTTPError(t *testing.T) {
++
++
++	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		w.Header().Set("Content-Type", "application/json")
++		w.WriteHeader(http.StatusServiceUnavailable)
++		_, _ = io.WriteString(w, `{"error":{"type":"unavailable","reason":"planned outage"},"status":503}`)
++	}))
++	defer ts.Close()
++
++	result, err := newClient(t, ts.URL).MultiSearch().
++		Add(elastic.NewSearchRequest().Source(`{"query":{"match_all":{}}}`)).
++		Do(context.Background())
++
++
++	if err == nil {
++		t.Fatalf("Do() error = nil, want non-nil")
++	}
++	if result != nil {
++		t.Fatalf("Do() result = %#v, want nil", result)
++	}
++}
++
++func TestMultiSearchDoReturnsTypedDecodeError(t *testing.T) {
++
++
++	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		w.Header().Set("Content-Type", "application/json")
++		_, _ = io.WriteString(w, `{"took":`)
++	}))
++	defer ts.Close()
++
++	result, err := newClient(t, ts.URL).MultiSearch().
++		Add(elastic.NewSearchRequest().Source(`{"query":{"match_all":{}}}`)).
++		Do(context.Background())
++
++
++	if err == nil {
++		t.Fatalf("Do() error = nil, want non-nil")
++	}
++	if result != nil {
++		t.Fatalf("Do() result = %#v, want nil", result)
++	}
++}
++
++func TestMultiSearchDoSucceedsAcrossManyCycles(t *testing.T) {
++
++
++	requests := 0
++	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		requests++
++		w.Header().Set("Content-Type", "application/json")
++		_, _ = io.WriteString(w, oneResponseBody(1, 1, 200, false))
++	}))
++	defer ts.Close()
++
++
++	for i := 0; i < 10; i++ {
++		result, err := newClient(t, ts.URL).MultiSearch().
++			Add(elastic.NewSearchRequest().Source(`{"query":{"match_all":{}}}`)).
++			Do(context.Background())
++		if err != nil {
++			t.Fatalf("cycle %d Do() error = %v", i, err)
++		}
++		if result.TookInMillis != 1 {
++			t.Fatalf("cycle %d TookInMillis = %d, want %d", i, result.TookInMillis, int64(1))
++		}
++		if len(result.Responses) != 1 {
++			t.Fatalf("cycle %d len(result.Responses) = %d, want %d", i, len(result.Responses), 1)
++		}
++	}
++
++	if requests != 10 {
++		t.Fatalf("server requests = %d, want %d", requests, 10)
++	}
++}
++
++func assertNDJSONLinesEqual(t *testing.T, got string, wantLines []string) {
++	t.Helper()
++
++	gotLines := splitNDJSONLines(t, got, len(wantLines))
++	for i := range wantLines {
++		assertJSONLineEqual(t, gotLines[i], wantLines[i])
++	}
++}
++
++func splitNDJSONLines(t *testing.T, got string, wantCount int) []string {
++	t.Helper()
++
++	if !strings.HasSuffix(got, "\n") {
++		t.Fatalf("request body %q does not have required trailing newline", got)
++	}
++	gotLines := strings.Split(strings.TrimSuffix(got, "\n"), "\n")
++	if len(gotLines) != wantCount {
++		t.Fatalf("request body line count = %d, want %d; body = %q", len(gotLines), wantCount, got)
++	}
++	return gotLines
++}
++
++func assertJSONLineEqual(t *testing.T, got string, want string) {
++	t.Helper()
++
++	gotJSON := decodeJSONLine(t, got, "got")
++	wantJSON := decodeJSONLine(t, want, "want")
++	if !reflect.DeepEqual(gotJSON, wantJSON) {
++		t.Fatalf("request body line = %s, want JSON-equivalent to %s", got, want)
++	}
++}
++
++func assertHeaderIndices(t *testing.T, line string, want []string) {
++	t.Helper()
++
++	raw := decodeJSONLine(t, line, "header")
++	header, ok := raw.(map[string]interface{})
++	if !ok {
++		t.Fatalf("request header line = %s, want JSON object", line)
++	}
++
++	var got []string
++	if v, ok := header["index"]; ok {
++		got = appendIndexValues(t, got, v, "index")
++	}
++	if v, ok := header["indices"]; ok {
++		got = appendIndexValues(t, got, v, "indices")
++	}
++	if !reflect.DeepEqual(got, want) {
++		t.Fatalf("request header indices = %#v, want %#v; line = %s", got, want, line)
++	}
++}
++
++func appendIndexValues(t *testing.T, got []string, value interface{}, field string) []string {
++	t.Helper()
++
++	switch v := value.(type) {
++	case string:
++		return append(got, v)
++	case []interface{}:
++		for _, item := range v {
++			s, ok := item.(string)
++			if !ok {
++				t.Fatalf("request header %s item = %#v, want string", field, item)
++			}
++			got = append(got, s)
++		}
++		return got
++	default:
++		t.Fatalf("request header %s = %#v, want string or string array", field, value)
++		return got
++	}
++}
++
++func decodeJSONLine(t *testing.T, line string, label string) interface{} {
++	t.Helper()
++
++	var v interface{}
++	if err := json.Unmarshal([]byte(line), &v); err != nil {
++		t.Fatalf("%s request body line is invalid JSON: %v; line = %q", label, err, line)
++	}
++	return v
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,19 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++
++cd /workspace/repo
++export GOWORK=off
++export GOPROXY=off
++export GOSUMDB=off
++export GOTOOLCHAIN=local
++exec go test -v -count=1 ./usercase-test-coderl/...

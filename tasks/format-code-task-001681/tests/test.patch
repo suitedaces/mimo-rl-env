@@ -1,0 +1,221 @@
+diff --git a/run_tags_test.go b/run_tags_test.go
+new file mode 100644
+index 0000000..878a76e
+--- /dev/null
++++ b/run_tags_test.go
+@@ -0,0 +1,205 @@
++package ecspresso
++
++import (
++	"context"
++	"encoding/json"
++	"io"
++	"net/http"
++	"os"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/aws/aws-sdk-go-v2/aws"
++	"github.com/aws/aws-sdk-go-v2/credentials"
++	"github.com/aws/aws-sdk-go-v2/service/ecs"
++)
++
++type runTagsRoundTripper struct {
++	serviceTags []map[string]string
++	listCalls   int
++	runBodies   [][]byte
++}
++
++func (rt *runTagsRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
++	body, _ := io.ReadAll(req.Body)
++	target := req.Header.Get("X-Amz-Target")
++	var response string
++	switch {
++	case strings.HasSuffix(target, ".ListTagsForResource"):
++		rt.listCalls++
++		encoded := make([]string, 0, len(rt.serviceTags))
++		for _, tag := range rt.serviceTags {
++			b, _ := json.Marshal(tag)
++			encoded = append(encoded, string(b))
++		}
++		response = `{"tags":[` + strings.Join(encoded, ",") + `]}`
++	case strings.HasSuffix(target, ".DescribeServices"):
++		response = `{"services":[{"serviceName":"demo","serviceArn":"arn:aws:ecs:us-east-1:123456789012:service/demo/demo","clusterArn":"arn:aws:ecs:us-east-1:123456789012:cluster/demo","taskDefinition":"arn:aws:ecs:us-east-1:123456789012:task-definition/demo:7","desiredCount":1,"status":"ACTIVE"}],"failures":[]}`
++	case strings.HasSuffix(target, ".DescribeTaskDefinition"):
++		response = `{"taskDefinition":{"family":"demo","revision":7,"taskDefinitionArn":"arn:aws:ecs:us-east-1:123456789012:task-definition/demo:7","containerDefinitions":[{"name":"app","image":"example.invalid/app:latest"}]},"tags":[]}`
++	case strings.HasSuffix(target, ".RunTask"):
++		rt.runBodies = append(rt.runBodies, body)
++		response = `{"tasks":[{"taskArn":"arn:aws:ecs:us-east-1:123456789012:task/demo/abc"}],"failures":[]}`
++	default:
++		return nil, &unexpectedRunTagsOperation{target: target}
++	}
++	return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(response)), Request: req}, nil
++}
++
++type unexpectedRunTagsOperation struct{ target string }
++
++func (e *unexpectedRunTagsOperation) Error() string { return "unexpected ECS operation: " + e.target }
++
++func newRunTagsApp(t *testing.T, rt *runTagsRoundTripper) *App {
++	t.Helper()
++	path := t.TempDir() + "/service.json"
++	if err := os.WriteFile(path, []byte(`{"serviceName":"demo","serviceArn":"arn:aws:ecs:us-east-1:123456789012:service/demo/demo"}`), 0600); err != nil {
++		t.Fatal(err)
++	}
++	cfg := aws.Config{
++		Region:      "us-east-1",
++		Credentials: credentials.NewStaticCredentialsProvider("access", "secret", ""),
++		HTTPClient:  &http.Client{Transport: rt},
++	}
++	return &App{
++		Service: "demo", Cluster: "demo",
++		ecs:    ecs.NewFromConfig(cfg),
++		config: &Config{Service: "demo", Cluster: "demo", ServiceDefinitionPath: path, Timeout: &Duration{Duration: time.Minute}},
++		loader: newConfigLoader(nil, nil), logger: newLogger(),
++	}
++}
++
++func parseRunTagsCLI(t *testing.T, args ...string) *RunOption {
++	t.Helper()
++	_, opts, _, err := ParseCLIv2(append([]string{"run", "--skip-task-definition", "--no-wait"}, args...))
++	if err != nil {
++		t.Fatalf("run tag arguments were rejected: %v", err)
++	}
++	return opts.Run
++}
++
++func decodeRunTags(t *testing.T, body []byte) (string, bool, []map[string]interface{}) {
++	t.Helper()
++	var payload map[string]json.RawMessage
++	if err := json.Unmarshal(body, &payload); err != nil {
++		t.Fatalf("invalid RunTask request: %v", err)
++	}
++	var tags []map[string]interface{}
++	if err := json.Unmarshal(payload["tags"], &tags); err != nil {
++		t.Fatalf("invalid tags in RunTask request: %v", err)
++	}
++	var propagate string
++	_, present := payload["propagateTags"]
++	if present {
++		if err := json.Unmarshal(payload["propagateTags"], &propagate); err != nil {
++			t.Fatalf("invalid propagateTags in RunTask request: %v", err)
++		}
++	}
++	result := make([]map[string]interface{}, len(tags))
++	for i, tag := range tags {
++		result[i] = tag
++	}
++	return propagate, present, result
++}
++
++func TestRunTaskServiceTagsAreOverriddenByExplicitTags(t *testing.T) {
++	rt := &runTagsRoundTripper{serviceTags: []map[string]string{{"key": "Team", "value": "platform"}, {"key": "Env", "value": "prod"}}}
++	app := newRunTagsApp(t, rt)
++	opt := parseRunTagsCLI(t, "--propagate-tags", "SERVICE", "--tags", "Team=app,Trace=enabled")
++	if err := app.Run(context.Background(), *opt); err != nil {
++		t.Fatalf("run failed: %v", err)
++	}
++	if len(rt.runBodies) != 1 {
++		t.Fatalf("expected one RunTask call, got %d", len(rt.runBodies))
++	}
++	propagate, present, tags := decodeRunTags(t, rt.runBodies[0])
++	if present || propagate != "" {
++		t.Fatalf("service propagation should be represented by explicit merged tags, got %q (present=%t)", propagate, present)
++	}
++	got := map[string]string{}
++	for _, tag := range tags {
++		got[tag["key"].(string)] = tag["value"].(string)
++	}
++	if len(got) != 3 || got["Env"] != "prod" || got["Team"] != "app" || got["Trace"] != "enabled" {
++		t.Fatalf("unexpected merged tags: %#v", tags)
++	}
++	for i := 1; i < len(tags); i++ {
++		if tags[i-1]["key"].(string) > tags[i]["key"].(string) {
++			t.Fatalf("merged tags are not ordered by key: %#v", tags)
++		}
++	}
++}
++
++func TestRunTaskTaskDefinitionPropagationRemainsExplicit(t *testing.T) {
++	rt := &runTagsRoundTripper{}
++	app := newRunTagsApp(t, rt)
++	opt := parseRunTagsCLI(t, "--propagate-tags", "TASK_DEFINITION", "--tags", "Env=prod")
++	if err := app.Run(context.Background(), *opt); err != nil {
++		t.Fatalf("run failed: %v", err)
++	}
++	propagate, present, tags := decodeRunTags(t, rt.runBodies[0])
++	if !present || propagate != "TASK_DEFINITION" {
++		t.Fatalf("expected TASK_DEFINITION propagation, got %q (present=%t)", propagate, present)
++	}
++	if rt.listCalls != 0 {
++		t.Fatal("TASK_DEFINITION propagation fetched service tags")
++	}
++	if len(tags) != 1 || tags[0]["key"] != "Env" || tags[0]["value"] != "prod" {
++		t.Fatalf("unexpected explicit tags: %#v", tags)
++	}
++}
++
++func TestRunTaskWithoutPropagationOmitsPropagationField(t *testing.T) {
++	for _, mode := range []string{"", "NONE"} {
++		t.Run(mode, func(t *testing.T) {
++			rt := &runTagsRoundTripper{}
++			app := newRunTagsApp(t, rt)
++			args := []string{"--tags", "Env=prod"}
++			if mode != "" {
++				args = append(args, "--propagate-tags", mode)
++			}
++			opt := parseRunTagsCLI(t, args...)
++			if err := app.Run(context.Background(), *opt); err != nil {
++				t.Fatalf("run failed: %v", err)
++			}
++			propagate, present, tags := decodeRunTags(t, rt.runBodies[0])
++			if present || propagate != "" {
++				t.Fatalf("disabled propagation must remain unset, got %q (present=%t)", propagate, present)
++			}
++			if rt.listCalls != 0 {
++				t.Fatal("disabled propagation fetched service tags")
++			}
++			if len(tags) != 1 || tags[0]["key"] != "Env" {
++				t.Fatalf("explicit tags were lost: %#v", tags)
++			}
++		})
++	}
++}
++
++func TestRunTaskNormalizesDuplicateTagsAndRejectsEmptyKeys(t *testing.T) {
++	rt := &runTagsRoundTripper{}
++	app := newRunTagsApp(t, rt)
++	opt := parseRunTagsCLI(t, "--tags", "Env=dev,Team=app,Env=prod,Empty=")
++	if err := app.Run(context.Background(), *opt); err != nil {
++		t.Fatalf("run failed: %v", err)
++	}
++	_, _, tags := decodeRunTags(t, rt.runBodies[0])
++	got := map[string]string{}
++	for _, tag := range tags {
++		got[tag["key"].(string)] = tag["value"].(string)
++	}
++	if len(tags) != 3 || len(got) != 3 || got["Env"] != "prod" || got["Team"] != "app" || got["Empty"] != "" {
++		t.Fatalf("duplicate keys were not normalized with last value winning: %#v", tags)
++	}
++
++	rt = &runTagsRoundTripper{}
++	app = newRunTagsApp(t, rt)
++	opt = parseRunTagsCLI(t, "--tags", "=missing")
++	if err := app.Run(context.Background(), *opt); err == nil {
++		t.Fatal("empty tag key was accepted")
++	}
++	if len(rt.runBodies) != 0 {
++		t.Fatal("invalid tags reached ECS RunTask")
++	}
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,5 @@
++#!/bin/bash
++set -euo pipefail
++
++
++go test .

@@ -1,0 +1,251 @@
+diff --git a/usercase-test-coderl/fixtures/sitecustomize.py b/usercase-test-coderl/fixtures/sitecustomize.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/fixtures/sitecustomize.py
+@@ -0,0 +1,64 @@
++import hashlib
++import json
++import os
++
++
++class FakeTelegramManagerClient:
++    def __init__(self, config, proxy=None):
++        self.config = config
++        self.proxy = proxy
++        self.max_file_size = int(os.environ.get("FAKE_TG_MAX_FILE_SIZE", "4096"))
++        self.max_caption_length = 1024
++
++    def start(self):
++        pass
++
++    def send_files(self, entity, files, delete_on_success=False, print_file_id=False, forward=(),
++                   send_as_media=False):
++        rows = []
++        concat = bytearray()
++        for index, file in enumerate(files):
++            head = file.read(257)
++            rest = file.readall() if hasattr(file, "readall") else file.read()
++            data = head + rest
++            concat.extend(data)
++            rows.append({
++                "declared_size": file.file_size,
++                "first16": data[:16].hex(),
++                "force_file": bool(file.force_file),
++                "index": index,
++                "last16": data[-16:].hex(),
++                "name": file.file_name,
++                "payload_len": len(data),
++                "sha256": hashlib.sha256(data).hexdigest(),
++                "short": file.short_name,
++            })
++            try:
++                file.close()
++            except Exception:
++                pass
++
++        for row in rows:
++            print("PART " + json.dumps(row, sort_keys=True, separators=(",", ":")))
++        print("SUMMARY " + json.dumps({
++            "concat_len": len(concat),
++            "concat_sha256": hashlib.sha256(concat).hexdigest(),
++            "count": len(rows),
++            "delete_on_success": bool(delete_on_success),
++            "entity": entity,
++            "forward": list(forward),
++            "print_file_id": bool(print_file_id),
++            "send_as_media": bool(send_as_media),
++        }, sort_keys=True, separators=(",", ":")))
++        return []
++
++    def send_files_as_album(self, entity, files, delete_on_success=False, print_file_id=False, forward=()):
++        return self.send_files(entity, files, delete_on_success, print_file_id, forward, send_as_media=True)
++
++
++def _patch():
++    import telegram_upload.management as management
++    management.TelegramManagerClient = FakeTelegramManagerClient
++
++
++_patch()
+diff --git a/usercase-test-coderl/usecase.sh b/usercase-test-coderl/usecase.sh
+new file mode 100755
+--- /dev/null
++++ b/usercase-test-coderl/usecase.sh
+@@ -0,0 +1,160 @@
++#!/usr/bin/env bash
++
++set -u
++export LANG=C.UTF-8 LC_ALL=C.UTF-8 TZ=UTC
++
++
++( cd /workspace/repo && python - <<'PY' >/dev/null
++import telegram_upload
++assert telegram_upload.__file__.startswith("/workspace/repo/")
++PY
++) || { echo "FAIL: build" >&2; exit 1; }
++
++BIN="$(command -v telegram-upload || true)"
++[ -n "$BIN" ] || { echo "FAIL: telegram-upload entry point not found" >&2; exit 1; }
++
++TMP=$(mktemp -d)
++trap 'rm -rf "$TMP"' EXIT
++cd "$TMP" || exit 1
++fail() { echo "FAIL: $*" >&2; exit 1; }
++
++export PYTHONPATH="/workspace/repo/usercase-test-coderl/fixtures:/workspace/repo${PYTHONPATH:+:$PYTHONPATH}"
++export FAKE_TG_MAX_FILE_SIZE=4096
++
++python - <<'PY'
++from pathlib import Path
++import hashlib
++import json
++
++root = Path(".")
++max_size = 4096
++
++def stream(label, n):
++    out = bytearray()
++    counter = 0
++    while len(out) < n:
++        out.extend(hashlib.sha256(f"{label}:{counter}".encode("ascii")).digest())
++        counter += 1
++    return bytes(out[:n])
++
++(root / "nested").mkdir()
++(root / "nested" / "large-video.mkv").write_bytes(stream("large-video", max_size + 1000))
++(root / "triple.bin").write_bytes(stream("triple", max_size * 2 + 17))
++(root / "exact.bin").write_bytes(stream("exact", max_size))
++(root / "config.json").write_text(json.dumps({"api_id": 1, "api_hash": "x"}))
++PY
++
++
++
++
++"$BIN" --help >out 2>err; ec=$?
++[ "$ec" -eq 0 ] || fail "F_help exit $ec; want 0"
++
++grep -Fq -- "--large-files" out || fail "F_help missing --large-files option: $(cat out)"
++python - <<'PY' || fail "F_help missing fail/split choices in --large-files help: $(cat out)"
++from pathlib import Path
++
++lines = Path("out").read_text().splitlines()
++for i, line in enumerate(lines):
++    if "--large-files" in line:
++        block = "\n".join(lines[i:i + 3])
++        assert "split" in block, block
++        assert "fail" in block, block
++        break
++else:
++    raise AssertionError("--large-files option not found")
++PY
++[ ! -s err ] || fail "F_help unexpected stderr: $(cat err)"
++
++
++
++
++"$BIN" --config config.json --large-files split nested/large-video.mkv >out 2>err; ec=$?
++[ "$ec" -eq 0 ] || fail "F1 exit $ec; want 0; stderr=$(cat err)"
++
++python - <<'PY' || fail "F1 split validation failed: $(cat out)"
++from pathlib import Path
++import hashlib
++import json
++
++max_size = 4096
++source = Path("nested/large-video.mkv").read_bytes()
++parts = []
++summary = None
++for line in Path("out").read_text().splitlines():
++    if line.startswith("PART "):
++        parts.append(json.loads(line[5:]))
++    elif line.startswith("SUMMARY "):
++        summary = json.loads(line[8:])
++    else:
++        raise AssertionError(f"unexpected output line: {line!r}")
++
++expected_chunks = [source[:max_size], source[max_size:]]
++expected_names = ["large-video.mkv.00", "large-video.mkv.01"]
++assert len(parts) == 2, parts
++for index, (row, chunk, name) in enumerate(zip(parts, expected_chunks, expected_names)):
++    assert row["index"] == index, row
++    assert row["name"] == name, row
++    assert row["declared_size"] == len(chunk), row
++    assert row["payload_len"] == len(chunk), row
++    assert row["force_file"] is True, row
++    assert row["sha256"] == hashlib.sha256(chunk).hexdigest(), row
++
++assert summary is not None
++assert summary["count"] == 2, summary
++assert summary["concat_len"] == len(source), summary
++assert summary["concat_sha256"] == hashlib.sha256(source).hexdigest(), summary
++PY
++[ ! -s err ] || fail "F1 unexpected stderr: $(cat err)"
++
++
++
++
++"$BIN" --config config.json --large-files split triple.bin exact.bin >out 2>err; ec=$?
++[ "$ec" -eq 0 ] || fail "F2 exit $ec; want 0; stderr=$(cat err)"
++
++python - <<'PY' || fail "F2 split validation failed: $(cat out)"
++from pathlib import Path
++import hashlib
++import json
++
++max_size = 4096
++triple = Path("triple.bin").read_bytes()
++exact = Path("exact.bin").read_bytes()
++parts = []
++for line in Path("out").read_text().splitlines():
++    if line.startswith("PART "):
++        parts.append(json.loads(line[5:]))
++    elif not line.startswith("SUMMARY "):
++        raise AssertionError(f"unexpected output line: {line!r}")
++
++expected = [
++    ("triple.bin.00", triple[:max_size], True),
++    ("triple.bin.01", triple[max_size:max_size * 2], True),
++    ("triple.bin.02", triple[max_size * 2:], True),
++    ("exact.bin", exact, None),
++]
++assert len(parts) == len(expected), parts
++for index, (row, (name, chunk, force_file)) in enumerate(zip(parts, expected)):
++    assert row["index"] == index, row
++    assert row["name"] == name, row
++    assert row["declared_size"] == len(chunk), row
++    assert row["payload_len"] == len(chunk), row
++    if force_file is not None:
++        assert row["force_file"] is force_file, row
++    assert row["sha256"] == hashlib.sha256(chunk).hexdigest(), row
++PY
++[ ! -s err ] || fail "F2 unexpected stderr: $(cat err)"
++
++
++
++
++"$BIN" --config config.json nested/large-video.mkv >out 2>err; ec=$?
++
++[ "$ec" -ne 0 ] || fail "F_err exit $ec; want non-zero"
++[ ! -s out ] || fail "F_err unexpected stdout: $(cat out)"
++
++[ -s err ] || fail "F_err expected stderr explanation"
++
++echo "PASS"
++exit 0
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,12 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++exec bash /workspace/repo/usercase-test-coderl/usecase.sh

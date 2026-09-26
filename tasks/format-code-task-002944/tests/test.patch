@@ -1,0 +1,422 @@
+diff --git a/usercase-test-coderl/route_lookup_test.go b/usercase-test-coderl/route_lookup_test.go
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/route_lookup_test.go
+@@ -0,0 +1,384 @@
++//go:build linux
++// +build linux
++
++package usercase_test_coderl
++
++import (
++	"errors"
++	"fmt"
++	"net"
++	"os"
++	"runtime"
++	"testing"
++
++	"github.com/vishvananda/netlink"
++	"github.com/vishvananda/netns"
++)
++
++
++
++
++
++type routeSnapshot struct {
++	Len       int
++	Gw        string
++	Table     int
++	LinkIndex int
++	Dst       string
++	Src       string
++	Family    int
++	Flags     []string
++	MultiPath int
++	Priority  int
++	MTU       int
++	Type      int
++	Scope     string
++}
++
++func snapshot(routes []netlink.Route) routeSnapshot {
++	s := routeSnapshot{Len: len(routes)}
++	if len(routes) == 0 {
++		return s
++	}
++	r := routes[0]
++	return routeSnapshot{
++		Len:       len(routes),
++		Gw:        r.Gw.String(),
++		Table:     r.Table,
++		LinkIndex: r.LinkIndex,
++		Dst:       fmt.Sprint(r.Dst),
++		Src:       fmt.Sprint(r.Src),
++		Family:    r.Family,
++		Flags:     r.ListFlags(),
++		MultiPath: len(r.MultiPath),
++		Priority:  r.Priority,
++		MTU:       r.MTU,
++		Type:      r.Type,
++		Scope:     r.Scope.String(),
++	}
++}
++
++func assertSnapshot(t *testing.T, got routeSnapshot, want routeSnapshot) {
++	t.Helper()
++	if got.Len != want.Len ||
++		got.Gw != want.Gw ||
++		got.Table != want.Table ||
++		got.LinkIndex != want.LinkIndex ||
++		got.Dst != want.Dst ||
++		got.Src != want.Src ||
++		got.Family != want.Family ||
++		got.MultiPath != want.MultiPath ||
++		got.Priority != want.Priority ||
++		got.MTU != want.MTU ||
++		got.Type != want.Type ||
++		got.Scope != want.Scope {
++		t.Fatalf("route snapshot mismatch:\n got: %+v\nwant: %+v", got, want)
++	}
++	if len(got.Flags) != len(want.Flags) {
++		t.Fatalf("route flags mismatch: got %v want %v", got.Flags, want.Flags)
++	}
++	for i := range got.Flags {
++		if got.Flags[i] != want.Flags[i] {
++			t.Fatalf("route flags mismatch: got %v want %v", got.Flags, want.Flags)
++		}
++	}
++}
++
++func assertSameRouteSnapshot(t *testing.T, got, want []netlink.Route) {
++	t.Helper()
++
++
++	assertSnapshot(t, snapshot(got), snapshot(want))
++}
++
++func assertIPv4LookupRoute(t *testing.T, routes []netlink.Route, destination net.IP) netlink.Route {
++	t.Helper()
++
++
++	if len(routes) == 0 {
++		t.Fatalf("RouteGet returned no routes for %s", destination)
++	}
++	route := routes[0]
++	if route.Family != netlink.FAMILY_V4 {
++		t.Fatalf("route family = %d, want IPv4 family %d", route.Family, netlink.FAMILY_V4)
++	}
++	wantDst := (&net.IPNet{IP: destination.To4(), Mask: net.CIDRMask(32, 32)}).String()
++	if route.Dst == nil || route.Dst.String() != wantDst {
++		t.Fatalf("route destination = %v, want %s", route.Dst, wantDst)
++	}
++	if route.LinkIndex <= 0 {
++		t.Fatalf("route output link index = %d, want a decoded output link", route.LinkIndex)
++	}
++	return route
++}
++
++func assertFIBMatchRoute(t *testing.T, routes []netlink.Route, destination net.IP) {
++	t.Helper()
++	if len(routes) == 0 {
++		t.Fatalf("FIBMatch lookup returned no routes for %s", destination)
++	}
++	route := routes[0]
++	if route.Family != netlink.FAMILY_V4 {
++		t.Fatalf("FIBMatch route family = %d, want IPv4 family %d", route.Family, netlink.FAMILY_V4)
++	}
++	if route.Dst == nil {
++		t.Fatalf("FIBMatch route destination was not decoded")
++	}
++	clonedDst := (&net.IPNet{IP: destination.To4(), Mask: net.CIDRMask(32, 32)}).String()
++
++
++	if route.Dst.String() == clonedDst {
++		t.Fatalf("FIBMatch returned cloned destination %s instead of the matching route entry", clonedDst)
++	}
++	if route.LinkIndex <= 0 {
++		t.Fatalf("FIBMatch output link index = %d, want a decoded output link", route.LinkIndex)
++	}
++}
++
++func fdCount(t *testing.T) int {
++	t.Helper()
++	entries, err := os.ReadDir("/proc/self/fd")
++	if err != nil {
++		t.Fatalf("read /proc/self/fd: %v", err)
++	}
++	return len(entries)
++}
++
++func TestHandleRouteGetAndEmptyOptionsReturnDecodedIPv4Route(t *testing.T) {
++
++
++
++
++	h, err := netlink.NewHandle()
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer h.Close()
++
++	routes, err := h.RouteGet(net.ParseIP("8.8.8.8"))
++	if err != nil {
++		t.Fatal(err)
++	}
++	assertIPv4LookupRoute(t, routes, net.ParseIP("8.8.8.8"))
++
++	nilOptions, err := h.RouteGetWithOptions(net.ParseIP("8.8.8.8"), nil)
++	if err != nil {
++		t.Fatal(err)
++	}
++	assertSameRouteSnapshot(t, nilOptions, routes)
++
++	emptyOptions, err := h.RouteGetWithOptions(net.ParseIP("8.8.8.8"), &netlink.RouteGetOptions{})
++	if err != nil {
++		t.Fatal(err)
++	}
++	assertSameRouteSnapshot(t, emptyOptions, routes)
++}
++
++func TestNewHandleAtNoneRouteGetReturnsDecodedIPv4Route(t *testing.T) {
++
++
++
++
++	h, err := netlink.NewHandleAt(netns.None())
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer h.Close()
++
++	routes, err := h.RouteGet(net.ParseIP("8.8.8.8"))
++	if err != nil {
++		t.Fatal(err)
++	}
++	assertIPv4LookupRoute(t, routes, net.ParseIP("8.8.8.8"))
++}
++
++func TestRouteGetWithOptionsEncodesLookupOptions(t *testing.T) {
++
++
++
++
++	h, err := netlink.NewHandle()
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer h.Close()
++
++	destination := net.ParseIP("8.8.8.8")
++	baseline, err := h.RouteGet(destination)
++	if err != nil {
++		t.Fatal(err)
++	}
++	baselineRoute := assertIPv4LookupRoute(t, baseline, destination)
++	outputLink, err := h.LinkByIndex(baselineRoute.LinkIndex)
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	var uid uint32 = 0
++	cases := []struct {
++		name string
++		opts *netlink.RouteGetOptions
++	}{
++		{
++			name: "Oif",
++			opts: &netlink.RouteGetOptions{Oif: outputLink.Attrs().Name},
++		},
++		{
++			name: "OifIndex",
++			opts: &netlink.RouteGetOptions{OifIndex: baselineRoute.LinkIndex},
++		},
++		{
++			name: "UID",
++			opts: &netlink.RouteGetOptions{UID: &uid},
++		},
++		{
++			name: "Mark",
++			opts: &netlink.RouteGetOptions{Mark: 0xBEE},
++		},
++	}
++
++	for _, tc := range cases {
++		routes, err := h.RouteGetWithOptions(destination, tc.opts)
++		if err != nil {
++			t.Fatalf("%s: %v", tc.name, err)
++		}
++
++
++		assertSameRouteSnapshot(t, routes, baseline)
++	}
++
++	if baselineRoute.Src == nil {
++		t.Fatalf("baseline route did not include a source address to use for SrcAddr option coverage: %+v", baselineRoute)
++	}
++	srcRoutes, err := h.RouteGetWithOptions(destination, &netlink.RouteGetOptions{SrcAddr: baselineRoute.Src, OifIndex: baselineRoute.LinkIndex})
++	if err != nil {
++		t.Fatalf("SrcAddrAndOifIndex: %v", err)
++	}
++
++
++	assertIPv4LookupRoute(t, srcRoutes, destination)
++
++	routes, err := h.RouteGetWithOptions(destination, &netlink.RouteGetOptions{SrcAddr: net.ParseIP("203.0.113.254"), OifIndex: baselineRoute.LinkIndex})
++	if err == nil {
++		t.Fatalf("invalid SrcAddr lookup returned routes %+v, want kernel error", routes)
++	}
++	if len(routes) != 0 {
++		t.Fatalf("invalid SrcAddr lookup returned %d routes, want 0", len(routes))
++	}
++
++	fibRoutes, err := h.RouteGetWithOptions(destination, &netlink.RouteGetOptions{FIBMatch: true})
++	if err != nil {
++		t.Fatalf("FIBMatch: %v", err)
++	}
++	assertFIBMatchRoute(t, fibRoutes, destination)
++}
++
++func TestRouteGetReportsSpecificErrorsForUnusableInputs(t *testing.T) {
++
++
++
++
++	h, err := netlink.NewHandle()
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer h.Close()
++
++	for _, opts := range []*netlink.RouteGetOptions{
++		{Oif: "definitely-missing-route-oif-coderl"},
++		{Iif: "definitely-missing-route-iif-coderl"},
++		{VrfName: "definitely-missing-route-vrf-coderl"},
++	} {
++		routes, err := h.RouteGetWithOptions(net.ParseIP("8.8.8.8"), opts)
++		if len(routes) != 0 {
++			t.Fatalf("missing-link lookup returned %d routes, want 0", len(routes))
++		}
++		var notFound netlink.LinkNotFoundError
++		if !errors.As(err, &notFound) {
++			t.Fatalf("error type = %T, want netlink.LinkNotFoundError", err)
++		}
++	}
++
++	routes, err := h.RouteGet(net.ParseIP("2001:4860:4860::8888"))
++	if len(routes) != 0 {
++		t.Fatalf("IPv6 unreachable lookup returned %d routes, want 0", len(routes))
++	}
++
++
++	if err == nil {
++		t.Fatal("IPv6 unreachable lookup returned nil error")
++	}
++}
++
++func TestHandleCloseIsIdempotent(t *testing.T) {
++
++
++
++
++	h, err := netlink.NewHandle()
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err := h.Close(); err != nil {
++		t.Fatalf("first close: %v", err)
++	}
++	if err := h.Close(); err != nil {
++		t.Fatalf("second close: %v", err)
++	}
++}
++
++func TestTwoHandlesKeepIndependentRouteLookupState(t *testing.T) {
++
++
++
++
++	a, err := netlink.NewHandle()
++	if err != nil {
++		t.Fatal(err)
++	}
++	b, err := netlink.NewHandle()
++	if err != nil {
++		a.Close()
++		t.Fatal(err)
++	}
++	defer b.Close()
++
++	if err := a.Close(); err != nil {
++		t.Fatal(err)
++	}
++
++	routes, err := b.RouteGet(net.ParseIP("8.8.8.8"))
++	if err != nil {
++		t.Fatal(err)
++	}
++	assertIPv4LookupRoute(t, routes, net.ParseIP("8.8.8.8"))
++}
++
++func TestHandleRouteLookupCloseDoesNotLeakFileDescriptors(t *testing.T) {
++
++
++
++
++	runtime.GC()
++	start := fdCount(t)
++	for i := 0; i < 100; i++ {
++		h, err := netlink.NewHandle()
++		if err != nil {
++			t.Fatalf("cycle %d NewHandle: %v", i, err)
++		}
++		routes, err := h.RouteGet(net.ParseIP("8.8.8.8"))
++		if err != nil {
++			h.Close()
++			t.Fatalf("cycle %d RouteGet: %v", i, err)
++		}
++		assertIPv4LookupRoute(t, routes, net.ParseIP("8.8.8.8"))
++		if err := h.Close(); err != nil {
++			t.Fatalf("cycle %d Close: %v", i, err)
++		}
++	}
++	runtime.GC()
++	end := fdCount(t)
++	if end > start+2 {
++		t.Fatalf("fd count grew from %d to %d after closed handle cycles", start, end)
++	}
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,28 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++
++cd /workspace/repo
++
++
++
++
++
++GO_BIN=/root/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.23.0.linux-amd64/bin/go
++export GOPROXY=off
++export GOSUMDB=off
++export GONOSUMDB='*'
++export GOVCS='*:off'
++export GOTOOLCHAIN=local
++export GOTELEMETRY=off
++export GOFLAGS="${GOFLAGS:-} -mod=readonly"
++exec "$GO_BIN" test -v -count=1 -p=1 ./usercase-test-coderl/...

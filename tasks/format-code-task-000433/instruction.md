@@ -1,0 +1,1 @@
+`{"controller": "component", "controllerGroup": "apps.kubeblocks.io", "controllerKind": "Component", "Component": {"name":"mongo-mongodb","namespace":"default"}, "namespace": "default", "name": "mongo-mongodb", "reconcileID": "1e07239f-4193-481b-8a68-9782c1817228", "error": "role selector for service is not defined, service: default, role: leader"`

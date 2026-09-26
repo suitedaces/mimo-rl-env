@@ -1,0 +1,402 @@
+diff --git a/usercase-test-coderl/pool.test.js b/usercase-test-coderl/pool.test.js
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/pool.test.js
+@@ -0,0 +1,370 @@
++
++
++
++
++
++
++
++
++
++
++"use strict";
++
++const assert = require("assert");
++const Module = require("module");
++
++if (typeof navigator === "undefined") {
++  global.navigator = {userAgent: "", hardwareConcurrency: 4};
++}
++
++const originalLoad = Module._load;
++Module._load = function(request, parent, isMain) {
++  if (request.indexOf("ffmpeg.js/ffmpeg-worker-webm") !== -1) {
++    return "mock-worker-url";
++  }
++  return originalLoad.apply(this, arguments);
++};
++
++require("babel-core/register");
++
++class FakeWorker {
++  constructor(url) {
++    this.url = url;
++    this.posted = [];
++    this.terminateCount = 0;
++    FakeWorker.instances.push(this);
++    FakeWorker.active.push(this);
++  }
++
++  postMessage(message, transfer) {
++    this.posted.push({
++      message,
++      transferLength: transfer ? transfer.length : 0,
++    });
++  }
++
++  terminate() {
++    this.terminateCount += 1;
++    const index = FakeWorker.active.indexOf(this);
++    if (index !== -1) {
++      FakeWorker.active.splice(index, 1);
++    }
++  }
++
++  emit(data) {
++    this.onmessage({data});
++  }
++}
++
++FakeWorker.instances = [];
++FakeWorker.active = [];
++global.Worker = FakeWorker;
++
++const {Pool} = require("../src/ffmpeg");
++
++function resetWorkers() {
++  FakeWorker.instances.length = 0;
++  FakeWorker.active.length = 0;
++}
++
++function workerAt(index) {
++  return FakeWorker.instances[index];
++}
++
++function simplifyFiles(files) {
++  return files.map(file => ({
++    name: file.name,
++    data: Array.from(file.data),
++  }));
++}
++
++function simplifyMemfs(files) {
++  return (files || []).map(file => ({
++    name: file.name,
++    data: file.data,
++  }));
++}
++
++function assertRunPosted(worker, expectedArguments, expectedMEMFS, expectedWORKERFS) {
++  assert.strictEqual(worker.posted.length, 1);
++  const posted = worker.posted[0];
++  const message = posted.message;
++
++  assert.strictEqual(message.type, "run");
++  assert.deepStrictEqual(message.arguments, expectedArguments);
++
++  assert.deepStrictEqual(simplifyMemfs(message.MEMFS), expectedMEMFS);
++
++  const workerfsMounts = (message.mounts || []).filter(mount => mount.type === "WORKERFS");
++  if (expectedWORKERFS.length === 0) {
++    assert.strictEqual(workerfsMounts.length, 0);
++  } else {
++    assert.strictEqual(workerfsMounts.length, 1);
++
++    assert.deepStrictEqual(workerfsMounts[0].opts && workerfsMounts[0].opts.blobs, expectedWORKERFS);
++  }
++}
++
++async function assertRejectsWithError(promise, message) {
++  try {
++    await promise;
++  } catch (err) {
++    assert.strictEqual(err.constructor, Error);
++    assert.strictEqual(err.message, message);
++    return;
++  }
++  assert.fail("expected promise to reject");
++}
++
++const tests = [];
++function test(name, fn) {
++  tests.push({name, fn});
++}
++
++test("successful jobs use fresh workers, emit per-job logs, and resolve MEMFS", async function() {
++
++
++  resetWorkers();
++  const pool = new Pool();
++  const firstLogs = [];
++  const secondLogs = [];
++  const sourceData = new Uint8Array([1, 2, 3]);
++  const keepData = new Uint8Array([4, 5]);
++  const blobInput = {name: "clip.webm", path: "clip.webm"};
++
++  assert.strictEqual(FakeWorker.instances.length, 0);
++  assert.strictEqual(FakeWorker.active.length, 0);
++
++  const firstJob = pool.spawnJob({
++    params: ["-i", "in.webm", "-pass", "1", "1.webm"],
++    onLog: line => firstLogs.push(line),
++    MEMFS: [{name: "in.webm", data: sourceData}],
++    WORKERFS: [blobInput],
++  });
++  const secondJob = pool.spawnJob({
++    params: ["-i", "1.webm", "-c", "copy", "out.webm"],
++    onLog: line => secondLogs.push(line),
++    MEMFS: [{name: "font.ttf", data: keepData}],
++  });
++
++  assert.strictEqual(FakeWorker.instances.length, 2);
++  assert.strictEqual(FakeWorker.active.length, 2);
++
++  assert.ok(workerAt(0).url);
++  assert.ok(workerAt(1).url);
++  assert.deepStrictEqual(firstLogs, []);
++  assert.deepStrictEqual(secondLogs, []);
++
++  workerAt(1).emit({type: "ready"});
++
++  assertRunPosted(
++    workerAt(1),
++    ["-i", "1.webm", "-c", "copy", "out.webm"],
++    [{name: "font.ttf", data: keepData}],
++    []
++  );
++
++  workerAt(0).emit({type: "ready"});
++
++  assertRunPosted(
++    workerAt(0),
++    ["-i", "in.webm", "-pass", "1", "1.webm"],
++    [{name: "in.webm", data: sourceData}],
++    [blobInput]
++  );
++
++  workerAt(0).emit({type: "stdout", data: "first stdout"});
++  workerAt(1).emit({type: "stderr", data: "second stderr"});
++  workerAt(0).emit({type: "stderr", data: "first stderr"});
++  workerAt(1).emit({type: "stdout", data: "second stdout"});
++  assert.deepStrictEqual(firstLogs, ["first stdout", "first stderr"]);
++  assert.deepStrictEqual(secondLogs, ["second stderr", "second stdout"]);
++
++  workerAt(1).emit({
++    type: "done",
++    data: {MEMFS: [{name: "out.webm", data: new Uint8Array([8, 9, 10])}]},
++  });
++  assert.strictEqual(FakeWorker.active.length, 1);
++  assert.strictEqual(workerAt(1).terminateCount, 1);
++
++  workerAt(0).emit({
++    type: "done",
++    data: {MEMFS: [{name: "1.webm", data: new Uint8Array([6, 7])}]},
++  });
++
++  assert.deepStrictEqual(simplifyFiles(await firstJob), [{
++    name: "1.webm",
++    data: [6, 7],
++  }]);
++  assert.deepStrictEqual(simplifyFiles(await secondJob), [{
++    name: "out.webm",
++    data: [8, 9, 10],
++  }]);
++  assert.strictEqual(FakeWorker.active.length, 0);
++  assert.strictEqual(workerAt(0).terminateCount, 1);
++  assert.strictEqual(workerAt(1).terminateCount, 1);
++});
++
++test("optional MEMFS and WORKERFS default to empty worker inputs", async function() {
++
++
++  resetWorkers();
++  const pool = new Pool();
++  const logs = [];
++
++  const job = pool.spawnJob({
++    params: ["-version"],
++    onLog: line => logs.push(line),
++  });
++  assert.strictEqual(FakeWorker.instances.length, 1);
++
++  workerAt(0).emit({type: "ready"});
++
++  assertRunPosted(workerAt(0), ["-version"], [], []);
++
++  workerAt(0).emit({type: "stdout", data: "ffmpeg version"});
++
++  workerAt(0).emit({type: "done", data: {MEMFS: []}});
++
++  assert.deepStrictEqual(await job, []);
++  assert.deepStrictEqual(logs, ["ffmpeg version"]);
++  assert.strictEqual(FakeWorker.active.length, 0);
++  assert.strictEqual(workerAt(0).terminateCount, 1);
++});
++
++test("worker error messages reject with Error carrying worker data", async function() {
++
++
++  resetWorkers();
++  const pool = new Pool();
++  const job = pool.spawnJob({
++    params: ["-i", "bad.webm"],
++    onLog: function() {},
++  });
++
++  workerAt(0).emit({type: "ready"});
++  workerAt(0).emit({type: "error", data: "boom"});
++
++  await assertRejectsWithError(job, "boom");
++  assert.strictEqual(FakeWorker.active.length, 0);
++  assert.strictEqual(workerAt(0).terminateCount, 1);
++});
++
++test("non-zero exit rejects with the concrete process exit message", async function() {
++
++
++  resetWorkers();
++  const pool = new Pool();
++  const job = pool.spawnJob({
++    params: ["-i", "bad.webm"],
++    onLog: function() {},
++  });
++
++  workerAt(0).emit({type: "ready"});
++  workerAt(0).emit({type: "exit", data: 7});
++
++  await assertRejectsWithError(job, "Process exited with 7");
++  assert.strictEqual(FakeWorker.active.length, 0);
++  assert.strictEqual(workerAt(0).terminateCount, 1);
++});
++
++test("bad first worker message rejects before run is posted", async function() {
++
++
++  resetWorkers();
++  const pool = new Pool();
++  const job = pool.spawnJob({
++    params: ["-i", "input.webm"],
++    onLog: function() {},
++  });
++
++  workerAt(0).emit({type: "stdout", data: "too early"});
++
++
++  let rejected = false;
++  try {
++    await job;
++  } catch (err) {
++    rejected = true;
++    assert.strictEqual(err.constructor, Error);
++    assert.match(err.message, /bad|worker|message/i);
++  }
++  assert.strictEqual(rejected, true);
++  assert.deepStrictEqual(workerAt(0).posted, []);
++  assert.strictEqual(FakeWorker.active.length, 0);
++  assert.strictEqual(workerAt(0).terminateCount, 1);
++});
++
++test("destroy terminates in-flight workers and is idempotent", function() {
++
++
++  resetWorkers();
++  const pool = new Pool();
++
++  pool.spawnJob({params: ["first"], onLog: function() {}});
++  pool.spawnJob({params: ["second"], onLog: function() {}});
++  assert.strictEqual(FakeWorker.active.length, 2);
++  assert.strictEqual(workerAt(0).terminateCount, 0);
++  assert.strictEqual(workerAt(1).terminateCount, 0);
++
++  pool.destroy();
++  assert.strictEqual(FakeWorker.active.length, 0);
++  assert.strictEqual(workerAt(0).terminateCount, 1);
++  assert.strictEqual(workerAt(1).terminateCount, 1);
++
++  pool.destroy();
++  assert.strictEqual(FakeWorker.active.length, 0);
++  assert.strictEqual(workerAt(0).terminateCount, 1);
++  assert.strictEqual(workerAt(1).terminateCount, 1);
++});
++
++test("two pools own and destroy only their own in-flight workers", function() {
++
++
++  resetWorkers();
++  const a = new Pool();
++  const b = new Pool();
++
++  a.spawnJob({params: ["a.webm"], onLog: function() {}});
++  b.spawnJob({params: ["b.webm"], onLog: function() {}});
++  assert.strictEqual(FakeWorker.instances.length, 2);
++  assert.strictEqual(FakeWorker.active.length, 2);
++
++  a.destroy();
++  assert.strictEqual(FakeWorker.active.length, 1);
++  assert.strictEqual(workerAt(0).terminateCount, 1);
++  assert.strictEqual(workerAt(1).terminateCount, 0);
++
++  b.destroy();
++  assert.strictEqual(FakeWorker.active.length, 0);
++  assert.strictEqual(workerAt(0).terminateCount, 1);
++  assert.strictEqual(workerAt(1).terminateCount, 1);
++});
++
++test("construct use cleanup cycles keep active worker resources bounded", function() {
++
++
++  resetWorkers();
++
++  for (let i = 0; i < 100; i += 1) {
++    const pool = new Pool();
++    pool.spawnJob({params: ["cycle", String(i)], onLog: function() {}});
++    assert.strictEqual(FakeWorker.active.length, 1);
++    pool.destroy();
++    assert.strictEqual(FakeWorker.active.length, 0);
++  }
++
++  assert.strictEqual(FakeWorker.instances.length, 100);
++  assert.strictEqual(FakeWorker.active.length, 0);
++});
++
++(async function run() {
++  for (const entry of tests) {
++    await entry.fn();
++    console.log("ok - " + entry.name);
++  }
++  console.log("1.." + tests.length);
++})().catch(err => {
++  console.error(err && err.stack || err);
++  process.exit(1);
++});
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,22 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++cd /workspace/repo
++
++
++if [ ! -f node_modules/babel-core/register.js ] ||
++   [ ! -f node_modules/ffmpeg.js/ffmpeg-worker-webm.js ]; then
++  echo "offline dependencies are missing from /workspace/repo/node_modules" >&2
++  exit 1
++fi
++
++exec node /workspace/repo/usercase-test-coderl/pool.test.js

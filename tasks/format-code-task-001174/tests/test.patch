@@ -1,0 +1,219 @@
+diff --git a/xblock/test/test_fragment_pod_runtime_contract.py b/xblock/test/test_fragment_pod_runtime_contract.py
+new file mode 100644
+--- /dev/null
++++ b/xblock/test/test_fragment_pod_runtime_contract.py
+@@ -0,0 +1,201 @@
++# -*- coding: utf-8 -*-
++
++
++import copy
++import json
++import unittest
++
++from xblock.core import XBlock, XBlockAside
++from xblock.field_data import DictFieldData
++from xblock.fields import Scope, ScopeIds, String
++from xblock.fragment import Fragment
++from xblock.test.tools import TestRuntime
++
++
++def _transported_fragment(content=u"transported", init_args=None):
++    fragment = Fragment(content)
++    fragment.add_css(u".transported { color: green; }")
++    fragment.add_javascript_url(u"/static/transported.js")
++    fragment.initialize_js("TransportedView", init_args)
++    return json.loads(json.dumps(fragment.to_pods()))
++
++
++class PodViewBlock(XBlock):
++    saved_value = String(scope=Scope.settings)
++
++    def student_view(self, context):
++        self.saved_value = context[u"saved_value"]
++        return _transported_fragment(init_args=context[u"init_args"])
++
++    def fallback_view(self, view_name, context):
++        return _transported_fragment(
++            content=u"fallback:" + view_name,
++            init_args=context,
++        )
++
++
++class InvalidPodViewBlock(XBlock):
++    saved_value = String(scope=Scope.settings)
++
++    def student_view(self, context):
++        self.saved_value = u"must not be persisted"
++        return {"content": u"incomplete transport payload"}
++
++
++class NativeFragmentBlock(XBlock):
++    def student_view(self, context):
++        fragment = Fragment(u"native fragment")
++        fragment.add_css(u".native { display: block; }")
++        fragment.initialize_js("NativeView", {"native": True})
++        return fragment
++
++
++class PodAside(XBlockAside):
++    @XBlockAside.aside_for("student_view")
++    def student_view_aside(self, block, context):
++        return _transported_fragment(
++            content=u"transported aside",
++            init_args={"aside": True},
++        )
++
++
++class FragmentPodProtocolTest(unittest.TestCase):
++
++    def test_complete_round_trip_preserves_public_fragment_behavior(self):
++        original = Fragment(u"<p>snowman: \u2603</p>")
++        original.add_css(u".pod { color: blue; }")
++        original.add_javascript_url(u"/static/pod.js")
++        original.add_resource(u"<template>pod</template>", "text/html", "foot")
++        original.initialize_js("PodView", {"nested": [1, {"ready": False}]})
++
++        wire_payload = json.loads(json.dumps(original.to_pods()))
++        try:
++            restored = Fragment.from_pods(wire_payload)
++        except Exception as exc:
++            self.fail("Fragment.from_pods could not restore its own transported payload: %r" % (exc,))
++
++        self.assertEqual(wire_payload, restored.to_pods())
++        self.assertEqual(original.body_html(), restored.body_html())
++        self.assertEqual(original.head_html(), restored.head_html())
++        self.assertEqual(original.foot_html(), restored.foot_html())
++
++    def test_falsy_initializer_arguments_are_not_treated_as_absent(self):
++        for value in ({}, [], 0, False, u""):
++            fragment = Fragment()
++            fragment.initialize_js("FalsyArgs", value)
++            self.assertEqual(value, fragment.to_pods()["json_init_args"])
++
++    def test_legacy_and_extended_payloads_are_accepted(self):
++        legacy = {
++            "content": u"legacy",
++            "resources": [],
++            "js_init_fn": "LegacyView",
++            "js_init_version": 1,
++            "future_transport_metadata": {"ignored": True},
++        }
++        restored = Fragment.from_pods(legacy)
++        self.assertEqual(u"legacy", restored.body_html())
++        self.assertIsNone(restored.to_pods()["json_init_args"])
++
++        extended = _transported_fragment(init_args={"version": 2})
++        extended["resources"][0]["future_resource_metadata"] = "ignored"
++        restored = Fragment.from_pods(extended)
++        self.assertIn(".transported", restored.head_html())
++
++    def test_payloads_and_fragments_do_not_share_mutable_state(self):
++        payload = _transported_fragment(init_args={"nested": ["original"]})
++        restored = Fragment.from_pods(payload)
++        expected = copy.deepcopy(restored.to_pods())
++
++        payload["json_init_args"]["nested"].append("payload mutation")
++        payload["resources"][0]["data"] = u"payload resource mutation"
++        self.assertEqual(expected, restored.to_pods())
++
++        exported = restored.to_pods()
++        exported["json_init_args"]["nested"].append("export mutation")
++        exported["resources"][0]["data"] = u"exported resource mutation"
++        self.assertEqual(expected, restored.to_pods())
++
++    def test_malformed_payloads_raise_protocol_errors(self):
++        valid_payload = {
++            "content": u"payload",
++            "resources": [{"kind": "text", "data": u"x", "mimetype": "text/css", "placement": "head"}],
++            "js_init_fn": None,
++            "js_init_version": None,
++        }
++        for member in ("content", "resources", "js_init_fn", "js_init_version"):
++            payload = copy.deepcopy(valid_payload)
++            del payload[member]
++            with self.assertRaises((TypeError, ValueError)):
++                Fragment.from_pods(payload)
++        for member in ("kind", "data", "mimetype", "placement"):
++            payload = copy.deepcopy(valid_payload)
++            del payload["resources"][0][member]
++            with self.assertRaises((TypeError, ValueError)):
++                Fragment.from_pods(payload)
++        with self.assertRaises((TypeError, ValueError)):
++            Fragment.from_pods([])
++
++
++class RuntimePodViewTest(unittest.TestCase):
++
++    def _make_block(self, block_class, block_type):
++        field_data = DictFieldData({})
++        runtime = TestRuntime(services={"field-data": field_data})
++        definition_id = runtime.id_generator.create_definition(block_type)
++        usage_id = runtime.id_generator.create_usage(definition_id)
++        block = block_class(
++            runtime,
++            scope_ids=ScopeIds("user", block_type, definition_id, usage_id),
++        )
++        return runtime, field_data, block
++
++    def _assert_transported_render(self, rendered, expected_content):
++        self.assertIn(expected_content, rendered.body_html())
++        self.assertIn(".transported", rendered.head_html())
++        self.assertIn("/static/transported.js", rendered.foot_html())
++        self.assertIn("data-init='TransportedView'", rendered.body_html())
++        self.assertIn("data-runtime-version='1'", rendered.body_html())
++
++    def test_normal_view_accepts_pod_and_preserves_rendered_behavior(self):
++        runtime, field_data, block = self._make_block(PodViewBlock, "pod_view")
++        rendered = runtime.render(block, "student_view", {
++            u"saved_value": u"saved from pod view",
++            u"init_args": {u"attempts": 0},
++        })
++
++        self._assert_transported_render(rendered, u"transported")
++        self.assertIn('"attempts": 0', rendered.body_html())
++        self.assertEqual(u"saved from pod view", field_data.get(block, "saved_value"))
++
++    def test_fallback_view_accepts_pod(self):
++        runtime, _, block = self._make_block(PodViewBlock, "pod_fallback")
++        rendered = runtime.render(block, "author_preview", {u"fallback": True})
++
++        self._assert_transported_render(rendered, u"fallback:author_preview")
++        self.assertIn('"fallback": true', rendered.body_html())
++
++    @XBlockAside.register_temp_plugin(PodAside, "pod_aside_contract")
++    def test_aside_view_accepts_pod_and_merges_it_into_the_result(self):
++        runtime, _, block = self._make_block(NativeFragmentBlock, "native_with_pod_aside")
++        rendered = runtime.render(block, "student_view", {})
++
++        self.assertIn(u"native fragment", rendered.body_html())
++        self.assertIn(u"transported aside", rendered.body_html())
++        self.assertIn(".transported", rendered.head_html())
++        self.assertIn("/static/transported.js", rendered.foot_html())
++        self.assertIn("data-init='TransportedView'", rendered.body_html())
++        self.assertIn('"aside": true', rendered.body_html())
++
++    def test_invalid_pod_is_rejected_before_view_state_is_saved(self):
++        runtime, field_data, block = self._make_block(InvalidPodViewBlock, "invalid_pod")
++        with self.assertRaises((TypeError, ValueError)):
++            runtime.render(block, "student_view", {})
++        self.assertFalse(field_data.has(block, "saved_value"))
++
++    def test_native_fragment_views_remain_supported(self):
++        runtime, _, block = self._make_block(NativeFragmentBlock, "native_fragment")
++        rendered = runtime.render(block, "student_view", {})
++        self.assertIn(u"native fragment", rendered.body_html())
++        self.assertIn(".native", rendered.head_html())
++        self.assertIn("data-init='NativeView'", rendered.body_html())
++        self.assertIn('"native": true', rendered.body_html())
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,7 @@
++#!/bin/bash
++set -euo pipefail
++
++pytest -q \
++  xblock/test/test_fragment_pod_runtime_contract.py \
++  xblock/test/test_runtime.py::test_runtime_render \
++  xblock/test/test_asides.py::TestAsides

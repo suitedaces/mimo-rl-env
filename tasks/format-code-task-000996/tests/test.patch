@@ -1,0 +1,243 @@
+diff --git a/shamir/codespec_verified_shares_test.go b/shamir/codespec_verified_shares_test.go
+new file mode 100644
+index 0000000000..5ed817eea5
+--- /dev/null
++++ b/shamir/codespec_verified_shares_test.go
+@@ -0,0 +1,221 @@
++package shamir_test
++
++import (
++	"bytes"
++	"crypto/sha256"
++	"testing"
++
++	"github.com/hashicorp/vault/shamir"
++)
++
++const (
++	verifiedShareMagic       = "VSS1"
++	verifiedThresholdOffset  = 4
++	verifiedIdentifierStart  = 5
++	verifiedIdentifierEnd    = 21
++	verifiedXOffset          = 21
++	verifiedPayloadOffset    = 22
++	verifiedChecksumSize     = sha256.Size
++	verifiedExpectedOverhead = 54
++)
++
++func requireVerifiedShares(t *testing.T, shares [][]byte, secret []byte, threshold int) {
++	t.Helper()
++	if shamir.ShareOverhead != verifiedExpectedOverhead {
++		t.Fatalf("ShareOverhead = %d; want %d for the VSS1 envelope", shamir.ShareOverhead, verifiedExpectedOverhead)
++	}
++	if len(shares) == 0 {
++		t.Fatal("Split returned no shares")
++	}
++	for i, share := range shares {
++		if got, want := len(share), len(secret)+verifiedExpectedOverhead; got != want {
++			t.Fatalf("share %d length = %d; want %d", i, got, want)
++		}
++		if string(share[:len(verifiedShareMagic)]) != verifiedShareMagic {
++			t.Fatalf("share %d magic = %q; want %q", i, share[:len(verifiedShareMagic)], verifiedShareMagic)
++		}
++	}
++
++	wantDigest := sha256.Sum256(secret)
++	wantIdentifier := append([]byte(nil), shares[0][verifiedIdentifierStart:verifiedIdentifierEnd]...)
++	seenX := make(map[byte]bool)
++	for i, share := range shares {
++		if got := int(share[verifiedThresholdOffset]); got != threshold {
++			t.Fatalf("share %d threshold = %d; want %d", i, got, threshold)
++		}
++		if !bytes.Equal(share[verifiedIdentifierStart:verifiedIdentifierEnd], wantIdentifier) {
++			t.Fatalf("share %d has a different share-set identifier", i)
++		}
++		x := share[verifiedXOffset]
++		if x == 0 {
++			t.Fatalf("share %d has the reserved zero x-coordinate", i)
++		}
++		if seenX[x] {
++			t.Fatalf("share %d repeats x-coordinate %d", i, x)
++		}
++		seenX[x] = true
++		if !bytes.Equal(share[len(share)-verifiedChecksumSize:], wantDigest[:]) {
++			t.Fatalf("share %d does not carry the SHA-256 digest of the secret", i)
++		}
++	}
++}
++
++func cloneShares(shares [][]byte) [][]byte {
++	out := make([][]byte, len(shares))
++	for i, share := range shares {
++		out[i] = append([]byte(nil), share...)
++	}
++	return out
++}
++
++func requireCombineError(t *testing.T, shares [][]byte) {
++	t.Helper()
++	secret, err := shamir.Combine(shares)
++	if err == nil {
++		t.Fatalf("Combine(%d shares) succeeded with %x; want an error", len(shares), secret)
++	}
++	if secret != nil {
++		t.Fatalf("Combine returned partial secret %x with error %v; want nil output", secret, err)
++	}
++}
++
++func TestCodespecVerifiedShareEnvelopeAndRoundTrip(t *testing.T) {
++	secret := []byte{0x00, 0x01, 0x7f, 0x80, 0xff, 'v', 'a', 'u', 'l', 't'}
++	shares, err := shamir.Split(secret, 6, 3)
++	if err != nil {
++		t.Fatalf("Split failed: %v", err)
++	}
++	requireVerifiedShares(t, shares, secret, 3)
++
++	for _, selected := range [][][]byte{
++		{shares[5], shares[1], shares[3]},
++		{shares[2], shares[0], shares[4]},
++		shares,
++	} {
++		got, err := shamir.Combine(selected)
++		if err != nil {
++			t.Fatalf("Combine failed: %v", err)
++		}
++		if !bytes.Equal(got, secret) {
++			t.Fatalf("Combine returned %x; want %x", got, secret)
++		}
++	}
++}
++
++func TestCodespecVerifiedThresholdBoundary(t *testing.T) {
++	secret := []byte("threshold-boundary")
++	shares, err := shamir.Split(secret, 5, 4)
++	if err != nil {
++		t.Fatalf("Split failed: %v", err)
++	}
++	requireVerifiedShares(t, shares, secret, 4)
++
++	requireCombineError(t, shares[:3])
++	got, err := shamir.Combine([][]byte{shares[4], shares[2], shares[0], shares[1]})
++	if err != nil {
++		t.Fatalf("Combine at the encoded threshold failed: %v", err)
++	}
++	if !bytes.Equal(got, secret) {
++		t.Fatalf("Combine returned %q; want %q", got, secret)
++	}
++}
++
++func TestCodespecVerifiedPayloadAndDigestIntegrity(t *testing.T) {
++	secret := []byte("integrity-check")
++	shares, err := shamir.Split(secret, 5, 3)
++	if err != nil {
++		t.Fatalf("Split failed: %v", err)
++	}
++	requireVerifiedShares(t, shares, secret, 3)
++
++	payloadCorrupt := cloneShares(shares[:3])
++	payloadCorrupt[1][verifiedPayloadOffset] ^= 0x40
++	requireCombineError(t, payloadCorrupt)
++
++	commonBadDigest := cloneShares(shares[:3])
++	for _, share := range commonBadDigest {
++		share[len(share)-1] ^= 0x01
++	}
++	requireCombineError(t, commonBadDigest)
++
++	inconsistentDigest := cloneShares(shares[:3])
++	inconsistentDigest[2][len(inconsistentDigest[2])-1] ^= 0x02
++	requireCombineError(t, inconsistentDigest)
++}
++
++func TestCodespecVerifiedMetadataAndCoordinates(t *testing.T) {
++	secret := []byte("metadata-check")
++	shares, err := shamir.Split(secret, 4, 3)
++	if err != nil {
++		t.Fatalf("Split failed: %v", err)
++	}
++	requireVerifiedShares(t, shares, secret, 3)
++
++	differentIdentifier := cloneShares(shares[:3])
++	differentIdentifier[1][verifiedIdentifierStart] ^= 0x80
++	requireCombineError(t, differentIdentifier)
++
++	differentThreshold := cloneShares(shares[:3])
++	differentThreshold[1][verifiedThresholdOffset] = 2
++	requireCombineError(t, differentThreshold)
++
++	invalidThreshold := cloneShares(shares[:3])
++	for _, share := range invalidThreshold {
++		share[verifiedThresholdOffset] = 1
++	}
++	requireCombineError(t, invalidThreshold)
++
++	differentMarker := cloneShares(shares[:3])
++	differentMarker[1][0] = 'L'
++	requireCombineError(t, differentMarker)
++
++	zeroCoordinate := cloneShares(shares[:3])
++	zeroCoordinate[0][verifiedXOffset] = 0
++	requireCombineError(t, zeroCoordinate)
++
++	duplicateCoordinate := cloneShares(shares[:3])
++	duplicateCoordinate[1][verifiedXOffset] = duplicateCoordinate[0][verifiedXOffset]
++	requireCombineError(t, duplicateCoordinate)
++}
++
++func TestCodespecVerifiedChecksEveryProvidedShare(t *testing.T) {
++	secret := []byte("do-not-ignore-extra-shares")
++	shares, err := shamir.Split(secret, 5, 3)
++	if err != nil {
++		t.Fatalf("Split failed: %v", err)
++	}
++	requireVerifiedShares(t, shares, secret, 3)
++
++	corruptExtra := cloneShares(shares)
++	corruptExtra[4][verifiedPayloadOffset] ^= 0x20
++	requireCombineError(t, corruptExtra)
++}
++
++func TestCodespecLegacySharesRemainReadable(t *testing.T) {
++
++
++	legacy := [][]byte{
++		{0x6e, 0x6a, 0x01},
++		{0x6d, 0x69, 0x02},
++		{0x6c, 0x68, 0x03},
++	}
++	for _, selected := range [][][]byte{
++		{legacy[0], legacy[1]},
++		{legacy[2], legacy[0]},
++		legacy,
++	} {
++		got, err := shamir.Combine(selected)
++		if err != nil {
++			t.Fatalf("Combine rejected legacy shares: %v", err)
++		}
++		if !bytes.Equal(got, []byte("ok")) {
++			t.Fatalf("legacy Combine returned %x; want %x", got, []byte("ok"))
++		}
++	}
++
++	legacyZeroX := [][]byte{
++		{0x6f, 0x6b, 0x00},
++		{0x6e, 0x6a, 0x01},
++	}
++	requireCombineError(t, legacyZeroX)
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,11 @@
++#!/bin/bash
++set -euo pipefail
++
++
++REPO_ROOT="$(git rev-parse --show-toplevel)"
++VAULT_GOPATH_ROOT="$(go env GOPATH | cut -d: -f1)/src/github.com/hashicorp/vault"
++test "$(readlink -f "${VAULT_GOPATH_ROOT}")" = "${REPO_ROOT}"
++cd "${VAULT_GOPATH_ROOT}"
++GO111MODULE=off go test -vet=off ./shamir \
++  -run '^(TestCodespec.*|TestSplit_invalid|TestSplit|TestCombine_invalid|TestCombine)$' \
++  -count=1

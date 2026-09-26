@@ -1,0 +1,5 @@
+I want `udiskie-umount` to support an all-devices mode. When I run `udiskie-umount -a` or `udiskie-umount --all`, it should not require any DEVICE argument; instead it should find every handleable root device known to udiskie and attempt to remove each one.
+
+For this mode, udiskie should use the same automatic removal behavior it uses for device trees: recursively unmount mounted filesystems and lock unlocked encrypted volumes below each root. The `--detach`, `--no-detach`, `--eject`, `--no-eject`, `--lock`, and `--no-lock` strategy flags should apply to each selected root in all-devices mode, so `udiskie-umount --all --detach --eject --no-lock` attempts those requested follow-up operations for every selected device.
+
+The command should return exit code 0 when every attempted root removal succeeds, and exit code 1 when any selected root removal fails. `udiskie-umount --help` should document the invocation as accepting either `-a`/`--all` or one or more device paths, and the shell completions and manpage should expose `-a, --all` as the option for unmounting all handleable devices.

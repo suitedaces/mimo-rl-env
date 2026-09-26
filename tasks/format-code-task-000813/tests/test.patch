@@ -1,0 +1,488 @@
+diff --git a/usercase-test-coderl/test_recaptcha_client_submit.py b/usercase-test-coderl/test_recaptcha_client_submit.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/test_recaptcha_client_submit.py
+@@ -0,0 +1,463 @@
++
++
++import json
++import os
++import urllib.request as urllib_request
++from urllib.parse import parse_qs
++
++import pytest
++from django.conf import settings
++from django.test import override_settings
++
++if not settings.configured:
++    settings.configure(INSTALLED_APPS=[], SECRET_KEY="usercase-fixture")
++
++from django_recaptcha import client
++
++
++class FakeHTTPResponse:
++    def __init__(self, body):
++        self.body = body
++        self.closed = False
++        self.read_calls = 0
++
++    def read(self):
++        self.read_calls += 1
++        return self.body
++
++    def close(self):
++        self.closed = True
++
++    def __enter__(self):
++        return self
++
++    def __exit__(self, exc_type, exc, tb):
++        self.close()
++
++
++def response_projection(response):
++    return {
++        "is_valid": response.is_valid,
++        "error_codes": response.error_codes,
++        "action": response.action,
++        "extra_data": response.extra_data,
++    }
++
++
++def assert_form_body(encoded, expected):
++
++    assert isinstance(encoded, bytes)
++    parsed = parse_qs(
++        encoded.decode("utf-8"), keep_blank_values=True, strict_parsing=True
++    )
++    for key, value in expected.items():
++        assert parsed.get(key) == [value]
++
++
++def assert_required_headers(headers):
++
++    assert headers["Content-type"] == "application/x-www-form-urlencoded"
++    assert headers["User-agent"] == "reCAPTCHA Django"
++
++
++def normalize_request_args(args, kwargs):
++
++    normalized = dict(kwargs)
++    for name, value in zip(("url", "data", "headers"), args):
++        normalized.setdefault(name, value)
++    return normalized
++
++
++def patch_request_stack(monkeypatch, request_cls, build_opener_func, proxy_handler_cls=None):
++
++    monkeypatch.setattr(client, "Request", request_cls, raising=False)
++    monkeypatch.setattr(urllib_request, "Request", request_cls)
++    monkeypatch.setattr(client, "build_opener", build_opener_func, raising=False)
++    monkeypatch.setattr(urllib_request, "build_opener", build_opener_func)
++    if proxy_handler_cls is not None:
++        monkeypatch.setattr(client, "ProxyHandler", proxy_handler_cls, raising=False)
++        monkeypatch.setattr(urllib_request, "ProxyHandler", proxy_handler_cls)
++
++
++def install_response(monkeypatch, body, captured=None):
++    fake_response = FakeHTTPResponse(body)
++
++    class FakeRequest:
++        def __init__(self, *args, **kwargs):
++            request_kwargs = normalize_request_args(args, kwargs)
++            if captured is not None:
++                captured["params"] = request_kwargs.get("data")
++                captured["request_kwargs"] = request_kwargs
++
++    class FakeOpener:
++        def open(self, request_object, timeout=None):
++            if captured is not None:
++                captured["opened_request_is_fake"] = isinstance(request_object, FakeRequest)
++                captured["timeout"] = timeout
++            return fake_response
++
++    def fake_build_opener(*args):
++        if captured is not None:
++            captured["opener_args"] = args
++        return FakeOpener()
++
++    patch_request_stack(monkeypatch, FakeRequest, fake_build_opener)
++    return fake_response
++
++
++def test_success_response_preserves_remaining_metadata(monkeypatch):
++
++
++
++
++    fake_response = install_response(
++        monkeypatch,
++        b'{"success": true, "challenge_ts": "2019-01-11T13:57:23Z", "hostname": "testkey.google.com"}',
++    )
++
++    actual = response_projection(
++        client.submit("token-alpha", "private-alpha", "203.0.113.10")
++    )
++
++    assert actual == {
++        "is_valid": True,
++        "error_codes": [],
++        "action": None,
++        "extra_data": {
++            "challenge_ts": "2019-01-11T13:57:23Z",
++            "hostname": "testkey.google.com",
++        },
++    }
++    assert fake_response.closed is True
++
++    assert fake_response.read_calls >= 1
++
++
++def test_failure_response_exposes_error_codes(monkeypatch):
++
++
++
++
++    install_response(
++        monkeypatch,
++        b'{"success": false, "error-codes": ["invalid-input-response", "invalid-input-secret"]}',
++    )
++
++    actual = response_projection(
++        client.submit("token-beta", "private-beta", "198.51.100.7")
++    )
++
++    assert actual == {
++        "is_valid": False,
++        "error_codes": ["invalid-input-response", "invalid-input-secret"],
++        "action": None,
++        "extra_data": {},
++    }
++
++
++def test_action_is_separated_from_score_and_other_metadata(monkeypatch):
++
++
++
++
++    captured = {}
++    install_response(
++        monkeypatch,
++        b'{"success": true, "action": "login", "score": 0.9, "hostname": "example.com", "apk_package_name": "com.example.app"}',
++        captured,
++    )
++
++    actual = response_projection(
++        client.submit("token gamma/space", "private+gamma", "2001:db8::1")
++    )
++
++    assert_form_body(
++        captured["params"],
++        {
++            "secret": "private+gamma",
++            "response": "token gamma/space",
++            "remoteip": "2001:db8::1",
++        },
++    )
++    assert actual == {
++        "is_valid": True,
++        "error_codes": [],
++        "action": "login",
++        "extra_data": {
++            "score": 0.9,
++            "hostname": "example.com",
++            "apk_package_name": "com.example.app",
++        },
++    }
++
++
++def test_utf8_response_body_is_decoded_before_json_parsing(monkeypatch):
++
++
++
++
++    install_response(
++        monkeypatch,
++        b'{"success": true, "hostname": "caf\xc3\xa9.example", "challenge_ts": "2020-02-03T04:05:06Z"}',
++    )
++
++    actual = response_projection(
++        client.submit("token-utf8", "private-utf8", "203.0.113.77")
++    )
++
++    assert actual == {
++        "is_valid": True,
++        "error_codes": [],
++        "action": None,
++        "extra_data": {
++            "hostname": "caf\u00e9.example",
++            "challenge_ts": "2020-02-03T04:05:06Z",
++        },
++    }
++
++
++def test_invalid_json_raises_json_decode_error(monkeypatch):
++
++
++
++
++    install_response(monkeypatch, b'{"success": true')
++
++    with pytest.raises(json.JSONDecodeError):
++        client.submit("token-invalid-json", "private-invalid-json", "192.0.2.13")
++
++
++def test_request_uses_form_fields_headers_default_domain_and_timeout(monkeypatch):
++
++
++
++
++    records = {}
++
++    class FakeRequest:
++        def __init__(self, *args, **kwargs):
++            records["request_kwargs"] = normalize_request_args(args, kwargs)
++
++    class FakeOpener:
++        def open(self, request_object, timeout):
++            records["opened_request_is_fake"] = isinstance(request_object, FakeRequest)
++            records["timeout"] = timeout
++            return FakeHTTPResponse(b'{"success": true}')
++
++    def fake_build_opener(*args):
++        records["opener_args"] = args
++        return FakeOpener()
++
++    patch_request_stack(monkeypatch, FakeRequest, fake_build_opener)
++
++    with override_settings():
++        actual = response_projection(
++            client.submit("request token", "request-secret", "192.0.2.44")
++        )
++
++    request_kwargs = records["request_kwargs"]
++
++    assert request_kwargs["url"] == "https://www.google.com/recaptcha/api/siteverify"
++    assert_form_body(
++        request_kwargs["data"],
++        {
++            "secret": "request-secret",
++            "response": "request token",
++            "remoteip": "192.0.2.44",
++        },
++    )
++    assert_required_headers(request_kwargs["headers"])
++
++    assert "opener_args" in records
++    assert records["opened_request_is_fake"] is True
++    assert records["timeout"] == 10
++    assert actual == {
++        "is_valid": True,
++        "error_codes": [],
++        "action": None,
++        "extra_data": {},
++    }
++
++
++def test_request_honors_domain_proxy_and_timeout_settings(monkeypatch):
++
++
++
++
++    records = {}
++
++    class FakeRequest:
++        def __init__(self, *args, **kwargs):
++            records["request_kwargs"] = normalize_request_args(args, kwargs)
++
++    class FakeOpener:
++        def open(self, request_object, timeout):
++            records["opened_request_is_fake"] = isinstance(request_object, FakeRequest)
++            records["timeout"] = timeout
++            return FakeHTTPResponse(b'{"success": true}')
++
++    class FakeProxyHandler:
++        def __init__(self, proxies):
++            self.proxies = proxies
++
++    def fake_build_opener(*args):
++        records["opener_args"] = args
++        return FakeOpener()
++
++    patch_request_stack(monkeypatch, FakeRequest, fake_build_opener, FakeProxyHandler)
++
++    with override_settings(
++        RECAPTCHA_DOMAIN="www.recaptcha.net",
++        RECAPTCHA_PROXY={"https": "https://proxy.example:8443"},
++        RECAPTCHA_VERIFY_REQUEST_TIMEOUT=3,
++    ):
++        actual = response_projection(
++            client.submit("custom token", "custom-secret", "198.51.100.55")
++        )
++
++    request_kwargs = records["request_kwargs"]
++
++    assert request_kwargs["url"] == "https://www.recaptcha.net/recaptcha/api/siteverify"
++    assert_form_body(
++        request_kwargs["data"],
++        {
++            "secret": "custom-secret",
++            "response": "custom token",
++            "remoteip": "198.51.100.55",
++        },
++    )
++    assert_required_headers(request_kwargs["headers"])
++
++    proxy_handlers = [
++        arg for arg in records["opener_args"] if isinstance(arg, FakeProxyHandler)
++    ]
++    assert any(
++        handler.proxies == {"https": "https://proxy.example:8443"}
++        for handler in proxy_handlers
++    )
++    assert records["opened_request_is_fake"] is True
++    assert records["timeout"] == 3
++    assert actual == {
++        "is_valid": True,
++        "error_codes": [],
++        "action": None,
++        "extra_data": {},
++    }
++
++
++def test_referential_transparency_for_same_arguments(monkeypatch):
++    bodies = [
++        b'{"success": true, "challenge_ts": "2019-01-11T13:57:23Z", "hostname": "testkey.google.com"}',
++        b'{"success": true, "challenge_ts": "2019-01-11T13:57:23Z", "hostname": "testkey.google.com"}',
++    ]
++
++    def install_next_response(monkeypatch, body):
++        fake_response = FakeHTTPResponse(body)
++
++        class FakeRequest:
++            def __init__(self, *args, **kwargs):
++                request_kwargs = normalize_request_args(args, kwargs)
++                assert_form_body(
++                    request_kwargs["data"],
++                    {
++                        "secret": "private-alpha",
++                        "response": "token-alpha",
++                        "remoteip": "203.0.113.10",
++                    },
++                )
++
++        class FakeOpener:
++            def open(self, request_object, timeout=None):
++                return fake_response
++
++        def fake_build_opener(*args):
++            return FakeOpener()
++
++        patch_request_stack(monkeypatch, FakeRequest, fake_build_opener)
++
++    install_next_response(monkeypatch, bodies.pop(0))
++    first = response_projection(
++        client.submit("token-alpha", "private-alpha", "203.0.113.10")
++    )
++    install_next_response(monkeypatch, bodies.pop(0))
++    second = response_projection(
++        client.submit("token-alpha", "private-alpha", "203.0.113.10")
++    )
++
++    actual = [first, second]
++
++    assert actual == [
++        {
++            "is_valid": True,
++            "error_codes": [],
++            "action": None,
++            "extra_data": {
++                "challenge_ts": "2019-01-11T13:57:23Z",
++                "hostname": "testkey.google.com",
++            },
++        },
++        {
++            "is_valid": True,
++            "error_codes": [],
++            "action": None,
++            "extra_data": {
++                "challenge_ts": "2019-01-11T13:57:23Z",
++                "hostname": "testkey.google.com",
++            },
++        },
++    ]
++
++
++def test_success_projection_with_caller_argument_list(monkeypatch):
++    install_response(monkeypatch, b'{"success": true, "hostname": "immutable.example"}')
++    inputs = ["mutable-token", "mutable-secret", "192.0.2.90"]
++
++    actual = response_projection(client.submit(*inputs))
++
++
++    assert actual == {
++        "is_valid": True,
++        "error_codes": [],
++        "action": None,
++        "extra_data": {"hostname": "immutable.example"},
++    }
++
++
++def test_failure_projection_for_timeout_error_code(monkeypatch):
++    install_response(
++        monkeypatch,
++        b'{"success": false, "error-codes": ["timeout-or-duplicate"]}',
++    )
++    actual = response_projection(
++        client.submit("token-process", "private-process", "198.51.100.200")
++    )
++
++
++    assert actual == {
++        "is_valid": False,
++        "error_codes": ["timeout-or-duplicate"],
++        "action": None,
++        "extra_data": {},
++    }
++
++
++def test_submit_returns_expected_response_from_non_repo_cwd(monkeypatch, tmp_path):
++    install_response(monkeypatch, b'{"success": true, "hostname": "side-effect.example"}')
++
++    old_cwd = os.getcwd()
++    os.chdir(tmp_path)
++    try:
++        actual = response_projection(
++            client.submit("token-side-effect", "private-side-effect", "203.0.113.201")
++        )
++    finally:
++        os.chdir(old_cwd)
++
++
++
++    assert actual == {
++        "is_valid": True,
++        "error_codes": [],
++        "action": None,
++        "extra_data": {"hostname": "side-effect.example"},
++    }
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,15 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++cd /workspace/repo
++export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
++exec python -m pytest /workspace/repo/usercase-test-coderl/test_recaptcha_client_submit.py -v

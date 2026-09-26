@@ -1,0 +1,7 @@
+PRAW submission drafts currently blur the distinction between an omitted option and an explicitly empty or false one. That makes it impossible to clear a saved title/body or turn off flags when submitting an existing draft, and empty self-posts can be encoded as link drafts. Align the draft helper and model methods so callers can round-trip title-only and empty-text drafts without losing their intent.
+
+`reddit.drafts.create()` must reject a call that supplies both `selftext` and `url`, even when the text is the empty string. Supplying `selftext` (including `""`) must produce a markdown draft whose body is that exact text; supplying `url` must produce a link draft whose body is that URL. Keep the existing title-only behavior when neither source is supplied.
+
+`Draft.update()` must preserve an explicitly supplied empty selftext and explicit boolean false in the outgoing draft request, including the matching markdown kind, instead of treating them as missing.
+
+`Draft.submit()` treats only `None` as omitted: every supplied value, including `""`, `False`, and an empty title, overrides the stored draft value. If a caller supplies a new `selftext` or `url`, submit only that content source and do not leak the other source from the saved draft; supplying both sources remains an error. With no overrides, stored values are inherited and the draft id is forwarded. A string subreddit override is resolved and used as the submission target, while the draft's subreddit remains the fallback. Preserve the existing public return values and request flow for valid calls.

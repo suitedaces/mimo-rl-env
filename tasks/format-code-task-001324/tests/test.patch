@@ -1,0 +1,579 @@
+diff --git a/usercase-test-coderl/blob_stateful_test.go b/usercase-test-coderl/blob_stateful_test.go
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/blob_stateful_test.go
+@@ -0,0 +1,548 @@
++package usercase_test_coderl
++
++import (
++	"bufio"
++	"bytes"
++	"os"
++	"runtime"
++	"strconv"
++	"strings"
++	"testing"
++	"time"
++
++	imagick "gopkg.in/gographics/imagick.v2/imagick"
++)
++
++
++
++
++
++
++func initialize(t *testing.T) {
++	t.Helper()
++	imagick.Initialize()
++	t.Cleanup(imagick.Terminate)
++}
++
++func requireNoError(t *testing.T, label string, err error) {
++	t.Helper()
++	if err != nil {
++		t.Fatalf("%s returned error: %T %v", label, err, err)
++	}
++}
++
++func requireBlobPrefix(t *testing.T, label string, blob []byte, prefix []byte) {
++	t.Helper()
++	if len(blob) <= len(prefix) {
++		t.Fatalf("%s blob length = %d, want more than signature length %d", label, len(blob), len(prefix))
++	}
++	if !bytes.HasPrefix(blob, prefix) {
++		t.Fatalf("%s blob signature = % x, want prefix % x", label, blob[:len(prefix)], prefix)
++	}
++}
++
++func newSolidWand(t *testing.T, width, height uint, color, format string) (*imagick.MagickWand, *imagick.PixelWand) {
++	t.Helper()
++	bg := imagick.NewPixelWand()
++	if got := bg.SetColor(color); got != true {
++		t.Fatalf("PixelWand.SetColor(%q) = %v, want true", color, got)
++	}
++	mw := imagick.NewMagickWand()
++	requireNoError(t, "NewImage", mw.NewImage(width, height, bg))
++	requireNoError(t, "SetImageFormat", mw.SetImageFormat(format))
++	return mw, bg
++}
++
++func TestBlobRoundTripBetweenIndependentWands(t *testing.T) {
++
++
++	initialize(t)
++
++	src, srcBg := newSolidWand(t, 3, 2, "#336699", "PNG")
++	defer src.Destroy()
++	defer srcBg.Destroy()
++
++	if got := src.GetNumberImages(); got != 1 {
++		t.Fatalf("source image count = %d, want 1", got)
++	}
++	if got := src.GetImageWidth(); got != 3 {
++		t.Fatalf("source width = %d, want 3", got)
++	}
++	if got := src.GetImageHeight(); got != 2 {
++		t.Fatalf("source height = %d, want 2", got)
++	}
++	if got := src.GetImageFormat(); got != "PNG" {
++		t.Fatalf("source format = %q, want %q", got, "PNG")
++	}
++
++	blob, err := src.GetImageBlob()
++	requireNoError(t, "GetImageBlob", err)
++
++	requireBlobPrefix(t, "PNG", blob, []byte("\x89PNG\r\n\x1a\n"))
++
++	dst := imagick.NewMagickWand()
++	defer dst.Destroy()
++	if got := dst.GetNumberImages(); got != 0 {
++		t.Fatalf("fresh destination image count = %d, want 0", got)
++	}
++	if got := dst.GetImageWidth(); got != 0 {
++		t.Fatalf("fresh destination width = %d, want 0", got)
++	}
++	if got := dst.GetImageHeight(); got != 0 {
++		t.Fatalf("fresh destination height = %d, want 0", got)
++	}
++	if got := dst.GetImageFormat(); got != "" {
++		t.Fatalf("fresh destination format = %q, want empty string", got)
++	}
++
++	requireNoError(t, "ReadImageBlob", dst.ReadImageBlob(blob))
++	if got := dst.GetNumberImages(); got != 1 {
++		t.Fatalf("decoded destination image count = %d, want 1", got)
++	}
++	if got := dst.GetImageWidth(); got != 3 {
++		t.Fatalf("decoded destination width = %d, want 3", got)
++	}
++	if got := dst.GetImageHeight(); got != 2 {
++		t.Fatalf("decoded destination height = %d, want 2", got)
++	}
++	if got := dst.GetImageFormat(); got != "PNG" {
++		t.Fatalf("decoded destination format = %q, want %q", got, "PNG")
++	}
++}
++
++func TestPingImageBlobPopulatesMetadataOnlyFromBytes(t *testing.T) {
++
++
++	initialize(t)
++
++	src, srcBg := newSolidWand(t, 3, 2, "#336699", "PNG")
++	defer src.Destroy()
++	defer srcBg.Destroy()
++	blob, err := src.GetImageBlob()
++	requireNoError(t, "GetImageBlob", err)
++
++	requireBlobPrefix(t, "PNG", blob, []byte("\x89PNG\r\n\x1a\n"))
++
++	ping := imagick.NewMagickWand()
++	defer ping.Destroy()
++	if got := ping.GetNumberImages(); got != 0 {
++		t.Fatalf("fresh ping wand image count = %d, want 0", got)
++	}
++	requireNoError(t, "PingImageBlob", ping.PingImageBlob(blob))
++	if got := ping.GetNumberImages(); got != 1 {
++		t.Fatalf("ping image count = %d, want 1", got)
++	}
++	if got := ping.GetImageWidth(); got != 3 {
++		t.Fatalf("ping width = %d, want 3", got)
++	}
++	if got := ping.GetImageHeight(); got != 2 {
++		t.Fatalf("ping height = %d, want 2", got)
++	}
++	if got := ping.GetImageFormat(); got != "PNG" {
++		t.Fatalf("ping format = %q, want %q", got, "PNG")
++	}
++}
++
++func TestGetImagesBlobPreservesGifSequenceState(t *testing.T) {
++
++
++	initialize(t)
++
++	firstBg := imagick.NewPixelWand()
++	secondBg := imagick.NewPixelWand()
++	defer firstBg.Destroy()
++	defer secondBg.Destroy()
++	if got := firstBg.SetColor("red"); got != true {
++		t.Fatalf("first background SetColor = %v, want true", got)
++	}
++	if got := secondBg.SetColor("blue"); got != true {
++		t.Fatalf("second background SetColor = %v, want true", got)
++	}
++
++	seq := imagick.NewMagickWand()
++	defer seq.Destroy()
++	requireNoError(t, "first NewImage", seq.NewImage(4, 3, firstBg))
++	requireNoError(t, "first SetImageFormat", seq.SetImageFormat("GIF"))
++	requireNoError(t, "first SetImageDelay", seq.SetImageDelay(7))
++	requireNoError(t, "second NewImage", seq.NewImage(5, 6, secondBg))
++	requireNoError(t, "second SetImageFormat", seq.SetImageFormat("GIF"))
++	requireNoError(t, "second SetImageDelay", seq.SetImageDelay(11))
++
++	if got := seq.GetNumberImages(); got != 2 {
++		t.Fatalf("sequence image count before encode = %d, want 2", got)
++	}
++	if got := seq.GetImageWidth(); got != 5 {
++		t.Fatalf("current sequence width before encode = %d, want 5", got)
++	}
++	if got := seq.GetImageHeight(); got != 6 {
++		t.Fatalf("current sequence height before encode = %d, want 6", got)
++	}
++	if got := seq.GetImageFormat(); got != "GIF" {
++		t.Fatalf("current sequence format before encode = %q, want %q", got, "GIF")
++	}
++	if got := seq.GetImageDelay(); got != 11 {
++		t.Fatalf("current sequence delay before encode = %d, want 11", got)
++	}
++	if got := seq.GetIteratorIndex(); got != 1 {
++		t.Fatalf("current sequence iterator index before encode = %d, want 1", got)
++	}
++
++	seq.SetFirstIterator()
++	if got := seq.GetImageWidth(); got != 4 {
++		t.Fatalf("first sequence width before encode = %d, want 4", got)
++	}
++	if got := seq.GetImageHeight(); got != 3 {
++		t.Fatalf("first sequence height before encode = %d, want 3", got)
++	}
++	if got := seq.GetImageDelay(); got != 7 {
++		t.Fatalf("first sequence delay before encode = %d, want 7", got)
++	}
++	if got := seq.GetIteratorIndex(); got != 0 {
++		t.Fatalf("first sequence iterator index before encode = %d, want 0", got)
++	}
++
++	gifBlob, err := seq.GetImagesBlob()
++	requireNoError(t, "GetImagesBlob", err)
++
++	if len(gifBlob) <= 6 {
++		t.Fatalf("GIF sequence blob length = %d, want more than signature length 6", len(gifBlob))
++	}
++	if got := string(gifBlob[:3]); got != "GIF" {
++		t.Fatalf("GIF sequence signature = %q, want %q", got, "GIF")
++	}
++
++	decoded := imagick.NewMagickWand()
++	defer decoded.Destroy()
++	requireNoError(t, "ReadImageBlob GIF sequence", decoded.ReadImageBlob(gifBlob))
++	if got := decoded.GetNumberImages(); got != 2 {
++		t.Fatalf("decoded GIF image count at initial iterator = %d, want 2", got)
++	}
++	if got := decoded.GetImageFormat(); got != "GIF" {
++		t.Fatalf("decoded GIF current format at initial iterator = %q, want %q", got, "GIF")
++	}
++
++
++	decoded.SetFirstIterator()
++	if got := decoded.GetImageWidth(); got != 4 {
++		t.Fatalf("decoded GIF first width = %d, want 4", got)
++	}
++	if got := decoded.GetImageHeight(); got != 3 {
++		t.Fatalf("decoded GIF first height = %d, want 3", got)
++	}
++
++	if got := decoded.NextImage(); got != true {
++		t.Fatalf("decoded GIF NextImage = %v, want true", got)
++	}
++	if got := decoded.GetImageWidth(); got != 5 {
++		t.Fatalf("decoded GIF second width = %d, want 5", got)
++	}
++	if got := decoded.GetImageHeight(); got != 6 {
++		t.Fatalf("decoded GIF second height = %d, want 6", got)
++	}
++
++}
++
++func TestGetImagesBlobForJpegSequenceReturnsValidFirstImageBlob(t *testing.T) {
++
++
++	initialize(t)
++
++	firstBg := imagick.NewPixelWand()
++	secondBg := imagick.NewPixelWand()
++	defer firstBg.Destroy()
++	defer secondBg.Destroy()
++	if got := firstBg.SetColor("yellow"); got != true {
++		t.Fatalf("first JPEG background SetColor = %v, want true", got)
++	}
++	if got := secondBg.SetColor("black"); got != true {
++		t.Fatalf("second JPEG background SetColor = %v, want true", got)
++	}
++
++	seq := imagick.NewMagickWand()
++	defer seq.Destroy()
++	requireNoError(t, "first JPEG NewImage", seq.NewImage(8, 4, firstBg))
++	requireNoError(t, "first JPEG SetImageFormat", seq.SetImageFormat("JPEG"))
++	requireNoError(t, "second JPEG NewImage", seq.NewImage(9, 5, secondBg))
++	requireNoError(t, "second JPEG SetImageFormat", seq.SetImageFormat("JPEG"))
++	seq.SetFirstIterator()
++
++	if got := seq.GetNumberImages(); got != 2 {
++		t.Fatalf("JPEG source image count = %d, want 2", got)
++	}
++	if got := seq.GetImageWidth(); got != 8 {
++		t.Fatalf("JPEG source first width = %d, want 8", got)
++	}
++	if got := seq.GetImageHeight(); got != 4 {
++		t.Fatalf("JPEG source first height = %d, want 4", got)
++	}
++	if got := seq.GetImageFormat(); got != "JPEG" {
++		t.Fatalf("JPEG source first format = %q, want %q", got, "JPEG")
++	}
++
++	jpegBlob, err := seq.GetImagesBlob()
++	requireNoError(t, "GetImagesBlob JPEG", err)
++
++	requireBlobPrefix(t, "JPEG fallback", jpegBlob, []byte("\xff\xd8\xff"))
++
++	decoded := imagick.NewMagickWand()
++	defer decoded.Destroy()
++	requireNoError(t, "ReadImageBlob JPEG fallback", decoded.ReadImageBlob(jpegBlob))
++	if got := decoded.GetNumberImages(); got != 1 {
++		t.Fatalf("decoded JPEG fallback image count = %d, want 1", got)
++	}
++	if got := decoded.GetImageWidth(); got != 8 {
++		t.Fatalf("decoded JPEG fallback width = %d, want 8", got)
++	}
++	if got := decoded.GetImageHeight(); got != 4 {
++		t.Fatalf("decoded JPEG fallback height = %d, want 4", got)
++	}
++	if got := decoded.GetImageFormat(); got != "JPEG" {
++		t.Fatalf("decoded JPEG fallback format = %q, want %q", got, "JPEG")
++	}
++}
++
++func TestEmptyBlobInputsReturnExactPublicErrorMessage(t *testing.T) {
++
++
++	initialize(t)
++
++	readWand := imagick.NewMagickWand()
++	defer readWand.Destroy()
++	readErr := readWand.ReadImageBlob([]byte{})
++	if readErr == nil {
++		t.Fatalf("ReadImageBlob empty error = nil, want message %q", "zero-length blob not permitted")
++	}
++	if got := readErr.Error(); got != "zero-length blob not permitted" {
++		t.Fatalf("ReadImageBlob empty error message = %q, want %q", got, "zero-length blob not permitted")
++	}
++	if got := readWand.GetNumberImages(); got != 0 {
++		t.Fatalf("read wand image count after empty blob = %d, want 0", got)
++	}
++
++	pingWand := imagick.NewMagickWand()
++	defer pingWand.Destroy()
++	pingErr := pingWand.PingImageBlob([]byte{})
++	if pingErr == nil {
++		t.Fatalf("PingImageBlob empty error = nil, want message %q", "zero-length blob not permitted")
++	}
++	if got := pingErr.Error(); got != "zero-length blob not permitted" {
++		t.Fatalf("PingImageBlob empty error message = %q, want %q", got, "zero-length blob not permitted")
++	}
++	if got := pingWand.GetNumberImages(); got != 0 {
++		t.Fatalf("ping wand image count after empty blob = %d, want 0", got)
++	}
++}
++
++func TestBlobReturningMethodsRejectFreshWandWithNilBlobAndError(t *testing.T) {
++
++
++	initialize(t)
++
++	mw := imagick.NewMagickWand()
++	defer mw.Destroy()
++	if got := mw.GetNumberImages(); got != 0 {
++		t.Fatalf("fresh wand image count = %d, want 0", got)
++	}
++	if got := mw.GetImageWidth(); got != 0 {
++		t.Fatalf("fresh wand width = %d, want 0", got)
++	}
++	if got := mw.GetImageHeight(); got != 0 {
++		t.Fatalf("fresh wand height = %d, want 0", got)
++	}
++	if got := mw.GetImageFormat(); got != "" {
++		t.Fatalf("fresh wand format = %q, want empty string", got)
++	}
++
++	blob, err := mw.GetImageBlob()
++	if blob != nil {
++		t.Fatalf("GetImageBlob on fresh wand blob = %v, want nil", blob)
++	}
++	if got := len(blob); got != 0 {
++		t.Fatalf("GetImageBlob on fresh wand blob length = %d, want 0", got)
++	}
++
++	if err == nil {
++		t.Fatalf("GetImageBlob on fresh wand error = nil, want non-nil")
++	}
++
++	seqBlob, seqErr := mw.GetImagesBlob()
++	if seqBlob != nil {
++		t.Fatalf("GetImagesBlob on fresh wand blob = %v, want nil", seqBlob)
++	}
++	if got := len(seqBlob); got != 0 {
++		t.Fatalf("GetImagesBlob on fresh wand blob length = %d, want 0", got)
++	}
++
++	if seqErr == nil {
++		t.Fatalf("GetImagesBlob on fresh wand error = nil, want non-nil")
++	}
++}
++
++func TestTwoWandsMaintainIndependentBlobState(t *testing.T) {
++
++
++	initialize(t)
++
++	a, aBg := newSolidWand(t, 3, 2, "#336699", "PNG")
++	defer a.Destroy()
++	defer aBg.Destroy()
++	blob, err := a.GetImageBlob()
++	requireNoError(t, "GetImageBlob", err)
++
++	requireBlobPrefix(t, "independence source PNG", blob, []byte("\x89PNG\r\n\x1a\n"))
++
++	b := imagick.NewMagickWand()
++	defer b.Destroy()
++	if got := a.GetNumberImages(); got != 1 {
++		t.Fatalf("wand a image count after creating a = %d, want 1", got)
++	}
++	if got := a.GetImageWidth(); got != 3 {
++		t.Fatalf("wand a width after creating a = %d, want 3", got)
++	}
++	if got := a.GetImageHeight(); got != 2 {
++		t.Fatalf("wand a height after creating a = %d, want 2", got)
++	}
++	if got := a.GetImageFormat(); got != "PNG" {
++		t.Fatalf("wand a format after creating a = %q, want %q", got, "PNG")
++	}
++	if got := b.GetNumberImages(); got != 0 {
++		t.Fatalf("wand b image count before read = %d, want 0", got)
++	}
++	if got := b.GetImageWidth(); got != 0 {
++		t.Fatalf("wand b width before read = %d, want 0", got)
++	}
++	if got := b.GetImageHeight(); got != 0 {
++		t.Fatalf("wand b height before read = %d, want 0", got)
++	}
++	if got := b.GetImageFormat(); got != "" {
++		t.Fatalf("wand b format before read = %q, want empty string", got)
++	}
++
++	requireNoError(t, "ReadImageBlob into b", b.ReadImageBlob(blob))
++	if got := b.GetNumberImages(); got != 1 {
++		t.Fatalf("wand b image count after read = %d, want 1", got)
++	}
++	if got := b.GetImageWidth(); got != 3 {
++		t.Fatalf("wand b width after read = %d, want 3", got)
++	}
++	if got := b.GetImageHeight(); got != 2 {
++		t.Fatalf("wand b height after read = %d, want 2", got)
++	}
++	if got := b.GetImageFormat(); got != "PNG" {
++		t.Fatalf("wand b format after read = %q, want %q", got, "PNG")
++	}
++}
++
++func TestDestroyIsIdempotentForBlobWorkflowWand(t *testing.T) {
++
++
++	initialize(t)
++
++	mw, bg := newSolidWand(t, 3, 2, "#336699", "PNG")
++	defer bg.Destroy()
++	if got := mw.IsVerified(); got != true {
++		t.Fatalf("wand verified before Destroy = %v, want true", got)
++	}
++	blob, err := mw.GetImageBlob()
++	requireNoError(t, "GetImageBlob before Destroy", err)
++
++	requireBlobPrefix(t, "blob before Destroy", blob, []byte("\x89PNG\r\n\x1a\n"))
++
++	mw.Destroy()
++	if got := mw.IsVerified(); got != false {
++		t.Fatalf("wand verified after first Destroy = %v, want false", got)
++	}
++	mw.Destroy()
++	if got := mw.IsVerified(); got != false {
++		t.Fatalf("wand verified after second Destroy = %v, want false", got)
++	}
++}
++
++func TestBlobWorkflowConstructUseDestroyCyclesStayResourceBounded(t *testing.T) {
++
++
++	initialize(t)
++
++	for i := 0; i < 20; i++ {
++		runBlobLifecycleCycle(t)
++	}
++	runtime.GC()
++	time.Sleep(100 * time.Millisecond)
++	startRSS := vmRSSKB(t)
++	startFDs := countFDs(t)
++	startGoroutines := runtime.NumGoroutine()
++
++	for i := 0; i < 120; i++ {
++		runBlobLifecycleCycle(t)
++		if i%20 == 0 {
++			runtime.GC()
++		}
++	}
++	runtime.GC()
++	time.Sleep(200 * time.Millisecond)
++	endRSS := vmRSSKB(t)
++	endFDs := countFDs(t)
++	endGoroutines := runtime.NumGoroutine()
++
++	if got := int64(endRSS) - int64(startRSS); got > 12288 {
++		t.Fatalf("VmRSS growth after 120 blob lifecycle cycles = %d KiB, want <= 12288 KiB", got)
++	}
++	if got := endFDs - startFDs; got > 2 {
++		t.Fatalf("FD count growth after 120 blob lifecycle cycles = %d, want <= 2", got)
++	}
++	if got := endGoroutines - startGoroutines; got > 2 {
++		t.Fatalf("goroutine count growth after 120 blob lifecycle cycles = %d, want <= 2", got)
++	}
++}
++
++func runBlobLifecycleCycle(t *testing.T) {
++	t.Helper()
++	bg := imagick.NewPixelWand()
++	defer bg.Destroy()
++	if got := bg.SetColor("white"); got != true {
++		t.Fatalf("cycle background SetColor = %v, want true", got)
++	}
++	mw := imagick.NewMagickWand()
++	defer mw.Destroy()
++	requireNoError(t, "cycle NewImage", mw.NewImage(128, 128, bg))
++	requireNoError(t, "cycle SetImageFormat", mw.SetImageFormat("PNG"))
++	blob, err := mw.GetImageBlob()
++	requireNoError(t, "cycle GetImageBlob", err)
++
++	requireBlobPrefix(t, "cycle PNG", blob, []byte("\x89PNG\r\n\x1a\n"))
++}
++
++func vmRSSKB(t *testing.T) uint64 {
++	t.Helper()
++	f, err := os.Open("/proc/self/status")
++	requireNoError(t, "open /proc/self/status", err)
++	defer f.Close()
++
++	scanner := bufio.NewScanner(f)
++	for scanner.Scan() {
++		line := scanner.Text()
++		if !strings.HasPrefix(line, "VmRSS:") {
++			continue
++		}
++		fields := strings.Fields(line)
++		if len(fields) != 3 {
++			t.Fatalf("VmRSS fields = %v, want [VmRSS: <number> kB]", fields)
++		}
++		if fields[2] != "kB" {
++			t.Fatalf("VmRSS unit = %q, want %q", fields[2], "kB")
++		}
++		value, err := strconv.ParseUint(fields[1], 10, 64)
++		requireNoError(t, "parse VmRSS", err)
++		return value
++	}
++	requireNoError(t, "scan /proc/self/status", scanner.Err())
++	t.Fatal("VmRSS entry missing from /proc/self/status")
++	return 0
++}
++
++func countFDs(t *testing.T) int {
++	t.Helper()
++	entries, err := os.ReadDir("/proc/self/fd")
++	requireNoError(t, "read /proc/self/fd", err)
++	return len(entries)
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,21 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++
++cd /workspace/repo
++
++export GOTOOLCHAIN=local
++export GOPROXY=off
++export GOSUMDB=off
++export GONOSUMDB='*'
++
++exec go test -v -count=1 ./usercase-test-coderl/...

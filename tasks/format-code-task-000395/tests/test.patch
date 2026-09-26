@@ -1,0 +1,429 @@
+diff --git a/usercase-test-coderl/usecase.sh b/usercase-test-coderl/usecase.sh
+new file mode 100755
+--- /dev/null
++++ b/usercase-test-coderl/usecase.sh
+@@ -0,0 +1,407 @@
++#!/usr/bin/env bash
++
++set -u
++export LANG=C.UTF-8 LC_ALL=C.UTF-8 TZ=UTC
++
++fail() { echo "FAIL: $*" >&2; exit 1; }
++
++PYTHON_BIN=$(command -v python3 || true)
++[ -n "$PYTHON_BIN" ] || fail "python3 is required for this Python CLI acceptance test"
++
++SCRIPT=/workspace/repo/wxPython/RunScript.py
++SETUP_SCRIPT=/workspace/repo/wxPython/setup.py
++[ -f "$SCRIPT" ] || fail "RunScript.py is missing from wxPython resources"
++[ -f "$SETUP_SCRIPT" ] || fail "setup.py is missing"
++
++ROOT_TMP=/tmp/dsymtools-fixture-coderl
++rm -rf "$ROOT_TMP"
++mkdir -p "$ROOT_TMP"
++
++APP_PARENT=/Applications
++APP_ROOT=/Applications/DSYMTools.app
++DB_DIR=$APP_ROOT/Contents/Resources
++DB_PATH=$DB_DIR/dsym.db
++HAD_APP_PARENT=0
++HAD_APP_ROOT=0
++
++[ -e "$APP_PARENT" ] && HAD_APP_PARENT=1
++if [ -e "$APP_ROOT" ]; then
++    HAD_APP_ROOT=1
++    mv "$APP_ROOT" "$ROOT_TMP/original-DSYMTools.app" || fail "backup existing DSYMTools.app"
++fi
++
++cleanup() {
++    rm -rf "$APP_ROOT"
++    if [ "$HAD_APP_ROOT" -eq 1 ]; then
++        mkdir -p "$APP_PARENT"
++        mv "$ROOT_TMP/original-DSYMTools.app" "$APP_ROOT" 2>/dev/null || true
++    fi
++    if [ "$HAD_APP_PARENT" -eq 0 ]; then
++        rmdir "$APP_PARENT" 2>/dev/null || true
++    fi
++    rm -rf "$ROOT_TMP"
++}
++trap cleanup EXIT
++
++mkdir -p "$DB_DIR" || fail "create DSYMTools resource directory"
++
++RUNNER=$ROOT_TMP/run_python_file.py
++cat >"$RUNNER" <<'PY'
++import os
++import re
++import sys
++
++path = sys.argv[1]
++sys.argv = [path] + sys.argv[2:]
++with open(path, "r", encoding="utf-8") as handle:
++    source = handle.read()
++
++try:
++    code = compile(source, path, "exec")
++except SyntaxError:
++    converted = []
++    for line in source.splitlines(True):
++        match = re.match(r"^(\s*)print\s+(.+?)(\r?\n)?$", line)
++        if match and not match.group(2).lstrip().startswith(">>"):
++            converted.append("%sprint(%s)%s" % (match.group(1), match.group(2), match.group(3) or ""))
++        else:
++            converted.append(line)
++    code = compile("".join(converted), path, "exec")
++
++globals_dict = {"__name__": "__main__", "__file__": path, "__builtins__": __builtins__}
++exec(code, globals_dict, globals_dict)
++PY
++
++SETUP_PROBE=$ROOT_TMP/probe_setup.py
++cat >"$SETUP_PROBE" <<'PY'
++import builtins
++import json
++import os
++import re
++import sys
++import types
++
++path = sys.argv[1]
++with open(path, "r", encoding="utf-8") as handle:
++    source = handle.read()
++
++try:
++    code = compile(source, path, "exec")
++except SyntaxError:
++    converted = []
++    for line in source.splitlines(True):
++        match = re.match(r"^(\s*)print\s+(.+?)(\r?\n)?$", line)
++        if match and not match.group(2).lstrip().startswith(">>"):
++            converted.append("%sprint(%s)%s" % (match.group(1), match.group(2), match.group(3) or ""))
++        else:
++            converted.append(line)
++    code = compile("".join(converted), path, "exec")
++
++builtins.reload = lambda module: module
++sys.setdefaultencoding = lambda encoding: None
++captured = {}
++
++def setup(**kwargs):
++    captured.update(kwargs)
++
++fake_setuptools = types.ModuleType("setuptools")
++fake_setuptools.setup = setup
++sys.modules["setuptools"] = fake_setuptools
++
++cwd = os.getcwd()
++os.chdir(os.path.dirname(path) or ".")
++try:
++    exec(code, {"__name__": "__main__", "__file__": path, "__builtins__": builtins.__dict__}, {})
++finally:
++    os.chdir(cwd)
++
++print(json.dumps({
++    "app": captured.get("app"),
++    "data_files": captured.get("data_files"),
++    "name": captured.get("name"),
++    "options": captured.get("options"),
++    "setup_requires": captured.get("setup_requires"),
++}, ensure_ascii=False, sort_keys=True))
++PY
++
++reset_registry() {
++    rm -f "$DB_PATH"
++    mkdir -p "$DB_DIR" || fail "create db dir"
++}
++
++registry_count() {
++    "$PYTHON_BIN" - "$DB_PATH" <<'PY'
++import os
++import sqlite3
++import sys
++
++db = sys.argv[1]
++if not os.path.exists(db):
++    print(0)
++    raise SystemExit
++con = sqlite3.connect(db)
++try:
++    cur = con.execute("select count(*) from archives")
++    print(cur.fetchone()[0])
++except sqlite3.Error:
++    print(0)
++finally:
++    con.close()
++PY
++}
++
++registry_rows() {
++    "$PYTHON_BIN" - "$DB_PATH" <<'PY'
++import os
++import sqlite3
++import sys
++
++db = sys.argv[1]
++if not os.path.exists(db):
++    raise SystemExit
++con = sqlite3.connect(db)
++try:
++    for (path,) in con.execute("select file_path from archives order by file_path"):
++        print(path)
++finally:
++    con.close()
++PY
++}
++
++registry_table_info() {
++    "$PYTHON_BIN" - "$DB_PATH" <<'PY'
++import os
++import sqlite3
++import sys
++
++db = sys.argv[1]
++if not os.path.exists(db):
++    raise SystemExit
++con = sqlite3.connect(db)
++try:
++    for row in con.execute("pragma table_info(archives)"):
++        print("|".join("" if value is None else str(value) for value in row))
++finally:
++    con.close()
++PY
++}
++
++registry_unique_index_count() {
++    "$PYTHON_BIN" - "$DB_PATH" <<'PY'
++import os
++import sqlite3
++import sys
++
++db = sys.argv[1]
++if not os.path.exists(db):
++    print(0)
++    raise SystemExit
++con = sqlite3.connect(db)
++try:
++    print(sum(1 for row in con.execute("pragma index_list(archives)") if row[2]))
++finally:
++    con.close()
++PY
++}
++
++assert_file_exact() {
++    local actual=$1
++    local expected=$2
++    cmp -s "$actual" "$expected" || {
++        echo "expected:" >&2
++        sed -n l "$expected" >&2
++        echo "actual:" >&2
++        sed -n l "$actual" >&2
++        fail "$3"
++    }
++}
++
++run_candidate() {
++    env -i LANG=C.UTF-8 LC_ALL=C.UTF-8 TZ=UTC "$@"
++}
++
++
++
++
++reset_registry
++F1_SRC=$ROOT_TMP/f1-debug-src
++F1_PROJECT=$ROOT_TMP/f1-debug-project
++mkdir -p "$F1_SRC/MyDebug.app.dSYM/Contents/Resources/DWARF" "$F1_PROJECT/dSYM"
++printf 'debug-symbols\n' >"$F1_SRC/MyDebug.app.dSYM/Contents/Resources/DWARF/MyDebug"
++run_candidate \
++    EFFECTIVE_PLATFORM_NAME=-iphoneos \
++    DWARF_DSYM_FOLDER_PATH="$F1_SRC" \
++    BUILD_STYLE=Debug \
++    DWARF_DSYM_FILE_NAME=MyDebug.app.dSYM \
++    EXECUTABLE_NAME=MyDebug \
++    PROJECT_DIR="$F1_PROJECT" \
++    "$PYTHON_BIN" "$RUNNER" "$SCRIPT" >"$ROOT_TMP/f1.out" 2>"$ROOT_TMP/f1.err"; ec=$?
++printf '%s\n%s\n%s\n' "-iphoneos" "$F1_SRC" "跳过debug模式" >"$ROOT_TMP/f1.expected"
++[ "$ec" -eq 0 ] || fail "F1 exit $ec; want 0"
++
++[ "$(sed -n '1p' "$ROOT_TMP/f1.out")" = "-iphoneos" ] || fail "F1 first stdout line mismatch"
++[ "$(sed -n '2p' "$ROOT_TMP/f1.out")" = "$F1_SRC" ] || fail "F1 second stdout line mismatch"
++grep -Fxq "跳过debug模式" "$ROOT_TMP/f1.out" || fail "F1 stdout should include debug skip message"
++
++[ -d "$F1_SRC/MyDebug.app.dSYM" ] || fail "F1 source dSYM was moved"
++[ -z "$(find "$F1_PROJECT/dSYM" -mindepth 1 -maxdepth 1 -print -quit)" ] || fail "F1 destination dSYM should not be created"
++[ "$(registry_count)" = "0" ] || fail "F1 registry should remain empty"
++
++
++
++
++reset_registry
++F2_SRC=$ROOT_TMP/f2-simulator-src
++F2_PROJECT=$ROOT_TMP/f2-simulator-project
++mkdir -p "$F2_SRC/Sim.app.dSYM/Contents/Resources/DWARF" "$F2_PROJECT/dSYM"
++printf 'sim-symbols\n' >"$F2_SRC/Sim.app.dSYM/Contents/Resources/DWARF/Sim"
++run_candidate \
++    EFFECTIVE_PLATFORM_NAME=-iphonesimulator \
++    DWARF_DSYM_FOLDER_PATH="$F2_SRC" \
++    BUILD_STYLE=Release \
++    DWARF_DSYM_FILE_NAME=Sim.app.dSYM \
++    EXECUTABLE_NAME=Sim \
++    PROJECT_DIR="$F2_PROJECT" \
++    "$PYTHON_BIN" "$RUNNER" "$SCRIPT" >"$ROOT_TMP/f2.out" 2>"$ROOT_TMP/f2.err"; ec=$?
++printf '%s\n%s\n%s\n' "-iphonesimulator" "$F2_SRC" "跳过模拟器编译情况" >"$ROOT_TMP/f2.expected"
++[ "$ec" -eq 0 ] || fail "F2 exit $ec; want 0"
++
++[ "$(sed -n '1p' "$ROOT_TMP/f2.out")" = "-iphonesimulator" ] || fail "F2 first stdout line mismatch"
++[ "$(sed -n '2p' "$ROOT_TMP/f2.out")" = "$F2_SRC" ] || fail "F2 second stdout line mismatch"
++grep -Fxq "跳过模拟器编译情况" "$ROOT_TMP/f2.out" || fail "F2 stdout should include simulator skip message"
++
++[ -d "$F2_SRC/Sim.app.dSYM" ] || fail "F2 source dSYM was moved"
++[ -z "$(find "$F2_PROJECT/dSYM" -mindepth 1 -maxdepth 1 -print -quit)" ] || fail "F2 destination dSYM should not be created"
++[ "$(registry_count)" = "0" ] || fail "F2 registry should remain empty"
++
++
++
++
++reset_registry
++F3_SRC=$ROOT_TMP/f3-release-src
++F3_PROJECT=$ROOT_TMP/f3-release-project
++mkdir -p "$F3_SRC/Crashy.app.dSYM/Contents/Resources/DWARF" "$F3_PROJECT/dSYM"
++printf 'symbol-payload\n' >"$F3_SRC/Crashy.app.dSYM/Contents/Resources/DWARF/Crashy"
++F3_BEFORE=$(date +%Y%m%d%H%M%S)
++run_candidate \
++    EFFECTIVE_PLATFORM_NAME=-iphoneos \
++    DWARF_DSYM_FOLDER_PATH="$F3_SRC" \
++    BUILD_STYLE=Release \
++    DWARF_DSYM_FILE_NAME=Crashy.app.dSYM \
++    EXECUTABLE_NAME=Crashy \
++    PROJECT_DIR="$F3_PROJECT" \
++    "$PYTHON_BIN" "$RUNNER" "$SCRIPT" >"$ROOT_TMP/f3.out" 2>"$ROOT_TMP/f3.err"; ec=$?
++F3_AFTER=$(date +%Y%m%d%H%M%S)
++[ "$ec" -eq 0 ] || fail "F3 exit $ec; want 0; stderr=$(cat "$ROOT_TMP/f3.err")"
++
++[ "$(sed -n '1p' "$ROOT_TMP/f3.out")" = "-iphoneos" ] || fail "F3 first stdout line mismatch"
++[ "$(sed -n '2p' "$ROOT_TMP/f3.out")" = "$F3_SRC" ] || fail "F3 second stdout line mismatch"
++
++F3_LINE3=$(grep -F "moving $F3_SRC/Crashy.app.dSYM to $F3_PROJECT/dSYM/Crashy." "$ROOT_TMP/f3.out" | head -n 1)
++F3_PREFIX="moving $F3_SRC/Crashy.app.dSYM to $F3_PROJECT/dSYM/Crashy."
++case "$F3_LINE3" in
++    "$F3_PREFIX"*.app.dSYM) ;;
++    *) fail "F3 moving line mismatch: $F3_LINE3" ;;
++esac
++F3_DEST=${F3_LINE3#moving $F3_SRC/Crashy.app.dSYM to }
++F3_TS=${F3_DEST#"$F3_PROJECT/dSYM/Crashy."}
++F3_TS=${F3_TS%.app.dSYM}
++[[ "$F3_TS" =~ ^[0-9]{14}$ ]] || fail "F3 timestamp is not YYYYmmddHHMMSS: $F3_TS"
++[ "$F3_TS" -ge "$F3_BEFORE" ] && [ "$F3_TS" -le "$F3_AFTER" ] || fail "F3 timestamp $F3_TS outside run window $F3_BEFORE..$F3_AFTER"
++[ ! -e "$F3_SRC/Crashy.app.dSYM" ] || fail "F3 source dSYM still exists after move"
++[ -d "$F3_DEST" ] || fail "F3 destination dSYM missing: $F3_DEST"
++[ "$(cat "$F3_DEST/Contents/Resources/DWARF/Crashy")" = "symbol-payload" ] || fail "F3 moved payload mismatch"
++[ "$(registry_rows)" = "$F3_DEST" ] || fail "F3 registry row mismatch: $(registry_rows)"
++[ "$(registry_table_info)" = "0|file_path|varchar(10)|0||0" ] || fail "F3 registry schema mismatch: $(registry_table_info)"
++[ "$(registry_unique_index_count)" = "1" ] || fail "F3 registry should have one unique index"
++
++
++
++
++reset_registry
++F4_SRC=$ROOT_TMP/f4-missing-env-src
++F4_PROJECT=$ROOT_TMP/f4-missing-env-project
++mkdir -p "$F4_SRC" "$F4_PROJECT/dSYM"
++run_candidate \
++    EFFECTIVE_PLATFORM_NAME=-iphoneos \
++    DWARF_DSYM_FOLDER_PATH="$F4_SRC" \
++    BUILD_STYLE=Release \
++    EXECUTABLE_NAME=NoEnv \
++    PROJECT_DIR="$F4_PROJECT" \
++    "$PYTHON_BIN" "$RUNNER" "$SCRIPT" >"$ROOT_TMP/f4.out" 2>"$ROOT_TMP/f4.err"; ec=$?
++printf '%s\n%s\n' "-iphoneos" "$F4_SRC" >"$ROOT_TMP/f4.expected"
++[ "$ec" -ne 0 ] || fail "F4 exit should be non-zero"
++
++[ "$(sed -n '1p' "$ROOT_TMP/f4.out")" = "-iphoneos" ] || fail "F4 first stdout line mismatch"
++[ "$(sed -n '2p' "$ROOT_TMP/f4.out")" = "$F4_SRC" ] || fail "F4 second stdout line mismatch"
++[ "$(registry_count)" = "0" ] || fail "F4 registry should remain empty"
++[ -z "$(find "$F4_PROJECT/dSYM" -mindepth 1 -maxdepth 1 -print -quit)" ] || fail "F4 should not create destination dSYM"
++
++
++
++
++reset_registry
++F5_SRC=$ROOT_TMP/f5-missing-source-src
++F5_PROJECT=$ROOT_TMP/f5-missing-source-project
++mkdir -p "$F5_SRC" "$F5_PROJECT/dSYM"
++F5_BEFORE=$(date +%Y%m%d%H%M%S)
++run_candidate \
++    EFFECTIVE_PLATFORM_NAME=-iphoneos \
++    DWARF_DSYM_FOLDER_PATH="$F5_SRC" \
++    BUILD_STYLE=Release \
++    DWARF_DSYM_FILE_NAME=Missing.app.dSYM \
++    EXECUTABLE_NAME=Missing \
++    PROJECT_DIR="$F5_PROJECT" \
++    "$PYTHON_BIN" "$RUNNER" "$SCRIPT" >"$ROOT_TMP/f5.out" 2>"$ROOT_TMP/f5.err"; ec=$?
++F5_AFTER=$(date +%Y%m%d%H%M%S)
++[ "$ec" -ne 0 ] || fail "F5 exit should be non-zero"
++[ "$(sed -n '1p' "$ROOT_TMP/f5.out")" = "-iphoneos" ] || fail "F5 first stdout line mismatch"
++[ "$(sed -n '2p' "$ROOT_TMP/f5.out")" = "$F5_SRC" ] || fail "F5 second stdout line mismatch"
++
++F5_LINE3=$(grep -F "moving $F5_SRC/Missing.app.dSYM to $F5_PROJECT/dSYM/Missing." "$ROOT_TMP/f5.out" | head -n 1)
++F5_PREFIX="moving $F5_SRC/Missing.app.dSYM to $F5_PROJECT/dSYM/Missing."
++case "$F5_LINE3" in
++    "$F5_PREFIX"*.app.dSYM) ;;
++    *) fail "F5 moving line mismatch: $F5_LINE3" ;;
++esac
++F5_DEST=${F5_LINE3#moving $F5_SRC/Missing.app.dSYM to }
++F5_TS=${F5_DEST#"$F5_PROJECT/dSYM/Missing."}
++F5_TS=${F5_TS%.app.dSYM}
++[[ "$F5_TS" =~ ^[0-9]{14}$ ]] || fail "F5 timestamp is not YYYYmmddHHMMSS: $F5_TS"
++[ "$F5_TS" -ge "$F5_BEFORE" ] && [ "$F5_TS" -le "$F5_AFTER" ] || fail "F5 timestamp $F5_TS outside run window $F5_BEFORE..$F5_AFTER"
++
++[ ! -e "$F5_DEST" ] || fail "F5 destination should not exist after failed move"
++[ "$(registry_count)" = "0" ] || fail "F5 registry should remain empty"
++
++
++
++
++"$PYTHON_BIN" "$SETUP_PROBE" "$SETUP_SCRIPT" >"$ROOT_TMP/f6.out" 2>"$ROOT_TMP/f6.err"; ec=$?
++[ "$ec" -eq 0 ] || fail "F6 setup probe exit $ec; stderr=$(cat "$ROOT_TMP/f6.err")"
++
++"$PYTHON_BIN" - "$ROOT_TMP/f6.out" <<'PY' || fail "F6 setup.py does not include RunScript.py in py2app resources"
++import json
++import sys
++
++with open(sys.argv[1], "r", encoding="utf-8") as handle:
++    captured = json.load(handle)
++data_files = captured.get("data_files") or []
++options = captured.get("options") or {}
++
++def contains_runscript(value):
++    if isinstance(value, str):
++        return value == "RunScript.py" or value.endswith("/RunScript.py")
++    if isinstance(value, dict):
++        return any(contains_runscript(item) for item in value.values())
++    if isinstance(value, (list, tuple)):
++        return any(contains_runscript(item) for item in value)
++    return False
++
++#
++py2app_options = options.get("py2app") if isinstance(options, dict) else {}
++if not (contains_runscript(data_files) or contains_runscript(py2app_options)):
++    raise SystemExit(1)
++PY
++
++echo "PASS"
++exit 0
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,12 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++exec bash /workspace/repo/usercase-test-coderl/usecase.sh

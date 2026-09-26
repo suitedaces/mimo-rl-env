@@ -1,0 +1,540 @@
+diff --git a/usercase-test-coderl/test_write_dataframe_async.py b/usercase-test-coderl/test_write_dataframe_async.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/test_write_dataframe_async.py
+@@ -0,0 +1,508 @@
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++import gc
++import threading
++import time
++
++import pandas as pd
++import pytest
++
++from TM1py import CellService
++from TM1py.Exceptions import TM1pyWriteFailureException, TM1pyWritePartialFailureException
++
++
++class DummyRest:
++    version = "11.8.00000.1"
++    is_admin = True
++    is_data_admin = True
++    is_security_admin = True
++    session_id = "session-for-usercase"
++
++
++def make_service():
++    return CellService(DummyRest())
++
++
++def rows_from_frame(frame):
++    return [tuple(row) for row in frame.itertuples(index=False, name=None)]
++
++
++def normalized_row_map(records):
++    row_map = {}
++    for record in records:
++        for row in record["rows"]:
++            key = tuple(str(value).lower().replace(" ", "") for value in row[:-1])
++            row_map[key] = row[-1]
++    return row_map
++
++
++def sales_frame(rows):
++    return pd.DataFrame(rows, columns=["Version", "Month", "Measure", "Value"])
++
++
++def test_async_dataframe_write_chunks_and_delegates_with_options():
++
++
++
++
++    service = make_service()
++    records = []
++    worker_names = set()
++
++    def write_dataframe(**kwargs):
++        worker_names.add(threading.current_thread().name)
++        time.sleep(0.05)
++        records.append(
++            {
++                "cube_name": kwargs["cube_name"],
++                "dimensions": tuple(kwargs["dimensions"]),
++                "increment": kwargs["increment"],
++                "use_blob": kwargs["use_blob"],
++                "sandbox_name": kwargs["sandbox_name"],
++                "skip_non_updateable": kwargs.get("skip_non_updateable"),
++                "remove_blob": kwargs.get("remove_blob"),
++                "rows": rows_from_frame(kwargs["data"]),
++            }
++        )
++
++    service.write_dataframe = write_dataframe
++
++    result = service.write_dataframe_async(
++        "Sales",
++        sales_frame(
++            [
++                ["Actual", "Jan", "Units", 10],
++                ["Actual", "Feb", "Units", 20],
++                ["Budget", "Jan", "Units", 30],
++                ["Budget", "Feb", "Units", 40],
++                ["Forecast", "Jan", "Units", 50],
++                ["Forecast", "Feb", "Units", 60],
++                ["Plan", "Jan", "Units", 70],
++                ["Plan", "Feb", "Units", 80],
++            ]
++        ),
++        slice_size_of_dataframe=2,
++        max_workers=4,
++        dimensions=["Version", "Month", "Measure"],
++        increment=False,
++        sandbox_name="Plan",
++        skip_non_updateable=True,
++        remove_blob=False,
++    )
++
++    assert result is None
++
++    assert 1 <= len(worker_names) <= 4
++    assert sorted(records, key=lambda record: record["rows"][0]) == [
++        {
++            "cube_name": "Sales",
++            "dimensions": ("Version", "Month", "Measure"),
++            "increment": False,
++            "use_blob": True,
++            "sandbox_name": "Plan",
++            "skip_non_updateable": True,
++            "remove_blob": False,
++            "rows": [("Actual", "Jan", "Units", 10), ("Actual", "Feb", "Units", 20)],
++        },
++        {
++            "cube_name": "Sales",
++            "dimensions": ("Version", "Month", "Measure"),
++            "increment": False,
++            "use_blob": True,
++            "sandbox_name": "Plan",
++            "skip_non_updateable": True,
++            "remove_blob": False,
++            "rows": [("Budget", "Jan", "Units", 30), ("Budget", "Feb", "Units", 40)],
++        },
++        {
++            "cube_name": "Sales",
++            "dimensions": ("Version", "Month", "Measure"),
++            "increment": False,
++            "use_blob": True,
++            "sandbox_name": "Plan",
++            "skip_non_updateable": True,
++            "remove_blob": False,
++            "rows": [("Forecast", "Jan", "Units", 50), ("Forecast", "Feb", "Units", 60)],
++        },
++        {
++            "cube_name": "Sales",
++            "dimensions": ("Version", "Month", "Measure"),
++            "increment": False,
++            "use_blob": True,
++            "sandbox_name": "Plan",
++            "skip_non_updateable": True,
++            "remove_blob": False,
++            "rows": [("Plan", "Jan", "Units", 70), ("Plan", "Feb", "Units", 80)],
++        },
++    ]
++
++
++def test_async_dataframe_write_infers_dimensions_before_validating_and_writing():
++
++
++
++
++    service = make_service()
++    inferred_cubes = []
++    records = []
++
++    def get_dimension_names_for_writing(cube_name):
++        inferred_cubes.append(cube_name)
++        return ["Version", "Month", "Measure"]
++
++    def write_dataframe(**kwargs):
++        records.append({"dimensions": tuple(kwargs["dimensions"]), "rows": rows_from_frame(kwargs["data"])})
++
++    service.get_dimension_names_for_writing = get_dimension_names_for_writing
++    service.write_dataframe = write_dataframe
++
++    result = service.write_dataframe_async(
++        "Sales",
++        pd.DataFrame(
++            [
++                ["Actual", "Jan", "Units", 7],
++                ["Actual", "Feb", "Units", 8],
++                ["Actual", "Mar", "Units", 9],
++            ],
++            columns=["A", "B", "C", "Value"],
++        ),
++        slice_size_of_dataframe=2,
++        max_workers=1,
++        increment=False,
++    )
++
++    assert result is None
++
++    assert inferred_cubes and all(cube == "Sales" for cube in inferred_cubes)
++    assert records == [
++        {
++            "dimensions": ("Version", "Month", "Measure"),
++            "rows": [("Actual", "Jan", "Units", 7), ("Actual", "Feb", "Units", 8)],
++        },
++        {"dimensions": ("Version", "Month", "Measure"), "rows": [("Actual", "Mar", "Units", 9)]},
++    ]
++
++
++def test_async_dataframe_write_infers_dimensions_before_column_count_error():
++
++
++
++
++    service = make_service()
++    inferred_cubes = []
++    write_calls = []
++
++    def get_dimension_names_for_writing(cube_name):
++        inferred_cubes.append(cube_name)
++        return ["Version", "Month", "Measure"]
++
++    service.get_dimension_names_for_writing = get_dimension_names_for_writing
++    service.write_dataframe = lambda **kwargs: write_calls.append(kwargs["cube_name"])
++
++    with pytest.raises(ValueError) as exc:
++        service.write_dataframe_async(
++            "Sales",
++            pd.DataFrame(
++                [["Actual", "Jan", "Units", "extra", 1]],
++                columns=["Version", "Month", "Measure", "Extra", "Value"],
++            ),
++            slice_size_of_dataframe=2,
++            max_workers=1,
++            increment=False,
++        )
++
++
++    assert inferred_cubes and all(cube == "Sales" for cube in inferred_cubes)
++    assert write_calls == []
++    assert str(exc.value) == "Number of columns in 'data' DataFrame must be number of dimensions in cube + 1"
++
++
++def test_async_dataframe_write_aggregates_numeric_duplicates_when_incrementing():
++
++
++
++
++    service = make_service()
++    records = []
++
++    def write_dataframe(**kwargs):
++        records.append({"rows": rows_from_frame(kwargs["data"]), "increment": kwargs["increment"]})
++
++    service.write_dataframe = write_dataframe
++
++    result = service.write_dataframe_async(
++        "Sales",
++        sales_frame(
++            [
++                ["Actual", "Jan", "Units", 1],
++                ["Actual", "Jan", "Units", 2],
++                ["Actual", "Feb", "Units", 3],
++                ["Actual", "Feb", "Units", 4],
++                ["Budget", "Jan", "Units", 5],
++            ]
++        ),
++        slice_size_of_dataframe=2,
++        max_workers=1,
++        dimensions=["Version", "Month", "Measure"],
++        increment=True,
++    )
++
++    assert result is None
++
++    assert [record["increment"] for record in records] == [True, True]
++    assert sorted(len(record["rows"]) for record in records) == [1, 2]
++    assert normalized_row_map(records) == {
++        ("actual", "jan", "units"): 3,
++        ("actual", "feb", "units"): 7,
++        ("budget", "jan", "units"): 5,
++    }
++
++
++def test_async_dataframe_write_rejects_non_dataframe_data():
++
++
++
++
++    service = make_service()
++
++    with pytest.raises(ValueError) as exc:
++        service.write_dataframe_async("Sales", [["not", "a", "dataframe"]], dimensions=["Version", "Month", "Measure"])
++
++    assert str(exc.value) == "argument 'data' must of type DataFrame"
++
++
++def test_async_dataframe_write_rejects_wrong_column_count():
++
++
++
++
++    service = make_service()
++
++    with pytest.raises(ValueError) as exc:
++        service.write_dataframe_async(
++            "Sales",
++            pd.DataFrame(
++                [["Actual", "Jan", "Units", "extra", 1]],
++                columns=["Version", "Month", "Measure", "Extra", "Value"],
++            ),
++            dimensions=["Version", "Month", "Measure"],
++        )
++
++    assert str(exc.value) == "Number of columns in 'data' DataFrame must be number of dimensions in cube + 1"
++
++
++def test_async_dataframe_write_flattens_partial_and_total_chunk_failures():
++
++
++
++
++    service = make_service()
++    calls = []
++    failures = [
++        TM1pyWritePartialFailureException(["HasMinorErrors"], ["minor-one.log"], 2),
++        None,
++        TM1pyWriteFailureException(["Failed"], ["total-three.log"]),
++        TM1pyWritePartialFailureException(
++            ["HasMinorErrors", "HasMinorErrors"], ["minor-four-a.log", "minor-four-b.log"], 4
++        ),
++    ]
++
++    def write_dataframe(**kwargs):
++        index = len(calls)
++        calls.append(rows_from_frame(kwargs["data"]))
++        failure = failures[index]
++        if failure is not None:
++            raise failure
++
++    service.write_dataframe = write_dataframe
++
++    with pytest.raises(TM1pyWritePartialFailureException) as exc:
++        service.write_dataframe_async(
++            "Sales",
++            sales_frame(
++                [
++                    ["Actual", "Jan", "Units", 1],
++                    ["Actual", "Feb", "Units", 2],
++                    ["Actual", "Mar", "Units", 3],
++                    ["Actual", "Apr", "Units", 4],
++                ]
++            ),
++            slice_size_of_dataframe=1,
++            max_workers=1,
++            dimensions=["Version", "Month", "Measure"],
++            increment=False,
++        )
++
++    assert calls == [
++        [("Actual", "Jan", "Units", 1)],
++        [("Actual", "Feb", "Units", 2)],
++        [("Actual", "Mar", "Units", 3)],
++        [("Actual", "Apr", "Units", 4)],
++    ]
++    assert exc.value.statuses == ["HasMinorErrors", "Failed", "HasMinorErrors", "HasMinorErrors"]
++    assert exc.value.error_log_files == ["minor-one.log", "total-three.log", "minor-four-a.log", "minor-four-b.log"]
++    assert exc.value.attempts == 7
++
++    assert isinstance(exc.value, TM1pyWritePartialFailureException)
++
++
++def test_transaction_log_reactivation_brackets_whole_async_call_on_success_and_failure():
++
++
++
++
++    observed = []
++
++    for should_fail in [False, True]:
++        service = make_service()
++        events = []
++        service.deactivate_transactionlog = lambda cube_name: events.append(("deactivate", cube_name))
++        service.activate_transactionlog = lambda cube_name: events.append(("activate", cube_name))
++
++        def write_dataframe(**kwargs):
++            events.append(("write", kwargs["cube_name"]))
++            if should_fail:
++                raise TM1pyWriteFailureException(["Failed"], ["failed.log"])
++
++        service.write_dataframe = write_dataframe
++
++        try:
++            result = service.write_dataframe_async(
++                "Sales",
++                sales_frame([["Actual", "Jan", "Units", 1]]),
++                dimensions=["Version", "Month", "Measure"],
++                increment=False,
++                deactivate_transaction_log=True,
++                reactivate_transaction_log=True,
++            )
++            observed.append(("success", result, events))
++        except TM1pyWritePartialFailureException as exc:
++            observed.append(("failure", exc.statuses, exc.error_log_files, exc.attempts, events))
++
++    assert observed == [
++        ("success", None, [("deactivate", "Sales"), ("write", "Sales"), ("activate", "Sales")]),
++        ("failure", ["Failed"], ["failed.log"], 1, [("deactivate", "Sales"), ("write", "Sales"), ("activate", "Sales")]),
++    ]
++
++
++def test_transaction_log_cleanup_is_reusable_on_same_service():
++
++
++
++
++    service = make_service()
++    events = []
++    service.deactivate_transactionlog = lambda cube_name: events.append(("deactivate", cube_name))
++    service.activate_transactionlog = lambda cube_name: events.append(("activate", cube_name))
++    service.write_dataframe = lambda **kwargs: events.append(
++        ("write", kwargs["cube_name"], rows_from_frame(kwargs["data"]))
++    )
++
++    first_result = service.write_dataframe_async(
++        "Sales",
++        sales_frame([["Actual", "Jan", "Units", 1]]),
++        dimensions=["Version", "Month", "Measure"],
++        increment=False,
++        deactivate_transaction_log=True,
++        reactivate_transaction_log=True,
++    )
++    second_result = service.write_dataframe_async(
++        "Sales",
++        sales_frame([["Actual", "Jan", "Units", 2]]),
++        dimensions=["Version", "Month", "Measure"],
++        increment=False,
++        deactivate_transaction_log=True,
++        reactivate_transaction_log=True,
++    )
++
++    assert first_result is None
++    assert second_result is None
++    assert events == [
++        ("deactivate", "Sales"),
++        ("write", "Sales", [("Actual", "Jan", "Units", 1)]),
++        ("activate", "Sales"),
++        ("deactivate", "Sales"),
++        ("write", "Sales", [("Actual", "Jan", "Units", 2)]),
++        ("activate", "Sales"),
++    ]
++
++
++def test_two_cell_service_instances_keep_async_write_state_independent():
++
++
++
++
++    service_a = make_service()
++    service_b = make_service()
++    records_a = []
++    records_b = []
++    service_a.write_dataframe = lambda **kwargs: records_a.append((kwargs["cube_name"], rows_from_frame(kwargs["data"])))
++    service_b.write_dataframe = lambda **kwargs: records_b.append((kwargs["cube_name"], rows_from_frame(kwargs["data"])))
++
++    service_a.write_dataframe_async(
++        "SalesA",
++        sales_frame([["Actual", "Jan", "Units", 11], ["Budget", "Feb", "Units", 22]]),
++        slice_size_of_dataframe=1,
++        max_workers=1,
++        dimensions=["Version", "Month", "Measure"],
++        increment=False,
++    )
++    assert records_a == [
++        ("SalesA", [("Actual", "Jan", "Units", 11)]),
++        ("SalesA", [("Budget", "Feb", "Units", 22)]),
++    ]
++    assert records_b == []
++
++    service_b.write_dataframe_async(
++        "SalesB",
++        sales_frame([["Actual", "Mar", "Units", 33]]),
++        slice_size_of_dataframe=1,
++        max_workers=1,
++        dimensions=["Version", "Month", "Measure"],
++        increment=False,
++    )
++    assert records_a == [
++        ("SalesA", [("Actual", "Jan", "Units", 11)]),
++        ("SalesA", [("Budget", "Feb", "Units", 22)]),
++    ]
++    assert records_b == [("SalesB", [("Actual", "Mar", "Units", 33)])]
++
++
++def test_thread_pool_cleanup_stays_bounded_across_many_async_write_sessions():
++
++
++
++
++    write_calls = []
++
++    for index in range(100):
++        service = make_service()
++        service.write_dataframe = lambda **kwargs: write_calls.append(rows_from_frame(kwargs["data"]))
++        result = service.write_dataframe_async(
++            "Sales",
++            sales_frame([["Actual", "Jan", "Units", index], ["Actual", "Feb", "Units", index + 1]]),
++            slice_size_of_dataframe=2,
++            max_workers=4,
++            dimensions=["Version", "Month", "Measure"],
++            increment=False,
++            sandbox_name="Plan",
++        )
++        assert result is None
++
++    gc.collect()
++
++    assert len(write_calls) == 100
++    assert all(len(call_rows) == 2 for call_rows in write_calls)
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,22 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++
++cd /workspace/repo
++
++
++export PATH="/opt/coderl_tm1py_venv/bin:${PATH}"
++export PYTHONNOUSERSITE=1
++export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
++export PIP_NO_INDEX=1
++
++exec /opt/coderl_tm1py_venv/bin/python -m pytest /workspace/repo/usercase-test-coderl/test_write_dataframe_async.py -v

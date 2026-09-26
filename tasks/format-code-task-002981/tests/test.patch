@@ -1,0 +1,342 @@
+diff --git a/pkg/core/watcher_task_test.go b/pkg/core/watcher_task_test.go
+new file mode 100644
+index 0000000..7ad3d3f
+--- /dev/null
++++ b/pkg/core/watcher_task_test.go
+@@ -0,0 +1,315 @@
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++package core
++
++import (
++	"context"
++	"sync"
++	"time"
++
++	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
++
++	. "github.com/onsi/ginkgo/v2"
++	. "github.com/onsi/gomega"
++	"github.com/wave-k8s/wave/test/utils"
++	appsv1 "k8s.io/api/apps/v1"
++	corev1 "k8s.io/api/core/v1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/types"
++	"k8s.io/client-go/kubernetes/scheme"
++	"k8s.io/client-go/util/workqueue"
++	"sigs.k8s.io/controller-runtime/pkg/client"
++	"sigs.k8s.io/controller-runtime/pkg/event"
++	"sigs.k8s.io/controller-runtime/pkg/manager"
++	"sigs.k8s.io/controller-runtime/pkg/reconcile"
++)
++
++
++
++func drainQueue(q workqueue.RateLimitingInterface) map[types.NamespacedName]bool {
++	out := map[types.NamespacedName]bool{}
++	for q.Len() > 0 {
++		item, shutdown := q.Get()
++		if shutdown {
++			break
++		}
++		req, ok := item.(reconcile.Request)
++		Expect(ok).To(BeTrue())
++		out[req.NamespacedName] = true
++		q.Done(item)
++	}
++	return out
++}
++
++var _ = Describe("Wave watch-registry task Suite", func() {
++
++	Context("EnqueueRequestForWatcher event handler", func() {
++		var q workqueue.RateLimitingInterface
++		var watcherList map[types.NamespacedName]map[types.NamespacedName]bool
++
++		cmA := types.NamespacedName{Namespace: "ns", Name: "cmA"}
++		cmB := types.NamespacedName{Namespace: "ns", Name: "cmB"}
++		cmZ := types.NamespacedName{Namespace: "ns", Name: "cmZ"}
++		inst1 := types.NamespacedName{Namespace: "ns", Name: "inst1"}
++		inst2 := types.NamespacedName{Namespace: "ns", Name: "inst2"}
++		inst3 := types.NamespacedName{Namespace: "ns", Name: "inst3"}
++
++		object := func(nsn types.NamespacedName) client.Object {
++			return &corev1.ConfigMap{
++				ObjectMeta: metav1.ObjectMeta{
++					Name:      nsn.Name,
++					Namespace: nsn.Namespace,
++				},
++			}
++		}
++
++		BeforeEach(func() {
++			q = workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter())
++			watcherList = map[types.NamespacedName]map[types.NamespacedName]bool{
++				cmA: {inst1: true, inst2: true},
++				cmB: {inst3: true},
++			}
++		})
++
++		AfterEach(func() {
++			q.ShutDown()
++		})
++
++		It("enqueues all watchers of the created object", func() {
++			eh := EnqueueRequestForWatcher(watcherList)
++			eh.Create(context.TODO(), event.CreateEvent{Object: object(cmA)}, q)
++			Expect(drainQueue(q)).To(Equal(map[types.NamespacedName]bool{
++				inst1: true,
++				inst2: true,
++			}))
++		})
++
++		It("enqueues all watchers of a deleted object", func() {
++			eh := EnqueueRequestForWatcher(watcherList)
++			eh.Delete(context.TODO(), event.DeleteEvent{Object: object(cmB)}, q)
++			Expect(drainQueue(q)).To(Equal(map[types.NamespacedName]bool{
++				inst3: true,
++			}))
++		})
++
++		It("enqueues all watchers of a generic event object", func() {
++			eh := EnqueueRequestForWatcher(watcherList)
++			eh.Generic(context.TODO(), event.GenericEvent{Object: object(cmA)}, q)
++			Expect(drainQueue(q)).To(Equal(map[types.NamespacedName]bool{
++				inst1: true,
++				inst2: true,
++			}))
++		})
++
++		It("enqueues watchers of both old and new objects on update", func() {
++			eh := EnqueueRequestForWatcher(watcherList)
++			eh.Update(context.TODO(), event.UpdateEvent{
++				ObjectOld: object(cmA),
++				ObjectNew: object(cmB),
++			}, q)
++			Expect(drainQueue(q)).To(Equal(map[types.NamespacedName]bool{
++				inst1: true,
++				inst2: true,
++				inst3: true,
++			}))
++		})
++
++		It("enqueues nothing for an object that has no watchers", func() {
++			eh := EnqueueRequestForWatcher(watcherList)
++			eh.Create(context.TODO(), event.CreateEvent{Object: object(cmZ)}, q)
++			Expect(q.Len()).To(Equal(0))
++		})
++
++		It("reflects later mutations of the backing map", func() {
++			eh := EnqueueRequestForWatcher(watcherList)
++
++			eh.Create(context.TODO(), event.CreateEvent{Object: object(cmZ)}, q)
++			Expect(q.Len()).To(Equal(0))
++
++
++			watcherList[cmZ] = map[types.NamespacedName]bool{inst1: true}
++			eh.Create(context.TODO(), event.CreateEvent{Object: object(cmZ)}, q)
++			Expect(drainQueue(q)).To(Equal(map[types.NamespacedName]bool{
++				inst1: true,
++			}))
++		})
++	})
++
++	Context("Handler watch registry", func() {
++		var c client.Client
++		var h *Handler
++		var m utils.Matcher
++
++		var deployment *appsv1.Deployment
++		var mgrStopped *sync.WaitGroup
++		var stopMgr chan struct{}
++
++		const timeout = time.Second * 5
++
++		var example1Name, example2Name, example3Name types.NamespacedName
++		var instanceName types.NamespacedName
++
++		reconcileWithAnnotation := func() {
++			annotations := deployment.GetAnnotations()
++			if annotations == nil {
++				annotations = make(map[string]string)
++			}
++			annotations[RequiredAnnotation] = "true"
++			m.Update(deployment, func(obj client.Object) client.Object {
++				obj.SetAnnotations(annotations)
++				return obj
++			}, timeout).Should(Succeed())
++			_, err := h.HandleDeployment(deployment)
++			Expect(err).NotTo(HaveOccurred())
++			m.Get(deployment, timeout).Should(Succeed())
++			_, err = h.HandleDeployment(deployment)
++			Expect(err).NotTo(HaveOccurred())
++			m.Get(deployment, timeout).Should(Succeed())
++		}
++
++		BeforeEach(func() {
++			mgr, err := manager.New(cfg, manager.Options{
++				Metrics: metricsserver.Options{BindAddress: "0"},
++			})
++			Expect(err).NotTo(HaveOccurred())
++			c, err = client.New(cfg, client.Options{Scheme: scheme.Scheme})
++			Expect(err).NotTo(HaveOccurred())
++
++			h = NewHandler(c, mgr.GetEventRecorderFor("wave"))
++			m = utils.Matcher{Client: c}
++
++			stopMgr, mgrStopped = StartTestManager(mgr)
++
++			cm1 := utils.ExampleConfigMap1.DeepCopy()
++			cm2 := utils.ExampleConfigMap2.DeepCopy()
++			cm3 := utils.ExampleConfigMap3.DeepCopy()
++			cm4 := utils.ExampleConfigMap4.DeepCopy()
++			cm5 := utils.ExampleConfigMap5.DeepCopy()
++			cm6 := utils.ExampleConfigMap6.DeepCopy()
++			s1 := utils.ExampleSecret1.DeepCopy()
++			s2 := utils.ExampleSecret2.DeepCopy()
++			s3 := utils.ExampleSecret3.DeepCopy()
++			s4 := utils.ExampleSecret4.DeepCopy()
++			s5 := utils.ExampleSecret5.DeepCopy()
++			s6 := utils.ExampleSecret6.DeepCopy()
++
++			for _, obj := range []client.Object{cm1, cm2, cm3, cm4, cm5, cm6, s1, s2, s3, s4, s5, s6} {
++				m.Create(obj).Should(Succeed())
++				m.Get(obj, timeout).Should(Succeed())
++			}
++
++			deployment = utils.ExampleDeployment.DeepCopy()
++			m.Create(deployment).Should(Succeed())
++			m.Get(deployment, timeout).Should(Succeed())
++
++			example1Name = types.NamespacedName{Name: "example1", Namespace: deployment.GetNamespace()}
++			example2Name = types.NamespacedName{Name: "example2", Namespace: deployment.GetNamespace()}
++			example3Name = types.NamespacedName{Name: "example3", Namespace: deployment.GetNamespace()}
++			instanceName = types.NamespacedName{Name: deployment.GetName(), Namespace: deployment.GetNamespace()}
++		})
++
++		AfterEach(func() {
++
++
++			Eventually(func() error {
++				key := types.NamespacedName{Namespace: deployment.GetNamespace(), Name: deployment.GetName()}
++				err := c.Get(context.TODO(), key, deployment)
++				if err != nil {
++					return client.IgnoreNotFound(err)
++				}
++				deployment.SetFinalizers([]string{})
++				return client.IgnoreNotFound(c.Update(context.TODO(), deployment))
++			}, timeout).Should(Succeed())
++
++			close(stopMgr)
++			mgrStopped.Wait()
++
++			utils.DeleteAll(cfg, timeout,
++				&appsv1.DeploymentList{},
++				&corev1.ConfigMapList{},
++				&corev1.SecretList{},
++				&corev1.EventList{},
++			)
++		})
++
++		It("starts empty", func() {
++			Expect(h.GetWatchedConfigmaps()).To(BeEmpty())
++			Expect(h.GetWatchedSecrets()).To(BeEmpty())
++		})
++
++		Context("when an annotated instance is reconciled", func() {
++			BeforeEach(func() {
++				reconcileWithAnnotation()
++			})
++
++			It("records every referenced ConfigMap and Secret against the instance", func() {
++				Expect(h.GetWatchedConfigmaps()[example1Name]).To(HaveKey(instanceName))
++				Expect(h.GetWatchedConfigmaps()[example2Name]).To(HaveKey(instanceName))
++				Expect(h.GetWatchedConfigmaps()[example3Name]).To(HaveKey(instanceName))
++				Expect(h.GetWatchedSecrets()[example1Name]).To(HaveKey(instanceName))
++				Expect(h.GetWatchedSecrets()[example2Name]).To(HaveKey(instanceName))
++				Expect(h.GetWatchedSecrets()[example3Name]).To(HaveKey(instanceName))
++			})
++
++			It("drops children that are no longer referenced after a reconcile", func() {
++
++				containers := deployment.Spec.Template.Spec.Containers
++				Expect(containers[0].Name).To(Equal("container1"))
++				m.Update(deployment, func(obj client.Object) client.Object {
++					dpl := obj.(*appsv1.Deployment)
++					dpl.Spec.Template.Spec.Containers = []corev1.Container{containers[0]}
++					return dpl
++				}, timeout).Should(Succeed())
++				_, err := h.HandleDeployment(deployment)
++				Expect(err).NotTo(HaveOccurred())
++
++				Expect(h.GetWatchedConfigmaps()[example2Name]).NotTo(HaveKey(instanceName))
++				Expect(h.GetWatchedSecrets()[example2Name]).NotTo(HaveKey(instanceName))
++
++				Expect(h.GetWatchedConfigmaps()[example1Name]).To(HaveKey(instanceName))
++				Expect(h.GetWatchedConfigmaps()[example3Name]).To(HaveKey(instanceName))
++			})
++
++			It("forgets the instance entirely when RemoveWatches is called", func() {
++				h.RemoveWatches(instanceName)
++				Expect(h.GetWatchedConfigmaps()).To(BeEmpty())
++				Expect(h.GetWatchedSecrets()).To(BeEmpty())
++			})
++
++			It("forgets the instance when the required annotation is removed", func() {
++				m.Update(deployment, func(obj client.Object) client.Object {
++					obj.SetAnnotations(map[string]string{})
++					return obj
++				}, timeout).Should(Succeed())
++				_, err := h.HandleDeployment(deployment)
++				Expect(err).NotTo(HaveOccurred())
++
++				Expect(h.GetWatchedConfigmaps()).To(BeEmpty())
++				Expect(h.GetWatchedSecrets()).To(BeEmpty())
++			})
++		})
++
++		Context("when an instance without the annotation is reconciled", func() {
++			It("does not record the instance", func() {
++				_, err := h.HandleDeployment(deployment)
++				Expect(err).NotTo(HaveOccurred())
++				Expect(h.GetWatchedConfigmaps()).To(BeEmpty())
++				Expect(h.GetWatchedSecrets()).To(BeEmpty())
++			})
++		})
++	})
++})
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,16 @@
++#!/usr/bin/env bash
++
++
++
++set -euo pipefail
++HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++cd /testbed
++
++
++
++
++
++go test ./pkg/core/ -count=1 -args --ginkgo.skip="Wave watch-registry task Suite"
++
++
++go test ./pkg/core/ -count=1 -args --ginkgo.focus="Wave watch-registry task Suite"

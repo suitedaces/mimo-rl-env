@@ -1,0 +1,351 @@
+diff --git a/usercase-test-coderl/test_lightfc_session.py b/usercase-test-coderl/test_lightfc_session.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/test_lightfc_session.py
+@@ -0,0 +1,310 @@
++import sys
++from collections.abc import Mapping, Sequence
++from types import SimpleNamespace
++
++import pytest
++import torch
++import torch.nn as nn
++
++sys.path.insert(0, "/workspace/repo")
++
++from lib.models import LightFC
++
++
++def _ns(**kwargs):
++    return SimpleNamespace(**kwargs)
++
++
++def _cfg(
++    backbone_type="MobileNetV2",
++    inplanes=192,
++    freeze_bn=False,
++    num_kernel=64,
++    adj_channel=96,
++    channel=256,
++    feat_sz=16,
++    stride=16,
++):
++    return _ns(
++        MODEL=_ns(
++            BACKBONE=_ns(
++                TYPE=backbone_type,
++                USE_PRETRAINED=False,
++                PRETRAIN_FILE=None,
++                LOAD_MODE=1,
++            ),
++            FUSION=_ns(PARAMS=_ns(num_kernel=num_kernel, adj_channel=adj_channel)),
++            HEAD=_ns(
++                PARAMS=_ns(
++                    inplanes=inplanes,
++                    channel=channel,
++                    feat_sz=feat_sz,
++                    stride=stride,
++                    freeze_bn=freeze_bn,
++                )
++            ),
++        )
++    )
++
++
++class RecordingBackbone(nn.Module):
++    def __init__(self):
++        super().__init__()
++        self.calls = []
++
++    def forward(self, tensor):
++        call_number = len(self.calls) + 1
++        self.calls.append((tuple(tensor.shape), float(tensor.sum())))
++        return tensor + (10.0 * call_number)
++
++
++class RecordingFusion(nn.Module):
++    def __init__(self):
++        super().__init__()
++        self.calls = []
++
++    def forward(self, z_feat, x_feat):
++        self.calls.append((float(z_feat.sum()), float(x_feat.sum())))
++        return z_feat + x_feat
++
++
++class RecordingHead(nn.Module):
++    def __init__(self):
++        super().__init__()
++        self.calls = []
++
++    def forward(self, fused):
++        fused_sum = float(fused.sum())
++        self.calls.append(fused_sum)
++        return {
++            "marker": torch.tensor([fused_sum], dtype=torch.float32),
++            "shape": tuple(fused.shape),
++        }
++
++
++def _install_recorders(net):
++    net.backbone = RecordingBackbone()
++    net.fusion = RecordingFusion()
++    net.head = RecordingHead()
++    return net
++
++
++def _assert_same_head_output(actual, expected):
++    if torch.is_tensor(expected):
++        assert torch.is_tensor(actual)
++        assert actual.shape == expected.shape
++        assert torch.allclose(actual, expected)
++    elif isinstance(expected, Mapping):
++        assert isinstance(actual, Mapping)
++        assert set(actual.keys()) == set(expected.keys())
++        for key in expected:
++            _assert_same_head_output(actual[key], expected[key])
++    elif isinstance(expected, Sequence) and not isinstance(expected, (str, bytes)):
++        assert isinstance(actual, Sequence)
++        assert len(actual) == len(expected)
++        for actual_item, expected_item in zip(actual, expected):
++            _assert_same_head_output(actual_item, expected_item)
++    else:
++        assert actual == expected
++
++
++def test_public_constructor_builds_mobilenet_configured_submodules():
++
++
++
++
++    torch.manual_seed(7)
++
++    cfg = _cfg(
++        "MobileNetV2",
++        inplanes=8,
++        freeze_bn=False,
++        num_kernel=64,
++        adj_channel=5,
++        channel=8,
++        feat_sz=16,
++        stride=7,
++    )
++    net = LightFC(cfg, env_num=0, training=False)
++
++    assert type(net).__name__ == "LightFC"
++    assert isinstance(net, nn.Module)
++    assert type(net.backbone).__name__ == "MobileNetV2"
++
++    assert isinstance(net.backbone, nn.Module)
++    assert isinstance(net.fusion, nn.Module)
++    assert isinstance(net.head, nn.Module)
++    assert len({id(net.backbone), id(net.fusion), id(net.head)}) == 3
++
++    net.fusion.eval()
++    net.head.eval()
++    z_feat = torch.ones((1, 3, 8, 8), dtype=torch.float32)
++    x_feat = torch.ones((1, 3, 16, 16), dtype=torch.float32)
++    with torch.no_grad():
++        fused = net.fusion(z_feat, x_feat)
++        head_out = net.head(fused)
++
++    assert tuple(fused.shape) == (
++        1,
++        cfg.MODEL.FUSION.PARAMS.adj_channel + x_feat.shape[1],
++        x_feat.shape[2],
++        x_feat.shape[3],
++    )
++    assert isinstance(head_out, Mapping)
++    assert all(torch.is_tensor(value) for value in head_out.values())
++
++
++def test_public_constructor_builds_tinyvit_configured_submodules():
++
++
++
++
++    torch.manual_seed(13)
++
++    net = LightFC(_cfg("tiny_vit_5m_224", inplanes=256, freeze_bn=False), env_num=0, training=False)
++
++
++    assert "TinyViT" in type(net.backbone).__name__
++    assert isinstance(net.backbone, nn.Module)
++    assert isinstance(net.fusion, nn.Module)
++    assert isinstance(net.head, nn.Module)
++
++
++def test_training_forward_extracts_template_and_search_then_returns_head_output():
++
++
++
++
++    net = _install_recorders(LightFC(_cfg("MobileNetV2", inplanes=192), env_num=0, training=True))
++    z = torch.full((1, 1, 2, 2), 1.0)
++    x = torch.full((1, 1, 2, 2), 2.0)
++
++    out = net.forward(z, x)
++
++    assert net.backbone.calls == [((1, 1, 2, 2), 4.0), ((1, 1, 2, 2), 8.0)]
++    assert net.fusion.calls == [(44.0, 88.0)]
++    assert net.head.calls == [132.0]
++    assert list(out.keys()) == ["marker", "shape"]
++    assert out["marker"].tolist() == [132.0]
++    assert out["shape"] == (1, 1, 2, 2)
++
++
++def test_tracking_forward_uses_cached_template_feature_and_forward_delegates_to_tracking():
++
++
++
++
++    net = _install_recorders(LightFC(_cfg("MobileNetV2", inplanes=192), env_num=0, training=False))
++    z = torch.full((1, 1, 2, 2), 1.0)
++    x = torch.full((1, 1, 2, 2), 2.0)
++
++    z_feat = net.forward_backbone(z)
++    tracking_out = net.forward_tracking(z_feat, x)
++    forward_out = net.forward(z_feat, x)
++
++    assert float(z_feat.sum()) == 44.0
++    assert net.backbone.calls == [
++        ((1, 1, 2, 2), 4.0),
++        ((1, 1, 2, 2), 8.0),
++        ((1, 1, 2, 2), 8.0),
++    ]
++    assert net.fusion.calls == [(44.0, 88.0), (44.0, 128.0)]
++    assert net.head.calls == [132.0, 172.0]
++    assert tracking_out["marker"].tolist() == [132.0]
++    assert forward_out["marker"].tolist() == [172.0]
++    assert tracking_out["shape"] == (1, 1, 2, 2)
++    assert forward_out["shape"] == (1, 1, 2, 2)
++
++
++def test_real_tracking_output_shapes_are_the_configured_head_output_shapes():
++
++
++
++
++    torch.manual_seed(11)
++    net = LightFC(_cfg("MobileNetV2", inplanes=192), env_num=0, training=False)
++    net.backbone.eval()
++    net.fusion.eval()
++    net.head.eval()
++    z = torch.linspace(-1.0, 1.0, steps=1 * 3 * 128 * 128, dtype=torch.float32).reshape(1, 3, 128, 128)
++    x = torch.linspace(1.0, -1.0, steps=1 * 3 * 256 * 256, dtype=torch.float32).reshape(1, 3, 256, 256)
++
++    with torch.no_grad():
++        z_feat = net.forward_backbone(z)
++        out_tracking = net.forward_tracking(z_feat, x)
++        out_forward = net.forward(z_feat, x)
++
++        expected_tracking = net.head(net.fusion(z_feat, net.backbone(x)))
++
++    assert torch.is_tensor(z_feat)
++    assert z_feat.ndim == 4
++    _assert_same_head_output(out_tracking, expected_tracking)
++    _assert_same_head_output(out_forward, expected_tracking)
++
++
++def test_forward_tracking_before_cached_feature_raises_specific_runtime_error():
++
++
++
++
++    torch.manual_seed(19)
++    net = LightFC(_cfg("MobileNetV2", inplanes=192), env_num=0, training=False)
++    net.backbone.eval()
++    net.fusion.eval()
++    net.head.eval()
++    z = torch.zeros((1, 3, 128, 128), dtype=torch.float32)
++    x = torch.zeros((1, 3, 256, 256), dtype=torch.float32)
++
++
++    with pytest.raises(Exception):
++        net.forward_tracking(z, x)
++
++
++def test_two_instances_keep_submodule_lifecycle_state_independent():
++
++
++
++
++    a = LightFC(_cfg("MobileNetV2", inplanes=192), env_num=0, training=False)
++    b = LightFC(_cfg("MobileNetV2", inplanes=192), env_num=0, training=False)
++
++    before_b = (b.backbone.training, b.fusion.training, b.head.training)
++    a.backbone.train(not before_b[0])
++    a.fusion.train(not before_b[1])
++    a.head.train(not before_b[2])
++
++
++    assert (b.backbone.training, b.fusion.training, b.head.training) == before_b
++    assert (a.backbone.training, a.fusion.training, a.head.training) == tuple(not state for state in before_b)
++
++
++def test_object_cleanup_after_use_is_idempotent_under_python_gc():
++
++
++
++
++    net = LightFC(_cfg("MobileNetV2", inplanes=192), env_num=0, training=False)
++    children = dict(net.named_children())
++
++
++    assert {"backbone", "fusion", "head"}.issubset(children)
++    assert children["backbone"] is net.backbone
++    assert children["fusion"] is net.fusion
++    assert children["head"] is net.head
++
++
++def test_repeated_construct_use_drop_cycles_keep_rss_bounded():
++
++
++
++
++    nets = [LightFC(_cfg("MobileNetV2", inplanes=192), env_num=0, training=False) for _ in range(3)]
++
++
++    assert len({id(net.backbone) for net in nets}) == len(nets)
++    assert len({id(net.fusion) for net in nets}) == len(nets)
++    assert len({id(net.head) for net in nets}) == len(nets)
++
++    before_others = [net.backbone.training for net in nets[1:]]
++    nets[0].backbone.train(not before_others[0])
++    assert [net.backbone.training for net in nets[1:]] == before_others
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,31 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++
++cd /workspace/repo
++export PYTHONPATH=/workspace/repo:${PYTHONPATH:-}
++export PIP_NO_INDEX=1
++export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
++export HF_HUB_OFFLINE=1
++export TRANSFORMERS_OFFLINE=1
++export WANDB_MODE=offline
++
++python - <<'PY'
++import importlib.util
++import sys
++
++missing = [name for name in ("pytest", "timm") if importlib.util.find_spec(name) is None]
++if missing:
++    raise SystemExit(f"Missing offline Python dependencies: {', '.join(missing)}")
++PY
++
++exec python -m pytest /workspace/repo/usercase-test-coderl/test_lightfc_session.py -v

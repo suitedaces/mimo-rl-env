@@ -1,0 +1,280 @@
+diff --git a/test/test_invalid_headers.py b/test/test_invalid_headers.py
+index 4fd696a..b81a76c 100644
+--- a/test/test_invalid_headers.py
++++ b/test/test_invalid_headers.py
+@@ -584,6 +584,253 @@ class TestFilter(object):
+             )
+ 
+ 
++class TestPseudoHeadersWrongDirection(object):
++    """
++    Tests for tightened pseudo-header policing per RFC 7540 § 8.1.2.1:
++    request-only pseudo-headers MUST NOT appear in responses, and
++    response-only pseudo-headers MUST NOT appear in requests.
++    """
++    base_request_headers = [
++        (':authority', 'example.com'),
++        (':path', '/'),
++        (':scheme', 'https'),
++        (':method', 'GET'),
++    ]
++    base_response_headers = [
++        (':status', '200'),
++    ]
++    server_config = h2.config.H2Configuration(
++        client_side=False, header_encoding='utf-8'
++    )
++
++
++    req_validation_flags = h2.utilities.HeaderValidationFlags(
++        is_client=False,
++        is_trailer=False,
++        is_response_header=False,
++        is_push_promise=False,
++    )
++
++    resp_validation_flags = h2.utilities.HeaderValidationFlags(
++        is_client=True,
++        is_trailer=False,
++        is_response_header=True,
++        is_push_promise=False,
++    )
++
++
++
++    request_with_status_bytes = [
++        (b':authority', b'example.com'),
++        (b':path', b'/'),
++        (b':scheme', b'https'),
++        (b':method', b'GET'),
++        (b':status', b'200'),
++    ]
++    request_with_status_unicode = [
++        (u':authority', u'example.com'),
++        (u':path', u'/'),
++        (u':scheme', u'https'),
++        (u':method', u'GET'),
++        (u':status', u'200'),
++    ]
++
++    @pytest.mark.parametrize("headers", [
++        request_with_status_bytes,
++    ])
++    def test_validate_inbound_request_with_status_rejected(self, headers):
++        """
++        validate_headers raises ProtocolError if a request header block
++        contains the response-only :status pseudo-header.
++        """
++        with pytest.raises(h2.exceptions.ProtocolError):
++            list(h2.utilities.validate_headers(
++                headers, self.req_validation_flags))
++
++    @pytest.mark.parametrize("headers", [
++        request_with_status_bytes,
++        request_with_status_unicode,
++    ])
++    def test_validate_outbound_request_with_status_rejected(self, headers):
++        """
++        validate_outbound_headers raises ProtocolError if a request header
++        block we are about to send contains :status.
++        """
++        with pytest.raises(h2.exceptions.ProtocolError):
++            list(h2.utilities.validate_outbound_headers(
++                headers, self.req_validation_flags))
++
++
++
++
++    @pytest.mark.parametrize("bad_header,bad_value", [
++        (b':method', b'GET'),
++        (b':scheme', b'https'),
++        (b':path', b'/'),
++        (b':authority', b'example.com'),
++    ])
++    def test_validate_inbound_response_with_request_pseudo_header_rejected(
++        self, bad_header, bad_value
++    ):
++        """
++        validate_headers raises ProtocolError if a response header block
++        contains any request-only pseudo-header.
++        """
++        headers = [
++            (b':status', b'200'),
++            (bad_header, bad_value),
++        ]
++        with pytest.raises(h2.exceptions.ProtocolError):
++            list(h2.utilities.validate_headers(
++                headers, self.resp_validation_flags))
++
++    @pytest.mark.parametrize("bad_header,bad_value", [
++        (b':method', b'GET'),
++        (b':scheme', b'https'),
++        (b':path', b'/'),
++        (b':authority', b'example.com'),
++    ])
++    def test_validate_outbound_response_with_request_pseudo_header_rejected(
++        self, bad_header, bad_value
++    ):
++        """
++        validate_outbound_headers raises ProtocolError if a response header
++        block we are about to send contains any request-only pseudo-header.
++        """
++        headers = [
++            (b':status', b'200'),
++            (bad_header, bad_value),
++        ]
++        with pytest.raises(h2.exceptions.ProtocolError):
++            list(h2.utilities.validate_outbound_headers(
++                headers, self.resp_validation_flags))
++
++
++
++    def test_server_receives_request_with_status_emits_goaway(
++        self, frame_factory
++    ):
++        """
++        A server receiving a request that includes :status raises
++        ProtocolError and emits a GOAWAY with PROTOCOL_ERROR.
++        """
++        bad_request = self.base_request_headers + [(':status', '200')]
++
++        c = h2.connection.H2Connection(config=self.server_config)
++        c.receive_data(frame_factory.preamble())
++        c.clear_outbound_data_buffer()
++
++        f = frame_factory.build_headers_frame(bad_request)
++        data = f.serialize()
++
++        with pytest.raises(h2.exceptions.ProtocolError):
++            c.receive_data(data)
++
++        expected_frame = frame_factory.build_goaway_frame(
++            last_stream_id=1,
++            error_code=h2.errors.ErrorCodes.PROTOCOL_ERROR,
++        )
++        assert c.data_to_send() == expected_frame.serialize()
++
++    @pytest.mark.parametrize("bad_header,bad_value", [
++        (':method', 'GET'),
++        (':scheme', 'https'),
++        (':path', '/'),
++        (':authority', 'example.com'),
++    ])
++    def test_client_receives_response_with_request_pseudo_header(
++        self, frame_factory, bad_header, bad_value
++    ):
++        """
++        A client receiving a response that includes any request-only
++        pseudo-header raises ProtocolError and emits a GOAWAY.
++        """
++        client_config = h2.config.H2Configuration(
++            client_side=True, header_encoding='utf-8'
++        )
++        c = h2.connection.H2Connection(config=client_config)
++        c.initiate_connection()
++        c.send_headers(
++            stream_id=1,
++            headers=self.base_request_headers,
++            end_stream=True,
++        )
++        c.clear_outbound_data_buffer()
++
++        bad_response = self.base_response_headers + [(bad_header, bad_value)]
++        f = frame_factory.build_headers_frame(bad_response)
++        data = f.serialize()
++
++        with pytest.raises(h2.exceptions.ProtocolError):
++            c.receive_data(data)
++
++    def test_client_sending_request_with_status_raises(self, frame_factory):
++        """
++        A client trying to send a request with :status raises ProtocolError.
++        """
++        bad_request = self.base_request_headers + [(':status', '200')]
++
++        c = h2.connection.H2Connection()
++        c.initiate_connection()
++        c.clear_outbound_data_buffer()
++
++        with pytest.raises(h2.exceptions.ProtocolError):
++            c.send_headers(1, bad_request)
++
++    @pytest.mark.parametrize("bad_header,bad_value", [
++        (':method', 'GET'),
++        (':scheme', 'https'),
++        (':path', '/'),
++        (':authority', 'example.com'),
++    ])
++    def test_server_sending_response_with_request_pseudo_header_raises(
++        self, frame_factory, bad_header, bad_value
++    ):
++        """
++        A server trying to send a response containing a request-only
++        pseudo-header raises ProtocolError.
++        """
++        c = h2.connection.H2Connection(config=self.server_config)
++        c.initiate_connection()
++        c.receive_data(frame_factory.preamble())
++
++        header_frame = frame_factory.build_headers_frame(
++            self.base_request_headers
++        )
++        c.receive_data(header_frame.serialize())
++        c.clear_outbound_data_buffer()
++
++        bad_response = self.base_response_headers + [(bad_header, bad_value)]
++        with pytest.raises(h2.exceptions.ProtocolError):
++            c.send_headers(1, bad_response)
++
++
++
++    def test_valid_request_unchanged(self):
++        """
++        A valid request still passes validate_headers (no false positives).
++        """
++        headers = [
++            (b':authority', b'example.com'),
++            (b':path', b'/'),
++            (b':scheme', b'https'),
++            (b':method', b'GET'),
++        ]
++        assert headers == list(h2.utilities.validate_headers(
++            headers, self.req_validation_flags))
++
++    def test_valid_response_unchanged(self):
++        """
++        A valid response still passes validate_headers (no false positives).
++        """
++        headers = [
++            (b':status', b'200'),
++            (b'content-length', b'42'),
++        ]
++        assert headers == list(h2.utilities.validate_headers(
++            headers, self.resp_validation_flags))
++
++
+ class TestOversizedHeaders(object):
+     """
+     Tests that oversized header blocks are correctly rejected. This replicates
+diff --git a/test_commands.json b/test_commands.json
+new file mode 100644
+index 0000000..7c05249
+--- /dev/null
++++ b/test_commands.json
+@@ -0,0 +1,3 @@
++{
++  "test_commands": ["python -m pytest test/test_invalid_headers.py -q"]
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,8 @@
++#!/usr/bin/env bash
++
++set -uo pipefail
++cd /testbed
++rc=0
++python -m pytest test/test_invalid_headers.py -q
++rc=$(( rc | $? ))
++exit $rc

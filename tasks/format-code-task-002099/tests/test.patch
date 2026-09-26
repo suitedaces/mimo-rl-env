@@ -1,0 +1,274 @@
+diff --git a/app/rpc/tests/rpc_test.go b/app/rpc/tests/rpc_test.go
+index 1c9d4890f4..08cb363d6e 100644
+--- a/app/rpc/tests/rpc_test.go
++++ b/app/rpc/tests/rpc_test.go
+@@ -10,7 +10,14 @@ import (
+ 	"bytes"
+ 	"encoding/json"
+ 	"fmt"
++	"log"
++	"math/big"
++	"math/rand"
++	"os"
++	"strings"
+ 	"sync"
++	"testing"
++	"time"
+ 
+ 	sdk "github.com/cosmos/cosmos-sdk/types"
+ 	ethcmn "github.com/ethereum/go-ethereum/common"
+@@ -20,13 +27,6 @@ import (
+ 	"github.com/okex/okexchain/app/rpc/websockets"
+ 	"github.com/stretchr/testify/require"
+ 	"golang.org/x/net/websocket"
+-
+-	"math/big"
+-	"math/rand"
+-	"os"
+-	"strings"
+-	"testing"
+-	"time"
+ )
+ 
+ const (
+@@ -1260,7 +1260,7 @@ func TestEth_Subscribe_And_UnSubscribe(t *testing.T) {
+ 	excuteInvalidMessage(t, ws, invalidMessage)
+ }
+ 
+-func excuteValidMessage(t *testing.T, ws  *websocket.Conn, message []byte) {
++func excuteValidMessage(t *testing.T, ws *websocket.Conn, message []byte) {
+ 	fmt.Println("Send:", string(message))
+ 	_, err := ws.Write(message)
+ 	require.NoError(t, err)
+@@ -1293,7 +1293,7 @@ func excuteValidMessage(t *testing.T, ws  *websocket.Conn, message []byte) {
+ 	require.Equal(t, "true", string(res.Result))
+ }
+ 
+-func excuteInvalidMessage(t *testing.T, ws  *websocket.Conn, message []byte) {
++func excuteInvalidMessage(t *testing.T, ws *websocket.Conn, message []byte) {
+ 	fmt.Println("Send:", string(message))
+ 	_, err := ws.Write(message)
+ 	require.NoError(t, err)
+@@ -1367,4 +1367,156 @@ func TestWebsocket_PendingTransaction(t *testing.T) {
+ 	cancelMsg := fmt.Sprintf(`{"id": 2, "method": "eth_unsubscribe", "params": [%s]}`, subscriptionId)
+ 	_, err = ws.Write([]byte(cancelMsg))
+ 	require.NoError(t, err)
+-}
+\ No newline at end of file
++}
++
++
++
++
++
++
++func TestWebsocket_Logs(t *testing.T) {
++	contractAddr1, contractAddr2, contractAddr3 := deployTestTokenContract(t), deployTestTokenContract(t), deployTestTokenContract(t)
++
++
++	tests := []struct {
++		addressList string
++		topicsList  string
++		expected    int
++	}{
++
++		{"", "", 21},
++
++		{fmt.Sprintf(`"address":"%s"`, contractAddr1), "", 7},
++
++		{fmt.Sprintf(`"address":["%s","%s"]`, contractAddr1, contractAddr2), "", 14},
++
++		{fmt.Sprintf(`"address":["%s","%s"]`, contractAddr1, contractAddr2), fmt.Sprintf(`"topics":["%s"]`, approveFuncHash), 6},
++
++		{fmt.Sprintf(`"address":["%s","%s"]`, contractAddr1, contractAddr2), fmt.Sprintf(`"topics":[null, null, ["%s"]]`, recvAddr1Hash), 4},
++
++		{fmt.Sprintf(`"address":["%s","%s"]`, contractAddr1, contractAddr2), fmt.Sprintf(`"topics":[["%s"], null, ["%s"]]`, approveFuncHash, recvAddr1Hash), 2},
++
++		{fmt.Sprintf(`"address":["%s","%s"]`, contractAddr1, contractAddr2), fmt.Sprintf(`"topics":[["%s","%s"], null, ["%s","%s"]]`, approveFuncHash, transferFuncHash, recvAddr1Hash, recvAddr2Hash), 8},
++	}
++
++	go func() {
++		time.Sleep(time.Minute * 2)
++		panic("the tasks have been running for too long time, over 2 minutes")
++	}()
++
++	var wg sync.WaitGroup
++	wg.Add(len(tests) + 1)
++	for i, test := range tests {
++		go verifyWebSocketRecvNum(t, &wg, i, test.addressList, test.topicsList, test.expected)
++	}
++	go sendTxs(t, &wg, contractAddr1, contractAddr2, contractAddr3)
++	wg.Wait()
++}
++
++func deployTestTokenContract(t *testing.T) string {
++	param := make([]map[string]string, 1)
++	param[0] = map[string]string{
++		"from":     hexAddr1.Hex(),
++		"data":     ttokenContractByteCode,
++		"gasPrice": (*hexutil.Big)(defaultGasPrice.Amount.BigInt()).String(),
++	}
++	rpcRes := Call(t, "eth_sendTransaction", param)
++	var hash ethcmn.Hash
++	require.NoError(t, json.Unmarshal(rpcRes.Result, &hash))
++	receipt := WaitForReceipt(t, hash)
++	require.NotNil(t, receipt)
++	contractAddr, ok := receipt["contractAddress"].(string)
++	require.True(t, ok)
++	return contractAddr
++}
++
++func verifyWebSocketRecvNum(t *testing.T, wg *sync.WaitGroup, index int, addressList, topicsList string, expected int) {
++	defer wg.Done()
++
++
++	origin, url := "http://127.0.0.1:8546/", "ws://127.0.0.1:8546"
++	ws, err := websocket.Dial(url, "", origin)
++	require.NoError(t, err)
++	defer func() {
++
++		err := ws.Close()
++		require.NoError(t, err)
++	}()
++
++
++	param := assembleParameters(addressList, topicsList)
++	_, err = ws.Write([]byte(param))
++	require.NoError(t, err)
++
++	msg := make([]byte, 10240)
++
++	n, err := ws.Read(msg)
++	var res Response
++	require.NoError(t, err)
++	require.NoError(t, json.Unmarshal(msg[:n], &res))
++	require.Nil(t, res.Error)
++	subscriptionId := string(res.Result)
++	log.Printf("test case %d: websocket %s is created successfully, expect receive %d logs \n", index, subscriptionId, expected)
++
++	for i := 0; i < expected; i++ {
++		n, err = ws.Read(msg)
++		require.NoError(t, err)
++		var notification websockets.SubscriptionNotification
++		require.NoError(t, json.Unmarshal(msg[:n], &notification))
++	}
++
++
++	cancelMsg := fmt.Sprintf(`{"id": 2, "method": "eth_unsubscribe", "params": [%s]}`, subscriptionId)
++	_, err = ws.Write([]byte(cancelMsg))
++	require.NoError(t, err)
++	log.Printf("test case %d: webdocket %s receive %d logs, then close successfully", index, subscriptionId, expected)
++}
++
++func assembleParameters(addressList string, topicsList string) string {
++	var param string
++	if addressList == "" {
++		param = topicsList
++	}
++	if topicsList == "" {
++		param = addressList
++	}
++	if addressList != "" && topicsList != "" {
++		param = addressList + "," + topicsList
++	}
++	return fmt.Sprintf(`{"id": 2, "method": "eth_subscribe", "params": ["logs",{%s}]}`, param)
++}
++
++func sendTxs(t *testing.T, wg *sync.WaitGroup, contractAddrs ...string) {
++	dataList := []string{
++
++		"0x40c10f190000000000000000000000002cf4ea7df75b513509d95946b43062e26bd8803500000000000000000000000000000000000000000000000000000000ffffffff",
++
++		"0x095ea7b30000000000000000000000009ad84c8630e0282f78e5479b46e64e17779e3cfb0000000000000000000000000000000000000000000000000000000000bc614e",
++
++		"0x095ea7b3000000000000000000000000c9c9b43322f5e1dc401252076fa4e699c9122cd60000000000000000000000000000000000000000000000000000000000bc614e",
++
++		"0x095ea7b30000000000000000000000002b5cf24aebce90f0b8f80bc42603157b27cfbf470000000000000000000000000000000000000000000000000000000000bc614e",
++
++		"0xa9059cbb0000000000000000000000009ad84c8630e0282f78e5479b46e64e17779e3cfb00000000000000000000000000000000000000000000000000000000000004d2",
++
++		"0xa9059cbb000000000000000000000000c9c9b43322f5e1dc401252076fa4e699c9122cd600000000000000000000000000000000000000000000000000000000000004d2",
++
++		"0xa9059cbb0000000000000000000000002b5cf24aebce90f0b8f80bc42603157b27cfbf4700000000000000000000000000000000000000000000000000000000000004d2",
++	}
++	defer wg.Done()
++	for _, contractAddr := range contractAddrs {
++		for i := 0; i < 7; i++ {
++			param := make([]map[string]string, 1)
++			param[0] = make(map[string]string)
++			param[0]["from"] = hexAddr1.Hex()
++			param[0]["to"] = contractAddr
++			param[0]["data"] = dataList[i]
++			param[0]["gasPrice"] = (*hexutil.Big)(defaultGasPrice.Amount.BigInt()).String()
++			rpcRes := Call(t, "eth_sendTransaction", param)
++			var hash ethcmn.Hash
++			require.NoError(t, json.Unmarshal(rpcRes.Result, &hash))
++
++			time.Sleep(time.Second * 1)
++		}
++	}
++}
+diff --git a/app/rpc/tests/utils_test.go b/app/rpc/tests/utils_test.go
+index 05a09a19e4..0517002296 100644
+--- a/app/rpc/tests/utils_test.go
++++ b/app/rpc/tests/utils_test.go
+@@ -58,6 +58,15 @@ const (
+ 
+ 	// world parameter in Hello event: 1024
+ 	worldTopic = "0x0000000000000000000000000000000000000000000000000000000000000400"
++
++
++	ttokenContractByteCode = "0x608060405234801561001057600080fd5b5060405162000b6438038062000b648339818101604052608081101561003557600080fd5b810190808051604051939291908464010000000082111561005557600080fd5b90830190602082018581111561006a57600080fd5b825164010000000081118282018810171561008457600080fd5b82525081516020918201929091019080838360005b838110156100b1578181015183820152602001610099565b50505050905090810190601f1680156100de5780820380516001836020036101000a031916815260200191505b506040526020018051604051939291908464010000000082111561010157600080fd5b90830190602082018581111561011657600080fd5b825164010000000081118282018810171561013057600080fd5b82525081516020918201929091019080838360005b8381101561015d578181015183820152602001610145565b50505050905090810190601f16801561018a5780820380516001836020036101000a031916815260200191505b5060409081526020828101519290910151865192945092506101b191600091870190610201565b5082516101c5906001906020860190610201565b50600280546001600160a01b0390921661010002610100600160a81b031960ff90941660ff1990931692909217929092161790555061029c9050565b828054600181600116156101000203166002900490600052602060002090601f016020900481019282601f1061024257805160ff191683800117855561026f565b8280016001018555821561026f579182015b8281111561026f578251825591602001919060010190610254565b5061027b92915061027f565b5090565b61029991905b8082111561027b5760008155600101610285565b90565b6108b880620002ac6000396000f3fe608060405234801561001057600080fd5b50600436106100a95760003560e01c806340c10f191161007157806340c10f19146101d957806342966c681461020557806370a082311461022257806395d89b4114610248578063a9059cbb14610250578063dd62ed3e1461027c576100a9565b806306fdde03146100ae578063095ea7b31461012b57806318160ddd1461016b57806323b872dd14610185578063313ce567146101bb575b600080fd5b6100b66102aa565b6040805160208082528351818301528351919283929083019185019080838360005b838110156100f05781810151838201526020016100d8565b50505050905090810190601f16801561011d5780820380516001836020036101000a031916815260200191505b509250505060405180910390f35b6101576004803603604081101561014157600080fd5b506001600160a01b038135169060200135610340565b604080519115158252519081900360200190f35b6101736103a7565b60408051918252519081900360200190f35b6101576004803603606081101561019b57600080fd5b506001600160a01b038135811691602081013590911690604001356103ad565b6101c3610519565b6040805160ff9092168252519081900360200190f35b610157600480360360408110156101ef57600080fd5b506001600160a01b038135169060200135610522565b6101576004803603602081101561021b57600080fd5b5035610537565b6101736004803603602081101561023857600080fd5b50356001600160a01b031661060c565b6100b6610627565b6101576004803603604081101561026657600080fd5b506001600160a01b038135169060200135610687565b6101736004803603604081101561029257600080fd5b506001600160a01b0381358116916020013516610694565b60008054604080516020601f60026000196101006001881615020190951694909404938401819004810282018101909252828152606093909290918301828280156103365780601f1061030b57610100808354040283529160200191610336565b820191906000526020600020905b81548152906001019060200180831161031957829003601f168201915b5050505050905090565b3360008181526005602090815260408083206001600160a01b038716808552908352818420869055815186815291519394909390927f8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925928290030190a35060015b92915050565b60035490565b6000336001600160a01b03851614806103e957506001600160a01b03841660009081526005602090815260408083203384529091529020548211155b610432576040805162461bcd60e51b815260206004820152601560248201527422a9292fa12a27a5a2a72fa120a22fa1a0a62622a960591b604482015290519081900360640190fd5b61043d8484846106bf565b336001600160a01b0385161480159061047b57506001600160a01b038416600090815260056020908152604080832033845290915290205460001914155b1561050f576001600160a01b03841660009081526005602090815260408083203384529091529020546104ae90836107d1565b6001600160a01b03858116600090815260056020908152604080832033808552908352928190208590558051948552519287169391927f8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b9259281900390910190a35b5060019392505050565b60025460ff1690565b600061052e83836107e1565b50600192915050565b30600090815260046020526040812054821115610592576040805162461bcd60e51b815260206004820152601460248201527311549497d25394d551919250d251539517d0905360621b604482015290519081900360640190fd5b306000908152600460205260409020546105ac90836107d1565b306000908152600460205260409020556003546105c990836107d1565b60035560408051838152905160009130917fddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef9181900360200190a3506001919050565b6001600160a01b031660009081526004602052604090205490565b60018054604080516020601f600260001961010087891615020190951694909404938401819004810282018101909252828152606093909290918301828280156103365780601f1061030b57610100808354040283529160200191610336565b600061052e3384846106bf565b6001600160a01b03918216600090815260056020908152604080832093909416825291909152205490565b6001600160a01b038316600090815260046020526040902054811115610723576040805162461bcd60e51b815260206004820152601460248201527311549497d25394d551919250d251539517d0905360621b604482015290519081900360640190fd5b6001600160a01b03831660009081526004602052604090205461074690826107d1565b6001600160a01b0380851660009081526004602052604080822093909355908416815220546107759082610872565b6001600160a01b0380841660008181526004602090815260409182902094909455805185815290519193928716927fddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef92918290030190a3505050565b808203828111156103a157600080fd5b6001600160a01b0382166000908152600460205260409020546108049082610872565b6001600160a01b03831660009081526004602052604090205560035461082a9082610872565b6003556040805182815290516001600160a01b038416916000917fddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef9181900360200190a35050565b808201828110156103a157600080fdfea2646970667358221220a3d106c9f53703c13c9efe61ba3fdde06510efec7cce1c90fb4f376e677c7d5364736f6c63430006000033000000000000000000000000000000000000000000000000000000000000008000000000000000000000000000000000000000000000000000000000000000c000000000000000000000000000000000000000000000000000000000000000120000000000000000000000002cf4ea7df75b513509d95946b43062e26bd8803500000000000000000000000000000000000000000000000000000000000000036f6b74000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000036f6b740000000000000000000000000000000000000000000000000000000000"
++	approveFuncHash       = "0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925"
++	transferFuncHash      = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
++	recvAddr1             = "0xc9c9b43322f5e1dc401252076fa4e699c9122cd6"
++	recvAddr2             = "0x9ad84c8630e0282f78e5479b46e64e17779e3cfb"
++	recvAddr1Hash         = "0x000000000000000000000000c9c9b43322f5e1dc401252076fa4e699c9122cd6"
++	recvAddr2Hash         = "0x0000000000000000000000009ad84c8630e0282f78e5479b46e64e17779e3cfb"
+ )
+ 
+ const (
+diff --git a/mimo_build_env.tar.gz.b64 b/mimo_build_env.tar.gz.b64
+new file mode 100644
+--- /dev/null
++++ b/mimo_build_env.tar.gz.b64
+@@ -0,0 +1,28 @@
++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
++aqihhhpqqKGGGmroJvoDkxvpHAAoAAA=
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,6 @@
++#!/usr/bin/env bash
++
++set -uo pipefail
++cd /testbed || exit 1
++base64 -d mimo_build_env.tar.gz.b64 | tar -xzf - -C /testbed || exit 1
++exec bash -lc 'cd /testbed && bash -eo pipefail /testbed/.build_env/test_command.sh'

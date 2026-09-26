@@ -1,0 +1,200 @@
+diff --git a/tests/cases/client_upload_test.py b/tests/cases/client_upload_test.py
+new file mode 100644
+index 000000000..4910a36c4
+--- /dev/null
++++ b/tests/cases/client_upload_test.py
+@@ -0,0 +1,185 @@
++#!/usr/bin/env python
++# -*- coding: utf-8 -*-
++
++import os
++import sys
++import tempfile
++import unittest
++
++sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..',
++                                'clients',
++                                'python'))
++import GirderClient as client_module
++
++
++class _Response(object):
++    def __init__(self, status, payload):
++        self.status_code = status
++        self._payload = payload
++        self.url = 'http://fake'
++        self.text = repr(payload)
++
++    def json(self):
++        return self._payload
++
++
++class _UploadServer(object):
++    def __init__(self, initial='', offset=0, zero=False, expected_size=0,
++                 resume=False):
++        self.data = initial
++        self.offset = offset
++        self.zero = zero
++        self.expected_size = expected_size
++        self.resume = resume
++        self.upload_id = 'upload-1'
++        self.seen_name = None
++
++    def request(self, url, params=None, files=None):
++        if url.endswith('/file'):
++            assert not self.resume
++            self.seen_name = params['name']
++            assert params['parentType'] == 'item'
++            assert params['parentId'] == 'item'
++            assert params['size'] == self.expected_size
++            if self.zero:
++                return _Response(200, {'_id': 'file-empty', 'size': 0})
++            return _Response(200, {'_id': self.upload_id})
++        if url.endswith('/file/offset'):
++            return _Response(200, {'offset': self.offset})
++        if url.endswith('/file/chunk'):
++            assert params['uploadId'] == self.upload_id
++            assert int(params['offset']) == self.offset
++            chunk = files['chunk']
++            assert len(chunk) <= 4
++            if self.zero:
++                raise AssertionError('zero-byte upload must not send a chunk')
++            self.data += chunk
++            self.offset += len(chunk)
++            if self.offset == self.expected_size:
++                return _Response(200, {'_id': 'file-final'})
++            return _Response(200, {'received': self.offset})
++        raise AssertionError('unexpected URL: ' + url)
++
++
++class ClientUploadTest(unittest.TestCase):
++    def setUp(self):
++        self.original_methods = client_module.GirderClient.METHODS
++        self.original_post = client_module.requests.post
++        self.original_get = client_module.requests.get
++
++    def tearDown(self):
++        client_module.GirderClient.METHODS = self.original_methods
++        client_module.requests.post = self.original_post
++        client_module.requests.get = self.original_get
++
++    def _client(self, server):
++        client = client_module.GirderClient('fake', 1)
++        client.token = 'token'
++        client.MAX_CHUNK_SIZE = 4
++        client_module.GirderClient.METHODS = {
++            'GET': server.request,
++            'POST': server.request,
++            'PUT': server.request,
++            'DELETE': server.request
++        }
++        client_module.requests.post = server.request
++        client_module.requests.get = server.request
++        return client
++
++    def _file(self, contents, name='payload.bin'):
++        directory = tempfile.mkdtemp()
++        path = os.path.join(directory, name)
++        with open(path, 'wb') as stream:
++            stream.write(contents)
++        self.addCleanup(lambda: os.rmdir(directory))
++        self.addCleanup(lambda: os.remove(path))
++        return path
++
++    def test_chunked_upload_uses_offsets_and_preserves_binary_data(self):
++        server = _UploadServer(expected_size=11)
++        client = self._client(server)
++        path = self._file('ab\x00cdEFghIJ')
++
++        try:
++            result = client.uploadFileToItem('item', path)
++        except Exception as exc:
++            self.fail('upload failed: %s' % exc)
++
++        self.assertEqual(result, 'file-final')
++        self.assertEqual(server.data, 'ab\x00cdEFghIJ')
++        self.assertEqual(server.seen_name, 'payload.bin')
++
++    def test_upload_resumes_from_server_offset(self):
++        server = _UploadServer(initial='abcd', offset=4, expected_size=10,
++                               resume=True)
++        client = self._client(server)
++        path = self._file('abcdefghij')
++
++        result = client.uploadFileToItem('item', path,
++                                         uploadId=server.upload_id)
++
++        self.assertEqual(result, 'file-final')
++        self.assertEqual(server.data, 'abcdefghij')
++
++    def test_zero_byte_upload_returns_final_file_without_chunk(self):
++        server = _UploadServer(zero=True, expected_size=0)
++        client = self._client(server)
++        path = self._file('')
++
++        try:
++            result = client.uploadFileToItem('item', path)
++        except Exception as exc:
++            self.fail('zero-byte upload failed: %s' % exc)
++        self.assertEqual(result, 'file-empty')
++
++    def test_non_successful_chunk_response_is_an_error(self):
++        class FailingServer(_UploadServer):
++            def request(self, url, params=None, files=None):
++                if url.endswith('/file/chunk'):
++                    return _Response(500, {'_id': 'not-a-success'})
++                return super(FailingServer, self).request(url, params, files)
++
++        server = FailingServer(expected_size=4)
++        client = self._client(server)
++        path = self._file('data')
++        with self.assertRaises(Exception):
++            client.uploadFileToItem('item', path)
++
++    def test_missing_initial_id_is_an_error(self):
++        class MissingInitialIdServer(_UploadServer):
++            def request(self, url, params=None, files=None):
++                if url.endswith('/file'):
++                    return _Response(200, {'size': self.expected_size})
++                return super(MissingInitialIdServer, self).request(
++                    url, params, files)
++
++        client = self._client(MissingInitialIdServer(expected_size=4))
++        path = self._file('data')
++        with self.assertRaises(Exception):
++            client.uploadFileToItem('item', path)
++
++    def test_missing_final_id_is_an_error(self):
++        class MissingFinalIdServer(_UploadServer):
++            def request(self, url, params=None, files=None):
++                response = super(MissingFinalIdServer, self).request(
++                    url, params, files)
++                if url.endswith('/file/chunk'):
++                    return _Response(200, {'received': self.offset})
++                return response
++
++        client = self._client(MissingFinalIdServer(expected_size=4))
++        path = self._file('data')
++        with self.assertRaises(Exception):
++            client.uploadFileToItem('item', path)
++
++    def test_resume_offset_beyond_file_is_an_error(self):
++        server = _UploadServer(offset=20, expected_size=4, resume=True)
++        client = self._client(server)
++        path = self._file('data')
++        with self.assertRaises(Exception):
++            client.uploadFileToItem('item', path,
++                                    uploadId=server.upload_id)
++
++
++if __name__ == '__main__':
++    unittest.main()
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,4 @@
++#!/bin/bash
++set -euo pipefail
++
++python -m unittest -v tests.cases.client_upload_test

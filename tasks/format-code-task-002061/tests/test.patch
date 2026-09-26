@@ -1,0 +1,272 @@
+diff --git a/test/node-fetch/main.js b/test/node-fetch/main.js
+index 153659d0..feaf0daa 100644
+--- a/test/node-fetch/main.js
++++ b/test/node-fetch/main.js
+@@ -4,6 +4,7 @@
+ // Test tools
+ const zlib = require('zlib')
+ const stream = require('stream')
++const http = require('http')
+ const vm = require('vm')
+ const chai = require('chai')
+ const crypto = require('crypto')
+@@ -17,6 +18,8 @@ const {
+   fetch,
+   Headers,
+   Request,
++  FormData,
++  File,
+   Response,
+   setGlobalDispatcher,
+   Agent
+@@ -36,6 +39,73 @@ const {
+   Uint8Array: VMUint8Array
+ } = vm.runInNewContext('this')
+ 
++function createFormEchoServer () {
++  return new Promise((resolve) => {
++    const server = http.createServer((req, res) => {
++      const chunks = []
++
++      req.on('data', (chunk) => {
++        chunks.push(chunk)
++      })
++
++      req.on('end', () => {
++        res.setHeader('content-type', 'application/json')
++        res.end(JSON.stringify({
++          method: req.method,
++          headers: req.headers,
++          body: Buffer.concat(chunks).toString('utf8')
++        }))
++      })
++    })
++
++    server.listen(0, 'localhost', () => {
++      const { port } = server.address()
++      resolve({
++        url: `http://localhost:${port}/`,
++        close: () => new Promise((resolveClose) => server.close(resolveClose))
++      })
++    })
++  })
++}
++
++function getMultipartBoundary (contentType) {
++  const match = /(?:^|;\s*)boundary=([^;]+)/i.exec(contentType || '')
++  return match && match[1]
++}
++
++function getMultipartParts (rawBody, boundary) {
++  return rawBody
++    .split(`--${boundary}`)
++    .slice(1, -1)
++    .map((section) => {
++      const trimmed = section
++        .replace(/^\r\n/, '')
++        .replace(/\r\n$/, '')
++      const separator = trimmed.indexOf('\r\n\r\n')
++
++      expect(separator).to.be.greaterThan(-1)
++
++      const rawHeaders = trimmed.slice(0, separator)
++      const body = trimmed.slice(separator + 4)
++      const headers = {}
++
++      for (const line of rawHeaders.split('\r\n')) {
++        const idx = line.indexOf(':')
++        expect(idx).to.be.greaterThan(-1)
++        headers[line.slice(0, idx).toLowerCase()] = line.slice(idx + 1).trim()
++      }
++
++      return { headers, body }
++    })
++}
++
++function findMultipartPart (parts, name) {
++  return parts.find((part) => {
++    const disposition = part.headers['content-disposition'] || ''
++    return new RegExp(`(?:^|;\\s*)name="${name}"(?:;|$)`).test(disposition)
++  })
++}
++
+ chai.use(chaiPromised)
+ chai.use(chaiIterator)
+ chai.use(chaiString)
+@@ -1150,6 +1220,146 @@ describe('node-fetch', () => {
+     })
+   })
+ 
++  it('should expose constructable FormData and File from undici', async () => {
++    expect(FormData).to.be.a('function')
++    expect(File).to.be.a('function')
++
++    const form = new FormData()
++    form.append('field', 'value')
++    form.append('field', 'second')
++
++    expect(form.get('field')).to.equal('value')
++    expect(form.getAll('field')).to.deep.equal(['value', 'second'])
++    expect(Array.from(form)).to.deep.equal([
++      ['field', 'value'],
++      ['field', 'second']
++    ])
++
++    const file = new File(['hello'], 'hello.txt', { type: 'text/plain' })
++    expect(file.type).to.equal('text/plain')
++
++    form.append('upload', file)
++    expect(form.get('upload')).to.equal(file)
++  })
++
++  it('should allow POST request with form-data as body', async () => {
++    const server = await createFormEchoServer()
++
++    try {
++      const form = new FormData()
++      form.append('alpha', '1')
++      form.append('beta', 'two words')
++
++      const res = await fetch(server.url, {
++        method: 'POST',
++        body: form
++      })
++      const observed = await res.json()
++
++      expect(observed.method).to.equal('POST')
++
++      const contentType = observed.headers['content-type']
++      expect(contentType).to.match(/^multipart\/form-data(?:;|$)/i)
++
++      const boundary = getMultipartBoundary(contentType)
++      expect(boundary).to.be.a('string').and.not.equal('')
++
++      const parts = getMultipartParts(observed.body, boundary)
++      const alpha = findMultipartPart(parts, 'alpha')
++      const beta = findMultipartPart(parts, 'beta')
++
++      expect(alpha).to.exist
++      expect(beta).to.exist
++      expect(alpha.body).to.equal('1')
++      expect(beta.body).to.equal('two words')
++      expect(alpha.headers['content-disposition']).to.match(/form-data/i)
++      expect(beta.headers['content-disposition']).to.match(/form-data/i)
++    } finally {
++      await server.close()
++    }
++  })
++
++  it('should send file entries in multipart FormData bodies', async () => {
++    const server = await createFormEchoServer()
++
++    try {
++      const form = new FormData()
++      const file = new File(['file-body-123'], 'note.txt', { type: 'text/plain' })
++
++      form.append('upload', file)
++
++      const res = await fetch(server.url, {
++        method: 'POST',
++        body: form
++      })
++      const observed = await res.json()
++      const boundary = getMultipartBoundary(observed.headers['content-type'])
++
++      expect(boundary).to.be.a('string').and.not.equal('')
++
++      const parts = getMultipartParts(observed.body, boundary)
++      const upload = findMultipartPart(parts, 'upload')
++
++      expect(upload).to.exist
++      expect(upload.headers['content-disposition']).to.match(/form-data/i)
++      expect(upload.headers['content-disposition']).to.include('name="upload"')
++      expect(upload.headers['content-disposition']).to.include('filename="note.txt"')
++      expect(upload.headers['content-type']).to.equal('text/plain')
++      expect(upload.body).to.equal('file-body-123')
++    } finally {
++      await server.close()
++    }
++  })
++
++  it('should parse urlencoded response bodies with formData', async () => {
++    const res = new Response('first=one&space=hello+world&encoded=a%2Bb&dup=1&dup=2', {
++      headers: {
++        'content-type': 'application/x-www-form-urlencoded;charset=UTF-8'
++      }
++    })
++
++    const form = await res.formData()
++
++    expect(form.get('first')).to.equal('one')
++    expect(form.get('space')).to.equal('hello world')
++    expect(form.get('encoded')).to.equal('a+b')
++    expect(form.getAll('dup')).to.deep.equal(['1', '2'])
++  })
++
++  it('should parse urlencoded request bodies with formData', async () => {
++    const req = new Request(base, {
++      method: 'POST',
++      body: 'x=10&y=two+words',
++      headers: {
++        'content-type': 'application/x-www-form-urlencoded'
++      }
++    })
++
++    const form = await req.formData()
++
++    expect(form.get('x')).to.equal('10')
++    expect(form.get('y')).to.equal('two words')
++  })
++
++  it('should reject multipart formData parsing with a clear unsupported error', async () => {
++    const res = new Response('--abc\r\n\r\nignored\r\n--abc--', {
++      headers: {
++        'content-type': 'multipart/form-data; boundary=abc'
++      }
++    })
++
++    let error
++    try {
++      await res.formData()
++    } catch (err) {
++      error = err
++    }
++
++    expect(error).to.exist
++    expect(error).to.have.property('name', 'NotSupportedError')
++    expect(error).to.have.property('code', 'UND_ERR_NOT_SUPPORTED')
++  })
++
+   it('constructing a Response with URLSearchParams as body should have a Content-Type', () => {
+     const parameters = new URLSearchParams()
+     const res = new Response(parameters)
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,25 @@
++#!/bin/bash
++set -uo pipefail
++cd /testbed
++
++
++if [ ! -d node_modules/chai ] || [ ! -d node_modules/mocha ]; then
++  npm install --no-audit --no-fund --ignore-scripts
++fi
++
++
++BASE_GREP='should allow POST request with object body|constructing a Response with URLSearchParams as body should have a Content-Type|constructing a Request with URLSearchParams as body should have a Content-Type|Reading a body with URLSearchParams should echo back the result|constructing a Request/Response with URLSearchParams and mutating it should not affected body|should allow POST request with URLSearchParams as body|should still recognize URLSearchParams when extended'
++NEW_GREP='should expose constructable FormData and File from undici|should allow POST request with form-data as body|should send file entries in multipart FormData bodies|should parse urlencoded response bodies with formData|should parse urlencoded request bodies with formData|should reject multipart formData parsing with a clear unsupported error'
++
++case "${1:-}" in
++  base)
++    npx mocha test/node-fetch/main.js --exit --timeout 30000 --grep "$BASE_GREP"
++    ;;
++  new)
++    npx mocha test/node-fetch/main.js --exit --timeout 30000 --grep "$NEW_GREP"
++    ;;
++  *)
++    echo "usage: $0 base|new"
++    exit 2
++    ;;
++esac

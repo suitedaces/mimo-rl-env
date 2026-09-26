@@ -1,0 +1,479 @@
+diff --git a/usercase-test-coderl/solid_model_to_jsonld.test.ts b/usercase-test-coderl/solid_model_to_jsonld.test.ts
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/solid_model_to_jsonld.test.ts
+@@ -0,0 +1,418 @@
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
++import { bootModels, FieldType, TimestampField, setEngine } from 'soukai';
++import type { Engine, EngineDocument, EngineDocumentsCollection } from 'soukai';
++import { bootSolidModels, defineSolidModelSchema } from 'soukai-solid/models';
++
++
++
++
++
++
++const PersonSchema = defineSolidModelSchema({
++    rdfContexts: {
++        foaf: 'http://xmlns.com/foaf/0.1/',
++        vcard: 'http://www.w3.org/2006/vcard/ns#',
++    },
++    rdfsClass: 'Person',
++    timestamps: [TimestampField.CreatedAt],
++    history: true,
++    fields: {
++        name: FieldType.String,
++        nickName: {
++            type: FieldType.String,
++            rdfProperty: 'vcard:nickname',
++        },
++        friendUrls: {
++            type: FieldType.Array,
++            rdfProperty: 'knows',
++            items: FieldType.Key,
++        },
++    },
++});
++
++class AcceptancePerson extends PersonSchema {}
++
++const MovieSchema = defineSolidModelSchema({
++    rdfContexts: { schema: 'https://schema.org/' },
++    rdfsClass: 'Movie',
++    timestamps: false,
++    fields: {
++        title: {
++            type: FieldType.String,
++            rdfProperty: 'name',
++        },
++        releaseDate: {
++            type: FieldType.Date,
++            rdfProperty: 'datePublished',
++        },
++    },
++});
++
++class AcceptanceMovie extends MovieSchema {
++    public actionsRelationship() {
++        return this.hasMany(AcceptanceWatchAction, 'object').usingSameDocument().onDelete('cascade');
++    }
++}
++
++const WatchActionSchema = defineSolidModelSchema({
++    rdfContexts: { schema: 'https://schema.org/' },
++    rdfsClass: 'WatchAction',
++    timestamps: false,
++    fields: {
++        object: FieldType.Key,
++        startTime: FieldType.Date,
++    },
++});
++
++class AcceptanceWatchAction extends WatchActionSchema {
++    public movieRelationship() {
++        return this.belongsToOne(AcceptanceMovie, 'object');
++    }
++}
++
++function bootAcceptanceModels(): void {
++    bootSolidModels();
++    bootModels({ AcceptancePerson, AcceptanceMovie, AcceptanceWatchAction });
++}
++
++function makePerson(): AcceptancePerson {
++    const person = new AcceptancePerson({
++        url: 'https://example.com/people/alice#it',
++        name: 'Alice Example',
++        nickName: 'Al',
++        friendUrls: ['https://example.com/people/bob#it', 'https://example.com/people/carol#it'],
++        createdAt: new Date('2024-01-02T03:04:05.000Z'),
++    });
++
++    person.relatedOperations.attachSetOperation({
++        resourceUrl: person.url,
++        date: new Date('2024-01-03T04:05:06.000Z'),
++        property: 'https://schema.org/name',
++        value: 'Alice Example',
++    });
++
++    return person;
++}
++
++function makeMovieWithAction(): [AcceptanceMovie, AcceptanceWatchAction] {
++    const movie = new AcceptanceMovie({
++        url: 'https://example.com/movies/spirited-away#it',
++        title: 'Spirited Away',
++        releaseDate: new Date('2001-07-20T00:00:00.000Z'),
++    });
++    const action = new AcceptanceWatchAction({
++        url: 'https://example.com/movies/spirited-away#watch',
++        object: movie.url,
++        startTime: new Date('2020-05-06T07:08:09.000Z'),
++    });
++
++    movie.setRelationModels('actions', [action]);
++    action.setRelationModel('movie', movie);
++
++    return [movie, action];
++}
++
++function installCountingEngine(): string[] {
++    const calls: string[] = [];
++    const record = (method: string) => {
++        calls.push(method);
++        throw new Error(`toJsonLD unexpectedly called engine.${method}`);
++    };
++    const engine: Engine = {
++        create: async (): Promise<string> => record('create'),
++        readOne: async (): Promise<EngineDocument> => record('readOne'),
++        readMany: async (): Promise<EngineDocumentsCollection> => record('readMany'),
++        update: async (): Promise<void> => record('update'),
++        delete: async (): Promise<void> => record('delete'),
++    };
++
++    setEngine(engine);
++
++    return calls;
++}
++
++const XSD_DATE_TIME = 'http://www.w3.org/2001/XMLSchema#dateTime';
++
++function expectRecord(value: unknown): Record<string, unknown> {
++    expect(value).toEqual(expect.any(Object));
++    expect(Array.isArray(value)).toBe(false);
++
++    return value as Record<string, unknown>;
++}
++
++function expectDateTime(value: unknown, expected: string): void {
++    expect(value).toEqual({
++        '@type': XSD_DATE_TIME,
++        '@value': expected,
++    });
++}
++
++function expectIdReferences(value: unknown, expectedUrls: string[]): void {
++    const references = Array.isArray(value) ? value : [value];
++
++    expect(references).toHaveLength(expectedUrls.length);
++    expect(references.map((reference) => expectRecord(reference)['@id']).sort()).toEqual([...expectedUrls].sort());
++}
++
++function expectNoExportedRelations(jsonld: Record<string, unknown>): void {
++    expect(jsonld).not.toHaveProperty('metadata');
++    expect(jsonld).not.toHaveProperty('operations');
++}
++
++function expectPersonExport(
++    jsonld: Record<string, unknown>,
++    options: {
++        url?: string;
++        name: string;
++        nickName: string;
++        friendUrls: string[];
++        createdAt?: string;
++        includesHistory?: boolean;
++    },
++): void {
++    expect(jsonld).toEqual(expect.objectContaining({
++        '@context': expect.objectContaining({
++            '@vocab': 'http://xmlns.com/foaf/0.1/',
++            vcard: 'http://www.w3.org/2006/vcard/ns#',
++        }),
++        '@type': 'Person',
++        name: options.name,
++        'vcard:nickname': options.nickName,
++    }));
++
++    options.url ? expect(jsonld['@id']).toBe(options.url) : expect(jsonld).not.toHaveProperty('@id');
++    expectIdReferences(jsonld.knows, options.friendUrls);
++
++    if (options.createdAt) {
++        const metadata = expectRecord(jsonld.metadata);
++
++        expect(metadata['@type']).toBe('crdt:Metadata');
++        expectDateTime(metadata['crdt:createdAt'], options.createdAt);
++
++        if (options.url) {
++            expect(metadata['@id']).toEqual(expect.any(String));
++        }
++    } else {
++        expect(jsonld).not.toHaveProperty('metadata');
++    }
++
++    if (options.includesHistory) {
++        expect(jsonld).toHaveProperty('operations');
++
++        const operations = Array.isArray(jsonld.operations) ? jsonld.operations : [jsonld.operations];
++
++        expect(operations.length).toBeGreaterThan(0);
++        operations.forEach(expectRecord);
++    } else {
++        expect(jsonld).not.toHaveProperty('operations');
++    }
++}
++
++function expectMovieExport(jsonld: Record<string, unknown>, options: { ids: boolean }): void {
++    expect(jsonld).toEqual(expect.objectContaining({
++        '@context': expect.objectContaining({
++            '@vocab': 'https://schema.org/',
++            actions: { '@reverse': 'object' },
++        }),
++        '@type': 'Movie',
++        name: 'Spirited Away',
++    }));
++
++    options.ids
++        ? expect(jsonld['@id']).toBe('https://example.com/movies/spirited-away#it')
++        : expect(jsonld).not.toHaveProperty('@id');
++    expectDateTime(jsonld.datePublished, '2001-07-20T00:00:00.000Z');
++
++    const actions = Array.isArray(jsonld.actions) ? jsonld.actions : [jsonld.actions];
++    const action = expectRecord(actions[0]);
++
++    expect(actions).toHaveLength(1);
++    expect(action['@type']).toBe('WatchAction');
++    options.ids
++        ? expect(action['@id']).toBe('https://example.com/movies/spirited-away#watch')
++        : expect(action).not.toHaveProperty('@id');
++    expectDateTime(action.startTime, '2020-05-06T07:08:09.000Z');
++    expect(action).not.toHaveProperty('object');
++}
++
++describe('SolidModel.toJsonLD acceptance', () => {
++    beforeEach(() => {
++        bootAcceptanceModels();
++    });
++
++    afterEach(() => {
++        setEngine(null);
++        vi.unstubAllGlobals();
++    });
++
++    it('exports a new unsaved Solid model graph with default ids, timestamps, and history', () => {
++
++
++        const person = makePerson();
++
++
++        expectPersonExport(person.toJsonLD(), {
++            url: 'https://example.com/people/alice#it',
++            name: 'Alice Example',
++            nickName: 'Al',
++            friendUrls: ['https://example.com/people/bob#it', 'https://example.com/people/carol#it'],
++            createdAt: '2024-01-02T03:04:05.000Z',
++            includesHistory: true,
++        });
++    });
++
++    it('omits model ids, timestamp metadata, and history operations for a minimal export without mutating state', () => {
++
++
++        const person = makePerson();
++        const stateBeforeExport = {
++            url: person.url,
++            metadataUrl: person.metadata?.url,
++            metadataResourceUrl: person.metadata?.resourceUrl,
++            metadataCreatedAt: person.metadata?.createdAt?.toISOString(),
++            operations: person.operations?.length,
++            dirty: person.isDirty(),
++            metadataLoaded: person.isRelationLoaded('metadata'),
++            operationsLoaded: person.isRelationLoaded('operations'),
++        };
++
++        const firstExport = person.toJsonLD({ ids: false, timestamps: false, history: false });
++        const secondExport = person.toJsonLD({ ids: false, timestamps: false, history: false });
++
++
++        expectPersonExport(firstExport, {
++            name: 'Alice Example',
++            nickName: 'Al',
++            friendUrls: ['https://example.com/people/bob#it', 'https://example.com/people/carol#it'],
++        });
++        expectNoExportedRelations(firstExport);
++
++        expectPersonExport(secondExport, {
++            name: 'Alice Example',
++            nickName: 'Al',
++            friendUrls: ['https://example.com/people/bob#it', 'https://example.com/people/carol#it'],
++        });
++        expectNoExportedRelations(secondExport);
++
++        expect({
++            url: person.url,
++            metadataUrl: person.metadata?.url,
++            metadataResourceUrl: person.metadata?.resourceUrl,
++            metadataCreatedAt: person.metadata?.createdAt?.toISOString(),
++            operations: person.operations?.length,
++            dirty: person.isDirty(),
++            metadataLoaded: person.isRelationLoaded('metadata'),
++            operationsLoaded: person.isRelationLoaded('operations'),
++        }).toEqual(stateBeforeExport);
++    });
++
++    it('embeds loaded document relations through the reverse RDF property without recursively embedding the parent', () => {
++
++
++        const [movie] = makeMovieWithAction();
++
++
++        expectMovieExport(movie.toJsonLD(), { ids: true });
++    });
++
++    it('applies minimal export options to loaded related models and leaves both instances unchanged', () => {
++
++
++        const [movie, action] = makeMovieWithAction();
++        const stateBeforeExport = {
++            movieUrl: movie.url,
++            actionUrl: action.url,
++            movieDirty: movie.isDirty(),
++            actionDirty: action.isDirty(),
++            actionsLoaded: movie.isRelationLoaded('actions'),
++            actionMovieLoaded: action.isRelationLoaded('movie'),
++            actionsLength: movie.getRelationModels('actions')?.length,
++            actionMovieTitle: action.getRelationModel<AcceptanceMovie>('movie')?.title,
++        };
++
++
++        expectMovieExport(movie.toJsonLD({ ids: false, timestamps: false, history: false }), { ids: false });
++        expect({
++            movieUrl: movie.url,
++            actionUrl: action.url,
++            movieDirty: movie.isDirty(),
++            actionDirty: action.isDirty(),
++            actionsLoaded: movie.isRelationLoaded('actions'),
++            actionMovieLoaded: action.isRelationLoaded('movie'),
++            actionsLength: movie.getRelationModels('actions')?.length,
++            actionMovieTitle: action.getRelationModel<AcceptanceMovie>('movie')?.title,
++        }).toEqual(stateBeforeExport);
++    });
++
++    it('keeps independent model instances from sharing export state', () => {
++
++
++        const alice = makePerson();
++        const bob = new AcceptancePerson({
++            url: 'https://example.com/people/bob#it',
++            name: 'Bob Example',
++            nickName: 'Bobby',
++            friendUrls: ['https://example.com/people/alice#it'],
++            createdAt: new Date('2024-02-03T04:05:06.000Z'),
++        });
++        const bobOperationsBeforeExport = bob.operations?.length;
++
++
++        expectPersonExport(alice.toJsonLD({ ids: false, timestamps: false, history: false }), {
++            name: 'Alice Example',
++            nickName: 'Al',
++            friendUrls: ['https://example.com/people/bob#it', 'https://example.com/people/carol#it'],
++        });
++        expectPersonExport(bob.toJsonLD({ ids: false, timestamps: false, history: false }), {
++            name: 'Bob Example',
++            nickName: 'Bobby',
++            friendUrls: ['https://example.com/people/alice#it'],
++        });
++
++        expect({
++            aliceOperations: alice.operations?.length,
++            bobOperations: bob.operations?.length,
++            aliceUrl: alice.url,
++            bobUrl: bob.url,
++            bobMetadataCreatedAt: bob.metadata?.createdAt?.toISOString(),
++        }).toEqual({
++            aliceOperations: 1,
++            bobOperations: bobOperationsBeforeExport,
++            aliceUrl: 'https://example.com/people/alice#it',
++            bobUrl: 'https://example.com/people/bob#it',
++            bobMetadataCreatedAt: '2024-02-03T04:05:06.000Z',
++        });
++    });
++
++    it('runs repeated construct-export cycles without engine writes or network calls', () => {
++
++
++        const engineCalls = installCountingEngine();
++        let fetchCalls = 0;
++
++        vi.stubGlobal('fetch', async () => {
++            fetchCalls++;
++            throw new Error('toJsonLD unexpectedly called fetch');
++        });
++
++        for (let i = 0; i < 125; i++) {
++            const person = new AcceptancePerson({
++                url: `https://example.com/people/repeated-${i}#it`,
++                name: `Repeated ${i}`,
++                nickName: `R${i}`,
++                friendUrls: ['https://example.com/people/alice#it'],
++                createdAt: new Date('2024-03-04T05:06:07.000Z'),
++            });
++
++
++            expectPersonExport(person.toJsonLD({ ids: false, timestamps: false, history: false }), {
++                name: `Repeated ${i}`,
++                nickName: `R${i}`,
++                friendUrls: ['https://example.com/people/alice#it'],
++            });
++        }
++
++        expect(engineCalls).toEqual([]);
++        expect(fetchCalls).toBe(0);
++    });
++});
+diff --git a/usercase-test-coderl/vitest.config.ts b/usercase-test-coderl/vitest.config.ts
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/vitest.config.ts
+@@ -0,0 +1,15 @@
++import { fileURLToPath, URL } from 'node:url';
++
++import { defineConfig } from 'vitest/config';
++
++export default defineConfig({
++    resolve: {
++        alias: {
++            soukai: fileURLToPath(new URL('../packages/soukai/src/', import.meta.url)),
++            'soukai-solid': fileURLToPath(new URL('../packages/soukai-solid/src/', import.meta.url)),
++        },
++    },
++    test: {
++        include: ['usercase-test-coderl/**/*.test.ts'],
++    },
++});
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,31 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++export COREPACK_ENABLE_DOWNLOAD_PROMPT=0
++export NO_UPDATE_NOTIFIER=1
++export PNPM_CONFIG_OFFLINE=true
++export PNPM_CONFIG_UPDATE_NOTIFIER=false
++set -e
++cd /workspace/repo
++set -euo pipefail
++
++cd /workspace/repo
++
++
++pnpm install --frozen-lockfile --offline --ignore-scripts >/dev/null
++
++
++mkdir -p /workspace/repo/node_modules/@tsconfig /workspace/repo/node_modules/.bin
++ln -sfn .pnpm/vitest@3.0.9_@types+node@22.20.1_yaml@2.9.0/node_modules/vitest /workspace/repo/node_modules/vitest
++ln -sfn ../.pnpm/@tsconfig+node22@22.0.5/node_modules/@tsconfig/node22 /workspace/repo/node_modules/@tsconfig/node22
++
++exec node /workspace/repo/node_modules/vitest/vitest.mjs run \
++    --config /workspace/repo/usercase-test-coderl/vitest.config.ts \
++    /workspace/repo/usercase-test-coderl/solid_model_to_jsonld.test.ts \
++    --reporter verbose

@@ -1,0 +1,395 @@
+diff --git a/usercase-test-coderl/parser_stateful_test.go b/usercase-test-coderl/parser_stateful_test.go
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/parser_stateful_test.go
+@@ -0,0 +1,366 @@
++package usercase_test_coderl
++
++import (
++	"io"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/aaasen/kapok/parse"
++)
++
++
++
++
++type pageSnapshot struct {
++	Title      string
++	Links      []string
++	Categories []string
++}
++
++type gatedReader struct {
++	chunks  chan string
++	current string
++	closed  bool
++}
++
++func (r *gatedReader) Read(p []byte) (int, error) {
++	for r.current == "" {
++		if r.closed {
++			return 0, io.EOF
++		}
++
++		next, ok := <-r.chunks
++		if !ok {
++			r.closed = true
++			return 0, io.EOF
++		}
++		r.current = next
++	}
++
++	n := copy(p, r.current)
++	r.current = r.current[n:]
++	return n, nil
++}
++
++type chunkReader struct {
++	data  string
++	sizes []int
++	pos   int
++	idx   int
++}
++
++func (r *chunkReader) Read(p []byte) (int, error) {
++	if r.pos >= len(r.data) {
++		return 0, io.EOF
++	}
++
++	n := 7
++	if r.idx < len(r.sizes) {
++		n = r.sizes[r.idx]
++		r.idx++
++	}
++	if n > len(p) {
++		n = len(p)
++	}
++	if remaining := len(r.data) - r.pos; n > remaining {
++		n = remaining
++	}
++
++	copy(p, r.data[r.pos:r.pos+n])
++	r.pos += n
++	return n, nil
++}
++
++func snapshot(page *parse.Page) pageSnapshot {
++	if page == nil {
++		return pageSnapshot{Title: "<nil>"}
++	}
++	return pageSnapshot{
++		Title:      page.Title,
++		Links:      page.Links,
++		Categories: page.Categories,
++	}
++}
++
++func receivePage(t *testing.T, pages <-chan *parse.Page) (pageSnapshot, bool) {
++	t.Helper()
++
++	select {
++	case page, ok := <-pages:
++		return snapshot(page), ok
++	case <-time.After(2 * time.Second):
++		t.Fatal("timed out waiting for parser output")
++		return pageSnapshot{}, false
++	}
++}
++
++func assertSnapshot(t *testing.T, got pageSnapshot, want pageSnapshot) {
++	t.Helper()
++
++
++	if got.Title != want.Title || !sameStrings(got.Links, want.Links) || !sameStrings(got.Categories, want.Categories) {
++		t.Fatalf("page snapshot = %#v, want %#v", got, want)
++	}
++}
++
++func assertTitleAndLinks(t *testing.T, got pageSnapshot, wantTitle string, wantLinks []string) {
++	t.Helper()
++
++	if got.Title != wantTitle || !sameStrings(got.Links, wantLinks) {
++		t.Fatalf("page title/links = %q/%#v, want %q/%#v", got.Title, got.Links, wantTitle, wantLinks)
++	}
++}
++
++func sameStrings(got []string, want []string) bool {
++	if len(got) != len(want) {
++		return false
++	}
++	for i := range got {
++		if got[i] != want[i] {
++			return false
++		}
++	}
++	return true
++}
++
++func TestParserStreamsDumpPagesSkipsRedirectsAndCloses(t *testing.T) {
++
++
++	first := "before<mediawiki>" +
++		"<siteinfo><sitename>Kapok</sitename></siteinfo>" +
++		"<page><title>Alpha</title><revision><text>Lead [[Beta]] and [[Category:Science]].</text></revision></page>"
++	rest := "between" +
++		"<page><title>Redirected</title><revision><text>#REDIRECT [[Alpha]]</text></revision></page>" +
++
++		"<page><title></title><revision><text>[[Alpha]]</text></revision></page>" +
++		"<page><revision><text>[[NoTitle]]</text></revision></page>" +
++		"<page><title>Gamma</title><revision><text>Return to [[Alpha]] and [[Category:Math|mathematics]].</text></revision></page>" +
++		"</mediawiki>after"
++	totalInputBytes := int64(len(first) + len(rest))
++
++	parser := parse.NewParser()
++	if parser.BytesProcessed != 0 {
++		t.Fatalf("fresh BytesProcessed = %d, want 0", parser.BytesProcessed)
++	}
++
++	reader := &gatedReader{chunks: make(chan string)}
++	pages := make(chan *parse.Page)
++	parser.Parse(reader, pages)
++
++	reader.chunks <- first
++	got, ok := receivePage(t, pages)
++	if ok != true {
++		t.Fatalf("first receive ok = %t, want true", ok)
++	}
++	assertSnapshot(t, got, pageSnapshot{
++		Title:      "Alpha",
++		Links:      []string{"Beta"},
++		Categories: []string{"Science"},
++	})
++
++	if parser.BytesProcessed <= 0 || parser.BytesProcessed > int64(len(first)) {
++		t.Fatalf("BytesProcessed after first complete page = %d, want between 1 and %d", parser.BytesProcessed, len(first))
++	}
++
++	reader.chunks <- rest
++	close(reader.chunks)
++
++	got, ok = receivePage(t, pages)
++	if ok != true {
++		t.Fatalf("second receive ok = %t, want true", ok)
++	}
++
++	assertTitleAndLinks(t, got, "Gamma", []string{"Alpha"})
++
++	_, ok = receivePage(t, pages)
++	if ok != false {
++		t.Fatalf("third receive ok = %t, want false", ok)
++	}
++	if parser.BytesProcessed != totalInputBytes {
++		t.Fatalf("final BytesProcessed = %d, want %d", parser.BytesProcessed, totalInputBytes)
++	}
++}
++
++func TestParserPreservesPagesAcrossReaderChunks(t *testing.T) {
++
++
++	input := "before<mediawiki>" +
++		"<siteinfo><sitename>Kapok</sitename></siteinfo>" +
++		"<page><title>Alpha</title><revision><text>Lead [[Beta]] and [[Category:Science]].</text></revision></page>" +
++		"between" +
++		"<page><title>Redirected</title><revision><text>#REDIRECT [[Alpha]]</text></revision></page>" +
++
++		"<page><title></title><revision><text>[[Alpha]]</text></revision></page>" +
++		"<page><revision><text>[[NoTitle]]</text></revision></page>" +
++		"<page><title>Gamma</title><revision><text>Return to [[Alpha]] and [[Category:Math|mathematics]].</text></revision></page>" +
++		"</mediawiki>after"
++
++	parser := parse.NewParser()
++	pages := make(chan *parse.Page)
++	parser.Parse(&chunkReader{
++		data:  input,
++		sizes: []int{3, 2, 1, 4, 5, 1, 2, 9, 1, 6, 3, 2, 8},
++	}, pages)
++
++	got, ok := receivePage(t, pages)
++	if ok != true {
++		t.Fatalf("first receive ok = %t, want true", ok)
++	}
++	assertSnapshot(t, got, pageSnapshot{
++		Title:      "Alpha",
++		Links:      []string{"Beta"},
++		Categories: []string{"Science"},
++	})
++
++	got, ok = receivePage(t, pages)
++	if ok != true {
++		t.Fatalf("second receive ok = %t, want true", ok)
++	}
++
++	assertTitleAndLinks(t, got, "Gamma", []string{"Alpha"})
++
++	_, ok = receivePage(t, pages)
++	if ok != false {
++		t.Fatalf("third receive ok = %t, want false", ok)
++	}
++	if parser.BytesProcessed != int64(len(input)) {
++		t.Fatalf("final BytesProcessed = %d, want %d", parser.BytesProcessed, len(input))
++	}
++}
++
++func TestParserSkipsMalformedAndInvalidTitlePagesThenContinues(t *testing.T) {
++
++
++	input := "junk" +
++		"<page><revision><text>[[NoTitle]]</text></revision></page>" +
++
++		"<page><title></title><revision><text>[[Alpha]]</text></revision></page>" +
++		"<page><title>Delta</title><revision><text>[[Alpha]] [[Category:Valid]]</text></revision></page>" +
++		"tail"
++
++	parser := parse.NewParser()
++	pages := make(chan *parse.Page)
++	parser.Parse(strings.NewReader(input), pages)
++
++	got, ok := receivePage(t, pages)
++	if ok != true {
++		t.Fatalf("first receive ok = %t, want true", ok)
++	}
++
++	assertTitleAndLinks(t, got, "Delta", []string{"Alpha"})
++
++	_, ok = receivePage(t, pages)
++	if ok != false {
++		t.Fatalf("second receive ok = %t, want false", ok)
++	}
++	if parser.BytesProcessed != int64(len(input)) {
++		t.Fatalf("final BytesProcessed = %d, want %d", parser.BytesProcessed, len(input))
++	}
++}
++
++func TestExhaustedReaderClosesOutputChannelForRepeatedReceives(t *testing.T) {
++
++
++	input := "outside only with <mediawiki></mediawiki> wrappers"
++
++	parser := parse.NewParser()
++	pages := make(chan *parse.Page)
++	parser.Parse(strings.NewReader(input), pages)
++
++	_, ok := receivePage(t, pages)
++	if ok != false {
++		t.Fatalf("first receive ok = %t, want false", ok)
++	}
++
++	_, ok = receivePage(t, pages)
++	if ok != false {
++		t.Fatalf("second receive ok = %t, want false", ok)
++	}
++	if parser.BytesProcessed != int64(len(input)) {
++		t.Fatalf("final BytesProcessed = %d, want %d", parser.BytesProcessed, len(input))
++	}
++}
++
++func TestSeparateParserInstancesMaintainIndependentCountersAndSessions(t *testing.T) {
++
++
++	a := parse.NewParser()
++	b := parse.NewParser()
++
++	aPages := make(chan *parse.Page)
++	aInput := "<page><title>One</title><revision><text>[[Two]]</text></revision></page>"
++	a.Parse(strings.NewReader(aInput), aPages)
++	got, ok := receivePage(t, aPages)
++	if ok != true {
++		t.Fatalf("a first receive ok = %t, want true", ok)
++	}
++	assertSnapshot(t, got, pageSnapshot{
++		Title:      "One",
++		Links:      []string{"Two"},
++		Categories: nil,
++	})
++	_, ok = receivePage(t, aPages)
++	if ok != false {
++		t.Fatalf("a second receive ok = %t, want false", ok)
++	}
++
++	if a.BytesProcessed != int64(len(aInput)) {
++		t.Fatalf("a BytesProcessed = %d, want %d", a.BytesProcessed, len(aInput))
++	}
++	if b.BytesProcessed != 0 {
++		t.Fatalf("b fresh BytesProcessed = %d, want 0", b.BytesProcessed)
++	}
++
++	bPages := make(chan *parse.Page)
++	bInput := "outside<page><title>Two</title><revision><text>[[One]] [[Category:Solo]]</text></revision></page>tail"
++	b.Parse(strings.NewReader(bInput), bPages)
++	got, ok = receivePage(t, bPages)
++	if ok != true {
++		t.Fatalf("b first receive ok = %t, want true", ok)
++	}
++
++	assertTitleAndLinks(t, got, "Two", []string{"One"})
++	_, ok = receivePage(t, bPages)
++	if ok != false {
++		t.Fatalf("b second receive ok = %t, want false", ok)
++	}
++
++	if a.BytesProcessed != int64(len(aInput)) {
++		t.Fatalf("a BytesProcessed after b parse = %d, want %d", a.BytesProcessed, len(aInput))
++	}
++	if b.BytesProcessed != int64(len(bInput)) {
++		t.Fatalf("b BytesProcessed = %d, want %d", b.BytesProcessed, len(bInput))
++	}
++}
++
++func TestRepeatedParserSessionsDoNotLeakGoroutines(t *testing.T) {
++
++
++	input := "<page><title>Leak</title><revision><text>[[Target]]</text></revision></page>"
++
++	for i := 0; i < 150; i++ {
++		parser := parse.NewParser()
++		pages := make(chan *parse.Page)
++		parser.Parse(strings.NewReader(input), pages)
++
++		got, ok := receivePage(t, pages)
++		if ok != true {
++			t.Fatalf("cycle %d first receive ok = %t, want true", i, ok)
++		}
++		assertSnapshot(t, got, pageSnapshot{
++			Title:      "Leak",
++			Links:      []string{"Target"},
++			Categories: nil,
++		})
++
++		_, ok = receivePage(t, pages)
++		if ok != false {
++			t.Fatalf("cycle %d second receive ok = %t, want false", i, ok)
++		}
++		if parser.BytesProcessed != int64(len(input)) {
++			t.Fatalf("cycle %d final BytesProcessed = %d, want %d", i, parser.BytesProcessed, len(input))
++		}
++	}
++
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,19 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++export GOPROXY=off
++export GOSUMDB=off
++export GOVCS='*:off'
++export GOTELEMETRY=off
++
++cd /workspace/repo
++exec go test -v -count=1 ./usercase-test-coderl/...

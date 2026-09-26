@@ -1,0 +1,444 @@
+diff --git a/usercase-test-coderl/session_url_query_test.go b/usercase-test-coderl/session_url_query_test.go
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/session_url_query_test.go
+@@ -0,0 +1,414 @@
++package usercase_test_coderl
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"net/http"
++	"net/http/httptest"
++	"net/url"
++	"os"
++	"path/filepath"
++	"strconv"
++	"strings"
++	"testing"
++
++	web "github.com/beego/beego/v2/server/web"
++	"github.com/beego/beego/v2/server/web/session"
++)
++
++func newMemoryManager(t *testing.T, cookieName string, enableURLQuery bool, setCookie bool) *session.Manager {
++	t.Helper()
++	cfg := session.NewManagerConfig(
++		session.CfgCookieName(cookieName),
++		session.CfgEnableSidInURLQuery(enableURLQuery),
++		session.CfgSetCookie(setCookie),
++		session.CfgSessionIdLength(4),
++	)
++	mgr, err := session.NewManager("memory", cfg)
++	if err != nil {
++		t.Fatalf("NewManager returned error: %v", err)
++	}
++	return mgr
++}
++
++func destroyID(mgr *session.Manager, cookieName string, sid string) {
++	req := httptest.NewRequest(http.MethodGet, "/", nil)
++	req.AddCookie(&http.Cookie{Name: cookieName, Value: url.QueryEscape(sid)})
++	mgr.SessionDestroy(httptest.NewRecorder(), req)
++}
++
++func TestURLQueryLookupReturnsExistingMemorySession(t *testing.T) {
++
++
++	ctx := context.Background()
++	mgr := newMemoryManager(t, "sid", true, true)
++	destroyID(mgr, "sid", "abc123")
++	defer destroyID(mgr, "sid", "abc123")
++
++	seed, err := mgr.GetSessionStore("abc123")
++	if err != nil {
++		t.Fatalf("GetSessionStore returned error: %v", err)
++	}
++	if err := seed.Set(ctx, "user", "alice"); err != nil {
++		t.Fatalf("Set returned error: %v", err)
++	}
++	req := httptest.NewRequest(http.MethodGet, "/?sid=abc123", nil)
++	res := httptest.NewRecorder()
++	store, err := mgr.SessionStart(res, req)
++	if err != nil {
++		t.Fatalf("SessionStart returned error: %v", err)
++	}
++
++	if store.SessionID(ctx) != "abc123" {
++		t.Fatalf("SessionID = %q, want %q", store.SessionID(ctx), "abc123")
++	}
++	if got := store.Get(ctx, "user"); got != "alice" {
++		t.Fatalf("stored user = %#v, want %q", got, "alice")
++	}
++	store.SessionRelease(ctx, res)
++}
++
++func TestMissingURLQuerySessionCreatesFreshSession(t *testing.T) {
++
++
++	ctx := context.Background()
++	mgr := newMemoryManager(t, "sid", true, true)
++	destroyID(mgr, "sid", "missing123")
++
++	req := httptest.NewRequest(http.MethodGet, "/?sid=missing123", nil)
++	res := httptest.NewRecorder()
++	store, err := mgr.SessionStart(res, req)
++	if err != nil {
++		t.Fatalf("SessionStart returned error: %v", err)
++	}
++	generatedID := store.SessionID(ctx)
++	defer destroyID(mgr, "sid", generatedID)
++
++
++	if generatedID == "missing123" {
++		t.Fatalf("SessionID = %q, want a fresh generated ID", generatedID)
++	}
++	if generatedID == "" {
++		t.Fatalf("SessionID is empty, want a fresh generated ID")
++	}
++	if got := store.Get(ctx, "user"); got != nil {
++		t.Fatalf("stored user = %#v, want nil", got)
++	}
++	store.SessionRelease(ctx, res)
++}
++
++func TestURLQueryLookupDisabledIgnoresQueryValue(t *testing.T) {
++
++
++	ctx := context.Background()
++	mgr := newMemoryManager(t, "sid", false, false)
++	destroyID(mgr, "sid", "urlonly")
++	defer destroyID(mgr, "sid", "urlonly")
++
++	seed, err := mgr.GetSessionStore("urlonly")
++	if err != nil {
++		t.Fatalf("GetSessionStore returned error: %v", err)
++	}
++	if err := seed.Set(ctx, "user", "bob"); err != nil {
++		t.Fatalf("Set returned error: %v", err)
++	}
++
++	req := httptest.NewRequest(http.MethodGet, "/?sid=urlonly", nil)
++	res := httptest.NewRecorder()
++	store, err := mgr.SessionStart(res, req)
++	if err != nil {
++		t.Fatalf("SessionStart returned error: %v", err)
++	}
++	generatedID := store.SessionID(ctx)
++	defer destroyID(mgr, "sid", generatedID)
++
++
++	if generatedID == "urlonly" {
++		t.Fatalf("SessionID = %q, want URL query value to be ignored", generatedID)
++	}
++	if generatedID == "" {
++		t.Fatalf("SessionID is empty, want a generated ID separate from URL query value")
++	}
++	if got := store.Get(ctx, "user"); got != nil {
++		t.Fatalf("stored user = %#v, want nil", got)
++	}
++	store.SessionRelease(ctx, res)
++}
++
++func TestURLQueryParseErrorReturnsSpecificErrorAndNoStore(t *testing.T) {
++
++
++	mgr := newMemoryManager(t, "sid", true, true)
++
++	req := httptest.NewRequest(http.MethodGet, "/?sid=abc123%zz", nil)
++	res := httptest.NewRecorder()
++	store, err := mgr.SessionStart(res, req)
++
++	var escapeErr url.EscapeError
++	if !errors.As(err, &escapeErr) {
++		t.Fatalf("SessionStart error type = %T, want url.EscapeError", err)
++	}
++
++	if store != nil {
++		t.Fatalf("store = %#v, want nil", store)
++	}
++}
++
++func TestManagerConfigOptionAndJSONFieldSetURLQueryLookup(t *testing.T) {
++
++
++	cfgTrue := session.NewManagerConfig(session.CfgEnableSidInURLQuery(true))
++	if cfgTrue.EnableSidInURLQuery != true {
++		t.Fatalf("option-enabled config EnableSidInURLQuery = %v, want true", cfgTrue.EnableSidInURLQuery)
++	}
++
++	cfgFalse := session.NewManagerConfig(session.CfgEnableSidInURLQuery(false))
++	if cfgFalse.EnableSidInURLQuery != false {
++		t.Fatalf("option-disabled config EnableSidInURLQuery = %v, want false", cfgFalse.EnableSidInURLQuery)
++	}
++
++	var cfgJSONTrue session.ManagerConfig
++
++	if err := json.Unmarshal([]byte(`{"EnableSidInURLQuery":true}`), &cfgJSONTrue); err != nil {
++		t.Fatalf("json.Unmarshal true config returned error: %v", err)
++	}
++	if cfgJSONTrue.EnableSidInURLQuery != true {
++		t.Fatalf("JSON true config EnableSidInURLQuery = %v, want true", cfgJSONTrue.EnableSidInURLQuery)
++	}
++
++	var cfgJSONFalse session.ManagerConfig
++
++	if err := json.Unmarshal([]byte(`{"EnableSidInURLQuery":false}`), &cfgJSONFalse); err != nil {
++		t.Fatalf("json.Unmarshal false config returned error: %v", err)
++	}
++	if cfgJSONFalse.EnableSidInURLQuery != false {
++		t.Fatalf("JSON false config EnableSidInURLQuery = %v, want false", cfgJSONFalse.EnableSidInURLQuery)
++	}
++}
++
++func TestWebSessionConfigFieldFeedsPublicSessionBehavior(t *testing.T) {
++
++
++	ctx := context.Background()
++	oldSession := web.BConfig.WebConfig.Session
++	oldGlobalSessions := web.GlobalSessions
++	oldWd, err := os.Getwd()
++	if err != nil {
++		t.Fatalf("Getwd returned error: %v", err)
++	}
++	defer func() { web.BConfig.WebConfig.Session = oldSession }()
++	defer func() { web.GlobalSessions = oldGlobalSessions }()
++	defer func() {
++		if err := os.Chdir(oldWd); err != nil {
++			t.Fatalf("Chdir restore returned error: %v", err)
++		}
++	}()
++
++	appRoot := t.TempDir()
++	if err := os.MkdirAll(filepath.Join(appRoot, "conf"), 0o755); err != nil {
++		t.Fatalf("MkdirAll conf returned error: %v", err)
++	}
++	if err := os.MkdirAll(filepath.Join(appRoot, "views"), 0o755); err != nil {
++		t.Fatalf("MkdirAll views returned error: %v", err)
++	}
++	appConf := strings.Join([]string{
++		"AppName = fixture_session_url_query",
++		"RunMode = test",
++		"SessionOn = true",
++		"SessionProvider = memory",
++		"SessionName = sid",
++		"SessionGCMaxLifetime = 3600",
++		"SessionAutoSetCookie = false",
++		"SessionEnableSidInURLQuery = true",
++		"ViewsPath = views",
++		"",
++	}, "\n")
++	if err := os.WriteFile(filepath.Join(appRoot, "conf", "app.conf"), []byte(appConf), 0o644); err != nil {
++		t.Fatalf("WriteFile app.conf returned error: %v", err)
++	}
++
++	web.TestBeegoInit(appRoot)
++	if web.BConfig.WebConfig.Session.SessionEnableSidInURLQuery != true {
++		t.Fatalf("web session config SessionEnableSidInURLQuery = %v, want true", web.BConfig.WebConfig.Session.SessionEnableSidInURLQuery)
++	}
++	if web.BConfig.WebConfig.Session.SessionName != "sid" {
++		t.Fatalf("web session config SessionName = %q, want %q", web.BConfig.WebConfig.Session.SessionName, "sid")
++	}
++	if web.GlobalSessions == nil {
++		t.Fatalf("web.GlobalSessions is nil, want registered session manager")
++	}
++
++	destroyID(web.GlobalSessions, "sid", "webcfg123")
++	defer destroyID(web.GlobalSessions, "sid", "webcfg123")
++	seed, err := web.GlobalSessions.GetSessionStore("webcfg123")
++	if err != nil {
++		t.Fatalf("GetSessionStore returned error: %v", err)
++	}
++	if err := seed.Set(ctx, "user", "carol"); err != nil {
++		t.Fatalf("Set returned error: %v", err)
++	}
++
++	req := httptest.NewRequest(http.MethodGet, "/?sid=webcfg123", nil)
++	res := httptest.NewRecorder()
++	store, err := web.GlobalSessions.SessionStart(res, req)
++	if err != nil {
++		t.Fatalf("SessionStart returned error: %v", err)
++	}
++
++	if store.SessionID(ctx) != "webcfg123" {
++		t.Fatalf("SessionID = %q, want %q", store.SessionID(ctx), "webcfg123")
++	}
++	if got := store.Get(ctx, "user"); got != "carol" {
++		t.Fatalf("stored user = %#v, want %q", got, "carol")
++	}
++	store.SessionRelease(ctx, res)
++}
++
++func TestTwoManagersKeepURLQuerySessionsIndependentByCookieName(t *testing.T) {
++
++
++	ctx := context.Background()
++	mgrA := newMemoryManager(t, "sidA", true, false)
++	mgrB := newMemoryManager(t, "sidB", true, false)
++	destroyID(mgrA, "sidA", "sharedA")
++	destroyID(mgrB, "sidB", "sharedB")
++	defer destroyID(mgrA, "sidA", "sharedA")
++	defer destroyID(mgrB, "sidB", "sharedB")
++
++	storeA, err := mgrA.GetSessionStore("sharedA")
++	if err != nil {
++		t.Fatalf("GetSessionStore A returned error: %v", err)
++	}
++	if err := storeA.Set(ctx, "user", "alice"); err != nil {
++		t.Fatalf("Set A returned error: %v", err)
++	}
++	storeB, err := mgrB.GetSessionStore("sharedB")
++	if err != nil {
++		t.Fatalf("GetSessionStore B returned error: %v", err)
++	}
++	if err := storeB.Set(ctx, "user", "bob"); err != nil {
++		t.Fatalf("Set B returned error: %v", err)
++	}
++
++	reqA := httptest.NewRequest(http.MethodGet, "/?sidA=sharedA&sidB=sharedB", nil)
++	resA := httptest.NewRecorder()
++	actualA, err := mgrA.SessionStart(resA, reqA)
++	if err != nil {
++		t.Fatalf("SessionStart A returned error: %v", err)
++	}
++
++	if actualA.SessionID(ctx) != "sharedA" {
++		t.Fatalf("manager A SessionID = %q, want %q", actualA.SessionID(ctx), "sharedA")
++	}
++	if got := actualA.Get(ctx, "user"); got != "alice" {
++		t.Fatalf("manager A user = %#v, want %q", got, "alice")
++	}
++
++	reqB := httptest.NewRequest(http.MethodGet, "/?sidA=sharedA&sidB=sharedB", nil)
++	resB := httptest.NewRecorder()
++	actualB, err := mgrB.SessionStart(resB, reqB)
++	if err != nil {
++		t.Fatalf("SessionStart B returned error: %v", err)
++	}
++	if actualB.SessionID(ctx) != "sharedB" {
++		t.Fatalf("manager B SessionID = %q, want %q", actualB.SessionID(ctx), "sharedB")
++	}
++	if got := actualB.Get(ctx, "user"); got != "bob" {
++		t.Fatalf("manager B user = %#v, want %q", got, "bob")
++	}
++	actualA.SessionRelease(ctx, resA)
++	actualB.SessionRelease(ctx, resB)
++}
++
++func TestSessionDestroyIsIdempotentForURLQueryCreatedSession(t *testing.T) {
++
++
++	ctx := context.Background()
++	mgr := newMemoryManager(t, "sid", true, true)
++
++	req := httptest.NewRequest(http.MethodGet, "/?sid=does-not-exist", nil)
++	res := httptest.NewRecorder()
++	store, err := mgr.SessionStart(res, req)
++	if err != nil {
++		t.Fatalf("SessionStart returned error: %v", err)
++	}
++	generatedID := store.SessionID(ctx)
++	defer destroyID(mgr, "sid", generatedID)
++
++	if generatedID == "" || generatedID == "does-not-exist" {
++		t.Fatalf("SessionID = %q, want a fresh generated ID", generatedID)
++	}
++	if got := store.Get(ctx, "user"); got != nil {
++		t.Fatalf("stored user = %#v, want nil", got)
++	}
++}
++
++func TestRepeatedURLQueryCreateDestroyKeepsActiveSessionsBounded(t *testing.T) {
++
++
++	ctx := context.Background()
++	mgr := newMemoryManager(t, "sid", true, true)
++
++	for i := 0; i < 120; i++ {
++		absentID := "absent" + strconv.Itoa(i)
++		req := httptest.NewRequest(http.MethodGet, "/?sid="+absentID, nil)
++		res := httptest.NewRecorder()
++		store, err := mgr.SessionStart(res, req)
++		if err != nil {
++			t.Fatalf("cycle %d SessionStart returned error: %v", i, err)
++		}
++		generatedID := store.SessionID(ctx)
++
++		if generatedID == "" || generatedID == absentID {
++			t.Fatalf("cycle %d SessionID = %q, want a fresh generated ID", i, generatedID)
++		}
++		if got := store.Get(ctx, "user"); got != nil {
++			t.Fatalf("cycle %d stored user = %#v, want nil", i, got)
++		}
++		store.SessionRelease(ctx, res)
++		destroyID(mgr, "sid", generatedID)
++	}
++}
++
++func TestCookieTakesPrecedenceOverURLQuerySessionID(t *testing.T) {
++
++
++	ctx := context.Background()
++	mgr := newMemoryManager(t, "sid", true, false)
++	destroyID(mgr, "sid", "cookie123")
++	destroyID(mgr, "sid", "query123")
++	defer destroyID(mgr, "sid", "cookie123")
++	defer destroyID(mgr, "sid", "query123")
++
++	cookieStore, err := mgr.GetSessionStore("cookie123")
++	if err != nil {
++		t.Fatalf("GetSessionStore cookie returned error: %v", err)
++	}
++	if err := cookieStore.Set(ctx, "user", "cookie-user"); err != nil {
++		t.Fatalf("Set cookie returned error: %v", err)
++	}
++	queryStore, err := mgr.GetSessionStore("query123")
++	if err != nil {
++		t.Fatalf("GetSessionStore query returned error: %v", err)
++	}
++	if err := queryStore.Set(ctx, "user", "query-user"); err != nil {
++		t.Fatalf("Set query returned error: %v", err)
++	}
++
++	req := httptest.NewRequest(http.MethodGet, "/?sid=query123", nil)
++	req.AddCookie(&http.Cookie{Name: "sid", Value: url.QueryEscape("cookie123")})
++	res := httptest.NewRecorder()
++	store, err := mgr.SessionStart(res, req)
++	if err != nil {
++		t.Fatalf("SessionStart returned error: %v", err)
++	}
++
++	if store.SessionID(ctx) != "cookie123" {
++		t.Fatalf("SessionID = %q, want %q", store.SessionID(ctx), "cookie123")
++	}
++	if got := store.Get(ctx, "user"); got != "cookie-user" {
++		t.Fatalf("stored user = %#v, want %q", got, "cookie-user")
++	}
++	store.SessionRelease(ctx, res)
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,20 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++export GOPATH="/root/go"
++export GOMODCACHE="/root/go/pkg/mod"
++export GOPROXY="off"
++export GOSUMDB="off"
++export GOTOOLCHAIN="local"
++export GOFLAGS="-mod=readonly"
++set -e
++cd /workspace/repo
++set -euo pipefail
++cd /workspace/repo
++exec /root/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.2.linux-amd64/bin/go test -v -count=1 ./usercase-test-coderl/...

@@ -1,0 +1,421 @@
+diff --git a/pkg/action/fsck_test.go b/pkg/action/fsck_test.go
+index e4c39c64..407e56e5 100644
+--- a/pkg/action/fsck_test.go
++++ b/pkg/action/fsck_test.go
+@@ -4,8 +4,13 @@ import (
+ 	"bytes"
+ 	"context"
+ 	"flag"
++	"io"
++	"io/ioutil"
+ 	"os"
++	"path/filepath"
++	"strconv"
+ 	"strings"
++	"syscall"
+ 	"testing"
+ 
+ 	"github.com/gopasspw/gopass/pkg/ctxutil"
+@@ -40,7 +45,10 @@ func TestFsck(t *testing.T) {
+ 	// fsck
+ 	c := cli.NewContext(app, flag.NewFlagSet("default", flag.ContinueOnError), nil)
+ 	assert.NoError(t, act.Fsck(ctx, c))
+-	assert.Equal(t, "Extra recipients on foo: [0xFEEDBEEF]\nPushed changes to git remote", strings.TrimSpace(buf.String()))
++	got := buf.String()
++	assert.Contains(t, got, "Extra recipients on foo: [0xFEEDBEEF]")
++	assert.Contains(t, got, "Pushed changes to git remote")
++	assert.True(t, firstOutputLineBefore(got, "Extra recipients on foo"), "fsck should print startup output before longer checks")
+ 	buf.Reset()
+ 
+ 	// fsck fo
+@@ -49,6 +57,139 @@ func TestFsck(t *testing.T) {
+ 	c = cli.NewContext(app, fs, nil)
+ 
+ 	assert.NoError(t, act.Fsck(ctx, c))
+-	assert.Equal(t, "Extra recipients on foo: [0xFEEDBEEF]\nPushed changes to git remote", strings.TrimSpace(buf.String()))
++	got = buf.String()
++	assert.Contains(t, got, "Extra recipients on foo: [0xFEEDBEEF]")
++	assert.Contains(t, got, "Pushed changes to git remote")
+ 	buf.Reset()
+ }
++
++func TestFsckPrintsStartupAndProgress(t *testing.T) {
++	u := gptest.NewUnitTester(t)
++	defer u.Remove()
++	addFsckEntries(t, u, "alpha", "beta", "gamma")
++
++	ctx := context.Background()
++	ctx = ctxutil.WithTerminal(ctx, false)
++	act, err := newMock(ctx, u)
++	assert.NoError(t, err)
++
++	color.NoColor = true
++	app := cli.NewApp()
++	c := cli.NewContext(app, flag.NewFlagSet("default", flag.ContinueOnError), nil)
++
++	got, err := captureProcessStdout(t, func() error {
++		return act.Fsck(ctx, c)
++	})
++	assert.NoError(t, err)
++	assert.True(t, firstOutputLineBefore(got, "Extra recipients on foo"), "fsck should print startup output before longer checks")
++
++	assert.True(t, hasVisibleProgressUpdate(got, len(u.Entries)+3), "fsck should report checked/total progress, got %q", got)
++}
++
++func TestFsckSuppressesProgressWhenOutputHidden(t *testing.T) {
++	u := gptest.NewUnitTester(t)
++	defer u.Remove()
++	addFsckEntries(t, u, "alpha", "beta", "gamma")
++
++	ctx := context.Background()
++	ctx = ctxutil.WithTerminal(ctx, false)
++	ctx = out.WithHidden(ctx, true)
++	act, err := newMock(ctx, u)
++	assert.NoError(t, err)
++
++	color.NoColor = true
++	app := cli.NewApp()
++	c := cli.NewContext(app, flag.NewFlagSet("default", flag.ContinueOnError), nil)
++
++	got, err := captureProcessStdout(t, func() error {
++		return act.Fsck(ctx, c)
++	})
++	assert.NoError(t, err)
++	assert.False(t, hasVisibleProgressUpdate(got, 1), "hidden output should not leak progress, got %q", got)
++}
++
++func addFsckEntries(t *testing.T, u *gptest.Unit, names ...string) {
++	for _, name := range names {
++		fn := filepath.Join(u.StoreDir(""), name+".txt")
++		assert.NoError(t, ioutil.WriteFile(fn, []byte("secret"), 0600))
++	}
++}
++
++func firstOutputLineBefore(output, later string) bool {
++	for _, line := range strings.Split(output, "\n") {
++		line = strings.TrimSpace(line)
++		if line == "" {
++			continue
++		}
++		return !strings.Contains(line, later)
++	}
++	return false
++}
++
++func hasVisibleProgressUpdate(output string, minTotal int) bool {
++	fields := strings.FieldsFunc(output, func(r rune) bool {
++		return r < '0' || r > '9'
++	})
++	for i := 0; i+1 < len(fields); i++ {
++		current, err := strconv.Atoi(fields[i])
++		if err != nil {
++			continue
++		}
++		total, err := strconv.Atoi(fields[i+1])
++		if err != nil {
++			continue
++		}
++		if current > 0 && total >= minTotal && current <= total {
++			return true
++		}
++	}
++	return false
++}
++
++func captureProcessStdout(t *testing.T, fn func() error) (string, error) {
++	t.Helper()
++
++	oldOut := out.Stdout
++	oldStdout := stdout
++	defer func() {
++		out.Stdout = oldOut
++		stdout = oldStdout
++	}()
++
++	origFD, err := syscall.Dup(int(os.Stdout.Fd()))
++	if err != nil {
++		return "", err
++	}
++	defer syscall.Close(origFD)
++
++	r, w, err := os.Pipe()
++	if err != nil {
++		return "", err
++	}
++
++	var buf bytes.Buffer
++	done := make(chan error, 1)
++	go func() {
++		_, copyErr := io.Copy(&buf, r)
++		done <- copyErr
++	}()
++
++	if err := syscall.Dup2(int(w.Fd()), int(os.Stdout.Fd())); err != nil {
++		_ = r.Close()
++		_ = w.Close()
++		return "", err
++	}
++	out.Stdout = os.Stdout
++	stdout = os.Stdout
++
++	runErr := fn()
++
++	_ = syscall.Dup2(origFD, int(os.Stdout.Fd()))
++	_ = w.Close()
++	copyErr := <-done
++	_ = r.Close()
++	if copyErr != nil {
++		return buf.String(), copyErr
++	}
++	return buf.String(), runErr
++}
+diff --git a/pkg/backend/storage/fs/fsck_test.go b/pkg/backend/storage/fs/fsck_test.go
+new file mode 100644
+index 00000000..f3e37056
+--- /dev/null
++++ b/pkg/backend/storage/fs/fsck_test.go
+@@ -0,0 +1,28 @@
++package fs
++
++import (
++	"context"
++	"io/ioutil"
++	"os"
++	"path/filepath"
++	"testing"
++
++	"github.com/stretchr/testify/assert"
++)
++
++func TestFsckRemovesEmptyDirectories(t *testing.T) {
++	dir, err := ioutil.TempDir("", "gopass-fsck-")
++	assert.NoError(t, err)
++	defer os.RemoveAll(dir)
++
++	emptyDir := filepath.Join(dir, "stale-empty-dir")
++	assert.NoError(t, os.MkdirAll(emptyDir, 0700))
++
++	s := New(dir)
++
++	err = s.fsckCheckDir(context.Background(), emptyDir)
++	assert.NoError(t, err)
++
++	_, statErr := os.Stat(emptyDir)
++	assert.True(t, os.IsNotExist(statErr), "empty directory should be removed")
++}
+diff --git a/pkg/store/root/fsck_test.go b/pkg/store/root/fsck_test.go
+index 1c29b52f..93b61a0d 100644
+--- a/pkg/store/root/fsck_test.go
++++ b/pkg/store/root/fsck_test.go
+@@ -1,13 +1,22 @@
+ package root
+ 
+ import (
++	"bytes"
+ 	"context"
++	"errors"
++	"os"
++	"path/filepath"
++	"strings"
+ 	"testing"
+ 
++	"github.com/gopasspw/gopass/pkg/backend"
+ 	"github.com/gopasspw/gopass/pkg/ctxutil"
+ 	"github.com/gopasspw/gopass/pkg/out"
++	storepkg "github.com/gopasspw/gopass/pkg/store"
++	"github.com/gopasspw/gopass/pkg/tree"
+ 	"github.com/gopasspw/gopass/tests/gptest"
+ 
++	"github.com/fatih/color"
+ 	"github.com/stretchr/testify/assert"
+ )
+ 
+@@ -24,3 +33,150 @@ func TestFsck(t *testing.T) {
+ 
+ 	assert.NoError(t, rs.Fsck(ctx, ""))
+ }
++
++func TestFsckContinuesAfterSubStoreFailureAndReturnsAllFailures(t *testing.T) {
++	u := gptest.NewUnitTester(t)
++	defer u.Remove()
++
++	ctx := context.Background()
++	rs, err := createRootStore(ctx, u)
++	assert.NoError(t, err)
++
++	var seen []string
++	alphaErr := errors.New("alpha injected failure")
++	betaErr := errors.New("beta injected failure")
++
++	rs.mounts = map[string]storepkg.Store{
++		"alpha": &recordingStore{name: "alpha", err: alphaErr, seen: &seen},
++		"beta":  &recordingStore{name: "beta", err: betaErr, seen: &seen},
++	}
++
++	buf := &bytes.Buffer{}
++	oldOut := out.Stdout
++	out.Stdout = buf
++	defer func() {
++		out.Stdout = oldOut
++	}()
++	color.NoColor = true
++
++	err = rs.Fsck(ctx, "")
++	assert.Error(t, err)
++
++	assert.Contains(t, seen, "alpha:")
++	assert.Contains(t, seen, "beta:")
++
++	errText := err.Error()
++	assert.Contains(t, errText, "alpha injected failure")
++	assert.Contains(t, errText, "beta injected failure")
++
++	assert.NotEmpty(t, buf.String(), "fsck should report mounted-store failures")
++}
++
++func TestFsckPrefixesMountedStoreOutputWithAlias(t *testing.T) {
++	u := gptest.NewUnitTester(t)
++	defer u.Remove()
++
++	ctx := context.Background()
++	ctx = backend.WithCryptoBackend(ctx, backend.Plain)
++	ctx = backend.WithRCSBackend(ctx, backend.Noop)
++
++	rs, err := createRootStore(ctx, u)
++	assert.NoError(t, err)
++
++	assert.NoError(t, u.InitStore("alpha"))
++	assert.NoError(t, u.InitStore("beta"))
++	assert.NoError(t, os.Chmod(filepath.Join(u.StoreDir("alpha"), "foo.txt"), 0644))
++	assert.NoError(t, os.Chmod(filepath.Join(u.StoreDir("beta"), "foo.txt"), 0644))
++
++	assert.NoError(t, rs.AddMount(ctx, "alpha", u.StoreDir("alpha")))
++	assert.NoError(t, rs.AddMount(ctx, "beta", u.StoreDir("beta")))
++
++	buf := &bytes.Buffer{}
++	oldOut := out.Stdout
++	out.Stdout = buf
++	defer func() {
++		out.Stdout = oldOut
++	}()
++	color.NoColor = true
++
++	assert.NoError(t, rs.Fsck(ctx, ""))
++
++	got := buf.String()
++	assertOutputLineWithPrefixContains(t, got, "alpha", u.StoreDir("alpha"))
++	assertOutputLineWithPrefixContains(t, got, "beta", u.StoreDir("beta"))
++}
++
++func assertOutputLineWithPrefixContains(t *testing.T, output, alias, text string) {
++	t.Helper()
++	prefix := "[" + alias + "]"
++	for _, line := range strings.Split(output, "\n") {
++		if strings.HasPrefix(line, prefix) && strings.Contains(line, text) {
++			return
++		}
++	}
++	t.Fatalf("expected output line for %s to contain %q, got %q", alias, text, output)
++}
++
++type recordingStore struct {
++	name string
++	err  error
++	seen *[]string
++}
++
++func (r *recordingStore) String() string { return r.name }
++
++func (r *recordingStore) GetTemplate(context.Context, string) ([]byte, error) { return nil, nil }
++func (r *recordingStore) HasTemplate(context.Context, string) bool            { return false }
++func (r *recordingStore) ListTemplates(context.Context, string) []string      { return nil }
++func (r *recordingStore) LookupTemplate(context.Context, string) ([]byte, bool) {
++	return nil, false
++}
++func (r *recordingStore) RemoveTemplate(context.Context, string) error      { return nil }
++func (r *recordingStore) SetTemplate(context.Context, string, []byte) error { return nil }
++func (r *recordingStore) TemplateTree(context.Context) (tree.Tree, error)   { return nil, nil }
++
++func (r *recordingStore) AddRecipient(context.Context, string) error { return nil }
++func (r *recordingStore) GetRecipients(context.Context, string) ([]string, error) {
++	return nil, nil
++}
++func (r *recordingStore) RemoveRecipient(context.Context, string) error { return nil }
++func (r *recordingStore) SaveRecipients(context.Context) error          { return nil }
++func (r *recordingStore) SetRecipients(context.Context, []string) error { return nil }
++func (r *recordingStore) Recipients(context.Context) []string           { return nil }
++func (r *recordingStore) ImportMissingPublicKeys(context.Context) error { return nil }
++func (r *recordingStore) ExportMissingPublicKeys(context.Context, []string) (bool, error) {
++	return false, nil
++}
++
++func (r *recordingStore) Fsck(ctx context.Context, path string) error {
++	*r.seen = append(*r.seen, r.name+":"+path)
++	return r.err
++}
++func (r *recordingStore) Path() string                                  { return r.name }
++func (r *recordingStore) URL() string                                   { return r.name }
++func (r *recordingStore) RCS() backend.RCS                              { return nil }
++func (r *recordingStore) Crypto() backend.Crypto                        { return nil }
++func (r *recordingStore) Storage() backend.Storage                      { return nil }
++func (r *recordingStore) GitInit(context.Context, string, string) error { return nil }
++func (r *recordingStore) Alias() string                                 { return r.name }
++func (r *recordingStore) Copy(context.Context, string, string) error    { return nil }
++func (r *recordingStore) Delete(context.Context, string) error          { return nil }
++func (r *recordingStore) Equals(storepkg.Store) bool                    { return false }
++func (r *recordingStore) Exists(context.Context, string) bool           { return false }
++func (r *recordingStore) Get(context.Context, string) (storepkg.Secret, error) {
++	return nil, nil
++}
++func (r *recordingStore) GetRevision(context.Context, string, string) (storepkg.Secret, error) {
++	return nil, nil
++}
++func (r *recordingStore) Init(context.Context, string, ...string) error  { return nil }
++func (r *recordingStore) Initialized(context.Context) bool               { return true }
++func (r *recordingStore) IsDir(context.Context, string) bool             { return false }
++func (r *recordingStore) List(context.Context, string) ([]string, error) { return nil, nil }
++func (r *recordingStore) ListRevisions(context.Context, string) ([]backend.Revision, error) {
++	return nil, nil
++}
++func (r *recordingStore) Move(context.Context, string, string) error         { return nil }
++func (r *recordingStore) Set(context.Context, string, storepkg.Secret) error { return nil }
++func (r *recordingStore) Prune(context.Context, string) error                { return nil }
++func (r *recordingStore) Valid() bool                                        { return true }
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,33 @@
++#!/bin/bash
++set -euo pipefail
++cd /testbed
++
++
++export GOROOT=/opt/go-1.10
++export GOPATH=/root/go
++export GO111MODULE=off
++export PATH=$GOROOT/bin:$PATH
++
++
++mkdir -p /root/go/src/github.com/gopasspw
++ln -sfn /testbed /root/go/src/github.com/gopasspw/gopass
++
++
++rm -rf /root/.cache/go-build
++
++cd /root/go/src/github.com/gopasspw/gopass
++
++case "${1:-}" in
++  base)
++    go test -count=1 -v -run '^TestAction$' ./pkg/action/
++    ;;
++  new)
++    go test -count=1 -v -run '^(TestFsck|TestFsckPrintsStartupAndProgress|TestFsckSuppressesProgressWhenOutputHidden)$' ./pkg/action/
++    go test -count=1 -v -run '^TestFsckRemovesEmptyDirectories$' ./pkg/backend/storage/fs/
++    go test -count=1 -v -run '^(TestFsckContinuesAfterSubStoreFailureAndReturnsAllFailures|TestFsckPrefixesMountedStoreOutputWithAlias)$' ./pkg/store/root/
++    ;;
++  *)
++    echo "usage: $0 base|new"
++    exit 2
++    ;;
++esac

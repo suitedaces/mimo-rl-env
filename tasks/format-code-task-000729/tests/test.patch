@@ -1,0 +1,303 @@
+diff --git a/pkg/terraform/files_timeout_test.go b/pkg/terraform/files_timeout_test.go
+new file mode 100644
+index 0000000..e6958a2
+--- /dev/null
++++ b/pkg/terraform/files_timeout_test.go
+@@ -0,0 +1,276 @@
++package terraform
++
++import (
++	"context"
++	"encoding/base64"
++	"encoding/json"
++	"path/filepath"
++	"reflect"
++	"testing"
++	"time"
++
++	"github.com/crossplane/crossplane-runtime/pkg/meta"
++	xpfake "github.com/crossplane/crossplane-runtime/pkg/resource/fake"
++	"github.com/spf13/afero"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++
++	"github.com/crossplane/terrajet/pkg/config"
++	"github.com/crossplane/terrajet/pkg/resource"
++	"github.com/crossplane/terrajet/pkg/resource/fake"
++)
++
++
++
++const hiddenTerraformTimeoutMetadataKey = "e2bfb730-ecaa-11e6-8f88-34363bc7c4c0"
++
++func hiddenTimeoutTestResource(privateRaw string) resource.Terraformed {
++	annotations := map[string]string{
++		meta.AnnotationKeyExternalName: "some-id",
++	}
++	if privateRaw != "" {
++		annotations[resource.AnnotationKeyPrivateRawAttribute] = privateRaw
++	}
++	return &fake.Terraformed{
++		Managed: xpfake.Managed{
++			ObjectMeta: metav1.ObjectMeta{
++				Name:        "example",
++				Annotations: annotations,
++			},
++		},
++		Parameterizable: fake.Parameterizable{Parameters: map[string]interface{}{
++			"param": "paramval",
++		}},
++		Observable: fake.Observable{Observation: map[string]interface{}{
++			"obs": "obsval",
++		}},
++		MetadataProvider: fake.MetadataProvider{Type: "terrajet_resource"},
++	}
++}
++
++func hiddenWriteTFStateMetadata(t *testing.T, cfg *config.Resource, privateRaw string) map[string]interface{} {
++	t.Helper()
++
++	fs := afero.NewMemMapFs()
++	ctx := context.Background()
++	fp, err := NewFileProducer(ctx, nil, dir, hiddenTimeoutTestResource(privateRaw), Setup{}, cfg, WithFileSystem(fs))
++	if err != nil {
++		t.Fatalf("cannot initialize file producer: %v", err)
++	}
++	if err := fp.WriteTFState(ctx); err != nil {
++		t.Fatalf("cannot write tfstate: %v", err)
++	}
++
++	rawState, err := afero.ReadFile(fs, filepath.Join(dir, "terraform.tfstate"))
++	if err != nil {
++		t.Fatalf("cannot read generated tfstate: %v", err)
++	}
++
++	var state struct {
++		Resources []struct {
++			Instances []struct {
++				Private string `json:"private"`
++			} `json:"instances"`
++		} `json:"resources"`
++	}
++	if err := json.Unmarshal(rawState, &state); err != nil {
++		t.Fatalf("cannot parse generated tfstate: %v\n%s", err, string(rawState))
++	}
++	if len(state.Resources) != 1 || len(state.Resources[0].Instances) != 1 {
++		t.Fatalf("expected one state resource instance, got %#v", state.Resources)
++	}
++
++	decoded, err := base64.StdEncoding.DecodeString(state.Resources[0].Instances[0].Private)
++	if err != nil {
++		t.Fatalf("cannot decode private state metadata: %v", err)
++	}
++	if len(decoded) == 0 {
++		return map[string]interface{}{}
++	}
++
++	var meta map[string]interface{}
++	if err := json.Unmarshal(decoded, &meta); err != nil {
++		t.Fatalf("cannot parse private state metadata: %v\n%s", err, string(decoded))
++	}
++	return meta
++}
++
++func hiddenWriteMainTFResource(t *testing.T, cfg *config.Resource) map[string]interface{} {
++	t.Helper()
++
++	fs := afero.NewMemMapFs()
++	ctx := context.Background()
++	setup := Setup{
++		Requirement: ProviderRequirement{
++			Source:  "hashicorp/provider-test",
++			Version: "1.2.3",
++		},
++	}
++	fp, err := NewFileProducer(ctx, nil, dir, hiddenTimeoutTestResource("{}"), setup, cfg, WithFileSystem(fs))
++	if err != nil {
++		t.Fatalf("cannot initialize file producer: %v", err)
++	}
++	if err := fp.WriteMainTF(); err != nil {
++		t.Fatalf("cannot write main.tf: %v", err)
++	}
++
++	rawMainTF, err := afero.ReadFile(fs, filepath.Join(dir, "main.tf.json"))
++	if err != nil {
++		t.Fatalf("cannot read generated main.tf: %v", err)
++	}
++	var mainTF map[string]interface{}
++	if err := json.Unmarshal(rawMainTF, &mainTF); err != nil {
++		t.Fatalf("cannot parse generated main.tf: %v\n%s", err, string(rawMainTF))
++	}
++
++	resources := hiddenObject(t, mainTF["resource"])
++	byType := hiddenObject(t, resources["terrajet_resource"])
++	return hiddenObject(t, byType["example"])
++}
++
++func hiddenObject(t *testing.T, v interface{}) map[string]interface{} {
++	t.Helper()
++	m, ok := v.(map[string]interface{})
++	if !ok {
++		t.Fatalf("expected object, got %T: %#v", v, v)
++	}
++	return m
++}
++
++func hiddenTimeoutMetadata(t *testing.T, meta map[string]interface{}) map[string]interface{} {
++	t.Helper()
++	v, ok := meta[hiddenTerraformTimeoutMetadataKey]
++	if !ok {
++		t.Fatalf("timeout metadata key %q is absent from %#v", hiddenTerraformTimeoutMetadataKey, meta)
++	}
++	return hiddenObject(t, v)
++}
++
++func hiddenAssertNumber(t *testing.T, got interface{}, want int64) {
++	t.Helper()
++	if got != float64(want) {
++		t.Fatalf("unexpected numeric timeout value: got %#v (%T), want %d", got, got, want)
++	}
++}
++
++func TestWriteTFState_OperationTimeoutsPrivateMetadata(t *testing.T) {
++	t.Run("ConfiguredReadAndCreateTimeoutsAreEncoded", func(t *testing.T) {
++		cfg := config.DefaultResource("terrajet_resource", nil, func(r *config.Resource) {
++			r.OperationTimeouts.Read = 2 * time.Minute
++			r.OperationTimeouts.Create = 3 * time.Minute
++		})
++
++		meta := hiddenWriteTFStateMetadata(t, cfg, `{}`)
++		timeouts := hiddenTimeoutMetadata(t, meta)
++
++		hiddenAssertNumber(t, timeouts["read"], (2 * time.Minute).Nanoseconds())
++		hiddenAssertNumber(t, timeouts["create"], (3 * time.Minute).Nanoseconds())
++		if _, ok := timeouts["update"]; ok {
++			t.Fatalf("unexpected update timeout metadata: %#v", timeouts)
++		}
++		if _, ok := timeouts["delete"]; ok {
++			t.Fatalf("unexpected delete timeout metadata: %#v", timeouts)
++		}
++	})
++
++	t.Run("ConfiguredUpdateAndDeleteTimeoutsAreEncoded", func(t *testing.T) {
++		cfg := config.DefaultResource("terrajet_resource", nil, func(r *config.Resource) {
++			r.OperationTimeouts.Update = 4 * time.Minute
++			r.OperationTimeouts.Delete = 5 * time.Minute
++		})
++
++		meta := hiddenWriteTFStateMetadata(t, cfg, `{}`)
++		timeouts := hiddenTimeoutMetadata(t, meta)
++
++		hiddenAssertNumber(t, timeouts["update"], (4 * time.Minute).Nanoseconds())
++		hiddenAssertNumber(t, timeouts["delete"], (5 * time.Minute).Nanoseconds())
++		if _, ok := timeouts["read"]; ok {
++			t.Fatalf("unexpected read timeout metadata: %#v", timeouts)
++		}
++		if _, ok := timeouts["create"]; ok {
++			t.Fatalf("unexpected create timeout metadata: %#v", timeouts)
++		}
++	})
++
++	t.Run("NoConfiguredTimeoutDoesNotAddTimeoutMetadata", func(t *testing.T) {
++		cfg := config.DefaultResource("terrajet_resource", nil)
++
++		meta := hiddenWriteTFStateMetadata(t, cfg, `{"some-key":"some-value","nested":{"x":1}}`)
++
++		if _, ok := meta[hiddenTerraformTimeoutMetadataKey]; ok {
++			t.Fatalf("timeout metadata should be absent when no timeout is configured: %#v", meta)
++		}
++		if got := meta["some-key"]; got != "some-value" {
++			t.Fatalf("unrelated metadata was not preserved: got %#v", got)
++		}
++		if !reflect.DeepEqual(meta["nested"], map[string]interface{}{"x": float64(1)}) {
++			t.Fatalf("nested unrelated metadata was not preserved: %#v", meta["nested"])
++		}
++	})
++
++	t.Run("ExistingTimeoutMetadataIsMerged", func(t *testing.T) {
++		cfg := config.DefaultResource("terrajet_resource", nil, func(r *config.Resource) {
++			r.OperationTimeouts.Read = time.Minute
++		})
++		existing := `{"e2bfb730-ecaa-11e6-8f88-34363bc7c4c0":{"create":600000000000,"read":1200000000000},"some-key":"some-value"}`
++
++		meta := hiddenWriteTFStateMetadata(t, cfg, existing)
++		timeouts := hiddenTimeoutMetadata(t, meta)
++
++		hiddenAssertNumber(t, timeouts["read"], time.Minute.Nanoseconds())
++		hiddenAssertNumber(t, timeouts["create"], (10 * time.Minute).Nanoseconds())
++		if _, ok := timeouts["update"]; ok {
++			t.Fatalf("unexpected zero-value update timeout metadata: %#v", timeouts)
++		}
++		if got := meta["some-key"]; got != "some-value" {
++			t.Fatalf("unrelated metadata was not preserved: got %#v", got)
++		}
++	})
++
++	t.Run("ExistingMetadataWithoutTimeoutGetsTimeoutKey", func(t *testing.T) {
++		cfg := config.DefaultResource("terrajet_resource", nil, func(r *config.Resource) {
++			r.OperationTimeouts.Delete = 6 * time.Minute
++		})
++
++		meta := hiddenWriteTFStateMetadata(t, cfg, `{"other":{"keep":true},"some-key":"some-value"}`)
++		timeouts := hiddenTimeoutMetadata(t, meta)
++
++		hiddenAssertNumber(t, timeouts["delete"], (6 * time.Minute).Nanoseconds())
++		if got := meta["some-key"]; got != "some-value" {
++			t.Fatalf("unrelated metadata was not preserved: got %#v", got)
++		}
++		if !reflect.DeepEqual(meta["other"], map[string]interface{}{"keep": true}) {
++			t.Fatalf("nested unrelated metadata was not preserved: %#v", meta["other"])
++		}
++	})
++}
++
++func TestWriteMainTF_OperationTimeoutsParameterUnchanged(t *testing.T) {
++	t.Run("ConfiguredTimeoutsAreRenderedAsParameters", func(t *testing.T) {
++		cfg := config.DefaultResource("terrajet_resource", nil, func(r *config.Resource) {
++			r.OperationTimeouts.Read = 7 * time.Minute
++			r.OperationTimeouts.Update = 11 * time.Minute
++		})
++
++		resource := hiddenWriteMainTFResource(t, cfg)
++		got, ok := resource["timeouts"].(map[string]interface{})
++		if !ok {
++			t.Fatalf("timeouts parameter is absent or has unexpected type: %#v", resource["timeouts"])
++		}
++		want := map[string]interface{}{
++			"read":   "7m0s",
++			"update": "11m0s",
++		}
++		if !reflect.DeepEqual(got, want) {
++			t.Fatalf("unexpected timeouts parameter: got %#v, want %#v", got, want)
++		}
++	})
++
++	t.Run("NoConfiguredTimeoutOmitsTimeoutsParameter", func(t *testing.T) {
++		cfg := config.DefaultResource("terrajet_resource", nil)
++
++		resource := hiddenWriteMainTFResource(t, cfg)
++		if _, ok := resource["timeouts"]; ok {
++			t.Fatalf("timeouts parameter should be omitted when all operation timeouts are unset: %#v", resource["timeouts"])
++		}
++	})
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,16 @@
++#!/bin/bash
++set -uo pipefail
++cd /testbed
++
++case "$1" in
++  base)
++    go test -v -count=1 ./pkg/terraform/ -run '^(TestWriteTFState|TestWriteMainTF)$'
++    ;;
++  new)
++    go test -v -count=1 ./pkg/terraform/ -run '^(TestWriteTFState_OperationTimeoutsPrivateMetadata|TestWriteMainTF_OperationTimeoutsParameterUnchanged)$'
++    ;;
++  *)
++    echo "usage: $0 base|new"
++    exit 2
++    ;;
++esac

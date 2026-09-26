@@ -1,0 +1,521 @@
+diff --git a/usercase-test-coderl/amqp_publisher_test.go b/usercase-test-coderl/amqp_publisher_test.go
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/amqp_publisher_test.go
+@@ -0,0 +1,489 @@
++package usercase_test_coderl
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"testing"
++	"time"
++
++	amqptransport "github.com/go-kit/kit/transport/amqp"
++	amqp "github.com/rabbitmq/amqp091-go"
++)
++
++type squadronRequest struct {
++	Squadron int `json:"s"`
++}
++
++type squadronResponse struct {
++	Squadron int    `json:"s"`
++	Name     string `json:"n"`
++}
++
++type publishCall struct {
++	Exchange  string
++	Key       string
++	Mandatory bool
++	Immediate bool
++	Message   amqp.Publishing
++}
++
++type consumeCall struct {
++	Queue     string
++	Consumer  string
++	AutoAck   bool
++	Exclusive bool
++	NoLocal   bool
++	NoWait    bool
++	Args      amqp.Table
++}
++
++type recordingChannel struct {
++	publishes  []publishCall
++	consumes   []consumeCall
++	deliveries []amqp.Delivery
++}
++
++func (ch *recordingChannel) Publish(exchange, key string, mandatory, immediate bool, msg amqp.Publishing) error {
++	ch.publishes = append(ch.publishes, publishCall{
++		Exchange:  exchange,
++		Key:       key,
++		Mandatory: mandatory,
++		Immediate: immediate,
++		Message:   msg,
++	})
++	return nil
++}
++
++func (ch *recordingChannel) Consume(queue, consumer string, autoAck, exclusive, noLocal, noWait bool, args amqp.Table) (<-chan amqp.Delivery, error) {
++	ch.consumes = append(ch.consumes, consumeCall{
++		Queue:     queue,
++		Consumer:  consumer,
++		AutoAck:   autoAck,
++		Exclusive: exclusive,
++		NoLocal:   noLocal,
++		NoWait:    noWait,
++		Args:      args,
++	})
++	out := make(chan amqp.Delivery, len(ch.deliveries))
++	for _, delivery := range ch.deliveries {
++		out <- delivery
++	}
++	return out, nil
++}
++
++type ackRecorder struct {
++	count    int
++	tags     []uint64
++	multiple []bool
++}
++
++func (a *ackRecorder) Ack(tag uint64, multiple bool) error {
++	a.count++
++	a.tags = append(a.tags, tag)
++	a.multiple = append(a.multiple, multiple)
++	return nil
++}
++
++func (a *ackRecorder) Nack(tag uint64, multiple bool, requeue bool) error {
++	return nil
++}
++
++func (a *ackRecorder) Reject(tag uint64, requeue bool) error {
++	return nil
++}
++
++func encodeJSONRequest(_ context.Context, pub *amqp.Publishing, request interface{}) error {
++	body, err := json.Marshal(request)
++	if err != nil {
++		return err
++	}
++	pub.Body = body
++	pub.ContentType = "application/json"
++	return nil
++}
++
++func decodeJSONResponse(_ context.Context, delivery *amqp.Delivery) (interface{}, error) {
++	var response squadronResponse
++	if err := json.Unmarshal(delivery.Body, &response); err != nil {
++		return nil, err
++	}
++	return response, nil
++}
++
++func mustResponseBody(t *testing.T, response squadronResponse) []byte {
++	t.Helper()
++	body, err := json.Marshal(response)
++	if err != nil {
++		t.Fatal(err)
++	}
++	return body
++}
++
++func TestPublisherEndpointPublishesConsumesMatchesAcksAndDecodes(t *testing.T) {
++
++
++	acker := &ackRecorder{}
++	channel := &recordingChannel{
++		deliveries: []amqp.Delivery{
++			{CorrelationId: "wrong", Body: []byte(`{"s":1,"n":"wrong"}`)},
++			{CorrelationId: "correlation", Body: []byte(`{"s":437,"n":"husky"}`), Acknowledger: acker, DeliveryTag: 9},
++		},
++	}
++	queue := &amqp.Queue{Name: "some queue"}
++	afterSeen := ""
++
++	publisher := amqptransport.NewPublisher(
++		channel,
++		queue,
++		encodeJSONRequest,
++		decodeJSONResponse,
++		amqptransport.PublisherBefore(
++			amqptransport.SetCorrelationID("correlation"),
++			amqptransport.SetPublishExchange("fleet"),
++			amqptransport.SetPublishKey("requests"),
++			amqptransport.SetConsumeAutoAck(false),
++			amqptransport.SetConsumeArgs(amqp.Table{"priority": "gold"}),
++		),
++		amqptransport.PublisherAfter(func(ctx context.Context, delivery *amqp.Delivery) context.Context {
++			afterSeen = delivery.CorrelationId + ":" + string(delivery.Body)
++			return ctx
++		}),
++	)
++
++	actual, err := publisher.Endpoint()(context.Background(), squadronRequest{Squadron: 437})
++	if err != nil {
++		t.Fatalf("unexpected endpoint error: %v", err)
++	}
++
++	if got := actual.(squadronResponse); got != (squadronResponse{Squadron: 437, Name: "husky"}) {
++		t.Fatalf("decoded response = %#v, want %#v", got, squadronResponse{Squadron: 437, Name: "husky"})
++	}
++	if len(channel.publishes) != 1 {
++		t.Fatalf("publish call count = %d, want 1", len(channel.publishes))
++	}
++	if channel.publishes[0].Exchange != "fleet" {
++		t.Fatalf("publish exchange = %q, want %q", channel.publishes[0].Exchange, "fleet")
++	}
++	if channel.publishes[0].Key != "requests" {
++		t.Fatalf("publish key = %q, want %q", channel.publishes[0].Key, "requests")
++	}
++
++	if channel.publishes[0].Message.CorrelationId != "correlation" {
++		t.Fatalf("publishing CorrelationId = %q, want %q", channel.publishes[0].Message.CorrelationId, "correlation")
++	}
++	if channel.publishes[0].Message.ContentType != "application/json" {
++		t.Fatalf("publishing ContentType = %q, want %q", channel.publishes[0].Message.ContentType, "application/json")
++	}
++	if string(channel.publishes[0].Message.Body) != `{"s":437}` {
++		t.Fatalf("publishing Body = %s, want %s", string(channel.publishes[0].Message.Body), `{"s":437}`)
++	}
++	if len(channel.consumes) != 1 {
++		t.Fatalf("consume call count = %d, want 1", len(channel.consumes))
++	}
++	if channel.consumes[0].Queue != "some queue" {
++		t.Fatalf("consume queue = %q, want %q", channel.consumes[0].Queue, "some queue")
++	}
++
++	if channel.consumes[0].AutoAck != false {
++		t.Fatalf("consume autoAck = %v, want false", channel.consumes[0].AutoAck)
++	}
++	if got := channel.consumes[0].Args["priority"]; got != "gold" {
++		t.Fatalf("consume args priority = %#v, want %q", got, "gold")
++	}
++	if acker.count != 1 {
++		t.Fatalf("ack count = %d, want 1", acker.count)
++	}
++	if len(acker.tags) != 1 || acker.tags[0] != 9 {
++		t.Fatalf("ack tags = %#v, want []uint64{9}", acker.tags)
++	}
++
++	if afterSeen != `correlation:{"s":437,"n":"husky"}` {
++		t.Fatalf("after hook saw %q, want %q", afterSeen, `correlation:{"s":437,"n":"husky"}`)
++	}
++}
++
++func TestPublisherEndpointReturnsEncodeErrorBeforePublishOrConsume(t *testing.T) {
++
++
++	channel := &recordingChannel{}
++	publisher := amqptransport.NewPublisher(
++		channel,
++		&amqp.Queue{Name: "some queue"},
++		func(context.Context, *amqp.Publishing, interface{}) error { return errors.New("err!") },
++		decodeJSONResponse,
++	)
++
++	actual, err := publisher.Endpoint()(context.Background(), squadronRequest{Squadron: 437})
++
++	if actual != nil {
++		t.Fatalf("response = %#v, want nil", actual)
++	}
++	if err == nil {
++		t.Fatal("error = nil, want errors.New(\"err!\")")
++	}
++	if err.Error() != "err!" {
++		t.Fatalf("error message = %q, want %q", err.Error(), "err!")
++	}
++	if len(channel.publishes) != 0 {
++		t.Fatalf("publish call count = %d, want 0", len(channel.publishes))
++	}
++	if len(channel.consumes) != 0 {
++		t.Fatalf("consume call count = %d, want 0", len(channel.consumes))
++	}
++}
++
++func TestPublisherEndpointReturnsDecodeErrorAfterMatchedReply(t *testing.T) {
++
++
++	channel := &recordingChannel{
++		deliveries: []amqp.Delivery{
++			{CorrelationId: "correlation", Body: []byte(`{"s":437,"n":"husky"}`)},
++		},
++	}
++	publisher := amqptransport.NewPublisher(
++		channel,
++		&amqp.Queue{Name: "some queue"},
++		encodeJSONRequest,
++		func(context.Context, *amqp.Delivery) (interface{}, error) { return nil, errors.New("err!") },
++		amqptransport.PublisherBefore(amqptransport.SetCorrelationID("correlation")),
++	)
++
++	actual, err := publisher.Endpoint()(context.Background(), squadronRequest{Squadron: 437})
++
++	if actual != nil {
++		t.Fatalf("response = %#v, want nil", actual)
++	}
++	if err == nil {
++		t.Fatal("error = nil, want errors.New(\"err!\")")
++	}
++	if err.Error() != "err!" {
++		t.Fatalf("error message = %q, want %q", err.Error(), "err!")
++	}
++	if len(channel.publishes) != 1 {
++		t.Fatalf("publish call count = %d, want 1", len(channel.publishes))
++	}
++	if len(channel.consumes) != 1 {
++		t.Fatalf("consume call count = %d, want 1", len(channel.consumes))
++	}
++}
++
++func TestPublisherTimeoutReturnsContextDeadlineExceeded(t *testing.T) {
++
++
++	channel := &recordingChannel{}
++	publisher := amqptransport.NewPublisher(
++		channel,
++		&amqp.Queue{Name: "some queue"},
++		encodeJSONRequest,
++		decodeJSONResponse,
++		amqptransport.PublisherBefore(amqptransport.SetCorrelationID("missing")),
++		amqptransport.PublisherTimeout(5*time.Millisecond),
++	)
++
++	actual, err := publisher.Endpoint()(context.Background(), squadronRequest{Squadron: 437})
++
++	if actual != nil {
++		t.Fatalf("response = %#v, want nil", actual)
++	}
++	if !errors.Is(err, context.DeadlineExceeded) {
++		t.Fatalf("error = %#v, want context.DeadlineExceeded", err)
++	}
++
++	if err == nil {
++		t.Fatal("error = nil, want context.DeadlineExceeded")
++	}
++	if len(channel.publishes) != 1 {
++		t.Fatalf("publish call count = %d, want 1", len(channel.publishes))
++	}
++	if len(channel.consumes) != 1 {
++		t.Fatalf("consume call count = %d, want 1", len(channel.consumes))
++	}
++}
++
++func TestSetConsumeAutoAckTrueDoesNotAckMatchedDelivery(t *testing.T) {
++
++
++	acker := &ackRecorder{}
++	channel := &recordingChannel{
++		deliveries: []amqp.Delivery{
++			{CorrelationId: "correlation", Body: []byte(`{"s":437,"n":"husky"}`), Acknowledger: acker, DeliveryTag: 10},
++		},
++	}
++	publisher := amqptransport.NewPublisher(
++		channel,
++		&amqp.Queue{Name: "some queue"},
++		encodeJSONRequest,
++		decodeJSONResponse,
++		amqptransport.PublisherBefore(
++			amqptransport.SetCorrelationID("correlation"),
++			amqptransport.SetConsumeAutoAck(true),
++		),
++	)
++
++	actual, err := publisher.Endpoint()(context.Background(), squadronRequest{Squadron: 437})
++	if err != nil {
++		t.Fatalf("unexpected endpoint error: %v", err)
++	}
++	if got := actual.(squadronResponse); got != (squadronResponse{Squadron: 437, Name: "husky"}) {
++		t.Fatalf("decoded response = %#v, want %#v", got, squadronResponse{Squadron: 437, Name: "husky"})
++	}
++	if channel.consumes[0].AutoAck != true {
++		t.Fatalf("consume autoAck = %v, want true", channel.consumes[0].AutoAck)
++	}
++	if acker.count != 0 {
++		t.Fatalf("ack count = %d, want 0", acker.count)
++	}
++}
++
++func TestSendAndForgetDelivererPublishesWithoutConsuming(t *testing.T) {
++
++
++	channel := &recordingChannel{}
++	publisher := amqptransport.NewPublisher(
++		channel,
++		&amqp.Queue{Name: "some queue"},
++		encodeJSONRequest,
++		func(context.Context, *amqp.Delivery) (interface{}, error) { return "forgotten", nil },
++		amqptransport.PublisherBefore(
++			amqptransport.SetCorrelationID("fire"),
++			amqptransport.SetPublishExchange("fleet"),
++			amqptransport.SetPublishKey("events"),
++		),
++		amqptransport.PublisherDeliverer(amqptransport.SendAndForgetDeliverer),
++		amqptransport.PublisherTimeout(time.Hour),
++	)
++
++	actual, err := publisher.Endpoint()(context.Background(), squadronRequest{Squadron: 437})
++	if err != nil {
++		t.Fatalf("unexpected endpoint error: %v", err)
++	}
++	if actual != "forgotten" {
++		t.Fatalf("response = %#v, want %q", actual, "forgotten")
++	}
++	if len(channel.publishes) != 1 {
++		t.Fatalf("publish call count = %d, want 1", len(channel.publishes))
++	}
++	if len(channel.consumes) != 0 {
++		t.Fatalf("consume call count = %d, want 0", len(channel.consumes))
++	}
++	if channel.publishes[0].Exchange != "fleet" {
++		t.Fatalf("publish exchange = %q, want %q", channel.publishes[0].Exchange, "fleet")
++	}
++	if channel.publishes[0].Key != "events" {
++		t.Fatalf("publish key = %q, want %q", channel.publishes[0].Key, "events")
++	}
++	if channel.publishes[0].Message.CorrelationId != "fire" {
++		t.Fatalf("publishing CorrelationId = %q, want %q", channel.publishes[0].Message.CorrelationId, "fire")
++	}
++}
++
++func TestPublisherInstancesKeepIndependentState(t *testing.T) {
++
++
++	channelA := &recordingChannel{
++		deliveries: []amqp.Delivery{
++			{CorrelationId: "a", Body: []byte(`{"s":101,"n":"alpha"}`)},
++		},
++	}
++	channelB := &recordingChannel{
++		deliveries: []amqp.Delivery{
++			{CorrelationId: "b", Body: []byte(`{"s":202,"n":"bravo"}`)},
++		},
++	}
++	publisherA := amqptransport.NewPublisher(
++		channelA,
++		&amqp.Queue{Name: "qa"},
++		encodeJSONRequest,
++		decodeJSONResponse,
++		amqptransport.PublisherBefore(
++			amqptransport.SetCorrelationID("a"),
++			amqptransport.SetPublishKey("ka"),
++		),
++	)
++	publisherB := amqptransport.NewPublisher(
++		channelB,
++		&amqp.Queue{Name: "qb"},
++		encodeJSONRequest,
++		decodeJSONResponse,
++		amqptransport.PublisherBefore(
++			amqptransport.SetCorrelationID("b"),
++			amqptransport.SetPublishKey("kb"),
++		),
++	)
++
++	actualA, errA := publisherA.Endpoint()(context.Background(), squadronRequest{Squadron: 101})
++	actualB, errB := publisherB.Endpoint()(context.Background(), squadronRequest{Squadron: 202})
++
++	if errA != nil {
++		t.Fatalf("publisher A error = %v, want nil", errA)
++	}
++	if errB != nil {
++		t.Fatalf("publisher B error = %v, want nil", errB)
++	}
++	if got := actualA.(squadronResponse); got != (squadronResponse{Squadron: 101, Name: "alpha"}) {
++		t.Fatalf("publisher A response = %#v, want %#v", got, squadronResponse{Squadron: 101, Name: "alpha"})
++	}
++	if got := actualB.(squadronResponse); got != (squadronResponse{Squadron: 202, Name: "bravo"}) {
++		t.Fatalf("publisher B response = %#v, want %#v", got, squadronResponse{Squadron: 202, Name: "bravo"})
++	}
++
++	if channelA.consumes[0].Queue != "qa" {
++		t.Fatalf("publisher A consume queue = %q, want %q", channelA.consumes[0].Queue, "qa")
++	}
++	if channelB.consumes[0].Queue != "qb" {
++		t.Fatalf("publisher B consume queue = %q, want %q", channelB.consumes[0].Queue, "qb")
++	}
++	if channelA.publishes[0].Key != "ka" {
++		t.Fatalf("publisher A key = %q, want %q", channelA.publishes[0].Key, "ka")
++	}
++	if channelB.publishes[0].Key != "kb" {
++		t.Fatalf("publisher B key = %q, want %q", channelB.publishes[0].Key, "kb")
++	}
++	if channelA.publishes[0].Message.CorrelationId != "a" {
++		t.Fatalf("publisher A correlation = %q, want %q", channelA.publishes[0].Message.CorrelationId, "a")
++	}
++	if channelB.publishes[0].Message.CorrelationId != "b" {
++		t.Fatalf("publisher B correlation = %q, want %q", channelB.publishes[0].Message.CorrelationId, "b")
++	}
++}
++
++func TestPublisherConstructUseCyclesDoNotLeakGoroutinesOrFDs(t *testing.T) {
++
++
++	body := mustResponseBody(t, squadronResponse{Squadron: 437, Name: "husky"})
++	totalPublishes := 0
++	totalConsumes := 0
++
++	for i := 0; i < 100; i++ {
++		channel := &recordingChannel{
++			deliveries: []amqp.Delivery{
++				{CorrelationId: "correlation", Body: body},
++			},
++		}
++		publisher := amqptransport.NewPublisher(
++			channel,
++			&amqp.Queue{Name: "some queue"},
++			encodeJSONRequest,
++			decodeJSONResponse,
++			amqptransport.PublisherBefore(amqptransport.SetCorrelationID("correlation")),
++		)
++		actual, err := publisher.Endpoint()(context.Background(), squadronRequest{Squadron: 437})
++		if err != nil {
++			t.Fatalf("cycle %d endpoint error = %v, want nil", i, err)
++		}
++		if got := actual.(squadronResponse); got != (squadronResponse{Squadron: 437, Name: "husky"}) {
++			t.Fatalf("cycle %d response = %#v, want %#v", i, got, squadronResponse{Squadron: 437, Name: "husky"})
++		}
++		totalPublishes += len(channel.publishes)
++		totalConsumes += len(channel.consumes)
++	}
++
++
++	if totalPublishes != 100 {
++		t.Fatalf("publish calls across cycles = %d, want 100", totalPublishes)
++	}
++	if totalConsumes != 100 {
++		t.Fatalf("consume calls across cycles = %d, want 100", totalConsumes)
++	}
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,22 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++cd /workspace/repo
++
++
++export GOPROXY=off
++export GOSUMDB=off
++export GOTOOLCHAIN=local
++export GOVCS='*:off'
++export GOFLAGS="-mod=readonly"
++
++exec go test -v -count=1 ./usercase-test-coderl/...

@@ -1,0 +1,138 @@
+diff --git a/porch/repository/pkg/git/resource_update_contract_test.go b/porch/repository/pkg/git/resource_update_contract_test.go
+new file mode 100644
+index 000000000..e752e2bbd
+--- /dev/null
++++ b/porch/repository/pkg/git/resource_update_contract_test.go
+@@ -0,0 +1,122 @@
++package git
++
++import (
++	"context"
++	"path/filepath"
++	"testing"
++
++	"github.com/GoogleContainerTools/kpt/porch/api/porch/v1alpha1"
++	configapi "github.com/GoogleContainerTools/kpt/porch/api/porchconfig/v1alpha1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++)
++
++func TestResourceUpdateReplacesSnapshotAndValidatesPaths(t *testing.T) {
++	ctx := context.Background()
++	root := t.TempDir()
++	_, address := ServeGitRepository(t, filepath.Join("testdata", "trivial-repository.tar"), root)
++	repo, err := OpenRepository(ctx, "contract", "default", &configapi.GitRepository{Repo: address}, filepath.Join(root, "cache"), GitRepositoryOptions{})
++	if err != nil {
++		t.Fatalf("OpenRepository failed: %v", err)
++	}
++
++	invalidCases := []struct {
++		name      string
++		packageID string
++		resources map[string]string
++	}{
++		{name: "parent traversal", packageID: "parent", resources: map[string]string{"../escape.yaml": "bad"}},
++		{name: "absolute path", packageID: "absolute", resources: map[string]string{"/escape.yaml": "bad"}},
++		{name: "parent segment", packageID: "parent-segment", resources: map[string]string{"nested/../escape.yaml": "bad"}},
++		{name: "current segment", packageID: "current-segment", resources: map[string]string{"./escape.yaml": "bad"}},
++		{name: "empty path", packageID: "empty", resources: map[string]string{"": "bad"}},
++		{name: "file and child conflict", packageID: "conflict", resources: map[string]string{"a": "file", "a/b": "child"}},
++	}
++	for _, tc := range invalidCases {
++		t.Run(tc.name, func(t *testing.T) {
++			packageName := "invalid-" + tc.packageID
++			draft, err := repo.CreatePackageRevision(ctx, &v1alpha1.PackageRevision{
++				ObjectMeta: metav1.ObjectMeta{Name: "contract:" + packageName + ":v1", Namespace: "default"},
++				Spec:       v1alpha1.PackageRevisionSpec{PackageName: packageName, Revision: "v1", RepositoryName: "contract"},
++			})
++			if err != nil {
++				t.Fatalf("CreatePackageRevision failed: %v", err)
++			}
++			original := map[string]string{"Kptfile": "kind: Kptfile\n", "keep.txt": "keep"}
++			if err := draft.UpdateResources(ctx, &v1alpha1.PackageRevisionResources{Spec: v1alpha1.PackageRevisionResourcesSpec{Resources: original}}, &v1alpha1.Task{}); err != nil {
++				t.Fatalf("initial UpdateResources failed: %v", err)
++			}
++			created, err := draft.Close(ctx)
++			if err != nil {
++				t.Fatalf("initial Close failed: %v", err)
++			}
++			update, err := repo.UpdatePackage(ctx, created)
++			if err != nil {
++				t.Fatalf("UpdatePackage failed: %v", err)
++			}
++			err = update.UpdateResources(ctx, &v1alpha1.PackageRevisionResources{Spec: v1alpha1.PackageRevisionResourcesSpec{Resources: tc.resources}}, &v1alpha1.Task{})
++			if err == nil {
++				t.Fatalf("UpdateResources accepted invalid resource paths: %#v", tc.resources)
++			}
++			unchanged, err := update.Close(ctx)
++			if err != nil {
++				t.Fatalf("Close after rejected update failed: %v", err)
++			}
++			resources, err := unchanged.GetResources(ctx)
++			if err != nil {
++				t.Fatalf("GetResources after rejected update failed: %v", err)
++			}
++			if len(resources.Spec.Resources) != len(original) {
++				t.Fatalf("rejected update changed resource count: got %#v, want %#v", resources.Spec.Resources, original)
++			}
++			for key, want := range original {
++				if got := resources.Spec.Resources[key]; got != want {
++					t.Errorf("rejected update changed %q: got %q, want %q", key, got, want)
++				}
++			}
++		})
++	}
++
++	draft, err := repo.CreatePackageRevision(ctx, &v1alpha1.PackageRevision{
++		ObjectMeta: metav1.ObjectMeta{Name: "contract:replace:v1", Namespace: "default"},
++		Spec:       v1alpha1.PackageRevisionSpec{PackageName: "replace", Revision: "v1", RepositoryName: "contract"},
++	})
++	if err != nil {
++		t.Fatalf("CreatePackageRevision failed: %v", err)
++	}
++	initial := map[string]string{"Kptfile": "kind: Kptfile\n", "old.yaml": "old", "nested/keep.txt": "keep"}
++	if err := draft.UpdateResources(ctx, &v1alpha1.PackageRevisionResources{Spec: v1alpha1.PackageRevisionResourcesSpec{Resources: initial}}, &v1alpha1.Task{}); err != nil {
++		t.Fatalf("initial UpdateResources failed: %v", err)
++	}
++	revision, err := draft.Close(ctx)
++	if err != nil {
++		t.Fatalf("initial Close failed: %v", err)
++	}
++
++	update, err := repo.UpdatePackage(ctx, revision)
++	if err != nil {
++		t.Fatalf("UpdatePackage failed: %v", err)
++	}
++	replacement := map[string]string{"Kptfile": "kind: Kptfile\n", "new.yaml": "new", "nested/keep.txt": "updated"}
++	if err := update.UpdateResources(ctx, &v1alpha1.PackageRevisionResources{Spec: v1alpha1.PackageRevisionResourcesSpec{Resources: replacement}}, &v1alpha1.Task{}); err != nil {
++		t.Fatalf("replacement UpdateResources failed: %v", err)
++	}
++	updated, err := update.Close(ctx)
++	if err != nil {
++		t.Fatalf("replacement Close failed: %v", err)
++	}
++	resources, err := updated.GetResources(ctx)
++	if err != nil {
++		t.Fatalf("GetResources failed: %v", err)
++	}
++	if got := resources.Spec.Resources; len(got) != len(replacement) {
++		t.Fatalf("resource snapshot retained omitted files: got %#v, want %#v", got, replacement)
++	}
++	for key, want := range replacement {
++		if got := resources.Spec.Resources[key]; got != want {
++			t.Errorf("resource %q: got %q, want %q", key, got, want)
++		}
++	}
++	if _, ok := resources.Spec.Resources["old.yaml"]; ok {
++		t.Errorf("omitted old.yaml was retained in replacement snapshot")
++	}
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,5 @@
++#!/bin/bash
++set -euo pipefail
++
++
++(cd porch && go test ./repository/pkg/git -run '^TestResourceUpdateReplacesSnapshotAndValidatesPaths$' -count=1)

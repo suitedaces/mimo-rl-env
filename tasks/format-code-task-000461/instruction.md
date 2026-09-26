@@ -1,0 +1,7 @@
+I want server-side `Meteor.SmartCollection` live queries to honor the `fields` option when a cursor is observed or published. The API shape is `var coll = new Meteor.SmartCollection(name, options); var cursor = coll.find(selector, {fields: projection}); cursor.observeChanges(callbacks);`, and the same projected output should flow through a cursor returned from `Meteor.publish`.
+
+For an inclusion projection such as `{aa: 1, "bb.c": 1}`, when a matching document is `{_id: "aa", aa: 10, bb: {c: 10, k: 12}, cc: 20}`, the `added` callback should receive id `"aa"` and document `{_id: "aa", aa: 10, bb: {c: 10}}`. `_id` should be included by default for inclusion projections, but `{aa: 1, _id: 0}` should omit `_id` from the delivered document fields.
+
+For an exclusion projection such as `{aa: 0, "bb.c": 0}`, when a matching document is `{_id: "aa", aa: 50, bb: {c: 45, k: 12}, cc: 20}`, the delivered document should be `{_id: "aa", bb: {k: 12}, cc: 20}`. The same projection rules should apply to later `changed` field maps, so with `{aa: 1}` a change map `{aa: 50, bb: 30}` should notify observers only with `{aa: 50}` and update the live-query cache only for that projected field.
+
+The projection validator should reject unsupported field specs by throwing `Error`: field names containing `$` or values that are not numeric `0` or `1` are invalid, and mixing inclusion and exclusion in the same projection is invalid except for excluding `_id` alongside included fields.

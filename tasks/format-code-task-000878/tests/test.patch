@@ -1,0 +1,193 @@
+diff --git a/tests/test_datastructures.py b/tests/test_datastructures.py
+index 42405c2..52555b8 100644
+--- a/tests/test_datastructures.py
++++ b/tests/test_datastructures.py
+@@ -330,3 +330,14 @@ def test_multidict():
+     assert q.getlist("a") == ["123"]
+     q.update([("a", "456")], a="789", b="123")
+     assert q == MultiDict([("a", "456"), ("a", "789"), ("b", "123")])
++
++
++def test_url_from_scope_without_query_string():
++    scope = {
++        "type": "http",
++        "scheme": "https",
++        "path": "/hello",
++        "headers": [(b"host", b"example.org")],
++    }
++
++    assert str(URL(scope=scope)) == "https://example.org/hello"
+diff --git a/tests/test_requests.py b/tests/test_requests.py
+index defdf3a..fe5189b 100644
+--- a/tests/test_requests.py
++++ b/tests/test_requests.py
+@@ -2,8 +2,10 @@ import asyncio
+ 
+ import pytest
+ 
++from starlette.applications import Starlette
+ from starlette.requests import ClientDisconnect, Request, State
+ from starlette.responses import JSONResponse, Response
++from starlette.routing import Route
+ from starlette.testclient import TestClient
+ 
+ 
+@@ -358,3 +360,16 @@ def test_request_send_push_promise_without_setting_send():
+     client = TestClient(app)
+     response = client.get("/")
+     assert response.json() == {"json": "Send channel not available"}
++
++
++async def show_base_url(request):
++    return JSONResponse({"base_url": str(request.base_url)})
++
++
++def test_request_base_url_includes_root_path_without_request_path_or_query():
++    app = Starlette(routes=[Route("/items/{item_id}", show_base_url, methods=["GET"])])
++    client = TestClient(app, base_url="https://example.org", root_path="/api")
++
++    assert client.get("/items/123?debug=true").json() == {
++        "base_url": "https://example.org/api/"
++    }
+diff --git a/tests/test_routing.py b/tests/test_routing.py
+index 3c0c4cd..8fdb3ba 100644
+--- a/tests/test_routing.py
++++ b/tests/test_routing.py
+@@ -1,5 +1,6 @@
+ import pytest
+ 
++from starlette.applications import Starlette
+ from starlette.responses import JSONResponse, PlainTextResponse, Response
+ from starlette.routing import Host, Mount, NoMatchFound, Route, Router, WebSocketRoute
+ from starlette.testclient import TestClient
+@@ -353,3 +354,56 @@ def test_subdomain_reverse_urls():
+         ).make_absolute_url("https://whatever")
+         == "https://foo.example.org/homepage"
+     )
++
++
++async def url_for_with_root_path(request):
++    user_id = request.path_params.get("user_id", 42)
++    return JSONResponse(
++        {
++            "home": str(request.url_for("homepage")),
++            "detail": str(request.url_for("accounts:detail", user_id=user_id)),
++        }
++    )
++
++
++url_for_with_root_path_routes = [
++    Route("/", url_for_with_root_path, name="homepage", methods=["GET"]),
++    Mount(
++        "/accounts",
++        name="accounts",
++        routes=[
++            Route(
++                "/users/{user_id}/",
++                url_for_with_root_path,
++                name="detail",
++                methods=["GET"],
++            )
++        ],
++    ),
++]
++
++
++def test_request_url_for_preserves_root_path_for_root_and_mount():
++    app = Starlette(routes=url_for_with_root_path_routes)
++    client = TestClient(app, base_url="https://example.org", root_path="/api/v1")
++
++    assert client.get("/").json() == {
++        "home": "https://example.org/api/v1/",
++        "detail": "https://example.org/api/v1/accounts/users/42/",
++    }
++    assert client.get("/accounts/users/42/").json() == {
++        "home": "https://example.org/api/v1/",
++        "detail": "https://example.org/api/v1/accounts/users/42/",
++    }
++
++
++def test_request_url_for_uses_configured_root_path_value():
++    app = Starlette(routes=url_for_with_root_path_routes)
++    client = TestClient(
++        app, base_url="https://outside.example", root_path="/service-area"
++    )
++
++    assert client.get("/accounts/users/7/").json() == {
++        "home": "https://outside.example/service-area/",
++        "detail": "https://outside.example/service-area/accounts/users/7/",
++    }
+diff --git a/tests/test_testclient.py b/tests/test_testclient.py
+index 504034b..39826b0 100644
+--- a/tests/test_testclient.py
++++ b/tests/test_testclient.py
+@@ -4,6 +4,7 @@ import pytest
+ 
+ from starlette.applications import Starlette
+ from starlette.responses import JSONResponse
++from starlette.routing import Route, WebSocketRoute
+ from starlette.testclient import TestClient
+ from starlette.websockets import WebSocket, WebSocketDisconnect
+ 
+@@ -113,3 +114,28 @@ def test_websocket_blocking_receive():
+     with client.websocket_connect("/") as websocket:
+         data = websocket.receive_json()
+         assert data == {"message": "test"}
++
++
++async def echo_root_path(request):
++    return JSONResponse({"root_path": request.scope["root_path"]})
++
++
++def test_testclient_sets_root_path_on_http_scope():
++    app = Starlette(routes=[Route("/", echo_root_path, methods=["GET"])])
++    client = TestClient(app, root_path="/proxy-prefix")
++
++    assert client.get("/").json() == {"root_path": "/proxy-prefix"}
++
++
++async def echo_websocket_root_path(websocket):
++    await websocket.accept()
++    await websocket.send_text(websocket.scope["root_path"])
++    await websocket.close()
++
++
++def test_testclient_sets_root_path_on_websocket_scope():
++    app = Starlette(routes=[WebSocketRoute("/ws", echo_websocket_root_path)])
++    client = TestClient(app, root_path="/ws-prefix")
++
++    with client.websocket_connect("/ws") as websocket:
++        assert websocket.receive_text() == "/ws-prefix"
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,28 @@
++#!/bin/bash
++set -uo pipefail
++cd /testbed
++
++
++pip install -e . --quiet --no-input
++pip install pytest requests --quiet --no-input
++
++
++case "${1:-}" in
++  base)
++    python -m pytest tests/test_routing.py -v -k "not test_request_url_for_preserves_root_path_for_root_and_mount and not test_request_url_for_uses_configured_root_path_value"
++    ;;
++  new)
++    python -m pytest \
++      tests/test_routing.py::test_request_url_for_preserves_root_path_for_root_and_mount \
++      tests/test_routing.py::test_request_url_for_uses_configured_root_path_value \
++      tests/test_requests.py::test_request_base_url_includes_root_path_without_request_path_or_query \
++      tests/test_testclient.py::test_testclient_sets_root_path_on_http_scope \
++      tests/test_testclient.py::test_testclient_sets_root_path_on_websocket_scope \
++      tests/test_datastructures.py::test_url_from_scope_without_query_string \
++      -v
++    ;;
++  *)
++    echo "usage: $0 base|new"
++    exit 2
++    ;;
++esac

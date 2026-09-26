@@ -1,0 +1,258 @@
+diff --git a/test/codespec_safe_diagnostics.js b/test/codespec_safe_diagnostics.js
+new file mode 100644
+index 0000000..3459f3c
+--- /dev/null
++++ b/test/codespec_safe_diagnostics.js
+@@ -0,0 +1,241 @@
++var assert = require('assert');
++var childProcess = require('child_process');
++var fs = require('fs');
++var os = require('os');
++var path = require('path');
++var transpile = require('../index.js');
++var packageInfo = require('../package.json');
++
++var cli = path.resolve(__dirname, '..', 'js2php');
++
++function runCli(args, input) {
++  return childProcess.spawnSync(process.execPath, [cli].concat(args || []), {
++    input: input,
++    encoding: 'utf8'
++  });
++}
++
++function captureFailure(source, options) {
++  var thrown = null;
++  try {
++    transpile(source, options);
++  } catch (error) {
++    thrown = error;
++  }
++  return thrown;
++}
++
++function assertCleanProcess(result, expectedStatus) {
++  if (result.error) {
++    throw result.error;
++  }
++  assert.strictEqual(result.status, expectedStatus);
++  assert.strictEqual(result.signal, null);
++}
++
++describe('codespec safe translation diagnostics', function() {
++  it('throws a structured UnsupportedSyntaxError without logging', function() {
++    var originalLog = console.log;
++    var logged = [];
++    var error;
++
++    console.log = function() {
++      logged.push(Array.prototype.slice.call(arguments));
++    };
++    try {
++      error = captureFailure('var ready = true;\ndebugger;', {
++        sourceName: 'workflow.js'
++      });
++    } finally {
++      console.log = originalLog;
++    }
++
++    assert.strictEqual(typeof transpile.UnsupportedSyntaxError, 'function');
++    assert.ok(error instanceof Error);
++    assert.strictEqual(error.name, 'UnsupportedSyntaxError');
++    assert.strictEqual(error.code, 'E_UNSUPPORTED_SYNTAX');
++    assert.strictEqual(error.nodeType, 'DebuggerStatement');
++    assert.strictEqual(error.sourceName, 'workflow.js');
++    assert.strictEqual(error.line, 2);
++    assert.strictEqual(error.column, 1);
++    assert.strictEqual(error.message, 'Unsupported syntax: DebuggerStatement');
++    assert.deepStrictEqual(logged, []);
++  });
++
++  it('reports more than one kind of unhandled AST node', function() {
++    var error = captureFailure('var n = 0;\nlabel: while (n < 1) { n++; }');
++
++    assert.ok(error instanceof Error);
++    assert.strictEqual(error.name, 'UnsupportedSyntaxError');
++    assert.strictEqual(error.nodeType, 'LabeledStatement');
++    assert.strictEqual(error.sourceName, '<input>');
++    assert.strictEqual(error.line, 2);
++    assert.strictEqual(error.column, 1);
++  });
++
++  [
++    ['var [first] = values;', 'ArrayPattern'],
++    ['var {id} = record;', 'ObjectPattern'],
++    ['function collect(...items) { return items; }', 'RestElement'],
++    ['var copy = [...items];', 'SpreadElement']
++  ].forEach(function(testCase) {
++    it('rejects unsupported ' + testCase[1] + ' syntax', function() {
++      var error = captureFailure(testCase[0]);
++      assert.ok(error instanceof Error, testCase[1] + ' must stop translation');
++      assert.strictEqual(error.name, 'UnsupportedSyntaxError');
++      assert.strictEqual(error.nodeType, testCase[1]);
++      assert.strictEqual(error.code, 'E_UNSUPPORTED_SYNTAX');
++    });
++  });
++
++  it('normalizes parser failures as ParseError instances', function() {
++    var error = captureFailure('var answer = ;', { sourceName: 'broken.js' });
++
++    assert.strictEqual(typeof transpile.ParseError, 'function');
++    assert.ok(error instanceof Error);
++    assert.ok(error instanceof transpile.ParseError);
++    assert.strictEqual(error.name, 'ParseError');
++    assert.strictEqual(error.code, 'E_PARSE');
++    assert.strictEqual(error.sourceName, 'broken.js');
++    assert.strictEqual(error.line, 1);
++    assert.strictEqual(error.column, 14);
++    assert.ok(/Unexpected token ;/.test(error.message));
++  });
++
++  it('keeps successful library translation and default invocation compatible', function() {
++    var source = 'var values = [1, 2];\nvar_dump(values.length);';
++    var expected = '<?php\n$values = array(1, 2);\nvar_dump(count($values));\n';
++
++    assert.strictEqual(transpile(source), expected);
++    assert.strictEqual(transpile(source, { sourceName: 'values.js' }), expected);
++  });
++
++  it('uses a file operand even when standard input is redirected', function() {
++    var dir = fs.mkdtempSync(path.join(os.tmpdir(), 'js2php-codespec-file-'));
++    var sourcePath = path.join(dir, 'chosen.js');
++    var source = 'var chosen = 7;\n';
++    var result;
++
++    try {
++      fs.writeFileSync(sourcePath, source);
++      result = runCli([sourcePath], 'var wrong = 9;\n');
++    } finally {
++      fs.rmSync(dir, { recursive: true, force: true });
++    }
++
++    assertCleanProcess(result, 0);
++    assert.strictEqual(result.stderr, '');
++    assert.strictEqual(result.stdout, transpile(source));
++  });
++
++  it('accepts standard input with no operand', function() {
++    var source = 'var piped = [3, 4];\n';
++    var expected = transpile(source);
++    var implicit = runCli([], source);
++
++    assertCleanProcess(implicit, 0);
++    assert.strictEqual(implicit.stderr, '');
++    assert.strictEqual(implicit.stdout, expected);
++  });
++
++  it('accepts standard input through the dash operand', function() {
++    var source = 'var piped = [3, 4];\n';
++    var expected = transpile(source);
++    var explicit = runCli(['-'], source);
++
++    assertCleanProcess(explicit, 0);
++    assert.strictEqual(explicit.stderr, '');
++    assert.strictEqual(explicit.stdout, expected);
++  });
++
++  it('handles version flags before considering piped source', function() {
++    var version = runCli(['--version'], 'debugger;\n');
++    var shortVersion = runCli(['-v'], 'debugger;\n');
++
++    [version, shortVersion].forEach(function(result) {
++      assertCleanProcess(result, 0);
++      assert.strictEqual(result.stderr, '');
++    });
++    assert.strictEqual(version.stdout, packageInfo.version + '\n');
++    assert.strictEqual(shortVersion.stdout, packageInfo.version + '\n');
++  });
++
++  it('handles help flags before considering piped source', function() {
++    var help = runCli(['--help'], 'debugger;\n');
++    var shortHelp = runCli(['-h'], 'debugger;\n');
++
++    [help, shortHelp].forEach(function(result) {
++      assertCleanProcess(result, 0);
++      assert.strictEqual(result.stderr, '');
++    });
++    assert.strictEqual(help.stdout, 'Usage: js2php [--help] [--version] [file|-]\n');
++    assert.strictEqual(shortHelp.stdout, help.stdout);
++  });
++
++  it('prints one file-attributed diagnostic and no PHP for unsupported syntax', function() {
++    var dir = fs.mkdtempSync(path.join(os.tmpdir(), 'js2php-codespec-error-'));
++    var sourcePath = path.join(dir, 'unsupported.js');
++    var fileResult;
++
++    try {
++      fs.writeFileSync(sourcePath, 'var ok = 1;\ndebugger;\n');
++      fileResult = runCli([sourcePath], 'var ignored = true;\n');
++    } finally {
++      fs.rmSync(dir, { recursive: true, force: true });
++    }
++
++    assertCleanProcess(fileResult, 1);
++    assert.strictEqual(fileResult.stdout, '');
++    assert.strictEqual(
++      fileResult.stderr,
++      sourcePath + ':2:1: Unsupported syntax: DebuggerStatement\n'
++    );
++  });
++
++  it('prints one stdin-attributed diagnostic and no PHP for parse errors', function() {
++    var stdinResult = runCli(['-'], 'var broken = ;\n');
++
++    assertCleanProcess(stdinResult, 1);
++    assert.strictEqual(stdinResult.stdout, '');
++    assert.ok(/^<stdin>:1:14: .*Unexpected token ;.*\n$/.test(stdinResult.stderr));
++    assert.strictEqual(stdinResult.stderr.indexOf('\n    at '), -1);
++  });
++
++  it('rejects an unknown option as an invocation error', function() {
++    var result = runCli(['--unknown'], '');
++
++    assertCleanProcess(result, 2);
++    assert.strictEqual(result.stdout, '');
++    assert.ok(/^js2php: .+\n/.test(result.stderr));
++    assert.strictEqual(result.stderr.indexOf('\n    at '), -1);
++    assert.ok(/unknown option/.test(result.stderr));
++  });
++
++  it('rejects multiple input operands as an invocation error', function() {
++    var result = runCli(['one.js', 'two.js'], '');
++
++    assertCleanProcess(result, 2);
++    assert.strictEqual(result.stdout, '');
++    assert.ok(/^js2php: .+\n/.test(result.stderr));
++    assert.strictEqual(result.stderr.indexOf('\n    at '), -1);
++    assert.ok(/one input/.test(result.stderr));
++  });
++
++  it('reports an unreadable input file without a stack trace', function() {
++    var dir = fs.mkdtempSync(path.join(os.tmpdir(), 'js2php-codespec-missing-'));
++    var missing = path.join(dir, 'does-not-exist.js');
++    var result;
++
++    try {
++      result = runCli([missing], '');
++    } finally {
++      fs.rmSync(dir, { recursive: true, force: true });
++    }
++
++    assertCleanProcess(result, 2);
++    assert.strictEqual(result.stdout, '');
++    assert.ok(/^js2php: .+\n/.test(result.stderr));
++    assert.strictEqual(result.stderr.indexOf('\n    at '), -1);
++    assert.ok(/cannot read/.test(result.stderr));
++  });
++});
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,6 @@
++#!/bin/bash
++set -euo pipefail
++
++
++./node_modules/.bin/mocha ./test/codespec_safe_diagnostics.js
++./node_modules/.bin/mocha ./test/suite.js --grep 'closures|core_array|loops'

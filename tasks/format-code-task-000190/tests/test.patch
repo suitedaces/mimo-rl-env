@@ -1,0 +1,224 @@
+diff --git a/tests/algorithms/test_laplacian_batch_stream_contract.py b/tests/algorithms/test_laplacian_batch_stream_contract.py
+new file mode 100644
+index 0000000..5081c04
+--- /dev/null
++++ b/tests/algorithms/test_laplacian_batch_stream_contract.py
+@@ -0,0 +1,204 @@
++import math
++
++import pytest
++
++from pydp.algorithms.laplacian import (
++    BoundedMean,
++    BoundedStandardDeviation,
++    BoundedSum,
++    BoundedVariance,
++    Count,
++)
++
++
++TEST_EPSILON = 1e100
++
++
++def make_count():
++    return Count(epsilon=TEST_EPSILON, dtype="int")
++
++
++class SinglePass:
++    def __init__(self, values):
++        self.values = values
++        self.iterations = 0
++
++    def __iter__(self):
++        self.iterations += 1
++        if self.iterations != 1:
++            raise AssertionError("input iterable was requested more than once")
++        yield from self.values
++
++
++class IterationFailure(Exception):
++    pass
++
++
++def fails_after_one_value():
++    yield 10
++    raise IterationFailure("source failed")
++
++
++@pytest.mark.parametrize(
++    "algorithm, expected",
++    [
++        (Count(epsilon=TEST_EPSILON, dtype="int"), 3),
++        (
++            BoundedSum(
++                epsilon=TEST_EPSILON,
++                lower_bound=0,
++                upper_bound=10,
++                dtype="int",
++            ),
++            6,
++        ),
++        (
++            BoundedSum(
++                epsilon=TEST_EPSILON,
++                lower_bound=0.0,
++                upper_bound=10.0,
++                dtype="float",
++            ),
++            6.0,
++        ),
++        (
++            BoundedMean(
++                epsilon=TEST_EPSILON,
++                lower_bound=0,
++                upper_bound=10,
++                dtype="int",
++            ),
++            2.0,
++        ),
++        (
++            BoundedVariance(
++                epsilon=TEST_EPSILON,
++                lower_bound=0,
++                upper_bound=10,
++                dtype="int",
++            ),
++            2.0 / 3.0,
++        ),
++        (
++            BoundedStandardDeviation(
++                epsilon=TEST_EPSILON,
++                lower_bound=0,
++                upper_bound=10,
++                dtype="int",
++            ),
++            math.sqrt(2.0 / 3.0),
++        ),
++    ],
++)
++def test_result_accepts_single_pass_iterables_across_laplacian_algorithms(
++    algorithm, expected
++):
++    entries = SinglePass([1, 2, 3])
++
++    assert algorithm.result(entries) == pytest.approx(expected)
++    assert entries.iterations == 1
++
++
++def test_quick_result_is_a_stateless_batch_operation_with_original_configuration():
++    algorithm = BoundedSum(
++        epsilon=TEST_EPSILON,
++        lower_bound=-5.0,
++        upper_bound=-1.0,
++        l0_sensitivity=2,
++        linf_sensitivity=3,
++        dtype="float",
++    )
++    algorithm.add_entries([100.0, 200.0])
++
++    entries = SinglePass([100.0, -3.0, -100.0])
++    assert algorithm.quick_result(entries) == pytest.approx(-9.0)
++    assert entries.iterations == 1
++    assert algorithm.partial_result() == pytest.approx(-2.0)
++
++
++def test_batch_results_and_incremental_results_do_not_consume_each_others_state():
++    algorithm = make_count()
++    algorithm.add_entries([10, 20])
++
++    assert algorithm.result((value for value in range(7))) == 7
++    assert algorithm.result([1, 2, 3, 4]) == 4
++    assert algorithm.result() == 2
++    assert algorithm.result((99,)) == 1
++
++
++def test_explicit_partial_result_and_legacy_scalar_result_forms_are_equivalent():
++    via_named_method = make_count()
++    via_named_method.add_entries((1, 2, 3))
++    assert via_named_method.partial_result(0.25) == 3
++
++    via_legacy_result = make_count()
++    via_legacy_result.add_entries([1, 2, 3])
++    assert via_legacy_result.result(0.25) == 3
++
++    zero_budget = make_count()
++    zero_budget.add_entries([1, 2, 3])
++    assert zero_budget.result(0.0) == 3
++
++
++def test_add_entries_accepts_finite_iterables_and_consumes_them_once():
++    algorithm = make_count()
++    entries = SinglePass([2, 4, 6, 8])
++
++    assert algorithm.add_entries(entries) is None
++    assert entries.iterations == 1
++    assert algorithm.partial_result() == 4
++
++
++@pytest.mark.parametrize("bad_entries", ["123", b"123", bytearray(b"123")])
++def test_text_and_binary_containers_are_not_treated_as_entry_batches(bad_entries):
++    algorithm = make_count()
++    algorithm.add_entry(1)
++
++    with pytest.raises(TypeError):
++        algorithm.result(bad_entries)
++
++    with pytest.raises(TypeError):
++        algorithm.add_entries(bad_entries)
++    assert algorithm.partial_result() == 1
++
++
++@pytest.mark.parametrize(
++    "operation, expected_exception",
++    [
++        (lambda algorithm: algorithm.add_entries(fails_after_one_value()), IterationFailure),
++        (lambda algorithm: algorithm.add_entries([10, object()]), TypeError),
++        (lambda algorithm: algorithm.result(fails_after_one_value()), IterationFailure),
++        (lambda algorithm: algorithm.result([10, object()]), TypeError),
++    ],
++)
++def test_failed_iterables_do_not_partially_update_incremental_state(
++    operation, expected_exception
++):
++    algorithm = make_count()
++    algorithm.add_entry(1)
++
++    with pytest.raises(expected_exception):
++        operation(algorithm)
++
++    assert algorithm.partial_result() == 1
++
++
++def test_reset_restores_incremental_use_without_affecting_batch_results():
++    algorithm = make_count()
++    algorithm.add_entries([1, 2])
++    assert algorithm.partial_result() == 2
++
++    assert algorithm.reset() is None
++    algorithm.add_entries(value for value in [3, 4, 5])
++    assert algorithm.result([8, 9, 10, 11]) == 4
++    assert algorithm.partial_result() == 3
++
++
++def test_serialized_summaries_stay_compatible_with_isolated_batch_results():
++    source = make_count()
++    source.add_entries([1, 2, 3])
++
++    destination = make_count()
++    assert destination.merge(source.serialize()) is None
++    assert destination.quick_result([10, 20]) == 2
++    assert destination.partial_result() == 3
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,9 @@
++#!/bin/bash
++set -euo pipefail
++
++
++export PYTHONPATH="${PWD}${PYTHONPATH:+:${PYTHONPATH}}"
++PYDP_BUNDLED_LIBS=/usr/local/lib/python3.14/dist-packages/python_dp.libs
++test -d "${PYDP_BUNDLED_LIBS}"
++export LD_LIBRARY_PATH="${PYDP_BUNDLED_LIBS}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
++pytest -q tests/algorithms/test_laplacian_batch_stream_contract.py

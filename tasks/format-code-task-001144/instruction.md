@@ -1,0 +1,12 @@
+Make `qcodes.utils.deprecate.deprecate` safe and predictable for the callable forms used by instrument classes. Class-level deprecation currently walks attributes through normal lookup and then assigns wrapped bound objects back to the class. That changes Python descriptor binding (most visibly, a static method called through an instance receives an unexpected `self`) and leaves other callable descriptors without consistent warnings.
+
+Keep the existing public decorator API, `QCoDeSDeprecationWarning`, and message format. A decorated standalone function must keep its name, docstring, annotations/signature, return value, and single warning per call. For a decorated class, construction must still emit exactly one `The class <ClassName> is deprecated...` warning and a directly declared normal instance method must emit exactly one `The function <method_name> is deprecated...` warning per invocation.
+
+Extend that class behavior without changing Python's binding rules:
+
+- A directly declared `@staticmethod` must remain callable with the same arguments through both the class and an instance. Each invocation emits exactly one function deprecation warning naming the static method.
+- A directly declared `@classmethod` must remain callable through both access paths, receive the decorated class as `cls`, return its original result, and emit exactly one function deprecation warning naming the class method.
+- For a directly declared `property`, every accessor that exists (getter, setter, and deleter) must retain its normal return/state behavior and emit exactly one function deprecation warning naming the property each time that accessor is used.
+- A directly declared `async def` method must remain recognizable as a coroutine function, remain awaitable with its original result, and emit exactly one function deprecation warning per call.
+
+Class decoration must be local to the decorated class. Do not wrap or copy inherited methods, static methods, class methods, or properties: using an inherited member through the deprecated subclass must preserve normal binding and must not emit a member-level deprecation warning. A deprecated subclass must still warn once when it is constructed, even when it inherits `__init__`; that construction warning is distinct from inherited-member access. Decorating a subclass must not mutate the base class or make the base class's members warn. Existing behavior for ordinary decorated functions, class construction, and directly declared instance methods must remain compatible.

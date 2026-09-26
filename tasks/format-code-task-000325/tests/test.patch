@@ -1,0 +1,381 @@
+diff --git a/tests/test_api/test_client/test_session/test_middlewares/test_retry_codespec.py b/tests/test_api/test_client/test_session/test_middlewares/test_retry_codespec.py
+new file mode 100644
+index 00000000..b13f2763
+--- /dev/null
++++ b/tests/test_api/test_client/test_session/test_middlewares/test_retry_codespec.py
+@@ -0,0 +1,362 @@
++import asyncio
++import contextvars
++import importlib
++
++import pytest
++
++from aiogram.client.session.middlewares.manager import RequestMiddlewareManager
++from aiogram.exceptions import (
++    TelegramBadRequest,
++    TelegramEntityTooLarge,
++    TelegramNetworkError,
++    TelegramRetryAfter,
++    TelegramServerError,
++)
++from aiogram.methods import GetMe
++from aiogram.utils.backoff import BackoffConfig
++
++
++def retry_middleware_type():
++    module_name = "aiogram.client.session.middlewares.retry"
++    try:
++        module = importlib.import_module(module_name)
++    except ModuleNotFoundError as exc:
++        if exc.name != module_name:
++            raise
++        pytest.fail(f"public retry middleware module {module_name!r} is missing")
++    middleware_type = getattr(module, "RetryRequestMiddleware", None)
++    assert middleware_type is not None, "RetryRequestMiddleware is missing from its public module"
++    return middleware_type
++
++
++def deterministic_backoff():
++    return BackoffConfig(min_delay=0.25, max_delay=1.0, factor=2.0, jitter=0.0)
++
++
++class ScriptedEndpoint:
++    def __init__(self, *outcomes):
++        self.outcomes = list(outcomes)
++        self.calls = []
++
++    async def __call__(self, bot, method):
++        self.calls.append((bot, method))
++        outcome = self.outcomes.pop(0)
++        if isinstance(outcome, BaseException):
++            raise outcome
++        return outcome
++
++
++async def test_codespec_success_is_returned_without_sleeping():
++    middleware = retry_middleware_type()(
++        sleep=lambda delay: pytest.fail(f"unexpected sleep for {delay}"),
++    )
++    bot = object()
++    method = GetMe()
++    result = object()
++    endpoint = ScriptedEndpoint(result)
++
++    assert await middleware(endpoint, bot, method) is result
++    assert endpoint.calls == [(bot, method)]
++
++
++async def test_codespec_network_errors_retry_with_backoff_and_same_request():
++    middleware_type = retry_middleware_type()
++    method = GetMe()
++    bot = object()
++    result = object()
++    delays = []
++
++    async def sleep(delay):
++        delays.append(delay)
++
++    endpoint = ScriptedEndpoint(
++        TelegramNetworkError(method=method, message="network down"),
++        result,
++    )
++    middleware = middleware_type(
++        max_attempts=3,
++        backoff_config=deterministic_backoff(),
++        sleep=sleep,
++    )
++
++    assert await middleware(endpoint, bot, method) is result
++    assert endpoint.calls == [(bot, method), (bot, method)]
++    assert delays == [0.25]
++
++
++async def test_codespec_server_errors_advance_exponential_backoff():
++    middleware_type = retry_middleware_type()
++    method = GetMe()
++    delays = []
++
++    async def sleep(delay):
++        delays.append(delay)
++
++    endpoint = ScriptedEndpoint(
++        TelegramServerError(method=method, message="server one"),
++        TelegramServerError(method=method, message="server two"),
++        "recovered",
++    )
++    middleware = middleware_type(
++        max_attempts=3,
++        backoff_config=deterministic_backoff(),
++        sleep=sleep,
++    )
++
++    assert await middleware(endpoint, object(), method) == "recovered"
++    assert len(endpoint.calls) == 3
++    assert delays == [0.25, 0.5]
++
++
++async def test_codespec_retry_after_never_sleeps_less_than_either_source():
++    middleware_type = retry_middleware_type()
++    method = GetMe()
++    delays = []
++
++    async def sleep(delay):
++        delays.append(delay)
++
++    endpoint = ScriptedEndpoint(
++        TelegramRetryAfter(method=method, message="short limit", retry_after=0.1),
++        TelegramRetryAfter(method=method, message="long limit", retry_after=2),
++        "ok",
++    )
++    middleware = middleware_type(
++        max_attempts=3,
++        backoff_config=deterministic_backoff(),
++        sleep=sleep,
++    )
++
++    assert await middleware(endpoint, object(), method) == "ok"
++    assert delays == [0.25, 2]
++
++
++async def test_codespec_default_attempt_limit_reraises_last_error_without_final_sleep():
++    middleware_type = retry_middleware_type()
++    method = GetMe()
++    delays = []
++    failures = [
++        TelegramNetworkError(method=method, message=f"failure {index}") for index in range(3)
++    ]
++
++    async def sleep(delay):
++        delays.append(delay)
++
++    endpoint = ScriptedEndpoint(*failures)
++    middleware = middleware_type(backoff_config=deterministic_backoff(), sleep=sleep)
++
++    with pytest.raises(TelegramNetworkError) as caught:
++        await middleware(endpoint, object(), method)
++
++    assert caught.value is failures[-1]
++    assert len(endpoint.calls) == 3
++    assert delays == [0.25, 0.5]
++
++
++async def test_codespec_configured_attempt_limit_counts_the_initial_call():
++    middleware_type = retry_middleware_type()
++    method = GetMe()
++    delays = []
++    failures = [
++        TelegramServerError(method=method, message="first"),
++        TelegramServerError(method=method, message="second"),
++    ]
++
++    async def sleep(delay):
++        delays.append(delay)
++
++    endpoint = ScriptedEndpoint(*failures, "must not be reached")
++    middleware = middleware_type(
++        max_attempts=2,
++        backoff_config=deterministic_backoff(),
++        sleep=sleep,
++    )
++
++    with pytest.raises(TelegramServerError) as caught:
++        await middleware(endpoint, object(), method)
++
++    assert caught.value is failures[-1]
++    assert len(endpoint.calls) == 2
++    assert delays == [0.25]
++
++
++@pytest.mark.parametrize(
++    "failure",
++    [
++        TelegramBadRequest(method=GetMe(), message="bad request"),
++        TelegramEntityTooLarge(method=GetMe(), message="too large"),
++        RuntimeError("application failure"),
++    ],
++)
++async def test_codespec_unlisted_errors_are_not_retried(failure):
++    middleware_type = retry_middleware_type()
++    method = GetMe()
++    delays = []
++
++    async def sleep(delay):
++        delays.append(delay)
++
++    endpoint = ScriptedEndpoint(failure, "must not be reached")
++    middleware = middleware_type(
++        max_attempts=3,
++        backoff_config=deterministic_backoff(),
++        sleep=sleep,
++    )
++
++    with pytest.raises(type(failure)) as caught:
++        await middleware(endpoint, object(), method)
++
++    assert caught.value is failure
++    assert len(endpoint.calls) == 1
++    assert delays == []
++
++
++@pytest.mark.parametrize("max_attempts", [0, -1])
++def test_codespec_attempt_limit_must_be_positive(max_attempts):
++    middleware_type = retry_middleware_type()
++
++    with pytest.raises(ValueError):
++        middleware_type(max_attempts=max_attempts)
++
++
++async def test_codespec_handler_cancellation_is_propagated_immediately():
++    middleware_type = retry_middleware_type()
++    delays = []
++
++    async def sleep(delay):
++        delays.append(delay)
++
++    endpoint = ScriptedEndpoint(asyncio.CancelledError(), "must not be reached")
++    middleware = middleware_type(
++        max_attempts=3,
++        backoff_config=deterministic_backoff(),
++        sleep=sleep,
++    )
++
++    with pytest.raises(asyncio.CancelledError):
++        await middleware(endpoint, object(), GetMe())
++
++    assert len(endpoint.calls) == 1
++    assert delays == []
++
++
++async def test_codespec_sleep_cancellation_stops_before_another_attempt():
++    middleware_type = retry_middleware_type()
++    method = GetMe()
++    failure = TelegramNetworkError(method=method, message="offline")
++
++    async def cancelled_sleep(delay):
++        raise asyncio.CancelledError()
++
++    endpoint = ScriptedEndpoint(failure, "must not be reached")
++    middleware = middleware_type(
++        max_attempts=3,
++        backoff_config=deterministic_backoff(),
++        sleep=cancelled_sleep,
++    )
++
++    with pytest.raises(asyncio.CancelledError):
++        await middleware(endpoint, object(), method)
++
++    assert len(endpoint.calls) == 1
++
++
++async def test_codespec_sequential_calls_restart_the_backoff_schedule():
++    middleware_type = retry_middleware_type()
++    method = GetMe()
++    delays = []
++
++    async def sleep(delay):
++        delays.append(delay)
++
++    middleware = middleware_type(
++        max_attempts=3,
++        backoff_config=deterministic_backoff(),
++        sleep=sleep,
++    )
++    first = ScriptedEndpoint(
++        TelegramNetworkError(method=method, message="first"),
++        "first result",
++    )
++    second = ScriptedEndpoint(
++        TelegramNetworkError(method=method, message="second"),
++        "second result",
++    )
++
++    assert await middleware(first, object(), method) == "first result"
++    assert await middleware(second, object(), method) == "second result"
++    assert delays == [0.25, 0.25]
++
++
++async def test_codespec_concurrent_calls_have_independent_backoff_state():
++    middleware_type = retry_middleware_type()
++    methods = {"left": GetMe(), "right": GetMe()}
++    labels = {id(method): label for label, method in methods.items()}
++    counts = {"left": 0, "right": 0}
++    delays = {"left": [], "right": []}
++    active_label = contextvars.ContextVar("codespec_retry_request_label")
++
++    async def endpoint(bot, method):
++        label = labels[id(method)]
++        active_label.set(label)
++        counts[label] += 1
++        if counts[label] <= 2:
++            raise TelegramNetworkError(method=method, message=f"{label} transient")
++        return label
++
++    async def sleep(delay):
++        delays[active_label.get()].append(delay)
++        await asyncio.sleep(0)
++
++    middleware = middleware_type(
++        max_attempts=3,
++        backoff_config=deterministic_backoff(),
++        sleep=sleep,
++    )
++
++    results = await asyncio.gather(
++        middleware(endpoint, object(), methods["left"]),
++        middleware(endpoint, object(), methods["right"]),
++    )
++
++    assert results == ["left", "right"]
++    assert counts == {"left": 3, "right": 3}
++    assert delays == {"left": [0.25, 0.5], "right": [0.25, 0.5]}
++
++
++async def test_codespec_retries_reenter_only_downstream_middlewares():
++    middleware_type = retry_middleware_type()
++    manager = RequestMiddlewareManager()
++    method = GetMe()
++    calls = {"outer": 0, "inner": 0, "target": 0}
++
++    async def outer(make_request, bot, request_method):
++        calls["outer"] += 1
++        return await make_request(bot, request_method)
++
++    async def inner(make_request, bot, request_method):
++        calls["inner"] += 1
++        return await make_request(bot, request_method)
++
++    async def target(bot, request_method, timeout=None):
++        calls["target"] += 1
++        if calls["target"] == 1:
++            raise TelegramNetworkError(method=request_method, message="once")
++        return timeout
++
++    async def sleep(delay):
++        return None
++
++    manager.register(outer)
++    manager.register(
++        middleware_type(
++            max_attempts=2,
++            backoff_config=deterministic_backoff(),
++            sleep=sleep,
++        )
++    )
++    manager.register(inner)
++
++    wrapped = manager.wrap_middlewares(target, timeout=42)
++    assert await wrapped(object(), method) == 42
++    assert calls == {"outer": 1, "inner": 2, "target": 2}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,8 @@
++#!/bin/bash
++set -euo pipefail
++
++
++pytest -q \
++  tests/test_api/test_client/test_session/test_middlewares/test_retry_codespec.py \
++  tests/test_api/test_client/test_session/test_middlewares/test_manager.py \
++  tests/test_utils/test_backoff.py

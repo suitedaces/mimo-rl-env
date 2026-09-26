@@ -1,0 +1,335 @@
+diff --git a/usercase-test-coderl/fixtures/etcd-fixture.go b/usercase-test-coderl/fixtures/etcd-fixture.go
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/fixtures/etcd-fixture.go
+@@ -0,0 +1,65 @@
++package main
++
++import (
++	"fmt"
++	"log"
++	"net"
++	"net/url"
++	"os"
++	"path/filepath"
++
++	"github.com/coreos/etcd/embed"
++)
++
++func freeURL() url.URL {
++	l, err := net.Listen("tcp", "127.0.0.1:0")
++	if err != nil {
++		log.Fatal(err)
++	}
++	addr := l.Addr().String()
++	if err := l.Close(); err != nil {
++		log.Fatal(err)
++	}
++	u, err := url.Parse("http://" + addr)
++	if err != nil {
++		log.Fatal(err)
++	}
++	return *u
++}
++
++func main() {
++	if len(os.Args) != 2 {
++		log.Fatalf("usage: %s DATA_DIR", os.Args[0])
++	}
++
++	clientURL := freeURL()
++	peerURL := freeURL()
++
++	cfg := embed.NewConfig()
++	cfg.Name = "fixture-etcd"
++	cfg.Dir = filepath.Join(os.Args[1], "etcd-data")
++	cfg.LCUrls = []url.URL{clientURL}
++	cfg.ACUrls = []url.URL{clientURL}
++	cfg.LPUrls = []url.URL{peerURL}
++	cfg.APUrls = []url.URL{peerURL}
++	cfg.InitialCluster = cfg.Name + "=" + peerURL.String()
++
++	e, err := embed.StartEtcd(cfg)
++	if err != nil {
++		log.Fatal(err)
++	}
++	defer e.Close()
++
++	select {
++	case <-e.Server.ReadyNotify():
++		fmt.Println(clientURL.Host)
++		_ = os.Stdout.Sync()
++	case <-e.Err():
++		log.Fatal("etcd stopped before becoming ready")
++	}
++
++	select {
++	case <-e.Err():
++	case <-make(chan struct{}):
++	}
++}
+diff --git a/usercase-test-coderl/usecase.sh b/usercase-test-coderl/usecase.sh
+new file mode 100755
+--- /dev/null
++++ b/usercase-test-coderl/usecase.sh
+@@ -0,0 +1,239 @@
++#!/usr/bin/env bash
++
++set -u
++export LANG=C.UTF-8 LC_ALL=C.UTF-8 TZ=UTC
++
++( cd /workspace/repo && make sentinel stolonctl ) || { echo "FAIL: build stolon binaries" >&2; exit 1; }
++( cd /workspace/repo && go build -o /tmp/fixture-etcd-fixture ./usercase-test-coderl/fixtures/etcd-fixture.go ) \
++	|| { echo "FAIL: build etcd fixture" >&2; exit 1; }
++
++BIN=/workspace/repo/bin/stolon-sentinel
++CTL=/workspace/repo/bin/stolonctl
++
++TMP=$(mktemp -d)
++trap 'cleanup' EXIT
++cd "$TMP" || exit 1
++
++fail() { echo "FAIL: $*" >&2; exit 1; }
++
++cleanup() {
++	if [ "${SENTINEL_PID:-}" ]; then
++		kill "$SENTINEL_PID" 2>/dev/null || true
++		wait "$SENTINEL_PID" 2>/dev/null || true
++	fi
++	if [ "${ETCD_PID:-}" ]; then
++		kill "$ETCD_PID" 2>/dev/null || true
++		wait "$ETCD_PID" 2>/dev/null || true
++	fi
++	rm -rf "$TMP"
++}
++
++start_store() {
++	local name=$1
++	local dir="$TMP/$name"
++	mkdir -p "$dir"
++	/tmp/fixture-etcd-fixture "$dir" >"$dir/endpoint" 2>"$dir/etcd.err" &
++	ETCD_PID=$!
++	for _ in $(seq 1 100); do
++		if [ -s "$dir/endpoint" ]; then
++			STORE_ENDPOINT=$(cat "$dir/endpoint")
++			return 0
++		fi
++		if ! kill -0 "$ETCD_PID" 2>/dev/null; then
++			break
++		fi
++		sleep 0.1
++	done
++	cat "$dir/etcd.err" >&2 || true
++	fail "$name: etcd fixture did not become ready"
++}
++
++stop_store() {
++	if [ "${ETCD_PID:-}" ]; then
++		kill "$ETCD_PID" 2>/dev/null || true
++		wait "$ETCD_PID" 2>/dev/null || true
++		ETCD_PID=
++	fi
++}
++
++run_sentinel_until_clusterdata() {
++	local cluster_name=$1
++	local spec_file=$2
++	local label=$3
++
++	"$BIN" \
++		--cluster-name "$cluster_name" \
++		--store-backend etcdv3 \
++		--store-endpoints "$STORE_ENDPOINT" \
++		--initial-cluster-spec "$spec_file" \
++		--log-level error >"$label.sentinel.out" 2>"$label.sentinel.err" &
++	SENTINEL_PID=$!
++
++	for _ in $(seq 1 80); do
++		"$CTL" \
++			--cluster-name "$cluster_name" \
++			--store-backend etcdv3 \
++			--store-endpoints "$STORE_ENDPOINT" \
++			clusterdata read >"$label.clusterdata.json" 2>"$label.read.err" && break
++		if ! kill -0 "$SENTINEL_PID" 2>/dev/null; then
++			break
++		fi
++		sleep 0.25
++	done
++
++	kill -TERM "$SENTINEL_PID" 2>/dev/null || true
++	wait "$SENTINEL_PID"
++	local ec=$?
++	SENTINEL_PID=
++	[ "$ec" -eq 0 ] || fail "$label sentinel exit $ec; want 0 after SIGTERM"
++
++	[ -s "$label.clusterdata.json" ] || fail "$label did not write readable cluster data; last read err: $(cat "$label.read.err" 2>/dev/null)"
++}
++
++run_sentinel_against_existing_clusterdata() {
++	local cluster_name=$1
++	local spec_file=$2
++	local label=$3
++
++	"$BIN" \
++		--cluster-name "$cluster_name" \
++		--store-backend etcdv3 \
++		--store-endpoints "$STORE_ENDPOINT" \
++		--initial-cluster-spec "$spec_file" \
++		--log-level error >"$label.sentinel.out" 2>"$label.sentinel.err" &
++	SENTINEL_PID=$!
++
++	sleep 1
++	"$CTL" \
++		--cluster-name "$cluster_name" \
++		--store-backend etcdv3 \
++		--store-endpoints "$STORE_ENDPOINT" \
++		clusterdata read >"$label.clusterdata.json" 2>"$label.read.err"
++	local read_ec=$?
++
++	kill -TERM "$SENTINEL_PID" 2>/dev/null || true
++	wait "$SENTINEL_PID"
++	local ec=$?
++	SENTINEL_PID=
++	[ "$read_ec" -eq 0 ] || fail "$label could not read cluster data after existing-data sentinel run: $(cat "$label.read.err" 2>/dev/null)"
++	[ "$ec" -eq 0 ] || fail "$label sentinel exit $ec; want 0 after SIGTERM"
++
++}
++
++assert_json_expr() {
++	local file=$1
++	local expr=$2
++	local label=$3
++	python3 - "$file" "$expr" "$label" <<'PY'
++import json
++import re
++import sys
++
++path, expr, label = sys.argv[1], sys.argv[2], sys.argv[3]
++with open(path, encoding="utf-8") as f:
++    d = json.load(f)
++ok = eval(expr, {"__builtins__": {}}, {"d": d, "re": re, "isinstance": isinstance, "str": str})
++if not ok:
++    print("FAIL: " + label, file=sys.stderr)
++    sys.exit(1)
++PY
++}
++
++assert_json_equal() {
++	local want=$1
++	local got=$2
++	local label=$3
++	python3 - "$want" "$got" "$label" <<'PY'
++import json
++import sys
++
++want_path, got_path, label = sys.argv[1], sys.argv[2], sys.argv[3]
++with open(want_path, encoding="utf-8") as f:
++    want = json.load(f)
++with open(got_path, encoding="utf-8") as f:
++    got = json.load(f)
++if want != got:
++    print("FAIL: " + label, file=sys.stderr)
++    sys.exit(1)
++PY
++}
++
++
++
++
++"$BIN" --help >out 2>err; ec=$?
++[ "$ec" -eq 0 ] || fail "F1 exit $ec; want 0"
++grep -Fq -- "--initial-cluster-spec string" out || fail "F1 missing flag in help"
++
++grep -Eiq -- "initial.*cluster.*spec|cluster.*spec.*initial" out || fail "F1 help does not describe an initial cluster spec"
++grep -Eiq -- "not already initialized|not initialized|cluster is not.*initialized|only.*initial|ignored.*already initialized" out \
++	|| fail "F1 help does not describe use only when the cluster is not already initialized"
++[ ! -s err ] || fail "F1 unexpected stderr: $(cat err)"
++
++
++
++
++"$BIN" --cluster-name f2 --store-backend etcdv3 --store-endpoints 127.0.0.1:1 \
++	--initial-cluster-spec missing.json --log-level error >out 2>err; ec=$?
++
++[ "$ec" -ne 0 ] || fail "F2 exit $ec; want non-zero"
++cat out err >diag
++grep -Fq -- "cannot read provided initial cluster config file" diag || fail "F2 missing read error: $(cat diag)"
++
++
++
++
++printf '{' >bad-json.json
++"$BIN" --cluster-name f3 --store-backend etcdv3 --store-endpoints 127.0.0.1:1 \
++	--initial-cluster-spec bad-json.json --log-level error >out 2>err; ec=$?
++
++[ "$ec" -ne 0 ] || fail "F3 exit $ec; want non-zero"
++cat out err >diag
++grep -Fq -- "cannot parse provided initial cluster config" diag || fail "F3 missing parse error: $(cat diag)"
++
++
++
++
++printf '{"initMode":"new","maxStandbys":0}' >invalid-spec.json
++"$BIN" --cluster-name f4 --store-backend etcdv3 --store-endpoints 127.0.0.1:1 \
++	--initial-cluster-spec invalid-spec.json --log-level error >out 2>err; ec=$?
++
++[ "$ec" -ne 0 ] || fail "F4 exit $ec; want non-zero"
++cat out err >diag
++grep -Fq -- "invalid initial cluster" diag || fail "F4 missing validation error: $(cat diag)"
++
++
++
++
++
++
++cat >spec-one.json <<'JSON'
++{"initMode":"new","sleepInterval":"200ms","requestTimeout":"150ms","failInterval":"1s","convergenceTimeout":"3s","pgParameters":{"max_connections":"101","wal_level":"replica"},"pgHBA":["host all all 127.0.0.1/32 trust"],"additionalMasterReplicationSlots":["slot_a"],"automaticPgRestart":false}
++JSON
++start_store f5-store
++run_sentinel_until_clusterdata f5 spec-one.json f5
++assert_json_expr f5.clusterdata.json 'd["formatVersion"] == 1' "F5 formatVersion"
++
++assert_json_expr f5.clusterdata.json 'isinstance(d["cluster"]["uid"], str) and d["cluster"]["uid"] != ""' "F5 generated uid"
++assert_json_expr f5.clusterdata.json 'd["cluster"]["generation"] == 1' "F5 generation"
++
++assert_json_expr f5.clusterdata.json 'd["cluster"]["status"]["phase"] == "initializing"' "F5 initializing phase"
++assert_json_expr f5.clusterdata.json 'd["keepers"] == {} and d["dbs"] == {} and d["proxy"]["spec"] == {} and d["proxy"]["status"] == {}' "F5 empty layout"
++
++assert_json_expr f5.clusterdata.json 'd["cluster"]["spec"]["initMode"] == "new" and d["cluster"]["spec"]["sleepInterval"] == "200ms" and d["cluster"]["spec"]["requestTimeout"] == "150ms" and d["cluster"]["spec"]["failInterval"] == "1s" and d["cluster"]["spec"]["convergenceTimeout"] == "3s" and d["cluster"]["spec"]["pgParameters"] == {"max_connections":"101","wal_level":"replica"} and d["cluster"]["spec"]["pgHBA"] == ["host all all 127.0.0.1/32 trust"] and d["cluster"]["spec"]["additionalMasterReplicationSlots"] == ["slot_a"] and d["cluster"]["spec"]["automaticPgRestart"] is False' "F5 provided spec fields"
++
++
++
++
++cat >spec-two.json <<'JSON'
++{"initMode":"new","sleepInterval":"350ms","requestTimeout":"300ms","failInterval":"2s","convergenceTimeout":"4s","pgParameters":{"max_connections":"202","wal_level":"logical"},"pgHBA":["host all all 127.0.0.1/32 md5"],"additionalMasterReplicationSlots":["slot_b"],"automaticPgRestart":true}
++JSON
++cp f5.clusterdata.json before-existing.json
++run_sentinel_against_existing_clusterdata f5 spec-two.json f6
++
++assert_json_equal before-existing.json f6.clusterdata.json "F6 existing cluster data was mutated"
++assert_json_expr f6.clusterdata.json 'd["cluster"]["spec"]["sleepInterval"] == "200ms" and d["cluster"]["spec"]["pgParameters"]["max_connections"] == "101" and d["cluster"]["spec"]["additionalMasterReplicationSlots"] == ["slot_a"]' "F6 original spec preserved"
++stop_store
++
++echo "PASS"
++exit 0
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,16 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++export GOPROXY=off
++export GOSUMDB=off
++export GOTOOLCHAIN=local
++export VERSION="${VERSION:-local-offline}"
++set -e
++cd /workspace/repo
++exec bash /workspace/repo/usercase-test-coderl/usecase.sh

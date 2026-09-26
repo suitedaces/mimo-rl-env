@@ -1,0 +1,401 @@
+diff --git a/usercase-test-coderl/access_can_test.go b/usercase-test-coderl/access_can_test.go
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/access_can_test.go
+@@ -0,0 +1,369 @@
++package usercase_test_coderl
++
++import (
++	"fmt"
++	"reflect"
++	"strings"
++	"testing"
++
++	"upspin.io/access"
++	"upspin.io/upspin"
++)
++
++const (
++	accessPath = upspin.PathName("me@here.com/Access")
++	filePath   = upspin.PathName("me@here.com/foo/bar")
++)
++
++func parseAccess(t *testing.T, text string) *access.Access {
++	t.Helper()
++	a, err := access.Parse(accessPath, []byte(text))
++	if err != nil {
++		t.Fatalf("Parse(%q): %v", text, err)
++	}
++	return a
++}
++
++func removeGroups(names ...upspin.PathName) {
++	for _, name := range names {
++		_ = access.RemoveGroup(name)
++	}
++}
++
++func mustCan(t *testing.T, a *access.Access, requester upspin.UserName, right access.Right, pathName upspin.PathName, load func(upspin.PathName) ([]byte, error)) bool {
++	t.Helper()
++	ok, err := a.Can(requester, right, pathName, load)
++	if err != nil {
++		t.Fatalf("Can(%q, %s, %q) returned error: %v", requester, right, pathName, err)
++	}
++	return ok
++}
++
++func noLoad(t *testing.T) func(upspin.PathName) ([]byte, error) {
++	t.Helper()
++	return func(name upspin.PathName) ([]byte, error) {
++		t.Fatalf("load was called for %q", name)
++		return nil, fmt.Errorf("unreachable")
++	}
++}
++
++func TestCanLiteralUsersOwnersWildcardsAndControlFiles(t *testing.T) {
++
++
++	a := parseAccess(t, "r: reader@foo.bar, *@nsa.gov\nw: writer@foo.bar\nc: creator@foo.bar\nd: deleter@foo.bar\n")
++	load := noLoad(t)
++	groupPath := upspin.PathName("me@here.com/Group/family")
++
++
++	if got := mustCan(t, a, "reader@foo.bar", access.Read, filePath, load); got != true {
++		t.Fatalf("reader read ordinary file = %v, want true", got)
++	}
++	if got := mustCan(t, a, "writer@foo.bar", access.Read, filePath, load); got != false {
++		t.Fatalf("writer read ordinary file = %v, want false", got)
++	}
++	if got := mustCan(t, a, "writer@foo.bar", access.Write, filePath, load); got != true {
++		t.Fatalf("writer write ordinary file = %v, want true", got)
++	}
++	if got := mustCan(t, a, "me@here.com", access.Read, filePath, load); got != true {
++		t.Fatalf("owner read ordinary file = %v, want true", got)
++	}
++	if got := mustCan(t, a, "me@here.com", access.List, filePath, load); got != true {
++		t.Fatalf("owner list ordinary file = %v, want true", got)
++	}
++	if got := mustCan(t, a, "me@here.com", access.AnyRight, filePath, load); got != true {
++		t.Fatalf("owner any-right ordinary file = %v, want true", got)
++	}
++	if got := mustCan(t, a, "me@here.com", access.Create, filePath, load); got != false {
++		t.Fatalf("owner create ordinary file = %v, want false", got)
++	}
++	if got := mustCan(t, a, "joe@nsa.gov", access.Read, filePath, load); got != true {
++		t.Fatalf("domain wildcard read = %v, want true", got)
++	}
++	if got := mustCan(t, a, "*@nasa.gov", access.Read, filePath, load); got != false {
++		t.Fatalf("literal wildcard-looking requester read = %v, want false", got)
++	}
++	if got := mustCan(t, a, "writer@foo.bar", access.Write, accessPath, load); got != false {
++		t.Fatalf("non-owner write Access file = %v, want false", got)
++	}
++	if got := mustCan(t, a, "me@here.com", access.Write, accessPath, load); got != true {
++		t.Fatalf("owner write Access file = %v, want true", got)
++	}
++	if got := mustCan(t, a, "creator@foo.bar", access.Create, groupPath, load); got != false {
++		t.Fatalf("non-owner create Group file = %v, want false", got)
++	}
++	if got := mustCan(t, a, "deleter@foo.bar", access.Delete, groupPath, load); got != false {
++		t.Fatalf("non-owner delete Group file = %v, want false", got)
++	}
++	if got := mustCan(t, a, "me@here.com", access.Create, groupPath, load); got != true {
++		t.Fatalf("owner create Group file = %v, want true", got)
++	}
++	if got := mustCan(t, a, "me@here.com", access.Delete, groupPath, load); got != true {
++		t.Fatalf("owner delete Group file = %v, want true", got)
++	}
++}
++
++func TestCanLoadsAndCachesDirectGroup(t *testing.T) {
++
++
++	const family = upspin.PathName("me@here.com/Group/family")
++	removeGroups(family)
++	defer removeGroups(family)
++
++	a := parseAccess(t, "r: family\n")
++	var calls []upspin.PathName
++	load := func(name upspin.PathName) ([]byte, error) {
++		calls = append(calls, name)
++		return []byte("sister@me.com, brother@me.com"), nil
++	}
++
++	if got := mustCan(t, a, "sister@me.com", access.Read, filePath, load); got != true {
++		t.Fatalf("sister read through group = %v, want true", got)
++	}
++	if got := len(calls); got != 1 {
++		t.Fatalf("load call count after first group lookup = %d, want 1", got)
++	}
++	if got := calls[0]; got != family {
++		t.Fatalf("first load path = %q, want %q", got, family)
++	}
++	if got := mustCan(t, a, "aunt@me.com", access.Read, filePath, load); got != false {
++		t.Fatalf("aunt read through group = %v, want false", got)
++	}
++	if got := len(calls); got != 1 {
++		t.Fatalf("load call count after cached non-member lookup = %d, want 1", got)
++	}
++	if got := mustCan(t, a, "sister@me.com", access.Read, filePath, load); got != true {
++		t.Fatalf("sister read through cached group = %v, want true", got)
++	}
++	if got := len(calls); got != 1 {
++		t.Fatalf("load call count after cached member lookup = %d, want 1", got)
++	}
++}
++
++func TestCanFollowsNestedGroupsAndTreatsGroupOwnerAsMember(t *testing.T) {
++
++
++	const (
++		outer = upspin.PathName("me@here.com/Group/outer")
++		inner = upspin.PathName("me@here.com/Group/inner")
++	)
++	removeGroups(outer, inner)
++	defer removeGroups(outer, inner)
++
++	a := parseAccess(t, "r: outer\n")
++	files := map[upspin.PathName][]byte{
++		outer: []byte("me@here.com/Group/inner"),
++		inner: []byte("cousin@me.com"),
++	}
++	var calls []upspin.PathName
++	load := func(name upspin.PathName) ([]byte, error) {
++		calls = append(calls, name)
++		return files[name], nil
++	}
++
++	if got := mustCan(t, a, "cousin@me.com", access.Read, filePath, load); got != true {
++		t.Fatalf("nested group member read = %v, want true", got)
++	}
++	wantCalls := []upspin.PathName{outer, inner}
++	if !reflect.DeepEqual(calls, wantCalls) {
++		t.Fatalf("nested group load paths = %#v, want %#v", calls, wantCalls)
++	}
++	if got := mustCan(t, a, "me@here.com", access.Read, filePath, load); got != true {
++		t.Fatalf("group owner read through group = %v, want true", got)
++	}
++	if got := len(calls); got != 2 {
++		t.Fatalf("load call count after owner check = %d, want 2", got)
++	}
++	if got := mustCan(t, a, "aunt@me.com", access.Read, filePath, load); got != false {
++		t.Fatalf("non-member read through nested group = %v, want false", got)
++	}
++	if got := len(calls); got != 2 {
++		t.Fatalf("load call count after cached non-member check = %d, want 2", got)
++	}
++
++
++
++	const external = upspin.PathName("friend@other.com/Group/club")
++	removeGroups(external)
++	defer removeGroups(external)
++	ownerAccess := parseAccess(t, "r: friend@other.com/Group/club\n")
++	ownerLoad := func(name upspin.PathName) ([]byte, error) {
++		if name != external {
++			t.Fatalf("external owner load path = %q, want %q", name, external)
++		}
++		return nil, nil
++	}
++	if got := mustCan(t, ownerAccess, "friend@other.com", access.Read, filePath, ownerLoad); got != true {
++		t.Fatalf("external group owner read through group = %v, want true", got)
++	}
++}
++
++func TestCanAllUserGrantsAuthenticatedRequesters(t *testing.T) {
++
++
++	a := parseAccess(t, "r: all\n")
++	load := noLoad(t)
++
++	if got := mustCan(t, a, "reader@foo.bar", access.Read, filePath, load); got != true {
++		t.Fatalf("reader read through all = %v, want true", got)
++	}
++	if got := mustCan(t, a, "joe@nsa.gov", access.Read, filePath, load); got != true {
++		t.Fatalf("joe read through all = %v, want true", got)
++	}
++}
++
++func TestCanRejectsInvalidRequesterAndRight(t *testing.T) {
++
++
++	a := parseAccess(t, "r: reader@foo.bar\n")
++	load := noLoad(t)
++
++	ok, err := a.Can("not valid", access.Read, filePath, load)
++	if ok != false {
++		t.Fatalf("invalid requester ok = %v, want false", ok)
++	}
++
++	if err == nil {
++		t.Fatal("invalid requester error = nil, want error")
++	}
++
++	ok, err = a.Can("reader@foo.bar", access.Right(99), filePath, load)
++	if ok != false {
++		t.Fatalf("invalid right ok = %v, want false", ok)
++	}
++	if err == nil {
++		t.Fatal("invalid right error = nil, want error")
++	}
++}
++
++func TestCanInstancesKeepIndependentPolicyState(t *testing.T) {
++
++
++	a := parseAccess(t, "r: alpha@foo.bar\nw: alpha@foo.bar\n")
++	b := parseAccess(t, "r: beta@foo.bar\nw: beta@foo.bar\n")
++	load := noLoad(t)
++
++	if got := mustCan(t, a, "alpha@foo.bar", access.Read, filePath, load); got != true {
++		t.Fatalf("a alpha read = %v, want true", got)
++	}
++	if got := mustCan(t, a, "beta@foo.bar", access.Read, filePath, load); got != false {
++		t.Fatalf("a beta read = %v, want false", got)
++	}
++	if got := mustCan(t, b, "alpha@foo.bar", access.Read, filePath, load); got != false {
++		t.Fatalf("b alpha read = %v, want false", got)
++	}
++	if got := mustCan(t, b, "beta@foo.bar", access.Read, filePath, load); got != true {
++		t.Fatalf("b beta read = %v, want true", got)
++	}
++	if got := mustCan(t, a, "alpha@foo.bar", access.Write, filePath, load); got != true {
++		t.Fatalf("a alpha write = %v, want true", got)
++	}
++	if got := mustCan(t, b, "beta@foo.bar", access.Write, filePath, load); got != true {
++		t.Fatalf("b beta write = %v, want true", got)
++	}
++}
++
++func TestGroupCacheReusesCachedMembershipWithChangedLoader(t *testing.T) {
++
++
++
++	const family = upspin.PathName("me@here.com/Group/family")
++	removeGroups(family)
++	defer removeGroups(family)
++
++	a := parseAccess(t, "r: family\n")
++	var calls int
++	load := func(name upspin.PathName) ([]byte, error) {
++		calls++
++		if name != family {
++			t.Fatalf("load path = %q, want %q", name, family)
++		}
++		if calls == 1 {
++			return []byte("sister@me.com"), nil
++		}
++		return []byte("aunt@me.com"), nil
++	}
++
++	if got := mustCan(t, a, "sister@me.com", access.Read, filePath, load); got != true {
++		t.Fatalf("sister read before cleanup = %v, want true", got)
++	}
++	if calls != 1 {
++		t.Fatalf("load count before cleanup = %d, want 1", calls)
++	}
++
++
++	if got := mustCan(t, a, "aunt@me.com", access.Read, filePath, load); got != false {
++		t.Fatalf("aunt read through cached first group = %v, want false", got)
++	}
++	if calls != 1 {
++		t.Fatalf("load count after cached changed-loader lookup = %d, want 1", calls)
++	}
++}
++
++func TestRepeatedCanCachesEachLoadedGroup(t *testing.T) {
++
++
++
++	const cycles = 150
++	totalLoads := 0
++	var groupNames []upspin.PathName
++	defer func() {
++		removeGroups(groupNames...)
++	}()
++
++	for i := 0; i < cycles; i++ {
++		groupName := upspin.PathName(fmt.Sprintf("me@here.com/Group/family%d", i))
++		removeGroups(groupName)
++		groupNames = append(groupNames, groupName)
++		a := parseAccess(t, fmt.Sprintf("r: family%d\n", i))
++		loadsThisCycle := 0
++		load := func(name upspin.PathName) ([]byte, error) {
++			loadsThisCycle++
++			totalLoads++
++			if name != groupName {
++				t.Fatalf("cycle %d load path = %q, want %q", i, name, groupName)
++			}
++			return []byte("sister@me.com"), nil
++		}
++
++		if got := mustCan(t, a, "sister@me.com", access.Read, filePath, load); got != true {
++			t.Fatalf("cycle %d sister read = %v, want true", i, got)
++		}
++		if loadsThisCycle != 1 {
++			t.Fatalf("cycle %d load count after first Can = %d, want 1", i, loadsThisCycle)
++		}
++		if got := mustCan(t, a, "sister@me.com", access.Read, filePath, load); got != true {
++			t.Fatalf("cycle %d cached sister read = %v, want true", i, got)
++		}
++		if loadsThisCycle != 1 {
++			t.Fatalf("cycle %d load count after cached Can = %d, want 1", i, loadsThisCycle)
++		}
++	}
++
++	if totalLoads != 150 {
++		t.Fatalf("total load count = %d, want 150", totalLoads)
++	}
++
++
++}
++
++func TestCanDoesNotLoadWhenDeniedByLiteralPolicy(t *testing.T) {
++
++
++	a := parseAccess(t, "r: reader@foo.bar\nw: writer@foo.bar\n")
++	var calls []upspin.PathName
++	load := func(name upspin.PathName) ([]byte, error) {
++		calls = append(calls, name)
++		return nil, fmt.Errorf("unexpected load")
++	}
++
++	ok, err := a.Can("writer@foo.bar", access.Read, filePath, load)
++	if ok != false {
++		t.Fatalf("writer read ok = %v, want false", ok)
++	}
++	if err != nil {
++		t.Fatalf("writer read error = %v, want nil", err)
++	}
++	if len(calls) != 0 {
++		t.Fatalf("load calls = %s, want none", strings.TrimSpace(fmt.Sprint(calls)))
++	}
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,22 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++
++cd /workspace/repo
++
++
++export GOPROXY=off
++export GOSUMDB=off
++export GOVCS='*:off'
++export GOTOOLCHAIN=local
++export GOFLAGS='-mod=readonly'
++exec go test -v -count=1 ./usercase-test-coderl/...

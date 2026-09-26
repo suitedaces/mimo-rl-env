@@ -1,0 +1,680 @@
+diff --git a/usercase-test-coderl/test_dynamic_table_changeset.py b/usercase-test-coderl/test_dynamic_table_changeset.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/test_dynamic_table_changeset.py
+@@ -0,0 +1,655 @@
++import builtins
++import copy
++import json
++import os
++import socket
++import subprocess
++import sys
++from dataclasses import dataclass, field
++from pathlib import Path
++from typing import Optional
++
++from dbt.adapters.relation_configs import RelationConfigChangeAction
++from dbt.adapters.snowflake import SnowflakeRelation
++from dbt.adapters.snowflake.relation_configs import (
++    SnowflakeDynamicTableClusterByConfigChange,
++    SnowflakeDynamicTableConfigChangeset,
++    SnowflakeDynamicTableImmutableWhereConfigChange,
++    SnowflakeDynamicTableInitializationWarehouseConfigChange,
++    SnowflakeDynamicTableRefreshModeConfigChange,
++    SnowflakeDynamicTableSchedulerConfigChange,
++    SnowflakeDynamicTableTargetLagConfigChange,
++    SnowflakeDynamicTableTransientConfigChange,
++    SnowflakeDynamicTableWarehouseConfigChange,
++)
++
++
++
++
++
++
++
++class ConfigFixture:
++    def __init__(self, extra):
++        self.extra = dict(extra)
++        self.materialized = "dynamic_table"
++
++    def get(self, key, default=None):
++        return self.extra.get(key, default)
++
++    def __bool__(self):
++        return True
++
++    def __eq__(self, other):
++        return (
++            isinstance(other, ConfigFixture)
++            and self.extra == other.extra
++            and self.materialized == other.materialized
++        )
++
++
++@dataclass
++class RelationConfigFixture:
++    database: str = "DB"
++    schema: str = "SCHEMA"
++    identifier: str = "DT"
++    compiled_code: Optional[str] = "select 1 as id"
++    config: ConfigFixture = field(default_factory=lambda: ConfigFixture({}))
++
++
++@dataclass
++class RowFixture:
++    values: dict
++
++    def get(self, key, default=None):
++        return self.values.get(key, default)
++
++
++@dataclass
++class TableFixture:
++    rows: list
++
++
++BASE_EXISTING_DYNAMIC_TABLE = {
++    "name": "DT",
++    "schema_name": "SCHEMA",
++    "database_name": "DB",
++    "text": "select 1 as id",
++    "target_lag": "1 minute",
++    "warehouse": "WH_X",
++    "initialization_warehouse": None,
++    "refresh_mode": "AUTO",
++    "scheduler": "ENABLE",
++    "row_access_policy": None,
++    "table_tag": None,
++    "cluster_by": None,
++    "immutable_where": None,
++    "transient": None,
++}
++
++BASE_REQUESTED_CONFIG = {
++    "target_lag": "1 minute",
++    "snowflake_warehouse": "WH_X",
++    "snowflake_initialization_warehouse": None,
++    "refresh_mode": "AUTO",
++    "scheduler": "ENABLE",
++    "immutable_where": None,
++    "cluster_by": None,
++}
++
++ALTER = RelationConfigChangeAction.alter
++CREATE = RelationConfigChangeAction.create
++
++
++def relation_results(**overrides):
++    values = dict(BASE_EXISTING_DYNAMIC_TABLE)
++    values.update(overrides)
++    return {"dynamic_table": TableFixture([RowFixture(values)])}
++
++
++def relation_config(**overrides):
++    extra = dict(BASE_REQUESTED_CONFIG)
++    extra.update(overrides)
++    return RelationConfigFixture(config=ConfigFixture(extra))
++
++
++def serialize_changeset(changeset):
++    if changeset is None:
++        return None
++    fields = (
++        "target_lag",
++        "snowflake_warehouse",
++        "snowflake_initialization_warehouse",
++        "refresh_mode",
++        "scheduler",
++        "immutable_where",
++        "cluster_by",
++        "transient",
++    )
++    result = {}
++    for field_name in fields:
++        change = getattr(changeset, field_name)
++        result[field_name] = (
++            None
++            if change is None
++            else {
++                "action": str(change.action),
++                "context": change.context,
++                "requires_full_refresh": change.requires_full_refresh,
++            }
++        )
++    result["has_changes"] = changeset.has_changes
++    result["requires_full_refresh"] = changeset.requires_full_refresh
++    return result
++
++
++def test_returns_none_when_dynamic_table_settings_match():
++
++
++
++
++    actual = SnowflakeRelation.dynamic_table_config_changeset(
++        relation_results(),
++        relation_config(),
++    )
++
++    assert actual is None
++
++
++def test_target_lag_and_refresh_warehouse_differences_are_alter_changes():
++
++
++
++
++    actual = SnowflakeRelation.dynamic_table_config_changeset(
++        relation_results(),
++        relation_config(target_lag="5 minutes", refresh_warehouse="WH_REFRESH"),
++    )
++
++    assert actual == SnowflakeDynamicTableConfigChangeset(
++        target_lag=SnowflakeDynamicTableTargetLagConfigChange(
++            action=ALTER,
++            context="5 minutes",
++        ),
++        snowflake_warehouse=SnowflakeDynamicTableWarehouseConfigChange(
++            action=ALTER,
++            context="WH_REFRESH",
++        ),
++    )
++    assert actual.has_changes is True
++    assert actual.requires_full_refresh is False
++
++
++def test_requested_none_target_lag_is_ignored():
++
++
++
++
++    actual = SnowflakeRelation.dynamic_table_config_changeset(
++        relation_results(scheduler="DISABLE"),
++        relation_config(target_lag=None, scheduler="DISABLE"),
++    )
++
++    assert actual is None
++
++
++def test_initialization_warehouse_difference_is_alter_change():
++
++
++
++
++    actual = SnowflakeRelation.dynamic_table_config_changeset(
++        relation_results(initialization_warehouse="NONE"),
++        relation_config(snowflake_initialization_warehouse="WH_INIT"),
++    )
++
++    assert actual == SnowflakeDynamicTableConfigChangeset(
++        snowflake_initialization_warehouse=SnowflakeDynamicTableInitializationWarehouseConfigChange(
++            action=ALTER,
++            context="WH_INIT",
++        )
++    )
++    assert actual.has_changes is True
++    assert actual.requires_full_refresh is False
++
++
++def test_scheduler_difference_is_alter_change():
++
++
++
++
++    actual = SnowflakeRelation.dynamic_table_config_changeset(
++        relation_results(target_lag=None, scheduler="ENABLE"),
++        relation_config(target_lag=None, scheduler="DISABLE"),
++    )
++
++    assert actual == SnowflakeDynamicTableConfigChangeset(
++        scheduler=SnowflakeDynamicTableSchedulerConfigChange(
++            action=ALTER,
++            context="DISABLE",
++        )
++    )
++    assert actual.has_changes is True
++    assert actual.requires_full_refresh is False
++
++
++def test_immutable_where_difference_uses_normalized_requested_context():
++
++
++
++
++    actual = SnowflakeRelation.dynamic_table_config_changeset(
++        relation_results(immutable_where="IMMUTABLE WHERE (tenant_id > 10)"),
++        relation_config(immutable_where="tenant_id > 99"),
++    )
++
++    assert actual == SnowflakeDynamicTableConfigChangeset(
++        immutable_where=SnowflakeDynamicTableImmutableWhereConfigChange(
++            action=ALTER,
++            context="tenant_id > 99",
++        )
++    )
++    assert actual.has_changes is True
++    assert actual.requires_full_refresh is False
++
++
++def test_cluster_by_difference_uses_joined_requested_list_context():
++
++
++
++
++    actual = SnowflakeRelation.dynamic_table_config_changeset(
++        relation_results(cluster_by="USER_ID"),
++        relation_config(cluster_by=["USER_ID", "EVENT_DATE"]),
++    )
++
++    assert actual == SnowflakeDynamicTableConfigChangeset(
++        cluster_by=SnowflakeDynamicTableClusterByConfigChange(
++            action=ALTER,
++            context="USER_ID, EVENT_DATE",
++        )
++    )
++    assert actual.has_changes is True
++    assert actual.requires_full_refresh is False
++
++
++def test_requested_auto_refresh_mode_difference_is_ignored():
++
++
++
++
++    actual = SnowflakeRelation.dynamic_table_config_changeset(
++        relation_results(refresh_mode="FULL"),
++        relation_config(refresh_mode="AUTO"),
++    )
++
++    assert actual is None
++
++
++def test_requested_full_refresh_mode_difference_is_create_change_requiring_full_refresh():
++
++
++
++
++    actual = SnowflakeRelation.dynamic_table_config_changeset(
++        relation_results(refresh_mode="AUTO"),
++        relation_config(refresh_mode="FULL"),
++    )
++
++    assert actual == SnowflakeDynamicTableConfigChangeset(
++        refresh_mode=SnowflakeDynamicTableRefreshModeConfigChange(
++            action=CREATE,
++            context="FULL",
++        )
++    )
++    assert actual.has_changes is True
++    assert actual.requires_full_refresh is True
++
++
++def test_transient_difference_when_both_values_known_requires_full_refresh():
++
++
++
++
++    actual = SnowflakeRelation.dynamic_table_config_changeset(
++        relation_results(transient=False),
++        relation_config(transient=True),
++    )
++
++    assert actual == SnowflakeDynamicTableConfigChangeset(
++        transient=SnowflakeDynamicTableTransientConfigChange(
++            action=CREATE,
++            context=True,
++        )
++    )
++    assert actual.has_changes is True
++    assert actual.requires_full_refresh is True
++
++
++def test_transient_change_is_ignored_when_existing_value_unknown():
++
++
++
++
++    actual = SnowflakeRelation.dynamic_table_config_changeset(
++        relation_results(transient=None),
++        relation_config(transient=True),
++    )
++
++    assert actual is None
++
++
++def test_transient_change_is_ignored_when_requested_value_unknown():
++
++
++
++
++    actual = SnowflakeRelation.dynamic_table_config_changeset(
++        relation_results(transient=True),
++        relation_config(transient=None),
++    )
++
++    assert actual is None
++
++
++def test_combined_dynamic_table_changes_populate_each_relevant_field():
++
++
++
++
++    actual = SnowflakeRelation.dynamic_table_config_changeset(
++        relation_results(
++            target_lag="2 minutes",
++            warehouse="WH_OLD",
++            initialization_warehouse="WH_OLD_INIT",
++            refresh_mode="FULL",
++            scheduler="DISABLE",
++            immutable_where="NONE",
++            cluster_by="",
++            transient=False,
++        ),
++        relation_config(
++            target_lag="10 minutes",
++            refresh_warehouse="WH_REFRESH",
++            snowflake_initialization_warehouse="WH_INIT",
++            refresh_mode="INCREMENTAL",
++            scheduler="ENABLE",
++            immutable_where="tenant_id is not null",
++            cluster_by=["TENANT_ID", "EVENT_TS"],
++            transient=True,
++        ),
++    )
++
++    assert actual == SnowflakeDynamicTableConfigChangeset(
++        target_lag=SnowflakeDynamicTableTargetLagConfigChange(
++            action=ALTER,
++            context="10 minutes",
++        ),
++        snowflake_warehouse=SnowflakeDynamicTableWarehouseConfigChange(
++            action=ALTER,
++            context="WH_REFRESH",
++        ),
++        snowflake_initialization_warehouse=SnowflakeDynamicTableInitializationWarehouseConfigChange(
++            action=ALTER,
++            context="WH_INIT",
++        ),
++        refresh_mode=SnowflakeDynamicTableRefreshModeConfigChange(
++            action=CREATE,
++            context="INCREMENTAL",
++        ),
++        scheduler=SnowflakeDynamicTableSchedulerConfigChange(
++            action=ALTER,
++            context="ENABLE",
++        ),
++        immutable_where=SnowflakeDynamicTableImmutableWhereConfigChange(
++            action=ALTER,
++            context="tenant_id is not null",
++        ),
++        cluster_by=SnowflakeDynamicTableClusterByConfigChange(
++            action=ALTER,
++            context="TENANT_ID, EVENT_TS",
++        ),
++        transient=SnowflakeDynamicTableTransientConfigChange(
++            action=CREATE,
++            context=True,
++        ),
++    )
++    assert actual.has_changes is True
++    assert actual.requires_full_refresh is True
++
++
++def test_scheduler_enable_difference_is_alter_change():
++
++
++
++
++    actual = SnowflakeRelation.dynamic_table_config_changeset(
++        relation_results(target_lag="5 minutes", scheduler="DISABLE"),
++        relation_config(target_lag="5 minutes", scheduler="ENABLE"),
++    )
++
++
++    assert actual == SnowflakeDynamicTableConfigChangeset(
++        scheduler=SnowflakeDynamicTableSchedulerConfigChange(
++            action=ALTER,
++            context="ENABLE",
++        )
++    )
++    assert actual.has_changes is True
++    assert actual.requires_full_refresh is False
++
++
++def test_referential_transparency_same_inputs_equal_results():
++    actual_one = SnowflakeRelation.dynamic_table_config_changeset(
++        relation_results(),
++        relation_config(target_lag="5 minutes", refresh_warehouse="WH_REFRESH"),
++    )
++    actual_two = SnowflakeRelation.dynamic_table_config_changeset(
++        relation_results(),
++        relation_config(target_lag="5 minutes", refresh_warehouse="WH_REFRESH"),
++    )
++
++    assert actual_one == actual_two
++    assert actual_one == SnowflakeDynamicTableConfigChangeset(
++        target_lag=SnowflakeDynamicTableTargetLagConfigChange(
++            action=ALTER,
++            context="5 minutes",
++        ),
++        snowflake_warehouse=SnowflakeDynamicTableWarehouseConfigChange(
++            action=ALTER,
++            context="WH_REFRESH",
++        ),
++    )
++
++
++def test_inputs_are_not_mutated():
++    existing = relation_results(
++        immutable_where="IMMUTABLE WHERE (tenant_id > 10)",
++        cluster_by="USER_ID",
++        transient=False,
++    )
++    requested = relation_config(
++        immutable_where="tenant_id > 99",
++        cluster_by=["USER_ID", "EVENT_DATE"],
++        transient=True,
++    )
++    existing_before = copy.deepcopy(existing)
++    requested_before = copy.deepcopy(requested)
++
++    actual = SnowflakeRelation.dynamic_table_config_changeset(existing, requested)
++
++    assert actual == SnowflakeDynamicTableConfigChangeset(
++        immutable_where=SnowflakeDynamicTableImmutableWhereConfigChange(
++            action=ALTER,
++            context="tenant_id > 99",
++        ),
++        cluster_by=SnowflakeDynamicTableClusterByConfigChange(
++            action=ALTER,
++            context="USER_ID, EVENT_DATE",
++        ),
++        transient=SnowflakeDynamicTableTransientConfigChange(
++            action=CREATE,
++            context=True,
++        ),
++    )
++    assert existing == existing_before
++    assert requested == requested_before
++
++
++def test_same_input_result_matches_fresh_python_process():
++    in_process = serialize_changeset(
++        SnowflakeRelation.dynamic_table_config_changeset(
++            relation_results(refresh_mode="AUTO"),
++            relation_config(refresh_mode="FULL"),
++        )
++    )
++
++    script = r'''
++import json
++from dataclasses import dataclass, field
++from typing import Optional
++from dbt.adapters.snowflake import SnowflakeRelation
++
++class ConfigFixture:
++    def __init__(self, extra):
++        self.extra = dict(extra)
++        self.materialized = "dynamic_table"
++    def get(self, key, default=None):
++        return self.extra.get(key, default)
++    def __bool__(self):
++        return True
++
++@dataclass
++class RelationConfigFixture:
++    database: str = "DB"
++    schema: str = "SCHEMA"
++    identifier: str = "DT"
++    compiled_code: Optional[str] = "select 1 as id"
++    config: ConfigFixture = field(default_factory=lambda: ConfigFixture({}))
++
++@dataclass
++class RowFixture:
++    values: dict
++    def get(self, key, default=None):
++        return self.values.get(key, default)
++
++@dataclass
++class TableFixture:
++    rows: list
++
++base_existing = {
++    "name": "DT",
++    "schema_name": "SCHEMA",
++    "database_name": "DB",
++    "text": "select 1 as id",
++    "target_lag": "1 minute",
++    "warehouse": "WH_X",
++    "initialization_warehouse": None,
++    "refresh_mode": "AUTO",
++    "scheduler": "ENABLE",
++    "row_access_policy": None,
++    "table_tag": None,
++    "cluster_by": None,
++    "immutable_where": None,
++    "transient": None,
++}
++base_requested = {
++    "target_lag": "1 minute",
++    "snowflake_warehouse": "WH_X",
++    "snowflake_initialization_warehouse": None,
++    "refresh_mode": "FULL",
++    "scheduler": "ENABLE",
++    "immutable_where": None,
++    "cluster_by": None,
++}
++
++def serialize_changeset(changeset):
++    if changeset is None:
++        return None
++    fields = (
++        "target_lag",
++        "snowflake_warehouse",
++        "snowflake_initialization_warehouse",
++        "refresh_mode",
++        "scheduler",
++        "immutable_where",
++        "cluster_by",
++        "transient",
++    )
++    result = {}
++    for field_name in fields:
++        change = getattr(changeset, field_name)
++        result[field_name] = (
++            None
++            if change is None
++            else {
++                "action": str(change.action),
++                "context": change.context,
++                "requires_full_refresh": change.requires_full_refresh,
++            }
++        )
++    result["has_changes"] = changeset.has_changes
++    result["requires_full_refresh"] = changeset.requires_full_refresh
++    return result
++
++existing = {"dynamic_table": TableFixture([RowFixture(base_existing)])}
++requested = RelationConfigFixture(config=ConfigFixture(base_requested))
++print(json.dumps(serialize_changeset(SnowflakeRelation.dynamic_table_config_changeset(existing, requested)), sort_keys=True))
++'''
++    completed = subprocess.run(
++        [sys.executable, "-c", script],
++        check=True,
++        text=True,
++        capture_output=True,
++    )
++    fresh_process = json.loads(completed.stdout)
++
++    assert fresh_process == in_process
++    assert fresh_process == {
++        "target_lag": None,
++        "snowflake_warehouse": None,
++        "snowflake_initialization_warehouse": None,
++        "refresh_mode": {
++            "action": "create",
++            "context": "FULL",
++            "requires_full_refresh": True,
++        },
++        "scheduler": None,
++        "immutable_where": None,
++        "cluster_by": None,
++        "transient": None,
++        "has_changes": True,
++        "requires_full_refresh": True,
++    }
++
++
++def test_no_undeclared_filesystem_or_network_side_effects(monkeypatch, tmp_path):
++    def fail_open(*args, **kwargs):
++        raise AssertionError(f"unexpected filesystem access via open: {args!r}")
++
++    def fail_socket(*args, **kwargs):
++        raise AssertionError("unexpected network access")
++
++    monkeypatch.chdir(tmp_path)
++    before = {path.relative_to(tmp_path) for path in Path(tmp_path).rglob("*")}
++    monkeypatch.setattr(builtins, "open", fail_open)
++    monkeypatch.setattr(socket, "socket", fail_socket)
++    monkeypatch.setattr(socket, "create_connection", fail_socket)
++
++    actual = SnowflakeRelation.dynamic_table_config_changeset(
++        relation_results(),
++        relation_config(target_lag="5 minutes", refresh_warehouse="WH_REFRESH"),
++    )
++
++    after = {path.relative_to(tmp_path) for path in Path(tmp_path).rglob("*")}
++    assert actual == SnowflakeDynamicTableConfigChangeset(
++        target_lag=SnowflakeDynamicTableTargetLagConfigChange(
++            action=ALTER,
++            context="5 minutes",
++        ),
++        snowflake_warehouse=SnowflakeDynamicTableWarehouseConfigChange(
++            action=ALTER,
++            context="WH_REFRESH",
++        ),
++    )
++    assert after == before
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,15 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++cd /workspace/repo
++export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
++exec /usr/local/bin/python -m pytest -o addopts="" /workspace/repo/usercase-test-coderl/test_dynamic_table_changeset.py -v

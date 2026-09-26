@@ -1,0 +1,265 @@
+diff --git a/src/manager/store/dependency_planner_codespec_test.go b/src/manager/store/dependency_planner_codespec_test.go
+new file mode 100644
+index 00000000..d3af2d40
+--- /dev/null
++++ b/src/manager/store/dependency_planner_codespec_test.go
+@@ -0,0 +1,250 @@
++package store_test
++
++import (
++	"reflect"
++	"strings"
++	"testing"
++
++	"github.com/Dataman-Cloud/swan/src/manager/store"
++	ctypes "github.com/aanand/compose-file/types"
++)
++
++func codespecService(name string, dependencies ...string) *store.DockerService {
++	return &store.DockerService{
++		Name: name,
++		Service: &ctypes.ServiceConfig{
++			Name:      name,
++			DependsOn: dependencies,
++		},
++		Extra: &store.YamlExtra{},
++	}
++}
++
++func codespecValidWithoutPanic(group store.ServiceGroup) (err error, panicked bool) {
++	defer func() {
++		if recover() != nil {
++			panicked = true
++		}
++	}()
++	err = group.Valid()
++	return err, false
++}
++
++func codespecSortWithoutPanic(group store.ServiceGroup) (order []string, err error, panicked bool) {
++	defer func() {
++		if recover() != nil {
++			panicked = true
++		}
++	}()
++	order, err = group.PrioritySort()
++	return order, err, false
++}
++
++func TestCodespecDependencyPlanIsStableAndDependencyFirst(t *testing.T) {
++	single := store.ServiceGroup{"solo": codespecService("solo")}
++	if err := single.Valid(); err != nil {
++		t.Fatalf("single-service group should be valid: %v", err)
++	}
++	if got, err := single.PrioritySort(); err != nil || !reflect.DeepEqual(got, []string{"solo"}) {
++		t.Fatalf("single-service plan = %v, %v; want [solo], nil", got, err)
++	}
++
++	apiDependencies := []string{"db", "cache"}
++	webDependencies := []string{"worker", "api"}
++	group := store.ServiceGroup{
++		"web":     codespecService("web", webDependencies...),
++		"worker":  codespecService("worker", "db"),
++		"metrics": codespecService("metrics"),
++		"db":      codespecService("db"),
++		"cache":   codespecService("cache"),
++		"api":     codespecService("api", apiDependencies...),
++	}
++	if err := group.Valid(); err != nil {
++		t.Fatalf("well-formed dependency graph should be valid: %v", err)
++	}
++
++	want := []string{"cache", "db", "api", "metrics", "worker", "web"}
++	for i := 0; i < 20; i++ {
++		got, err := group.PrioritySort()
++		if err != nil {
++			t.Fatalf("valid group returned an error: %v", err)
++		}
++		if !reflect.DeepEqual(got, want) {
++			t.Fatalf("plan %d = %v, want stable ready-service order %v", i, got, want)
++		}
++	}
++
++	if !reflect.DeepEqual(apiDependencies, []string{"db", "cache"}) {
++		t.Fatalf("PrioritySort mutated api dependencies: %v", apiDependencies)
++	}
++	if !reflect.DeepEqual(webDependencies, []string{"worker", "api"}) {
++		t.Fatalf("PrioritySort mutated web dependencies: %v", webDependencies)
++	}
++
++	equivalent := store.ServiceGroup{
++		"api":     codespecService("api", "cache", "db"),
++		"cache":   codespecService("cache"),
++		"db":      codespecService("db"),
++		"metrics": codespecService("metrics"),
++		"web":     codespecService("web", "api", "worker"),
++		"worker":  codespecService("worker", "db"),
++	}
++	if got, err := equivalent.PrioritySort(); err != nil || !reflect.DeepEqual(got, want) {
++		t.Fatalf("equivalent dependency declarations produced %v, %v; want %v, nil", got, err, want)
++	}
++}
++
++func TestCodespecDependencyPlanRejectsMalformedMembers(t *testing.T) {
++	tests := []struct {
++		name  string
++		group store.ServiceGroup
++		key   string
++	}{
++		{name: "nil group", group: nil},
++		{name: "empty group", group: store.ServiceGroup{}},
++		{name: "empty service name", group: store.ServiceGroup{
++			"": codespecService(""),
++		}},
++		{name: "hyphenated service name", group: store.ServiceGroup{
++			"web-api": codespecService("web-api"),
++		}, key: "web-api"},
++		{name: "nil service", group: store.ServiceGroup{"api": nil}, key: "api"},
++		{name: "nil service config", group: store.ServiceGroup{
++			"api": {Name: "api", Extra: &store.YamlExtra{}},
++		}, key: "api"},
++		{name: "nil extra settings", group: store.ServiceGroup{
++			"api": {Name: "api", Service: &ctypes.ServiceConfig{Name: "api"}},
++		}, key: "api"},
++		{name: "outer name mismatch", group: store.ServiceGroup{
++			"api": codespecService("other"),
++		}, key: "api"},
++		{name: "embedded name mismatch", group: store.ServiceGroup{
++			"api": {Name: "api", Service: &ctypes.ServiceConfig{Name: "other"}, Extra: &store.YamlExtra{}},
++		}, key: "api"},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			validErr, validPanicked := codespecValidWithoutPanic(tt.group)
++			if validPanicked {
++				t.Fatal("Valid panicked instead of returning an error")
++			}
++			if validErr == nil {
++				t.Fatal("Valid accepted a malformed service group")
++			}
++
++			order, sortErr, sortPanicked := codespecSortWithoutPanic(tt.group)
++			if sortPanicked {
++				t.Fatal("PrioritySort panicked instead of returning an error")
++			}
++			if sortErr == nil {
++				t.Fatalf("PrioritySort accepted a malformed group and returned %v", order)
++			}
++			if order != nil {
++				t.Fatalf("PrioritySort returned partial order %v with error %v", order, sortErr)
++			}
++			if tt.key != "" {
++				if !strings.Contains(validErr.Error(), tt.key) || !strings.Contains(sortErr.Error(), tt.key) {
++					t.Fatalf("errors must identify service %q: Valid=%q PrioritySort=%q", tt.key, validErr, sortErr)
++				}
++			}
++		})
++	}
++}
++
++func TestCodespecDependencyDeclarationsAreValidated(t *testing.T) {
++	tests := []struct {
++		name        string
++		group       store.ServiceGroup
++		mustMention []string
++	}{
++		{
++			name: "missing dependency",
++			group: store.ServiceGroup{
++				"api": codespecService("api", "database"),
++			},
++			mustMention: []string{"api", "database"},
++		},
++		{
++			name: "duplicate dependency",
++			group: store.ServiceGroup{
++				"api": codespecService("api", "db", "db"),
++				"db":  codespecService("db"),
++			},
++			mustMention: []string{"api", "db"},
++		},
++		{
++			name: "self dependency",
++			group: store.ServiceGroup{
++				"api": codespecService("api", "api"),
++			},
++			mustMention: []string{"api"},
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			if err := tt.group.Valid(); err == nil {
++				t.Fatal("Valid accepted an invalid dependency declaration")
++			}
++			order, err := tt.group.PrioritySort()
++			if err == nil {
++				t.Fatalf("PrioritySort accepted an invalid dependency declaration: %v", order)
++			}
++			if order != nil {
++				t.Fatalf("PrioritySort returned partial order %v with error %v", order, err)
++			}
++			for _, token := range tt.mustMention {
++				if !strings.Contains(err.Error(), token) {
++					t.Fatalf("PrioritySort error %q does not identify %q", err, token)
++				}
++			}
++		})
++	}
++}
++
++func TestCodespecDependencyCyclesReturnNoLaunchPlan(t *testing.T) {
++	tests := []struct {
++		name        string
++		group       store.ServiceGroup
++		cycleMember []string
++	}{
++		{
++			name: "multi service cycle",
++			group: store.ServiceGroup{
++				"api":      codespecService("api", "worker"),
++				"worker":   codespecService("worker", "database"),
++				"database": codespecService("database", "api"),
++				"metrics":  codespecService("metrics"),
++			},
++			cycleMember: []string{"api", "worker", "database"},
++		},
++		{
++			name: "self cycle",
++			group: store.ServiceGroup{
++				"api": codespecService("api", "api"),
++			},
++			cycleMember: []string{"api"},
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			if err := tt.group.Valid(); err == nil {
++				t.Fatal("Valid accepted a dependency cycle")
++			}
++			order, err := tt.group.PrioritySort()
++			if err == nil {
++				t.Fatalf("PrioritySort accepted a dependency cycle: %v", order)
++			}
++			if order != nil {
++				t.Fatalf("PrioritySort exposed partial launch plan %v", order)
++			}
++			for _, member := range tt.cycleMember {
++				if !strings.Contains(err.Error(), member) {
++					t.Fatalf("cycle error %q does not identify member %q", err, member)
++				}
++			}
++		})
++	}
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,4 @@
++#!/bin/bash
++set -euo pipefail
++
++GOPATH=/go GO111MODULE=off go test github.com/Dataman-Cloud/swan/src/manager/store -run '^TestCodespecDependency' -count=1

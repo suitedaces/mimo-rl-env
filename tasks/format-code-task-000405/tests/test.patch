@@ -1,0 +1,176 @@
+diff --git a/test_commands.json b/test_commands.json
+new file mode 100644
+index 0000000000..f4b6f55bbe
+--- /dev/null
++++ b/test_commands.json
+@@ -0,0 +1,3 @@
++{
++  "test_commands": ["python -m pytest tests/models/test_taskinstance.py -k 'test_get_rendered_template_fields_pending_task_masks_sensitive_variable or test_get_rendered_template_fields_pending_task_does_not_mask_nonsensitive_variable or test_get_rendered_template_fields_restores_mask_secrets_in_logs or test_get_rendered_template_fields '"]
++}
+diff --git a/tests/models/test_taskinstance.py b/tests/models/test_taskinstance.py
+index e53b52e11b..6d30f2f14b 100644
+--- a/tests/models/test_taskinstance.py
++++ b/tests/models/test_taskinstance.py
+@@ -2090,6 +2090,149 @@ class TestTaskInstance:
+         with create_session() as session:
+             session.query(RenderedTaskInstanceFields).delete()
+ 
++    @provide_session
++    def test_get_rendered_template_fields_pending_task_masks_sensitive_variable(
++        self, dag_maker, session=None
++    ):
++        """
++        Pending task (no RTIF row) referencing a sensitive Variable should have
++        the rendered field masked when displayed by the webserver.
++
++        Regression test for https://github.com/apache/airflow/issues/22909.
++        """
++        from airflow.utils.log.secrets_masker import _secrets_masker
++
++
++
++        secret_value = "supersecretvalueonlyfortest_pending_mask"
++        Variable.set("var_with_secret_for_pending_test", secret_value)
++
++
++        masker = _secrets_masker()
++        original_patterns = set(masker.patterns)
++        original_replacer = masker.replacer
++        masker.patterns = set()
++        masker.replacer = None
++
++        original_mask_setting = settings.MASK_SECRETS_IN_LOGS
++        try:
++            with dag_maker('test-dag-pending-mask', session=session) as dag:
++                task = BashOperator(
++                    task_id='task_with_secret',
++                    bash_command="echo {{ var.value.var_with_secret_for_pending_test }}",
++                )
++            dag.fileloc = TEST_DAGS_FOLDER / 'test_get_k8s_pod_yaml.py'
++            ti = dag_maker.create_dagrun().task_instances[0]
++            ti.task = task
++
++
++            settings.MASK_SECRETS_IN_LOGS = False
++            ti.get_rendered_template_fields(session=session)
++
++            assert secret_value not in ti.task.bash_command, (
++                f"Sensitive variable value should be masked in rendered fields for pending task. "
++                f"Got bash_command={ti.task.bash_command!r}"
++            )
++            assert "***" in ti.task.bash_command
++        finally:
++            settings.MASK_SECRETS_IN_LOGS = original_mask_setting
++            masker.patterns = original_patterns
++            masker.replacer = original_replacer
++            Variable.delete("var_with_secret_for_pending_test")
++            with create_session() as cleanup_session:
++                cleanup_session.query(RenderedTaskInstanceFields).delete()
++
++    @provide_session
++    def test_get_rendered_template_fields_pending_task_does_not_mask_nonsensitive_variable(
++        self, dag_maker, session=None
++    ):
++        """
++        Pending task referencing a NON-sensitive Variable should keep the
++        rendered value intact (no over-masking).
++        """
++        from airflow.utils.log.secrets_masker import _secrets_masker
++
++        plain_value = "this_is_a_plain_nonsensitive_value_xyz"
++
++        Variable.set("plain_var_for_pending_test", plain_value)
++
++        masker = _secrets_masker()
++        original_patterns = set(masker.patterns)
++        original_replacer = masker.replacer
++        masker.patterns = set()
++        masker.replacer = None
++
++        original_mask_setting = settings.MASK_SECRETS_IN_LOGS
++        try:
++            with dag_maker('test-dag-pending-plain', session=session) as dag:
++                task = BashOperator(
++                    task_id='task_with_plain_var',
++                    bash_command="echo {{ var.value.plain_var_for_pending_test }}",
++                )
++            dag.fileloc = TEST_DAGS_FOLDER / 'test_get_k8s_pod_yaml.py'
++            ti = dag_maker.create_dagrun().task_instances[0]
++            ti.task = task
++
++            settings.MASK_SECRETS_IN_LOGS = False
++            ti.get_rendered_template_fields(session=session)
++
++            assert plain_value in ti.task.bash_command, (
++                f"Non-sensitive variable value should not be masked. "
++                f"Got bash_command={ti.task.bash_command!r}"
++            )
++        finally:
++            settings.MASK_SECRETS_IN_LOGS = original_mask_setting
++            masker.patterns = original_patterns
++            masker.replacer = original_replacer
++            Variable.delete("plain_var_for_pending_test")
++            with create_session() as cleanup_session:
++                cleanup_session.query(RenderedTaskInstanceFields).delete()
++
++    @provide_session
++    def test_get_rendered_template_fields_restores_mask_secrets_in_logs(
++        self, dag_maker, session=None
++    ):
++        """
++        get_rendered_template_fields must NOT permanently flip
++        settings.MASK_SECRETS_IN_LOGS — it has to restore the original value
++        even if the original was False (webserver default).
++        """
++        from airflow.utils.log.secrets_masker import _secrets_masker
++
++        Variable.set("restore_flag_test_secret_var", "tmpvalue_for_restore_test")
++
++        masker = _secrets_masker()
++        original_patterns = set(masker.patterns)
++        original_replacer = masker.replacer
++        masker.patterns = set()
++        masker.replacer = None
++
++        original_mask_setting = settings.MASK_SECRETS_IN_LOGS
++        try:
++            with dag_maker('test-dag-mask-restore', session=session) as dag:
++                task = BashOperator(
++                    task_id='restore_task',
++                    bash_command="echo {{ var.value.restore_flag_test_secret_var }}",
++                )
++            dag.fileloc = TEST_DAGS_FOLDER / 'test_get_k8s_pod_yaml.py'
++            ti = dag_maker.create_dagrun().task_instances[0]
++            ti.task = task
++
++            settings.MASK_SECRETS_IN_LOGS = False
++            ti.get_rendered_template_fields(session=session)
++
++            assert settings.MASK_SECRETS_IN_LOGS is False, (
++                "get_rendered_template_fields must restore MASK_SECRETS_IN_LOGS "
++                "to its previous value after running."
++            )
++        finally:
++            settings.MASK_SECRETS_IN_LOGS = original_mask_setting
++            masker.patterns = original_patterns
++            masker.replacer = original_replacer
++            Variable.delete("restore_flag_test_secret_var")
++            with create_session() as cleanup_session:
++                cleanup_session.query(RenderedTaskInstanceFields).delete()
++
+     @mock.patch.dict(os.environ, {"AIRFLOW_IS_K8S_EXECUTOR_POD": "True"})
+     @mock.patch("airflow.settings.pod_mutation_hook")
+     def test_render_k8s_pod_yaml(self, pod_mutation_hook, create_task_instance):
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,8 @@
++#!/usr/bin/env bash
++
++set -uo pipefail
++cd /testbed
++rc=0
++python -m pytest tests/models/test_taskinstance.py -k 'test_get_rendered_template_fields_pending_task_masks_sensitive_variable or test_get_rendered_template_fields_pending_task_does_not_mask_nonsensitive_variable or test_get_rendered_template_fields_restores_mask_secrets_in_logs or test_get_rendered_template_fields '
++rc=$(( rc | $? ))
++exit $rc

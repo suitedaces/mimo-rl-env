@@ -1,0 +1,253 @@
+diff --git a/usercase-test-coderl/test_custom_parse_decorators.py b/usercase-test-coderl/test_custom_parse_decorators.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/test_custom_parse_decorators.py
+@@ -0,0 +1,226 @@
++
++
++
++
++
++
++
++import copy
++import contextlib
++import io
++import json
++import socket
++import subprocess
++import sys
++import textwrap
++
++import pytest
++
++import fire
++from fire import decorators
++
++
++class NamedCountComponent:
++
++  @decorators.SetParseFns(count=int)
++  def double(self, count):
++    return 2 * count
++
++
++class MixedParserComponent:
++
++  @decorators.SetParseFns(float, arg2=str)
++  def example(self, arg1, arg2):
++    return arg1, arg2
++
++
++class DefaultParserComponent:
++
++  @decorators.SetParseFn(str)
++  def example(self, arg1, arg2=None, *varargs, **kwargs):
++    return arg1, arg2, varargs, kwargs
++
++
++class NamedOnlyComponent:
++
++  @decorators.SetParseFn(str, 'mode')
++  def choose(self, count, mode='0', enabled=True, payload=None):
++    return count, mode, enabled, payload
++
++
++class PrecedenceComponent:
++
++  @decorators.SetParseFn(str)
++  @decorators.SetParseFns(
++      lambda value: 'pos:' + value,
++      arg1=lambda value: 'named:' + value,
++      arg2=lambda value: 'arg2:' + value)
++  def values(self, arg1, arg2, arg3):
++    return arg1, arg2, arg3
++
++
++class DirectCallComponent:
++
++  @decorators.SetParseFns(int)
++  def echo(self, value):
++    return value, type(value).__name__
++
++
++class ErrorComponent:
++
++  @decorators.SetParseFns(count=int)
++  def double(self, count):
++    return 2 * count
++
++
++def _stable_json(value):
++  return json.dumps(value, sort_keys=True, separators=(',', ':'))
++
++
++def test_set_parse_fns_named_parser_is_used_for_matching_parameter():
++
++
++
++  actual = fire.Fire(NamedCountComponent, command=['double', '2'])
++
++  assert actual == 4
++
++
++def test_set_parse_fns_positional_parser_wins_over_named_parser():
++
++
++
++  actual = fire.Fire(MixedParserComponent, command=['example', '10', '10'])
++
++  assert actual == (10.0, '10')
++
++
++def test_set_parse_fn_default_parser_applies_to_args_varargs_and_kwargs():
++
++
++
++  actual = fire.Fire(
++      DefaultParserComponent,
++      command=['example', '1', '--arg2=2', '3', '4', '--kwarg=5'])
++
++  assert actual == ('1', '2', ('3', '4'), {'kwarg': '5'})
++
++
++def test_set_parse_fn_named_argument_does_not_override_normal_parsing_elsewhere():
++
++
++
++  actual = fire.Fire(
++      NamedOnlyComponent,
++      command=[
++          'choose', '7', '--mode=08', '--enabled=False',
++          '--payload={a: [1, 2]}'
++      ])
++
++  assert actual == (7, '08', False, {'a': [1, 2]})
++
++
++def test_parser_selection_order_positional_named_default_normal():
++
++
++
++  actual = fire.Fire(PrecedenceComponent, command=['values', 'x', '2', '3'])
++
++  assert actual == ('pos:x', 'arg2:2', '3')
++
++
++def test_direct_python_call_is_not_reparsed_by_decorator_metadata():
++
++
++
++  actual = DirectCallComponent().echo('9')
++
++  assert actual == ('9', 'str')
++
++
++def test_selected_parser_exception_propagates_without_fallback():
++
++
++
++  with pytest.raises(ValueError) as exc_info:
++    fire.Fire(ErrorComponent, command=['double', 'bad'])
++
++
++  assert exc_info.type is ValueError
++
++
++def test_referential_transparency_for_same_command():
++  command = ['choose', '7', '--mode=08', '--enabled=False',
++             '--payload={a: [1, 2]}']
++
++  assert fire.Fire(NamedOnlyComponent, command=command) == fire.Fire(
++      NamedOnlyComponent, command=command)
++
++
++def test_fire_does_not_mutate_caller_command_tokens():
++  command = ['example', '1', '--arg2=2', '3', '4', '--kwarg=5']
++  before = copy.deepcopy(command)
++
++  actual = fire.Fire(DefaultParserComponent, command=command)
++
++  assert actual == ('1', '2', ('3', '4'), {'kwarg': '5'})
++  assert command == before
++
++
++def test_no_global_state_cache_across_fresh_python_process(tmp_path):
++  command = ['values', 'x', '2', '3']
++  with contextlib.redirect_stdout(io.StringIO()):
++    in_process = fire.Fire(PrecedenceComponent, command=command)
++  script = textwrap.dedent("""
++      import contextlib
++      import io
++      import json
++      import sys
++      sys.path.insert(0, '/workspace/repo')
++      import fire
++      from fire import decorators
++
++      class PrecedenceComponent:
++        @decorators.SetParseFn(str)
++        @decorators.SetParseFns(
++            lambda value: 'pos:' + value,
++            arg1=lambda value: 'named:' + value,
++            arg2=lambda value: 'arg2:' + value)
++        def values(self, arg1, arg2, arg3):
++          return arg1, arg2, arg3
++
++      with contextlib.redirect_stdout(io.StringIO()):
++        result = fire.Fire(PrecedenceComponent, command=['values', 'x', '2', '3'])
++      sys.stdout.write(json.dumps(result, sort_keys=True, separators=(',', ':')))
++      """)
++  script_path = tmp_path / 'fresh_process_check.py'
++  script_path.write_text(script, encoding='utf-8')
++
++  completed = subprocess.run(
++      [sys.executable, str(script_path)],
++      check=True,
++      cwd='/workspace/repo',
++      text=True,
++      stdout=subprocess.PIPE,
++      stderr=subprocess.PIPE)
++
++  assert _stable_json(in_process) == '["pos:x","arg2:2","3"]'
++  assert completed.stdout == '["pos:x","arg2:2","3"]'
++
++
++def test_no_undeclared_relative_file_writes_or_network(tmp_path, monkeypatch):
++  def forbidden_socket(*args, **kwargs):
++    raise AssertionError('network access is not declared for parse decorators')
++
++  monkeypatch.chdir(tmp_path)
++  monkeypatch.setattr(socket, 'socket', forbidden_socket)
++  before = sorted(path.relative_to(tmp_path).as_posix()
++                  for path in tmp_path.rglob('*'))
++
++  actual = fire.Fire(MixedParserComponent, command=['example', '10', '10'])
++
++  after = sorted(path.relative_to(tmp_path).as_posix()
++                 for path in tmp_path.rglob('*'))
++  assert actual == (10.0, '10')
++  assert before == []
++  assert after == []
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,17 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++cd /workspace/repo
++export PYTHONPATH="/workspace/repo${PYTHONPATH:+:${PYTHONPATH}}"
++export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
++export PYTEST_ADDOPTS=
++exec /usr/bin/python -m pytest /workspace/repo/usercase-test-coderl/test_custom_parse_decorators.py -v

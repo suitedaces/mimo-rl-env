@@ -1,0 +1,213 @@
+diff --git a/usercase-test-coderl/fixtures/env_app/my_app.py b/usercase-test-coderl/fixtures/env_app/my_app.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/fixtures/env_app/my_app.py
+@@ -0,0 +1,38 @@
++import os
++import sys
++from typing import Any
++
++import hydra
++from hydra.experimental.callback import Callback
++from hydra.types import TaskFunction
++from hydra.utils import target_whitelist
++from omegaconf import DictConfig
++
++
++class EnvCallback(Callback):
++    def on_job_start(
++        self, config: DictConfig, *, task_function: TaskFunction, **kwargs: Any
++    ) -> None:
++        print("callback:" + os.environ.get("foo", "<missing>"))
++
++
++@hydra.main(version_base=None, config_path="conf", config_name="config")
++def main(cfg: DictConfig) -> None:
++    print("task:" + os.environ.get("foo", "<missing>"))
++    if cfg.get("fail", False):
++        raise RuntimeError("intentional failure after env_set")
++
++
++if __name__ == "__main__":
++    print("before:" + os.environ.get("foo", "<missing>"))
++    exit_code = 0
++    try:
++        with target_whitelist("my_app.*"):
++            main()
++    except BaseException as exc:
++        if isinstance(exc, SystemExit):
++            exit_code = int(exc.code or 0) if isinstance(exc.code, int) else 1
++        else:
++            exit_code = 1
++    print("after:" + os.environ.get("foo", "<missing>"))
++    sys.exit(exit_code)
+diff --git a/usercase-test-coderl/usecase.sh b/usercase-test-coderl/usecase.sh
+new file mode 100755
+--- /dev/null
++++ b/usercase-test-coderl/usecase.sh
+@@ -0,0 +1,148 @@
++#!/usr/bin/env bash
++
++set -u
++export LANG=C.UTF-8 LC_ALL=C.UTF-8 TZ=UTC
++
++TMP=$(mktemp -d)
++trap 'rm -rf "$TMP"' EXIT
++
++fail() {
++    echo "FAIL: $*" >&2
++    exit 1
++}
++
++assert_stdout_has_lines() {
++    local label=$1
++    shift
++    local stdout
++    stdout=$(cat "$APP/out")
++    for expected_line in "$@"; do
++
++        grep -Fxq "$expected_line" "$APP/out" || fail "$label stdout missing '$expected_line': $stdout"
++    done
++}
++
++assert_no_hydra_failure_on_success() {
++    local label=$1
++
++    ! grep -Eq 'Traceback|Error executing job|RuntimeError' "$APP/err" || fail "$label unexpected failure stderr: $(cat "$APP/err")"
++}
++
++assert_failure_reported() {
++    local label=$1
++
++    [ -s "$APP/err" ] || fail "$label expected stderr for raised task"
++}
++
++PYTHON=${PYTHON:-/workspace/repo/.venv/bin/python}
++
++[ -x "$PYTHON" ] || fail "expected offline venv python at $PYTHON"
++export PYTHONNOUSERSITE=1
++
++( cd /workspace/repo && "$PYTHON" setup.py antlr >"$TMP/build.out" 2>"$TMP/build.err" ) || {
++    cat "$TMP/build.out" >&2
++    cat "$TMP/build.err" >&2
++    fail "build"
++}
++
++export PYTHONPATH="/workspace/repo${PYTHONPATH:+:$PYTHONPATH}"
++
++APP="$TMP/env_app"
++mkdir -p "$APP/conf"
++cp /workspace/repo/usercase-test-coderl/fixtures/env_app/my_app.py "$APP/my_app.py"
++
++write_base_config() {
++    cat >"$APP/conf/config.yaml" <<'YAML'
++fail: false
++hydra:
++  callbacks:
++    env_callback:
++      _target_: my_app.EnvCallback
++YAML
++}
++
++write_literal_config() {
++    cat >"$APP/conf/config.yaml" <<'YAML'
++fail: false
++hydra:
++  job:
++    env_set:
++      foo: from_config
++  callbacks:
++    env_callback:
++      _target_: my_app.EnvCallback
++YAML
++}
++
++write_interpolation_config() {
++    cat >"$APP/conf/config.yaml" <<'YAML'
++foo: bar
++fail: false
++hydra:
++  job:
++    env_set:
++      foo: ${foo}
++  callbacks:
++    env_callback:
++      _target_: my_app.EnvCallback
++YAML
++}
++
++COMMON_ARGS=(
++    "hydra/job_logging=disabled"
++    "hydra/hydra_logging=disabled"
++    "hydra.output_subdir=null"
++)
++
++
++
++
++write_base_config
++( cd "$APP" && env -u foo "$PYTHON" my_app.py "+hydra.job.env_set.foo=bar" "${COMMON_ARGS[@]}" >out 2>err )
++ec=$?
++[ "$ec" -eq 0 ] || fail "F1 exit $ec; want 0"
++assert_stdout_has_lines F1 "before:<missing>" "callback:bar" "task:bar" "after:<missing>"
++assert_no_hydra_failure_on_success F1
++
++
++
++
++write_literal_config
++( cd "$APP" && foo=preexisting "$PYTHON" my_app.py "${COMMON_ARGS[@]}" >out 2>err )
++ec=$?
++[ "$ec" -eq 0 ] || fail "F2 exit $ec; want 0"
++assert_stdout_has_lines F2 "before:preexisting" "callback:from_config" "task:from_config" "after:preexisting"
++assert_no_hydra_failure_on_success F2
++
++
++
++
++write_interpolation_config
++( cd "$APP" && env -u foo "$PYTHON" my_app.py "${COMMON_ARGS[@]}" >out 2>err )
++ec=$?
++[ "$ec" -eq 0 ] || fail "F3 exit $ec; want 0"
++assert_stdout_has_lines F3 "before:<missing>" "callback:bar" "task:bar" "after:<missing>"
++assert_no_hydra_failure_on_success F3
++
++
++
++
++write_interpolation_config
++( cd "$APP" && foo=preexisting "$PYTHON" my_app.py "fail=true" "${COMMON_ARGS[@]}" >out 2>err )
++ec=$?
++[ "$ec" -ne 0 ] || fail "F4 exit $ec; want non-zero"
++assert_stdout_has_lines F4 "before:preexisting" "callback:bar" "task:bar" "after:preexisting"
++assert_failure_reported F4
++
++
++
++
++write_interpolation_config
++( cd "$APP" && env -u foo "$PYTHON" my_app.py "fail=true" "${COMMON_ARGS[@]}" >out 2>err )
++ec=$?
++[ "$ec" -ne 0 ] || fail "F5 exit $ec; want non-zero"
++assert_stdout_has_lines F5 "before:<missing>" "callback:bar" "task:bar" "after:<missing>"
++assert_failure_reported F5
++
++echo "PASS"
++exit 0
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,12 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++exec bash /workspace/repo/usercase-test-coderl/usecase.sh

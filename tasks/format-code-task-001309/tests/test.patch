@@ -1,0 +1,450 @@
+diff --git a/usercase-test-coderl/decode_stateful_test.go b/usercase-test-coderl/decode_stateful_test.go
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/decode_stateful_test.go
+@@ -0,0 +1,398 @@
++package usercase_test_coderl
++
++import (
++	"bytes"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"mime/multipart"
++	"net/http"
++	"net/http/httptest"
++	"net/url"
++	"strconv"
++	"strings"
++	"testing"
++
++	"github.com/go-playground/form"
++	lars "github.com/go-playground/lars"
++)
++
++type decodePayload struct {
++	ID    int    `form:"id" xml:"ID"`
++	Name  string `form:"Name" xml:"Name"`
++	Note  string `form:"Note" xml:"Note"`
++	Query string `form:"Query" xml:"Query"`
++}
++
++type shout string
++
++type customDecodePayload struct {
++	Word shout `form:"Word"`
++}
++
++func newDecodeRouter(t *testing.T, maxMemory int64) *lars.LARS {
++	t.Helper()
++
++	router := lars.New()
++	router.Post("/user/:id", func(c lars.Context) {
++		var got decodePayload
++		include := c.Request().Header.Get("X-Include") == "true"
++		err := c.Decode(include, maxMemory, &got)
++		if err != nil {
++			fmt.Fprintf(c.Response(), "ERR:%T:%v", err, err)
++			return
++		}
++		writeJSON(t, c, got)
++	})
++	return router
++}
++
++func writeJSON(t *testing.T, c lars.Context, got interface{}) {
++	t.Helper()
++
++	body, err := json.Marshal(got)
++	if err != nil {
++		t.Fatalf("json marshal failed: %v", err)
++	}
++	fmt.Fprintf(c.Response(), "OK:%s", body)
++}
++
++func requireOKPayload(t *testing.T, body string) decodePayload {
++	t.Helper()
++
++	if !strings.HasPrefix(body, "OK:") {
++		t.Fatalf("response body = %q, want OK payload", body)
++	}
++	var got decodePayload
++	if err := json.Unmarshal([]byte(strings.TrimPrefix(body, "OK:")), &got); err != nil {
++		t.Fatalf("decode response payload failed: %v; body = %q", err, body)
++	}
++	return got
++}
++
++func requireOKCustomPayload(t *testing.T, body string) customDecodePayload {
++	t.Helper()
++
++	if !strings.HasPrefix(body, "OK:") {
++		t.Fatalf("response body = %q, want OK payload", body)
++	}
++	var got customDecodePayload
++	if err := json.Unmarshal([]byte(strings.TrimPrefix(body, "OK:")), &got); err != nil {
++		t.Fatalf("decode custom response payload failed: %v; body = %q", err, body)
++	}
++	return got
++}
++
++func serve(router *lars.LARS, method, path, contentType, body string, include bool) (int, string) {
++	req, err := http.NewRequest(method, path, strings.NewReader(body))
++	if err != nil {
++		panic(err)
++	}
++	if contentType != "" {
++		req.Header.Set(lars.ContentType, contentType)
++	}
++	req.Header.Set("X-Include", strconv.FormatBool(include))
++
++	recorder := httptest.NewRecorder()
++	router.Serve().ServeHTTP(recorder, req)
++	return recorder.Code, recorder.Body.String()
++}
++
++func serveMultipart(router *lars.LARS, path string, include bool, closeWriter bool) (int, string) {
++	var body bytes.Buffer
++	writer := multipart.NewWriter(&body)
++	if err := writer.WriteField("Name", "Mina"); err != nil {
++		panic(err)
++	}
++	if err := writer.WriteField("Note", "hello"); err != nil {
++		panic(err)
++	}
++	contentType := writer.FormDataContentType()
++	if closeWriter {
++		if err := writer.Close(); err != nil {
++			panic(err)
++		}
++	}
++
++	req, err := http.NewRequest(lars.POST, path, &body)
++	if err != nil {
++		panic(err)
++	}
++	req.Header.Set(lars.ContentType, contentType)
++	req.Header.Set("X-Include", strconv.FormatBool(include))
++
++	recorder := httptest.NewRecorder()
++	router.Serve().ServeHTTP(recorder, req)
++	return recorder.Code, recorder.Body.String()
++}
++
++func requireErrorResponse(t *testing.T, body string) {
++	t.Helper()
++
++	if !strings.HasPrefix(body, "ERR:") {
++		t.Fatalf("response body = %q, want Decode error", body)
++	}
++}
++
++func TestDecodeJSONAndXMLByContentTypeWithCharsetAndMaxMemory(t *testing.T) {
++
++
++	router := newDecodeRouter(t, 64)
++
++	code, body := serve(router, lars.POST, "/user/13", lars.ApplicationJSON+"; charset=utf-8", `{"Name":"Ana","Note":"json"}`, false)
++	if code != 200 {
++		t.Fatalf("json charset status = %d, want 200", code)
++	}
++
++	if got := requireOKPayload(t, body); got != (decodePayload{Name: "Ana", Note: "json"}) {
++		t.Fatalf("json charset payload = %#v", got)
++	}
++
++	code, body = serve(router, lars.POST, "/user/13", lars.ApplicationXML+"; charset=utf-8", `<payload><Name>Ana</Name><Note>xml</Note></payload>`, false)
++	if code != 200 {
++		t.Fatalf("xml charset status = %d, want 200", code)
++	}
++
++	if got := requireOKPayload(t, body); got != (decodePayload{Name: "Ana", Note: "xml"}) {
++		t.Fatalf("xml charset payload = %#v", got)
++	}
++
++	limited := newDecodeRouter(t, 12)
++	code, body = serve(limited, lars.POST, "/user/13", lars.ApplicationJSON, `{"Name":"Ana","Note":"json"}`, true)
++	if code != 200 {
++		t.Fatalf("json limit status = %d, want 200", code)
++	}
++
++	requireErrorResponse(t, body)
++}
++
++func TestDecodeMalformedJSONReturnsConcreteDecoderError(t *testing.T) {
++
++
++	router := lars.New()
++	router.Post("/user/:id", func(c lars.Context) {
++		var got decodePayload
++		err := c.Decode(true, 64, &got)
++		var syntaxErr *json.SyntaxError
++		if errors.As(err, &syntaxErr) {
++			fmt.Fprintf(c.Response(), "ERR:%T:%v", err, err)
++			return
++		}
++		fmt.Fprintf(c.Response(), "OTHER:%T:%v", err, err)
++	})
++
++	code, body := serve(router, lars.POST, "/user/13", lars.ApplicationJSON, `{"Name":}`, true)
++	if code != 200 {
++		t.Fatalf("malformed json status = %d, want 200", code)
++	}
++
++	if !strings.HasPrefix(body, "ERR:*json.SyntaxError:") {
++		t.Fatalf("malformed json body = %q", body)
++	}
++}
++
++func TestDecodeURLEncodedFormIncludeFlagControlsRouteAndQueryMerge(t *testing.T) {
++
++
++	router := newDecodeRouter(t, 64)
++	formBody := url.Values{"Name": {"Joey"}, "Note": {"form"}}.Encode()
++
++	code, body := serve(router, lars.POST, "/user/13?Query=query", lars.ApplicationForm, formBody, true)
++	if code != 200 {
++		t.Fatalf("form include status = %d, want 200", code)
++	}
++
++	if got := requireOKPayload(t, body); got != (decodePayload{ID: 13, Name: "Joey", Note: "form", Query: "query"}) {
++		t.Fatalf("form include payload = %#v", got)
++	}
++
++	code, body = serve(router, lars.POST, "/user/13?Query=query", lars.ApplicationForm, formBody, false)
++	if code != 200 {
++		t.Fatalf("form no-include status = %d, want 200", code)
++	}
++
++	if got := requireOKPayload(t, body); got != (decodePayload{Name: "Joey", Note: "form"}) {
++		t.Fatalf("form no-include payload = %#v", got)
++	}
++
++	code, body = serve(router, lars.POST, "/user/13", lars.ApplicationForm, "%zz", true)
++	if code != 200 {
++		t.Fatalf("bad form status = %d, want 200", code)
++	}
++
++	requireErrorResponse(t, body)
++}
++
++func TestDecodeMultipartFormIncludeFlagControlsRouteAndQueryMerge(t *testing.T) {
++
++
++	router := newDecodeRouter(t, 64)
++
++	code, body := serveMultipart(router, "/user/17?Query=query", true, true)
++	if code != 200 {
++		t.Fatalf("multipart include status = %d, want 200", code)
++	}
++
++	if got := requireOKPayload(t, body); got != (decodePayload{ID: 17, Name: "Mina", Note: "hello", Query: "query"}) {
++		t.Fatalf("multipart include payload = %#v", got)
++	}
++
++	code, body = serveMultipart(router, "/user/17?Query=query", false, true)
++	if code != 200 {
++		t.Fatalf("multipart no-include status = %d, want 200", code)
++	}
++
++	if got := requireOKPayload(t, body); got != (decodePayload{Name: "Mina", Note: "hello"}) {
++		t.Fatalf("multipart no-include payload = %#v", got)
++	}
++
++	code, body = serveMultipart(router, "/user/17?Query=query", true, false)
++	if code != 200 {
++		t.Fatalf("bad multipart status = %d, want 200", code)
++	}
++
++	requireErrorResponse(t, body)
++}
++
++func TestDecodeUnsupportedAndEmptyContentTypesLeaveTargetZero(t *testing.T) {
++
++
++	router := newDecodeRouter(t, 64)
++
++	code, body := serve(router, lars.POST, "/user/13", "text/plain", "Name=Nope", true)
++	if code != 200 {
++		t.Fatalf("unsupported status = %d, want 200", code)
++	}
++
++	if got := requireOKPayload(t, body); got != (decodePayload{}) {
++		t.Fatalf("unsupported payload = %#v", got)
++	}
++
++	code, body = serve(router, lars.POST, "/user/13", "", "Name=Nope", true)
++	if code != 200 {
++		t.Fatalf("empty content-type status = %d, want 200", code)
++	}
++
++	if got := requireOKPayload(t, body); got != (decodePayload{}) {
++		t.Fatalf("empty content-type payload = %#v", got)
++	}
++}
++
++func TestBuiltInFormDecoderCanRegisterCustomDecodeBehavior(t *testing.T) {
++
++
++	router := lars.New()
++	decoder := router.BuiltInFormDecoder()
++	decoder.RegisterCustomTypeFunc(func(values []string) (interface{}, error) {
++		return shout(strings.ToUpper(values[0]) + "!"), nil
++	}, shout(""))
++	router.Post("/custom", func(c lars.Context) {
++		var got customDecodePayload
++		err := c.Decode(false, 64, &got)
++		if err != nil {
++			fmt.Fprintf(c.Response(), "ERR:%T:%v", err, err)
++			return
++		}
++		writeJSON(t, c, got)
++	})
++
++	code, body := serve(router, lars.POST, "/custom", lars.ApplicationForm, "Word=hello", false)
++	if code != 200 {
++		t.Fatalf("custom decoder status = %d, want 200", code)
++	}
++
++	if got := requireOKCustomPayload(t, body); got.Word != shout("HELLO!") {
++		t.Fatalf("custom decoder payload = %#v", got)
++	}
++
++	var typed *form.Decoder = decoder
++	if fmt.Sprintf("%T", typed) != "*form.Decoder" {
++		t.Fatalf("decoder type = %q", fmt.Sprintf("%T", typed))
++	}
++}
++
++func TestDecodeInsideHandlerUsesCurrentRequestContext(t *testing.T) {
++
++
++
++	router := newDecodeRouter(t, 64)
++	code, body := serve(router, lars.POST, "/user/13", lars.ApplicationForm, "Name=Joey", true)
++	if code != 200 {
++		t.Fatalf("current request status = %d, want 200", code)
++	}
++	if got := requireOKPayload(t, body); got != (decodePayload{ID: 13, Name: "Joey"}) {
++		t.Fatalf("current request payload = %#v", got)
++	}
++}
++
++func TestIndependentRoutersKeepDecodeStateSeparate(t *testing.T) {
++
++
++	a := newDecodeRouter(t, 64)
++	b := newDecodeRouter(t, 64)
++
++	codeA, bodyA := serve(a, lars.POST, "/user/13", lars.ApplicationForm, "Name=Joey", true)
++	codeB, bodyB := serve(b, lars.POST, "/user/99", "text/plain", "Name=Nope", true)
++	if codeA != 200 {
++		t.Fatalf("router a status = %d, want 200", codeA)
++	}
++
++	if got := requireOKPayload(t, bodyA); got != (decodePayload{ID: 13, Name: "Joey"}) {
++		t.Fatalf("router a payload = %#v", got)
++	}
++	if codeB != 200 {
++		t.Fatalf("router b status = %d, want 200", codeB)
++	}
++
++	if got := requireOKPayload(t, bodyB); got != (decodePayload{}) {
++		t.Fatalf("router b payload = %#v", got)
++	}
++}
++
++func TestRequestContextCleanupIsRepeatableAcrossRequests(t *testing.T) {
++
++
++	router := newDecodeRouter(t, 64)
++
++	code, body := serve(router, lars.POST, "/user/13", lars.ApplicationForm, "Name=First", true)
++	if code != 200 {
++		t.Fatalf("first cleanup-cycle status = %d, want 200", code)
++	}
++
++	if got := requireOKPayload(t, body); got != (decodePayload{ID: 13, Name: "First"}) {
++		t.Fatalf("first cleanup-cycle payload = %#v", got)
++	}
++
++	code, body = serve(router, lars.POST, "/user/21", lars.ApplicationForm, "Name=Second", true)
++	if code != 200 {
++		t.Fatalf("second cleanup-cycle status = %d, want 200", code)
++	}
++
++	if got := requireOKPayload(t, body); got != (decodePayload{ID: 21, Name: "Second"}) {
++		t.Fatalf("second cleanup-cycle payload = %#v", got)
++	}
++}
++
++func TestRepeatedDecodeCyclesKeepDecodeWorking(t *testing.T) {
++
++
++	successfulCycles := 0
++
++	for i := 0; i < 150; i++ {
++		router := newDecodeRouter(t, 64)
++		code, body := serve(router, lars.POST, "/user/13", lars.ApplicationForm, "Name=Joey", true)
++		if code != 200 {
++			t.Fatalf("cycle status = %d, want 200", code)
++		}
++
++		if got := requireOKPayload(t, body); got != (decodePayload{ID: 13, Name: "Joey"}) {
++			t.Fatalf("cycle payload = %#v", got)
++		}
++		successfulCycles++
++	}
++
++
++	if successfulCycles != 150 {
++		t.Fatalf("successful cycles = %d, want 150", successfulCycles)
++	}
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,42 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++
++GOPATH_DIR="${TMPDIR:-/tmp}/lars-fixture-gopath"
++LOCALA_DEPS="/opt/stage4a_deps/lars-gopath/src"
++rm -rf "$GOPATH_DIR"
++mkdir -p "$GOPATH_DIR/src/github.com/go-playground" \
++         "$GOPATH_DIR/src/github.com/gorilla" \
++         "$GOPATH_DIR/src/gopkg.in/go-playground"
++
++ln -s /workspace/repo "$GOPATH_DIR/src/github.com/go-playground/lars"
++
++for dep in \
++  github.com/go-playground/form \
++  github.com/gorilla/websocket \
++  gopkg.in/go-playground/assert.v1
++do
++  if [ ! -d "$LOCALA_DEPS/$dep" ]; then
++    echo "missing staged offline dependency: $LOCALA_DEPS/$dep" >&2
++    exit 1
++  fi
++done
++
++ln -s "$LOCALA_DEPS/github.com/go-playground/form" \
++  "$GOPATH_DIR/src/github.com/go-playground/form"
++ln -s "$LOCALA_DEPS/github.com/gorilla/websocket" \
++  "$GOPATH_DIR/src/github.com/gorilla/websocket"
++ln -s "$LOCALA_DEPS/gopkg.in/go-playground/assert.v1" \
++  "$GOPATH_DIR/src/gopkg.in/go-playground/assert.v1"
++
++cd "$GOPATH_DIR/src/github.com/go-playground/lars"
++exec env GOPATH="$GOPATH_DIR" GO111MODULE=off GOPROXY=off GOSUMDB=off go test -v -count=1 ./usercase-test-coderl/...

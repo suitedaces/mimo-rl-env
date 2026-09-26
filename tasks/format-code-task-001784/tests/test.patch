@@ -1,0 +1,227 @@
+diff --git a/usercase-test-coderl/usecase.sh b/usercase-test-coderl/usecase.sh
+new file mode 100755
+--- /dev/null
++++ b/usercase-test-coderl/usecase.sh
+@@ -0,0 +1,205 @@
++#!/usr/bin/env bash
++
++set -u
++export LANG=C.UTF-8 LC_ALL=C.UTF-8 TZ=UTC
++
++fail() { echo "FAIL: $*" >&2; exit 1; }
++
++CLI=/workspace/repo/backup/backup-cli
++CLI_PYTHON=/workspace/repo/backup/.venv/bin/python
++[ -x "$CLI" ] || fail "backup-cli is not executable"
++[ -x "$CLI_PYTHON" ] || fail "backup virtualenv python is not executable"
++
++backup_cli() {
++
++
++    "$CLI_PYTHON" "$CLI" "$@"
++}
++
++( cd /workspace/repo/backup && backup_cli restore --help > /tmp/backup-cli-restore-help.out 2> /tmp/backup-cli-restore-help.err ) \
++    || fail "backup-cli restore help is unavailable"
++
++
++[ -s /tmp/backup-cli-restore-help.out ] || fail "backup-cli restore help is empty"
++grep -Eiq 'backend[-_ ]?url|backend' /tmp/backup-cli-restore-help.out \
++    || fail "restore help does not mention the backend URL argument"
++grep -Eiq 'restore[-_ ]?destination|destination' /tmp/backup-cli-restore-help.out \
++    || fail "restore help does not mention the restore destination argument"
++
++TMP=$(mktemp -d)
++trap 'rm -rf "$TMP" /tmp/backup-cli-restore-help.out /tmp/backup-cli-restore-help.err' EXIT
++cd "$TMP" || exit 1
++
++python3 - "$TMP" <<'PY'
++import os
++import sqlite3
++import struct
++import sys
++
++base = sys.argv[1]
++
++
++def snapshot_db(path):
++    db = sqlite3.connect(path)
++    db.execute("CREATE TABLE kv (key TEXT PRIMARY KEY, val TEXT NOT NULL)")
++    db.execute("CREATE TABLE audit (id INTEGER PRIMARY KEY, note TEXT NOT NULL)")
++    db.execute("INSERT INTO kv VALUES ('phase', 'snapshot')")
++    db.execute("INSERT INTO audit VALUES (1, 'snapshot-row')")
++    db.commit()
++    db.close()
++
++
++def write_backup(path, changes):
++    offset = 512
++    version = 0
++    prev_offset = 0
++    with open(path, "wb") as f:
++        f.write(b"\0" * 512)
++        for version, typ, payload in changes:
++            prev_offset = offset
++            f.seek(offset)
++            f.write(struct.pack("!IIb", len(payload), version, typ))
++            f.write(payload)
++            offset += 9 + len(payload)
++
++        prev_version = changes[-2][0] if len(changes) > 1 else 0
++        header = struct.pack(
++            "!IIQIQQ",
++            1,
++            version,
++            offset,
++            prev_version,
++            prev_offset if changes else 0,
++            len(changes),
++        )
++        f.seek(0)
++        f.write(header + b"\0" * (512 - len(header)))
++
++
++snapshot_path = os.path.join(base, "snapshot.sqlite3")
++snapshot_db(snapshot_path)
++
++snapshot_changes = [
++    (4, 2, open(snapshot_path, "rb").read()),
++    (
++        5,
++        1,
++        b"\0".join(
++            s.encode("utf-8")
++            for s in [
++                "UPDATE kv SET val = val || '|tx1' WHERE key = 'phase'",
++                "INSERT INTO audit(id, note) VALUES (2, 'first transaction')",
++            ]
++        ),
++    ),
++    (
++        6,
++        1,
++        b"\0".join(
++            s.encode("utf-8")
++            for s in [
++                "UPDATE kv SET val = val || '|tx2' WHERE key = 'phase'",
++                "INSERT INTO audit(id, note) VALUES (3, 'second transaction')",
++            ]
++        ),
++    ),
++]
++write_backup(os.path.join(base, "snapshot-and-transactions.dbak"), snapshot_changes)
++
++transaction_only_changes = [
++    (
++        1,
++        1,
++        b"\0".join(
++            s.encode("utf-8")
++            for s in [
++                "CREATE TABLE kv (key TEXT PRIMARY KEY, val TEXT NOT NULL)",
++                "INSERT INTO kv VALUES ('created', 'from-tx')",
++            ]
++        ),
++    ),
++    (
++        2,
++        1,
++        b"\0".join(
++            s.encode("utf-8")
++            for s in [
++                "UPDATE kv SET val = val || '-second' WHERE key = 'created'",
++            ]
++        ),
++    ),
++]
++write_backup(os.path.join(base, "transactions-only.dbak"), transaction_only_changes)
++PY
++
++db_dump() {
++    python3 - "$1" <<'PY'
++import sqlite3
++import sys
++
++db = sqlite3.connect(sys.argv[1])
++for row in db.execute("SELECT key, val FROM kv ORDER BY key"):
++    print("kv|{}|{}".format(*row))
++if db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='audit'").fetchone():
++    for row in db.execute("SELECT id, note FROM audit ORDER BY id"):
++        print("audit|{}|{}".format(*row))
++db.close()
++PY
++}
++
++
++
++
++backup_cli restore "file://$TMP/snapshot-and-transactions.dbak" "$TMP/explicit.sqlite3" >out 2>err; ec=$?
++[ "$ec" -eq 0 ] || fail "F1 exit $ec; want 0"
++[ ! -s out ] || fail "F1 stdout: $(cat out)"
++[ ! -s err ] || fail "F1 stderr: $(cat err)"
++[ -f "$TMP/explicit.sqlite3" ] || fail "F1 did not create explicit destination database"
++EXPECTED_F1='kv|phase|snapshot|tx1|tx2
++audit|1|snapshot-row
++audit|2|first transaction
++audit|3|second transaction'
++ACTUAL_F1=$(db_dump "$TMP/explicit.sqlite3")
++[ "$ACTUAL_F1" = "$EXPECTED_F1" ] || fail "F1 database dump: $ACTUAL_F1"
++
++
++
++
++mkdir "$TMP/node"
++backup_cli restore "file://$TMP/snapshot-and-transactions.dbak" "$TMP/node" >out 2>err; ec=$?
++[ "$ec" -eq 0 ] || fail "F2 exit $ec; want 0"
++[ ! -s out ] || fail "F2 stdout: $(cat out)"
++[ ! -s err ] || fail "F2 stderr: $(cat err)"
++[ -f "$TMP/node/lightningd.sqlite3" ] || fail "F2 did not create lightningd.sqlite3 inside directory"
++ACTUAL_F2=$(db_dump "$TMP/node/lightningd.sqlite3")
++[ "$ACTUAL_F2" = "$EXPECTED_F1" ] || fail "F2 database dump: $ACTUAL_F2"
++
++
++
++
++backup_cli restore "file://$TMP/transactions-only.dbak" "$TMP/transactions-only.sqlite3" >out 2>err; ec=$?
++[ "$ec" -eq 0 ] || fail "F3 exit $ec; want 0"
++[ ! -s out ] || fail "F3 stdout: $(cat out)"
++[ ! -s err ] || fail "F3 stderr: $(cat err)"
++EXPECTED_F3='kv|created|from-tx-second'
++ACTUAL_F3=$(db_dump "$TMP/transactions-only.sqlite3")
++[ "$ACTUAL_F3" = "$EXPECTED_F3" ] || fail "F3 database dump: $ACTUAL_F3"
++
++
++
++
++backup_cli restore "file://$TMP/snapshot-and-transactions.dbak" "$TMP/explicit.sqlite3" >out 2>err; ec=$?
++[ "$ec" -ne 0 ] || fail "F4 exit $ec; want non-zero"
++grep -Fq "Destination for backup restore exists: $TMP/explicit.sqlite3" err \
++    || fail "F4 stderr missing existing-destination error: $(cat err)"
++
++
++
++
++backup_cli restore "file://$TMP/snapshot-and-transactions.dbak" "$TMP/node" >out 2>err; ec=$?
++[ "$ec" -ne 0 ] || fail "F5 exit $ec; want non-zero"
++grep -Fq "Destination for backup restore exists: $TMP/node/lightningd.sqlite3" err \
++    || fail "F5 stderr missing existing-destination error: $(cat err)"
++
++echo "PASS"
++exit 0
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,12 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++exec bash /workspace/repo/usercase-test-coderl/usecase.sh

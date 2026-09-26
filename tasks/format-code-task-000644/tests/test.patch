@@ -1,0 +1,369 @@
+diff --git a/usercase-test-coderl/test_artifact_wiring.py b/usercase-test-coderl/test_artifact_wiring.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/test_artifact_wiring.py
+@@ -0,0 +1,340 @@
++from argo.workflows.client.models import V1Container, V1alpha1Artifact
++from argo.workflows.dsl import Workflow
++from argo.workflows.dsl.tasks import artifact, task
++from argo.workflows.dsl.templates import inputs, outputs, template
++
++
++def _task_by_name(manifest, name):
++    tasks = manifest["spec"]["templates"][0]["dag"]["tasks"]
++    return next(task_manifest for task_manifest in tasks if task_manifest["name"] == name)
++
++
++def _template_by_name(manifest, name):
++    templates = manifest["spec"]["templates"]
++    return next(template_manifest for template_manifest in templates if template_manifest["name"] == name)
++
++
++def _assert_artifacts_match(actual, expected):
++
++    assert len(actual) == len(expected)
++    unmatched = list(actual)
++    for expected_artifact in expected:
++        match_index = next(
++            (
++                index
++                for index, artifact_manifest in enumerate(unmatched)
++                if all(
++                    artifact_manifest.get(field) == value
++                    for field, value in expected_artifact.items()
++                )
++            ),
++            None,
++        )
++        assert match_index is not None, (
++            f"missing artifact with fields {expected_artifact!r} in {actual!r}"
++        )
++        unmatched.pop(match_index)
++
++
++def _artifact_passing_workflow_class():
++    class ArtifactPassing(Workflow):
++        name = "artifact-passing"
++
++        @task
++        def generate_artifact(self):
++            return self.generate_message()
++
++        @task
++        @artifact(
++            name="message",
++            _from="{{tasks.generate-artifact.outputs.artifacts.hello-art}}",
++        )
++        def consume_artifact(self, message):
++
++            assert isinstance(message, V1alpha1Artifact)
++            return self.print_message(message=message)
++
++        @template
++        @outputs.artifact(name="hello-art", path="/tmp/hello_world.txt")
++        def generate_message(self):
++            return V1Container(
++                image="alpine:3.7",
++                name="generate-message",
++                command=["sh", "-c"],
++                args=["echo hello world > /tmp/hello_world.txt"],
++            )
++
++        @template
++        @inputs.artifact(name="message", path="/tmp/message")
++        def print_message(self, message):
++            return V1Container(
++                image="alpine:3.7",
++                name="print-message",
++                command=["cat", "/tmp/message"],
++            )
++
++    return ArtifactPassing
++
++
++def _hyphen_and_stacked_workflow_class():
++    class HyphenAndStackedArtifacts(Workflow):
++        name = "hyphen-and-stacked-artifacts"
++
++        @task
++        @artifact(
++            name="input-file",
++            path="/tmp/input-file",
++            _from="{{tasks.build.outputs.artifacts.input-file}}",
++        )
++        def consume_hyphenated(self, input_file):
++
++            assert isinstance(input_file, V1alpha1Artifact)
++            return self.consume_template(input_file=input_file)
++
++        @template
++        @inputs.artifact(name="input-file", path="/tmp/input-file")
++        def consume_template(self, input_file):
++            return V1Container(
++                image="alpine:3.7",
++                name="consume-template",
++                command=["cat", "/tmp/input-file"],
++            )
++
++        @template
++        @outputs.artifact(name="first-art", path="/tmp/first.txt")
++        @outputs.artifact(name="second-art", path="/tmp/second.txt")
++        def multi_output(self):
++            return V1Container(
++                image="alpine:3.7",
++                name="multi-output",
++                command=["sh", "-c"],
++                args=["touch /tmp/first.txt /tmp/second.txt"],
++            )
++
++        @task
++        @artifact(name="first", _from="{{tasks.multi.outputs.artifacts.first-art}}")
++        @artifact(name="second", _from="{{tasks.multi.outputs.artifacts.second-art}}")
++        def multi_consume(self, first, second):
++
++            assert isinstance(first, V1alpha1Artifact)
++            assert isinstance(second, V1alpha1Artifact)
++            return self.multi_output()
++
++    return HyphenAndStackedArtifacts
++
++
++def test_task_artifact_argument_is_injected_and_serialized():
++
++
++
++    ArtifactPassing = _artifact_passing_workflow_class()
++    wf = ArtifactPassing(compile=False)
++
++    wf.compile()
++    manifest = wf.to_dict()
++    task_manifest = _task_by_name(manifest, "consume-artifact")
++
++
++    assert "artifacts" in task_manifest["arguments"]
++    _assert_artifacts_match(
++        task_manifest["arguments"]["artifacts"],
++        [
++            {
++                "_from": "{{tasks.generate-artifact.outputs.artifacts.hello-art}}",
++                "name": "message",
++            }
++        ],
++    )
++
++    assert task_manifest.get("template")
++
++
++def test_template_artifact_inputs_and_outputs_are_advertised():
++
++
++
++    ArtifactPassing = _artifact_passing_workflow_class()
++    wf = ArtifactPassing()
++    manifest = wf.to_dict()
++
++    generate_template = _template_by_name(manifest, "generate-message")
++    print_template = _template_by_name(manifest, "print-message")
++
++    _assert_artifacts_match(
++        generate_template["outputs"]["artifacts"],
++        [{"name": "hello-art", "path": "/tmp/hello_world.txt"}],
++    )
++    _assert_artifacts_match(
++        print_template["inputs"]["artifacts"],
++        [{"name": "message", "path": "/tmp/message"}],
++    )
++
++
++def test_hyphenated_artifact_name_is_injected_as_snake_case_keyword():
++
++
++
++    HyphenAndStackedArtifacts = _hyphen_and_stacked_workflow_class()
++    wf = HyphenAndStackedArtifacts()
++    manifest = wf.to_dict()
++    task_manifest = _task_by_name(manifest, "consume-hyphenated")
++
++    _assert_artifacts_match(
++        task_manifest["arguments"]["artifacts"],
++        [
++            {
++                "_from": "{{tasks.build.outputs.artifacts.input-file}}",
++                "name": "input-file",
++                "path": "/tmp/input-file",
++            }
++        ],
++    )
++
++    assert task_manifest.get("template")
++
++
++def test_stacked_artifact_decorators_preserve_all_entries():
++
++
++
++    HyphenAndStackedArtifacts = _hyphen_and_stacked_workflow_class()
++    wf = HyphenAndStackedArtifacts()
++    manifest = wf.to_dict()
++
++    task_manifest = _task_by_name(manifest, "multi-consume")
++    template_manifest = _template_by_name(manifest, "multi-output")
++
++    _assert_artifacts_match(
++        task_manifest["arguments"]["artifacts"],
++        [
++            {
++                "_from": "{{tasks.multi.outputs.artifacts.second-art}}",
++                "name": "second",
++            },
++            {
++                "_from": "{{tasks.multi.outputs.artifacts.first-art}}",
++                "name": "first",
++            },
++        ],
++    )
++    _assert_artifacts_match(
++        template_manifest["outputs"]["artifacts"],
++        [
++            {"name": "second-art", "path": "/tmp/second.txt"},
++            {"name": "first-art", "path": "/tmp/first.txt"},
++        ],
++    )
++
++
++def test_compile_injects_artifact_instead_of_requiring_manual_task_argument():
++
++
++
++    HyphenAndStackedArtifacts = _hyphen_and_stacked_workflow_class()
++    wf = HyphenAndStackedArtifacts(compile=False)
++
++
++    wf.compile()
++    manifest = wf.to_dict()
++    task_manifest = _task_by_name(manifest, "consume-hyphenated")
++
++    _assert_artifacts_match(
++        task_manifest["arguments"]["artifacts"],
++        [
++            {
++                "_from": "{{tasks.build.outputs.artifacts.input-file}}",
++                "name": "input-file",
++                "path": "/tmp/input-file",
++            }
++        ],
++    )
++
++
++def test_compile_is_idempotent_after_artifacts_are_wired():
++
++
++
++    ArtifactPassing = _artifact_passing_workflow_class()
++    wf = ArtifactPassing(compile=False)
++
++    wf.compile()
++    first_manifest = wf.to_dict()
++    wf.compile()
++    second_manifest = wf.to_dict()
++
++
++    _assert_artifacts_match(
++        _task_by_name(first_manifest, "consume-artifact")["arguments"]["artifacts"],
++        [
++            {
++                "_from": "{{tasks.generate-artifact.outputs.artifacts.hello-art}}",
++                "name": "message",
++            }
++        ],
++    )
++    _assert_artifacts_match(
++        _task_by_name(second_manifest, "consume-artifact")["arguments"]["artifacts"],
++        [
++            {
++                "_from": "{{tasks.generate-artifact.outputs.artifacts.hello-art}}",
++                "name": "message",
++            }
++        ],
++    )
++
++
++def test_two_workflow_instances_keep_artifact_compile_state_independent():
++
++
++
++    ArtifactPassing = _artifact_passing_workflow_class()
++    a = ArtifactPassing(compile=False)
++    b = ArtifactPassing(compile=False)
++
++    a.compile()
++    a_manifest = a.to_dict()
++
++
++    _assert_artifacts_match(
++        _task_by_name(a_manifest, "consume-artifact")["arguments"]["artifacts"],
++        [
++            {
++                "_from": "{{tasks.generate-artifact.outputs.artifacts.hello-art}}",
++                "name": "message",
++            }
++        ],
++    )
++
++    b.compile()
++    b_manifest = b.to_dict()
++
++    _assert_artifacts_match(
++        _task_by_name(b_manifest, "consume-artifact")["arguments"]["artifacts"],
++        [
++            {
++                "_from": "{{tasks.generate-artifact.outputs.artifacts.hello-art}}",
++                "name": "message",
++            }
++        ],
++    )
++
++
++def test_repeated_artifact_workflow_cycles_do_not_accumulate_artifacts():
++
++
++
++    ArtifactPassing = _artifact_passing_workflow_class()
++
++
++    for _ in range(25):
++        wf = ArtifactPassing()
++        manifest = wf.to_dict()
++        _assert_artifacts_match(
++            _task_by_name(manifest, "consume-artifact")["arguments"]["artifacts"],
++            [
++                {
++                    "_from": "{{tasks.generate-artifact.outputs.artifacts.hello-art}}",
++                    "name": "message",
++                }
++            ],
++        )
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,19 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++
++cd /workspace/repo
++
++export PIP_NO_INDEX=1
++export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
++
++exec python -m pytest /workspace/repo/usercase-test-coderl/test_artifact_wiring.py -v

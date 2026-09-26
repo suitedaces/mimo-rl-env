@@ -1,0 +1,399 @@
+diff --git a/pkg/scheduler/actions/allocate/codespec_scoring_failure_test.go b/pkg/scheduler/actions/allocate/codespec_scoring_failure_test.go
+new file mode 100644
+index 000000000..4122c9566
+--- /dev/null
++++ b/pkg/scheduler/actions/allocate/codespec_scoring_failure_test.go
+@@ -0,0 +1,125 @@
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++package allocate
++
++import (
++	"errors"
++	"sync"
++	"testing"
++
++	v1 "k8s.io/api/core/v1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/client-go/tools/record"
++
++	schedulingv1 "volcano.sh/apis/pkg/apis/scheduling/v1beta1"
++	"volcano.sh/volcano/cmd/scheduler/app/options"
++	"volcano.sh/volcano/pkg/scheduler/api"
++	"volcano.sh/volcano/pkg/scheduler/cache"
++	"volcano.sh/volcano/pkg/scheduler/conf"
++	"volcano.sh/volcano/pkg/scheduler/framework"
++	"volcano.sh/volcano/pkg/scheduler/util"
++)
++
++const codeSpecRejectingScorerName = "codespec-rejecting-scorer"
++
++type codeSpecRejectingScorer struct{}
++
++func (p *codeSpecRejectingScorer) Name() string { return codeSpecRejectingScorerName }
++
++func (p *codeSpecRejectingScorer) OnSessionOpen(ssn *framework.Session) {
++	ssn.AddNodeOrderFn(p.Name(), func(_ *api.TaskInfo, _ *api.NodeInfo) (float64, error) {
++		return 0, errors.New("scoring backend unavailable")
++	})
++}
++
++func (p *codeSpecRejectingScorer) OnSessionClose(_ *framework.Session) {}
++
++type codeSpecRecordingBinder struct {
++	sync.Mutex
++	binds map[string]string
++}
++
++func (b *codeSpecRecordingBinder) Bind(pod *v1.Pod, hostname string) error {
++	b.Lock()
++	defer b.Unlock()
++	b.binds[pod.Namespace+"/"+pod.Name] = hostname
++	return nil
++}
++
++func (b *codeSpecRecordingBinder) count() int {
++	b.Lock()
++	defer b.Unlock()
++	return len(b.binds)
++}
++
++func TestCodeSpecAllocateLeavesTaskPendingWhenScoringRejectsEveryNode(t *testing.T) {
++	framework.RegisterPluginBuilder(codeSpecRejectingScorerName, func(framework.Arguments) framework.Plugin {
++		return &codeSpecRejectingScorer{}
++	})
++	defer framework.CleanupPluginBuilders()
++
++	options.ServerOpts = &options.ServerOption{
++		MinNodesToFind:             100,
++		MinPercentageOfNodesToFind: 5,
++		PercentageOfNodesToFind:    100,
++	}
++
++	binder := &codeSpecRecordingBinder{binds: map[string]string{}}
++	schedulerCache := &cache.SchedulerCache{
++		Nodes:         make(map[string]*api.NodeInfo),
++		Jobs:          make(map[api.JobID]*api.JobInfo),
++		Queues:        make(map[api.QueueID]*api.QueueInfo),
++		Binder:        binder,
++		StatusUpdater: &util.FakeStatusUpdater{},
++		VolumeBinder:  &util.FakeVolumeBinder{},
++		Recorder:      record.NewFakeRecorder(10),
++	}
++
++	schedulerCache.AddNode(util.BuildNode("only-node", util.BuildResourceList("4", "8Gi"), nil))
++	pod := util.BuildPod("codespec", "pending-task", "", v1.PodPending,
++		util.BuildResourceList("1", "1Gi"), "scoring-job", nil, nil)
++	pod.Annotations[schedulingv1.NumaPolicyKey] = "single-numa-node"
++	schedulerCache.AddPod(pod)
++	schedulerCache.AddPodGroupV1beta1(&schedulingv1.PodGroup{
++		ObjectMeta: metav1.ObjectMeta{Name: "scoring-job", Namespace: "codespec"},
++		Spec: schedulingv1.PodGroupSpec{
++			Queue: "codespec-queue",
++		},
++		Status: schedulingv1.PodGroupStatus{Phase: schedulingv1.PodGroupInqueue},
++	})
++	schedulerCache.AddQueueV1beta1(&schedulingv1.Queue{
++		ObjectMeta: metav1.ObjectMeta{Name: "codespec-queue"},
++		Spec:       schedulingv1.QueueSpec{Weight: 1},
++	})
++
++	enabled := true
++	ssn := framework.OpenSession(schedulerCache, []conf.Tier{{Plugins: []conf.PluginOption{{
++		Name:             codeSpecRejectingScorerName,
++		EnabledNodeOrder: &enabled,
++	}}}}, nil)
++	defer framework.CloseSession(ssn)
++
++	New().Execute(ssn)
++
++	if got := binder.count(); got != 0 {
++		t.Errorf("expected no binding when every node score failed, got %d", got)
++	}
++	job := ssn.Jobs[api.JobID("codespec/scoring-job")]
++	if job == nil || len(job.TaskStatusIndex[api.Pending]) != 1 {
++		t.Fatalf("task must remain pending after scoring failure, job state: %#v", job)
++	}
++}
+diff --git a/pkg/scheduler/util/codespec_node_scoring_test.go b/pkg/scheduler/util/codespec_node_scoring_test.go
+new file mode 100644
+index 000000000..ce00680f7
+--- /dev/null
++++ b/pkg/scheduler/util/codespec_node_scoring_test.go
+@@ -0,0 +1,251 @@
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++package util
++
++import (
++	"errors"
++	"math"
++	"reflect"
++	"sort"
++	"testing"
++
++	k8sframework "k8s.io/kubernetes/pkg/scheduler/framework/v1alpha1"
++
++	"volcano.sh/volcano/pkg/scheduler/api"
++)
++
++func codeSpecScoringNodes(names ...string) []*api.NodeInfo {
++	nodes := make([]*api.NodeInfo, 0, len(names))
++	for _, name := range names {
++		nodes = append(nodes, &api.NodeInfo{Name: name})
++	}
++	return nodes
++}
++
++func codeSpecScoresByNode(t *testing.T, scores map[float64][]*api.NodeInfo) map[string]float64 {
++	t.Helper()
++	result := make(map[string]float64)
++	for score, nodes := range scores {
++		if math.IsNaN(score) || math.IsInf(score, 0) {
++			t.Errorf("non-finite score bucket returned: %v", score)
++		}
++		for _, node := range nodes {
++			if node == nil {
++				t.Error("nil node returned in score bucket")
++				continue
++			}
++			if _, exists := result[node.Name]; exists {
++				t.Errorf("node %q returned more than once", node.Name)
++			}
++			result[node.Name] = score
++		}
++	}
++	return result
++}
++
++func codeSpecNodeNames(nodes []*api.NodeInfo) []string {
++	result := make([]string, 0, len(nodes))
++	for _, node := range nodes {
++		if node == nil {
++			result = append(result, "<nil>")
++		} else {
++			result = append(result, node.Name)
++		}
++	}
++	return result
++}
++
++func TestCodeSpecPrioritizeNodesAggregatesAllStages(t *testing.T) {
++	nodes := codeSpecScoringNodes("node-b", "node-a", "node-c")
++	direct := map[string]float64{"node-a": -1.5, "node-b": 4, "node-c": 0.5}
++	plugin := map[string]float64{"node-a": 3, "node-b": -2}
++
++	mapFn := func(_ *api.TaskInfo, node *api.NodeInfo) (map[string]float64, float64, error) {
++		mapped := map[string]float64{}
++		if score, found := plugin[node.Name]; found {
++			mapped["codespec-normalizer"] = score
++		}
++		return mapped, direct[node.Name], nil
++	}
++	reduceFn := func(_ *api.TaskInfo, byPlugin map[string]k8sframework.NodeScoreList) (map[string]float64, error) {
++		result := map[string]float64{"not-a-candidate": 500}
++		for _, score := range byPlugin["codespec-normalizer"] {
++			result[score.Name] = float64(score.Score)
++		}
++		return result, nil
++	}
++	batchFn := func(_ *api.TaskInfo, _ []*api.NodeInfo) (map[string]float64, error) {
++		return map[string]float64{"node-a": 1, "node-b": 2, "not-a-candidate": 500}, nil
++	}
++
++	got := codeSpecScoresByNode(t, PrioritizeNodes(nil, nodes, batchFn, mapFn, reduceFn))
++	want := map[string]float64{"node-a": 2.5, "node-b": 4, "node-c": 0.5}
++	if !reflect.DeepEqual(got, want) {
++		t.Fatalf("combined scores mismatch: want %v, got %v", want, got)
++	}
++}
++
++func TestCodeSpecPrioritizeNodesIsolatesPerNodeFailures(t *testing.T) {
++	nodes := codeSpecScoringNodes("map-failed", "good-a", "good-b")
++	mapFn := func(_ *api.TaskInfo, node *api.NodeInfo) (map[string]float64, float64, error) {
++		if node.Name == "map-failed" {
++			return map[string]float64{"codespec": 99}, 99, errors.New("map score unavailable")
++		}
++		return map[string]float64{"codespec": 1}, 1, nil
++	}
++	reduceFn := func(_ *api.TaskInfo, byPlugin map[string]k8sframework.NodeScoreList) (map[string]float64, error) {
++		seen := []string{}
++		result := map[string]float64{}
++		for _, score := range byPlugin["codespec"] {
++			seen = append(seen, score.Name)
++			result[score.Name] = float64(score.Score)
++		}
++		sort.Strings(seen)
++		if want := []string{"good-a", "good-b"}; !reflect.DeepEqual(seen, want) {
++			t.Errorf("reducer received ineligible nodes: want %v, got %v", want, seen)
++		}
++		return result, nil
++	}
++	batchFn := func(_ *api.TaskInfo, eligible []*api.NodeInfo) (map[string]float64, error) {
++		seen := codeSpecNodeNames(eligible)
++		sort.Strings(seen)
++		if want := []string{"good-a", "good-b"}; !reflect.DeepEqual(seen, want) {
++			t.Errorf("batch scorer received ineligible nodes: want %v, got %v", want, seen)
++		}
++		return map[string]float64{"map-failed": 1000, "good-a": 2, "good-b": 3}, nil
++	}
++
++	got := codeSpecScoresByNode(t, PrioritizeNodes(nil, nodes, batchFn, mapFn, reduceFn))
++	want := map[string]float64{"good-a": 4, "good-b": 5}
++	if !reflect.DeepEqual(got, want) {
++		t.Fatalf("per-node failure was not isolated: want %v, got %v", want, got)
++	}
++}
++
++func TestCodeSpecPrioritizeNodesRejectsNonFiniteContributions(t *testing.T) {
++	nodes := codeSpecScoringNodes("bad-direct", "bad-plugin", "bad-reduce", "bad-batch", "good")
++	mapFn := func(_ *api.TaskInfo, node *api.NodeInfo) (map[string]float64, float64, error) {
++		switch node.Name {
++		case "bad-direct":
++			return map[string]float64{"codespec": 1}, math.NaN(), nil
++		case "bad-plugin":
++			return map[string]float64{"codespec": math.Inf(1)}, 1, nil
++		default:
++			return map[string]float64{"codespec": 1}, 0, nil
++		}
++	}
++	reduceFn := func(_ *api.TaskInfo, byPlugin map[string]k8sframework.NodeScoreList) (map[string]float64, error) {
++		result := map[string]float64{}
++		for _, score := range byPlugin["codespec"] {
++			result[score.Name] = float64(score.Score)
++		}
++		result["bad-reduce"] = math.NaN()
++		return result, nil
++	}
++	batchFn := func(_ *api.TaskInfo, _ []*api.NodeInfo) (map[string]float64, error) {
++		return map[string]float64{
++			"bad-direct": 100,
++			"bad-plugin": 100,
++			"bad-batch":  math.Inf(-1),
++			"good":       2,
++		}, nil
++	}
++
++	got := codeSpecScoresByNode(t, PrioritizeNodes(nil, nodes, batchFn, mapFn, reduceFn))
++	want := map[string]float64{"good": 3}
++	if !reflect.DeepEqual(got, want) {
++		t.Fatalf("invalid scores were not filtered per node: want %v, got %v", want, got)
++	}
++}
++
++func TestCodeSpecPrioritizeNodesFailsClosedOnStageErrors(t *testing.T) {
++	nodes := codeSpecScoringNodes("node-a", "node-b")
++	mapFn := func(_ *api.TaskInfo, _ *api.NodeInfo) (map[string]float64, float64, error) {
++		return map[string]float64{"codespec": 1}, 2, nil
++	}
++	goodReduce := func(_ *api.TaskInfo, _ map[string]k8sframework.NodeScoreList) (map[string]float64, error) {
++		return map[string]float64{"node-a": 3, "node-b": 3}, nil
++	}
++	goodBatch := func(_ *api.TaskInfo, _ []*api.NodeInfo) (map[string]float64, error) {
++		return map[string]float64{"node-a": 4, "node-b": 4}, nil
++	}
++
++	t.Run("reducer", func(t *testing.T) {
++		reduceErr := func(_ *api.TaskInfo, _ map[string]k8sframework.NodeScoreList) (map[string]float64, error) {
++			return map[string]float64{"node-a": 100}, errors.New("reduce failed")
++		}
++		if got := PrioritizeNodes(nil, nodes, goodBatch, mapFn, reduceErr); len(got) != 0 {
++			t.Fatalf("reducer error must produce no selectable nodes, got %v", codeSpecScoresByNode(t, got))
++		}
++	})
++
++	t.Run("batch", func(t *testing.T) {
++		batchErr := func(_ *api.TaskInfo, _ []*api.NodeInfo) (map[string]float64, error) {
++			return map[string]float64{"node-a": 100}, errors.New("batch failed")
++		}
++		if got := PrioritizeNodes(nil, nodes, batchErr, mapFn, goodReduce); len(got) != 0 {
++			t.Fatalf("batch error must produce no selectable nodes, got %v", codeSpecScoresByNode(t, got))
++		}
++	})
++}
++
++func TestCodeSpecSortNodesIsDeterministicAndDoesNotMutateInput(t *testing.T) {
++	nodeA, nodeB, nodeC, nodeZ := &api.NodeInfo{Name: "node-a"}, &api.NodeInfo{Name: "node-b"}, &api.NodeInfo{Name: "node-c"}, &api.NodeInfo{Name: "node-z"}
++	nodeScores := map[float64][]*api.NodeInfo{
++		10:          {nodeZ, nil, nodeA},
++		-2:          {nodeC, nodeB},
++		math.Inf(1): {{Name: "infinite"}},
++		math.NaN():  {{Name: "not-a-number"}},
++	}
++	beforeTen := append([]*api.NodeInfo(nil), nodeScores[10]...)
++	beforeNegative := append([]*api.NodeInfo(nil), nodeScores[-2]...)
++
++	got := codeSpecNodeNames(SortNodes(nodeScores))
++	want := []string{"node-a", "node-z", "node-b", "node-c"}
++	if !reflect.DeepEqual(got, want) {
++		t.Fatalf("ranked order mismatch: want %v, got %v", want, got)
++	}
++	if !reflect.DeepEqual(nodeScores[10], beforeTen) || !reflect.DeepEqual(nodeScores[-2], beforeNegative) {
++		t.Fatal("SortNodes mutated an input score bucket")
++	}
++
++	negativeOnly := map[float64][]*api.NodeInfo{
++		-5: codeSpecScoringNodes("node-z", "node-a"),
++		-2: codeSpecScoringNodes("node-c", "node-b"),
++	}
++	if got, want := codeSpecNodeNames(SortNodes(negativeOnly)), []string{"node-b", "node-c", "node-a", "node-z"}; !reflect.DeepEqual(got, want) {
++		t.Fatalf("all-negative ranked order mismatch: want %v, got %v", want, got)
++	}
++}
++
++func TestCodeSpecSelectBestNodeUsesDeterministicOrderForNegativeScores(t *testing.T) {
++	nodeScores := map[float64][]*api.NodeInfo{
++		-5:          codeSpecScoringNodes("node-z", "node-a"),
++		-2:          codeSpecScoringNodes("node-c", "node-b"),
++		math.Inf(1): codeSpecScoringNodes("invalid-infinite"),
++	}
++
++	for i := 0; i < 5; i++ {
++		got := SelectBestNode(nodeScores)
++		if got == nil || got.Name != "node-b" {
++			t.Fatalf("selection %d: want node-b, got %#v", i, got)
++		}
++	}
++	if got := SelectBestNode(map[float64][]*api.NodeInfo{math.NaN(): {{Name: "invalid"}}}); got != nil {
++		t.Fatalf("invalid-only input must have no best node, got %s", got.Name)
++	}
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,6 @@
++#!/bin/bash
++set -euo pipefail
++
++
++go test ./pkg/scheduler/util ./pkg/scheduler/actions/allocate \
++  -run '^(TestCodeSpec.*|TestSelectBestNode|TestAllocate)$' -count=1

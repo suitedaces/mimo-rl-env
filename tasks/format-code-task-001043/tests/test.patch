@@ -1,0 +1,306 @@
+diff --git a/pkg/asset/agent/mirror/registriesconf_projection_codespec_test.go b/pkg/asset/agent/mirror/registriesconf_projection_codespec_test.go
+new file mode 100644
+index 0000000000..6e337e3790
+--- /dev/null
++++ b/pkg/asset/agent/mirror/registriesconf_projection_codespec_test.go
+@@ -0,0 +1,168 @@
++package mirror_test
++
++import (
++	"errors"
++	"reflect"
++	"testing"
++
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++
++	"github.com/openshift/installer/pkg/asset"
++	"github.com/openshift/installer/pkg/asset/agent"
++	"github.com/openshift/installer/pkg/asset/agent/mirror"
++	"github.com/openshift/installer/pkg/asset/installconfig"
++	"github.com/openshift/installer/pkg/asset/releaseimage"
++	"github.com/openshift/installer/pkg/types"
++)
++
++func TestCodespecRegistriesConfGeneratedProjectionKeepsAllMirrors(t *testing.T) {
++	parents := asset.Parents{}
++	parents.Add(
++		&agent.OptionalInstallConfig{
++			Supplied: true,
++			InstallConfig: installconfig.InstallConfig{Config: &types.InstallConfig{
++				ObjectMeta: metav1.ObjectMeta{Namespace: "projection-test"},
++				ImageContentSources: []types.ImageContentSource{
++					{Source: "registry.example.test/release", Mirrors: []string{"mirror-a.test/release", "mirror-b.test/release", "mirror-a.test/release"}},
++					{Source: "registry.example.test/content"},
++					{Source: "registry.example.test/release", Mirrors: []string{"mirror-b.test/release", "mirror-c.test/release"}},
++					{Source: "registry.example.test/content", Mirrors: []string{"mirror-a.test/content"}},
++				},
++			}},
++		},
++		&releaseimage.Image{PullSpec: "registry.example.test/release:latest"},
++	)
++
++	got := &mirror.RegistriesConf{}
++	if err := got.Generate(parents); err != nil {
++		t.Fatalf("Generate() returned an error: %v", err)
++	}
++
++	wantProjection := []mirror.RegistriesConfig{
++		{Location: "registry.example.test/release", Mirror: "mirror-a.test/release"},
++		{Location: "registry.example.test/release", Mirror: "mirror-b.test/release"},
++		{Location: "registry.example.test/release", Mirror: "mirror-c.test/release"},
++		{Location: "registry.example.test/content", Mirror: "mirror-a.test/content"},
++	}
++	if !reflect.DeepEqual(got.MirrorConfig, wantProjection) {
++		t.Errorf("generated MirrorConfig mismatch\nwant: %#v\n got: %#v", wantProjection, got.MirrorConfig)
++	}
++
++	if got.Config == nil || len(got.Config.Registries) != 2 {
++		t.Fatalf("generated registries.conf should contain two source entries, got %#v", got.Config)
++	}
++	wantMirrors := [][]string{
++		{"mirror-a.test/release", "mirror-b.test/release", "mirror-c.test/release"},
++		{"mirror-a.test/content"},
++	}
++	for i, registry := range got.Config.Registries {
++		var locations []string
++		for _, endpoint := range registry.Mirrors {
++			locations = append(locations, endpoint.Location)
++		}
++		if !reflect.DeepEqual(locations, wantMirrors[i]) {
++			t.Errorf("registry %d mirror order mismatch: want %v, got %v", i, wantMirrors[i], locations)
++		}
++	}
++}
++
++func TestCodespecRegistriesConfLoadedProjectionNormalizesRepeatedSources(t *testing.T) {
++	contents := []byte(`
++[[registry]]
++location = "registry.example.test/release"
++[[registry.mirror]]
++location = "mirror-a.test/release"
++[[registry.mirror]]
++location = "mirror-b.test/release"
++
++[[registry]]
++location = "registry.example.test/content"
++[[registry.mirror]]
++location = "mirror-a.test/content"
++
++[[registry]]
++location = "registry.example.test/release"
++[[registry.mirror]]
++location = "mirror-b.test/release"
++[[registry.mirror]]
++location = "mirror-c.test/release"
++`)
++	got := &mirror.RegistriesConf{}
++	found, err := got.Load(singleFileFetcher{file: &asset.File{Filename: mirror.RegistriesConfFilename, Data: contents}})
++	if err != nil || !found {
++		t.Fatalf("Load() = (%v, %v), want (true, nil)", found, err)
++	}
++
++	want := []mirror.RegistriesConfig{
++		{Location: "registry.example.test/release", Mirror: "mirror-a.test/release"},
++		{Location: "registry.example.test/release", Mirror: "mirror-b.test/release"},
++		{Location: "registry.example.test/release", Mirror: "mirror-c.test/release"},
++		{Location: "registry.example.test/content", Mirror: "mirror-a.test/content"},
++	}
++	if !reflect.DeepEqual(got.MirrorConfig, want) {
++		t.Errorf("loaded MirrorConfig mismatch\nwant: %#v\n got: %#v", want, got.MirrorConfig)
++	}
++}
++
++func TestCodespecRegistriesConfLoadAllowsSourcesWithoutMirrors(t *testing.T) {
++	contents := []byte(`
++unqualified-search-registries = ["registry.access.redhat.com"]
++
++[[registry]]
++location = "registry.example.test/passthrough"
++
++[[registry]]
++location = "registry.example.test/mirrored"
++[[registry.mirror]]
++location = "mirror.example.test/mirrored"
++`)
++	got := &mirror.RegistriesConf{}
++	var found bool
++	var err error
++	panicked := didPanic(func() {
++		found, err = got.Load(singleFileFetcher{file: &asset.File{Filename: mirror.RegistriesConfFilename, Data: contents}})
++	})
++	if panicked {
++		t.Fatal("Load() panicked for a valid registry entry with no mirrors")
++	}
++	if err != nil || !found {
++		t.Fatalf("Load() = (%v, %v), want (true, nil)", found, err)
++	}
++	want := []mirror.RegistriesConfig{{
++		Location: "registry.example.test/mirrored",
++		Mirror:   "mirror.example.test/mirrored",
++	}}
++	if !reflect.DeepEqual(got.MirrorConfig, want) {
++		t.Errorf("unmirrored sources must be omitted from MirrorConfig: want %#v, got %#v", want, got.MirrorConfig)
++	}
++	if got.Config == nil || len(got.Config.Registries) != 2 {
++		t.Errorf("Load() must retain both registry entries in Config, got %#v", got.Config)
++	}
++}
++
++func didPanic(fn func()) (panicked bool) {
++	defer func() {
++		panicked = recover() != nil
++	}()
++	fn()
++	return false
++}
++
++type singleFileFetcher struct {
++	file *asset.File
++	err  error
++}
++
++func (f singleFileFetcher) FetchByName(string) (*asset.File, error) {
++	if f.err != nil {
++		return nil, f.err
++	}
++	if f.file == nil {
++		return nil, errors.New("file not found")
++	}
++	return f.file, nil
++}
++
++func (singleFileFetcher) FetchByPattern(string) ([]*asset.File, error) {
++	return nil, errors.New("unexpected FetchByPattern call")
++}
+diff --git a/pkg/asset/agent/image/release_mirror_policy_codespec_test.go b/pkg/asset/agent/image/release_mirror_policy_codespec_test.go
+new file mode 100644
+index 0000000000..20f3884958
+--- /dev/null
++++ b/pkg/asset/agent/image/release_mirror_policy_codespec_test.go
+@@ -0,0 +1,116 @@
++package image_test
++
++import (
++	"context"
++	"os"
++	"path/filepath"
++	"reflect"
++	"strings"
++	"testing"
++
++	operatorv1alpha1 "github.com/openshift/api/operator/v1alpha1"
++	"sigs.k8s.io/yaml"
++
++	"github.com/openshift/installer/pkg/asset/agent/image"
++	"github.com/openshift/installer/pkg/asset/agent/mirror"
++)
++
++func TestCodespecReleaseExtractionGroupsEveryMirrorBySource(t *testing.T) {
++	binDir := t.TempDir()
++	ocPath := filepath.Join(binDir, "oc")
++	if err := os.WriteFile(ocPath, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
++		t.Fatal(err)
++	}
++	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
++	t.Setenv("XDG_CACHE_HOME", t.TempDir())
++
++	exec := &recordingExecuter{t: t}
++	release := image.NewRelease(exec, image.Config{MaxTries: 1},
++		"registry.example.test/release:latest", "{}", []mirror.RegistriesConfig{
++			{Location: "registry.example.test/release", Mirror: "mirror-a.test/release"},
++			{Location: "registry.example.test/release", Mirror: "mirror-b.test/release"},
++			{Location: "registry.example.test/content", Mirror: "mirror-a.test/content"},
++			{Location: "registry.example.test/release", Mirror: "mirror-c.test/release"},
++		})
++
++	if _, err := release.ExtractFile("agent-installer-node-agent", "/usr/bin/agent"); err != nil {
++		t.Fatalf("ExtractFile() returned an error: %v", err)
++	}
++	if len(exec.policies) != 2 {
++		t.Fatalf("expected release lookup and image extraction to each receive an ICSP, got %d policies", len(exec.policies))
++	}
++
++	want := []operatorv1alpha1.RepositoryDigestMirrors{
++		{Source: "registry.example.test/release", Mirrors: []string{"mirror-a.test/release", "mirror-b.test/release", "mirror-c.test/release"}},
++		{Source: "registry.example.test/content", Mirrors: []string{"mirror-a.test/content"}},
++	}
++	for i, policy := range exec.policies {
++		if !reflect.DeepEqual(policy.Spec.RepositoryDigestMirrors, want) {
++			t.Errorf("operation %d ICSP mismatch\nwant: %#v\n got: %#v", i, want, policy.Spec.RepositoryDigestMirrors)
++		}
++	}
++}
++
++type recordingExecuter struct {
++	t        *testing.T
++	policies []operatorv1alpha1.ImageContentSourcePolicy
++	calls    int
++}
++
++func (e *recordingExecuter) Execute(command string, args ...string) (string, string, int) {
++	e.t.Helper()
++	if command != "oc" {
++		e.t.Errorf("unexpected executable %q", command)
++	}
++	var policyPath string
++	for _, arg := range args {
++		if strings.HasPrefix(arg, "--icsp-file=") {
++			policyPath = strings.TrimPrefix(arg, "--icsp-file=")
++			break
++		}
++	}
++	if policyPath == "" {
++		e.t.Errorf("oc call did not include --icsp-file: %v", args)
++		return "", "missing ICSP", 1
++	}
++	data, err := os.ReadFile(policyPath)
++	if err != nil {
++		e.t.Errorf("reading ICSP: %v", err)
++		return "", err.Error(), 1
++	}
++	var policy operatorv1alpha1.ImageContentSourcePolicy
++	if err := yaml.Unmarshal(data, &policy); err != nil {
++		e.t.Errorf("decoding ICSP: %v", err)
++		return "", err.Error(), 1
++	}
++	e.policies = append(e.policies, policy)
++	e.calls++
++	if e.calls == 1 {
++		return "registry.example.test/payload:latest", "", 0
++	}
++	for i, arg := range args {
++		if arg != "--path" || i+1 >= len(args) {
++			continue
++		}
++		parts := strings.SplitN(args[i+1], ":", 2)
++		if len(parts) != 2 {
++			continue
++		}
++		extractedPath := filepath.Join(parts[1], filepath.Base(parts[0]))
++		if err := os.WriteFile(extractedPath, []byte("test payload"), 0o600); err != nil {
++			e.t.Errorf("creating simulated extracted file: %v", err)
++			return "", err.Error(), 1
++		}
++	}
++	return "", "", 0
++}
++
++func (e *recordingExecuter) ExecuteWithContext(context.Context, string, ...string) (string, string, int) {
++	e.t.Helper()
++	e.t.Fatal("unexpected ExecuteWithContext call")
++	return "", "", 1
++}
++
++func (e *recordingExecuter) TempFile(dir, pattern string) (*os.File, error) {
++	return os.CreateTemp(dir, pattern)
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,5 @@
++#!/bin/bash
++set -euo pipefail
++
++
++go test ./pkg/asset/agent/mirror ./pkg/asset/agent/image

@@ -1,0 +1,214 @@
+diff --git a/lifecycle_test.go b/lifecycle_test.go
+new file mode 100644
+index 0000000..dd3034f
+--- /dev/null
++++ b/lifecycle_test.go
+@@ -0,0 +1,199 @@
++package optional
++
++import (
++	"errors"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"reflect"
++	"runtime"
++	"strings"
++	"testing"
++)
++
++func TestGeneratedPrimitiveLifecycle(t *testing.T) {
++	cases := []struct {
++		name  string
++		typ   reflect.Type
++		value reflect.Value
++	}{
++		{"Bool", reflect.TypeOf(false), reflect.ValueOf(true)},
++		{"BoolZero", reflect.TypeOf(false), reflect.ValueOf(false)},
++		{"Byte", reflect.TypeOf(byte(0)), reflect.ValueOf(byte(7))},
++		{"Complex128", reflect.TypeOf(complex128(0)), reflect.ValueOf(complex128(2 + 3i))},
++		{"Complex64", reflect.TypeOf(complex64(0)), reflect.ValueOf(complex64(2 + 3i))},
++		{"Float32", reflect.TypeOf(float32(0)), reflect.ValueOf(float32(1.25))},
++		{"Float64", reflect.TypeOf(float64(0)), reflect.ValueOf(float64(2.5))},
++		{"Int", reflect.TypeOf(int(0)), reflect.ValueOf(7)},
++		{"Int8", reflect.TypeOf(int8(0)), reflect.ValueOf(int8(-8))},
++		{"Int16", reflect.TypeOf(int16(0)), reflect.ValueOf(int16(-16))},
++		{"Int32", reflect.TypeOf(int32(0)), reflect.ValueOf(int32(-32))},
++		{"Int64", reflect.TypeOf(int64(0)), reflect.ValueOf(int64(-64))},
++		{"Rune", reflect.TypeOf(rune(0)), reflect.ValueOf(rune('x'))},
++		{"String", reflect.TypeOf(""), reflect.ValueOf("value")},
++		{"StringZero", reflect.TypeOf(""), reflect.ValueOf("")},
++		{"Uint", reflect.TypeOf(uint(0)), reflect.ValueOf(uint(7))},
++		{"Uint8", reflect.TypeOf(uint8(0)), reflect.ValueOf(uint8(8))},
++		{"Uint16", reflect.TypeOf(uint16(0)), reflect.ValueOf(uint16(16))},
++		{"Uint32", reflect.TypeOf(uint32(0)), reflect.ValueOf(uint32(32))},
++		{"Uint64", reflect.TypeOf(uint64(0)), reflect.ValueOf(uint64(64))},
++		{"Uintptr", reflect.TypeOf(uintptr(0)), reflect.ValueOf(uintptr(128))},
++		{"Error", reflect.TypeOf((*error)(nil)).Elem(), reflect.ValueOf(error(errors.New("boom")))},
++	}
++
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			wrapper := reflect.TypeOf(struct{}{})
++			lookupName := strings.TrimSuffix(tc.name, "Zero")
++			for _, candidate := range []reflect.Type{
++				reflect.TypeOf(Bool{}), reflect.TypeOf(Byte{}),
++				reflect.TypeOf(Complex128{}), reflect.TypeOf(Complex64{}),
++				reflect.TypeOf(Float32{}), reflect.TypeOf(Float64{}),
++				reflect.TypeOf(Int{}), reflect.TypeOf(Int8{}),
++				reflect.TypeOf(Int16{}), reflect.TypeOf(Int32{}),
++				reflect.TypeOf(Int64{}), reflect.TypeOf(Rune{}),
++				reflect.TypeOf(String{}), reflect.TypeOf(Uint{}),
++				reflect.TypeOf(Uint8{}), reflect.TypeOf(Uint16{}),
++				reflect.TypeOf(Uint32{}), reflect.TypeOf(Uint64{}),
++				reflect.TypeOf(Uintptr{}), reflect.TypeOf(Error{}),
++			} {
++				if strings.TrimPrefix(candidate.Name(), "Optional") == lookupName {
++					wrapper = candidate
++					break
++				}
++			}
++			if wrapper == reflect.TypeOf(struct{}{}) {
++				t.Fatalf("wrapper type for %s not found", lookupName)
++			}
++			o := reflect.New(wrapper).Elem()
++			get := o.Addr().MethodByName("Get")
++			got, panicked := safeCall(get)
++			if panicked || len(got) != 2 || !got[0].IsZero() || got[1].IsNil() || got[1].Interface().(error).Error() != "value not present" {
++				t.Fatalf("absent Get returned %#v", got)
++			}
++			if o.MethodByName("Present").Call(nil)[0].Bool() {
++				t.Fatal("zero value is present")
++			}
++			o.Addr().MethodByName("Set").Call([]reflect.Value{tc.value})
++			if !o.MethodByName("Present").Call(nil)[0].Bool() {
++				t.Fatal("Set did not persist on the addressable value")
++			}
++			got, panicked = safeCall(get)
++			if panicked {
++				t.Fatal("Get panicked after Set")
++			}
++			if got[1].IsNil() {
++				if !reflect.DeepEqual(got[0].Interface(), tc.value.Interface()) {
++					t.Fatalf("present Get returned %#v", got)
++				}
++			} else {
++				t.Fatalf("present Get returned %#v", got)
++			}
++			called := false
++			o.MethodByName("If").Call([]reflect.Value{reflect.MakeFunc(reflect.FuncOf([]reflect.Type{tc.typ}, nil, false), func([]reflect.Value) []reflect.Value {
++				called = true
++				return nil
++			})})
++			if !called {
++				t.Fatal("If did not invoke callback for a present value")
++			}
++			unset := o.Addr().MethodByName("Unset")
++			if !unset.IsValid() {
++				t.Fatal("Unset method is missing")
++			}
++			unset.Call(nil)
++			if o.MethodByName("Present").Call(nil)[0].Bool() {
++				t.Fatal("Unset left the value present")
++			}
++			unset.Call(nil)
++			if o.MethodByName("Present").Call(nil)[0].Bool() {
++				t.Fatal("repeated Unset made the value present")
++			}
++			got, panicked = safeCall(get)
++			if panicked || len(got) != 2 || !got[0].IsZero() || got[1].IsNil() || got[1].Interface().(error).Error() != "value not present" {
++				t.Fatalf("Get after Unset returned %#v", got)
++			}
++			fallback := reflect.ValueOf("fallback")
++			if tc.typ.Kind() != reflect.String {
++				fallback = reflect.Zero(tc.typ)
++			}
++			orElse := o.MethodByName("OrElse")
++			if got := orElse.Call([]reflect.Value{fallback})[0]; !reflect.DeepEqual(got.Interface(), fallback.Interface()) {
++				t.Fatalf("OrElse did not return fallback: %v", got.Interface())
++			}
++			called = false
++			o.MethodByName("If").Call([]reflect.Value{reflect.MakeFunc(reflect.FuncOf([]reflect.Type{tc.typ}, nil, false), func([]reflect.Value) []reflect.Value {
++				called = true
++				return nil
++			})})
++			if called {
++				t.Fatal("If invoked callback after Unset")
++			}
++		})
++	}
++}
++
++func TestExistingConstructorsRemainUsable(t *testing.T) {
++	if !NewString("x").Present() || !NewInt(1).Present() || !NewBool(true).Present() ||
++		!NewByte(1).Present() || !NewComplex128(1).Present() || !NewComplex64(1).Present() ||
++		!NewFloat32(1).Present() || !NewFloat64(1).Present() || !NewInt8(1).Present() ||
++		!NewInt16(1).Present() || !NewInt32(1).Present() || !NewInt64(1).Present() ||
++		!NewRune('x').Present() || !NewUint(1).Present() || !NewUint8(1).Present() ||
++		!NewUint16(1).Present() || !NewUint32(1).Present() || !NewUint64(1).Present() ||
++		!NewUintptr(1).Present() || !NewError(errors.New("x")).Present() {
++		t.Fatal("existing constructors did not create present wrappers")
++	}
++}
++
++func safeCall(method reflect.Value) (result []reflect.Value, panicked bool) {
++	defer func() {
++		if recover() != nil {
++			panicked = true
++		}
++	}()
++	return method.Call(nil), false
++}
++
++func TestGeneratorEmitsWorkingCustomWrapper(t *testing.T) {
++	_, thisFile, _, _ := runtime.Caller(0)
++	generator := filepath.Join(filepath.Dir(thisFile), "cmd", "optional", "main.go")
++	tmp := t.TempDir()
++	if err := os.WriteFile(filepath.Join(tmp, "types.go"), []byte("package fixture\ntype Widget struct { N int }\n"), 0644); err != nil {
++		t.Fatal(err)
++	}
++	cmd := exec.Command("go", "run", generator, "-type=Widget", "-output=OptionalWidget")
++	cmd.Dir = tmp
++	cmd.Env = append(os.Environ(), "GO111MODULE=off")
++	if out, err := cmd.CombinedOutput(); err != nil {
++		t.Fatalf("generator failed: %v\n%s", err, out)
++	}
++	testSource := `package fixture
++import ("testing"; "reflect")
++func safeGet(o *OptionalWidget) (w Widget, err error, panicked bool) {
++ defer func() { if recover() != nil { panicked = true } }()
++ w, err = o.Get()
++ return
++}
++func TestGeneratedWidgetLifecycle(t *testing.T) {
++ var o OptionalWidget
++ if _, err, panicked := safeGet(&o); panicked || err == nil { t.Fatal("absent Get must report an error without panicking") }
++			set := reflect.ValueOf(&o).MethodByName("Set")
++			if !set.IsValid() { t.Fatal("Set method is missing") }
++			set.Call([]reflect.Value{reflect.ValueOf(Widget{N: 9})})
++			if got, err := o.Get(); err != nil || got.N != 9 || !o.Present() { t.Fatalf("Set/Get failed: %#v, %v", got, err) }
++			unset := reflect.ValueOf(&o).MethodByName("Unset")
++			if !unset.IsValid() { t.Fatal("Unset method is missing") }
++			unset.Call(nil)
++			if o.Present() { t.Fatal("Unset must clear presence") }
++}
++`
++	if err := os.WriteFile(filepath.Join(tmp, "lifecycle_test.go"), []byte(testSource), 0644); err != nil {
++		t.Fatal(err)
++	}
++	cmd = exec.Command("go", "test", ".")
++	cmd.Dir = tmp
++	cmd.Env = append(os.Environ(), "GO111MODULE=off")
++	if out, err := cmd.CombinedOutput(); err != nil {
++		t.Fatalf("generated wrapper failed: %v\n%s", err, out)
++	}
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,4 @@
++#!/bin/bash
++set -euo pipefail
++
++GO111MODULE=off go test .

@@ -1,0 +1,224 @@
+diff --git a/armi/cases/tests/test_suite_execution_contract.py b/armi/cases/tests/test_suite_execution_contract.py
+new file mode 100644
+index 00000000..b4851e9d
+--- /dev/null
++++ b/armi/cases/tests/test_suite_execution_contract.py
+@@ -0,0 +1,206 @@
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++import os
++import tempfile
++import types
++import unittest
++from unittest.mock import patch
++
++from armi import cases, settings
++from armi.cli.runSuite import RunSuiteCommand
++
++
++class _ObservableSuiteCase(cases.Case):
++
++
++    def __init__(self, title, root, events, fails=False):
++        case_dir = os.path.join(root, title)
++        os.makedirs(case_dir)
++        cs = settings.Settings()
++        cs.path = os.path.join(case_dir, title + ".yaml")
++        super().__init__(cs)
++        self._events = events
++        self._fails = fails
++
++    def run(self):
++        self._events.append((self.title, os.getcwd()))
++        if self._fails:
++            raise RuntimeError("observable execution failure for " + self.title)
++
++
++class SuiteExecutionContractTests(unittest.TestCase):
++    def setUp(self):
++        self._tmp = tempfile.TemporaryDirectory()
++        self.events = []
++        self.suite = cases.CaseSuite(settings.Settings())
++
++    def tearDown(self):
++        self._tmp.cleanup()
++
++    def _case(self, title, fails=False, enabled=True):
++        case = _ObservableSuiteCase(title, self._tmp.name, self.events, fails=fails)
++        case.enabled = enabled
++        return case
++
++    def _add(self, *suite_cases):
++        for case in suite_cases:
++            self.suite.add(case)
++
++    def test_dependency_order_statuses_and_case_directories(self):
++        child = self._case("child")
++        parent = self._case("parent")
++        independent = self._case("independent")
++        child.addExplicitDependency(parent)
++        self._add(child, parent, independent)
++
++        original_dir = os.getcwd()
++        outcomes = self.suite.run()
++
++        self.assertEqual(
++            [title for title, _directory in self.events],
++            ["parent", "child", "independent"],
++        )
++        self.assertEqual(
++            [directory for _title, directory in self.events],
++            [parent.directory, child.directory, independent.directory],
++        )
++        self.assertEqual(
++            outcomes,
++            {child: "succeeded", parent: "succeeded", independent: "succeeded"},
++        )
++        self.assertEqual(os.getcwd(), original_dir)
++
++    def test_failure_blocks_descendants_but_not_independent_cases(self):
++        grandchild = self._case("grandchild")
++        child = self._case("child")
++        broken = self._case("broken", fails=True)
++        independent = self._case("independent")
++        child.addExplicitDependency(broken)
++        grandchild.addExplicitDependency(child)
++        self._add(grandchild, child, broken, independent)
++
++        original_dir = os.getcwd()
++        outcomes = self.suite.run()
++
++        self.assertEqual(
++            [title for title, _directory in self.events], ["broken", "independent"]
++        )
++        self.assertEqual(outcomes[broken], "failed")
++        self.assertEqual(outcomes[child], "blocked")
++        self.assertEqual(outcomes[grandchild], "blocked")
++        self.assertEqual(outcomes[independent], "succeeded")
++        self.assertEqual(os.getcwd(), original_dir)
++
++    def test_disabled_cases_block_dependents_without_stopping_other_work(self):
++        dependent = self._case("dependent")
++        disabled = self._case("disabled", enabled=False)
++        independent = self._case("independent")
++        dependent.addExplicitDependency(disabled)
++        self._add(dependent, disabled, independent)
++
++        outcomes = self.suite.run()
++
++        self.assertEqual(
++            [title for title, _directory in self.events], ["independent"]
++        )
++        self.assertEqual(outcomes[disabled], "disabled")
++        self.assertEqual(outcomes[dependent], "blocked")
++        self.assertEqual(outcomes[independent], "succeeded")
++
++    def test_fail_fast_distinguishes_blocked_from_cancelled_cases(self):
++        dependent = self._case("dependent")
++        broken = self._case("broken", fails=True)
++        independent = self._case("independent")
++        disabled = self._case("disabled", enabled=False)
++        dependent.addExplicitDependency(broken)
++        self._add(dependent, broken, independent, disabled)
++
++        try:
++            outcomes = self.suite.run(failFast=True)
++        except TypeError as error:
++            self.fail("CaseSuite.run must accept failFast: {}".format(error))
++
++        self.assertEqual([title for title, _directory in self.events], ["broken"])
++        self.assertEqual(outcomes[broken], "failed")
++        self.assertEqual(outcomes[dependent], "blocked")
++        self.assertEqual(outcomes[independent], "cancelled")
++        self.assertEqual(outcomes[disabled], "disabled")
++
++    def test_cycle_is_rejected_before_any_case_runs(self):
++        alpha = self._case("alpha")
++        beta = self._case("beta")
++        independent = self._case("independent")
++        alpha.addExplicitDependency(beta)
++        beta.addExplicitDependency(alpha)
++        self._add(independent, alpha, beta)
++
++        with self.assertRaises(ValueError) as raised:
++            self.suite.run()
++
++        self.assertEqual(self.events, [])
++        self.assertIn("alpha", str(raised.exception))
++        self.assertIn("beta", str(raised.exception))
++
++    def test_dependency_outside_suite_is_rejected_before_execution(self):
++        inside = self._case("inside")
++        outside = self._case("outside")
++        independent = self._case("independent")
++        inside.addExplicitDependency(outside)
++        self._add(independent, inside)
++
++        with self.assertRaises(ValueError) as raised:
++            self.suite.run()
++
++        self.assertEqual(self.events, [])
++        self.assertIn("inside", str(raised.exception))
++        self.assertIn("outside", str(raised.exception))
++
++
++class RunSuiteExitStatusContractTests(unittest.TestCase):
++    def _invoke_with_outcomes(self, outcomes):
++        class _ObservableSuite:
++            def __init__(self, _cs):
++                pass
++
++            def discover(self, **_kwargs):
++                pass
++
++            def run(self):
++                return outcomes
++
++        command = RunSuiteCommand()
++        with tempfile.TemporaryDirectory() as suite_dir:
++            command.args = types.SimpleNamespace(
++                suiteDir=suite_dir,
++                patterns=["*.yaml"],
++                ignore=[],
++                list=False,
++            )
++            with patch("armi.cli.runSuite.cases.CaseSuite", _ObservableSuite):
++                return command.invoke()
++
++    def test_cli_returns_success_for_successful_and_disabled_cases(self):
++        self.assertEqual(
++            self._invoke_with_outcomes(
++                {"completed": "succeeded", "not-selected": "disabled"}
++            ),
++            0,
++        )
++
++    def test_cli_returns_failure_for_unsuccessful_suite_outcomes(self):
++        for status in ("failed", "blocked", "cancelled"):
++            with self.subTest(status=status):
++                self.assertEqual(self._invoke_with_outcomes({"case": status}), 1)
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,7 @@
++#!/bin/bash
++set -euo pipefail
++
++python -m pytest -q \
++  armi/cases/tests/test_suite_execution_contract.py \
++  armi/cases/tests/test_cases.py \
++  -k "ExecutionContract or ExitStatusContract or CaseSuiteDependencies"

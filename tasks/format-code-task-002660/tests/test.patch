@@ -1,0 +1,376 @@
+diff --git a/usercase-test-coderl/calculate-retry-delay.test.ts b/usercase-test-coderl/calculate-retry-delay.test.ts
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/calculate-retry-delay.test.ts
+@@ -0,0 +1,348 @@
++import {execFileSync} from 'node:child_process';
++import {readdirSync} from 'node:fs';
++import {mkdtemp, rm} from 'node:fs/promises';
++import {tmpdir} from 'node:os';
++import path from 'node:path';
++import {fileURLToPath} from 'node:url';
++import http from 'node:http';
++import https from 'node:https';
++import net from 'node:net';
++import test from 'ava';
++import {calculateRetryDelay} from '../source/index.js';
++
++
++
++
++type PlainRetryOptions = {
++	limit: number;
++	methods: string[];
++	statusCodes: number[];
++	errorCodes: string[];
++	calculateDelay: ({computedValue}: {computedValue: number}) => number;
++	backoffLimit: number;
++	noise: number;
++	enforceRetryRules: boolean;
++};
++
++type PlainRetryObject = {
++	attemptCount: number;
++	retryOptions: PlainRetryOptions;
++	error: {
++		name: string;
++		code?: string;
++		options: {
++			method: string;
++		};
++		response?: {
++			statusCode: number;
++		};
++	};
++	computedValue: number;
++	retryAfter?: number;
++};
++
++const baseRetryOptions = (): PlainRetryOptions => ({
++	limit: 2,
++	methods: ['GET', 'PUT'],
++	statusCodes: [408, 413, 429, 500, 503],
++	errorCodes: ['ECONNRESET', 'ETIMEDOUT'],
++	calculateDelay: ({computedValue}) => computedValue,
++	backoffLimit: Number.POSITIVE_INFINITY,
++	noise: 0,
++	enforceRetryRules: true,
++});
++
++const requestError = (overrides: Partial<PlainRetryObject['error']> = {}): PlainRetryObject['error'] => ({
++	name: 'RequestError',
++	code: 'ECONNRESET',
++	options: {method: 'GET'},
++	...overrides,
++});
++
++const retryObject = (overrides: Partial<PlainRetryObject> = {}): PlainRetryObject => ({
++	attemptCount: 1,
++	retryOptions: baseRetryOptions(),
++	error: requestError(),
++	computedValue: Number.POSITIVE_INFINITY,
++	...overrides,
++});
++
++const calculate = (object: PlainRetryObject): number => calculateRetryDelay(object as never);
++
++test('explicit RetryError returns immediate retry sentinel', t => {
++
++
++	const actual = calculate(retryObject({
++		attemptCount: 99,
++		retryOptions: {
++			...baseRetryOptions(),
++			limit: 0,
++			methods: [],
++			errorCodes: [],
++			statusCodes: [],
++		},
++		error: requestError({name: 'RetryError'}),
++		computedValue: 123,
++	}));
++
++	t.is(actual, 1);
++});
++
++test('first retryable network failure uses first exponential delay', t => {
++
++
++	const actual = calculate(retryObject());
++
++	t.is(actual, 1000);
++});
++
++test('second retryable network failure doubles the deterministic delay', t => {
++
++
++	const actual = calculate(retryObject({attemptCount: 2}));
++
++	t.is(actual, 2000);
++});
++
++test('backoff limit caps an otherwise larger exponential delay', t => {
++
++
++	const actual = calculate(retryObject({
++		attemptCount: 3,
++		retryOptions: {
++			...baseRetryOptions(),
++			limit: 3,
++			backoffLimit: 1500,
++		},
++	}));
++
++	t.is(actual, 1500);
++});
++
++test('attempt count beyond the retry limit declines retry', t => {
++
++
++	const actual = calculate(retryObject({attemptCount: 3}));
++
++	t.is(actual, 0);
++});
++
++test('method outside configured retry methods declines retry', t => {
++
++
++	const actual = calculate(retryObject({
++		error: requestError({options: {method: 'POST'}}),
++	}));
++
++	t.is(actual, 0);
++});
++
++test('unconfigured error code without retryable response status declines retry', t => {
++
++
++	const actual = calculate(retryObject({
++		error: requestError({code: 'ERR_UNKNOWN'}),
++	}));
++
++	t.is(actual, 0);
++});
++
++test('retryable response status honors retryAfter when within computedValue', t => {
++
++
++	const actual = calculate(retryObject({
++		error: requestError({
++			code: 'ERR_UNKNOWN',
++			response: {statusCode: 503},
++		}),
++		retryAfter: 1200,
++		computedValue: 1200,
++	}));
++
++	t.is(actual, 1200);
++});
++
++test('retryable response status declines retryAfter greater than computedValue', t => {
++
++
++	const actual = calculate(retryObject({
++		error: requestError({
++			code: 'ERR_UNKNOWN',
++			response: {statusCode: 503},
++		}),
++		retryAfter: 1201,
++		computedValue: 1200,
++	}));
++
++	t.is(actual, 0);
++});
++
++test('status 413 without usable retryAfter declines retry', t => {
++
++
++	const actual = calculate(retryObject({
++		error: requestError({
++			code: 'ERR_UNKNOWN',
++			response: {statusCode: 413},
++		}),
++		computedValue: 5000,
++	}));
++
++	t.is(actual, 0);
++});
++
++test('retryable non-413 response without retryAfter falls back to exponential delay', t => {
++
++
++	const actual = calculate(retryObject({
++		error: requestError({
++			code: 'ERR_UNKNOWN',
++			response: {statusCode: 500},
++		}),
++		computedValue: 5000,
++	}));
++
++	t.is(actual, 1000);
++});
++
++test.serial('positive noise adds deterministic non-negative jitter below noise', t => {
++
++
++	const originalRandom = Math.random;
++	Math.random = () => 0.375;
++
++	try {
++		const actual = calculate(retryObject({
++			attemptCount: 2,
++			retryOptions: {
++				...baseRetryOptions(),
++				noise: 80,
++			},
++		}));
++
++		t.is(actual, 2030);
++	} finally {
++		Math.random = originalRandom;
++	}
++});
++
++test('uses retry rules from the supplied retry object', t => {
++	const actual = calculate(retryObject({
++		retryOptions: {
++			...baseRetryOptions(),
++			methods: ['PATCH'],
++			errorCodes: ['CUSTOM_RETRY_CODE'],
++			statusCodes: [],
++		},
++		error: requestError({
++			code: 'CUSTOM_RETRY_CODE',
++			options: {method: 'PATCH'},
++		}),
++	}));
++
++
++	t.is(actual, 1000);
++});
++
++test('referential transparency for the same retry state', t => {
++	const input = retryObject({attemptCount: 2});
++
++	t.is(calculate(input), 2000);
++	t.is(calculate(input), 2000);
++});
++
++test('does not mutate retryOptions, error, or response objects supplied by caller', t => {
++	const input = retryObject({
++		error: requestError({
++			code: 'ERR_UNKNOWN',
++			response: {statusCode: 503},
++		}),
++		retryAfter: 1200,
++		computedValue: 1200,
++	});
++	const before: PlainRetryObject = {
++		...input,
++		retryOptions: {
++			...input.retryOptions,
++			methods: [...input.retryOptions.methods],
++			statusCodes: [...input.retryOptions.statusCodes],
++			errorCodes: [...input.retryOptions.errorCodes],
++		},
++		error: {
++			...input.error,
++			options: {...input.error.options},
++			response: input.error.response && {...input.error.response},
++		},
++	};
++
++	t.is(calculate(input), 1200);
++	t.deepEqual(input, before);
++});
++
++test.serial('fresh process computes the same value after unrelated in-process calls', t => {
++	const input = retryObject({attemptCount: 2});
++
++	t.is(calculate(input), 2000);
++	t.is(calculate(retryObject({attemptCount: 1})), 1000);
++	t.is(calculate(retryObject({attemptCount: 3})), 0);
++
++	const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
++	const script = `
++		import {calculateRetryDelay} from ${JSON.stringify(path.join(repoRoot, 'source/index.js'))};
++		const retryOptions = {
++			limit: 2,
++			methods: ['GET', 'PUT'],
++			statusCodes: [408, 413, 429, 500, 503],
++			errorCodes: ['ECONNRESET', 'ETIMEDOUT'],
++			calculateDelay: ({computedValue}) => computedValue,
++			backoffLimit: Number.POSITIVE_INFINITY,
++			noise: 0,
++			enforceRetryRules: true,
++		};
++		const actual = calculateRetryDelay({
++			attemptCount: 2,
++			retryOptions,
++			error: {
++				name: 'RequestError',
++				code: 'ECONNRESET',
++				options: {method: 'GET'},
++			},
++			computedValue: Number.POSITIVE_INFINITY,
++		});
++		process.stdout.write(String(actual));
++	`;
++	const freshProcessOutput = execFileSync(process.execPath, ['--import=tsx/esm', '--input-type=module', '--eval', script], {
++		cwd: repoRoot,
++		encoding: 'utf8',
++	});
++
++	t.is(freshProcessOutput, '2000');
++});
++
++test.serial('does not perform filesystem or network side effects', async t => {
++	const workingDirectory = await mkdtemp(path.join(tmpdir(), 'got-retry-delay-'));
++	const beforeEntries = readdirSync(workingDirectory).sort();
++	const originalCwd = process.cwd();
++	const originalHttpRequest = http.request;
++	const originalHttpsRequest = https.request;
++	const originalNetConnect = net.connect;
++	const failNetwork = () => {
++		throw new Error('calculateRetryDelay attempted network IO');
++	};
++
++	process.chdir(workingDirectory);
++	http.request = failNetwork as never;
++	https.request = failNetwork as never;
++	net.connect = failNetwork as never;
++
++	try {
++		t.is(calculate(retryObject()), 1000);
++		t.deepEqual(readdirSync(workingDirectory).sort(), beforeEntries);
++	} finally {
++		process.chdir(originalCwd);
++		http.request = originalHttpRequest;
++		https.request = originalHttpsRequest;
++		net.connect = originalNetConnect;
++		await rm(workingDirectory, {recursive: true, force: true});
++	}
++});
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,18 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++cd /workspace/repo
++if [ ! -x node_modules/.bin/ava ] || [ ! -d node_modules/tsx ]; then
++	echo "local: offline dependencies are missing; refusing to run npm install" >&2
++	exit 1
++fi
++exec env NODE_OPTIONS='--import=tsx/esm' ./node_modules/.bin/ava /workspace/repo/usercase-test-coderl/calculate-retry-delay.test.ts

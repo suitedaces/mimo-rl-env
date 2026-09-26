@@ -1,0 +1,232 @@
+diff --git a/api/tests/opentrons/protocols/test_bundle_hardening.py b/api/tests/opentrons/protocols/test_bundle_hardening.py
+new file mode 100644
+index 0000000000..4726f0d38f
+--- /dev/null
++++ b/api/tests/opentrons/protocols/test_bundle_hardening.py
+@@ -0,0 +1,213 @@
++import io
++import zipfile
++
++import pytest
++
++from opentrons.protocols.bundle import extract_bundle, create_bundle
++from opentrons.protocols.types import BundleContents
++
++
++def _labware() -> dict:
++    return {
++        "namespace": "test",
++        "version": 1,
++        "parameters": {"loadName": "plate"},
++    }
++
++
++def _archive_with_extra(name: str) -> zipfile.ZipFile:
++    buffer = io.BytesIO()
++    with zipfile.ZipFile(buffer, "w") as archive:
++        archive.writestr("protocol.ot2.py", "def run(ctx):\n    pass\n")
++        archive.writestr(
++            "labware/plate.json",
++            '{"namespace":"test","version":1,'
++            '"parameters":{"loadName":"plate"}}',
++        )
++        archive.writestr(name, b"payload")
++    buffer.seek(0)
++    return zipfile.ZipFile(buffer)
++
++
++@pytest.mark.parametrize(
++    "member_name",
++    [
++        "../outside.txt",
++        "/protocol.ot2.py",
++        "data/../../outside.txt",
++        "data\\..\\outside.txt",
++        "C:/outside.txt",
++        "data//outside.txt",
++        "data/./outside.txt",
++    ],
++)
++def test_extract_rejects_unsafe_member_paths(member_name: str) -> None:
++    with _archive_with_extra(member_name) as archive:
++        with pytest.raises(RuntimeError):
++            extract_bundle(archive)
++
++
++@pytest.mark.parametrize(
++    ("first_name", "second_name"),
++    [
++        ("data/value.txt", "data/value.txt"),
++        ("data/cafe\u0301.txt", "data/caf\u00e9.txt"),
++    ],
++)
++def test_extract_rejects_duplicate_normalized_members(
++    first_name: str, second_name: str
++) -> None:
++    buffer = io.BytesIO()
++    with zipfile.ZipFile(buffer, "w") as archive:
++        archive.writestr("protocol.ot2.py", "def run(ctx):\n    pass\n")
++        archive.writestr(
++            "labware/plate.json",
++            '{"namespace":"test","version":1,'
++            '"parameters":{"loadName":"plate"}}',
++        )
++        archive.writestr(first_name, b"first")
++        archive.writestr(second_name, b"second")
++    buffer.seek(0)
++    with zipfile.ZipFile(buffer) as archive:
++        with pytest.raises(RuntimeError):
++            extract_bundle(archive)
++
++
++def test_create_bundle_round_trips_nested_data_and_python() -> None:
++    contents = BundleContents(
++        protocol="def run(ctx):\n    pass\n",
++        bundled_labware={"test/plate/1": _labware()},
++        bundled_data={
++            "nested/data.txt": b"data",
++            "root.bin": b"bytes",
++            "Case.txt": b"upper",
++            "case.txt": b"lower",
++            "cafe\u0301.txt": b"accent",
++        },
++        bundled_python={"helpers/util.py": "VALUE = 3\n"},
++    )
++    buffer = io.BytesIO()
++    create_bundle(contents, buffer)
++    buffer.seek(0)
++
++    with zipfile.ZipFile(buffer) as archive:
++        assert {
++            "data/nested/data.txt",
++            "data/root.bin",
++            "data/Case.txt",
++            "data/case.txt",
++            "data/cafe\u0301.txt",
++            "helpers/util.py",
++        }.issubset(archive.namelist())
++        assert extract_bundle(archive) == contents
++
++
++def test_bundle_without_custom_labware_round_trips() -> None:
++    contents = BundleContents(
++        protocol="def run(ctx):\n    pass\n",
++        bundled_labware={},
++        bundled_data={"settings.csv": b"a,b\n1,2\n"},
++        bundled_python={},
++    )
++    buffer = io.BytesIO()
++    create_bundle(contents, buffer)
++    buffer.seek(0)
++
++    with zipfile.ZipFile(buffer) as archive:
++        assert extract_bundle(archive) == contents
++
++
++@pytest.mark.parametrize(
++    "python_name",
++    [
++        "../helper.py",
++        "bad\\helper.py",
++        "C:/helper.py",
++        "helpers//helper.py",
++        "helpers/./helper.py",
++        "data/helper.py",
++        "labware/helper.py",
++        "protocol.ot2.py",
++    ],
++)
++def test_create_bundle_rejects_unsafe_or_reserved_python_names(
++    python_name: str,
++) -> None:
++    contents = BundleContents(
++        protocol="def run(ctx):\n    pass\n",
++        bundled_labware={"test/plate/1": _labware()},
++        bundled_data={},
++        bundled_python={python_name: "VALUE = 3\n"},
++    )
++    output = io.BytesIO()
++    with pytest.raises(RuntimeError):
++        create_bundle(contents, output)
++    assert output.getvalue() == b""
++
++
++@pytest.mark.parametrize(
++    "data_name",
++    [
++        "../payload.bin",
++        "data\\..\\payload.bin",
++        "/payload.bin",
++        "C:/payload.bin",
++        "nested//payload.bin",
++        "./payload.bin",
++    ],
++)
++def test_create_bundle_rejects_unsafe_or_reserved_data_names(data_name: str) -> None:
++    contents = BundleContents(
++        protocol="def run(ctx):\n    pass\n",
++        bundled_labware={"test/plate/1": _labware()},
++        bundled_data={data_name: b"payload"},
++        bundled_python={},
++    )
++    output = io.BytesIO()
++    with pytest.raises(RuntimeError):
++        create_bundle(contents, output)
++    assert output.getvalue() == b""
++
++
++@pytest.mark.parametrize(
++    "namespace", ["../outside", "bad\\path", "bad//path", "bad/./path"]
++)
++def test_create_bundle_rejects_unsafe_labware_names(namespace: str) -> None:
++    labware = _labware()
++    labware["namespace"] = namespace
++    contents = BundleContents(
++        protocol="def run(ctx):\n    pass\n",
++        bundled_labware={"ignored-key": labware},
++        bundled_data={},
++        bundled_python={},
++    )
++    output = io.BytesIO()
++    with pytest.raises(RuntimeError):
++        create_bundle(contents, output)
++    assert output.getvalue() == b""
++
++
++def test_create_bundle_rejects_duplicate_labware_members_atomically() -> None:
++    contents = BundleContents(
++        protocol="def run(ctx):\n    pass\n",
++        bundled_labware={"first": _labware(), "second": _labware()},
++        bundled_data={},
++        bundled_python={},
++    )
++    output = io.BytesIO()
++    with pytest.raises(RuntimeError):
++        create_bundle(contents, output)
++    assert output.getvalue() == b""
++
++
++def test_create_bundle_rejects_unicode_normalized_data_collision() -> None:
++    contents = BundleContents(
++        protocol="def run(ctx):\n    pass\n",
++        bundled_labware={},
++        bundled_data={"cafe\u0301.txt": b"first", "caf\u00e9.txt": b"second"},
++        bundled_python={},
++    )
++    output = io.BytesIO()
++    with pytest.raises(RuntimeError):
++        create_bundle(contents, output)
++    assert output.getvalue() == b""
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,8 @@
++#!/bin/bash
++set -euo pipefail
++
++
++.build_env/venv/bin/python -m pytest -q \
++  api/tests/opentrons/protocols/test_bundle_hardening.py \
++  api/tests/opentrons/protocols/test_bundle.py \
++  api/tests/opentrons/protocols/test_parse.py::test_parse_bundle_details

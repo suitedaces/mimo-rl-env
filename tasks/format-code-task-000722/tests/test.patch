@@ -1,0 +1,195 @@
+diff --git a/compose/decoder/decoder_behavior_test.go b/compose/decoder/decoder_behavior_test.go
+new file mode 100644
+index 000000000..e76a7a636
+--- /dev/null
++++ b/compose/decoder/decoder_behavior_test.go
+@@ -0,0 +1,163 @@
++package decoder_test
++
++import (
++	"bytes"
++	"encoding/csv"
++	"encoding/json"
++	"io"
++	"testing"
++
++	"github.com/cortezaproject/corteza-server/compose/decoder"
++	"github.com/cortezaproject/corteza-server/compose/types"
++	"github.com/cortezaproject/corteza-server/internal/test"
++)
++
++func rs(c string) io.ReadSeeker {
++	return bytes.NewReader([]byte(c))
++}
++
++func newFlat(c string) decoder.Decoder {
++	r := rs(c)
++	return decoder.NewFlatReader(csv.NewReader(r), r)
++}
++
++func newStructured(c string) decoder.Decoder {
++	r := rs(c)
++	return decoder.NewStructuredDecoder(json.NewDecoder(r), r)
++}
++
++const (
++	csvOne      = "f1,f2,ID\nr1v1,r1v2,1\n"
++	csvTwo      = "f1,f2,ID\na,b,1\nc,d,2\n"
++	jsonlOne    = "{ \"f1\": \"nr1v1\", \"f2\": \"r1v2\", \"ID\": \"1\" }\n"
++	jsonlTwo    = "{ \"f1\": \"a\", \"f2\": \"b\", \"ID\": \"1\" }\n{ \"f1\": \"c\", \"f2\": \"d\", \"ID\": \"2\" }\n"
++)
++
++func TestEntryCount(t *testing.T) {
++	cases := []struct {
++		name   string
++		dec    decoder.Decoder
++		expect uint64
++	}{
++		{"flat single data row", newFlat(csvOne), 1},
++		{"flat two data rows", newFlat(csvTwo), 2},
++		{"flat empty", newFlat(""), 0},
++		{"structured single", newStructured(jsonlOne), 1},
++		{"structured two", newStructured(jsonlTwo), 2},
++	}
++
++	for _, c := range cases {
++		t.Run(c.name, func(t *testing.T) {
++			got, err := c.dec.EntryCount()
++			test.NoError(t, err, "unexpected error: %v")
++			test.Assert(t, got == c.expect, "expected %d entries, got %d", c.expect, got)
++		})
++	}
++}
++
++func TestHeader(t *testing.T) {
++	t.Run("flat returns the first row in order", func(t *testing.T) {
++		h := newFlat(csvOne).Header()
++		test.Assert(t, len(h) == 3, "expected 3 header fields, got %d", len(h))
++		expect := []string{"f1", "f2", "ID"}
++		for i := range expect {
++			test.Assert(t, h[i] == expect[i], "header[%d]=%q, expected %q", i, h[i], expect[i])
++		}
++	})
++
++	t.Run("structured returns object keys", func(t *testing.T) {
++		h := newStructured(jsonlOne).Header()
++		test.Assert(t, len(h) == 3, "expected 3 header fields, got %d", len(h))
++		set := map[string]bool{}
++		for _, k := range h {
++			set[k] = true
++		}
++		for _, k := range []string{"f1", "f2", "ID"} {
++			test.Assert(t, set[k], "missing header field %q", k)
++		}
++	})
++}
++
++func collect(t *testing.T, dec decoder.Decoder, fields map[string]string) []*types.Record {
++	t.Helper()
++	var out []*types.Record
++	err := dec.Records(fields, func(r *types.Record) error {
++		out = append(out, r)
++		return nil
++	})
++	test.NoError(t, err, "unexpected error: %v")
++	return out
++}
++
++func TestRecordsFlat(t *testing.T) {
++	fields := map[string]string{"f1": "f1", "f2": "f2", "ID": "ID"}
++
++	recs := collect(t, newFlat(csvTwo), fields)
++	test.Assert(t, len(recs) == 2, "expected 2 records, got %d", len(recs))
++
++	first := recs[0]
++	test.Assert(t, first.ID == 1, "expected system field ID==1, got %d", first.ID)
++	test.Assert(t, len(first.Values) == 2, "expected 2 record values, got %d", len(first.Values))
++
++	v1 := first.Values.FilterByName("f1")
++	test.Assert(t, len(v1) == 1 && v1[0].Value == "a", "expected value f1==a")
++	v2 := first.Values.FilterByName("f2")
++	test.Assert(t, len(v2) == 1 && v2[0].Value == "b", "expected value f2==b")
++
++	test.Assert(t, recs[1].ID == 2, "expected second record ID==2, got %d", recs[1].ID)
++}
++
++func TestRecordsStructured(t *testing.T) {
++	fields := map[string]string{"f1": "f1", "f2": "f2", "ID": "ID"}
++
++	recs := collect(t, newStructured(jsonlTwo), fields)
++	test.Assert(t, len(recs) == 2, "expected 2 records, got %d", len(recs))
++
++	first := recs[0]
++	test.Assert(t, first.ID == 1, "expected system field ID==1, got %d", first.ID)
++	test.Assert(t, len(first.Values) == 2, "expected 2 record values, got %d", len(first.Values))
++	v1 := first.Values.FilterByName("f1")
++	test.Assert(t, len(v1) == 1 && v1[0].Value == "a", "expected value f1==a")
++}
++
++func TestRecordsSubsetMapping(t *testing.T) {
++
++	fields := map[string]string{"f1": "f1"}
++
++	recs := collect(t, newFlat(csvOne), fields)
++	test.Assert(t, len(recs) == 1, "expected 1 record, got %d", len(recs))
++	test.Assert(t, len(recs[0].Values) == 1, "expected 1 record value, got %d", len(recs[0].Values))
++	test.Assert(t, recs[0].ID == 0, "ID should be untouched when not mapped, got %d", recs[0].ID)
++}
++
++func TestRecordsEmptyTargetIsError(t *testing.T) {
++	fields := map[string]string{"f1": ""}
++
++	t.Run("flat", func(t *testing.T) {
++		err := newFlat(csvOne).Records(fields, func(*types.Record) error { return nil })
++		test.Error(t, err, "expected error for empty target field name")
++	})
++
++	t.Run("structured", func(t *testing.T) {
++		err := newStructured(jsonlOne).Records(fields, func(*types.Record) error { return nil })
++		test.Error(t, err, "expected error for empty target field name")
++	})
++}
++
++func TestHeaderDoesNotConsumeRecords(t *testing.T) {
++	fields := map[string]string{"f1": "f1", "f2": "f2", "ID": "ID"}
++
++	t.Run("flat", func(t *testing.T) {
++		dec := newFlat(csvTwo)
++		_ = dec.Header()
++		recs := collect(t, dec, fields)
++		test.Assert(t, len(recs) == 2, "expected 2 records after Header(), got %d", len(recs))
++	})
++
++	t.Run("structured", func(t *testing.T) {
++		dec := newStructured(jsonlTwo)
++		_ = dec.Header()
++		recs := collect(t, dec, fields)
++		test.Assert(t, len(recs) == 2, "expected 2 records after Header(), got %d", len(recs))
++	})
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,21 @@
++#!/usr/bin/env bash
++
++
++
++set -euo pipefail
++HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++cd /testbed
++
++
++
++
++
++export GO111MODULE=off
++SRC="$(go env GOPATH)/src/github.com/cortezaproject/corteza-server"
++cd "$SRC"
++
++
++go test ./compose/types/
++
++
++go test ./compose/decoder/

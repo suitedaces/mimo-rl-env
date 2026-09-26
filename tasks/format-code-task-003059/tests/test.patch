@@ -1,0 +1,425 @@
+diff --git a/usercase-test-coderl/test_manage_clone.py b/usercase-test-coderl/test_manage_clone.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/test_manage_clone.py
+@@ -0,0 +1,398 @@
++
++
++
++
++
++
++import io
++import os
++import tempfile
++
++import pytest
++import transaction
++import ZODB
++import zope.event
++from AccessControl import SecurityManager
++from AccessControl.SecurityManagement import newSecurityManager
++from AccessControl.SecurityManagement import noSecurityManager
++from Acquisition import Implicit
++from Acquisition import aq_base
++from OFS.Application import Application
++from OFS.CopySupport import CopyError
++from OFS.Folder import manage_addFolder
++from OFS.Image import File
++from OFS.Image import manage_addFile
++from Testing.makerequest import makerequest
++from ZODB.DemoStorage import DemoStorage
++from ZODB.FileStorage.FileStorage import FileStorage
++from ZODB.POSException import ConflictError
++
++
++ADD_IMAGES_AND_FILES = "Add images and files"
++COPY_OR_MOVE = "Copy or Move"
++FILE_META_TYPES = (
++    {
++        "name": "File",
++        "action": "manage_addFile",
++        "permission": ADD_IMAGES_AND_FILES,
++    },
++)
++
++
++class _SecurityPolicy:
++    def __init__(self, denied_permissions=()):
++        self._denied_permissions = tuple(denied_permissions)
++
++    def validate(self, *args, **kwargs):
++        return 1
++
++    def checkPermission(self, permission, object, context=None):
++        return permission not in self._denied_permissions
++
++
++class _User(Implicit):
++    def getId(self):
++        return "unit_tester"
++
++    getUserName = getId
++
++    def allowed(self, object, object_roles=None):
++        return 1
++
++
++class _CloneSession:
++    def __init__(self, storage=None, denied_permissions=()):
++        self.storage = storage or DemoStorage()
++        self.db = ZODB.DB(self.storage)
++        self.connection = self.db.open()
++        self.old_policy = SecurityManager.setSecurityPolicy(
++            _SecurityPolicy(denied_permissions)
++        )
++
++        self.root = self.connection.root()
++        self.root["Application"] = Application()
++        self.app = makerequest(self.root["Application"], stdout=io.BytesIO())
++        newSecurityManager(None, _User().__of__(self.root["Application"]))
++
++        manage_addFolder(self.app, "src")
++        manage_addFolder(self.app, "dest")
++        self.src = self.app.src
++        self.dest = self.app.dest
++        self.dest.all_meta_types = FILE_META_TYPES
++        manage_addFile(
++            self.src,
++            "doc",
++            title="",
++            file=b"hello",
++            content_type="text/plain",
++        )
++        transaction.commit()
++        transaction.begin()
++
++    def close(self):
++        noSecurityManager()
++        SecurityManager.setSecurityPolicy(self.old_policy)
++        transaction.abort()
++        self.connection.close()
++        self.db.close()
++        self.storage.close()
++
++
++@pytest.fixture
++def clone_session():
++    session = _CloneSession()
++    try:
++        yield session
++    finally:
++        session.close()
++
++
++def test_manage_clone_returns_inserted_clone_and_preserves_source(clone_session):
++
++
++
++    src = clone_session.src
++    dest = clone_session.dest
++    src_doc = src.doc
++
++    assert src.objectIds() == ["doc"]
++    assert dest.objectIds() == []
++    assert src_doc.getId() == "doc"
++    assert src_doc.meta_type == "File"
++
++    clone = dest.manage_clone(src_doc, "doc_copy")
++
++    assert clone.__class__.__module__ == "OFS.Image"
++    assert clone.__class__.__name__ == "File"
++    assert clone.getId() == "doc_copy"
++    assert clone.meta_type == "File"
++    assert clone.title == ""
++    assert clone.content_type == "text/plain"
++    assert src.objectIds() == ["doc"]
++    assert dest.objectIds() == ["doc_copy"]
++    assert [(key, ob.getId()) for key, ob in dest.objectItems()] == [
++        ("doc_copy", "doc_copy")
++    ]
++    assert [
++        (key, aq_base(ob) is aq_base(clone)) for key, ob in dest.objectItems()
++    ] == [("doc_copy", True)]
++    assert (aq_base(clone) is aq_base(src_doc)) is False
++    assert src_doc.getId() == "doc"
++
++    second_clone = dest.manage_clone(src_doc, "second_copy")
++
++    assert second_clone.getId() == "second_copy"
++    assert src.objectIds() == ["doc"]
++
++    assert set(dest.objectIds()) == {"doc_copy", "second_copy"}
++    assert {key: ob.getId() for key, ob in dest.objectItems()} == {
++        "doc_copy": "doc_copy",
++        "second_copy": "second_copy",
++    }
++
++
++def test_manage_clone_emits_copy_add_clone_events_and_after_clone_hook(monkeypatch):
++
++
++
++    event_log = []
++    current_dest = {"value": None}
++    original_manage_after_clone = File.manage_afterClone
++
++    def record_after_clone(self, item):
++        event_log.append(
++            (self.getId(), "manage_afterClone", list(current_dest["value"].objectIds()))
++        )
++
++    record_after_clone.__five_method__ = True
++    monkeypatch.setattr(File, "manage_afterClone", record_after_clone)
++
++    def subscriber(event):
++        dest = current_dest["value"]
++        if dest is None:
++            return
++        ob = getattr(event, "object", None)
++        name = ob.getId() if hasattr(ob, "getId") else None
++        if name in ("doc_copy", "doc", "dest"):
++            event_log.append((name, event.__class__.__name__, list(dest.objectIds())))
++
++    zope.event.subscribers.append(subscriber)
++    session = _CloneSession()
++    current_dest["value"] = session.dest
++    try:
++        event_log.clear()
++        clone = session.dest.manage_clone(session.src.doc, "doc_copy")
++
++        assert clone.getId() == "doc_copy"
++        assert session.src.objectIds() == ["doc"]
++        assert session.dest.objectIds() == ["doc_copy"]
++
++
++
++        copied_events = [
++            entry for entry in event_log if entry[1] == "ObjectCopiedEvent"
++        ]
++        added_events = [
++            entry for entry in event_log if entry[1] == "ObjectAddedEvent"
++        ]
++        after_clone_calls = [
++            entry for entry in event_log if entry[1] == "manage_afterClone"
++        ]
++        cloned_events = [
++            entry for entry in event_log if entry[1] == "ObjectClonedEvent"
++        ]
++
++        assert copied_events == [("doc_copy", "ObjectCopiedEvent", [])]
++        assert ("doc_copy", "ObjectWillBeAddedEvent", []) in event_log
++        assert added_events == [("doc_copy", "ObjectAddedEvent", ["doc_copy"])]
++        assert after_clone_calls == [
++            ("doc_copy", "manage_afterClone", ["doc_copy"])
++        ]
++        assert cloned_events == [("doc_copy", "ObjectClonedEvent", ["doc_copy"])]
++        assert event_log.index(copied_events[0]) < event_log.index(added_events[0])
++        assert event_log.index(added_events[0]) < event_log.index(cloned_events[0])
++    finally:
++        session.close()
++        zope.event.subscribers.remove(subscriber)
++        monkeypatch.setattr(File, "manage_afterClone", original_manage_after_clone)
++
++
++def test_manage_clone_rejects_non_copyable_source(monkeypatch, clone_session):
++
++
++
++    monkeypatch.setattr(File, "cb_isCopyable", lambda self: False)
++
++    with pytest.raises(CopyError) as error:
++        clone_session.dest.manage_clone(clone_session.src.doc, "doc_copy")
++
++    assert str(error.value) == "Not Supported"
++    assert error.value.args == ("Not Supported",)
++    assert clone_session.src.objectIds() == ["doc"]
++    assert clone_session.dest.objectIds() == []
++
++
++def test_manage_clone_rejects_invalid_destination_id(clone_session):
++
++
++
++    with pytest.raises(CopyError) as error:
++        clone_session.dest.manage_clone(clone_session.src.doc, "bad/id")
++
++    assert str(error.value) == "Invalid Id"
++    assert error.value.args == ("Invalid Id",)
++    assert clone_session.src.objectIds() == ["doc"]
++    assert clone_session.dest.objectIds() == []
++
++
++def test_manage_clone_rejects_source_copy_notification_failure(monkeypatch, clone_session):
++
++
++
++    def reject_copy_notification(self, container, op=0):
++        raise ValueError("boom")
++
++    monkeypatch.setattr(File, "_notifyOfCopyTo", reject_copy_notification)
++
++    with pytest.raises(CopyError) as error:
++        clone_session.dest.manage_clone(clone_session.src.doc, "doc_copy")
++
++    assert str(error.value) == "Clone Error"
++    assert error.value.args == ("Clone Error",)
++    assert clone_session.src.objectIds() == ["doc"]
++    assert clone_session.dest.objectIds() == []
++
++
++def test_manage_clone_preserves_conflict_errors(monkeypatch, clone_session):
++
++
++
++    def reject_with_conflict(self, container, op=0):
++        raise ConflictError("txn-conflict")
++
++    monkeypatch.setattr(File, "_notifyOfCopyTo", reject_with_conflict)
++
++    with pytest.raises(ConflictError) as error:
++        clone_session.dest.manage_clone(clone_session.src.doc, "doc_copy")
++
++    assert str(error.value) == "txn-conflict"
++    assert error.value.args == ("txn-conflict",)
++    assert clone_session.src.objectIds() == ["doc"]
++    assert clone_session.dest.objectIds() == []
++
++
++def test_manage_clone_checks_destination_paste_permission_before_copying(monkeypatch):
++
++
++
++    copy_notifications = []
++    original_notify = File._notifyOfCopyTo
++
++    def record_copy_notification(self, container, op=0):
++        copy_notifications.append(self.getId())
++        return original_notify(self, container, op=op)
++
++    monkeypatch.setattr(File, "_notifyOfCopyTo", record_copy_notification)
++    session = _CloneSession(denied_permissions=(ADD_IMAGES_AND_FILES,))
++    try:
++
++
++        with pytest.raises(Exception) as error:
++            session.dest.manage_clone(session.src.doc, "doc_copy")
++
++        assert error.value is not None
++        assert session.src.objectIds() == ["doc"]
++        assert session.dest.objectIds() == []
++        assert copy_notifications == []
++    finally:
++        session.close()
++
++
++def test_manage_clone_preserves_source_identity_in_session():
++
++
++
++    session = _CloneSession()
++    try:
++        src_doc = session.src.doc
++
++        clone = session.dest.manage_clone(src_doc, "doc_copy")
++
++
++        assert clone.getId() == "doc_copy"
++        assert session.src.objectIds() == ["doc"]
++        assert aq_base(session.src.doc) is aq_base(src_doc)
++        assert session.src.doc.getId() == "doc"
++        assert session.dest.objectIds() == ["doc_copy"]
++    finally:
++        session.close()
++
++
++def test_manage_clone_instances_keep_independent_destination_state():
++
++
++
++    first = _CloneSession()
++    second = _CloneSession()
++    try:
++        assert first.src.objectIds() == ["doc"]
++        assert first.dest.objectIds() == []
++        assert second.src.objectIds() == ["doc"]
++        assert second.dest.objectIds() == []
++
++        first_clone = first.dest.manage_clone(first.src.doc, "a_copy")
++
++        assert first_clone.getId() == "a_copy"
++        assert first.src.objectIds() == ["doc"]
++        assert first.dest.objectIds() == ["a_copy"]
++        assert second.src.objectIds() == ["doc"]
++        assert second.dest.objectIds() == []
++
++        second_clone = second.dest.manage_clone(second.src.doc, "b_copy")
++
++        assert second_clone.getId() == "b_copy"
++        assert first.src.objectIds() == ["doc"]
++        assert first.dest.objectIds() == ["a_copy"]
++        assert second.src.objectIds() == ["doc"]
++        assert second.dest.objectIds() == ["b_copy"]
++    finally:
++        second.close()
++        first.close()
++
++
++def test_manage_clone_works_in_filestorage_session():
++
++
++
++    with tempfile.TemporaryDirectory() as tempdir:
++        storage = FileStorage(os.path.join(tempdir, "Data.fs"))
++        session = _CloneSession(storage=storage)
++        try:
++            clone = session.dest.manage_clone(session.src.doc, "doc_copy")
++
++
++
++            assert clone.getId() == "doc_copy"
++            assert session.src.objectIds() == ["doc"]
++            assert session.dest.objectIds() == ["doc_copy"]
++        finally:
++            session.close()
++
++
++def test_manage_clone_repeated_filestorage_sessions():
++
++
++
++    with tempfile.TemporaryDirectory() as tempdir:
++
++
++        for index in range(100):
++            storage = FileStorage(os.path.join(tempdir, f"Data-{index}.fs"))
++            session = _CloneSession(storage=storage)
++            try:
++                clone = session.dest.manage_clone(session.src.doc, "doc_copy")
++                assert clone.getId() == "doc_copy"
++                assert session.src.objectIds() == ["doc"]
++                assert session.dest.objectIds() == ["doc_copy"]
++            finally:
++                session.close()
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,17 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++cd /workspace/repo
++
++export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
++
++exec python -m pytest /workspace/repo/usercase-test-coderl/test_manage_clone.py -v

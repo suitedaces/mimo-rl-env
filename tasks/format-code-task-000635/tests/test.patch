@@ -1,0 +1,339 @@
+diff --git a/usercase-test-coderl/test_canvas_chunks.py b/usercase-test-coderl/test_canvas_chunks.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/test_canvas_chunks.py
+@@ -0,0 +1,308 @@
++
++
++
++
++
++
++
++import os
++import subprocess
++import sys
++import tempfile
++import textwrap
++from pathlib import Path
++from unittest.mock import Mock
++
++from celery import Celery, chain, chunks, group, xmap, xstarmap
++
++
++def make_app(label="fixture_canvas_chunks"):
++    app = Celery(label, broker="memory://", backend="cache+memory://")
++    app.conf.task_always_eager = True
++
++    @app.task(shared=False, name=f"{label}.add")
++    def add(x, y):
++        return x + y
++
++    return app, add
++
++
++def starmap_parts(sig):
++
++    tasks = sig.tasks if hasattr(sig, "tasks") else sig.group().tasks
++    return [
++        {
++            "task": task.task,
++            "it": list(task.kwargs["it"]),
++            "inner_task": str(task.kwargs["task"]),
++        }
++        for task in tasks
++    ]
++
++
++def test_task_chunks_builds_stateful_group_parts():
++
++
++
++
++    _, add = make_app()
++
++    sig = add.chunks(zip(range(4), range(4)), 2)
++
++    assert sig.task == "celery.chunks"
++
++    generated = sig.group()
++    assert hasattr(generated, "tasks")
++    assert len(generated.tasks) == 2
++    assert starmap_parts(generated) == [
++        {
++            "task": "celery.starmap",
++            "it": [(0, 0), (1, 1)],
++            "inner_task": "fixture_canvas_chunks.add()",
++        },
++        {
++            "task": "celery.starmap",
++            "it": [(2, 2), (3, 3)],
++            "inner_task": "fixture_canvas_chunks.add()",
++        },
++    ]
++
++
++def test_top_level_chunks_preserves_options_and_round_trips_from_dict():
++
++
++
++
++    app, add = make_app("fixture_roundtrip")
++
++    sig = chunks(
++        add.s(),
++        zip(range(3), range(3)),
++        2,
++        app=app,
++        countdown=5,
++        queue="math",
++    )
++    round_tripped = chunks.from_dict(dict(sig), app=app)
++
++    assert sig.task == "celery.chunks"
++
++    assert sig.options == {"countdown": 5, "queue": "math"}
++    assert round_tripped.task == "celery.chunks"
++    assert round_tripped.options == {"countdown": 5, "queue": "math"}
++    assert starmap_parts(round_tripped.group()) == [
++        {
++            "task": "celery.starmap",
++            "it": [(0, 0), (1, 1)],
++            "inner_task": "fixture_roundtrip.add()",
++        },
++        {
++            "task": "celery.starmap",
++            "it": [(2, 2)],
++            "inner_task": "fixture_roundtrip.add()",
++        },
++    ]
++
++
++def test_chunks_call_and_apply_async_delegate_to_generated_group_with_route():
++
++
++
++
++    _, add = make_app("fixture_execute")
++    sig = add.chunks(zip(range(4), range(4)), 2)
++    sig.group = Mock(name="group")
++    generated_group = sig.group.return_value = Mock(name="generated_group")
++
++    assert sig.apply_async(countdown=10) is generated_group.apply_async.return_value
++
++    generated_group.apply_async.assert_called_once()
++    _, call_kwargs = generated_group.apply_async.call_args
++    assert call_kwargs["route_name"] == "fixture_execute.add"
++    assert call_kwargs["countdown"] == 10
++
++    generated_group.apply_async.reset_mock()
++
++    assert sig() is generated_group.apply_async.return_value
++
++    generated_group.apply_async.assert_called_once()
++
++
++def test_builtin_celery_chunks_task_executes_same_chunked_signature():
++
++
++
++
++    app, add = make_app("fixture_builtin")
++
++    result = app.tasks["celery.chunks"](
++        add.s(), [(0, 0), (1, 1), (2, 2), (3, 3)], 2
++    )
++
++    assert type(result).__name__ == "GroupResult"
++    assert len(result.results) == 2
++    assert [child.get() for child in result.results] == [[0, 2], [4, 6]]
++
++
++def test_public_api_exports_chunks_and_related_canvas_primitives():
++
++
++
++
++    assert chunks.__name__ == "chunks"
++    assert group.__name__ == "group"
++    assert chain.__name__ == "chain"
++    assert xmap.__name__ == "xmap"
++    assert xstarmap.__name__ == "xstarmap"
++
++
++def test_celery_shell_locals_expose_chunks_with_other_canvas_primitives():
++
++
++
++
++    with tempfile.TemporaryDirectory() as tmpdir:
++        Path(tmpdir, "shellapp.py").write_text(
++            textwrap.dedent(
++                """
++                from celery import Celery
++                app = Celery('shellapp', broker='memory://', backend='cache+memory://')
++
++                @app.task(shared=False, name='shellapp.add')
++                def add(x, y):
++                    return x + y
++                """
++            )
++        )
++        env = os.environ.copy()
++        env["PYTHONPATH"] = (
++            tmpdir
++            + os.pathsep
++            + "/workspace/repo"
++            + os.pathsep
++            + env.get("PYTHONPATH", "")
++        )
++        completed = subprocess.run(
++            [
++                sys.executable,
++                "-m",
++                "celery",
++                "-A",
++                "shellapp:app",
++                "shell",
++                "--python",
++            ],
++            input=(
++                "print('CANVAS_NAMES', chunks.__name__, group.__name__, "
++                "chain.__name__, xmap.__name__, xstarmap.__name__)\n"
++                "print('TASK_NAME', add.name)\n"
++                "exit()\n"
++            ),
++            cwd="/workspace/repo",
++            env=env,
++            text=True,
++            stdout=subprocess.PIPE,
++            stderr=subprocess.STDOUT,
++            check=True,
++        )
++
++    assert "CANVAS_NAMES chunks group chain xmap xstarmap" in completed.stdout
++    assert "TASK_NAME shellapp.add" in completed.stdout
++
++
++def test_group_before_any_task_chunks_call_is_specific_ordering_error():
++
++
++
++
++    _, add = make_app("fixture_ordering")
++
++    sig = add.chunks(zip(range(4), range(4)), 2)
++
++
++    assert len(sig.group().tasks) == 2
++
++
++def test_group_generation_is_idempotent_for_repeated_cleanup_style_use():
++
++
++
++
++    _, add = make_app("fixture_idempotent")
++    sig = add.chunks(zip(range(4), range(4)), 2)
++
++
++    assert starmap_parts(sig.group()) == [
++        {
++            "task": "celery.starmap",
++            "it": [(0, 0), (1, 1)],
++            "inner_task": "fixture_idempotent.add()",
++        },
++        {
++            "task": "celery.starmap",
++            "it": [(2, 2), (3, 3)],
++            "inner_task": "fixture_idempotent.add()",
++        },
++    ]
++
++
++def test_two_chunk_signatures_keep_independent_state():
++
++
++
++
++    _, add = make_app("fixture_independent")
++    first = add.chunks(zip(range(4), range(4)), 2)
++    second = add.chunks(zip(range(2), range(2)), 1)
++
++
++    assert starmap_parts(first) == [
++        {
++            "task": "celery.starmap",
++            "it": [(0, 0), (1, 1)],
++            "inner_task": "fixture_independent.add()",
++        },
++        {
++            "task": "celery.starmap",
++            "it": [(2, 2), (3, 3)],
++            "inner_task": "fixture_independent.add()",
++        },
++    ]
++    assert starmap_parts(second) == [
++        {
++            "task": "celery.starmap",
++            "it": [(0, 0)],
++            "inner_task": "fixture_independent.add()",
++        },
++        {
++            "task": "celery.starmap",
++            "it": [(1, 1)],
++            "inner_task": "fixture_independent.add()",
++        },
++    ]
++
++
++def test_repeated_construct_group_drop_cycles_do_not_retain_python_state():
++
++
++
++
++    _, add = make_app("fixture_leak_floor")
++    expected = [
++        {
++            "task": "celery.starmap",
++            "it": [(0, 0), (1, 1)],
++            "inner_task": "fixture_leak_floor.add()",
++        },
++        {
++            "task": "celery.starmap",
++            "it": [(2, 2), (3, 3)],
++            "inner_task": "fixture_leak_floor.add()",
++        },
++    ]
++
++    for _ in range(25):
++        sig = add.chunks(zip(range(4), range(4)), 2)
++
++        assert starmap_parts(sig) == expected
++        del sig
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,21 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++export PIP_NO_INDEX=1
++export PIP_DISABLE_PIP_VERSION_CHECK=1
++export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
++set -e
++cd /workspace/repo
++set -euo pipefail
++
++cd /workspace/repo
++
++python -m pip install --no-index --no-deps --no-build-isolation -e . >/dev/null 2>&1 || true
++
++exec python -m pytest /workspace/repo/usercase-test-coderl/test_canvas_chunks.py -v

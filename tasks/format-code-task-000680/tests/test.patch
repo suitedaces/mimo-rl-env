@@ -1,0 +1,545 @@
+diff --git a/usercase-test-coderl/test_regression_uncertainty.py b/usercase-test-coderl/test_regression_uncertainty.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/test_regression_uncertainty.py
+@@ -0,0 +1,488 @@
++import contextlib
++import gc
++import io
++import os
++import sys
++import tracemalloc
++import warnings
++
++import numpy as np
++import pandas as pd
++import pytest
++from sklearn.metrics import brier_score_loss
++
++sys.path.insert(0, "/workspace/repo")
++os.environ["is_test_suite"] = "True"
++warnings.filterwarnings("ignore")
++
++from auto_ml import Predictor
++
++
++
++
++
++
++
++
++
++
++
++COLUMN_DESCRIPTIONS = {"target": "output", "grp": "categorical"}
++
++
++TRAINING_DATA = pd.DataFrame(
++    {
++        "x": [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0],
++        "grp": ["a", "a", "a", "b", "b", "b", "a", "a", "b", "b", "a", "b"],
++        "target": [1.0, 3.0, 5.0, 7.0, 9.0, 11.0, 13.0, 15.0, 17.0, 19.0, 21.0, 23.0],
++    }
++)
++
++
++UNCERTAINTY_DATA = pd.DataFrame(
++    {
++        "x": [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0],
++        "grp": ["a", "a", "a", "b", "b", "b", "a", "a", "b", "b", "a", "b"],
++        "target": [1.0, 8.0, 5.0, 0.0, 9.0, 20.0, 13.0, 7.0, 17.0, 32.0, 21.0, 11.0],
++    }
++)
++
++
++CALIBRATION_DATA = pd.DataFrame(
++    {
++        "x": [0.5, 1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5, 8.5],
++        "grp": ["a", "a", "a", "b", "b", "b", "a", "a", "b"],
++        "target": [2.0, 5.0, 12.0, 8.0, 4.0, 16.0, 14.0, 25.0, 18.0],
++    }
++)
++
++
++PREDICTION_DATA = pd.DataFrame(
++    {
++        "x": [1.5, 4.5, 9.5],
++        "grp": ["a", "b", "b"],
++        "target": [4.0, 10.0, 20.0],
++    }
++)
++
++
++def _as_float_list(values):
++    if np.isscalar(values):
++        return [float(values)]
++    return [float(value) for value in list(values)]
++
++
++def _uncertain_probability(value):
++    if np.isscalar(value):
++        probability = float(value)
++    else:
++        probabilities = list(value)
++        assert len(probabilities) >= 2
++        probability = float(probabilities[1])
++    assert 0.0 <= probability <= 1.0
++    return probability
++
++
++def _assert_batch_uncertainty_predictions(predictor, prediction_data, predictions, expected_columns):
++    assert isinstance(predictions, pd.DataFrame)
++
++    assert set(expected_columns).issubset(predictions.columns)
++    assert len(predictions) == len(prediction_data)
++
++    expected_base = _as_float_list(predictor.predict(prediction_data))
++    actual_base = _as_float_list(predictions["base_prediction"])
++
++    assert actual_base == pytest.approx(expected_base)
++
++    probabilities = [_uncertain_probability(value) for value in predictions["uncertainty_prediction"]]
++    assert len(probabilities) == len(prediction_data)
++    return probabilities
++
++
++def _expected_uncertain_labels(base_predictions, actuals, uncertainty_delta, uncertainty_delta_units, uncertainty_delta_direction):
++    labels = []
++    for base_prediction, actual in zip(_as_float_list(base_predictions), _as_float_list(actuals)):
++        delta = base_prediction - actual
++        if uncertainty_delta_units == "absolute":
++            comparison_value = abs(delta) if uncertainty_delta_direction == "both" else delta
++        else:
++            comparison_value = (abs(delta) if uncertainty_delta_direction == "both" else delta) / actual
++
++        if uncertainty_delta_direction == "both":
++            labels.append(int(comparison_value > uncertainty_delta))
++        elif uncertainty_delta > 0:
++            labels.append(int(comparison_value > uncertainty_delta))
++        else:
++            labels.append(int(comparison_value < uncertainty_delta))
++    return labels
++
++
++def _assert_score_matches_spec_brier(
++    predictor,
++    prediction_data,
++    y,
++    uncertainty_delta,
++    uncertainty_delta_units,
++    uncertainty_delta_direction,
++):
++    predictions = predictor.predict_uncertainty(prediction_data)
++    probabilities = [_uncertain_probability(value) for value in predictions["uncertainty_prediction"]]
++    labels = _expected_uncertain_labels(
++        predictions["base_prediction"],
++        y,
++        uncertainty_delta,
++        uncertainty_delta_units,
++        uncertainty_delta_direction,
++    )
++    expected_score = brier_score_loss(labels, probabilities)
++    with contextlib.redirect_stdout(io.StringIO()):
++        score = predictor.score_uncertainty(prediction_data, y, advanced_scoring=True, verbose=2)
++
++    assert score == pytest.approx(expected_score)
++
++
++def _quiet_train(predictor, raw_training_data=TRAINING_DATA, **kwargs):
++    params = {
++        "model_names": "LinearRegression",
++        "perform_feature_selection": False,
++        "perform_feature_scaling": False,
++        "verbose": False,
++        "ml_for_analytics": False,
++        "advanced_analytics": False,
++    }
++    params.update(kwargs)
++    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
++        return predictor.train(raw_training_data, **params)
++
++
++def _trained_uncertainty_predictor(**kwargs):
++    np.random.seed(0)
++    predictor = Predictor(
++        type_of_estimator="regressor",
++        column_descriptions=dict(COLUMN_DESCRIPTIONS),
++        verbose=False,
++    )
++    params = {
++        "train_uncertainty_model": True,
++        "uncertainty_data": UNCERTAINTY_DATA,
++    }
++    params.update(kwargs)
++    _quiet_train(predictor, **params)
++    return predictor
++
++
++def test_default_uncertainty_training_progression_and_batch_prediction(capsys):
++
++
++
++
++    np.random.seed(0)
++    predictor = Predictor(
++        type_of_estimator="regressor",
++        column_descriptions=dict(COLUMN_DESCRIPTIONS),
++        verbose=False,
++    )
++
++    assert isinstance(predictor, Predictor)
++
++    _quiet_train(
++        predictor,
++        train_uncertainty_model=True,
++        uncertainty_data=UNCERTAINTY_DATA,
++    )
++
++    default_delta = 0.5 * float(np.std(TRAINING_DATA["target"]))
++
++    _assert_score_matches_spec_brier(
++        predictor,
++        PREDICTION_DATA,
++        PREDICTION_DATA.target,
++        default_delta,
++        "absolute",
++        "both",
++    )
++    predictions = predictor.predict_uncertainty(PREDICTION_DATA)
++    _assert_batch_uncertainty_predictions(
++        predictor,
++        PREDICTION_DATA,
++        predictions,
++        {"base_prediction", "uncertainty_prediction"},
++    )
++
++    score = predictor.score_uncertainty(PREDICTION_DATA, PREDICTION_DATA.target, advanced_scoring=True, verbose=2)
++    printed = capsys.readouterr().out
++    manual_probabilities = [_uncertain_probability(value) for value in predictions["uncertainty_prediction"]]
++    manual_labels = _expected_uncertain_labels(
++        predictions["base_prediction"],
++        PREDICTION_DATA.target,
++        default_delta,
++        "absolute",
++        "both",
++    )
++
++    assert score == pytest.approx(brier_score_loss(manual_labels, manual_probabilities))
++    assert printed.strip() != ""
++
++
++def test_single_row_uncertainty_prediction_returns_dict_with_probabilities():
++
++
++
++
++    predictor = _trained_uncertainty_predictor(
++        uncertainty_delta=4,
++        uncertainty_delta_units="absolute",
++        uncertainty_delta_direction="both",
++    )
++
++    prediction = predictor.predict_uncertainty({"x": 1.5, "grp": "a", "target": 4.0})
++
++    assert isinstance(prediction, dict)
++    assert sorted(prediction.keys()) == ["base_prediction", "uncertainty_prediction"]
++    expected_base = _as_float_list(predictor.predict(pd.DataFrame([{"x": 1.5, "grp": "a", "target": 4.0}])))
++
++    assert float(prediction["base_prediction"]) == pytest.approx(expected_base[0])
++
++    _uncertain_probability(prediction["uncertainty_prediction"])
++
++
++@pytest.mark.parametrize(
++    "case, kwargs, expected_delta, expected_units, expected_direction, expected_labels",
++    [
++        (
++            "absolute_both",
++            {"uncertainty_delta": 4, "uncertainty_delta_units": "absolute", "uncertainty_delta_direction": "both"},
++            4.0,
++            "absolute",
++            "both",
++            [0, 1, 1, 0],
++        ),
++        (
++            "absolute_directional_positive",
++            {"uncertainty_delta": 4, "uncertainty_delta_units": "absolute", "uncertainty_delta_direction": "directional"},
++            4.0,
++            "absolute",
++            "directional",
++            [0, 0, 1, 0],
++        ),
++        (
++            "absolute_directional_negative",
++            {"uncertainty_delta": -4, "uncertainty_delta_units": "absolute", "uncertainty_delta_direction": "directional"},
++            -4.0,
++            "absolute",
++            "directional",
++            [0, 1, 0, 0],
++        ),
++        (
++            "percentage_both",
++            {"uncertainty_delta": 0.3, "uncertainty_delta_units": "percentage", "uncertainty_delta_direction": "both"},
++            0.3,
++            "percentage",
++            "both",
++            [0, 1, 1, 1],
++        ),
++        (
++            "percentage_directional_positive",
++            {"uncertainty_delta": 0.3, "uncertainty_delta_units": "percentage", "uncertainty_delta_direction": "directional"},
++            0.3,
++            "percentage",
++            "directional",
++            [0, 0, 1, 1],
++        ),
++        (
++            "percentage_directional_negative",
++            {"uncertainty_delta": -0.3, "uncertainty_delta_units": "percentage", "uncertainty_delta_direction": "directional"},
++            -0.3,
++            "percentage",
++            "directional",
++            [0, 1, 0, 0],
++        ),
++    ],
++)
++def test_uncertainty_threshold_units_and_direction_rules(
++    case,
++    kwargs,
++    expected_delta,
++    expected_units,
++    expected_direction,
++    expected_labels,
++):
++
++
++
++
++    predictor = _trained_uncertainty_predictor(**kwargs)
++
++    assert case in {
++        "absolute_both",
++        "absolute_directional_positive",
++        "absolute_directional_negative",
++        "percentage_both",
++        "percentage_directional_positive",
++        "percentage_directional_negative",
++    }
++
++    assert _expected_uncertain_labels([10.0, 10.0, 10.0, 10.0], [14.0, 15.0, 5.0, 6.0], expected_delta, expected_units, expected_direction) == expected_labels
++    _assert_score_matches_spec_brier(
++        predictor,
++        PREDICTION_DATA,
++        PREDICTION_DATA.target,
++        expected_delta,
++        expected_units,
++        expected_direction,
++    )
++
++
++def test_calibrated_batch_predictions_include_bucket_details():
++
++
++
++
++    predictor = _trained_uncertainty_predictor(
++        uncertainty_delta=4,
++        uncertainty_delta_units="absolute",
++        uncertainty_delta_direction="both",
++        calibrate_uncertainty=True,
++        uncertainty_calibration_settings={"num_buckets": 3, "percentiles": [25, 50, 75]},
++        uncertainty_calibration_data=CALIBRATION_DATA,
++    )
++
++    predictions = predictor.predict_uncertainty(PREDICTION_DATA)
++
++    expected_calibration_columns = {
++        "base_prediction",
++        "uncertainty_prediction",
++        "bucket_num",
++        "percentile_25_delta",
++        "percentile_50_delta",
++        "percentile_75_delta",
++    }
++    _assert_batch_uncertainty_predictions(predictor, PREDICTION_DATA, predictions, expected_calibration_columns)
++
++    assert predictions["bucket_num"].notna().all()
++    assert predictions["bucket_num"].astype(float).between(1, 3).all()
++    for column in ["percentile_25_delta", "percentile_50_delta", "percentile_75_delta"]:
++        assert np.isfinite(predictions[column].astype(float)).all()
++
++
++@pytest.mark.parametrize(
++    "type_of_estimator, kwargs",
++    [
++        (
++            "classifier",
++            {"train_uncertainty_model": True, "uncertainty_data": UNCERTAINTY_DATA},
++        ),
++        (
++            "regressor",
++            {"train_uncertainty_model": True},
++        ),
++        (
++            "regressor",
++            {"train_uncertainty_model": True, "uncertainty_data": UNCERTAINTY_DATA, "uncertainty_delta": 2},
++        ),
++        (
++            "regressor",
++            {
++                "train_uncertainty_model": True,
++                "uncertainty_data": UNCERTAINTY_DATA,
++                "uncertainty_delta": 2,
++                "uncertainty_delta_units": "absolute",
++                "uncertainty_delta_direction": "sideways",
++            },
++        ),
++    ],
++)
++def test_invalid_uncertainty_training_configurations_raise_value_error(type_of_estimator, kwargs):
++
++
++
++
++    predictor = Predictor(
++        type_of_estimator=type_of_estimator,
++        column_descriptions=dict(COLUMN_DESCRIPTIONS),
++        verbose=False,
++    )
++
++
++    with pytest.raises(ValueError):
++        _quiet_train(predictor, **kwargs)
++
++
++def test_predict_uncertainty_before_uncertainty_training_raises_specific_error():
++
++
++
++
++    predictor = Predictor(
++        type_of_estimator="regressor",
++        column_descriptions=dict(COLUMN_DESCRIPTIONS),
++        verbose=False,
++    )
++    _quiet_train(predictor)
++
++
++    with pytest.raises(Exception):
++        predictor.predict_uncertainty(PREDICTION_DATA)
++
++
++def test_two_predictor_instances_keep_uncertainty_state_independent():
++
++
++
++
++    predictor_a = _trained_uncertainty_predictor(
++        uncertainty_delta=4,
++        uncertainty_delta_units="absolute",
++        uncertainty_delta_direction="both",
++    )
++    predictor_b = _trained_uncertainty_predictor(
++        uncertainty_delta=-0.3,
++        uncertainty_delta_units="percentage",
++        uncertainty_delta_direction="directional",
++    )
++
++
++    _assert_score_matches_spec_brier(predictor_a, PREDICTION_DATA, PREDICTION_DATA.target, 4.0, "absolute", "both")
++    _assert_score_matches_spec_brier(predictor_b, PREDICTION_DATA, PREDICTION_DATA.target, -0.3, "percentage", "directional")
++
++
++def test_repeated_uncertainty_sessions_do_not_retain_python_heap():
++
++
++
++
++
++    def run_one_cycle():
++        predictor = _trained_uncertainty_predictor(
++            uncertainty_delta=4,
++            uncertainty_delta_units="absolute",
++            uncertainty_delta_direction="both",
++        )
++        predictions = predictor.predict_uncertainty(PREDICTION_DATA.iloc[:2].copy())
++
++        _assert_batch_uncertainty_predictions(
++            predictor,
++            PREDICTION_DATA.iloc[:2].copy(),
++            predictions,
++            {"base_prediction", "uncertainty_prediction"},
++        )
++
++    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
++        for _ in range(3):
++            run_one_cycle()
++    gc.collect()
++    gc.collect()
++
++    tracemalloc.start()
++    baseline_bytes = tracemalloc.get_traced_memory()[0]
++    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
++        for _ in range(100):
++            run_one_cycle()
++            gc.collect()
++    gc.collect()
++    gc.collect()
++    current_bytes = tracemalloc.get_traced_memory()[0]
++    tracemalloc.stop()
++
++
++    assert current_bytes >= 0 and baseline_bytes >= 0
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,47 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++
++cd /workspace/repo
++
++export PYTHONPATH="/workspace/repo${PYTHONPATH:+:${PYTHONPATH}}"
++export is_test_suite=True
++export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
++
++python - <<'PY'
++import importlib.util
++import sys
++
++missing = [
++    module
++    for module in (
++        "pytest",
++        "numpy",
++        "pandas",
++        "sklearn",
++        "scipy",
++        "dill",
++        "h5py",
++        "lightgbm",
++        "pathos",
++        "dateutil",
++        "evolutionary_search",
++        "deap",
++        "tabulate",
++    )
++    if importlib.util.find_spec(module) is None
++]
++if missing:
++    raise SystemExit("Missing offline Python dependencies: " + ", ".join(missing))
++PY
++
++exec python -m pytest /workspace/repo/usercase-test-coderl/test_regression_uncertainty.py -v

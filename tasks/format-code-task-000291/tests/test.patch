@@ -1,0 +1,260 @@
+diff --git a/usercase-test-coderl/usecase.sh b/usercase-test-coderl/usecase.sh
+new file mode 100755
+--- /dev/null
++++ b/usercase-test-coderl/usecase.sh
+@@ -0,0 +1,238 @@
++#!/usr/bin/env bash
++
++set -u
++export LANG=C.UTF-8 LC_ALL=C.UTF-8 TZ=UTC
++export PYTHONWARNINGS=ignore
++export PYTHONDONTWRITEBYTECODE=1
++export NO_COLOR=1
++
++REPO=/workspace/repo
++
++TMP=$(mktemp -d)
++trap 'rm -rf "$TMP"' EXIT
++fail() { echo "FAIL: $*" >&2; exit 1; }
++
++VENV=${TST_VENV:-/opt/coderl-wake-venv}
++
++if [ ! -x "$VENV/bin/python" ] && [ -x /opt/coderl-venv/bin/python ]; then
++    VENV=/opt/coderl-venv
++fi
++[ -x "$VENV/bin/python" ] || fail "missing preinstalled Python venv"
++[ -x "$VENV/bin/wake" ] || fail "missing preinstalled wake CLI"
++BIN="$VENV/bin/wake"
++
++assert_detection_status() {
++    local feature=$1
++    local ec=$2
++
++    if [ "$ec" -ne 0 ] && [ "$ec" -ne 3 ]; then
++        fail "$feature exit $ec; want successful detector run"
++    fi
++}
++
++assert_no_internal_error() {
++    local feature=$1
++    local err_file=$2
++
++    if grep -Eiq 'Traceback|Unhandled exception|Internal error' "$err_file"; then
++        fail "$feature unexpected internal error: $(cat "$err_file")"
++    fi
++}
++
++assert_json_summary() {
++    local json_file=$1
++    local expected=$2
++    [ -f "$json_file" ] || fail "missing JSON output $json_file"
++    "$VENV/bin/python" - "$json_file" "$expected" <<'PY' || exit 1
++import json
++import sys
++from collections import Counter
++
++path, expected = sys.argv[1], sys.argv[2]
++data = json.load(open(path))
++actual = []
++for item in data:
++    loc = item["detection"]["location"]
++    actual.append(
++        (
++            item["detector_name"],
++            item["detection"]["message"],
++            item["impact"],
++            item["confidence"],
++            loc["relative_path"],
++            loc["start_line"],
++            loc["start_col"],
++            loc["end_line"],
++            loc["end_col"],
++        )
++    )
++want = [tuple(row) for row in json.loads(expected)]
++if Counter(actual) != Counter(want):
++    print("JSON detections mismatch", file=sys.stderr)
++    print("actual =", json.dumps(actual, indent=2), file=sys.stderr)
++    print("want   =", json.dumps(want, indent=2), file=sys.stderr)
++    sys.exit(1)
++PY
++}
++
++cd "$TMP" || exit 1
++
++
++
++
++"$BIN" detect tx-origin --help >out 2>err
++ec=$?
++[ "$ec" -eq 0 ] || fail "F1 exit $ec; want 0"
++
++grep -Fq "Usage:" out && grep -Fq "wake detect tx-origin" out \
++    || fail "F1 missing usage line"
++grep -Fq "Possibly incorrect usage of tx.origin" out \
++    || fail "F1 missing command description"
++
++grep -Fq -- "--account-abstraction" out \
++    || fail "F1 missing positive account-abstraction option"
++grep -Fq -- "no-account-abstraction" out \
++    || fail "F1 missing negative account-abstraction option"
++
++grep -Fq "[default:" out && grep -Fq "account-abstraction]" out \
++    || fail "F1 missing enabled default"
++
++
++
++
++mkdir -p case-default/contracts
++cat >case-default/contracts/TxOriginCase.sol <<'SOL'
++
++pragma solidity ^0.8.20;
++
++contract TxOriginCase {
++    address owner;
++    mapping(address => uint256) lastSeen;
++
++    function directAssignment() external view returns (address) {
++        address caller = tx.origin;
++        return caller;
++    }
++
++    function equalityOwner() external view {
++        require(tx.origin == owner, "owner");
++    }
++
++    function greaterThanCaller(address caller) external view {
++        require(tx.origin > caller, "gt");
++    }
++
++    function mappingAssignment() external {
++        lastSeen[tx.origin] = block.number;
++    }
++
++    function safeSender() external view {
++        require(tx.origin == msg.sender, "sender");
++    }
++
++    function safeRateLimitLt() external view {
++        require(lastSeen[tx.origin] < block.timestamp, "lt");
++    }
++
++    function safeRateLimitGt() external view {
++        require(lastSeen[tx.origin] > block.timestamp, "gt");
++    }
++}
++SOL
++(
++    cd case-default &&
++    "$BIN" detect --no-exclude-known-contracts --export json --target-version 0.8.34 tx-origin contracts/TxOriginCase.sol >"$TMP/out" 2>"$TMP/err"
++)
++ec=$?
++assert_detection_status F2 "$ec"
++EXPECTED_F2='[
++["tx-origin","Unsafe usage of tx.origin","medium","low","contracts/TxOriginCase.sol",9,26,9,35],
++["tx-origin","Unsafe usage of tx.origin","medium","low","contracts/TxOriginCase.sol",14,17,14,26],
++["tx-origin","Unsafe usage of tx.origin","medium","low","contracts/TxOriginCase.sol",18,17,18,26],
++["tx-origin","Unsafe usage of tx.origin","medium","low","contracts/TxOriginCase.sol",22,18,22,27],
++["tx-origin","Use of tx.origin may interfere with ERC-4337 account abstraction","warning","low","contracts/TxOriginCase.sol",9,26,9,35],
++["tx-origin","Use of tx.origin may interfere with ERC-4337 account abstraction","warning","low","contracts/TxOriginCase.sol",14,17,14,26],
++["tx-origin","Use of tx.origin may interfere with ERC-4337 account abstraction","warning","low","contracts/TxOriginCase.sol",18,17,18,26],
++["tx-origin","Use of tx.origin may interfere with ERC-4337 account abstraction","warning","low","contracts/TxOriginCase.sol",22,18,22,27],
++["tx-origin","Use of tx.origin may interfere with ERC-4337 account abstraction","warning","low","contracts/TxOriginCase.sol",26,17,26,26],
++["tx-origin","Use of tx.origin may interfere with ERC-4337 account abstraction","warning","low","contracts/TxOriginCase.sol",30,26,30,35],
++["tx-origin","Use of tx.origin may interfere with ERC-4337 account abstraction","warning","low","contracts/TxOriginCase.sol",34,26,34,35]
++]'
++assert_json_summary "$TMP/case-default/.wake/detections.json" "$EXPECTED_F2"
++assert_no_internal_error F2 "$TMP/err"
++
++
++
++
++cp -R case-default case-no-aa
++(
++    cd case-no-aa &&
++    "$BIN" detect --no-exclude-known-contracts --export json --target-version 0.8.34 tx-origin --no-account-abstraction contracts/TxOriginCase.sol >"$TMP/out" 2>"$TMP/err"
++)
++ec=$?
++assert_detection_status F3 "$ec"
++EXPECTED_F3='[
++["tx-origin","Unsafe usage of tx.origin","medium","low","contracts/TxOriginCase.sol",9,26,9,35],
++["tx-origin","Unsafe usage of tx.origin","medium","low","contracts/TxOriginCase.sol",14,17,14,26],
++["tx-origin","Unsafe usage of tx.origin","medium","low","contracts/TxOriginCase.sol",18,17,18,26],
++["tx-origin","Unsafe usage of tx.origin","medium","low","contracts/TxOriginCase.sol",22,18,22,27]
++]'
++assert_json_summary "$TMP/case-no-aa/.wake/detections.json" "$EXPECTED_F3"
++assert_no_internal_error F3 "$TMP/err"
++
++
++
++
++mkdir -p case-safe/contracts
++cat >case-safe/contracts/SafeOnly.sol <<'SOL'
++
++pragma solidity ^0.8.20;
++
++contract SafeOnly {
++    mapping(address => uint256) lastSeen;
++
++    function safeSender() external view {
++        require(tx.origin == msg.sender, "sender");
++    }
++
++    function safeRateLimitLt() external view {
++        require(lastSeen[tx.origin] < block.timestamp, "lt");
++    }
++
++    function safeRateLimitGt() external view {
++        require(lastSeen[tx.origin] > block.timestamp, "gt");
++    }
++}
++SOL
++(
++    cd case-safe &&
++    "$BIN" detect --no-exclude-known-contracts --export json --target-version 0.8.34 tx-origin --no-account-abstraction contracts/SafeOnly.sol >"$TMP/out" 2>"$TMP/err"
++)
++ec=$?
++
++assert_detection_status F4 "$ec"
++[ "$(cat case-safe/.wake/detections.json)" = "[]" ] \
++    || fail "F4 detections: $(cat case-safe/.wake/detections.json)"
++assert_no_internal_error F4 "$TMP/err"
++
++
++
++
++cp -R case-safe case-aa-explicit
++(
++    cd case-aa-explicit &&
++    "$BIN" detect --no-exclude-known-contracts --export json --target-version 0.8.34 tx-origin --account-abstraction contracts/SafeOnly.sol >"$TMP/out" 2>"$TMP/err"
++)
++ec=$?
++
++assert_detection_status F5 "$ec"
++EXPECTED_F5='[
++["tx-origin","Use of tx.origin may interfere with ERC-4337 account abstraction","warning","low","contracts/SafeOnly.sol",8,17,8,26],
++["tx-origin","Use of tx.origin may interfere with ERC-4337 account abstraction","warning","low","contracts/SafeOnly.sol",12,26,12,35],
++["tx-origin","Use of tx.origin may interfere with ERC-4337 account abstraction","warning","low","contracts/SafeOnly.sol",16,26,16,35]
++]'
++assert_json_summary "$TMP/case-aa-explicit/.wake/detections.json" "$EXPECTED_F5"
++assert_no_internal_error F5 "$TMP/err"
++
++echo "PASS"
++exit 0
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,12 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++exec bash /workspace/repo/usercase-test-coderl/usecase.sh

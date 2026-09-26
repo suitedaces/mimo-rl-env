@@ -1,0 +1,270 @@
+diff --git a/nautobot/core/tests/test_config_overlays_codespec.py b/nautobot/core/tests/test_config_overlays_codespec.py
+new file mode 100644
+index 000000000..9c0f8f8b1
+--- /dev/null
++++ b/nautobot/core/tests/test_config_overlays_codespec.py
+@@ -0,0 +1,254 @@
++import json
++import os
++from pathlib import Path
++import subprocess
++import sys
++import tempfile
++import textwrap
++import unittest
++
++
++REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
++RESULT_PREFIX = "CODESPEC_OVERLAY_RESULT="
++
++PROBE = textwrap.dedent(
++    """
++    import json
++    import os
++    import sys
++
++    from nautobot.core.runner import runner
++
++
++    initializer_paths = {}
++
++
++    def initialize(configuration):
++        initializer_paths["config_path"] = configuration.get("config_path")
++        initializer_paths["config_paths"] = list(configuration.get("config_paths", ()))
++
++
++    def report(configuration):
++        settings = configuration["settings"]
++        result = {
++            "base_only": getattr(settings, "BASE_ONLY", None),
++            "shared": getattr(settings, "SHARED", None),
++            "installed_apps": list(getattr(settings, "INSTALLED_APPS", ())),
++            "settings_path": getattr(settings, "SETTINGS_PATH", None),
++            "settings_paths": list(getattr(settings, "SETTINGS_PATHS", ())),
++            "callback_config_path": configuration.get("config_path"),
++            "callback_config_paths": list(configuration.get("config_paths", ())),
++            "initializer_config_path": initializer_paths.get("config_path"),
++            "initializer_config_paths": initializer_paths.get("config_paths", []),
++        }
++        print("CODESPEC_OVERLAY_RESULT=" + json.dumps(result, sort_keys=True))
++
++
++    common = {
++        "project": "codespec-overlay-probe",
++        "default_config_path": os.environ["CODESPEC_DEFAULT_CONFIG"],
++        "default_settings": None,
++        "settings_envvar": "NAUTOBOT_CONFIG",
++        "config_module_name": "codespec_overlay_probe_config",
++        "initializer": initialize,
++        "on_configure": report,
++        "runner_name": "codespec-overlay-probe",
++    }
++
++    if os.environ["CODESPEC_PROBE_MODE"] == "cli":
++        runner.management.execute_from_command_line = lambda argv: None
++        sys.argv = ["codespec-overlay-probe", *json.loads(os.environ["CODESPEC_PROBE_ARGS"])]
++        runner.run_app(description="Configuration overlay probe", **common)
++    else:
++        runner.configure_app(config_path=json.loads(os.environ["CODESPEC_CONFIG_PATH"]), **common)
++    """
++)
++
++
++class ConfigurationOverlayCodeSpecTests(unittest.TestCase):
++    def setUp(self):
++        self.temporary_directory = tempfile.TemporaryDirectory()
++        self.addCleanup(self.temporary_directory.cleanup)
++        self.directory = Path(self.temporary_directory.name)
++
++    def write_config(self, name, source):
++        path = self.directory / name
++        path.write_text(textwrap.dedent(source), encoding="utf-8")
++        return path
++
++    def run_probe(self, *, arguments=None, config_path=None, environment_config=None):
++        environment = os.environ.copy()
++        environment.pop("DJANGO_SETTINGS_MODULE", None)
++        environment.pop("NAUTOBOT_CONFIG", None)
++        old_pythonpath = environment.get("PYTHONPATH")
++        environment["PYTHONPATH"] = str(REPOSITORY_ROOT)
++        if old_pythonpath:
++            environment["PYTHONPATH"] += os.pathsep + old_pythonpath
++        environment["CODESPEC_DEFAULT_CONFIG"] = str(self.directory / "default.py")
++        if arguments is not None:
++            environment["CODESPEC_PROBE_MODE"] = "cli"
++            environment["CODESPEC_PROBE_ARGS"] = json.dumps(arguments)
++        else:
++            environment["CODESPEC_PROBE_MODE"] = "configure"
++            environment["CODESPEC_CONFIG_PATH"] = json.dumps(config_path)
++        if environment_config is not None:
++            environment["NAUTOBOT_CONFIG"] = environment_config
++
++        return subprocess.run(
++            [sys.executable, "-c", PROBE],
++            cwd=self.directory,
++            env=environment,
++            text=True,
++            capture_output=True,
++            check=False,
++        )
++
++    def parse_result(self, completed_process):
++        self.assertEqual(
++            completed_process.returncode,
++            0,
++            msg=f"stdout:\n{completed_process.stdout}\nstderr:\n{completed_process.stderr}",
++        )
++        result_lines = [
++            line for line in completed_process.stdout.splitlines() if line.startswith(RESULT_PREFIX)
++        ]
++        self.assertEqual(len(result_lines), 1, msg=completed_process.stdout)
++        return json.loads(result_lines[0][len(RESULT_PREFIX) :])
++
++    def make_base_and_overlay(self):
++        marker = self.directory / "executions.log"
++        base = self.write_config(
++            "base.py",
++            f"""
++            from pathlib import Path
++            Path({str(marker)!r}).open("a", encoding="utf-8").write("base\\n")
++            INSTALLED_APPS = ("base.application",)
++            BASE_ONLY = "from-base"
++            SHARED = "base-value"
++            """,
++        )
++        overlay = self.write_config(
++            "overlay.py",
++            f"""
++            from pathlib import Path
++            Path({str(marker)!r}).open("a", encoding="utf-8").write("overlay\\n")
++            EXTRA_INSTALLED_APPS = ("overlay.application",)
++            SHARED = "overlay-value"
++            """,
++        )
++        return base, overlay, marker
++
++    def assert_layered_result(self, result, base, overlay):
++        expected_paths = [str(base.resolve()), str(overlay.resolve())]
++        self.assertEqual(result["base_only"], "from-base")
++        self.assertEqual(result["shared"], "overlay-value")
++        self.assertEqual(result["installed_apps"], ["base.application", "overlay.application"])
++        self.assertEqual(result["settings_paths"], expected_paths)
++        self.assertEqual(result["settings_path"], expected_paths[-1])
++        self.assertEqual(result["callback_config_paths"], expected_paths)
++        self.assertEqual(result["callback_config_path"], expected_paths[-1])
++        self.assertEqual(result["initializer_config_paths"], expected_paths)
++        self.assertEqual(result["initializer_config_path"], expected_paths[-1])
++
++    def test_repeated_cli_config_layers_in_order_and_executes_each_once(self):
++        base, overlay, marker = self.make_base_and_overlay()
++
++        completed = self.run_probe(
++            arguments=[f"--config={base.name}", "-c", f"./{overlay.name}", "check"]
++        )
++
++        self.assert_layered_result(self.parse_result(completed), base, overlay)
++        self.assertEqual(marker.read_text(encoding="utf-8").splitlines(), ["base", "overlay"])
++
++    def test_environment_path_list_ignores_empty_and_duplicate_entries(self):
++        base, overlay, marker = self.make_base_and_overlay()
++        environment_config = os.pathsep.join([base.name, "", f"./{overlay.name}", str(base.resolve())])
++
++        completed = self.run_probe(arguments=["check"], environment_config=environment_config)
++
++        self.assert_layered_result(self.parse_result(completed), base, overlay)
++        self.assertEqual(marker.read_text(encoding="utf-8").splitlines(), ["base", "overlay"])
++
++    def test_explicit_config_set_completely_overrides_environment_set(self):
++        poison = self.directory / "environment-must-not-be-read.py"
++        explicit = self.write_config(
++            "explicit.py",
++            """
++            INSTALLED_APPS = ()
++            BASE_ONLY = "explicit"
++            SHARED = "explicit-only"
++            """,
++        )
++
++        completed = self.run_probe(
++            arguments=["--config", explicit.name, "check"], environment_config=str(poison)
++        )
++        result = self.parse_result(completed)
++
++        self.assertEqual(result["base_only"], "explicit")
++        self.assertEqual(result["shared"], "explicit-only")
++        self.assertEqual(result["settings_paths"], [str(explicit.resolve())])
++        self.assertNotIn(str(poison), completed.stderr)
++
++    def test_default_config_remains_the_single_layer_when_no_override_is_given(self):
++        marker = self.directory / "default-executions.log"
++        default = self.write_config(
++            "default.py",
++            f"""
++            from pathlib import Path
++            Path({str(marker)!r}).open("a", encoding="utf-8").write("default\\n")
++            INSTALLED_APPS = ("default.application",)
++            BASE_ONLY = "default"
++            """,
++        )
++
++        result = self.parse_result(self.run_probe(arguments=["check"]))
++
++        self.assertEqual(result["base_only"], "default")
++        self.assertEqual(result["installed_apps"], ["default.application"])
++        self.assertEqual(result["settings_paths"], [str(default.resolve())])
++        self.assertEqual(result["settings_path"], str(default.resolve()))
++        self.assertEqual(marker.read_text(encoding="utf-8").splitlines(), ["default"])
++
++    def test_missing_layer_is_reported_before_any_layer_executes(self):
++        marker = self.directory / "must-stay-absent.log"
++        first = self.write_config(
++            "first.py",
++            f"""
++            from pathlib import Path
++            Path({str(marker)!r}).write_text("executed", encoding="utf-8")
++            INSTALLED_APPS = ()
++            """,
++        )
++        missing = self.directory / "missing.py"
++
++        completed = self.run_probe(
++            arguments=["--config", first.name, "--config", missing.name, "check"]
++        )
++
++        self.assertEqual(completed.returncode, 2, msg=completed.stdout + completed.stderr)
++        self.assertIn(str(missing.resolve()), completed.stderr)
++        self.assertFalse(marker.exists(), "an earlier configuration layer executed before validation completed")
++
++    def test_programmatic_configure_app_accepts_string_and_sequence(self):
++        single = self.write_config(
++            "single.py",
++            """
++            INSTALLED_APPS = ("single.application",)
++            BASE_ONLY = "single"
++            """,
++        )
++        single_result = self.parse_result(self.run_probe(config_path=single.name))
++        self.assertEqual(single_result["settings_paths"], [str(single.resolve())])
++        self.assertEqual(single_result["settings_path"], str(single.resolve()))
++
++        base, overlay, marker = self.make_base_and_overlay()
++        sequence_result = self.parse_result(
++            self.run_probe(config_path=[base.name, f"./{overlay.name}", str(base.resolve())])
++        )
++        self.assert_layered_result(sequence_result, base, overlay)
++        self.assertEqual(marker.read_text(encoding="utf-8").splitlines(), ["base", "overlay"])
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,5 @@
++#!/bin/bash
++set -euo pipefail
++
++
++python -m unittest -v nautobot.core.tests.test_config_overlays_codespec

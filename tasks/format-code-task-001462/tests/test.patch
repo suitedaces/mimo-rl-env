@@ -1,0 +1,483 @@
+diff --git a/usercase-test-coderl/test_option_factories.py b/usercase-test-coderl/test_option_factories.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/test_option_factories.py
+@@ -0,0 +1,456 @@
++import builtins
++import copy
++import json
++import os
++import socket
++import subprocess
++import sys
++
++import pytest
++
++from jmcomic import (
++    JmModuleConfig,
++    JmOption,
++    JmcomicException,
++    PrettyFormatter,
++    create_option,
++    create_option_by_env,
++    create_option_by_file,
++    create_option_by_str,
++    jm_logger,
++)
++
++
++
++
++
++
++class ImageStub:
++    def __init__(self, suffix=".jpg", is_gif=False):
++        self.img_file_suffix = suffix
++        self.is_gif = is_gif
++
++
++def option_snapshot(option):
++    data = option.deconstruct()
++    metadata = data["client"]["postman"]["meta_data"]
++    return {
++        "version": data["version"],
++        "log": data["log"],
++        "dir_rule": data["dir_rule"],
++        "download": data["download"],
++        "client": {
++            "cache": data["client"]["cache"],
++            "domain": data["client"]["domain"],
++            "postman_type": data["client"]["postman"]["type"],
++            "postman_headers": metadata["headers"],
++            "postman_proxies": metadata["proxies"],
++            "impl": data["client"]["impl"],
++            "async_impl": data["client"]["async_impl"],
++            "retry_times": data["client"]["retry_times"],
++        },
++        "plugins": data["plugins"],
++        "filepath": option.filepath,
++    }
++
++
++def assert_common_default_behavior(
++    option,
++    base_dir,
++    *,
++    filepath=None,
++    retry_times=None,
++    download_cache=True,
++):
++    data = option.deconstruct()
++    expected_defaults = JmModuleConfig.option_default_dict()
++    if retry_times is None:
++        retry_times = expected_defaults["client"]["retry_times"]
++
++
++    assert isinstance(option, JmOption)
++    assert data["dir_rule"]["base_dir"] == str(base_dir)
++    assert option.client.impl == expected_defaults["client"]["impl"]
++    assert option.client.retry_times == retry_times
++    assert option.download.image.decode is True
++    assert option.download.cache is download_cache
++    assert option.plugins.valid == expected_defaults["plugins"]["valid"]
++    assert option.filepath == filepath
++
++
++@pytest.fixture(autouse=True)
++def restore_module_state(monkeypatch):
++    original_log_flag = JmModuleConfig.FLAG_ENABLE_JM_LOG
++    original_executor_log = JmModuleConfig.EXECUTOR_LOG
++    original_handlers = list(jm_logger.handlers)
++    original_level = jm_logger.level
++    original_proxies = JmModuleConfig.DEFAULT_PROXIES
++    monkeypatch.setattr(JmModuleConfig, "DEFAULT_PROXIES", {})
++    monkeypatch.setattr(JmModuleConfig, "EXECUTOR_LOG", lambda *args, **kwargs: None)
++    yield
++    JmModuleConfig.FLAG_ENABLE_JM_LOG = original_log_flag
++    JmModuleConfig.EXECUTOR_LOG = original_executor_log
++    JmModuleConfig.DEFAULT_PROXIES = original_proxies
++    jm_logger.handlers[:] = original_handlers
++    jm_logger.setLevel(original_level)
++
++
++def test_default_option_populates_module_defaults(tmp_path, monkeypatch):
++
++
++
++    monkeypatch.chdir(tmp_path)
++    monkeypatch.setattr(os, "cpu_count", lambda: 8)
++
++    option = JmOption.default()
++
++    assert_common_default_behavior(option, tmp_path)
++
++
++def test_create_option_by_str_yaml_deep_merges_suffix(tmp_path, monkeypatch):
++
++
++
++    monkeypatch.chdir(tmp_path)
++    monkeypatch.setattr(os, "cpu_count", lambda: 8)
++
++    option = create_option_by_str("download:\n  image:\n    suffix: .webp\n", mode=None)
++
++
++    assert_common_default_behavior(option, tmp_path)
++    assert option.download.image.suffix == ".webp"
++    assert option.decide_image_suffix(ImageStub(".jpg")) == ".webp"
++
++
++def test_create_option_by_file_preserves_filepath_and_to_file_target(tmp_path, monkeypatch):
++
++
++
++    monkeypatch.chdir(tmp_path)
++    monkeypatch.setattr(os, "cpu_count", lambda: 8)
++    option_path = tmp_path / "option.yml"
++    option_path.write_text("download:\n  image:\n    suffix: .webp\n", encoding="utf-8")
++
++    option = create_option_by_file(str(option_path))
++
++
++    assert_common_default_behavior(option, tmp_path, filepath=str(option_path))
++    assert option.download.image.suffix == ".webp"
++
++    option.to_file()
++    reloaded = create_option_by_file(str(option_path))
++    assert reloaded.filepath == str(option_path)
++    assert reloaded.download.image.suffix == ".webp"
++
++    assert reloaded.client.retry_times == JmModuleConfig.option_default_dict()["client"]["retry_times"]
++
++
++def test_create_option_alias_matches_file_factory(tmp_path, monkeypatch):
++
++
++
++    monkeypatch.chdir(tmp_path)
++    monkeypatch.setattr(os, "cpu_count", lambda: 8)
++    option_path = tmp_path / "alias.yml"
++    option_path.write_text("client:\n  retry_times: 2\n", encoding="utf-8")
++
++    option = create_option(str(option_path))
++
++
++    assert_common_default_behavior(option, tmp_path, filepath=str(option_path), retry_times=2)
++
++
++def test_create_option_by_env_loads_named_variable(tmp_path, monkeypatch):
++
++
++
++    monkeypatch.chdir(tmp_path)
++    monkeypatch.setattr(os, "cpu_count", lambda: 8)
++    option_path = tmp_path / "env.yml"
++    option_path.write_text("download:\n  cache: false\n", encoding="utf-8")
++    monkeypatch.setenv("MY_JM_OPTION", str(option_path))
++
++    option = create_option_by_env("MY_JM_OPTION")
++
++
++    assert_common_default_behavior(option, tmp_path, filepath=str(option_path), download_cache=False)
++
++
++def test_create_option_by_env_unset_raises_validation_exception(monkeypatch):
++
++
++
++    monkeypatch.delenv("MISSING_JM_OPTION", raising=False)
++
++    with pytest.raises(JmcomicException) as excinfo:
++        create_option_by_env("MISSING_JM_OPTION")
++
++
++    assert "MISSING_JM_OPTION" in str(excinfo.value)
++
++
++def test_create_option_by_env_empty_raises_validation_exception(monkeypatch):
++
++
++
++    monkeypatch.setenv("EMPTY_JM_OPTION", "")
++
++    with pytest.raises(JmcomicException) as excinfo:
++        create_option_by_env("EMPTY_JM_OPTION")
++
++
++    assert "EMPTY_JM_OPTION" in str(excinfo.value)
++
++
++def test_construct_partial_dict_deep_merges_defaults(tmp_path, monkeypatch):
++
++
++
++    monkeypatch.chdir(tmp_path)
++    monkeypatch.setattr(os, "cpu_count", lambda: 8)
++
++    option = JmOption.construct({"download": {"threading": {"image": 7}}, "client": {"retry_times": 2}})
++
++
++    assert_common_default_behavior(option, tmp_path, retry_times=2)
++    assert option.download.threading.image == 7
++    assert option.download.threading.photo == JmModuleConfig.option_default_dict()["download"]["threading"]["photo"]
++    assert option.client.retry_times == 2
++
++
++def test_construct_does_not_mutate_partial_input(tmp_path, monkeypatch):
++    monkeypatch.chdir(tmp_path)
++    monkeypatch.setattr(os, "cpu_count", lambda: 8)
++    config = {"download": {"threading": {"image": 7}}, "client": {"retry_times": 2}}
++    before = copy.deepcopy(config)
++
++    JmOption.construct(config)
++
++    assert config == before == {
++        "download": {"threading": {"image": 7}},
++        "client": {"retry_times": 2},
++    }
++
++
++def test_construct_partial_does_not_mutate_unrelated_default_branches(tmp_path, monkeypatch):
++
++
++
++    monkeypatch.chdir(tmp_path)
++    monkeypatch.setattr(os, "cpu_count", lambda: 8)
++
++    JmOption.construct({"download": {"image": {"suffix": ".webp"}}, "client": {"retry_times": 2}})
++
++
++    default_option = JmOption.default()
++    assert_common_default_behavior(default_option, tmp_path)
++    assert default_option.download.image.suffix is None
++    assert default_option.client.retry_times == JmModuleConfig.option_default_dict()["client"]["retry_times"]
++
++
++def test_construct_log_false_disables_normal_logging(tmp_path, monkeypatch):
++
++
++
++    monkeypatch.chdir(tmp_path)
++    monkeypatch.setattr(os, "cpu_count", lambda: 8)
++
++    option = JmOption.construct({"log": False})
++
++    assert option.deconstruct()["log"] is False
++    assert JmModuleConfig.FLAG_ENABLE_JM_LOG is False
++
++
++def test_construct_log_pretty_enables_pretty_logging(tmp_path, monkeypatch):
++
++
++
++    monkeypatch.chdir(tmp_path)
++    monkeypatch.setattr(os, "cpu_count", lambda: 8)
++
++    option = JmOption.construct({"log": "pretty"})
++
++    assert option.deconstruct()["log"] is True
++    assert JmModuleConfig.FLAG_ENABLE_JM_LOG is True
++
++    assert any(isinstance(handler.formatter, PrettyFormatter) for handler in jm_logger.handlers)
++
++
++def test_construct_migrates_old_threading_plugin_and_zip_levels(tmp_path, monkeypatch):
++
++
++
++    monkeypatch.chdir(tmp_path)
++    monkeypatch.setattr(os, "cpu_count", lambda: 8)
++    old_config = {
++        "download": {"threading": {"batch_count": 4}},
++        "plugin": {
++            "after_album": [
++                {"plugin": "zip", "kwargs": {"level": "photo", "filename_rule": "Ptitle"}}
++            ],
++            "after_photo": [
++                {"plugin": "zip", "kwargs": {"level": "album", "filename_rule": "Atitle"}}
++            ],
++        },
++    }
++
++    option = JmOption.construct(old_config)
++
++
++    assert option.download.threading.image == 4
++    assert option.download.threading.photo == JmModuleConfig.option_default_dict()["download"]["threading"]["photo"]
++    after_album = option.plugins.src_dict["after_album"]
++    after_photo = option.plugins.src_dict["after_photo"]
++
++
++    assert any(p.get("plugin") == "zip" and p.get("kwargs", {}).get("filename_rule") == "Atitle" for p in after_album)
++    assert any(p.get("plugin") == "zip" and p.get("kwargs", {}).get("filename_rule") == "Ptitle" for p in after_photo)
++
++
++def test_construct_without_defaults_uses_complete_dictionary_directly(monkeypatch):
++
++
++
++    complete = {
++        "dir_rule": {"rule": "Bd", "base_dir": "/complete/base", "normalize_zh": None},
++        "download": {
++            "cache": False,
++            "image": {"decode": False, "suffix": ".png"},
++            "threading": {"image": 1, "photo": 2},
++        },
++        "client": {
++            "cache": False,
++            "domain": ["example.test"],
++            "postman": {
++                "type": "requests",
++                "meta_data": {
++                    "impersonate": None,
++                    "headers": {"X-Test": "1"},
++                    "proxies": {"http": "http://proxy"},
++                },
++            },
++            "impl": "html",
++            "async_impl": "async_api",
++            "retry_times": 1,
++        },
++        "plugins": {"valid": "raise"},
++        "filepath": "/complete/option.yml",
++    }
++
++    option = JmOption.construct(complete, cover_default=False)
++
++
++    assert isinstance(option, JmOption)
++    assert option.dir_rule.rule_dsl == "Bd"
++    assert option.dir_rule.base_dir == "/complete/base"
++    assert option.download.cache is False
++    assert option.download.image.decode is False
++    assert option.download.image.suffix == ".png"
++    assert option.download.threading.src_dict == {"image": 1, "photo": 2}
++    assert option.client.cache is False
++    assert option.client.domain == ["example.test"]
++    assert option.client.postman.type == "requests"
++    assert option.client.postman.meta_data.headers["X-Test"] == "1"
++    assert option.client.postman.meta_data.proxies["http"] == "http://proxy"
++    assert option.client.impl == "html"
++    assert option.client.retry_times == 1
++    assert option.plugins.valid == "raise"
++    assert option.filepath == "/complete/option.yml"
++
++
++def test_create_option_by_str_is_referentially_transparent(tmp_path, monkeypatch):
++    monkeypatch.chdir(tmp_path)
++    monkeypatch.setattr(os, "cpu_count", lambda: 8)
++    text = "download:\n  image:\n    suffix: .webp\n"
++
++    first = create_option_by_str(text)
++    second = create_option_by_str(text)
++
++
++    assert_common_default_behavior(first, tmp_path)
++    assert_common_default_behavior(second, tmp_path)
++    assert first.download.image.suffix == ".webp"
++    assert second.download.image.suffix == ".webp"
++
++
++def test_create_option_by_str_has_no_cross_process_global_state(tmp_path, monkeypatch):
++    monkeypatch.chdir(tmp_path)
++    monkeypatch.setattr(os, "cpu_count", lambda: 8)
++    text = "download:\n  image:\n    suffix: .webp\n"
++    in_process = option_snapshot(create_option_by_str(text))
++    script = r'''
++import json
++import os
++import sys
++from unittest.mock import patch
++sys.path.insert(0, "/workspace/repo")
++sys.path.insert(0, "/workspace/repo/src")
++from jmcomic import JmModuleConfig, create_option_by_str
++JmModuleConfig.DEFAULT_PROXIES = {}
++os.chdir(sys.argv[1])
++def option_snapshot(option):
++    data = option.deconstruct()
++    metadata = data["client"]["postman"]["meta_data"]
++    return {
++        "version": data["version"],
++        "log": data["log"],
++        "dir_rule": data["dir_rule"],
++        "download": data["download"],
++        "client": {
++            "cache": data["client"]["cache"],
++            "domain": data["client"]["domain"],
++            "postman_type": data["client"]["postman"]["type"],
++            "postman_headers": metadata["headers"],
++            "postman_proxies": metadata["proxies"],
++            "impl": data["client"]["impl"],
++            "async_impl": data["client"]["async_impl"],
++            "retry_times": data["client"]["retry_times"],
++        },
++        "plugins": data["plugins"],
++        "filepath": option.filepath,
++    }
++with patch("os.cpu_count", return_value=8):
++    result = option_snapshot(create_option_by_str("download:\n  image:\n    suffix: .webp\n"))
++sys.stdout.write(json.dumps(result, sort_keys=True))
++'''
++
++    completed = subprocess.run(
++        [sys.executable, "-c", script, str(tmp_path)],
++        check=True,
++        stdout=subprocess.PIPE,
++        stderr=subprocess.PIPE,
++        text=True,
++    )
++    fresh_process = json.loads(completed.stdout)
++
++
++    assert in_process["download"]["image"]["suffix"] == ".webp"
++    assert fresh_process["download"]["image"]["suffix"] == ".webp"
++    assert fresh_process["download"]["cache"] is True
++    assert fresh_process["client"]["retry_times"] == JmModuleConfig.option_default_dict()["client"]["retry_times"]
++
++
++def test_create_option_by_str_has_no_undeclared_file_or_network_side_effects(tmp_path, monkeypatch):
++    monkeypatch.chdir(tmp_path)
++    monkeypatch.setattr(os, "cpu_count", lambda: 8)
++
++    def blocked_socket(*args, **kwargs):
++        raise AssertionError("network access is not declared for create_option_by_str")
++
++    real_open = builtins.open
++
++    def watched_open(file, mode="r", *args, **kwargs):
++        if any(flag in mode for flag in ("w", "a", "x", "+")):
++            raise AssertionError(f"file write is not declared for create_option_by_str: {file}")
++        return real_open(file, mode, *args, **kwargs)
++
++    monkeypatch.setattr(socket, "socket", blocked_socket)
++    monkeypatch.setattr(builtins, "open", watched_open)
++    before = sorted(path.relative_to(tmp_path).as_posix() for path in tmp_path.rglob("*"))
++
++    option = create_option_by_str("download:\n  image:\n    suffix: .webp\n")
++
++    after = sorted(path.relative_to(tmp_path).as_posix() for path in tmp_path.rglob("*"))
++    assert before == []
++    assert after == []
++    assert option.download.image.suffix == ".webp"
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,17 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++cd /workspace/repo
++VENV=/opt/coderl-stage4a-venv
++export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
++export PYTHONNOUSERSITE=1
++exec "$VENV/bin/python" -m pytest /workspace/repo/usercase-test-coderl/test_option_factories.py -v

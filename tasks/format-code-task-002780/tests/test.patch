@@ -1,0 +1,222 @@
+diff --git a/test/unit/create_app/index.ts b/test/unit/create_app/index.ts
+new file mode 100644
+index 0000000..43352b4
+--- /dev/null
++++ b/test/unit/create_app/index.ts
+@@ -0,0 +1,194 @@
++import * as fs from 'fs';
++import * as path from 'path';
++import * as assert from 'assert';
++import * as svelte from 'svelte/compiler';
++import { create_main_manifests } from '../../../src/core/create_manifests';
++
++
++
++
++require.extensions['.svelte'] = function (module: any, filename: string) {
++	const src = fs.readFileSync(filename, 'utf-8');
++	const { js } = svelte.compile(src, { generate: 'ssr', format: 'cjs', filename });
++	module._compile(js.code, filename);
++};
++
++const tmp_root = path.join(__dirname, '.tmp');
++
++let counter = 0;
++
++function setup(max_depth: number) {
++	const dir = path.join(tmp_root, `app-${process.pid}-${counter++}`);
++	const routes = path.join(dir, 'routes');
++	const output = path.join(dir, '__sapper__');
++	const internal = path.join(output, 'internal');
++
++	fs.mkdirSync(routes, { recursive: true });
++	fs.mkdirSync(internal, { recursive: true });
++
++
++	fs.writeFileSync(path.join(internal, 'shared.js'), 'exports.CONTEXT_KEY = {};');
++
++
++	fs.writeFileSync(path.join(routes, '_layout.svelte'),
++		`<script>export let segment; export let foo = '';</script>` +
++		`<div class="layout" data-seg="{segment}" data-foo="{foo}"><slot></slot></div>`);
++
++
++	fs.writeFileSync(path.join(routes, '_error.svelte'),
++		`<script>export let error; export let status;</script>` +
++		`<div class="error" data-status="{status}">{error.message}</div>`);
++
++	const components = [];
++	const parts = [];
++	for (let i = 0; i < max_depth; i += 1) {
++		const name = `c${i}`;
++		components.push({ name, file: `${name}.svelte`, has_preload: false });
++		parts.push({ component: components[i], params: [] });
++	}
++
++	const manifest_data: any = {
++		root: { name: 'root', file: '_layout.svelte', has_preload: false },
++		error: { name: 'error', file: '_error.svelte', has_preload: false },
++		components,
++		pages: [{ pattern: /^\/?$/, parts }],
++		server_routes: []
++	};
++
++	create_main_manifests({
++		bundler: 'rollup',
++		manifest_data,
++		dev: false,
++		cwd: dir,
++		src: routes,
++		dest: output,
++		routes,
++		output
++	});
++
++	return { dir, routes, internal };
++}
++
++
++
++function find_generated_component(internal: string) {
++	const svelte_files = fs.readdirSync(internal).filter(f => f.endsWith('.svelte'));
++	assert.equal(svelte_files.length, 1, `expected exactly one generated .svelte component, found: ${svelte_files.join(', ')}`);
++	return path.join(internal, svelte_files[0]);
++}
++
++
++function layout_component(routes: string, name: string) {
++	const file = path.join(routes, `${name}.svelte`);
++	fs.writeFileSync(file,
++		`<script>export let segment = ''; export let label = '';</script>` +
++		`<div class="${name}" data-seg="{segment}" data-label="{label}"><slot></slot></div>`);
++	return require(file).default;
++}
++
++
++function leaf_component(routes: string, name: string) {
++	const file = path.join(routes, `${name}.svelte`);
++	fs.writeFileSync(file,
++		`<script>export let label = '';</script>` +
++		`<div class="${name}" data-label="{label}">LEAF</div>`);
++	return require(file).default;
++}
++
++function normalize(html: string) {
++	return html.replace(/>\s+</g, '><').replace(/\s+/g, ' ').trim();
++}
++
++describe('create_app', () => {
++	after(() => {
++		try { fs.rmSync(tmp_root, { recursive: true, force: true }); } catch (e) {}
++	});
++
++	it('writes a generated root component into the internal directory', () => {
++		const { internal } = setup(1);
++		assert.ok(fs.existsSync(find_generated_component(internal)));
++	});
++
++	it('renders the root layout wrapping the nested page chain', () => {
++		const { routes, internal } = setup(2);
++		const App = require(find_generated_component(internal)).default;
++
++		const inner = layout_component(routes, 'inner');
++		const leaf = leaf_component(routes, 'leaf');
++
++		const { html } = App.render({
++			session: { subscribe() { return () => {}; } },
++			error: null,
++			status: 200,
++			segments: ['top', 'mid', 'end'],
++			level0: { props: { foo: 'rootprop' } },
++			level1: { component: inner, props: { label: 'L1' }, segment: 'mid' },
++			level2: { component: leaf, props: { label: 'L2' }, segment: 'end' }
++		});
++
++		const out = normalize(html);
++
++
++		assert.ok(/^<div class="layout" data-seg="top" data-foo="rootprop">/.test(out), out);
++
++		assert.ok(out.indexOf('<div class="inner" data-seg="mid" data-label="L1">') !== -1, out);
++
++		assert.ok(out.indexOf('<div class="leaf" data-label="L2">LEAF</div>') !== -1, out);
++
++
++		const i_layout = out.indexOf('class="layout"');
++		const i_inner = out.indexOf('class="inner"');
++		const i_leaf = out.indexOf('class="leaf"');
++		assert.ok(i_layout < i_inner && i_inner < i_leaf, `bad nesting order: ${out}`);
++
++		assert.ok(out.indexOf('</div></div></div>') !== -1, out);
++	});
++
++	it('renders the error component instead of the page chain when error is set', () => {
++		const { routes, internal } = setup(2);
++		const App = require(find_generated_component(internal)).default;
++
++		const inner = layout_component(routes, 'should_not_appear');
++
++		const { html } = App.render({
++			session: { subscribe() { return () => {}; } },
++			error: new Error('it broke'),
++			status: 500,
++			segments: ['top'],
++			level0: { props: { foo: 'rootprop' } },
++			level1: null,
++			level2: null
++		});
++
++		const out = normalize(html);
++
++
++		assert.ok(/^<div class="layout" data-seg="top" data-foo="rootprop">/.test(out), out);
++
++		assert.ok(out.indexOf('<div class="error" data-status="500">it broke</div>') !== -1, out);
++
++		assert.ok(out.indexOf('should_not_appear') === -1, out);
++	});
++
++	it('renders only the levels that are provided (shallower route in a deeper app)', () => {
++		const { routes, internal } = setup(2);
++		const App = require(find_generated_component(internal)).default;
++
++		const leaf = leaf_component(routes, 'onlyleaf');
++
++		const { html } = App.render({
++			session: { subscribe() { return () => {}; } },
++			error: null,
++			status: 200,
++			segments: ['top', 'mid'],
++			level0: { props: { foo: 'rootprop' } },
++			level1: { component: leaf, props: { label: 'solo' }, segment: 'mid' },
++			level2: null
++		});
++
++		const out = normalize(html);
++
++		assert.ok(/^<div class="layout" data-seg="top" data-foo="rootprop">/.test(out), out);
++		assert.ok(out.indexOf('<div class="onlyleaf" data-label="solo">LEAF</div>') !== -1, out);
++	});
++});
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,17 @@
++#!/usr/bin/env bash
++
++
++
++set -euo pipefail
++HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++cd /testbed
++
++
++
++MOCHA="node_modules/.bin/mocha --require sucrase/register"
++
++
++$MOCHA test/unit/clean_html/index.ts
++
++
++$MOCHA test/unit/create_app/index.ts

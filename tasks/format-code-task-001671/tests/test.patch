@@ -1,0 +1,265 @@
+diff --git a/usercase-test-coderl/test_slugs.py b/usercase-test-coderl/test_slugs.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/test_slugs.py
+@@ -0,0 +1,228 @@
++
++
++
++
++
++
++import copy
++import hashlib
++import json
++import os
++import re
++import socket
++import subprocess
++import sys
++
++import pytest
++
++from kubespawner.slugs import is_valid_label, multi_slug, safe_slug
++
++
++_HASH_SUFFIX_RE = re.compile(r"[0-9a-f]{8}")
++_SAFE_COMPONENT_RE = re.compile(r"[a-z][a-z0-9-]*[a-z0-9]|[a-z]")
++
++
++def _sha8(value):
++    return hashlib.sha256(value.encode("utf8")).hexdigest()[:8]
++
++
++def _assert_safe_slug_with_hash(result, original, max_length=32):
++    prefix, delimiter, hash_suffix = result.rpartition("---")
++    assert delimiter == "---"
++    assert hash_suffix == _sha8(original)
++    assert _SAFE_COMPONENT_RE.fullmatch(prefix)
++    assert "--" not in prefix
++    assert len(result) <= max_length
++
++
++def _multi_hash_suffix(result):
++    prefix, delimiter, hash_suffix = result.rpartition("---")
++    assert delimiter == "---"
++    assert _HASH_SUFFIX_RE.fullmatch(hash_suffix)
++    return prefix, hash_suffix
++
++
++def _assert_multi_slug_shape(result, component_count, max_length):
++    prefix, _hash_suffix = _multi_hash_suffix(result)
++    components = prefix.split("--")
++    assert len(components) == component_count
++    assert all(_SAFE_COMPONENT_RE.fullmatch(component) for component in components)
++    assert all("--" not in component for component in components)
++    assert len(result) <= max_length
++
++
++def test_safe_slug_returns_already_valid_default_name_unchanged():
++
++
++
++    assert safe_slug("jupyter-alex") == "jupyter-alex"
++
++
++def test_safe_slug_hashes_case_invalid_default_name():
++
++
++
++    assert safe_slug("jupyter-Alex") == "jupyter-alex---3a1c285c"
++
++
++def test_safe_slug_replaces_punctuation_with_hyphen():
++
++
++
++    assert safe_slug("user@email.com") == "user-email-com---0925f997"
++
++
++def test_safe_slug_hashes_double_hyphen_to_avoid_joined_slug_collision():
++
++
++
++    assert safe_slug("username--servername") == "username-servername---d957f1de"
++
++
++def test_safe_slug_respects_shorter_max_length_by_truncating_prefix():
++
++
++
++    assert safe_slug("x" * 17, max_length=16) == "xxxxx---d04fd59f"
++
++
++def test_safe_slug_keeps_valid_name_at_exact_length_limit():
++
++
++
++    assert safe_slug("x" * 16, max_length=16) == "xxxxxxxxxxxxxxxx"
++
++
++def test_safe_slug_prefixes_sanitized_name_that_would_start_with_digit():
++
++
++
++    result = safe_slug("9user")
++
++    _assert_safe_slug_with_hash(result, "9user")
++
++
++def test_safe_slug_uses_nonempty_fallback_for_all_unsafe_characters():
++
++
++
++    result = safe_slug("@@@")
++
++    _assert_safe_slug_with_hash(result, "@@@")
++
++
++def test_safe_slug_raises_value_error_for_impossible_length():
++
++
++
++
++    with pytest.raises(ValueError):
++        safe_slug("x" * 16, max_length=11)
++
++
++def test_safe_slug_accepts_label_validator_specific_valid_name():
++
++
++
++    assert safe_slug("AbC", is_valid=is_valid_label) == "AbC"
++
++
++def test_safe_slug_hashes_label_validator_invalid_punctuation():
++
++
++
++    assert safe_slug("a@b.c", is_valid=is_valid_label) == "a-b-c---d648b243"
++
++
++def test_multi_slug_combines_two_components_with_single_hash():
++
++
++
++    assert multi_slug(["user", "server"]) == "user--server---ff173834"
++
++
++def test_multi_slug_sanitizes_each_component_and_hashes_original_components():
++
++
++
++    names = ["User.Name", "server--One", "Ωmega"]
++    result = multi_slug(names, max_length=40)
++
++    _assert_multi_slug_shape(result, component_count=3, max_length=40)
++    assert result == multi_slug(names, max_length=40)
++    assert _multi_hash_suffix(multi_slug(["A", "b"]))[1] != _multi_hash_suffix(
++        multi_slug(["a", "b"])
++    )[1]
++    assert _multi_hash_suffix(multi_slug(["ab", "c"]))[1] != _multi_hash_suffix(
++        multi_slug(["a", "bc"])
++    )[1]
++
++
++def test_multi_slug_truncates_components_to_fit_requested_length():
++
++
++
++    result = multi_slug(["averylongusername", "anotherlongservername"], max_length=30)
++
++    _assert_multi_slug_shape(result, component_count=2, max_length=30)
++
++
++def test_multi_slug_raises_value_error_when_components_cannot_fit():
++
++
++
++
++    with pytest.raises(ValueError):
++        multi_slug(["a", "b", "c", "d"], max_length=16)
++
++
++def test_slug_generation_is_referentially_transparent_for_same_inputs():
++    assert safe_slug("jupyter-Alex") == safe_slug("jupyter-Alex")
++    assert multi_slug(["user", "server"]) == multi_slug(["user", "server"])
++
++
++def test_multi_slug_does_not_mutate_input_list():
++    names = ["User.Name", "server--One", "Ωmega"]
++    before = copy.deepcopy(names)
++
++    _assert_multi_slug_shape(multi_slug(names, max_length=40), component_count=3, max_length=40)
++    assert names == before
++
++
++def test_slug_generation_has_no_hidden_process_local_state():
++    in_process = {
++        "safe": safe_slug("a@b.c", is_valid=is_valid_label),
++        "multi": multi_slug(["user", "server"]),
++    }
++    script = """
++import json
++import sys
++sys.path.insert(0, "/workspace/repo")
++from kubespawner.slugs import is_valid_label, multi_slug, safe_slug
++sys.stdout.write(json.dumps({
++    "safe": safe_slug("a@b.c", is_valid=is_valid_label),
++    "multi": multi_slug(["user", "server"]),
++}, sort_keys=True))
++"""
++    completed = subprocess.run(
++        [sys.executable, "-c", script],
++        check=True,
++        stdout=subprocess.PIPE,
++        stderr=subprocess.PIPE,
++        text=True,
++    )
++    assert json.loads(completed.stdout) == in_process
++
++
++def test_slug_generation_does_not_use_filesystem_or_network(tmp_path, monkeypatch):
++    def blocked_socket(*args, **kwargs):
++        raise AssertionError("slug generation must not use the network")
++
++    monkeypatch.chdir(tmp_path)
++    monkeypatch.setattr(socket, "socket", blocked_socket)
++    before = sorted(os.listdir(tmp_path))
++
++    assert safe_slug("user@email.com") == "user-email-com---0925f997"
++    assert multi_slug(["user", "server"]) == "user--server---ff173834"
++
++    assert sorted(os.listdir(tmp_path)) == before
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,27 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++
++cd /workspace/repo
++
++VENV=/opt/coderl-stage4a-venv
++PYTHON="$VENV/bin/python"
++
++export PIP_NO_INDEX=1
++export PIP_DISABLE_PIP_VERSION_CHECK=1
++
++if [ ! -x "$PYTHON" ]; then
++  echo "local offline venv missing: $PYTHON" >&2
++  exit 1
++fi
++
++exec "$PYTHON" -m pytest /workspace/repo/usercase-test-coderl/test_slugs.py -v

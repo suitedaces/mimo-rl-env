@@ -1,0 +1,5 @@
+I want a `loadavg(prog: Program) -> tuple[float, float, float]` helper for Linux kernel programs. It should be importable as `from drgn.helpers.linux.sched import loadavg`, and also from the top-level Linux helper package as `from drgn.helpers.linux import loadavg`. Users should be able to call it with an explicit `Program`, or call `loadavg()` to use the current default program.
+
+The helper should read the kernel `avenrun` array and return the 1, 5, and 15 minute load averages as three Python floats, converting each kernel fixed-point value by dividing by `1 << 11`. For example, if the raw `avenrun` values are `[0, 0, 0]`, `loadavg(prog)` should return `(0.0, 0.0, 0.0)`. If the raw values are `[2048, 1024, 512]`, it should return `(1.0, 0.5, 0.25)`.
+
+Calling it repeatedly for the same unchanged `Program` should return the same tuple values and should not mutate the `Program`, the `avenrun` objects, the filesystem, the network, or module-level global state. If the program cannot resolve `avenrun`, the helper should propagate the normal drgn lookup failure instead of inventing fallback load averages.

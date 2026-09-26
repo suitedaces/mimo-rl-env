@@ -1,0 +1,320 @@
+diff --git a/usercase-test-coderl/test_molecular_local_energy.py b/usercase-test-coderl/test_molecular_local_energy.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/test_molecular_local_energy.py
+@@ -0,0 +1,289 @@
++import os
++
++os.environ.setdefault('JAX_ENABLE_X64', 'True')
++os.environ.setdefault('NVIDIA_TF32_OVERRIDE', '0')
++
++from functools import partial
++
++from jax import config
++
++config.update('jax_enable_x64', True)
++
++import jax
++import jax.numpy as jnp
++import numpy as np
++
++from deepqmc.hamil import MolecularHamiltonian
++from deepqmc.molecule import Molecule
++from deepqmc.physics import electronic_potential, nuclear_energy
++from deepqmc.types import PhysicalConfiguration, Psi
++
++
++
++
++
++
++
++
++
++EXPECTED_STAT_KEYS = [
++    'hamil/E_kin',
++    'hamil/V_el',
++    'hamil/V_loc',
++    'hamil/V_nl',
++    'hamil/lap',
++    'hamil/quantum_force',
++]
++
++
++def deterministic_ansatz(params, phys_conf):
++    return Psi(
++        sign=jnp.array(1.0),
++        log=(
++            params['alpha'] * jnp.sum(phys_conf.r * params['weights'])
++            + params['beta'] * jnp.sum(phys_conf.r**2)
++            + params['gamma']
++            * jnp.sum(phys_conf.R * jnp.array([0.05, -0.02, 0.03]))
++        ),
++    )
++
++
++def params_fixture():
++    return {
++        'alpha': jnp.array(1.3),
++        'beta': jnp.array(-0.031),
++        'gamma': jnp.array(0.11),
++        'weights': jnp.array([[1.2, -0.4, 0.9], [-0.8, 0.6, 1.1]]),
++    }
++
++
++def h2_hamiltonian_and_conf(nuclear_z):
++    mol = Molecule(
++        coords=[[0.0, 0.0, -nuclear_z], [0.0, 0.0, nuclear_z]],
++        charges=[1, 1],
++        charge=0,
++        spin=0,
++    )
++    phys_conf = PhysicalConfiguration(
++        R=mol.coords,
++        r=jnp.array([[0.25, -0.30, 0.10], [-0.40, 0.20, 0.35]]),
++        mol_idx=jnp.array(0),
++    )
++    return MolecularHamiltonian(mol=mol), phys_conf
++
++
++def lih_ecp_hamiltonian_and_conf():
++    mol = Molecule(
++        coords=[[0.0, 0.0, 0.0], [0.0, 0.0, 3.0]],
++        charges=[3, 1],
++        charge=0,
++        spin=0,
++    )
++    phys_conf = PhysicalConfiguration(
++        R=mol.coords,
++        r=jnp.array([[0.42, -0.31, 0.52], [-0.28, 0.37, 2.38]]),
++        mol_idx=jnp.array(0),
++    )
++    return MolecularHamiltonian(mol=mol, ecp_type='ccECP'), phys_conf
++
++
++def expected_local_energy_components(hamil, rng, params, phys_conf):
++    wf = partial(deterministic_ansatz, params)
++    e_kin, lap, quantum_force = hamil.pot.kinetic_term(
++        phys_conf, wf, hamil.lap_factory
++    )
++    v_el = electronic_potential(phys_conf)
++    v_loc = hamil.pot.local_potential(phys_conf)
++    v_nl = hamil.pot.nonloc_potential(rng, phys_conf, wf)
++    e_nuc = nuclear_energy(phys_conf, hamil.ns_valence)
++    stats = {
++        'hamil/V_el': v_el,
++        'hamil/E_kin': e_kin,
++        'hamil/V_loc': v_loc,
++        'hamil/V_nl': v_nl,
++        'hamil/lap': lap,
++        'hamil/quantum_force': quantum_force,
++    }
++    return e_kin + v_el + v_loc + v_nl + e_nuc, stats, e_nuc
++
++
++def assert_scalar_close(actual, expected):
++
++    np.testing.assert_allclose(
++        np.asarray(actual), np.asarray(expected), rtol=1e-10, atol=1e-10
++    )
++
++
++def assert_stats_close(actual, expected):
++    assert sorted(actual.keys()) == EXPECTED_STAT_KEYS
++    for key, value in expected.items():
++        assert_scalar_close(actual[key], value)
++
++
++def assert_params_literal(params):
++    expected = params_fixture()
++    assert sorted(params.keys()) == ['alpha', 'beta', 'gamma', 'weights']
++    for key, value in expected.items():
++        np.testing.assert_array_equal(np.asarray(params[key]), np.asarray(value))
++
++
++def assert_h2_phys_conf_literal(phys_conf, nuclear_z):
++    np.testing.assert_array_equal(
++        np.asarray(phys_conf.R),
++        np.asarray([[0.0, 0.0, -nuclear_z], [0.0, 0.0, nuclear_z]]),
++    )
++    np.testing.assert_array_equal(
++        np.asarray(phys_conf.r),
++        np.asarray([[0.25, -0.30, 0.10], [-0.40, 0.20, 0.35]]),
++    )
++    assert_scalar_close(phys_conf.mol_idx, 0)
++
++
++def test_coulomb_local_energy_callable_is_bound_deterministic_and_non_mutating():
++
++
++
++
++    hamil, phys_conf = h2_hamiltonian_and_conf(0.7)
++    params = params_fixture()
++    local_energy_fn = hamil.local_energy(deterministic_ansatz)
++
++    rng_1 = jax.random.PRNGKey(1)
++    expected_energy_1, expected_stats_1, expected_e_nuc = (
++        expected_local_energy_components(hamil, rng_1, params, phys_conf)
++    )
++    energy_1, stats_1 = local_energy_fn(rng_1, params, phys_conf)
++
++
++    assert_scalar_close(energy_1, expected_energy_1)
++    assert_stats_close(stats_1, expected_stats_1)
++    assert_scalar_close(
++        energy_1
++        - (
++            stats_1['hamil/V_el']
++            + stats_1['hamil/E_kin']
++            + stats_1['hamil/V_loc']
++            + stats_1['hamil/V_nl']
++        ),
++        expected_e_nuc,
++    )
++
++    rng_2 = jax.random.PRNGKey(2)
++    expected_energy_2, expected_stats_2, _ = expected_local_energy_components(
++        hamil, rng_2, params, phys_conf
++    )
++    energy_2, stats_2 = local_energy_fn(rng_2, params, phys_conf)
++
++
++    assert_scalar_close(energy_2, expected_energy_2)
++    assert_stats_close(stats_2, expected_stats_2)
++    assert_scalar_close(energy_2, energy_1)
++    assert_stats_close(stats_2, stats_1)
++
++    energy_3, stats_3 = local_energy_fn(rng_1, params, phys_conf)
++
++
++    assert_scalar_close(energy_3, energy_1)
++    assert_stats_close(stats_3, stats_1)
++    assert_params_literal(params)
++    assert_h2_phys_conf_literal(phys_conf, 0.7)
++
++
++def test_nonlocal_ecp_callable_uses_rng_for_quadrature_contribution():
++
++
++
++
++    hamil, phys_conf = lih_ecp_hamiltonian_and_conf()
++    params = params_fixture()
++    local_energy_fn = hamil.local_energy(deterministic_ansatz)
++
++    rng_7 = jax.random.PRNGKey(7)
++    expected_energy_7, expected_stats_7, _ = expected_local_energy_components(
++        hamil, rng_7, params, phys_conf
++    )
++    energy_7, stats_7 = local_energy_fn(rng_7, params, phys_conf)
++
++
++    assert_scalar_close(energy_7, expected_energy_7)
++    assert_stats_close(stats_7, expected_stats_7)
++
++    rng_8 = jax.random.PRNGKey(8)
++    expected_energy_8, expected_stats_8, _ = expected_local_energy_components(
++        hamil, rng_8, params, phys_conf
++    )
++    energy_8, stats_8 = local_energy_fn(rng_8, params, phys_conf)
++
++
++    assert_scalar_close(energy_8, expected_energy_8)
++    assert_stats_close(stats_8, expected_stats_8)
++    assert abs(np.asarray(stats_8['hamil/V_nl'] - stats_7['hamil/V_nl'])) > 1e-9
++    assert abs(np.asarray(energy_8 - energy_7)) > 1e-9
++
++    repeat_energy_7, repeat_stats_7 = local_energy_fn(rng_7, params, phys_conf)
++
++
++    assert_scalar_close(repeat_energy_7, energy_7)
++    assert_stats_close(repeat_stats_7, stats_7)
++    assert_params_literal(params)
++
++
++def test_two_local_energy_callables_keep_hamiltonian_state_independent():
++
++
++
++
++    compact_hamil, compact_conf = h2_hamiltonian_and_conf(0.7)
++    stretched_hamil, stretched_conf = h2_hamiltonian_and_conf(1.0)
++    params = params_fixture()
++    compact_fn = compact_hamil.local_energy(deterministic_ansatz)
++    stretched_fn = stretched_hamil.local_energy(deterministic_ansatz)
++
++    stretched_energy, stretched_stats = stretched_fn(
++        jax.random.PRNGKey(1), params, stretched_conf
++    )
++    expected_stretched_energy, expected_stretched_stats, _ = (
++        expected_local_energy_components(
++            stretched_hamil, jax.random.PRNGKey(1), params, stretched_conf
++        )
++    )
++
++
++    assert_scalar_close(stretched_energy, expected_stretched_energy)
++    assert_stats_close(stretched_stats, expected_stretched_stats)
++
++    compact_energy, compact_stats = compact_fn(
++        jax.random.PRNGKey(1), params, compact_conf
++    )
++    expected_compact_energy, expected_compact_stats, _ = (
++        expected_local_energy_components(
++            compact_hamil, jax.random.PRNGKey(1), params, compact_conf
++        )
++    )
++
++
++    assert_scalar_close(compact_energy, expected_compact_energy)
++    assert_stats_close(compact_stats, expected_compact_stats)
++    assert abs(np.asarray(compact_energy - stretched_energy)) > 1e-9
++
++
++def test_nonlocal_ecp_callable_reports_component_energy_with_rng():
++
++
++
++
++    hamil, phys_conf = lih_ecp_hamiltonian_and_conf()
++    params = params_fixture()
++    local_energy_fn = hamil.local_energy(deterministic_ansatz)
++
++    rng = jax.random.PRNGKey(9)
++    expected_energy, expected_stats, _ = expected_local_energy_components(
++        hamil, rng, params, phys_conf
++    )
++    energy, stats = local_energy_fn(rng, params, phys_conf)
++
++
++
++    assert_scalar_close(energy, expected_energy)
++    assert_stats_close(stats, expected_stats)
++    assert abs(np.asarray(stats['hamil/V_nl'])) > 1e-9
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,21 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++
++cd /workspace/repo
++
++export JAX_ENABLE_X64=True
++export NVIDIA_TF32_OVERRIDE=0
++export PYTHONPATH=/workspace/repo/src:${PYTHONPATH:-}
++export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
++
++exec python -m pytest /workspace/repo/usercase-test-coderl/test_molecular_local_energy.py -v

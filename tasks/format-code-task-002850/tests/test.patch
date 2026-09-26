@@ -1,0 +1,528 @@
+diff --git a/usercase-test-coderl/test_native_yaml_model_tests.py b/usercase-test-coderl/test_native_yaml_model_tests.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/test_native_yaml_model_tests.py
+@@ -0,0 +1,492 @@
++from __future__ import annotations
++
++from pathlib import Path
++
++from sqlmesh.core.config import Config, DuckDBConnectionConfig, GatewayConfig, ModelDefaultsConfig
++from sqlmesh.core.context import Context
++
++
++def _config(ignore_patterns: list[str] | None = None) -> Config:
++    return Config(
++        gateways={
++            "primary": GatewayConfig(
++                connection=DuckDBConnectionConfig(),
++                variables={"gateway_marker": "primary_marker", "item_limit": 3},
++            ),
++            "secondary": GatewayConfig(
++                connection=DuckDBConnectionConfig(),
++                variables={"gateway_marker": "secondary_marker", "item_limit": 7},
++            ),
++            "secon\tdary": GatewayConfig(
++                connection=DuckDBConnectionConfig(),
++                variables={"gateway_marker": "tab_marker", "item_limit": 11},
++            ),
++        },
++        default_gateway="primary",
++        model_defaults=ModelDefaultsConfig(dialect="duckdb"),
++        ignore_patterns=ignore_patterns or [],
++    )
++
++
++def _write(path: Path, content: str) -> None:
++    path.parent.mkdir(parents=True, exist_ok=True)
++    path.write_text(content, encoding="utf-8")
++
++
++def test_load_true_discovers_recursive_yaml_model_tests_and_honors_ignore_patterns(
++    tmp_path: Path,
++) -> None:
++
++
++
++
++    _write(
++        tmp_path / "tests/test_order_items.yaml",
++        """
++test_order_items:
++  model: sushi.order_items
++  inputs:
++    source.orders:
++      - id: 1
++        marker: "{{ var('gateway_marker') }}"
++        item_limit: {{ var('item_limit') }}
++  outputs:
++    query:
++      - id: 2
++        marker: "{{ var('gateway_marker') }}"
++""",
++    )
++    _write(
++        tmp_path / "tests/nested/test_multi.yml",
++        """
++test_alpha:
++  model: sushi.alpha
++  inputs:
++    source.alpha:
++      - id: 10
++        marker: "{{ var('gateway_marker') }}"
++  outputs:
++    query:
++      - id: 20
++        limit_seen: {{ var('item_limit') }}
++test_beta:
++  model: sushi.beta
++  inputs:
++    source.beta:
++      - id: 30
++        marker: "{{ var('gateway_marker') }}"
++  outputs:
++    query:
++      - id: 40
++        limit_seen: {{ var('item_limit') }}
++""",
++    )
++    _write(
++        tmp_path / "tests/ignored_skip.yaml",
++        """
++test_ignored:
++  model: sushi.ignored
++  inputs: {}
++  outputs: {}
++""",
++    )
++    _write(
++        tmp_path / "tests/not_a_test.yaml",
++        """
++not_loaded:
++  model: sushi.not_loaded
++  inputs: {}
++  outputs: {}
++""",
++    )
++    _write(tmp_path / "tests/test_json.json", '{"not_yaml": true}')
++
++    context = Context(
++        paths=tmp_path,
++        config=_config(ignore_patterns=["**/ignored_*.yaml"]),
++        gateway="primary",
++        load=True,
++        load_state=False,
++    )
++    try:
++        metadata = {item.test_name: item for item in context.select_tests()}
++
++        assert sorted(metadata) == ["test_alpha", "test_beta", "test_order_items"]
++        assert len(context.select_tests()) == 3
++
++        order_items = metadata["test_order_items"]
++        assert order_items.path == tmp_path / "tests/test_order_items.yaml"
++
++        assert order_items.test_name == "test_order_items"
++        assert order_items.body == {
++            "model": "sushi.order_items",
++            "inputs": {
++                "source.orders": [{"id": 1, "marker": "primary_marker", "item_limit": 3}]
++            },
++            "outputs": {"query": [{"id": 2, "marker": "primary_marker"}]},
++        }
++
++        assert metadata["test_alpha"].path == tmp_path / "tests/nested/test_multi.yml"
++
++        assert metadata["test_alpha"].body == {
++            "model": "sushi.alpha",
++            "inputs": {"source.alpha": [{"id": 10, "marker": "primary_marker"}]},
++            "outputs": {"query": [{"id": 20, "limit_seen": 3}]},
++        }
++        assert metadata["test_beta"].path == tmp_path / "tests/nested/test_multi.yml"
++
++        assert metadata["test_beta"].body == {
++            "model": "sushi.beta",
++            "inputs": {"source.beta": [{"id": 30, "marker": "primary_marker"}]},
++            "outputs": {"query": [{"id": 40, "limit_seen": 3}]},
++        }
++    finally:
++        context.close()
++
++
++def test_later_load_replaces_loaded_test_metadata_with_new_project_scan(tmp_path: Path) -> None:
++
++
++
++
++    _write(
++        tmp_path / "tests/test_initial.yaml",
++        """
++test_initial:
++  model: sushi.initial
++  inputs:
++    source.initial:
++      - marker: "{{ var('gateway_marker') }}"
++  outputs:
++    query:
++      - limit_seen: {{ var('item_limit') }}
++""",
++    )
++    context = Context(
++        paths=tmp_path,
++        config=_config(),
++        gateway="primary",
++        load=True,
++        load_state=False,
++    )
++    try:
++        assert [item.test_name for item in context.select_tests()] == ["test_initial"]
++
++        assert context.select_tests()[0].body["model"] == "sushi.initial"
++
++        _write(
++            tmp_path / "tests/nested/deeper/test_reload.yaml",
++            """
++test_reload_added:
++  model: sushi.reload
++  inputs:
++    source.reload:
++      - marker: "{{ var('gateway_marker') }}"
++  outputs:
++    query:
++      - limit_seen: {{ var('item_limit') }}
++""",
++        )
++
++
++        assert "test_initial" in {item.test_name for item in context.select_tests()}
++
++        context.load(update_schemas=False)
++        assert sorted(item.test_name for item in context.select_tests()) == [
++            "test_initial",
++            "test_reload_added",
++        ]
++
++        assert sorted(item.body["model"] for item in context.select_tests()) == [
++            "sushi.initial",
++            "sushi.reload",
++        ]
++    finally:
++        context.close()
++
++
++def test_gateway_variable_rendering_uses_default_override_and_escaped_gateway_value(
++    tmp_path: Path,
++) -> None:
++
++
++
++
++    _write(
++        tmp_path / "tests/test_default.yaml",
++        """
++test_default_case:
++  model: sushi.default
++  inputs:
++    source.default:
++      - marker: "{{ var('gateway_marker') }}"
++  outputs:
++    query:
++      - limit_seen: {{ var('item_limit') }}
++""",
++    )
++    _write(
++        tmp_path / "tests/test_secondary.yaml",
++        """
++test_secondary_case:
++  model: sushi.secondary
++  gateway: secondary
++  inputs:
++    source.secondary:
++      - marker: "{{ var('gateway_marker') }}"
++  outputs:
++    query:
++      - limit_seen: {{ var('item_limit') }}
++""",
++    )
++    _write(
++        tmp_path / "tests/test_tab.yaml",
++        """
++test_tab_case:
++  model: sushi.tabbed
++  gateway: "secon\\tdary"
++  inputs:
++    source.tabbed:
++      - marker: "{{ var('gateway_marker') }}"
++  outputs:
++    query:
++      - limit_seen: {{ var('item_limit') }}
++""",
++    )
++
++    context = Context(
++        paths=tmp_path,
++        config=_config(),
++        gateway="primary",
++        load=True,
++        load_state=False,
++    )
++    try:
++        metadata = {item.test_name: item for item in context.select_tests()}
++
++        assert sorted(metadata) == ["test_default_case", "test_secondary_case", "test_tab_case"]
++        assert metadata["test_default_case"].body == {
++            "model": "sushi.default",
++            "inputs": {"source.default": [{"marker": "primary_marker"}]},
++            "outputs": {"query": [{"limit_seen": 3}]},
++        }
++        assert metadata["test_secondary_case"].body == {
++            "model": "sushi.secondary",
++            "gateway": "secondary",
++            "inputs": {"source.secondary": [{"marker": "secondary_marker"}]},
++            "outputs": {"query": [{"limit_seen": 7}]},
++        }
++        assert metadata["test_tab_case"].body == {
++            "model": "sushi.tabbed",
++            "gateway": "secon\tdary",
++            "inputs": {"source.tabbed": [{"marker": "tab_marker"}]},
++            "outputs": {"query": [{"limit_seen": 11}]},
++        }
++    finally:
++        context.close()
++
++
++def test_two_context_instances_keep_loaded_test_metadata_independent(tmp_path: Path) -> None:
++
++
++
++
++    project_a = tmp_path / "project_a"
++    project_b = tmp_path / "project_b"
++    _write(
++        project_a / "tests/test_a.yaml",
++        """
++test_project_a:
++  model: sushi.project_a
++  inputs:
++    source.a:
++      - id: 101
++  outputs:
++    query:
++      - id: 201
++""",
++    )
++    _write(
++        project_b / "tests/test_b.yaml",
++        """
++test_project_b:
++  model: sushi.project_b
++  inputs:
++    source.b:
++      - id: 301
++  outputs:
++    query:
++      - id: 401
++""",
++    )
++
++    context_a = Context(
++        paths=project_a,
++        config=_config(),
++        gateway="primary",
++        load=True,
++        load_state=False,
++    )
++    context_b = Context(
++        paths=project_b,
++        config=_config(),
++        gateway="primary",
++        load=True,
++        load_state=False,
++    )
++    try:
++
++        assert [(item.test_name, item.body["model"]) for item in context_a.select_tests()] == [
++            ("test_project_a", "sushi.project_a")
++        ]
++
++        assert [(item.test_name, item.body["model"]) for item in context_b.select_tests()] == [
++            ("test_project_b", "sushi.project_b")
++        ]
++
++        _write(
++            project_a / "tests/test_a_added.yaml",
++            """
++test_project_a_added:
++  model: sushi.project_a_added
++  inputs:
++    source.a_added:
++      - id: 501
++  outputs:
++    query:
++      - id: 601
++""",
++        )
++        context_a.load(update_schemas=False)
++
++
++        assert sorted((item.test_name, item.body["model"]) for item in context_a.select_tests()) == [
++            ("test_project_a", "sushi.project_a"),
++            ("test_project_a_added", "sushi.project_a_added"),
++        ]
++
++        assert [(item.test_name, item.body["model"]) for item in context_b.select_tests()] == [
++            ("test_project_b", "sushi.project_b")
++        ]
++    finally:
++        context_a.close()
++        context_b.close()
++
++
++def test_selected_context_gateway_uses_that_gateway_by_default(tmp_path: Path) -> None:
++
++
++
++
++    _write(
++        tmp_path / "tests/test_one.yaml",
++        """
++test_one:
++  model: sushi.one
++  inputs:
++    source.one:
++      - marker: "{{ var('gateway_marker') }}"
++  outputs:
++    query:
++      - limit_seen: {{ var('item_limit') }}
++""",
++    )
++
++
++    context = Context(
++        paths=tmp_path,
++        config=_config(),
++        gateway="secondary",
++        load=True,
++        load_state=False,
++    )
++    try:
++        assert context.select_tests()[0].body == {
++            "model": "sushi.one",
++            "inputs": {"source.one": [{"marker": "secondary_marker"}]},
++            "outputs": {"query": [{"limit_seen": 7}]},
++        }
++    finally:
++        context.close()
++
++
++def test_load_true_discovers_simple_yaml_test_metadata(tmp_path: Path) -> None:
++
++
++
++
++    _write(
++        tmp_path / "tests/test_one.yaml",
++        """
++test_one:
++  model: sushi.one
++  inputs:
++    source.one:
++      - id: 1
++  outputs:
++    query:
++      - id: 2
++""",
++    )
++    context = Context(
++        paths=tmp_path,
++        config=_config(),
++        gateway="primary",
++        load=True,
++        load_state=False,
++    )
++
++    try:
++        metadata = context.select_tests()
++        assert len(metadata) == 1
++        assert metadata[0].path == tmp_path / "tests/test_one.yaml"
++        assert metadata[0].test_name == "test_one"
++        assert metadata[0].body == {
++            "model": "sushi.one",
++            "inputs": {"source.one": [{"id": 1}]},
++            "outputs": {"query": [{"id": 2}]},
++        }
++    finally:
++
++        context.close()
++
++
++def test_repeated_context_load_cycles_do_not_duplicate_loaded_metadata(tmp_path: Path) -> None:
++
++
++
++
++    _write(
++        tmp_path / "tests/test_one.yaml",
++        """
++test_one:
++  model: sushi.one
++  inputs:
++    source.one:
++      - marker: "{{ var('gateway_marker') }}"
++  outputs:
++    query:
++      - limit_seen: {{ var('item_limit') }}
++""",
++    )
++
++    context = Context(
++        paths=tmp_path,
++        config=_config(),
++        gateway="primary",
++        load=True,
++        load_state=False,
++    )
++    try:
++        for _ in range(5):
++
++            context.load(update_schemas=False)
++            metadata = context.select_tests()
++            assert [item.test_name for item in metadata] == ["test_one"]
++            assert metadata[0].body == {
++                "model": "sushi.one",
++                "inputs": {"source.one": [{"marker": "primary_marker"}]},
++                "outputs": {"query": [{"limit_seen": 3}]},
++            }
++    finally:
++        context.close()
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,26 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++export PIP_DISABLE_PIP_VERSION_CHECK=1
++export PIP_NO_INDEX=1
++export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
++export SQLMESH__DISABLE_ANONYMIZED_ANALYTICS=true
++set -e
++cd /workspace/repo
++set -euo pipefail
++
++cd /workspace/repo
++
++python -m pip install -e . --no-index --no-deps --no-build-isolation >/dev/null 2>&1
++
++exec python -m pytest \
++  -p xdist.plugin \
++  -p pytest_rerunfailures \
++  -p pytest_asyncio.plugin \
++  /workspace/repo/usercase-test-coderl/test_native_yaml_model_tests.py -v

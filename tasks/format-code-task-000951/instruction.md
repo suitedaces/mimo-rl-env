@@ -1,0 +1,1 @@
+The [firebase documentation](https://firebase.google.com/docs/reference/fcm/rest/v1/projects.messages#AndroidConfig) explicitly lists a `direct_boot_ok` field for the AndroidConfig payload, but this is [missing](https://github.com/firebase/firebase-admin-go/blob/v4.14.1/messaging/messaging.go#L116) in the Go SDK.

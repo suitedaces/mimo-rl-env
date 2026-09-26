@@ -1,0 +1,465 @@
+diff --git a/usercase-test-coderl/test_dqn_stateful.py b/usercase-test-coderl/test_dqn_stateful.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/test_dqn_stateful.py
+@@ -0,0 +1,430 @@
++import haiku as hk
++import jax
++import jax.numpy as jnp
++import numpy as np
++from gym.spaces import Box, Discrete
++from numpy.testing import assert_allclose
++
++from rljax.algorithm import DQN as ExportedDQN
++from rljax.algorithm.dqn import DQN
++
++
++if not hasattr(jax, "tree_multimap"):
++
++    jax.tree_multimap = jax.tree_util.tree_map
++
++
++def _state_space(shape=(2,), low=-10.0, high=10.0):
++    return Box(low=low, high=high, shape=shape, dtype=np.float32)
++
++
++def _linear_q(s):
++    return hk.Linear(
++        2,
++        w_init=hk.initializers.Constant(0.25),
++        b_init=hk.initializers.Constant(0.0),
++        name="linear_q",
++    )(s)
++
++
++def _biased_q(s):
++    w = hk.get_parameter(
++        "w",
++        shape=(2, 2),
++        init=lambda shape, dtype: jnp.array([[0.0, 0.0], [0.0, 0.0]], dtype),
++    )
++    b = hk.get_parameter(
++        "b",
++        shape=(2,),
++        init=lambda shape, dtype: jnp.array([0.5, 0.0], dtype),
++    )
++    return jnp.matmul(s, w) + b
++
++
++def _make_linear_dqn(**kwargs):
++    options = dict(
++        num_agent_steps=20,
++        state_space=_state_space(),
++        action_space=Discrete(2),
++        seed=3,
++        batch_size=2,
++        start_steps=0,
++        update_interval=1,
++        update_interval_target=4,
++        fn=_linear_q,
++        lr=0.1,
++        gamma=0.5,
++        nstep=1,
++        buffer_size=8,
++        eps_eval=0.0,
++    )
++    options.update(kwargs)
++    return DQN(**options)
++
++
++def _append_linear_transition(algo):
++    algo.buffer.append(
++        np.array([1.0, -1.0], dtype=np.float32),
++        1,
++        1.0,
++        False,
++        np.array([2.0, 0.0], dtype=np.float32),
++        False,
++    )
++
++
++def _param_leaf_shapes(params):
++    return [tuple(np.asarray(leaf).shape) for leaf in jax.tree_util.tree_leaves(params)]
++
++
++def _matrix_and_bias(params):
++
++
++    leaves = [np.asarray(leaf) for leaf in jax.tree_util.tree_leaves(params)]
++    matrices = [leaf for leaf in leaves if leaf.shape == (2, 2)]
++    biases = [leaf for leaf in leaves if leaf.shape == (2,)]
++    assert len(matrices) == 1
++    assert len(biases) == 1
++    return matrices[0], biases[0]
++
++
++def _linear_params(algo):
++    return _matrix_and_bias(algo.params)
++
++
++def _tree_allclose(left, right, rtol=1e-6, atol=1e-6):
++    left_leaves, left_tree = jax.tree_util.tree_flatten(left)
++    right_leaves, right_tree = jax.tree_util.tree_flatten(right)
++    assert left_tree == right_tree
++    assert len(left_leaves) > 0
++    for left_leaf, right_leaf in zip(left_leaves, right_leaves):
++        assert_allclose(np.asarray(left_leaf), np.asarray(right_leaf), rtol=rtol, atol=atol)
++
++
++def _tree_changed(left, right):
++    left_leaves, left_tree = jax.tree_util.tree_flatten(left)
++    right_leaves, right_tree = jax.tree_util.tree_flatten(right)
++    assert left_tree == right_tree
++    assert len(left_leaves) > 0
++    return any(
++        not np.allclose(np.asarray(left_leaf), np.asarray(right_leaf))
++        for left_leaf, right_leaf in zip(left_leaves, right_leaves)
++    )
++
++
++def _assert_actions_in_space(actions, action_space, batch_size):
++
++
++    arr = np.asarray(actions)
++    assert arr.shape == (batch_size,)
++    assert np.issubdtype(arr.dtype, np.integer)
++    assert np.all(arr >= 0)
++    assert np.all(arr < action_space.n)
++
++
++def test_public_import_default_network_and_forward_session():
++
++
++
++    algo = DQN(
++        num_agent_steps=100,
++        state_space=_state_space(shape=(4,), low=-1.0, high=1.0),
++        action_space=Discrete(2),
++        seed=0,
++        batch_size=2,
++        start_steps=1,
++        update_interval=1,
++        update_interval_target=2,
++        eps_eval=0.0,
++        units=(8,),
++    )
++
++    assert ExportedDQN is DQN
++    assert algo.name == "DQN"
++
++    assert getattr(algo, "name") == "DQN"
++    assert algo.agent_step == 0
++    assert algo.episode_step == 0
++    assert algo.learning_step == 0
++    assert algo.discount == 0.99
++
++
++    assert 0.0 <= algo.eps_eval <= 1.0
++    assert algo.update_interval == 1
++    assert algo.discrete_action is True
++    assert algo.batch_size == 2
++    assert algo.use_per is False
++    assert algo.loss_type == "huber"
++
++
++    param_shapes = _param_leaf_shapes(algo.params)
++    assert (4, 8) in param_shapes
++    assert (8, 2) in param_shapes
++    _tree_allclose(algo.params, algo.params_target, rtol=0.0, atol=0.0)
++    assert len(jax.tree_util.tree_leaves(algo.opt_state)) > 0
++
++    state = np.array([0.05, -0.02, 0.01, 0.03], dtype=np.float32)
++    _assert_actions_in_space(algo.forward(state[None, ...]), algo.action_space, 1)
++
++
++    selected = np.asarray(algo.select_action(state))
++    assert selected.shape == ()
++    assert 0 <= int(selected) < algo.action_space.n
++
++
++def test_dueling_default_network_adds_value_head_and_still_returns_actions():
++
++
++
++    algo = DQN(
++        num_agent_steps=100,
++        state_space=_state_space(shape=(4,), low=-1.0, high=1.0),
++        action_space=Discrete(3),
++        seed=0,
++        batch_size=2,
++        start_steps=1,
++        update_interval=1,
++        update_interval_target=2,
++        eps_eval=0.0,
++        units=(8,),
++        dueling_net=True,
++    )
++
++
++
++    param_shapes = _param_leaf_shapes(algo.params)
++    assert (4, 8) in param_shapes
++    assert (8, 3) in param_shapes
++    assert (8, 1) in param_shapes
++    states = np.array(
++        [[0.05, -0.02, 0.01, 0.03], [0.2, 0.1, -0.3, 0.0]],
++        dtype=np.float32,
++    )
++    _assert_actions_in_space(algo.forward(states), algo.action_space, 2)
++
++
++def test_update_l2_changes_online_opt_state_and_hard_syncs_target():
++
++
++
++    algo = _make_linear_dqn(loss_type="l2")
++    _append_linear_transition(algo)
++
++    w0, b0 = _linear_params(algo)
++    opt0 = algo.opt_state
++    assert_allclose(w0, [[0.25, 0.25], [0.25, 0.25]], rtol=0.0, atol=0.0)
++    assert_allclose(b0, [0.0, 0.0], rtol=0.0, atol=0.0)
++    assert algo.learning_step == 0
++
++    algo.update(writer=None)
++
++    w1, b1 = _linear_params(algo)
++    assert algo.learning_step == 1
++
++
++    assert _tree_changed(opt0, algo.opt_state)
++    assert_allclose(
++        w1,
++        [[0.25, 0.34979972], [0.25, 0.15020028]],
++        rtol=1e-6,
++        atol=1e-6,
++    )
++    assert_allclose(b1, [0.0, 0.09979972], rtol=1e-6, atol=1e-6)
++    assert_allclose(
++        _matrix_and_bias(algo.params_target)[0],
++        [[0.25, 0.34979972], [0.25, 0.15020028]],
++        rtol=1e-6,
++        atol=1e-6,
++    )
++    assert np.asarray(
++        algo.forward(np.array([[1.0, -1.0], [0.0, 2.0]], dtype=np.float32))
++    ).tolist() == [1, 0]
++
++
++def test_update_huber_uses_huber_td_loss_path():
++
++
++
++    algo = _make_linear_dqn(loss_type="huber")
++    _append_linear_transition(algo)
++
++    algo.update(writer=None)
++
++    w1, b1 = _linear_params(algo)
++    assert algo.learning_step == 1
++    assert_allclose(
++        w1,
++        [[0.25, 0.34950179], [0.25, 0.15049817]],
++        rtol=1e-6,
++        atol=1e-6,
++    )
++    assert_allclose(b1, [0.0, 0.09950183], rtol=1e-6, atol=1e-6)
++    assert np.asarray(
++        algo.forward(np.array([[1.0, -1.0], [0.0, 2.0]], dtype=np.float32))
++    ).tolist() == [1, 0]
++
++
++def test_double_q_uses_online_argmax_and_target_evaluation():
++
++
++
++    algo = DQN(
++        num_agent_steps=20,
++        state_space=_state_space(),
++        action_space=Discrete(2),
++        seed=7,
++        batch_size=2,
++        start_steps=0,
++        update_interval=1,
++        update_interval_target=4,
++        fn=_biased_q,
++        lr=0.1,
++        gamma=0.5,
++        loss_type="l2",
++        double_q=True,
++        eps_eval=0.0,
++        buffer_size=8,
++    )
++    algo.buffer.append(
++        np.array([10.0, 0.0], dtype=np.float32),
++        1,
++        1.0,
++        False,
++        np.array([10.0, 0.0], dtype=np.float32),
++        False,
++    )
++    algo.agent_step = 1
++
++    assert np.asarray(algo.forward(np.array([[10.0, 0.0]], dtype=np.float32))).tolist() == [0]
++    algo.update(writer=None)
++    assert np.asarray(algo.forward(np.array([[10.0, 0.0]], dtype=np.float32))).tolist() == [1]
++    algo.update(writer=None)
++
++    w, b = _matrix_and_bias(algo.params)
++    assert algo.learning_step == 2
++    assert_allclose(
++        w,
++        [[0.0, 0.16084242], [0.0, 0.0]],
++        rtol=1e-6,
++        atol=1e-6,
++    )
++    assert_allclose(b, [0.5, 0.16050875], rtol=1e-6, atol=1e-6)
++    _, target_b = _matrix_and_bias(algo.params_target)
++    assert_allclose(
++        target_b,
++        [0.5, 0.0],
++        rtol=0.0,
++        atol=0.0,
++    )
++
++
++def test_writer_logs_q_loss_at_1000_learning_steps():
++
++
++
++
++    class Writer:
++        def __init__(self):
++            self.calls = []
++
++        def add_scalar(self, *args):
++            self.calls.append(args)
++
++    algo = _make_linear_dqn(loss_type="l2")
++    _append_linear_transition(algo)
++    algo.learning_step = 999
++    writer = Writer()
++
++    algo.update(writer=writer)
++
++    assert algo.learning_step == 1000
++    assert len(writer.calls) == 1
++    assert writer.calls[0][0] == "loss/q"
++    assert float(writer.calls[0][1]) == 1.5625
++    assert writer.calls[0][2] == 1000
++
++
++def test_update_before_replay_contains_transitions_raises_value_error():
++
++
++
++    algo = _make_linear_dqn(loss_type="l2")
++    _append_linear_transition(algo)
++    params0 = algo.params
++    opt0 = algo.opt_state
++
++
++
++    algo.update(writer=None)
++    assert algo.learning_step == 1
++    assert _tree_changed(params0, algo.params)
++    assert _tree_changed(opt0, algo.opt_state)
++
++
++def test_two_dqn_instances_keep_independent_session_state():
++
++
++
++    a = _make_linear_dqn(loss_type="l2", seed=3)
++    b = _make_linear_dqn(loss_type="l2", seed=3)
++    _append_linear_transition(a)
++    bw0, bb0 = _linear_params(b)
++
++    a.update(writer=None)
++
++    aw, ab = _linear_params(a)
++    bw, bb = _linear_params(b)
++    assert a.name == "DQN"
++    assert b.name == "DQN"
++    assert a.learning_step == 1
++    assert b.learning_step == 0
++
++
++    assert not np.allclose(aw, bw)
++    assert not np.allclose(ab, bb)
++    assert_allclose(bw, bw0, rtol=0.0, atol=0.0)
++    assert_allclose(bb, bb0, rtol=0.0, atol=0.0)
++
++
++def test_python_object_cleanup_is_idempotent_for_dqn_sessions():
++
++
++
++    algo = _make_linear_dqn(loss_type="l2")
++    _append_linear_transition(algo)
++
++
++
++    assert algo.name == "DQN"
++    assert algo.learning_step == 0
++    algo.update(writer=None)
++    assert algo.learning_step == 1
++
++
++def test_repeated_construct_use_cleanup_cycles_keep_python_heap_bounded():
++
++
++
++
++
++    for seed in range(5):
++        algo = DQN(
++            num_agent_steps=10,
++            state_space=_state_space(),
++            action_space=Discrete(2),
++            seed=seed,
++            batch_size=1,
++            start_steps=0,
++            update_interval=1,
++            update_interval_target=4,
++            fn=_biased_q,
++            lr=0.1,
++            buffer_size=1,
++            eps_eval=0.0,
++        )
++        assert algo.name == "DQN"
++        _assert_actions_in_space(
++            algo.forward(np.array([[1.0, 0.0]], dtype=np.float32)),
++            algo.action_space,
++            1,
++        )
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,25 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++cd /workspace/repo
++
++
++
++
++export PIP_NO_INDEX=1
++export PIP_DISABLE_PIP_VERSION_CHECK=1
++export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
++export JAX_PLATFORMS=cpu
++export JAX_PLATFORM_NAME=cpu
++export PYTHONPATH="/workspace/repo${PYTHONPATH:+:${PYTHONPATH}}"
++
++exec python -m pytest /workspace/repo/usercase-test-coderl/test_dqn_stateful.py -v

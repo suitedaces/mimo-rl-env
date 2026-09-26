@@ -1,0 +1,214 @@
+diff --git a/usercase-test-coderl/usecase.sh b/usercase-test-coderl/usecase.sh
+new file mode 100755
+--- /dev/null
++++ b/usercase-test-coderl/usecase.sh
+@@ -0,0 +1,192 @@
++#!/usr/bin/env bash
++
++set -u
++export LANG=C.UTF-8 LC_ALL=C.UTF-8 TZ=UTC
++
++ROOT=/workspace/repo
++OS_ARCH="$(go env GOOS)_$(go env GOARCH)"
++
++export GO111MODULE=off
++
++export GOPROXY=off
++export GOSUMDB=off
++
++compiler_targets=(
++  "build/bin/grumpc"
++  "build/pkg/${OS_ARCH}/grumpy.a"
++  "build/lib/python2.7/site-packages/grumpy/__init__.py"
++)
++while IFS= read -r source; do
++  compiler_targets+=("build/lib/python2.7/site-packages/grumpy/compiler/$(basename "$source")")
++done < <(find "$ROOT/compiler" -name '*.py' -not -name '*_test.py' -print)
++while IFS= read -r source; do
++  rel="${source#"$ROOT/third_party/"}"
++  compiler_targets+=("build/lib/python2.7/site-packages/grumpy/$rel")
++done < <(find "$ROOT/third_party/pythonparser" -name '*.py' -print)
++
++( cd "$ROOT" && make "${compiler_targets[@]}" ) \
++  || { echo "FAIL: build" >&2; exit 1; }
++
++BIN="$ROOT/build/bin/grumpc"
++TMP=$(mktemp -d)
++trap 'rm -rf "$TMP"' EXIT
++
++export GOPATH="$ROOT/build:$TMP/gopath"
++export PYTHONPATH="$ROOT/build/lib/python2.7/site-packages"
++export PATH="$ROOT/build/bin:$PATH"
++
++mkdir -p "$TMP/gopath/src/__python__"
++cd "$TMP" || exit 1
++
++fail() { echo "FAIL: $*" >&2; exit 1; }
++
++compile_module() {
++  local mod="$1"
++  local source="$2"
++  mkdir -p "$TMP/gopath/src/__python__/$mod"
++  printf '%s\n' "$source" > "$TMP/$mod.py"
++  "$BIN" -modname="$mod" "$TMP/$mod.py" \
++    > "$TMP/gopath/src/__python__/$mod/module.go" 2> "$TMP/$mod.compile.err"
++  return $?
++}
++
++write_runner() {
++  local mod="$1"
++  cat > "$TMP/run_$mod.go" <<EOF
++package main
++
++import (
++	"fmt"
++	"os"
++
++	πg "grumpy"
++	_ "__python__/$mod"
++)
++
++func main() {
++	f := πg.NewRootFrame()
++	mods, raised := πg.ImportModule(f, "$mod")
++	if raised != nil {
++		fmt.Fprintln(os.Stderr, raised)
++		os.Exit(1)
++	}
++	val, raised := πg.GetAttr(f, mods[len(mods)-1], πg.NewStr("result"), nil)
++	if raised != nil {
++		fmt.Fprintln(os.Stderr, raised)
++		os.Exit(1)
++	}
++	repr, raised := πg.Repr(f, val)
++	if raised != nil {
++		fmt.Fprintln(os.Stderr, raised)
++		os.Exit(1)
++	}
++	fmt.Println(repr.Value())
++}
++EOF
++}
++
++assert_success_case() {
++  local fixture="$1"
++  local mod="$2"
++  local source="$3"
++  local expected="$4"
++
++  compile_module "$mod" "$source" > "$TMP/$fixture.compile.out"
++  local ec=$?
++  [ "$ec" -eq 0 ] || fail "$fixture compile exit $ec; stderr: $(cat "$TMP/$mod.compile.err")"
++  [ ! -s "$TMP/$fixture.compile.out" ] || fail "$fixture unexpected compile helper stdout"
++  [ ! -s "$TMP/$mod.compile.err" ] || fail "$fixture unexpected compile stderr: $(cat "$TMP/$mod.compile.err")"
++  [ -s "$TMP/gopath/src/__python__/$mod/module.go" ] || fail "$fixture emitted empty Go source"
++
++  write_runner "$mod"
++  go run "$TMP/run_$mod.go" > "$TMP/$fixture.run.out" 2> "$TMP/$fixture.run.err"
++  ec=$?
++  [ "$ec" -eq 0 ] || fail "$fixture run exit $ec; stderr: $(cat "$TMP/$fixture.run.err")"
++  [ "$(cat "$TMP/$fixture.run.out")" = "$expected" ] \
++    || fail "$fixture result: $(cat "$TMP/$fixture.run.out"); want $expected"
++  [ ! -s "$TMP/$fixture.run.err" ] || fail "$fixture unexpected run stderr: $(cat "$TMP/$fixture.run.err")"
++}
++
++assert_compile_error() {
++  local fixture="$1"
++  local mod="$2"
++  local source="$3"
++  local expected_stderr="$4"
++
++  compile_module "$mod" "$source" > "$TMP/$fixture.compile.out"
++  local ec=$?
++  [ "$ec" -ne 0 ] || fail "$fixture compile unexpectedly exited 0"
++
++  [ ! -s "$TMP/$fixture.compile.out" ] || fail "$fixture unexpected compile stdout"
++
++  [ -s "$TMP/$mod.compile.err" ] \
++    || fail "$fixture expected compile diagnostic like: $expected_stderr"
++  [ ! -s "$TMP/gopath/src/__python__/$mod/module.go" ] \
++    || fail "$fixture should not emit partial Go source"
++}
++
++
++
++
++assert_success_case "F1" "ucpos" \
++  $'def add(a, b): return a + b\nresult = add(2, 3)' \
++  "5"
++
++
++
++
++assert_success_case "F2" "uckw" \
++  $'def pair(a, b): return (a, b)\nresult = pair(b="bee", a="aye")' \
++  "('aye', 'bee')"
++
++
++
++
++assert_success_case "F3" "ucstar" \
++  $'more = (2, 3)\ndef f(a, b, c): return (a, b, c)\nresult = f(1, *more)' \
++  "(1, 2, 3)"
++
++
++
++
++assert_success_case "F4" "uckwargs" \
++  $'extra = {"y": 2}\ndef f(x, y): return (x, y)\nresult = f(x=1, **extra)' \
++  "(1, 2)"
++
++
++
++
++assert_compile_error "F5" "errcallee" \
++  $'result = ({x for x in (1, 2)})(1)' \
++  "line 1: node not yet implemented: SetComp"
++
++
++
++
++assert_compile_error "F6" "errpos" \
++  $'def consume(x): return x\nresult = consume(1 @ 2)' \
++  "line 2: binary op not implemented: MatMult"
++
++
++
++
++assert_compile_error "F7" "errkw" \
++  $'def consume(x): return x\nresult = consume(x={x for x in (1, 2)})' \
++  "line 2: node not yet implemented: SetComp"
++
++
++
++
++assert_compile_error "F8" "errstar" \
++  $'def consume(x): return x\nresult = consume(*{x for x in (1, 2)})' \
++  "line 2: node not yet implemented: SetComp"
++
++
++
++
++assert_compile_error "F9" "errkwargs" \
++  $'def consume(x): return x\nresult = consume(**{x for x in (1, 2)})' \
++  "line 2: node not yet implemented: SetComp"
++
++echo "PASS"
++exit 0
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,12 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++exec bash /workspace/repo/usercase-test-coderl/usecase.sh

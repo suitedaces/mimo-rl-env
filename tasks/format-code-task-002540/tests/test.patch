@@ -1,0 +1,406 @@
+diff --git a/usercase-test-coderl/sampling_test.go b/usercase-test-coderl/sampling_test.go
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/sampling_test.go
+@@ -0,0 +1,377 @@
++package usercase_test_coderl
++
++import (
++	"bytes"
++	"encoding/json"
++	"reflect"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/rs/zerolog"
++	zlog "github.com/rs/zerolog/log"
++)
++
++type recordingSampler struct {
++	decisions []bool
++	levels    []zerolog.Level
++}
++
++func (s *recordingSampler) Sample(level zerolog.Level) bool {
++	s.levels = append(s.levels, level)
++	idx := len(s.levels) - 1
++	if idx >= len(s.decisions) {
++		return false
++	}
++	return s.decisions[idx]
++}
++
++func emitNoLevel(logger zerolog.Logger, values ...int) {
++	for _, value := range values {
++		logger.Log().Int("i", value).Msg("")
++	}
++}
++
++func parseLogLines(t *testing.T, output string) []map[string]interface{} {
++	t.Helper()
++	lines := strings.Split(strings.TrimSuffix(output, "\n"), "\n")
++	if len(lines) == 1 && lines[0] == "" {
++		return nil
++	}
++	records := make([]map[string]interface{}, 0, len(lines))
++	for _, line := range lines {
++		var record map[string]interface{}
++		if err := json.Unmarshal([]byte(line), &record); err != nil {
++			t.Fatalf("log line %q is not valid JSON: %v", line, err)
++		}
++		records = append(records, record)
++	}
++	return records
++}
++
++func requireRecord(t *testing.T, record map[string]interface{}, i float64, level string) {
++	t.Helper()
++	if got := record["i"]; got != i {
++		t.Fatalf("record i = %#v, want %#v in %#v", got, i, record)
++	}
++	if level == "" {
++		if _, ok := record["level"]; ok {
++			t.Fatalf("record level present in no-level event: %#v", record)
++		}
++		return
++	}
++	if got := record["level"]; got != level {
++		t.Fatalf("record level = %#v, want %#v in %#v", got, level, record)
++	}
++}
++
++func TestBasicSamplerStatefulProgressionAndBoundaries(t *testing.T) {
++
++
++	zero := &zerolog.BasicSampler{N: 0}
++	if got := zero.Sample(zerolog.NoLevel); got != false {
++		t.Fatalf("BasicSampler{N:0}.Sample(NoLevel) = %t, want false", got)
++	}
++
++	one := &zerolog.BasicSampler{N: 1}
++	if got := one.Sample(zerolog.NoLevel); got != true {
++		t.Fatalf("BasicSampler{N:1} first Sample(NoLevel) = %t, want true", got)
++	}
++	if got := one.Sample(zerolog.NoLevel); got != true {
++		t.Fatalf("BasicSampler{N:1} second Sample(NoLevel) = %t, want true", got)
++	}
++
++	three := &zerolog.BasicSampler{N: 3}
++	got := []bool{
++		three.Sample(zerolog.NoLevel),
++		three.Sample(zerolog.NoLevel),
++		three.Sample(zerolog.NoLevel),
++		three.Sample(zerolog.NoLevel),
++		three.Sample(zerolog.NoLevel),
++		three.Sample(zerolog.NoLevel),
++		three.Sample(zerolog.NoLevel),
++	}
++	want := []bool{true, false, false, true, false, false, true}
++	if !reflect.DeepEqual(got, want) {
++		t.Fatalf("BasicSampler{N:3} sequence = %#v, want %#v", got, want)
++	}
++}
++
++func TestLoggerSampleAppliesAfterLevelFilteringBeforeEventCreation(t *testing.T) {
++
++
++	var out bytes.Buffer
++	sampler := &recordingSampler{decisions: []bool{false, true}}
++	logger := zerolog.New(&out).Level(zerolog.InfoLevel).Sample(sampler)
++
++	if event := logger.Debug(); event != nil {
++		t.Fatalf("Debug event below logger level = %v, want nil", event)
++	}
++	if got := len(sampler.levels); got != 0 {
++		t.Fatalf("sampler call count after filtered Debug = %d, want 0", got)
++	}
++	if got := out.String(); got != "" {
++		t.Fatalf("output after filtered Debug = %q, want %q", got, "")
++	}
++
++	if event := logger.Info(); event != nil {
++		event.Int("i", 1).Msg("")
++	}
++	if !reflect.DeepEqual(sampler.levels, []zerolog.Level{zerolog.InfoLevel}) {
++		t.Fatalf("sampler levels after rejected Info = %#v, want %#v", sampler.levels, []zerolog.Level{zerolog.InfoLevel})
++	}
++	if got := out.String(); got != "" {
++		t.Fatalf("output after rejected Info = %q, want %q", got, "")
++	}
++
++	logger.Info().Int("i", 2).Msg("")
++	if !reflect.DeepEqual(sampler.levels, []zerolog.Level{zerolog.InfoLevel, zerolog.InfoLevel}) {
++		t.Fatalf("sampler levels after accepted Info = %#v, want %#v", sampler.levels, []zerolog.Level{zerolog.InfoLevel, zerolog.InfoLevel})
++	}
++
++	records := parseLogLines(t, out.String())
++	if len(records) != 1 {
++		t.Fatalf("accepted Info record count = %d, want 1 (%q)", len(records), out.String())
++	}
++	requireRecord(t, records[0], 2, "info")
++}
++
++func TestSampledLoggerNoLevelOutputUsesStatefulBasicSampler(t *testing.T) {
++
++
++	var out bytes.Buffer
++	logger := zerolog.New(&out).Sample(&zerolog.BasicSampler{N: 2})
++
++	emitNoLevel(logger, 1, 2, 3, 4)
++
++	if got := out.String(); got != "{\"i\":1}\n{\"i\":3}\n" {
++		t.Fatalf("sampled no-level output = %q, want %q", got, "{\"i\":1}\n{\"i\":3}\n")
++	}
++}
++
++func TestPackageLogSampleConvenienceUsesGlobalLoggerOutput(t *testing.T) {
++
++
++	originalLogger := zlog.Logger
++	defer func() { zlog.Logger = originalLogger }()
++
++	var out bytes.Buffer
++	zlog.Logger = zerolog.New(&out)
++	sampled := zlog.Sample(&zerolog.BasicSampler{N: 2})
++
++	emitNoLevel(sampled, 1, 2, 3, 4)
++
++	if got := out.String(); got != "{\"i\":1}\n{\"i\":3}\n" {
++		t.Fatalf("log.Sample output = %q, want %q", got, "{\"i\":1}\n{\"i\":3}\n")
++	}
++}
++
++func TestRandomSamplerDeterministicBoundariesAndPredefinedRates(t *testing.T) {
++
++
++	if got := zerolog.RandomSampler(0).Sample(zerolog.NoLevel); got != false {
++		t.Fatalf("RandomSampler(0).Sample(NoLevel) = %t, want false", got)
++	}
++	if got := zerolog.RandomSampler(1).Sample(zerolog.NoLevel); got != true {
++		t.Fatalf("RandomSampler(1) first Sample(NoLevel) = %t, want true", got)
++	}
++	if got := zerolog.RandomSampler(1).Sample(zerolog.NoLevel); got != true {
++		t.Fatalf("RandomSampler(1) second Sample(NoLevel) = %t, want true", got)
++	}
++	if got := uint32(zerolog.Often); got != 10 {
++		t.Fatalf("uint32(Often) = %d, want 10", got)
++	}
++	if got := uint32(zerolog.Sometimes); got != 100 {
++		t.Fatalf("uint32(Sometimes) = %d, want 100", got)
++	}
++	if got := uint32(zerolog.Rarely); got != 1000 {
++		t.Fatalf("uint32(Rarely) = %d, want 1000", got)
++	}
++}
++
++func TestBurstSamplerBurstResetAndDelegation(t *testing.T) {
++
++
++	originalTimestampFunc := zerolog.TimestampFunc
++	defer func() { zerolog.TimestampFunc = originalTimestampFunc }()
++
++	t0 := time.Date(2024, 1, 2, 3, 4, 5, 0, time.UTC)
++	now := t0
++	zerolog.TimestampFunc = func() time.Time { return now }
++
++	burstOnly := &zerolog.BurstSampler{Burst: 2, Period: time.Second}
++	gotFirstPeriod := []bool{
++		burstOnly.Sample(zerolog.NoLevel),
++		burstOnly.Sample(zerolog.NoLevel),
++		burstOnly.Sample(zerolog.NoLevel),
++	}
++	if !reflect.DeepEqual(gotFirstPeriod, []bool{true, true, false}) {
++		t.Fatalf("BurstSampler first period sequence = %#v, want %#v", gotFirstPeriod, []bool{true, true, false})
++	}
++
++	now = t0.Add(time.Second)
++	gotSecondPeriod := []bool{
++		burstOnly.Sample(zerolog.NoLevel),
++		burstOnly.Sample(zerolog.NoLevel),
++		burstOnly.Sample(zerolog.NoLevel),
++	}
++	if !reflect.DeepEqual(gotSecondPeriod, []bool{true, true, false}) {
++		t.Fatalf("BurstSampler second period sequence = %#v, want %#v", gotSecondPeriod, []bool{true, true, false})
++	}
++
++	now = t0
++	withNext := &zerolog.BurstSampler{Burst: 2, Period: time.Second, NextSampler: &zerolog.BasicSampler{N: 2}}
++	gotWithNext := []bool{
++		withNext.Sample(zerolog.NoLevel),
++		withNext.Sample(zerolog.NoLevel),
++		withNext.Sample(zerolog.NoLevel),
++		withNext.Sample(zerolog.NoLevel),
++		withNext.Sample(zerolog.NoLevel),
++		withNext.Sample(zerolog.NoLevel),
++	}
++	if !reflect.DeepEqual(gotWithNext, []bool{true, true, true, false, true, false}) {
++		t.Fatalf("BurstSampler with NextSampler sequence = %#v, want %#v", gotWithNext, []bool{true, true, true, false, true, false})
++	}
++}
++
++func TestBurstSamplerZeroBurstOrPeriodGoesStraightToNextSampler(t *testing.T) {
++
++
++	zeroBurstNil := &zerolog.BurstSampler{Burst: 0, Period: time.Second}
++	if got := zeroBurstNil.Sample(zerolog.NoLevel); got != false {
++		t.Fatalf("BurstSampler{Burst:0,NextSampler:nil}.Sample(NoLevel) = %t, want false", got)
++	}
++
++	zeroPeriodNil := &zerolog.BurstSampler{Burst: 2, Period: 0}
++	if got := zeroPeriodNil.Sample(zerolog.NoLevel); got != false {
++		t.Fatalf("BurstSampler{Period:0,NextSampler:nil}.Sample(NoLevel) = %t, want false", got)
++	}
++
++	zeroBurstNext := &zerolog.BurstSampler{Burst: 0, Period: time.Second, NextSampler: &zerolog.BasicSampler{N: 2}}
++	gotZeroBurstNext := []bool{
++		zeroBurstNext.Sample(zerolog.NoLevel),
++		zeroBurstNext.Sample(zerolog.NoLevel),
++		zeroBurstNext.Sample(zerolog.NoLevel),
++	}
++	if !reflect.DeepEqual(gotZeroBurstNext, []bool{true, false, true}) {
++		t.Fatalf("BurstSampler zero Burst with NextSampler sequence = %#v, want %#v", gotZeroBurstNext, []bool{true, false, true})
++	}
++
++	zeroPeriodNext := &zerolog.BurstSampler{Burst: 2, Period: 0, NextSampler: &zerolog.BasicSampler{N: 2}}
++	gotZeroPeriodNext := []bool{
++		zeroPeriodNext.Sample(zerolog.NoLevel),
++		zeroPeriodNext.Sample(zerolog.NoLevel),
++		zeroPeriodNext.Sample(zerolog.NoLevel),
++	}
++	if !reflect.DeepEqual(gotZeroPeriodNext, []bool{true, false, true}) {
++		t.Fatalf("BurstSampler zero Period with NextSampler sequence = %#v, want %#v", gotZeroPeriodNext, []bool{true, false, true})
++	}
++}
++
++func TestLevelSamplerRoutesConfiguredLevelsAndAllowsUnconfiguredLevels(t *testing.T) {
++
++
++	var out bytes.Buffer
++	logger := zerolog.New(&out).Sample(zerolog.LevelSampler{
++		DebugSampler: &zerolog.BasicSampler{N: 0},
++		InfoSampler:  &zerolog.BasicSampler{N: 2},
++		WarnSampler:  &zerolog.BasicSampler{N: 1},
++	})
++
++	logger.Debug().Int("i", 1).Msg("")
++	logger.Info().Int("i", 2).Msg("")
++	logger.Info().Int("i", 3).Msg("")
++	logger.Warn().Int("i", 4).Msg("")
++	logger.Error().Int("i", 5).Msg("")
++	logger.Log().Int("i", 6).Msg("")
++
++
++	records := parseLogLines(t, out.String())
++	if len(records) != 4 {
++		t.Fatalf("LevelSampler logger record count = %d, want 4 (%q)", len(records), out.String())
++	}
++	requireRecord(t, records[0], 2, "info")
++	requireRecord(t, records[1], 4, "warn")
++	requireRecord(t, records[2], 5, "error")
++	requireRecord(t, records[3], 6, "")
++
++	direct := zerolog.LevelSampler{
++		TraceSampler: &zerolog.BasicSampler{N: 1},
++		DebugSampler: &zerolog.BasicSampler{N: 0},
++		InfoSampler:  &zerolog.BasicSampler{N: 1},
++		WarnSampler:  &zerolog.BasicSampler{N: 0},
++		ErrorSampler: &zerolog.BasicSampler{N: 1},
++	}
++	got := []bool{
++		direct.Sample(zerolog.TraceLevel),
++		direct.Sample(zerolog.DebugLevel),
++		direct.Sample(zerolog.InfoLevel),
++		direct.Sample(zerolog.WarnLevel),
++		direct.Sample(zerolog.ErrorLevel),
++		direct.Sample(zerolog.FatalLevel),
++		direct.Sample(zerolog.PanicLevel),
++		direct.Sample(zerolog.NoLevel),
++	}
++	want := []bool{true, false, true, false, true, true, true, true}
++	if !reflect.DeepEqual(got, want) {
++		t.Fatalf("LevelSampler direct sequence = %#v, want %#v", got, want)
++	}
++}
++
++func TestDisableSamplingOverrideIsReversibleAndIdempotent(t *testing.T) {
++
++
++	zerolog.DisableSampling(false)
++	defer zerolog.DisableSampling(false)
++
++	var out bytes.Buffer
++	logger := zerolog.New(&out).Sample(&zerolog.BasicSampler{N: 2})
++
++	zerolog.DisableSampling(true)
++	zerolog.DisableSampling(true)
++	emitNoLevel(logger, 1, 2)
++
++	zerolog.DisableSampling(false)
++	zerolog.DisableSampling(false)
++	emitNoLevel(logger, 3, 4, 5, 6)
++
++	if got := out.String(); got != "{\"i\":1}\n{\"i\":2}\n{\"i\":3}\n{\"i\":5}\n" {
++		t.Fatalf("DisableSampling override output = %q, want %q", got, "{\"i\":1}\n{\"i\":2}\n{\"i\":3}\n{\"i\":5}\n")
++	}
++}
++
++func TestSampledLoggersMaintainIndependentSamplerState(t *testing.T) {
++
++
++	var outA bytes.Buffer
++	var outB bytes.Buffer
++	loggerA := zerolog.New(&outA).Sample(&zerolog.BasicSampler{N: 2})
++	loggerB := zerolog.New(&outB).Sample(&zerolog.BasicSampler{N: 2})
++
++	loggerA.Log().Int("i", 1).Msg("")
++	loggerB.Log().Int("i", 10).Msg("")
++	loggerA.Log().Int("i", 2).Msg("")
++	loggerB.Log().Int("i", 11).Msg("")
++
++	if got := outA.String(); got != "{\"i\":1}\n" {
++		t.Fatalf("loggerA output = %q, want %q", got, "{\"i\":1}\n")
++	}
++	if got := outB.String(); got != "{\"i\":10}\n" {
++		t.Fatalf("loggerB output = %q, want %q", got, "{\"i\":10}\n")
++	}
++}
++
++func TestRepeatedSampledLoggerCyclesUseFreshBasicSamplerState(t *testing.T) {
++
++
++
++
++	for i := 0; i < 25; i++ {
++		var out bytes.Buffer
++		logger := zerolog.New(&out).Sample(&zerolog.BasicSampler{N: 2})
++		emitNoLevel(logger, 1, 2, 3, 4)
++		if got := out.String(); got != "{\"i\":1}\n{\"i\":3}\n" {
++			t.Fatalf("cycle %d sampled output = %q, want %q", i, got, "{\"i\":1}\n{\"i\":3}\n")
++		}
++	}
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,19 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++export GOTOOLCHAIN=local
++export GOPROXY=off
++export GOSUMDB=off
++set -e
++cd /workspace/repo
++set -euo pipefail
++
++cd /workspace/repo
++
++exec go test -v -count=1 ./usercase-test-coderl/...

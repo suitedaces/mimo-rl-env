@@ -1,0 +1,311 @@
+diff --git a/pkg/ingress/reference_indexer_test.go b/pkg/ingress/reference_indexer_test.go
+new file mode 100644
+index 000000000..bd5331568
+--- /dev/null
++++ b/pkg/ingress/reference_indexer_test.go
+@@ -0,0 +1,281 @@
++package ingress
++
++import (
++	"context"
++	"testing"
++
++	"github.com/stretchr/testify/assert"
++	corev1 "k8s.io/api/core/v1"
++	networking "k8s.io/api/networking/v1beta1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/util/intstr"
++	"sigs.k8s.io/aws-load-balancer-controller/pkg/annotations"
++	"sigs.k8s.io/controller-runtime/pkg/log"
++)
++
++func newTestReferenceIndexer() *defaultReferenceIndexer {
++	annotationParser := annotations.NewSuffixAnnotationParser("alb.ingress.kubernetes.io")
++	authConfigBuilder := NewDefaultAuthConfigBuilder(annotationParser)
++	enhancedBackendBuilder := NewDefaultEnhancedBackendBuilder(annotationParser)
++	return NewDefaultReferenceIndexer(enhancedBackendBuilder, authConfigBuilder, &log.NullLogger{})
++}
++
++func Test_referenceIndexer_BuildServiceRefIndexes(t *testing.T) {
++	type args struct {
++		ing *networking.Ingress
++	}
++	tests := []struct {
++		name string
++		args args
++		want []string
++	}{
++		{
++			name: "default backend and rule backends are collected, deduped and sorted",
++			args: args{
++				ing: &networking.Ingress{
++					ObjectMeta: metav1.ObjectMeta{Name: "my-ing"},
++					Spec: networking.IngressSpec{
++						Backend: &networking.IngressBackend{
++							ServiceName: "svc-a",
++							ServicePort: intstr.FromInt(80),
++						},
++						Rules: []networking.IngressRule{
++							{
++								IngressRuleValue: networking.IngressRuleValue{
++									HTTP: &networking.HTTPIngressRuleValue{
++										Paths: []networking.HTTPIngressPath{
++											{Backend: networking.IngressBackend{ServiceName: "svc-c", ServicePort: intstr.FromInt(80)}},
++											{Backend: networking.IngressBackend{ServiceName: "svc-b", ServicePort: intstr.FromInt(80)}},
++										},
++									},
++								},
++							},
++							{
++								IngressRuleValue: networking.IngressRuleValue{
++									HTTP: &networking.HTTPIngressRuleValue{
++										Paths: []networking.HTTPIngressPath{
++											{Backend: networking.IngressBackend{ServiceName: "svc-b", ServicePort: intstr.FromInt(80)}},
++											{Backend: networking.IngressBackend{ServiceName: "svc-d", ServicePort: intstr.FromInt(80)}},
++										},
++									},
++								},
++							},
++						},
++					},
++				},
++			},
++			want: []string{"svc-a", "svc-b", "svc-c", "svc-d"},
++		},
++		{
++			name: "without default backend",
++			args: args{
++				ing: &networking.Ingress{
++					ObjectMeta: metav1.ObjectMeta{Name: "my-ing"},
++					Spec: networking.IngressSpec{
++						Rules: []networking.IngressRule{
++							{
++								IngressRuleValue: networking.IngressRuleValue{
++									HTTP: &networking.HTTPIngressRuleValue{
++										Paths: []networking.HTTPIngressPath{
++											{Backend: networking.IngressBackend{ServiceName: "svc-b", ServicePort: intstr.FromInt(80)}},
++											{Backend: networking.IngressBackend{ServiceName: "svc-c", ServicePort: intstr.FromInt(80)}},
++										},
++									},
++								},
++							},
++						},
++					},
++				},
++			},
++			want: []string{"svc-b", "svc-c"},
++		},
++		{
++			name: "rules without an HTTP section are ignored",
++			args: args{
++				ing: &networking.Ingress{
++					ObjectMeta: metav1.ObjectMeta{Name: "my-ing"},
++					Spec: networking.IngressSpec{
++						Rules: []networking.IngressRule{
++							{IngressRuleValue: networking.IngressRuleValue{HTTP: nil}},
++							{
++								IngressRuleValue: networking.IngressRuleValue{
++									HTTP: &networking.HTTPIngressRuleValue{
++										Paths: []networking.HTTPIngressPath{
++											{Backend: networking.IngressBackend{ServiceName: "svc-b", ServicePort: intstr.FromInt(80)}},
++											{Backend: networking.IngressBackend{ServiceName: "svc-d", ServicePort: intstr.FromInt(80)}},
++										},
++									},
++								},
++							},
++						},
++					},
++				},
++			},
++			want: []string{"svc-b", "svc-d"},
++		},
++		{
++			name: "use-annotation backends are resolved; arn-only target groups contribute no service",
++			args: args{
++				ing: &networking.Ingress{
++					ObjectMeta: metav1.ObjectMeta{
++						Name: "my-ing",
++						Annotations: map[string]string{
++							"alb.ingress.kubernetes.io/actions.forward-single-svc":   `{"type":"forward","forwardConfig":{"targetGroups":[{"serviceName":"svc-a","servicePort":"80"}]}}`,
++							"alb.ingress.kubernetes.io/actions.forward-multiple-svc": `{"type":"forward","forwardConfig":{"targetGroups":[{"serviceName":"svc-b","servicePort":"80","weight":20},{"serviceName":"svc-c","servicePort":"80","weight":80}]}}`,
++							"alb.ingress.kubernetes.io/actions.forward-single-tg":    `{"type":"forward","forwardConfig":{"targetGroups":[{"targetGroupArn":"tg-a"}]}}`,
++							"alb.ingress.kubernetes.io/actions.forward-multiple-tg":  `{"type":"forward","forwardConfig":{"targetGroups":[{"targetGroupArn":"tg-a","weight":20},{"targetGroupArn":"tg-b","weight":20}]}}`,
++						},
++					},
++					Spec: networking.IngressSpec{
++						Backend: &networking.IngressBackend{
++							ServiceName: "forward-single-svc",
++							ServicePort: intstr.FromString("use-annotation"),
++						},
++						Rules: []networking.IngressRule{
++							{
++								IngressRuleValue: networking.IngressRuleValue{
++									HTTP: &networking.HTTPIngressRuleValue{
++										Paths: []networking.HTTPIngressPath{
++											{Backend: networking.IngressBackend{ServiceName: "forward-multiple-svc", ServicePort: intstr.FromString("use-annotation")}},
++											{Backend: networking.IngressBackend{ServiceName: "forward-single-tg", ServicePort: intstr.FromString("use-annotation")}},
++											{Backend: networking.IngressBackend{ServiceName: "forward-multiple-tg", ServicePort: intstr.FromString("use-annotation")}},
++										},
++									},
++								},
++							},
++						},
++					},
++				},
++			},
++			want: []string{"svc-a", "svc-b", "svc-c"},
++		},
++		{
++			name: "a backend that fails to build yields no names at all",
++			args: args{
++				ing: &networking.Ingress{
++					ObjectMeta: metav1.ObjectMeta{Name: "my-ing"},
++					Spec: networking.IngressSpec{
++						Backend: &networking.IngressBackend{
++							ServiceName: "svc-a",
++							ServicePort: intstr.FromInt(80),
++						},
++						Rules: []networking.IngressRule{
++							{
++								IngressRuleValue: networking.IngressRuleValue{
++									HTTP: &networking.HTTPIngressRuleValue{
++										Paths: []networking.HTTPIngressPath{
++
++											{Backend: networking.IngressBackend{ServiceName: "missing-action", ServicePort: intstr.FromString("use-annotation")}},
++										},
++									},
++								},
++							},
++						},
++					},
++				},
++			},
++			want: nil,
++		},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			i := newTestReferenceIndexer()
++			got := i.BuildServiceRefIndexes(context.Background(), tt.args.ing)
++			if len(tt.want) == 0 {
++				assert.Empty(t, got)
++			} else {
++				assert.Equal(t, tt.want, got)
++			}
++		})
++	}
++}
++
++func Test_referenceIndexer_BuildSecretRefIndexes(t *testing.T) {
++	type args struct {
++		ingOrSvc metav1.Object
++	}
++	tests := []struct {
++		name string
++		args args
++		want []string
++	}{
++		{
++			name: "ingress with OIDC auth annotation",
++			args: args{
++				ingOrSvc: &networking.Ingress{
++					ObjectMeta: metav1.ObjectMeta{
++						Name: "my-ing",
++						Annotations: map[string]string{
++							"alb.ingress.kubernetes.io/auth-type":    "oidc",
++							"alb.ingress.kubernetes.io/auth-idp-oidc": `{"issuer":"https://example.com","authorizationEndpoint":"https://authorization.example.com","tokenEndpoint":"https://token.example.com","userInfoEndpoint":"https://userinfo.example.com","secretName":"my-k8s-secret"}`,
++						},
++					},
++				},
++			},
++			want: []string{"my-k8s-secret"},
++		},
++		{
++			name: "OIDC secret is indexed even when auth-type is not set",
++			args: args{
++				ingOrSvc: &networking.Ingress{
++					ObjectMeta: metav1.ObjectMeta{
++						Name: "my-ing",
++						Annotations: map[string]string{
++							"alb.ingress.kubernetes.io/auth-idp-oidc": `{"issuer":"https://example.com","authorizationEndpoint":"https://authorization.example.com","tokenEndpoint":"https://token.example.com","userInfoEndpoint":"https://userinfo.example.com","secretName":"oidc-secret"}`,
++						},
++					},
++				},
++			},
++			want: []string{"oidc-secret"},
++		},
++		{
++			name: "service carrying OIDC config on its own",
++			args: args{
++				ingOrSvc: &corev1.Service{
++					ObjectMeta: metav1.ObjectMeta{
++						Name: "my-svc",
++						Annotations: map[string]string{
++							"alb.ingress.kubernetes.io/auth-idp-oidc": `{"issuer":"https://example.com","authorizationEndpoint":"https://authorization.example.com","tokenEndpoint":"https://token.example.com","userInfoEndpoint":"https://userinfo.example.com","secretName":"svc-secret"}`,
++						},
++					},
++				},
++			},
++			want: []string{"svc-secret"},
++		},
++		{
++			name: "no auth annotations",
++			args: args{
++				ingOrSvc: &networking.Ingress{
++					ObjectMeta: metav1.ObjectMeta{Name: "my-ing"},
++				},
++			},
++			want: nil,
++		},
++		{
++			name: "only cognito auth configured yields no secret",
++			args: args{
++				ingOrSvc: &networking.Ingress{
++					ObjectMeta: metav1.ObjectMeta{
++						Name: "my-ing",
++						Annotations: map[string]string{
++							"alb.ingress.kubernetes.io/auth-type":       "cognito",
++							"alb.ingress.kubernetes.io/auth-idp-cognito": `{"userPoolARN":"arn:aws:cognito-idp:us-west-2:xxx:userpool/xxx","userPoolClientID":"my-clientID","userPoolDomain":"my-domain"}`,
++						},
++					},
++				},
++			},
++			want: nil,
++		},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			i := newTestReferenceIndexer()
++			got := i.BuildSecretRefIndexes(context.Background(), tt.args.ingOrSvc)
++			if len(tt.want) == 0 {
++				assert.Empty(t, got)
++			} else {
++				assert.Equal(t, tt.want, got)
++			}
++		})
++	}
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,19 @@
++#!/usr/bin/env bash
++
++
++
++set -euo pipefail
++HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++cd /testbed
++
++
++
++
++export GOFLAGS=-mod=mod
++export GOPROXY=off
++
++
++go test ./pkg/ingress/...
++
++
++go test ./pkg/ingress/ -run 'Test_referenceIndexer'

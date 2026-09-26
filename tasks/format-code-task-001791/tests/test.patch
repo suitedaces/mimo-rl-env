@@ -1,0 +1,775 @@
+diff --git a/usercase-test-coderl/fixtures/fixture_vm_commit_acceptance_test.go b/usercase-test-coderl/fixtures/fixture_vm_commit_acceptance_test.go
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/fixtures/fixture_vm_commit_acceptance_test.go
+@@ -0,0 +1,624 @@
++package virter_test
++
++import (
++	"bytes"
++	"context"
++	"fmt"
++	"io"
++	"strings"
++	"testing"
++	"time"
++
++	libvirt "github.com/digitalocean/go-libvirt"
++	"golang.org/x/crypto/ssh"
++	lx "libvirt.org/go/libvirtxml"
++
++	"github.com/LINBIT/virter/internal/virter"
++)
++
++const (
++	fixturePoolName     = "fixture-pool"
++	fixtureNetworkName  = "fixture-network"
++	fixtureVMName       = "some-vm"
++	fixtureBaseImage    = "base-image"
++	fixtureCustomImage  = "custom-image"
++	fixtureVMIP         = "192.0.2.15"
++	fixtureVMMAC        = "52:54:00:00:00:2a"
++	fixtureLayerContent = "root disk content to commit\n"
++)
++
++type fixtureInstantTimeout struct{}
++
++func (fixtureInstantTimeout) After(time.Duration) <-chan time.Time {
++	ch := make(chan time.Time, 1)
++	ch <- time.Unix(0, 0)
++	return ch
++}
++
++type fixtureNeverTimeout struct{}
++
++func (fixtureNeverTimeout) After(time.Duration) <-chan time.Time {
++	return make(chan time.Time)
++}
++
++type fixtureFakeKeyStore struct{}
++
++func (fixtureFakeKeyStore) Auth() []ssh.AuthMethod { return nil }
++func (fixtureFakeKeyStore) KeyBytes() []byte       { return nil }
++func (fixtureFakeKeyStore) KeyPath() string        { return "" }
++func (fixtureFakeKeyStore) PublicKey() []byte      { return nil }
++
++type fixtureFakeStorageVol struct {
++	description *lx.StorageVolume
++	content     []byte
++}
++
++type fixtureFakePool struct {
++	vols map[string]*fixtureFakeStorageVol
++}
++
++type fixtureFakeDomain struct {
++	description   *lx.Domain
++	active        bool
++	persistent    bool
++	shutdownStops bool
++}
++
++type fixtureFakeLibvirtConnection struct {
++	pools    map[string]*fixtureFakePool
++	networks map[string]*lx.Network
++	domains  map[string]*fixtureFakeDomain
++}
++
++func fixtureLibvirtError(code libvirt.ErrorNumber, msg string) error {
++	return libvirt.Error{Code: uint32(code), Message: msg}
++}
++
++func newFixtureFakeLibvirtConnection() *fixtureFakeLibvirtConnection {
++	return &fixtureFakeLibvirtConnection{
++		pools: map[string]*fixtureFakePool{
++			fixturePoolName: {vols: map[string]*fixtureFakeStorageVol{}},
++		},
++		networks: map[string]*lx.Network{
++			fixtureNetworkName: {
++				Name: fixtureNetworkName,
++				IPs: []lx.NetworkIP{{
++					Address: "192.0.2.1",
++					Netmask: "255.255.255.0",
++					DHCP: &lx.NetworkDHCP{
++						Hosts: []lx.NetworkDHCPHost{{MAC: fixtureVMMAC, IP: fixtureVMIP}},
++					},
++				}},
++			},
++		},
++		domains: map[string]*fixtureFakeDomain{},
++	}
++}
++
++func fixtureStorageVol(name string, backing *lx.StorageVolumeBackingStore, content []byte) *fixtureFakeStorageVol {
++	return &fixtureFakeStorageVol{
++		description: &lx.StorageVolume{
++			Name:         name,
++			Key:          "/fixture/" + name,
++			Capacity:     &lx.StorageVolumeSize{Value: uint64(len(content)), Unit: "bytes"},
++			Physical:     &lx.StorageVolumeSize{Value: uint64(len(content)), Unit: "bytes"},
++			Target:       &lx.StorageVolumeTarget{Format: &lx.StorageVolumeTargetFormat{Type: "qcow2"}},
++			BackingStore: backing,
++		},
++		content: append([]byte(nil), content...),
++	}
++}
++
++func (l *fixtureFakeLibvirtConnection) addFakeImage(name string) {
++	layerName := virter.LayerVolumePrefix + "sha256:fixture-base-layer"
++	l.pools[fixturePoolName].vols[layerName] = fixtureStorageVol(layerName, nil, []byte("base image\n"))
++	l.pools[fixturePoolName].vols[virter.TagVolumePrefix+name] = fixtureStorageVol(
++		virter.TagVolumePrefix+name,
++		&lx.StorageVolumeBackingStore{Path: "./" + layerName, Format: &lx.StorageVolumeTargetFormat{Type: "qcow2"}},
++		nil,
++	)
++}
++
++func fixtureDomainXML(name string, active bool) *lx.Domain {
++	return &lx.Domain{
++		Name: name,
++		Devices: &lx.DomainDeviceList{
++			Disks: []lx.DomainDisk{
++				{
++					Device: "disk",
++					Driver: &lx.DomainDiskDriver{Name: "qemu", Type: "qcow2"},
++					Source: &lx.DomainDiskSource{Volume: &lx.DomainDiskSourceVolume{Pool: fixturePoolName, Volume: virter.DynamicLayerName(name)}},
++					Target: &lx.DomainDiskTarget{Dev: "vda", Bus: "virtio"},
++				},
++				{
++					Device: "cdrom",
++					Driver: &lx.DomainDiskDriver{Name: "qemu", Type: "raw"},
++					Source: &lx.DomainDiskSource{Volume: &lx.DomainDiskSourceVolume{Pool: fixturePoolName, Volume: virter.DynamicLayerName(name + "-cidata")}},
++					Target: &lx.DomainDiskTarget{Dev: "sda", Bus: "scsi"},
++				},
++			},
++			Interfaces: []lx.DomainInterface{{
++				MAC:    &lx.DomainInterfaceMAC{Address: fixtureVMMAC},
++				Source: &lx.DomainInterfaceSource{Network: &lx.DomainInterfaceSourceNetwork{Network: fixtureNetworkName}},
++			}},
++		},
++	}
++}
++
++func fixtureCommitVM(t *testing.T, active bool, withRoot bool) (*fixtureFakeLibvirtConnection, *virter.Virter) {
++	t.Helper()
++
++	l := newFixtureFakeLibvirtConnection()
++	l.addFakeImage(fixtureBaseImage)
++	l.domains[fixtureVMName] = &fixtureFakeDomain{
++		description:   fixtureDomainXML(fixtureVMName, active),
++		active:        active,
++		persistent:    true,
++		shutdownStops: true,
++	}
++	if withRoot {
++		l.pools[fixturePoolName].vols[virter.DynamicLayerName(fixtureVMName)] = fixtureStorageVol(
++			virter.DynamicLayerName(fixtureVMName),
++			&lx.StorageVolumeBackingStore{Path: "./" + virter.LayerVolumePrefix + "sha256:fixture-base-layer", Format: &lx.StorageVolumeTargetFormat{Type: "qcow2"}},
++			[]byte(fixtureLayerContent),
++		)
++	}
++	l.pools[fixturePoolName].vols[virter.DynamicLayerName(fixtureVMName+"-cidata")] = fixtureStorageVol(virter.DynamicLayerName(fixtureVMName+"-cidata"), nil, nil)
++
++	return l, virter.New(l, fixturePoolName, fixtureNetworkName, fixtureFakeKeyStore{})
++}
++
++func (l *fixtureFakeLibvirtConnection) committedImage(t *testing.T, v *virter.Virter, name string) *virter.LocalImage {
++	t.Helper()
++	pool, err := l.StoragePoolLookupByName(fixturePoolName)
++	if err != nil {
++		t.Fatalf("StoragePoolLookupByName: %v", err)
++	}
++	img, err := v.FindImage(name, pool)
++	if err != nil {
++		t.Fatalf("FindImage(%q): %v", name, err)
++	}
++	if img == nil {
++		t.Fatalf("FindImage(%q) = nil", name)
++	}
++	return img
++}
++
++func TestFixtureAcceptanceCommitStoppedDefaultImageName(t *testing.T) {
++	l, v := fixtureCommitVM(t, false, true)
++
++	err := v.VMCommit(context.Background(), fixtureNeverTimeout{}, fixtureVMName, virter.CommitConfig{
++		ImageName:       fixtureVMName,
++		Shutdown:        true,
++		ShutdownTimeout: time.Second,
++		ResetMachineID:  false,
++	}, false)
++	if err != nil {
++		t.Fatalf("VMCommit returned error: %v", err)
++	}
++
++	img := l.committedImage(t, v, fixtureVMName)
++	if got, want := img.Name(), fixtureVMName; got != want {
++		t.Fatalf("image name = %q; want %q", got, want)
++	}
++
++	if top := img.TopLayer(); top == nil || !strings.HasPrefix(top.Name(), virter.LayerVolumePrefix) {
++		t.Fatalf("top layer = %v; want local immutable layer", top)
++	}
++	if got := string(l.pools[fixturePoolName].vols[img.TopLayer().Name()].content); got != fixtureLayerContent {
++		t.Fatalf("committed layer content = %q; want preserved root content", got)
++	}
++	if _, ok := l.pools[fixturePoolName].vols[virter.DynamicLayerName(fixtureVMName)]; ok {
++		t.Fatalf("root boot volume was not converted away from dynamic layer")
++	}
++	if _, err := l.DomainLookupByName(fixtureVMName); err == nil {
++		t.Fatalf("domain %q still exists after commit", fixtureVMName)
++	}
++
++	imgs, err := v.ImageList()
++	if err != nil {
++		t.Fatalf("ImageList: %v", err)
++	}
++	found := false
++	for _, listed := range imgs {
++		if listed.Name() == fixtureVMName {
++			found = true
++		}
++	}
++	if !found {
++		t.Fatalf("ImageList did not include committed image %q", fixtureVMName)
++	}
++}
++
++func TestFixtureAcceptanceCommitExplicitImageName(t *testing.T) {
++	l, v := fixtureCommitVM(t, false, true)
++
++	err := v.VMCommit(context.Background(), fixtureNeverTimeout{}, fixtureVMName, virter.CommitConfig{
++		ImageName:       fixtureCustomImage,
++		Shutdown:        true,
++		ShutdownTimeout: time.Second,
++		ResetMachineID:  false,
++	}, false)
++	if err != nil {
++		t.Fatalf("VMCommit returned error: %v", err)
++	}
++
++	img := l.committedImage(t, v, fixtureCustomImage)
++	if got, want := img.Name(), fixtureCustomImage; got != want {
++		t.Fatalf("image name = %q; want %q", got, want)
++	}
++	pool, _ := l.StoragePoolLookupByName(fixturePoolName)
++	defaultName, err := v.FindImage(fixtureVMName, pool)
++	if err != nil {
++		t.Fatalf("FindImage(%q): %v", fixtureVMName, err)
++	}
++	if defaultName != nil {
++		t.Fatalf("default-name tag exists when explicit image name was requested")
++	}
++}
++
++func TestFixtureAcceptanceRunningShutdownFalseError(t *testing.T) {
++	_, v := fixtureCommitVM(t, true, true)
++
++	err := v.VMCommit(context.Background(), fixtureNeverTimeout{}, fixtureVMName, virter.CommitConfig{
++		ImageName:       fixtureVMName,
++		Shutdown:        false,
++		ShutdownTimeout: time.Second,
++		ResetMachineID:  true,
++	}, false)
++	if err == nil {
++		t.Fatalf("VMCommit succeeded; want error")
++	}
++	if got, want := err.Error(), "must allow shutdown to commit a running VM"; got != want {
++		t.Fatalf("error = %q; want %q", got, want)
++	}
++}
++
++func TestFixtureAcceptanceRunningShutdownTimeoutError(t *testing.T) {
++	l, v := fixtureCommitVM(t, true, true)
++	l.domains[fixtureVMName].shutdownStops = false
++
++	err := v.VMCommit(context.Background(), fixtureInstantTimeout{}, fixtureVMName, virter.CommitConfig{
++		ImageName:       fixtureVMName,
++		Shutdown:        true,
++		ShutdownTimeout: time.Second,
++		ResetMachineID:  false,
++	}, false)
++	if err == nil {
++		t.Fatalf("VMCommit succeeded; want error")
++	}
++
++	if !strings.Contains(err.Error(), "timed out waiting for domain to stop") {
++		t.Fatalf("error = %q; want timeout message", err)
++	}
++}
++
++func TestFixtureAcceptanceRunningShutdownSuccess(t *testing.T) {
++	l, v := fixtureCommitVM(t, true, true)
++
++	err := v.VMCommit(context.Background(), fixtureNeverTimeout{}, fixtureVMName, virter.CommitConfig{
++		ImageName:       fixtureVMName,
++		Shutdown:        true,
++		ShutdownTimeout: time.Second,
++		ResetMachineID:  false,
++	}, false)
++	if err != nil {
++		t.Fatalf("VMCommit returned error: %v", err)
++	}
++	if _, err := l.DomainLookupByName(fixtureVMName); err == nil {
++		t.Fatalf("domain %q still exists after commit", fixtureVMName)
++	}
++	l.committedImage(t, v, fixtureVMName)
++}
++
++func TestFixtureAcceptanceResetMachineIDStoppedError(t *testing.T) {
++	_, v := fixtureCommitVM(t, false, true)
++
++	err := v.VMCommit(context.Background(), fixtureNeverTimeout{}, fixtureVMName, virter.CommitConfig{
++		ImageName:       fixtureVMName,
++		Shutdown:        true,
++		ShutdownTimeout: time.Second,
++		ResetMachineID:  true,
++	}, false)
++	if err == nil {
++		t.Fatalf("VMCommit succeeded; want error")
++	}
++
++	if !strings.Contains(err.Error(), "cannot reset machine ID of VM") {
++		t.Fatalf("error = %q; want reset-machine-id message", err)
++	}
++}
++
++func TestFixtureAcceptanceMissingRootLayerError(t *testing.T) {
++	_, v := fixtureCommitVM(t, false, false)
++
++	err := v.VMCommit(context.Background(), fixtureNeverTimeout{}, fixtureVMName, virter.CommitConfig{
++		ImageName:       fixtureVMName,
++		Shutdown:        true,
++		ShutdownTimeout: time.Second,
++		ResetMachineID:  false,
++	}, false)
++	if err == nil {
++		t.Fatalf("VMCommit succeeded; want error")
++	}
++	if got, want := err.Error(), "could not commit: missing root layer"; got != want {
++		t.Fatalf("error = %q; want %q", got, want)
++	}
++}
++
++func (l *fixtureFakeLibvirtConnection) ConnectListAllDomains(int32, libvirt.ConnectListAllDomainsFlags) ([]libvirt.Domain, uint32, error) {
++	domains := make([]libvirt.Domain, 0, len(l.domains))
++	for name := range l.domains {
++		domains = append(domains, libvirt.Domain{Name: name})
++	}
++	return domains, uint32(len(domains)), nil
++}
++
++func (l *fixtureFakeLibvirtConnection) StoragePoolLookupByName(name string) (libvirt.StoragePool, error) {
++	if _, ok := l.pools[name]; !ok {
++		return libvirt.StoragePool{}, fixtureLibvirtError(libvirt.ErrNoStoragePool, "missing pool")
++	}
++	return libvirt.StoragePool{Name: name}, nil
++}
++
++func (l *fixtureFakeLibvirtConnection) StoragePoolListAllVolumes(pool libvirt.StoragePool, _ int32, _ uint32) ([]libvirt.StorageVol, uint32, error) {
++	p, ok := l.pools[pool.Name]
++	if !ok {
++		return nil, 0, fixtureLibvirtError(libvirt.ErrNoStoragePool, "missing pool")
++	}
++	vols := make([]libvirt.StorageVol, 0, len(p.vols))
++	for name, vol := range p.vols {
++		vols = append(vols, libvirt.StorageVol{Pool: pool.Name, Name: name, Key: vol.description.Key})
++	}
++	return vols, uint32(len(vols)), nil
++}
++
++func (l *fixtureFakeLibvirtConnection) StorageVolCreateXML(pool libvirt.StoragePool, xml string, _ libvirt.StorageVolCreateFlags) (libvirt.StorageVol, error) {
++	p, ok := l.pools[pool.Name]
++	if !ok {
++		return libvirt.StorageVol{}, fixtureLibvirtError(libvirt.ErrNoStoragePool, "missing pool")
++	}
++	var desc lx.StorageVolume
++	if err := desc.Unmarshal(xml); err != nil {
++		return libvirt.StorageVol{}, err
++	}
++	desc.Key = "/fixture/" + desc.Name
++	if desc.Physical == nil {
++		desc.Physical = &lx.StorageVolumeSize{Value: desc.Capacity.Value, Unit: "bytes"}
++	}
++	p.vols[desc.Name] = &fixtureFakeStorageVol{description: &desc}
++	return libvirt.StorageVol{Pool: pool.Name, Name: desc.Name, Key: desc.Key}, nil
++}
++
++func (l *fixtureFakeLibvirtConnection) StorageVolCreateXMLFrom(pool libvirt.StoragePool, xml string, _ libvirt.StorageVol, flags libvirt.StorageVolCreateFlags) (libvirt.StorageVol, error) {
++	return l.StorageVolCreateXML(pool, xml, flags)
++}
++
++func (l *fixtureFakeLibvirtConnection) StorageVolDelete(vol libvirt.StorageVol, _ libvirt.StorageVolDeleteFlags) error {
++	p, ok := l.pools[vol.Pool]
++	if !ok {
++		return fixtureLibvirtError(libvirt.ErrNoStoragePool, "missing pool")
++	}
++	delete(p.vols, vol.Name)
++	return nil
++}
++
++func (l *fixtureFakeLibvirtConnection) StorageVolLookupByName(pool libvirt.StoragePool, name string) (libvirt.StorageVol, error) {
++	p, ok := l.pools[pool.Name]
++	if !ok {
++		return libvirt.StorageVol{}, fixtureLibvirtError(libvirt.ErrNoStoragePool, "missing pool")
++	}
++	vol, ok := p.vols[name]
++	if !ok {
++		return libvirt.StorageVol{}, fixtureLibvirtError(libvirt.ErrNoStorageVol, "missing volume")
++	}
++	return libvirt.StorageVol{Pool: pool.Name, Name: name, Key: vol.description.Key}, nil
++}
++
++func (l *fixtureFakeLibvirtConnection) StorageVolUpload(vol libvirt.StorageVol, src io.Reader, _, _ uint64, _ libvirt.StorageVolUploadFlags) error {
++	fv, err := l.lookupVol(vol)
++	if err != nil {
++		return err
++	}
++	content, err := io.ReadAll(src)
++	if err != nil {
++		return err
++	}
++	fv.content = content
++	fv.description.Capacity = &lx.StorageVolumeSize{Value: uint64(len(content)), Unit: "bytes"}
++	fv.description.Physical = &lx.StorageVolumeSize{Value: uint64(len(content)), Unit: "bytes"}
++	return nil
++}
++
++func (l *fixtureFakeLibvirtConnection) StorageVolGetXMLDesc(vol libvirt.StorageVol, _ uint32) (string, error) {
++	fv, err := l.lookupVol(vol)
++	if err != nil {
++		return "", err
++	}
++	return fv.description.Marshal()
++}
++
++func (l *fixtureFakeLibvirtConnection) StorageVolDownload(vol libvirt.StorageVol, dst io.Writer, _, _ uint64, _ libvirt.StorageVolDownloadFlags) error {
++	fv, err := l.lookupVol(vol)
++	if err != nil {
++		return err
++	}
++	_, err = io.Copy(dst, bytes.NewReader(fv.content))
++	return err
++}
++
++func (l *fixtureFakeLibvirtConnection) StorageVolGetInfo(vol libvirt.StorageVol) (int8, uint64, uint64, error) {
++	fv, err := l.lookupVol(vol)
++	if err != nil {
++		return 0, 0, 0, err
++	}
++	return 0, uint64(len(fv.content)), uint64(len(fv.content)), nil
++}
++
++func (l *fixtureFakeLibvirtConnection) lookupVol(vol libvirt.StorageVol) (*fixtureFakeStorageVol, error) {
++	p, ok := l.pools[vol.Pool]
++	if !ok {
++		return nil, fixtureLibvirtError(libvirt.ErrNoStoragePool, "missing pool")
++	}
++	fv, ok := p.vols[vol.Name]
++	if !ok {
++		return nil, fixtureLibvirtError(libvirt.ErrNoStorageVol, "missing volume")
++	}
++	return fv, nil
++}
++
++func (l *fixtureFakeLibvirtConnection) ConnectListAllNetworks(int32, libvirt.ConnectListAllNetworksFlags) ([]libvirt.Network, uint32, error) {
++	networks := make([]libvirt.Network, 0, len(l.networks))
++	for name := range l.networks {
++		networks = append(networks, libvirt.Network{Name: name})
++	}
++	return networks, uint32(len(networks)), nil
++}
++
++func (l *fixtureFakeLibvirtConnection) NetworkLookupByName(name string) (libvirt.Network, error) {
++	if _, ok := l.networks[name]; !ok {
++		return libvirt.Network{}, fixtureLibvirtError(libvirt.ErrNoNetwork, "missing network")
++	}
++	return libvirt.Network{Name: name}, nil
++}
++
++func (l *fixtureFakeLibvirtConnection) NetworkGetXMLDesc(net libvirt.Network, _ uint32) (string, error) {
++	desc, ok := l.networks[net.Name]
++	if !ok {
++		return "", fixtureLibvirtError(libvirt.ErrNoNetwork, "missing network")
++	}
++	return desc.Marshal()
++}
++
++func (l *fixtureFakeLibvirtConnection) NetworkUpdate(net libvirt.Network, command, section uint32, _ int32, xml string, _ libvirt.NetworkUpdateFlags) error {
++	desc, ok := l.networks[net.Name]
++	if !ok {
++		return fixtureLibvirtError(libvirt.ErrNoNetwork, "missing network")
++	}
++	if command != uint32(libvirt.NetworkUpdateCommandDelete) || section != uint32(libvirt.NetworkSectionIPDhcpHost) {
++		return nil
++	}
++	for ipIdx := range desc.IPs {
++		if desc.IPs[ipIdx].DHCP == nil {
++			continue
++		}
++		hosts := desc.IPs[ipIdx].DHCP.Hosts
++		for hostIdx, host := range hosts {
++			if strings.Contains(xml, host.MAC) && strings.Contains(xml, host.IP) {
++				desc.IPs[ipIdx].DHCP.Hosts = append(hosts[:hostIdx], hosts[hostIdx+1:]...)
++				return nil
++			}
++		}
++	}
++	return nil
++}
++
++func (l *fixtureFakeLibvirtConnection) DomainLookupByName(name string) (libvirt.Domain, error) {
++	if _, ok := l.domains[name]; !ok {
++		return libvirt.Domain{}, fixtureLibvirtError(libvirt.ErrNoDomain, "missing domain")
++	}
++	return libvirt.Domain{Name: name}, nil
++}
++
++func (l *fixtureFakeLibvirtConnection) DomainGetXMLDesc(dom libvirt.Domain, _ libvirt.DomainXMLFlags) (string, error) {
++	fd, ok := l.domains[dom.Name]
++	if !ok {
++		return "", fixtureLibvirtError(libvirt.ErrNoDomain, "missing domain")
++	}
++	return fd.description.Marshal()
++}
++
++func (l *fixtureFakeLibvirtConnection) DomainIsActive(dom libvirt.Domain) (int32, error) {
++	fd, ok := l.domains[dom.Name]
++	if !ok {
++		return 0, fixtureLibvirtError(libvirt.ErrNoDomain, "missing domain")
++	}
++	if fd.active {
++		return 1, nil
++	}
++	return 0, nil
++}
++
++func (l *fixtureFakeLibvirtConnection) DomainIsPersistent(dom libvirt.Domain) (int32, error) {
++	fd, ok := l.domains[dom.Name]
++	if !ok {
++		return 0, fixtureLibvirtError(libvirt.ErrNoDomain, "missing domain")
++	}
++	if fd.persistent {
++		return 1, nil
++	}
++	return 0, nil
++}
++
++func (l *fixtureFakeLibvirtConnection) DomainShutdown(dom libvirt.Domain) error {
++	fd, ok := l.domains[dom.Name]
++	if !ok {
++		return fixtureLibvirtError(libvirt.ErrNoDomain, "missing domain")
++	}
++	if fd.shutdownStops {
++		fd.active = false
++	}
++	return nil
++}
++
++func (l *fixtureFakeLibvirtConnection) DomainDestroy(dom libvirt.Domain) error {
++	fd, ok := l.domains[dom.Name]
++	if !ok {
++		return fixtureLibvirtError(libvirt.ErrNoDomain, "missing domain")
++	}
++	fd.active = false
++	return nil
++}
++
++func (l *fixtureFakeLibvirtConnection) DomainUndefineFlags(dom libvirt.Domain, _ libvirt.DomainUndefineFlagsValues) error {
++	delete(l.domains, dom.Name)
++	return nil
++}
++
++func (l *fixtureFakeLibvirtConnection) DomainListAllSnapshots(libvirt.Domain, int32, uint32) ([]libvirt.DomainSnapshot, int32, error) {
++	return nil, 0, nil
++}
++
++func (l *fixtureFakeLibvirtConnection) DomainSnapshotDelete(libvirt.DomainSnapshot, libvirt.DomainSnapshotDeleteFlags) error {
++	return nil
++}
++
++func (l *fixtureFakeLibvirtConnection) Disconnect() error { return nil }
++
++func (l *fixtureFakeLibvirtConnection) NetworkGetDhcpLeases(libvirt.Network, libvirt.OptString, int32, uint32) ([]libvirt.NetworkDhcpLease, uint32, error) {
++	return nil, 0, nil
++}
++
++func (l *fixtureFakeLibvirtConnection) NetworkDefineXML(string) (libvirt.Network, error) {
++	return libvirt.Network{}, fmt.Errorf("unused")
++}
++
++func (l *fixtureFakeLibvirtConnection) NetworkSetAutostart(libvirt.Network, int32) error {
++	return fmt.Errorf("unused")
++}
++
++func (l *fixtureFakeLibvirtConnection) NetworkCreate(libvirt.Network) error {
++	return fmt.Errorf("unused")
++}
++func (l *fixtureFakeLibvirtConnection) NetworkDestroy(libvirt.Network) error {
++	return fmt.Errorf("unused")
++}
++func (l *fixtureFakeLibvirtConnection) NetworkUndefine(libvirt.Network) error {
++	return fmt.Errorf("unused")
++}
++
++func (l *fixtureFakeLibvirtConnection) DomainDefineXML(string) (libvirt.Domain, error) {
++	return libvirt.Domain{}, fmt.Errorf("unused")
++}
++
++func (l *fixtureFakeLibvirtConnection) DomainCreate(libvirt.Domain) error {
++	return fmt.Errorf("unused")
++}
++
++func (l *fixtureFakeLibvirtConnection) ConnectSupportsFeature(int32) (int32, error) {
++	return 0, nil
++}
++
++func (l *fixtureFakeLibvirtConnection) ConnectGetDomainCapabilities(libvirt.OptString, libvirt.OptString, libvirt.OptString, libvirt.OptString, libvirt.ConnectGetDomainCapabilitiesFlags) (string, error) {
++	return "", fmt.Errorf("unused")
++}
+diff --git a/usercase-test-coderl/usecase.sh b/usercase-test-coderl/usecase.sh
+new file mode 100755
+--- /dev/null
++++ b/usercase-test-coderl/usecase.sh
+@@ -0,0 +1,119 @@
++#!/usr/bin/env bash
++
++set -u
++export LANG=C LC_ALL=C TZ=UTC
++
++( cd /workspace/repo && make virter ) || { echo "FAIL: build" >&2; exit 1; }
++BIN=/workspace/repo/virter
++
++TMP=$(mktemp -d)
++trap 'rm -rf "$TMP"; rm -f /workspace/repo/internal/virter/fixture_vm_commit_acceptance_test.go' EXIT
++cd "$TMP" || exit 1
++fail() { echo "FAIL: $*" >&2; exit 1; }
++
++write_config() {
++  local dir="$1"
++  cat >"$dir/virter.toml" <<EOF
++[auth]
++virter_public_key_path = "$dir/id_rsa.pub"
++virter_private_key_path = "$dir/id_rsa"
++EOF
++}
++
++
++
++
++HOME="$TMP/home-help" "$BIN" vm commit --help >out 2>err; ec=$?
++[ "$ec" -eq 0 ] || fail "F1 exit $ec; want 0"
++[ ! -s err ] || fail "F1 unexpected stderr: $(cat err)"
++
++grep -Fq "commit vm-name [image-name]" out || fail "F1 missing commit usage"
++grep -Fq -- "--reset-machine-id" out || fail "F1 missing --reset-machine-id flag"
++grep -Fq -- "--shutdown" out || fail "F1 missing --shutdown flag"
++
++
++
++
++mkdir -p "$TMP/missing"
++write_config "$TMP/missing"
++HOME="$TMP/missing" "$BIN" --config "$TMP/missing/virter.toml" --logformat short vm commit >out 2>err; ec=$?
++[ "$ec" -ne 0 ] || fail "F2 exit 0; want non-zero"
++[ ! -s out ] || fail "F2 unexpected stdout: $(cat out)"
++
++grep -Eiq "arg|usage|vm-name" err || fail "F2 missing argument error"
++
++
++
++
++mkdir -p "$TMP/too-many"
++write_config "$TMP/too-many"
++HOME="$TMP/too-many" "$BIN" --config "$TMP/too-many/virter.toml" --logformat short vm commit alpha beta gamma >out 2>err; ec=$?
++[ "$ec" -ne 0 ] || fail "F3 exit 0; want non-zero"
++[ ! -s out ] || fail "F3 unexpected stdout: $(cat out)"
++
++grep -Eiq "arg|usage|vm-name" err || fail "F3 missing argument error"
++
++
++
++
++mkdir -p "$TMP/one-arg"
++write_config "$TMP/one-arg"
++HOME="$TMP/one-arg" "$BIN" --config "$TMP/one-arg/virter.toml" --logformat short vm commit demo-vm >out 2>err; ec=$?
++[ "$ec" -ne 0 ] || fail "F4 expected non-zero without libvirt in fixture environment"
++[ ! -s out ] || fail "F4 unexpected stdout: $(cat out)"
++
++[ -s err ] || fail "F4 expected stderr from attempted commit"
++
++
++
++
++mkdir -p "$TMP/two-args"
++write_config "$TMP/two-args"
++HOME="$TMP/two-args" "$BIN" --config "$TMP/two-args/virter.toml" --logformat short vm commit demo-vm committed-image --shutdown=false --reset-machine-id=false >out 2>err; ec=$?
++[ "$ec" -ne 0 ] || fail "F5 expected non-zero without libvirt in fixture environment"
++[ ! -s out ] || fail "F5 unexpected stdout: $(cat out)"
++
++[ -s err ] || fail "F5 expected stderr from attempted commit"
++
++cp /workspace/repo/usercase-test-coderl/fixtures/fixture_vm_commit_acceptance_test.go /workspace/repo/internal/virter/fixture_vm_commit_acceptance_test.go
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++go_test_out="$TMP/go-test.out"
++( cd /workspace/repo && go test ./internal/virter -run 'TestFixtureAcceptance' -count=1 -v ) >"$go_test_out" 2>&1; ec=$?
++[ "$ec" -eq 0 ] || fail "F6-F12 go test exit $ec; output: $(cat "$go_test_out")"
++grep -Fq -- "--- PASS: TestFixtureAcceptanceCommitStoppedDefaultImageName" "$go_test_out" || fail "F6 did not run/pass"
++grep -Fq -- "--- PASS: TestFixtureAcceptanceCommitExplicitImageName" "$go_test_out" || fail "F7 did not run/pass"
++grep -Fq -- "--- PASS: TestFixtureAcceptanceRunningShutdownFalseError" "$go_test_out" || fail "F8 did not run/pass"
++grep -Fq -- "--- PASS: TestFixtureAcceptanceRunningShutdownTimeoutError" "$go_test_out" || fail "F9 did not run/pass"
++grep -Fq -- "--- PASS: TestFixtureAcceptanceRunningShutdownSuccess" "$go_test_out" || fail "F10 did not run/pass"
++grep -Fq -- "--- PASS: TestFixtureAcceptanceResetMachineIDStoppedError" "$go_test_out" || fail "F11 did not run/pass"
++grep -Fq -- "--- PASS: TestFixtureAcceptanceMissingRootLayerError" "$go_test_out" || fail "F12 did not run/pass"
++
++echo "PASS"
++exit 0
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,17 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++
++export GOPROXY=off
++export GOSUMDB=off
++export GOTOOLCHAIN=local
++export GOFLAGS=-mod=vendor
++set -e
++cd /workspace/repo
++exec bash /workspace/repo/usercase-test-coderl/usecase.sh

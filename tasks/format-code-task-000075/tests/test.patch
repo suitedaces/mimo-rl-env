@@ -1,0 +1,427 @@
+diff --git a/config/lfu_defaults_test.go b/config/lfu_defaults_test.go
+new file mode 100644
+index 000000000..5d1fdfe25
+--- /dev/null
++++ b/config/lfu_defaults_test.go
+@@ -0,0 +1,83 @@
++package config
++
++import (
++	"reflect"
++	"testing"
++)
++
++func serverNumericFieldWithDefault(t *testing.T, want int64) reflect.Value {
++	t.Helper()
++	server := reflect.ValueOf(&DiceConfig.Server).Elem()
++	for i := 0; i < server.NumField(); i++ {
++		field := server.Field(i)
++		switch field.Kind() {
++		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
++			if field.Int() == want {
++				return field
++			}
++		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
++			if field.Uint() == uint64(want) {
++				return field
++			}
++		case reflect.Float32, reflect.Float64:
++			if field.Float() == float64(want) {
++				return field
++			}
++		}
++	}
++	t.Fatalf("server config option with numeric default %d is not available", want)
++	return reflect.Value{}
++}
++
++func numericFieldValue(t *testing.T, field reflect.Value) float64 {
++	t.Helper()
++	switch field.Kind() {
++	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
++		return float64(field.Int())
++	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
++		return float64(field.Uint())
++	case reflect.Float32, reflect.Float64:
++		return field.Float()
++	default:
++		t.Fatalf("server config field kind = %s, want numeric", field.Kind())
++		return 0
++	}
++}
++
++func setNumericField(t *testing.T, field reflect.Value, value float64) {
++	t.Helper()
++	switch field.Kind() {
++	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
++		field.SetInt(int64(value))
++	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
++		if value < 0 {
++			t.Fatalf("cannot set unsigned server config field to %g", value)
++		}
++		field.SetUint(uint64(value))
++	case reflect.Float32, reflect.Float64:
++		field.SetFloat(value)
++	default:
++		t.Fatalf("server config field kind = %s, want numeric", field.Kind())
++	}
++}
++
++func TestDefaultEvictionPolicyIsAllKeysLFU(t *testing.T) {
++	if DiceConfig.Server.EvictionPolicy != "allkeys-lfu" {
++		t.Fatalf("default eviction policy = %q, want allkeys-lfu", DiceConfig.Server.EvictionPolicy)
++	}
++}
++
++func TestLFULogFactorDefaultAndCanBeSet(t *testing.T) {
++	field := serverNumericFieldWithDefault(t, 10)
++	if got := numericFieldValue(t, field); got != 10 {
++		t.Fatalf("default LFU growth factor = %g, want 10", got)
++	}
++
++	original := numericFieldValue(t, field)
++	t.Cleanup(func() { setNumericField(t, field, original) })
++
++	setNumericField(t, field, 37)
++	if got := numericFieldValue(t, field); got != 37 {
++		t.Fatalf("LFU growth factor config did not retain runtime value, got %g", got)
++	}
++}
+diff --git a/internal/store/lfu_behavior_test.go b/internal/store/lfu_behavior_test.go
+new file mode 100644
+index 000000000..ccb247774
+--- /dev/null
++++ b/internal/store/lfu_behavior_test.go
+@@ -0,0 +1,291 @@
++package store
++
++import (
++	"reflect"
++	"testing"
++	"time"
++
++	"github.com/dicedb/dice/config"
++	"github.com/dicedb/dice/internal/object"
++)
++
++func serverNumericFieldWithDefault(t *testing.T, want int64) reflect.Value {
++	t.Helper()
++	server := reflect.ValueOf(&config.DiceConfig.Server).Elem()
++	for i := 0; i < server.NumField(); i++ {
++		field := server.Field(i)
++		switch field.Kind() {
++		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
++			if field.Int() == want {
++				return field
++			}
++		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
++			if field.Uint() == uint64(want) {
++				return field
++			}
++		case reflect.Float32, reflect.Float64:
++			if field.Float() == float64(want) {
++				return field
++			}
++		}
++	}
++	t.Fatalf("server config option with numeric default %d is not available", want)
++	return reflect.Value{}
++}
++
++func numericFieldValue(t *testing.T, field reflect.Value) float64 {
++	t.Helper()
++	switch field.Kind() {
++	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
++		return float64(field.Int())
++	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
++		return float64(field.Uint())
++	case reflect.Float32, reflect.Float64:
++		return field.Float()
++	default:
++		t.Fatalf("server config field kind = %s, want numeric", field.Kind())
++		return 0
++	}
++}
++
++func setNumericField(t *testing.T, field reflect.Value, value float64) {
++	t.Helper()
++	switch field.Kind() {
++	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
++		field.SetInt(int64(value))
++	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
++		if value < 0 {
++			t.Fatalf("cannot set unsigned server config field to %g", value)
++		}
++		field.SetUint(uint64(value))
++	case reflect.Float32, reflect.Float64:
++		field.SetFloat(value)
++	default:
++		t.Fatalf("server config field kind = %s, want numeric", field.Kind())
++	}
++}
++
++func withEvictionSettings(t *testing.T, policy string, ratio float64, keysLimit int, logFactor int) {
++	t.Helper()
++	originalPolicy := config.DiceConfig.Server.EvictionPolicy
++	originalRatio := config.DiceConfig.Server.EvictionRatio
++	originalKeysLimit := config.DiceConfig.Server.KeysLimit
++	growthFactorField := serverNumericFieldWithDefault(t, 10)
++	originalLogFactorValue := numericFieldValue(t, growthFactorField)
++	t.Cleanup(func() {
++		config.DiceConfig.Server.EvictionPolicy = originalPolicy
++		config.DiceConfig.Server.EvictionRatio = originalRatio
++		config.DiceConfig.Server.KeysLimit = originalKeysLimit
++		setNumericField(t, growthFactorField, originalLogFactorValue)
++	})
++	if policy != "" {
++		config.DiceConfig.Server.EvictionPolicy = policy
++	}
++	config.DiceConfig.Server.EvictionRatio = ratio
++	config.DiceConfig.Server.KeysLimit = keysLimit
++	setNumericField(t, growthFactorField, float64(logFactor))
++}
++
++func putTestKey(s *Store, key string) {
++	s.Put(key, &object.Obj{})
++}
++
++func touchKeyManyTimes(t *testing.T, s *Store, key string, count int) {
++	t.Helper()
++	for i := 0; i < count; i++ {
++		if got := s.Get(key); got == nil {
++			t.Fatalf("expected key %q to exist while building access frequency", key)
++		}
++	}
++}
++
++func assertKeyPresent(t *testing.T, s *Store, key string) {
++	t.Helper()
++	if got := s.Get(key); got == nil {
++		t.Fatalf("expected key %q to survive eviction", key)
++	}
++}
++
++func assertKeyMissing(t *testing.T, s *Store, key string) {
++	t.Helper()
++	if got := s.Get(key); got != nil {
++		t.Fatalf("expected key %q to be evicted", key)
++	}
++}
++
++func countMissing(t *testing.T, s *Store, keys ...string) int {
++	t.Helper()
++	missing := 0
++	for _, key := range keys {
++		if s.Get(key) == nil {
++			missing++
++		}
++	}
++	return missing
++}
++
++func TestAllKeysLFUPreservesFrequentlyAccessedKeysAgainstRecentColdKeys(t *testing.T) {
++	withEvictionSettings(t, "allkeys-lfu", 0.40, 5, 1)
++	s := NewStore(nil)
++
++	hotKeys := []string{"alpha-hot-1", "alpha-hot-2"}
++	coldKeys := []string{"beta-cold-1", "beta-cold-2", "beta-cold-3"}
++	for _, key := range hotKeys {
++		putTestKey(s, key)
++		touchKeyManyTimes(t, s, key, 220)
++	}
++
++	time.Sleep(1100 * time.Millisecond)
++	for _, key := range coldKeys {
++		putTestKey(s, key)
++	}
++	putTestKey(s, "alpha-trigger")
++
++	assertKeyPresent(t, s, "alpha-hot-1")
++	assertKeyPresent(t, s, "alpha-hot-2")
++	if missing := countMissing(t, s, coldKeys...); missing < 2 {
++		t.Fatalf("LFU eviction removed %d cold keys, want at least 2; this looks like recency-only eviction", missing)
++	}
++}
++
++func TestAllKeysLFUUsesAccessFrequencyForNeutralKeyNames(t *testing.T) {
++	withEvictionSettings(t, "allkeys-lfu", 0.50, 2, 1)
++	s := NewStore(nil)
++
++	putTestKey(s, "session:primary")
++	touchKeyManyTimes(t, s, "session:primary", 220)
++	time.Sleep(1100 * time.Millisecond)
++	putTestKey(s, "session:secondary")
++	putTestKey(s, "session:trigger")
++
++	assertKeyPresent(t, s, "session:primary")
++	assertKeyMissing(t, s, "session:secondary")
++}
++
++func TestAllKeysLFUTieBreaksByIdleTime(t *testing.T) {
++	withEvictionSettings(t, "allkeys-lfu", 0.50, 2, 10)
++	s := NewStore(nil)
++
++	putTestKey(s, "same-frequency-old")
++	time.Sleep(1100 * time.Millisecond)
++	putTestKey(s, "same-frequency-new")
++	putTestKey(s, "same-frequency-trigger")
++
++	assertKeyMissing(t, s, "same-frequency-old")
++	assertKeyPresent(t, s, "same-frequency-new")
++}
++
++func TestDefaultPolicyUsesLFUBehaviorWhenUnspecified(t *testing.T) {
++	withEvictionSettings(t, "", 0.50, 2, 1)
++	if config.DiceConfig.Server.EvictionPolicy != "allkeys-lfu" {
++		t.Fatalf("test requires the package default policy to be allkeys-lfu, got %q", config.DiceConfig.Server.EvictionPolicy)
++	}
++	s := NewStore(nil)
++
++	putTestKey(s, "default-hot")
++	touchKeyManyTimes(t, s, "default-hot", 220)
++	time.Sleep(1100 * time.Millisecond)
++	putTestKey(s, "default-recent-cold")
++	putTestKey(s, "default-trigger")
++
++	assertKeyPresent(t, s, "default-hot")
++	assertKeyMissing(t, s, "default-recent-cold")
++}
++
++func TestLFULogFactorLowProtectsFrequentlyAccessedKey(t *testing.T) {
++	withEvictionSettings(t, "allkeys-lfu", 0.50, 2, 1)
++	s := NewStore(nil)
++
++	putTestKey(s, "low-factor-hot")
++	touchKeyManyTimes(t, s, "low-factor-hot", 200)
++	time.Sleep(1100 * time.Millisecond)
++	putTestKey(s, "low-factor-cold")
++	touchKeyManyTimes(t, s, "low-factor-cold", 1)
++	putTestKey(s, "low-factor-trigger")
++
++	assertKeyPresent(t, s, "low-factor-hot")
++	assertKeyMissing(t, s, "low-factor-cold")
++}
++
++func TestLFULogFactorHighSlowsFrequencyGrowth(t *testing.T) {
++	withEvictionSettings(t, "allkeys-lfu", 0.50, 2, 100)
++	s := NewStore(nil)
++
++	putTestKey(s, "high-factor-hot")
++	touchKeyManyTimes(t, s, "high-factor-hot", 1)
++	time.Sleep(1100 * time.Millisecond)
++	putTestKey(s, "high-factor-cold")
++	touchKeyManyTimes(t, s, "high-factor-cold", 1)
++	putTestKey(s, "high-factor-trigger")
++
++	assertKeyMissing(t, s, "high-factor-hot")
++	assertKeyPresent(t, s, "high-factor-cold")
++}
++
++func TestLFULogFactorZeroMakesRepeatedAccessesDeterministicallyStronger(t *testing.T) {
++	withEvictionSettings(t, "allkeys-lfu", 0.50, 2, 0)
++
++	cases := [][3]string{
++		{"factor-zero-a-primary", "factor-zero-a-secondary", "factor-zero-a-trigger"},
++		{"factor-zero-b-primary", "factor-zero-b-secondary", "factor-zero-b-trigger"},
++		{"factor-zero-c-primary", "factor-zero-c-secondary", "factor-zero-c-trigger"},
++	}
++
++	for _, keys := range cases {
++		s := NewStore(nil)
++		putTestKey(s, keys[0])
++		touchKeyManyTimes(t, s, keys[0], 2)
++		time.Sleep(1100 * time.Millisecond)
++		putTestKey(s, keys[1])
++		touchKeyManyTimes(t, s, keys[1], 1)
++		putTestKey(s, keys[2])
++
++		assertKeyPresent(t, s, keys[0])
++		assertKeyMissing(t, s, keys[1])
++	}
++}
++
++func TestLFUFrequencyDoesNotWrapAfterManyAccesses(t *testing.T) {
++	withEvictionSettings(t, "allkeys-lfu", 0.50, 2, 1)
++	s := NewStore(nil)
++
++	putTestKey(s, "wrap-resistant-hot")
++	touchKeyManyTimes(t, s, "wrap-resistant-hot", 512)
++	time.Sleep(1100 * time.Millisecond)
++	putTestKey(s, "wrap-resistant-cold")
++	putTestKey(s, "wrap-resistant-trigger")
++
++	assertKeyPresent(t, s, "wrap-resistant-hot")
++	assertKeyMissing(t, s, "wrap-resistant-cold")
++}
++
++func TestLFUFrequencySaturatesInsteadOfWrappingUnderDeterministicGrowth(t *testing.T) {
++	withEvictionSettings(t, "allkeys-lfu", 0.50, 2, 0)
++	s := NewStore(nil)
++
++	putTestKey(s, "wrap-neutral-primary")
++	touchKeyManyTimes(t, s, "wrap-neutral-primary", 260)
++	time.Sleep(1100 * time.Millisecond)
++	putTestKey(s, "wrap-neutral-secondary")
++	touchKeyManyTimes(t, s, "wrap-neutral-secondary", 20)
++	putTestKey(s, "wrap-neutral-trigger")
++
++	assertKeyPresent(t, s, "wrap-neutral-primary")
++	assertKeyMissing(t, s, "wrap-neutral-secondary")
++}
++
++func TestLFUBookkeepingDoesNotCorruptLRUIdleOrdering(t *testing.T) {
++	withEvictionSettings(t, "allkeys-lfu", 0.50, 2, 1)
++	s := NewStore(nil)
++
++	putTestKey(s, "lfu-metadata-old")
++	touchKeyManyTimes(t, s, "lfu-metadata-old", 220)
++
++	time.Sleep(1100 * time.Millisecond)
++	config.DiceConfig.Server.EvictionPolicy = "allkeys-lru"
++	putTestKey(s, "plain-lru-new")
++	putTestKey(s, "plain-lru-trigger")
++
++	assertKeyMissing(t, s, "lfu-metadata-old")
++	assertKeyPresent(t, s, "plain-lru-new")
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,36 @@
++#!/bin/bash
++set -euo pipefail
++
++cd /testbed
++
++
++dev-switch go 1.23
++
++
++case "${1:-}" in
++  base)
++    go test -v -race -count=1 ./internal/server/utils/...
++    go test -v -race -count=1 ./internal/store -run '^(TestDelExpiry|TestAOF|TestAOFWithExat)$'
++    ;;
++  new)
++    go test -v -race -count=1 ./config -run '^(TestDefaultEvictionPolicyIsAllKeysLFU|TestLFULogFactorDefaultAndCanBeSet)$'
++    for test_name in \
++      TestAllKeysLFUPreservesFrequentlyAccessedKeysAgainstRecentColdKeys \
++      TestAllKeysLFUUsesAccessFrequencyForNeutralKeyNames \
++      TestAllKeysLFUTieBreaksByIdleTime \
++      TestDefaultPolicyUsesLFUBehaviorWhenUnspecified \
++      TestLFULogFactorLowProtectsFrequentlyAccessedKey \
++      TestLFULogFactorHighSlowsFrequencyGrowth \
++      TestLFULogFactorZeroMakesRepeatedAccessesDeterministicallyStronger \
++      TestLFUFrequencyDoesNotWrapAfterManyAccesses \
++      TestLFUFrequencySaturatesInsteadOfWrappingUnderDeterministicGrowth \
++      TestLFUBookkeepingDoesNotCorruptLRUIdleOrdering
++    do
++      go test -v -race -count=1 ./internal/store -run "^${test_name}$"
++    done
++    ;;
++  *)
++    echo "usage: $0 base|new"
++    exit 2
++    ;;
++esac

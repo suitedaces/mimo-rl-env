@@ -1,0 +1,353 @@
+diff --git a/ipn/conffile/include_codespec_test.go b/ipn/conffile/include_codespec_test.go
+new file mode 100644
+--- /dev/null
++++ b/ipn/conffile/include_codespec_test.go
+@@ -0,0 +1,338 @@
++
++
++
++package conffile_test
++
++import (
++	"bytes"
++	"encoding/json"
++	"fmt"
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++
++	"tailscale.com/ipn/conffile"
++)
++
++func writeCodespecConfig(t *testing.T, dir, name, contents string) string {
++	t.Helper()
++	path := filepath.Join(dir, name)
++	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.WriteFile(path, []byte(contents), 0600); err != nil {
++		t.Fatal(err)
++	}
++	return path
++}
++
++func loadCodespecConfig(t *testing.T, path string) *conffile.Config {
++	t.Helper()
++	c, err := conffile.Load(path)
++	if err != nil {
++		t.Fatalf("Load(%q) returned an unexpected error: %v", path, err)
++	}
++	return c
++}
++
++func requireCodespecLoadError(t *testing.T, path string, parts ...string) string {
++	t.Helper()
++	_, err := conffile.Load(path)
++	if err == nil {
++		t.Fatalf("Load(%q) succeeded; want an error", path)
++	}
++	msg := err.Error()
++	for _, part := range parts {
++		if !strings.Contains(msg, part) {
++			t.Errorf("Load(%q) error %q does not identify %q", path, msg, part)
++		}
++	}
++	return msg
++}
++
++func TestCodespecConfigIncludeRecursiveMerge(t *testing.T) {
++	dir := t.TempDir()
++	writeCodespecConfig(t, dir, "common.hujson", `{
++  // Shared defaults used by more specific machine configurations.
++  "version": "alpha0",
++  "hostname": "common-node",
++  "enabled": true,
++  "acceptDNS": true,
++  "acceptRoutes": true,
++  "authKey": "tskey-from-common",
++  "advertiseRoutes": ["10.0.0.0/8"],
++  "autoUpdate": {"check": true, "apply": true},
++}`)
++	writeCodespecConfig(t, dir, "layers/team defaults.hujson", `{
++  "version": "alpha0",
++  "include": "../common.hujson",
++  "acceptDNS": false,
++  "autoUpdate": {"apply": false}
++}`)
++	rootBody := `{
++  "version": "alpha0",
++  "include": ["layers/team defaults.hujson"],
++  "hostname": "",
++  "enabled": false,
++  "acceptRoutes": false,
++  "authKey": null,
++  "advertiseRoutes": []
++}`
++	root := writeCodespecConfig(t, dir, "root.hujson", rootBody)
++	c := loadCodespecConfig(t, root)
++
++	if c.Path != root {
++		t.Errorf("Config.Path = %q, want root path %q", c.Path, root)
++	}
++	if !bytes.Equal(c.Raw, []byte(rootBody)) {
++		t.Errorf("Config.Raw does not contain the unchanged root document")
++	}
++	if c.Version != "alpha0" || c.Parsed.Version != "alpha0" {
++		t.Errorf("versions = (%q, %q), want alpha0", c.Version, c.Parsed.Version)
++	}
++	if c.Parsed.Hostname == nil || *c.Parsed.Hostname != "" {
++		t.Errorf("hostname = %v, want an explicitly set empty string", c.Parsed.Hostname)
++	}
++	if !c.Parsed.Enabled.EqualBool(false) {
++		t.Errorf("enabled = %q, want explicit false", c.Parsed.Enabled)
++	}
++	if !c.Parsed.AcceptDNS.EqualBool(false) {
++		t.Errorf("acceptDNS = %q, want team layer's false", c.Parsed.AcceptDNS)
++	}
++	if !c.Parsed.AcceptRoutes.EqualBool(false) {
++		t.Errorf("acceptRoutes = %q, want root layer's false", c.Parsed.AcceptRoutes)
++	}
++	if c.Parsed.AuthKey != nil {
++		t.Errorf("authKey = %q, want root null to clear the inherited value", *c.Parsed.AuthKey)
++	}
++	if c.Parsed.AdvertiseRoutes == nil || len(c.Parsed.AdvertiseRoutes) != 0 {
++		t.Errorf("advertiseRoutes = %v, want an explicitly set empty array", c.Parsed.AdvertiseRoutes)
++	}
++	if c.Parsed.AutoUpdate == nil {
++		t.Fatal("autoUpdate is nil; want recursively merged object")
++	}
++	if !c.Parsed.AutoUpdate.Check || !c.Parsed.AutoUpdate.Apply.EqualBool(false) {
++		t.Errorf("autoUpdate = %+v, want inherited check=true and overridden apply=false", *c.Parsed.AutoUpdate)
++	}
++
++	if !json.Valid(c.Std) {
++		t.Fatalf("Config.Std is not valid JSON: %q", c.Std)
++	}
++	var effective map[string]any
++	if err := json.Unmarshal(c.Std, &effective); err != nil {
++		t.Fatal(err)
++	}
++	if _, ok := effective["include"]; ok {
++		t.Error("Config.Std retains include metadata; want only the effective config")
++	}
++	if got := effective["acceptDNS"]; got != false {
++		t.Errorf("Config.Std acceptDNS = %#v, want false", got)
++	}
++	if got, ok := effective["hostname"]; !ok || got != "" {
++		t.Errorf("Config.Std hostname = %#v (present %v), want an explicit empty string", got, ok)
++	}
++	if got, ok := effective["authKey"]; !ok || got != nil {
++		t.Errorf("Config.Std authKey = %#v (present %v), want explicit null", got, ok)
++	}
++	routes, ok := effective["advertiseRoutes"].([]any)
++	if !ok || len(routes) != 0 {
++		t.Errorf("Config.Std advertiseRoutes = %#v, want an explicit empty array", effective["advertiseRoutes"])
++	}
++	autoUpdate, ok := effective["autoUpdate"].(map[string]any)
++	if !ok || autoUpdate["check"] != true || autoUpdate["apply"] != false {
++		t.Errorf("Config.Std autoUpdate = %#v, want merged check/apply values", effective["autoUpdate"])
++	}
++}
++
++func TestCodespecConfigIncludePrecedenceAndAbsolutePaths(t *testing.T) {
++	dir := t.TempDir()
++	writeCodespecConfig(t, dir, "first.hujson", `{
++  "version": "alpha0",
++  "hostname": "first",
++  "acceptDNS": true
++}`)
++	second := writeCodespecConfig(t, dir, "second absolute.hujson", `{
++  "version": "alpha0",
++  "hostname": "second",
++  "acceptDNS": false
++}`)
++	root := writeCodespecConfig(t, dir, "root.hujson", fmt.Sprintf(`{
++  "version": "alpha0",
++  "include": ["first.hujson", %q],
++  "acceptDNS": true
++}`, second))
++
++	c := loadCodespecConfig(t, root)
++	if c.Parsed.Hostname == nil || *c.Parsed.Hostname != "second" {
++		t.Errorf("hostname = %v, want later include to win", c.Parsed.Hostname)
++	}
++	if !c.Parsed.AcceptDNS.EqualBool(true) {
++		t.Errorf("acceptDNS = %q, want including document to win", c.Parsed.AcceptDNS)
++	}
++}
++
++func TestCodespecConfigIncludeSharedDependencyIsNotCycle(t *testing.T) {
++	dir := t.TempDir()
++	writeCodespecConfig(t, dir, "shared.hujson", `{
++  "version": "alpha0",
++  "operatorUser": "shared-user"
++}`)
++	writeCodespecConfig(t, dir, "left.hujson", `{
++  "version": "alpha0",
++  "include": "shared.hujson",
++  "hostname": "left"
++}`)
++	writeCodespecConfig(t, dir, "right.hujson", `{
++  "version": "alpha0",
++  "include": "shared.hujson",
++  "acceptDNS": false
++}`)
++	root := writeCodespecConfig(t, dir, "root.hujson", `{
++  "version": "alpha0",
++  "include": ["left.hujson", "right.hujson"]
++}`)
++
++	c := loadCodespecConfig(t, root)
++	if c.Parsed.OperatorUser == nil || *c.Parsed.OperatorUser != "shared-user" {
++		t.Errorf("operatorUser = %v, want value from shared dependency", c.Parsed.OperatorUser)
++	}
++	if !c.Parsed.AcceptDNS.EqualBool(false) {
++		t.Errorf("acceptDNS = %q, want right branch value", c.Parsed.AcceptDNS)
++	}
++}
++
++func TestCodespecConfigIncludeCycleDiagnostics(t *testing.T) {
++	t.Run("self", func(t *testing.T) {
++		dir := t.TempDir()
++		root := writeCodespecConfig(t, dir, "self-ref.hujson", `{
++  "version": "alpha0",
++  "include": "self-ref.hujson"
++}`)
++		msg := requireCodespecLoadError(t, root, "self-ref.hujson")
++		lower := strings.ToLower(strings.ReplaceAll(msg, dir, ""))
++		if !strings.Contains(lower, "cycle") && !strings.Contains(lower, "cyclic") && !strings.Contains(lower, "recursive") {
++			t.Errorf("cycle error %q does not describe an include cycle", msg)
++		}
++	})
++
++	t.Run("indirect", func(t *testing.T) {
++		dir := t.TempDir()
++		a := writeCodespecConfig(t, dir, "graph-a.hujson", `{
++  "version": "alpha0",
++  "include": "nested/graph-b.hujson"
++}`)
++		writeCodespecConfig(t, dir, "nested/graph-b.hujson", `{
++  "version": "alpha0",
++  "include": "../graph-a.hujson"
++}`)
++		msg := requireCodespecLoadError(t, a, "graph-a.hujson", "graph-b.hujson")
++		lower := strings.ToLower(strings.ReplaceAll(msg, dir, ""))
++		if !strings.Contains(lower, "cycle") && !strings.Contains(lower, "cyclic") && !strings.Contains(lower, "recursive") {
++			t.Errorf("cycle error %q does not describe an include cycle", msg)
++		}
++	})
++}
++
++func TestCodespecConfigIncludeSourceErrors(t *testing.T) {
++	t.Run("missing", func(t *testing.T) {
++		dir := t.TempDir()
++		root := writeCodespecConfig(t, dir, "root.hujson", `{
++  "version": "alpha0",
++  "include": "missing-layer.hujson"
++}`)
++		requireCodespecLoadError(t, root, "missing-layer.hujson")
++	})
++
++	t.Run("malformed", func(t *testing.T) {
++		dir := t.TempDir()
++		writeCodespecConfig(t, dir, "malformed-layer.hujson", `{"version":"alpha0",`)
++		root := writeCodespecConfig(t, dir, "root.hujson", `{
++  "version": "alpha0",
++  "include": "malformed-layer.hujson"
++}`)
++		requireCodespecLoadError(t, root, "malformed-layer.hujson")
++	})
++
++	t.Run("missing-version", func(t *testing.T) {
++		dir := t.TempDir()
++		writeCodespecConfig(t, dir, "unversioned-layer.hujson", `{"hostname":"old"}`)
++		root := writeCodespecConfig(t, dir, "root.hujson", `{
++  "version": "alpha0",
++  "include": "unversioned-layer.hujson"
++}`)
++		requireCodespecLoadError(t, root, "unversioned-layer.hujson", "version")
++	})
++
++	t.Run("unsupported-version", func(t *testing.T) {
++		dir := t.TempDir()
++		writeCodespecConfig(t, dir, "future-layer.hujson", `{"version":"beta9"}`)
++		root := writeCodespecConfig(t, dir, "root.hujson", `{
++  "version": "alpha0",
++  "include": "future-layer.hujson"
++}`)
++		requireCodespecLoadError(t, root, "future-layer.hujson", "beta9")
++	})
++}
++
++func TestCodespecConfigIncludeStrictEffectiveSchema(t *testing.T) {
++	dir := t.TempDir()
++	writeCodespecConfig(t, dir, "unknown-field-layer.hujson", `{
++  "version": "alpha0",
++  "futureOption": true
++}`)
++	root := writeCodespecConfig(t, dir, "root.hujson", `{
++  "version": "alpha0",
++  "include": "unknown-field-layer.hujson"
++}`)
++	requireCodespecLoadError(t, root, "futureOption")
++}
++
++func TestCodespecConfigIncludeShapeErrors(t *testing.T) {
++	for _, tt := range []struct {
++		name    string
++		include string
++	}{
++		{name: "boolean", include: `true`},
++		{name: "object", include: `{"path":"layer.hujson"}`},
++		{name: "non-string-list-entry", include: `["layer.hujson", 7]`},
++	} {
++		t.Run(tt.name, func(t *testing.T) {
++			dir := t.TempDir()
++			writeCodespecConfig(t, dir, "layer.hujson", `{"version":"alpha0"}`)
++			root := writeCodespecConfig(t, dir, "root.hujson", fmt.Sprintf(`{
++  "version": "alpha0",
++  "include": %s
++}`, tt.include))
++			requireCodespecLoadError(t, root, "include")
++		})
++	}
++}
++
++func TestCodespecConfigRootRawAndStandaloneCompatibility(t *testing.T) {
++	dir := t.TempDir()
++	raw := `{
++  // A normal standalone HuJSON file must keep working.
++  "version": "alpha0",
++  "enabled": false,
++  "hostname": "",
++}`
++	path := writeCodespecConfig(t, dir, "standalone.hujson", raw)
++	c := loadCodespecConfig(t, path)
++
++	if c.Path != path {
++		t.Errorf("Config.Path = %q, want %q", c.Path, path)
++	}
++	if !bytes.Equal(c.Raw, []byte(raw)) {
++		t.Error("Config.Raw changed for a standalone file")
++	}
++	if !json.Valid(c.Std) {
++		t.Fatalf("Config.Std is not standardized JSON: %q", c.Std)
++	}
++	if !c.Parsed.Enabled.EqualBool(false) {
++		t.Errorf("enabled = %q, want false", c.Parsed.Enabled)
++	}
++	if c.Parsed.Hostname == nil || *c.Parsed.Hostname != "" {
++		t.Errorf("hostname = %v, want explicit empty string", c.Parsed.Hostname)
++	}
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,5 @@
++#!/bin/bash
++set -euo pipefail
++
++
++go test ./ipn/conffile -run '^TestCodespecConfig' -count=1

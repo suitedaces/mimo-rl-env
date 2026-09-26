@@ -1,0 +1,196 @@
+diff --git a/test/request/codespec-trusted-proxy-policy.js b/test/request/codespec-trusted-proxy-policy.js
+new file mode 100644
+index 0000000..0ef50e4
+--- /dev/null
++++ b/test/request/codespec-trusted-proxy-policy.js
+@@ -0,0 +1,171 @@
++'use strict';
++
++var request = require('../context').request;
++var supertest = require('supertest');
++var koa = require('../..');
++
++function forwardedRequest(value) {
++  var req = request();
++  req.socket.remoteAddress = '10.0.0.3';
++  if (value != null) req.header['x-forwarded-for'] = value;
++  return req;
++}
++
++describe('codespec trusted proxy policy', function(){
++  it('stops at the first untrusted hop and keeps that boundary address', function(){
++    var req = forwardedRequest('198.51.100.7, 203.0.113.9, 10.0.0.2');
++
++    req.app.proxy = function(address, hop) {
++      if (hop === 0) return address === '10.0.0.3';
++      if (hop === 1) return address === '10.0.0.2';
++      return false;
++    };
++
++    req.ips.should.eql(['203.0.113.9', '10.0.0.2']);
++    req.ip.should.equal('203.0.113.9');
++  });
++
++  it('numbers hops from the socket and re-evaluates each accepted hop', function(){
++    var req = forwardedRequest('198.51.100.7, 10.0.0.2');
++
++    req.app.proxy = function(address, hop) {
++      return hop === 0;
++    };
++
++    req.ips.should.eql(['10.0.0.2']);
++    req.ip.should.equal('10.0.0.2');
++  });
++
++  it('trims entries, drops empty entries, and preserves wire order when all hops are trusted', function(){
++    var req = forwardedRequest(' , 198.51.100.7 ,, 10.0.0.2, ');
++    req.app.proxy = function() { return true; };
++
++    req.ips.should.eql(['198.51.100.7', '10.0.0.2']);
++    req.ip.should.equal('198.51.100.7');
++  });
++
++  it('ignores every forwarded field when the direct peer is untrusted', function(){
++    var req = forwardedRequest('198.51.100.7, 10.0.0.2');
++    req.header.host = 'origin.internal:3000';
++    req.header['x-forwarded-host'] = 'public.example:8443, proxy.internal';
++    req.header['x-forwarded-proto'] = 'https, http';
++    req.app.proxy = function(address, hop) {
++      return address === '10.0.0.99' && hop === 0;
++    };
++
++    req.ips.should.eql([]);
++    req.ip.should.equal('10.0.0.3');
++    req.host.should.equal('origin.internal:3000');
++    req.hostname.should.equal('origin.internal');
++    req.protocol.should.equal('http');
++    req.secure.should.equal(false);
++    req.origin.should.equal('http://origin.internal:3000');
++  });
++
++  it('uses the first forwarded host and protocol when the direct peer is trusted', function(){
++    var req = forwardedRequest();
++    req.header.host = 'origin.internal:3000';
++    req.header['x-forwarded-host'] = 'public.example:8443, proxy.internal';
++    req.header['x-forwarded-proto'] = 'https, http';
++    req.app.proxy = function(address, hop) {
++      return address === '10.0.0.3' && hop === 0;
++    };
++
++    req.host.should.equal('public.example:8443');
++    req.hostname.should.equal('public.example');
++    req.protocol.should.equal('https');
++    req.secure.should.equal(true);
++    req.origin.should.equal('https://public.example:8443');
++  });
++
++  it('falls back to http when a trusted peer sends no usable protocol', function(){
++    var req = forwardedRequest();
++    req.header['x-forwarded-proto'] = '';
++    req.app.proxy = function() { return true; };
++
++    req.protocol.should.equal('http');
++    req.secure.should.equal(false);
++  });
++
++  it('always reports an encrypted socket as https', function(){
++    var req = forwardedRequest();
++    req.socket.encrypted = true;
++    req.header['x-forwarded-proto'] = 'http';
++    req.app.proxy = function() { return false; };
++
++    req.protocol.should.equal('https');
++    req.secure.should.equal(true);
++  });
++
++  it('does not authorize forwarded fields without a direct peer address', function(){
++    var req = forwardedRequest('198.51.100.7');
++    req.socket.remoteAddress = null;
++    req.header.host = 'origin.internal';
++    req.header['x-forwarded-host'] = 'public.example';
++    req.header['x-forwarded-proto'] = 'https';
++    req.app.proxy = function() { return true; };
++
++    req.ips.should.eql([]);
++    req.ip.should.equal('');
++    req.host.should.equal('origin.internal');
++    req.protocol.should.equal('http');
++  });
++
++  it('preserves the legacy true and false modes', function(){
++    var trusted = forwardedRequest(' , 198.51.100.7 ,, 10.0.0.2, ');
++    trusted.header.host = 'origin.internal';
++    trusted.header['x-forwarded-host'] = 'public.example, proxy.internal';
++    trusted.header['x-forwarded-proto'] = 'https, http';
++    trusted.app.proxy = true;
++
++    trusted.ips.should.eql(['198.51.100.7', '10.0.0.2']);
++    trusted.ip.should.equal('198.51.100.7');
++    trusted.host.should.equal('public.example');
++    trusted.protocol.should.equal('https');
++
++    var untrusted = forwardedRequest('198.51.100.7, 10.0.0.2');
++    untrusted.header.host = 'origin.internal';
++    untrusted.header['x-forwarded-host'] = 'public.example';
++    untrusted.header['x-forwarded-proto'] = 'https';
++    untrusted.app.proxy = false;
++
++    untrusted.ips.should.eql([]);
++    untrusted.ip.should.equal('10.0.0.3');
++    untrusted.host.should.equal('origin.internal');
++    untrusted.protocol.should.equal('http');
++  });
++
++  it('applies hop-limited trust through application contexts', function(done){
++    var app = koa();
++    app.proxy = function(address, hop) { return hop === 0; };
++
++    app.use(function *(){
++      this.body = {
++        ip: this.ip,
++        ips: this.ips,
++        host: this.host,
++        protocol: this.protocol,
++        hostname: this.hostname,
++        origin: this.origin,
++        secure: this.secure
++      };
++    });
++
++    supertest(app.listen())
++      .get('/')
++      .set('Host', 'origin.internal')
++      .set('X-Forwarded-For', '198.51.100.7, 203.0.113.9')
++      .set('X-Forwarded-Host', 'public.example')
++      .set('X-Forwarded-Proto', 'https')
++      .expect(200)
++      .expect({
++        ip: '203.0.113.9',
++        ips: ['203.0.113.9'],
++        host: 'public.example',
++        protocol: 'https',
++        hostname: 'public.example',
++        origin: 'https://public.example',
++        secure: true
++      }, done);
++  });
++});
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,14 @@
++#!/bin/bash
++set -euo pipefail
++
++
++NODE_ENV=test node --harmony ./node_modules/.bin/_mocha \
++  --require should \
++  --require should-http \
++  test/request/codespec-trusted-proxy-policy.js \
++  test/request/ip.js \
++  test/request/ips.js \
++  test/request/protocol.js \
++  test/request/host.js \
++  test/request/hostname.js \
++  --bail

@@ -1,0 +1,5 @@
+I want `AfcService.rename(source: str, target: str) -> None` to move or rename a file or directory on the connected device media filesystem.
+
+In a normal session, after `await afc.set_file_contents("source.txt", b"data")`, calling `await afc.rename("source.txt", "dest.txt")` should return `None`, `await afc.get_file_contents("dest.txt")` should return `b"data"`, and trying to read `"source.txt"` should raise `AfcFileNotFoundError`. It should also support moving paths between existing folders, such as renaming `"dir_a/dir_b/source.txt"` to `"dir_a/dest.txt"` while preserving the file bytes. Renaming a path to itself should be a successful no-op that leaves the contents intact.
+
+If the source path does not exist, `await afc.rename("missing.txt", "dest.txt")` should raise `AfcFileNotFoundError`. If the source exists but the device rejects the target path or reports another AFC failure, that AFC error should be surfaced rather than being converted into a missing-source error. The method should accept the same path-like values as other `AfcService` path methods and convert them before sending the device request.

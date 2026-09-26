@@ -1,0 +1,480 @@
+diff --git a/apply/apply_test.go b/apply/apply_test.go
+index 336586f9..0bfd4abf 100644
+--- a/apply/apply_test.go
++++ b/apply/apply_test.go
+@@ -26,6 +26,16 @@ func init() {
+ 	logrus.SetFormatter(formatter)
+ }
+ 
++func warningsMentionDockerDeprecation(warnings []string) bool {
++	for _, warning := range warnings {
++		lower := strings.ToLower(warning)
++		if strings.Contains(lower, "docker") && strings.Contains(lower, "deprecat") {
++			return true
++		}
++	}
++	return false
++}
++
+ func randomString(n int) string {
+ 	var letter = []rune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
+ 
+@@ -271,8 +281,9 @@ func TestApplySmokeTest(t *testing.T) {
+ 	c2, e := config.UpgradeConfigVersion(c)
+ 	r.NoError(e)
+ 
+-	e = c2.Validate()
++	w, e := c2.Validate()
+ 	r.NoError(e)
++	r.True(warningsMentionDockerDeprecation(w), "expected Docker deprecation warning in %#v", w)
+ 
+ 	e = Apply(fs, c2, templates.Templates, false)
+ 	r.NoError(e)
+diff --git a/apply/golden_file_test.go b/apply/golden_file_test.go
+index c2fd4101..def3e521 100644
+--- a/apply/golden_file_test.go
++++ b/apply/golden_file_test.go
+@@ -1,3 +1,4 @@
++//go:build !offline
+ // +build !offline
+ 
+ package apply_test
+@@ -7,6 +8,7 @@ import (
+ 	"fmt"
+ 	"os"
+ 	"path/filepath"
++	"strings"
+ 	"testing"
+ 
+ 	"github.com/chanzuckerberg/fogg/apply"
+@@ -21,6 +23,16 @@ import (
+ 
+ var updateGoldenFiles = flag.Bool("update", false, "when set, rewrite the golden files")
+ 
++func warningsMentionDockerDeprecation(warnings []string) bool {
++	for _, warning := range warnings {
++		lower := strings.ToLower(warning)
++		if strings.Contains(lower, "docker") && strings.Contains(lower, "deprecat") {
++			return true
++		}
++	}
++	return false
++}
++
+ func TestIntegration(t *testing.T) {
+ 
+ 	var testCases = []struct {
+@@ -54,8 +66,9 @@ func TestIntegration(t *testing.T) {
+ 				a.NoError(e)
+ 				fmt.Printf("conf %#v\n", conf)
+ 
+-				e = conf.Validate()
++				w, e := conf.Validate()
+ 				a.NoError(e)
++				a.False(warningsMentionDockerDeprecation(w), "did not expect Docker deprecation warning in %#v", w)
+ 
+ 				e = apply.Apply(testdataFs, conf, templates.Templates, true)
+ 				a.NoError(e)
+@@ -75,8 +88,9 @@ func TestIntegration(t *testing.T) {
+ 				a.NoError(e)
+ 				fmt.Printf("conf %#v\n", conf)
+ 
+-				e = conf.Validate()
++				w, e := conf.Validate()
+ 				a.NoError(e)
++				a.False(warningsMentionDockerDeprecation(w), "did not expect Docker deprecation warning in %#v", w)
+ 
+ 				e = apply.Apply(fs, conf, templates.Templates, true)
+ 				a.NoError(e)
+diff --git a/cmd/docker_warning_cli_test.go b/cmd/docker_warning_cli_test.go
+new file mode 100644
+index 00000000..f2a25f92
+--- /dev/null
++++ b/cmd/docker_warning_cli_test.go
+@@ -0,0 +1,160 @@
++package cmd
++
++import (
++	"bytes"
++	"encoding/json"
++	"io"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"sync"
++	"testing"
++
++	"github.com/chanzuckerberg/fogg/util"
++	"github.com/sirupsen/logrus"
++	"github.com/stretchr/testify/require"
++)
++
++
++const dockerWarningText = "Docker support is deprecated and will be removed in a future version of fogg."
++
++func minimalConfigWithDocker(t *testing.T, docker bool) []byte {
++	t.Helper()
++
++	b, err := util.TestFile("v2_minimal_valid")
++	require.NoError(t, err)
++
++	var conf map[string]interface{}
++	require.NoError(t, json.Unmarshal(b, &conf))
++	conf["docker"] = docker
++
++	out, err := json.Marshal(conf)
++	require.NoError(t, err)
++	return out
++}
++
++func runFoggCommandWithConfig(t *testing.T, command string, config []byte) (string, error) {
++	t.Helper()
++
++	dir := t.TempDir()
++	require.NoError(t, exec.Command("git", "init", dir).Run())
++
++	configPath := filepath.Join(dir, "fogg.yml")
++	require.NoError(t, os.WriteFile(configPath, config, 0600))
++
++	oldWd, err := os.Getwd()
++	require.NoError(t, err)
++	require.NoError(t, os.Chdir(dir))
++	defer func() {
++		require.NoError(t, os.Chdir(oldWd))
++	}()
++
++	var logOutput bytes.Buffer
++
++	previousLogOutput := logrus.StandardLogger().Out
++	previousFormatter := logrus.StandardLogger().Formatter
++	defer func() {
++		logrus.SetOutput(previousLogOutput)
++		logrus.SetFormatter(previousFormatter)
++	}()
++	logrus.SetOutput(&logOutput)
++	logrus.SetFormatter(&logrus.TextFormatter{DisableTimestamp: true})
++
++	rootCmd.SetArgs([]string{command, "--config", "fogg.yml"})
++
++	output, err := captureStdoutStderr(t, rootCmd.Execute)
++	return logOutput.String() + output, err
++}
++
++func captureStdoutStderr(t *testing.T, run func() error) (string, error) {
++	t.Helper()
++
++	oldStdout := os.Stdout
++	oldStderr := os.Stderr
++	stdoutR, stdoutW, err := os.Pipe()
++	require.NoError(t, err)
++	stderrR, stderrW, err := os.Pipe()
++	require.NoError(t, err)
++
++	os.Stdout = stdoutW
++	os.Stderr = stderrW
++	defer func() {
++		os.Stdout = oldStdout
++		os.Stderr = oldStderr
++	}()
++
++	var stdout bytes.Buffer
++	var stderr bytes.Buffer
++	var wg sync.WaitGroup
++	wg.Add(2)
++	go func() {
++		defer wg.Done()
++		_, _ = io.Copy(&stdout, stdoutR)
++	}()
++	go func() {
++		defer wg.Done()
++		_, _ = io.Copy(&stderr, stderrR)
++	}()
++
++	runErr := run()
++	require.NoError(t, stdoutW.Close())
++	require.NoError(t, stderrW.Close())
++	wg.Wait()
++	require.NoError(t, stdoutR.Close())
++	require.NoError(t, stderrR.Close())
++
++	return stdout.String() + stderr.String(), runErr
++}
++
++func invalidDockerConfig() []byte {
++	return []byte(`{"version":2,"docker":true}`)
++}
++
++func requireDockerWarning(t *testing.T, output string) {
++	t.Helper()
++	require.Contains(t, output, dockerWarningText)
++}
++
++func requireNoDockerWarning(t *testing.T, output string) {
++	t.Helper()
++	require.NotContains(t, output, dockerWarningText)
++}
++
++func TestPlanWarnsForDockerEnabledConfig(t *testing.T) {
++	output, err := runFoggCommandWithConfig(t, "plan", minimalConfigWithDocker(t, true))
++
++	require.NoError(t, err)
++	requireDockerWarning(t, output)
++}
++
++func TestApplyWarnsForDockerEnabledConfig(t *testing.T) {
++	output, err := runFoggCommandWithConfig(t, "apply", minimalConfigWithDocker(t, true))
++
++	require.NoError(t, err)
++	requireDockerWarning(t, output)
++}
++
++func TestPlanAndApplyDoNotWarnWhenDockerDisabled(t *testing.T) {
++	for _, command := range []string{"plan", "apply"} {
++		t.Run(command, func(t *testing.T) {
++			output, err := runFoggCommandWithConfig(t, command, minimalConfigWithDocker(t, false))
++
++			require.NoError(t, err)
++			requireNoDockerWarning(t, output)
++		})
++	}
++}
++
++func TestPlanWarnsBeforeFailingInvalidDockerConfig(t *testing.T) {
++	output, err := runFoggCommandWithConfig(t, "plan", invalidDockerConfig())
++
++	require.Error(t, err)
++	requireDockerWarning(t, output)
++}
++
++func TestApplyWarnsBeforeFailingInvalidDockerConfig(t *testing.T) {
++	output, err := runFoggCommandWithConfig(t, "apply", invalidDockerConfig())
++
++	require.Error(t, err)
++	requireDockerWarning(t, output)
++}
+diff --git a/config/v2/config_test.go b/config/v2/config_test.go
+index d2b7e6e2..e6b01626 100644
+--- a/config/v2/config_test.go
++++ b/config/v2/config_test.go
+@@ -16,8 +16,9 @@ func TestReadConfig(t *testing.T) {
+ 	c, e := ReadConfig(b)
+ 	a.NoError(e)
+ 
+-	e = c.Validate()
++	w, e := c.Validate()
+ 	a.Error(e)
++	a.False(containsDockerDeprecationLikeWarning(w), "did not expect Docker deprecation warning in %#v", w)
+ 
+ 	b2, e := util.TestFile("v2_minimal_valid")
+ 	a.NoError(e)
+@@ -25,8 +26,9 @@ func TestReadConfig(t *testing.T) {
+ 	c, e = ReadConfig(b2)
+ 	a.NoError(e)
+ 
+-	e = c.Validate()
++	w, e = c.Validate()
+ 	a.NoError(e)
++	a.False(containsDockerDeprecationLikeWarning(w), "did not expect Docker deprecation warning in %#v", w)
+ 
+ }
+ 
+@@ -41,8 +43,9 @@ func TestReadSnowflakeProvider(t *testing.T) {
+ 	r.NoError(e)
+ 	r.NotNil(c)
+ 
+-	e = c.Validate()
++	w, e := c.Validate()
+ 	r.NoError(e)
++	r.False(containsDockerDeprecationLikeWarning(w), "did not expect Docker deprecation warning in %#v", w)
+ 
+ 	r.NotNil(c.Defaults.Providers)
+ 	r.NotNil(c.Defaults.Providers.Snowflake)
+diff --git a/config/v2/validation_warning_test.go b/config/v2/validation_warning_test.go
+new file mode 100644
+index 00000000..fd2148a8
+--- /dev/null
++++ b/config/v2/validation_warning_test.go
+@@ -0,0 +1,68 @@
++package v2
++
++import (
++	"strings"
++	"testing"
++
++	"github.com/chanzuckerberg/fogg/util"
++	"github.com/stretchr/testify/require"
++)
++
++
++const dockerDeprecationWarning = "Docker support is deprecated and will be removed in a future version of fogg."
++
++func containsDockerDeprecationWarning(warnings []string) bool {
++	for _, warning := range warnings {
++		if strings.Contains(warning, dockerDeprecationWarning) {
++			return true
++		}
++	}
++	return false
++}
++
++func containsDockerDeprecationLikeWarning(warnings []string) bool {
++	for _, warning := range warnings {
++		lower := strings.ToLower(warning)
++		if strings.Contains(lower, "docker") && strings.Contains(lower, "deprecat") {
++			return true
++		}
++	}
++	return false
++}
++
++func readMinimalValidConfig(t *testing.T) *Config {
++	t.Helper()
++
++	b, err := util.TestFile("v2_minimal_valid")
++	require.NoError(t, err)
++
++	conf, err := ReadConfig(b)
++	require.NoError(t, err)
++	return conf
++}
++
++func TestValidateReturnsDockerDeprecationWarning(t *testing.T) {
++	conf := readMinimalValidConfig(t)
++	conf.Docker = true
++
++	warnings, err := conf.Validate()
++	require.NoError(t, err)
++	require.True(t, containsDockerDeprecationWarning(warnings), "expected Docker deprecation warning in %#v", warnings)
++}
++
++func TestValidateReturnsWarningsAlongsideFatalErrors(t *testing.T) {
++	conf := &Config{Docker: true}
++
++	warnings, err := conf.Validate()
++	require.Error(t, err)
++	require.True(t, containsDockerDeprecationWarning(warnings), "expected Docker deprecation warning in %#v", warnings)
++}
++
++func TestValidateDoesNotReturnDockerWarningWhenDockerDisabled(t *testing.T) {
++	conf := readMinimalValidConfig(t)
++	conf.Docker = false
++
++	warnings, err := conf.Validate()
++	require.NoError(t, err)
++	require.False(t, containsDockerDeprecationWarning(warnings), "did not expect Docker deprecation warning in %#v", warnings)
++}
+diff --git a/plan/plan_quick_test.go b/plan/plan_quick_test.go
+index ad5d65f3..4437c450 100644
+--- a/plan/plan_quick_test.go
++++ b/plan/plan_quick_test.go
+@@ -16,7 +16,7 @@ func TestValidConfigNoPanic(t *testing.T) {
+ 	assertion := func(conf *v2.Config) bool {
+ 		// fmt.Printf("GOT %#v\n\n", pretty.Sprint(conf))
+ 		// validate our configuration
+-		err := conf.Validate()
++		_, err := conf.Validate()
+ 
+ 		// if config is valid, there should be no panic
+ 		if err == nil {
+diff --git a/plan/plan_test.go b/plan/plan_test.go
+index 0616dbf8..269db677 100644
+--- a/plan/plan_test.go
++++ b/plan/plan_test.go
+@@ -1,6 +1,7 @@
+ package plan
+ 
+ import (
++	"strings"
+ 	"testing"
+ 
+ 	"github.com/chanzuckerberg/fogg/config"
+@@ -19,6 +20,16 @@ func init() {
+ 	logrus.SetFormatter(formatter)
+ }
+ 
++func warningsMentionDockerDeprecation(warnings []string) bool {
++	for _, warning := range warnings {
++		lower := strings.ToLower(warning)
++		if strings.Contains(lower, "docker") && strings.Contains(lower, "deprecat") {
++			return true
++		}
++	}
++	return false
++}
++
+ // func TestResolveRequired(t *testing.T) {
+ // 	resolved := resolveRequired("def", nil)
+ // 	assert.Equal(t, "def", resolved)
+@@ -108,8 +119,9 @@ func TestPlanBasicV2(t *testing.T) {
+ 	c2, err := v2.ReadConfig(b)
+ 	assert.Nil(t, err)
+ 
+-	err = c2.Validate()
++	w, err := c2.Validate()
+ 	a.NoError(err)
++	a.False(warningsMentionDockerDeprecation(w), "did not expect Docker deprecation warning in %#v", w)
+ 
+ 	plan, e := Eval(c2)
+ 	assert.Nil(t, e)
+diff --git a/plan/travisci_test.go b/plan/travisci_test.go
+index a57ff5fa..2070173e 100644
+--- a/plan/travisci_test.go
++++ b/plan/travisci_test.go
+@@ -70,8 +70,9 @@ func Test_buildTravisCI_Profiles(t *testing.T) {
+ 		}},
+ 	}
+ 
+-	err := c.Validate()
++	w, err := c.Validate()
+ 	a.NoError(err)
++	a.False(warningsMentionDockerDeprecation(w), "did not expect Docker deprecation warning in %#v", w)
+ 
+ 	p := &Plan{}
+ 	p.Accounts = p.buildAccounts(c)
+@@ -121,8 +122,9 @@ func Test_buildTravisCI_TestBuckets(t *testing.T) {
+ 		}},
+ 	}
+ 
+-	err := c.Validate()
++	w, err := c.Validate()
+ 	a.NoError(err)
++	a.False(warningsMentionDockerDeprecation(w), "did not expect Docker deprecation warning in %#v", w)
+ 
+ 	p := &Plan{}
+ 	p.Accounts = p.buildAccounts(c)
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,31 @@
++#!/bin/bash
++set -euo pipefail
++
++cd /testbed
++
++
++mkdir -p /root/go/src/github.com/chanzuckerberg
++ln -sfn /testbed /root/go/src/github.com/chanzuckerberg/fogg
++dev-switch go 1.23
++cd /root/go/src/github.com/chanzuckerberg/fogg
++
++
++export GO111MODULE=off
++
++case "${1:-}" in
++  base)
++    go test -count=1 ./apply/
++    go test -count=1 ./config/v2/ -run '^(Test_nonEmptyString|TestValidateOwnersAccount|TestValidateOwnersComponent|TestResolveStringArray|TestConfig_ValidateAWSProviders|TestReadConfig|TestReadSnowflakeProvider)$'
++    go test -count=1 ./plan/
++    ;;
++  new)
++    go test -count=1 ./config/v2/ -run '^(TestValidateReturnsDockerDeprecationWarning|TestValidateReturnsWarningsAlongsideFatalErrors|TestValidateDoesNotReturnDockerWarningWhenDockerDisabled)$'
++    go test -count=1 ./cmd/ -run '^(TestPlanWarnsForDockerEnabledConfig|TestApplyWarnsForDockerEnabledConfig|TestPlanAndApplyDoNotWarnWhenDockerDisabled|TestPlanWarnsBeforeFailingInvalidDockerConfig|TestApplyWarnsBeforeFailingInvalidDockerConfig)$'
++    go test -count=1 ./apply/ -run '^(TestApplySmokeTest|TestIntegration)$'
++    go test -count=1 ./plan/ -run '^(TestValidConfigNoPanic|TestPlanBasicV2|Test_buildTravisCI_Profiles|Test_buildTravisCI_TestBuckets)$'
++    ;;
++  *)
++    echo "usage: $0 base|new" >&2
++    exit 2
++    ;;
++esac

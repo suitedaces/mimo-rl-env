@@ -1,0 +1,283 @@
+diff --git a/safehttp/plugins/collector/collector_hardening_verifier_test.go b/safehttp/plugins/collector/collector_hardening_verifier_test.go
+new file mode 100644
+index 0000000..6f5e3cc
+--- /dev/null
++++ b/safehttp/plugins/collector/collector_hardening_verifier_test.go
+@@ -0,0 +1,267 @@
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++package collector_test
++
++import (
++	"io"
++	"net/http/httptest"
++	"strconv"
++	"strings"
++	"testing"
++
++	"github.com/google/go-safeweb/safehttp"
++	"github.com/google/go-safeweb/safehttp/plugins/collector"
++	"github.com/google/go-safeweb/safehttp/safehttptest"
++)
++
++const verifierMaxCollectorBody = 1 << 20
++
++var _ func(func(collector.Report), func(collector.CSPReport)) safehttp.Handler = collector.Handler
++
++type verifierTrackingBody struct {
++	r     *strings.Reader
++	reads int
++}
++
++func newVerifierTrackingBody(s string) *verifierTrackingBody {
++	return &verifierTrackingBody{r: strings.NewReader(s)}
++}
++
++func (b *verifierTrackingBody) Read(p []byte) (int, error) {
++	n, err := b.r.Read(p)
++	b.reads += n
++	return n, err
++}
++
++func (b *verifierTrackingBody) Close() error { return nil }
++
++func verifierRequest(method, contentType string, body io.ReadCloser, contentLength int64) *safehttp.IncomingRequest {
++	req := httptest.NewRequest(method, "/collector", nil)
++	req.Header.Set("Content-Type", contentType)
++	req.Body = body
++	req.ContentLength = contentLength
++	return safehttp.NewIncomingRequest(req)
++}
++
++func verifierBatch(n int) string {
++	var b strings.Builder
++	b.WriteByte('[')
++	for i := 0; i < n; i++ {
++		if i > 0 {
++			b.WriteByte(',')
++		}
++		b.WriteString(`{"type":"item-`)
++		b.WriteString(strconv.Itoa(i))
++		b.WriteString(`","body":{"index":`)
++		b.WriteString(strconv.Itoa(i))
++		b.WriteString(`}}`)
++	}
++	b.WriteByte(']')
++	return b.String()
++}
++
++func TestCollectorVerifierMediaTypesAndValidationPrecedence(t *testing.T) {
++	t.Run("media type matching is case insensitive and allows parameters", func(t *testing.T) {
++		var generic, deprecated int
++		h := collector.Handler(func(collector.Report) { generic++ }, func(collector.CSPReport) { deprecated++ })
++
++		genericReq := safehttptest.NewRequest(safehttp.MethodPost, "/collector", strings.NewReader(`[{"type":"custom","body":{}}]`))
++		genericReq.Header.Set("Content-Type", `Application/Reports+JSON; Charset="UTF-8"`)
++		genericRR := safehttptest.NewResponseRecorder()
++		h.ServeHTTP(genericRR.ResponseWriter, genericReq)
++		if got, want := genericRR.Status(), safehttp.StatusNoContent; got != want {
++			t.Errorf("parameterized generic report status got %v, want %v", got, want)
++		}
++
++		deprecatedReq := safehttptest.NewRequest(safehttp.MethodPost, "/collector", strings.NewReader(`{"blocked-uri":"https://blocked.example/"}`))
++		deprecatedReq.Header.Set("Content-Type", `APPLICATION/CSP-REPORT; profile=legacy`)
++		deprecatedRR := safehttptest.NewResponseRecorder()
++		h.ServeHTTP(deprecatedRR.ResponseWriter, deprecatedReq)
++		if got, want := deprecatedRR.Status(), safehttp.StatusNoContent; got != want {
++			t.Errorf("parameterized CSP report status got %v, want %v", got, want)
++		}
++		if generic != 1 || deprecated != 1 {
++			t.Errorf("callback counts got generic=%d deprecated=%d, want 1 and 1", generic, deprecated)
++		}
++	})
++
++	for _, tc := range []struct {
++		name        string
++		method      string
++		contentType string
++		contentLen  int64
++		want        safehttp.StatusCode
++	}{
++		{name: "method rejected before media type", method: safehttp.MethodGet, contentType: "text/plain", want: safehttp.StatusMethodNotAllowed},
++		{name: "unsupported media type rejected before body", method: safehttp.MethodPost, contentType: "text/plain", want: safehttp.StatusUnsupportedMediaType},
++		{name: "unsupported media type precedes declared body limit", method: safehttp.MethodPost, contentType: "text/plain", contentLen: verifierMaxCollectorBody + 1, want: safehttp.StatusUnsupportedMediaType},
++		{name: "malformed media type rejected before body", method: safehttp.MethodPost, contentType: `application/reports+json; charset`, want: safehttp.StatusUnsupportedMediaType},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			body := newVerifierTrackingBody(`[{"type":"custom","body":{}}]`)
++			contentLen := tc.contentLen
++			if contentLen == 0 {
++				contentLen = int64(body.r.Len())
++			}
++			called := false
++			h := collector.Handler(func(collector.Report) { called = true }, func(collector.CSPReport) { called = true })
++			rr := safehttptest.NewResponseRecorder()
++			h.ServeHTTP(rr.ResponseWriter, verifierRequest(tc.method, tc.contentType, body, contentLen))
++			if got := rr.Status(); got != tc.want {
++				t.Errorf("status got %v, want %v", got, tc.want)
++			}
++			if body.reads != 0 {
++				t.Errorf("body bytes read got %d, want 0", body.reads)
++			}
++			if called {
++				t.Error("callback was called for a rejected request")
++			}
++		})
++	}
++}
++
++func TestCollectorVerifierBodyLimitBoundaries(t *testing.T) {
++	base := `[{"type":"custom","body":{}}]`
++	exact := base + strings.Repeat(" ", verifierMaxCollectorBody-len(base))
++	var calls int
++	h := collector.Handler(func(collector.Report) { calls++ }, func(collector.CSPReport) { calls++ })
++
++	exactReq := safehttptest.NewRequest(safehttp.MethodPost, "/collector", strings.NewReader(exact))
++	exactReq.Header.Set("Content-Type", "application/reports+json")
++	exactRR := safehttptest.NewResponseRecorder()
++	h.ServeHTTP(exactRR.ResponseWriter, exactReq)
++	if got, want := exactRR.Status(), safehttp.StatusNoContent; got != want {
++		t.Errorf("exact-limit status got %v, want %v", got, want)
++	}
++	if calls != 1 {
++		t.Errorf("exact-limit callback count got %d, want 1", calls)
++	}
++
++	t.Run("known oversized body is rejected without reading", func(t *testing.T) {
++		body := newVerifierTrackingBody(exact + " ")
++		rr := safehttptest.NewResponseRecorder()
++		h.ServeHTTP(rr.ResponseWriter, verifierRequest(safehttp.MethodPost, "application/reports+json", body, verifierMaxCollectorBody+1))
++		if got, want := rr.Status(), safehttp.StatusRequestEntityTooLarge; got != want {
++			t.Errorf("status got %v, want %v", got, want)
++		}
++		if body.reads != 0 {
++			t.Errorf("body bytes read got %d, want 0", body.reads)
++		}
++	})
++
++	t.Run("unknown-length oversized body stops at first excess byte", func(t *testing.T) {
++		body := newVerifierTrackingBody(exact + strings.Repeat(" ", 4096))
++		rr := safehttptest.NewResponseRecorder()
++		h.ServeHTTP(rr.ResponseWriter, verifierRequest(safehttp.MethodPost, "application/reports+json", body, -1))
++		if got, want := rr.Status(), safehttp.StatusRequestEntityTooLarge; got != want {
++			t.Errorf("status got %v, want %v", got, want)
++		}
++		if body.reads > verifierMaxCollectorBody+1 {
++			t.Errorf("body bytes read got %d, want at most %d", body.reads, verifierMaxCollectorBody+1)
++		}
++	})
++
++	if calls != 1 {
++		t.Errorf("oversized requests changed callback count to %d, want 1", calls)
++	}
++}
++
++func TestCollectorVerifierBatchLimitAndOrder(t *testing.T) {
++	var gotTypes []string
++	h := collector.Handler(func(r collector.Report) { gotTypes = append(gotTypes, r.Type) }, func(collector.CSPReport) {
++		t.Error("deprecated callback called for generic batch")
++	})
++
++	exactReq := safehttptest.NewRequest(safehttp.MethodPost, "/collector", strings.NewReader(verifierBatch(100)))
++	exactReq.Header.Set("Content-Type", "application/reports+json")
++	exactRR := safehttptest.NewResponseRecorder()
++	h.ServeHTTP(exactRR.ResponseWriter, exactReq)
++	if got, want := exactRR.Status(), safehttp.StatusNoContent; got != want {
++		t.Errorf("100-report status got %v, want %v", got, want)
++	}
++	if len(gotTypes) != 100 {
++		t.Fatalf("100-report callback count got %d, want 100", len(gotTypes))
++	}
++	for i, got := range gotTypes {
++		if want := "item-" + strconv.Itoa(i); got != want {
++			t.Fatalf("callback %d type got %q, want %q", i, got, want)
++		}
++	}
++
++	gotTypes = nil
++	overReq := safehttptest.NewRequest(safehttp.MethodPost, "/collector", strings.NewReader(verifierBatch(101)))
++	overReq.Header.Set("Content-Type", "application/reports+json")
++	overRR := safehttptest.NewResponseRecorder()
++	h.ServeHTTP(overRR.ResponseWriter, overReq)
++	if got, want := overRR.Status(), safehttp.StatusRequestEntityTooLarge; got != want {
++		t.Errorf("101-report status got %v, want %v", got, want)
++	}
++	if len(gotTypes) != 0 {
++		t.Errorf("101-report callback count got %d, want 0", len(gotTypes))
++	}
++}
++
++func TestCollectorVerifierBatchDeliveryIsAtomic(t *testing.T) {
++	for _, tc := range []struct {
++		name string
++		body string
++	}{
++		{name: "null report element", body: `[{"type":"valid","body":{}},null]`},
++		{name: "null report body", body: `[{"type":"valid","body":{}},{"type":"invalid","body":null}]`},
++		{name: "null CSP violation body", body: `[{"type":"valid","body":{}},{"type":"csp-violation","body":null}]`},
++		{name: "scalar report body", body: `[{"type":"valid","body":{}},{"type":"invalid","body":7}]`},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			var calls int
++			h := collector.Handler(func(collector.Report) { calls++ }, func(collector.CSPReport) { calls++ })
++			req := safehttptest.NewRequest(safehttp.MethodPost, "/collector", strings.NewReader(tc.body))
++			req.Header.Set("Content-Type", "application/reports+json")
++			rr := safehttptest.NewResponseRecorder()
++			h.ServeHTTP(rr.ResponseWriter, req)
++			if got, want := rr.Status(), safehttp.StatusBadRequest; got != want {
++				t.Errorf("status got %v, want %v", got, want)
++			}
++			if calls != 0 {
++				t.Errorf("callback count got %d, want 0", calls)
++			}
++		})
++	}
++}
++
++func TestCollectorVerifierDeprecatedCSPObjectShapes(t *testing.T) {
++	for _, tc := range []struct {
++		name string
++		body string
++	}{
++		{name: "null top level", body: `null`},
++		{name: "null wrapped report", body: `{"csp-report":null}`},
++		{name: "array wrapped report", body: `{"csp-report":[]}`},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			var calls int
++			h := collector.Handler(func(collector.Report) { calls++ }, func(collector.CSPReport) { calls++ })
++			req := safehttptest.NewRequest(safehttp.MethodPost, "/collector", strings.NewReader(tc.body))
++			req.Header.Set("Content-Type", "application/csp-report")
++			rr := safehttptest.NewResponseRecorder()
++			h.ServeHTTP(rr.ResponseWriter, req)
++			if got, want := rr.Status(), safehttp.StatusBadRequest; got != want {
++				t.Errorf("status got %v, want %v", got, want)
++			}
++			if calls != 0 {
++				t.Errorf("callback count got %d, want 0", calls)
++			}
++		})
++	}
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,5 @@
++#!/bin/bash
++set -euo pipefail
++
++
++go test ./safehttp/plugins/collector -count=1

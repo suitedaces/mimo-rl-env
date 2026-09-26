@@ -1,0 +1,243 @@
+diff --git a/tests/unit/engines/rag/test_retrieval_fusion_codespec.py b/tests/unit/engines/rag/test_retrieval_fusion_codespec.py
+new file mode 100644
+index 0000000..d8bc1d1
+--- /dev/null
++++ b/tests/unit/engines/rag/test_retrieval_fusion_codespec.py
+@@ -0,0 +1,227 @@
++from collections.abc import Sequence
++
++import pytest
++from attrs import define, field
++
++from griptape.artifacts import BaseArtifact, InfoArtifact, TextArtifact
++from griptape.common import Reference
++from griptape.drivers import BaseRerankDriver
++from griptape.engines.rag import RagContext
++from griptape.engines.rag.modules import BaseRetrievalRagModule, TextChunksRerankRagModule
++from griptape.engines.rag.stages import RetrievalRagStage
++
++
++@define(kw_only=True)
++class CodespecStaticRetrievalModule(BaseRetrievalRagModule):
++    results: Sequence[BaseArtifact] = field(factory=list)
++    error: Exception | None = field(default=None)
++
++    def run(self, context: RagContext) -> Sequence[BaseArtifact]:
++        if self.error is not None:
++            raise self.error
++        return self.results
++
++
++@define(kw_only=True)
++class CodespecReverseRerankDriver(BaseRerankDriver):
++    def run(self, query: str, artifacts: list[TextArtifact]) -> list[TextArtifact]:
++        return list(reversed(artifacts))
++
++
++def text(value: str, artifact_id: str, **kwargs) -> TextArtifact:
++    return TextArtifact(value, id=artifact_id, **kwargs)
++
++
++def test_a_zero_max_chunks_returns_no_chunks_in_default_mode():
++    module = CodespecStaticRetrievalModule(name="only", results=[text("alpha", "a")])
++    context = RetrievalRagStage(retrieval_modules=[module], max_chunks=0).run(RagContext(query="q"))
++
++    assert context.text_chunks == []
++
++
++def test_context_diagnostics_default_empty_and_round_trip():
++    context = RagContext(query="q")
++
++    assert context.retrieval_scores == {}
++    assert context.retrieval_errors == {}
++
++    restored = RagContext.from_dict(context.to_dict())
++    assert restored.retrieval_scores == {}
++    assert restored.retrieval_errors == {}
++
++
++def test_default_concatenation_is_stable_and_clears_scores():
++    first = text("same", "first", meta={"source": "first"})
++    second = text("same", "second", meta={"source": "second"})
++    left = CodespecStaticRetrievalModule(
++        name="left",
++        results=[InfoArtifact("ignored"), first, text("left-only", "left-only")],
++    )
++    right = CodespecStaticRetrievalModule(
++        name="right",
++        results=[second, text("right-only", "right-only")],
++    )
++    context = RagContext(query="q", retrieval_scores={"stale": 1.0})
++
++    result = RetrievalRagStage(retrieval_modules=[left, right]).run(context)
++
++    assert [chunk.id for chunk in result.text_chunks] == ["first", "left-only", "right-only"]
++    assert result.text_chunks[0].meta == {"source": "first"}
++    assert result.retrieval_scores == {}
++    assert result.retrieval_errors == {}
++
++
++def test_rrf_scores_filter_non_text_and_count_each_module_once():
++    first_a = text("alpha", "a-first", meta={"origin": "left"}, reference=Reference(title="first"))
++    later_a = text("alpha", "a-later", meta={"origin": "right"}, reference=Reference(title="later"))
++    left = CodespecStaticRetrievalModule(
++        name="left",
++        results=[
++            InfoArtifact("does-not-consume-a-rank"),
++            first_a,
++            text("beta", "b-left"),
++            text("alpha", "a-repeat"),
++        ],
++    )
++    right = CodespecStaticRetrievalModule(
++        name="right",
++        results=[text("beta", "b-right"), text("gamma", "c"), later_a],
++    )
++    muted = CodespecStaticRetrievalModule(name="muted", results=[text("delta", "d")])
++
++    result = RetrievalRagStage(
++        retrieval_modules=[left, right, muted],
++        fusion_mode="rrf",
++        rrf_k=10,
++        module_weights={"left": 2, "muted": 0},
++    ).run(RagContext(query="q"))
++
++    assert [chunk.value for chunk in result.text_chunks] == ["alpha", "beta", "gamma", "delta"]
++    assert result.text_chunks[0].id == "a-first"
++    assert result.text_chunks[0].meta == {"origin": "left"}
++    assert result.text_chunks[0].reference.title == "first"
++    assert result.retrieval_scores == pytest.approx(
++        {
++            "a-first": 2 / 11 + 1 / 13,
++            "b-left": 2 / 12 + 1 / 11,
++            "c": 1 / 12,
++            "d": 0,
++        }
++    )
++
++
++def test_rrf_ties_follow_first_configured_appearance():
++    left = CodespecStaticRetrievalModule(name="left", results=[text("alpha", "a"), text("beta", "b-left")])
++    right = CodespecStaticRetrievalModule(
++        name="right", results=[text("beta", "b-right"), text("alpha", "a-right")]
++    )
++
++    result = RetrievalRagStage(retrieval_modules=[left, right], fusion_mode="rrf").run(RagContext(query="q"))
++
++    assert [chunk.id for chunk in result.text_chunks] == ["a", "b-left"]
++    assert result.retrieval_scores["a"] == pytest.approx(result.retrieval_scores["b-left"])
++    assert result.retrieval_scores["a"] == pytest.approx(1 / 61 + 1 / 62)
++
++
++def test_continue_records_current_errors_and_clears_them_on_reuse():
++    failed = CodespecStaticRetrievalModule(name="broken", error=ValueError("unavailable"))
++    healthy = CodespecStaticRetrievalModule(name="healthy", results=[text("available", "ok")])
++    stage = RetrievalRagStage(retrieval_modules=[failed, healthy], fusion_mode="rrf", on_error="continue")
++    context = RagContext(query="q", retrieval_errors={"stale": "old"}, retrieval_scores={"stale": 99})
++
++    first_result = stage.run(context)
++
++    assert [chunk.id for chunk in first_result.text_chunks] == ["ok"]
++    assert first_result.retrieval_errors == {"broken": "ValueError: unavailable"}
++    assert set(first_result.retrieval_scores) == {"ok"}
++
++    restored = RagContext.from_dict(first_result.to_dict())
++    assert restored.retrieval_errors == {"broken": "ValueError: unavailable"}
++    assert restored.retrieval_scores == pytest.approx(first_result.retrieval_scores)
++
++    failed.error = None
++    failed.results = [text("recovered", "recovered")]
++    second_result = stage.run(context)
++
++    assert [chunk.id for chunk in second_result.text_chunks] == ["recovered", "ok"]
++    assert second_result.retrieval_errors == {}
++    assert set(second_result.retrieval_scores) == {"recovered", "ok"}
++
++
++@pytest.mark.parametrize("fusion_mode", ["concatenate", "rrf"])
++def test_continue_applies_to_each_fusion_mode(fusion_mode):
++    failed = CodespecStaticRetrievalModule(name="broken", error=LookupError("missing"))
++    healthy = CodespecStaticRetrievalModule(name="healthy", results=[text("available", "ok")])
++
++    result = RetrievalRagStage(
++        retrieval_modules=[failed, healthy], fusion_mode=fusion_mode, on_error="continue"
++    ).run(RagContext(query="q"))
++
++    assert [chunk.id for chunk in result.text_chunks] == ["ok"]
++    assert result.retrieval_errors == {"broken": "LookupError: missing"}
++
++
++def test_raise_mode_propagates_and_preserves_context_state():
++    failed = CodespecStaticRetrievalModule(name="broken", error=RuntimeError("stop"))
++    original_chunk = text("original", "original")
++    context = RagContext(
++        query="q",
++        text_chunks=[original_chunk],
++        retrieval_errors={"existing": "error"},
++        retrieval_scores={"original": 0.5},
++    )
++
++    with pytest.raises(RuntimeError, match="stop"):
++        RetrievalRagStage(retrieval_modules=[failed]).run(context)
++
++    assert context.text_chunks == [original_chunk]
++    assert context.retrieval_errors == {"existing": "error"}
++    assert context.retrieval_scores == {"original": 0.5}
++
++
++def test_reranking_precedes_positive_limit_and_scores_cover_all_candidates():
++    module = CodespecStaticRetrievalModule(
++        name="source",
++        results=[text("alpha", "a"), text("beta", "b"), text("gamma", "c")],
++    )
++    reranker = TextChunksRerankRagModule(name="reverse", rerank_driver=CodespecReverseRerankDriver())
++
++    result = RetrievalRagStage(
++        retrieval_modules=[module],
++        rerank_module=reranker,
++        fusion_mode="rrf",
++        max_chunks=2,
++    ).run(RagContext(query="q"))
++
++    assert [chunk.id for chunk in result.text_chunks] == ["c", "b"]
++    assert set(result.retrieval_scores) == {"a", "b", "c"}
++
++
++@pytest.mark.parametrize(
++    "kwargs",
++    [
++        {"fusion_mode": "unknown"},
++        {"on_error": "ignore"},
++    ],
++)
++def test_invalid_modes_are_rejected(kwargs):
++    with pytest.raises(ValueError):
++        RetrievalRagStage(retrieval_modules=[], **kwargs)
++
++
++@pytest.mark.parametrize(
++    "kwargs",
++    [
++        {"rrf_k": 0},
++        {"rrf_k": -1},
++        {"rrf_k": float("inf")},
++        {"rrf_k": float("nan")},
++        {"module_weights": {"source": -0.1}},
++        {"module_weights": {"source": float("inf")}},
++        {"module_weights": {"source": float("nan")}},
++        {"max_chunks": -1},
++    ],
++)
++def test_invalid_numeric_configuration_is_rejected(kwargs):
++    with pytest.raises(ValueError):
++        RetrievalRagStage(retrieval_modules=[], **kwargs)
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,5 @@
++#!/bin/bash
++set -euo pipefail
++
++
++.venv/bin/pytest -q tests/unit/engines/rag/test_retrieval_fusion_codespec.py tests/unit/engines/rag/test_rag_engine.py tests/unit/engines/rag/test_rag_context.py

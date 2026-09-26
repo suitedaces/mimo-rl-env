@@ -1,0 +1,359 @@
+diff --git a/pkg/skaffold/schema/profile_requires_codespec_test.go b/pkg/skaffold/schema/profile_requires_codespec_test.go
+new file mode 100644
+index 000000000..d7b30ed99
+--- /dev/null
++++ b/pkg/skaffold/schema/profile_requires_codespec_test.go
+@@ -0,0 +1,341 @@
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++package schema_test
++
++import (
++	"io/ioutil"
++	"os"
++	"reflect"
++	"strings"
++	"testing"
++
++	config "github.com/GoogleContainerTools/skaffold/pkg/skaffold/config"
++	"github.com/GoogleContainerTools/skaffold/pkg/skaffold/schema"
++	"github.com/GoogleContainerTools/skaffold/pkg/skaffold/schema/latest"
++	yaml "gopkg.in/yaml.v2"
++)
++
++const profileRequiresBase = `apiVersion: skaffold/v1beta10
++kind: Config
++build:
++  artifacts:
++  - image: original
++    docker:
++      dockerfile: Original
++`
++
++func parseProfileRequiresConfig(t *testing.T, profiles string) *latest.SkaffoldConfig {
++	t.Helper()
++	f, err := ioutil.TempFile("", "profile-requires-*.yaml")
++	if err != nil {
++		t.Fatal(err)
++	}
++	name := f.Name()
++	defer os.Remove(name)
++	if _, err := f.WriteString(profileRequiresBase + profiles); err != nil {
++		f.Close()
++		t.Fatal(err)
++	}
++	if err := f.Close(); err != nil {
++		t.Fatal(err)
++	}
++
++	parsed, err := schema.ParseConfig(name, false)
++	if err != nil {
++		t.Fatalf("expected the latest profile schema to accept requires: %v", err)
++	}
++	return parsed.(*latest.SkaffoldConfig)
++}
++
++func profileRequiresImages(c *latest.SkaffoldConfig) []string {
++	var images []string
++	for _, artifact := range c.Build.Artifacts {
++		images = append(images, artifact.ImageName)
++	}
++	return images
++}
++
++func profileRequiresPipeline(t *testing.T, c *latest.SkaffoldConfig) string {
++	t.Helper()
++	b, err := yaml.Marshal(c.Pipeline)
++	if err != nil {
++		t.Fatal(err)
++	}
++	return string(b)
++}
++
++func requireProfileErrorNames(t *testing.T, err error, names ...string) {
++	t.Helper()
++	if err == nil {
++		t.Fatal("expected profile dependency resolution to fail")
++	}
++	for _, name := range names {
++		if !strings.Contains(err.Error(), name) {
++			t.Errorf("error %q does not identify %q", err, name)
++		}
++	}
++}
++
++func TestProfileRequiresTransitiveOrderAndSharedDependency(t *testing.T) {
++	c := parseProfileRequiresConfig(t, `profiles:
++- name: common
++  patches:
++  - op: add
++    path: /build/artifacts/-
++    value: {image: common, docker: {}}
++- name: compile
++  requires: [common]
++  patches:
++  - op: add
++    path: /build/artifacts/-
++    value: {image: compile, docker: {}}
++- name: security
++  requires: [common]
++  patches:
++  - op: add
++    path: /build/artifacts/-
++    value: {image: security, docker: {}}
++- name: release
++  requires: [compile, security]
++  patches:
++  - op: add
++    path: /build/artifacts/-
++    value: {image: release, docker: {}}
++`)
++
++	err := schema.ApplyProfiles(c, &config.SkaffoldOptions{Profiles: []string{"release"}})
++	if err != nil {
++		t.Fatalf("applying transitive profile requirements: %v", err)
++	}
++	want := []string{"original", "common", "compile", "security", "release"}
++	if got := profileRequiresImages(c); !reflect.DeepEqual(got, want) {
++		t.Errorf("dependency application order = %v, want %v", got, want)
++	}
++}
++
++func TestProfileRequiresPreservesOverlayPrecedence(t *testing.T) {
++	c := parseProfileRequiresConfig(t, `profiles:
++- name: foundation
++  patches:
++  - path: /build/artifacts/0/docker/dockerfile
++    value: Foundation
++- name: developer
++  requires: [foundation]
++  patches:
++  - path: /build/artifacts/0/docker/dockerfile
++    value: Developer
++- name: command-line-last
++  patches:
++  - path: /build/artifacts/0/docker/dockerfile
++    value: CommandLineLast
++`)
++
++	err := schema.ApplyProfiles(c, &config.SkaffoldOptions{Profiles: []string{"developer", "command-line-last"}})
++	if err != nil {
++		t.Fatalf("applying dependent profiles: %v", err)
++	}
++	if got := c.Build.Artifacts[0].DockerArtifact.DockerfilePath; got != "CommandLineLast" {
++		t.Errorf("dockerfile = %q, want later root profile to win", got)
++	}
++}
++
++func TestProfileRequiresExplicitAndAutomaticRootOrder(t *testing.T) {
++	c := parseProfileRequiresConfig(t, `profiles:
++- name: explicit
++  patches:
++  - op: add
++    path: /build/artifacts/-
++    value: {image: explicit, docker: {}}
++- name: both
++  activation:
++  - command: dev
++  patches:
++  - op: add
++    path: /build/artifacts/-
++    value: {image: both, docker: {}}
++- name: auto-first
++  activation:
++  - command: dev
++  patches:
++  - op: add
++    path: /build/artifacts/-
++    value: {image: auto-first, docker: {}}
++- name: auto-second
++  activation:
++  - command: dev
++  patches:
++  - op: add
++    path: /build/artifacts/-
++    value: {image: auto-second, docker: {}}
++`)
++
++	err := schema.ApplyProfiles(c, &config.SkaffoldOptions{
++		Command:  "dev",
++		Profiles: []string{"explicit", "both", "explicit"},
++	})
++	if err != nil {
++		t.Fatalf("applying explicit and automatic profiles: %v", err)
++	}
++	want := []string{"original", "explicit", "both", "auto-first", "auto-second"}
++	if got := profileRequiresImages(c); !reflect.DeepEqual(got, want) {
++		t.Errorf("root application order = %v, want %v", got, want)
++	}
++}
++
++func TestProfileRequiresOverridesPrerequisiteActivation(t *testing.T) {
++	c := parseProfileRequiresConfig(t, `profiles:
++- name: gated-prerequisite
++  activation:
++  - command: build
++  patches:
++  - op: add
++    path: /build/artifacts/-
++    value: {image: gated-prerequisite, docker: {}}
++- name: dev-root
++  requires: [gated-prerequisite]
++  activation:
++  - command: dev
++  patches:
++  - op: add
++    path: /build/artifacts/-
++    value: {image: dev-root, docker: {}}
++- name: unrelated-build
++  activation:
++  - command: build
++  patches:
++  - op: add
++    path: /build/artifacts/-
++    value: {image: unrelated-build, docker: {}}
++`)
++
++	err := schema.ApplyProfiles(c, &config.SkaffoldOptions{Command: "dev"})
++	if err != nil {
++		t.Fatalf("applying auto-activated dependent profile: %v", err)
++	}
++	want := []string{"original", "gated-prerequisite", "dev-root"}
++	if got := profileRequiresImages(c); !reflect.DeepEqual(got, want) {
++		t.Errorf("activation-aware dependency result = %v, want %v", got, want)
++	}
++}
++
++func TestProfileRequiresUnknownReferencesAreAtomic(t *testing.T) {
++	tests := []struct {
++		name       string
++		profiles   string
++		selected   []string
++		errorNames []string
++	}{
++		{
++			name: "unknown selected root after valid root",
++			profiles: `profiles:
++- name: valid
++  patches:
++  - op: add
++    path: /build/artifacts/-
++    value: {image: should-not-appear, docker: {}}
++`,
++			selected:   []string{"valid", "missing-root"},
++			errorNames: []string{"missing-root"},
++		},
++		{
++			name: "unknown dependency in inactive profile",
++			profiles: `profiles:
++- name: valid
++  patches:
++  - op: add
++    path: /build/artifacts/-
++    value: {image: should-not-appear, docker: {}}
++- name: broken
++  requires: [missing-parent]
++`,
++			selected:   []string{"valid"},
++			errorNames: []string{"broken", "missing-parent"},
++		},
++	}
++
++	for _, test := range tests {
++		t.Run(test.name, func(t *testing.T) {
++			c := parseProfileRequiresConfig(t, test.profiles)
++			before := profileRequiresPipeline(t, c)
++			err := schema.ApplyProfiles(c, &config.SkaffoldOptions{Profiles: test.selected})
++			requireProfileErrorNames(t, err, test.errorNames...)
++			if after := profileRequiresPipeline(t, c); after != before {
++				t.Errorf("pipeline changed after resolution error\nbefore:\n%s\nafter:\n%s", before, after)
++			}
++		})
++	}
++}
++
++func TestProfileRequiresCyclesAreAtomic(t *testing.T) {
++	c := parseProfileRequiresConfig(t, `profiles:
++- name: valid
++  patches:
++  - op: add
++    path: /build/artifacts/-
++    value: {image: should-not-appear, docker: {}}
++- name: alpha
++  requires: [beta]
++- name: beta
++  requires: [gamma]
++- name: gamma
++  requires: [alpha]
++`)
++	before := profileRequiresPipeline(t, c)
++	err := schema.ApplyProfiles(c, &config.SkaffoldOptions{Profiles: []string{"valid"}})
++	requireProfileErrorNames(t, err, "cycle", "alpha", "beta", "gamma")
++	if after := profileRequiresPipeline(t, c); after != before {
++		t.Errorf("pipeline changed after cycle error\nbefore:\n%s\nafter:\n%s", before, after)
++	}
++}
++
++func TestProfileRequiresDuplicateNamesAreRejectedAtomically(t *testing.T) {
++	c := parseProfileRequiresConfig(t, `profiles:
++- name: valid
++  patches:
++  - op: add
++    path: /build/artifacts/-
++    value: {image: should-not-appear, docker: {}}
++- name: duplicate
++- name: duplicate
++`)
++	before := profileRequiresPipeline(t, c)
++	err := schema.ApplyProfiles(c, &config.SkaffoldOptions{Profiles: []string{"valid"}})
++	requireProfileErrorNames(t, err, "duplicate")
++	if after := profileRequiresPipeline(t, c); after != before {
++		t.Errorf("pipeline changed after duplicate-name error\nbefore:\n%s\nafter:\n%s", before, after)
++	}
++}
++
++func TestProfileRequiresEmptyListIsCompatible(t *testing.T) {
++	c := parseProfileRequiresConfig(t, `profiles:
++- name: plain
++  requires: []
++  patches:
++  - path: /build/artifacts/0/docker/dockerfile
++    value: Plain
++`)
++	err := schema.ApplyProfiles(c, &config.SkaffoldOptions{Profiles: []string{"plain"}})
++	if err != nil {
++		t.Fatalf("applying profile with empty requirements: %v", err)
++	}
++	if got := c.Build.Artifacts[0].DockerArtifact.DockerfilePath; got != "Plain" {
++		t.Errorf("dockerfile = %q, want Plain", got)
++	}
++	if len(c.Profiles) != 0 {
++		t.Errorf("applied config retained %d profile definitions", len(c.Profiles))
++	}
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,7 @@
++#!/bin/bash
++set -euo pipefail
++
++
++GO111MODULE=off go test github.com/GoogleContainerTools/skaffold/pkg/skaffold/schema \
++  -run '^(TestProfileRequires|TestApplyPatch$|TestApplyInvalidPatch$|TestApplyProfiles$|TestActivatedProfiles$)' \
++  -count=1

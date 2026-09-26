@@ -1,0 +1,318 @@
+diff --git a/usercase-test-coderl/test_purchase_transaction.py b/usercase-test-coderl/test_purchase_transaction.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/test_purchase_transaction.py
+@@ -0,0 +1,293 @@
++import asyncio
++import os
++import random
++import tempfile
++import unittest
++from decimal import Decimal
++from types import SimpleNamespace
++
++from lbry.error import KeyFeeAboveMaxAllowedError
++from lbry.schema.claim import Claim
++from lbry.wallet import Account, Database, Headers, Input, Ledger, Output, Transaction, Wallet, WalletManager
++from lbry.wallet.constants import COIN
++from lbry.wallet.dewies import lbc_to_dewies
++
++
++
++
++
++
++
++
++class FakeExchange:
++
++    def __init__(self, mapping=None):
++        self.mapping = mapping or {}
++        self.calls = []
++
++    def to_dewies(self, currency, amount):
++        self.calls.append((currency, str(amount)))
++        key = (currency, str(amount))
++        if key in self.mapping:
++            return self.mapping[key]
++        if currency == "LBC":
++            text = str(amount)
++            if "." not in text:
++                text += ".0"
++            return lbc_to_dewies(text)
++        return self.mapping[key]
++
++
++class PurchaseTransactionAcceptance(unittest.IsolatedAsyncioTestCase):
++
++    async def asyncSetUp(self):
++        self.tmp = tempfile.TemporaryDirectory()
++        self.ledger = Ledger({
++            "db": Database(os.path.join(self.tmp.name, "blockchain.db")),
++            "headers": Headers(":memory:")
++        })
++        await self.ledger.db.open()
++        self.wallet = Wallet()
++        self.account = Account.from_dict(self.ledger, self.wallet, {
++            "seed": "carbon smart garage balance margin twelve chest sword "
++                    "toast envelope bottom stomach absent"
++        })
++        self.wallet.accounts.append(self.account)
++        self.ledger.add_account(self.account)
++        self.manager = WalletManager([self.wallet], {self.ledger.__class__: self.ledger})
++        self.manager.config = SimpleNamespace(max_key_fee=None)
++
++        self.addresses = await self.account.ensure_address_gap()
++        pubkey_hashes = [self.ledger.address_to_hash160(address) for address in self.addresses]
++        previous = Transaction(height=-2).add_outputs([
++            Output.pay_pubkey_hash(50 * COIN, pubkey_hashes[2])
++        ]).outputs[0]
++        funding_tx = Transaction(is_verified=True).add_inputs([Input.spend(previous)]).add_outputs([
++            Output.pay_pubkey_hash(1 * COIN, pubkey_hashes[0]),
++            Output.pay_pubkey_hash(3 * COIN, pubkey_hashes[1]),
++            Output.pay_pubkey_hash(5 * COIN, pubkey_hashes[2]),
++        ])
++        await self.ledger.db.insert_transaction(funding_tx)
++        for utxo in funding_tx.outputs:
++            pubkey_hash = utxo.script.values["pubkey_hash"]
++            await self.ledger.db.save_transaction_io(
++                funding_tx, self.ledger.hash160_to_address(pubkey_hash), pubkey_hash, ""
++            )
++
++    async def asyncTearDown(self):
++        await self.ledger.db.close()
++        self.tmp.cleanup()
++
++    def claim_output(self, claim_name, price, currency="LBC", fee_address=None, claim_address=None):
++        claim = Claim()
++        if currency == "LBC":
++            claim.stream.fee.lbc = Decimal(price)
++        elif currency == "USD":
++            claim.stream.fee.usd = Decimal(price)
++        else:
++            claim.stream.fee.btc = Decimal(price)
++        if fee_address is not None:
++            claim.stream.fee.address = fee_address
++        claim.stream.title = "priced stream"
++
++        holding_address = claim_address or self.addresses[4]
++        previous = Transaction(height=-2).add_outputs([
++            Output.pay_pubkey_hash(COIN, self.ledger.address_to_hash160(holding_address))
++        ]).outputs[0]
++        return Transaction(is_verified=True).add_inputs([Input.spend(previous)]).add_outputs([
++            Output.pay_claim_name_pubkey_hash(
++                lbc_to_dewies("0.01"), claim_name, claim,
++                self.ledger.address_to_hash160(holding_address)
++            )
++        ]).outputs[0]
++
++    def output_addresses(self, tx):
++        return [
++            output.get_address(self.ledger) if not output.script.is_return_data else "RETURN"
++            for output in tx.outputs
++        ]
++
++    async def assert_change_to_account(self, tx, account):
++        change_output = tx.outputs[2]
++
++        self.assertGreater(change_output.amount, 0)
++        self.assertIn(change_output.get_address(self.ledger), await account.change.get_addresses())
++
++    def assert_purchase_metadata_for_claim(self, tx, txo):
++
++        self.assertTrue(tx.outputs[1].is_purchase_data)
++        self.assertTrue(tx.outputs[1].can_decode_purchase_data)
++        self.assertEqual(tx.outputs[1].purchase_data.claim_id, txo.claim_id)
++
++    def assert_called_to_dewies(self, exchange, currency, amount):
++
++        self.assertTrue(
++            any(call_currency == currency and Decimal(call_amount) == Decimal(amount)
++                for call_currency, call_amount in exchange.calls)
++        )
++
++    async def test_explicit_lbc_fee_address_builds_signed_purchase_with_change(self):
++
++
++
++
++        txo = self.claim_output("explicit", "0.2", fee_address=self.addresses[3])
++        exchange = FakeExchange()
++
++        initial_balance = await self.account.get_detailed_balance()
++
++        self.assertGreater(initial_balance["available"], 0)
++        self.assertEqual(initial_balance["reserved"], 0)
++        random.seed(0)
++        tx = await self.manager.create_purchase_transaction([self.account], txo, exchange)
++
++
++        self.assertGreaterEqual(len(tx.inputs), 1)
++        self.assertEqual(len(tx.outputs), 3)
++        self.assertEqual(tx.outputs[0].amount, lbc_to_dewies("0.2"))
++        self.assertEqual(tx.outputs[0].get_address(self.ledger), txo.claim.stream.fee.address)
++        self.assertEqual(self.output_addresses(tx)[1], "RETURN")
++        self.assert_purchase_metadata_for_claim(tx, txo)
++        await self.assert_change_to_account(tx, self.account)
++
++        self.assertLess((await self.account.get_detailed_balance())["total"], initial_balance["total"])
++
++        await self.ledger.release_tx(tx)
++
++        self.assertEqual(await self.account.get_detailed_balance(), initial_balance)
++
++    async def test_missing_fee_address_pays_claim_address(self):
++
++
++
++
++        txo = self.claim_output("fallback", "0.2", claim_address=self.addresses[5])
++
++        random.seed(0)
++        tx = await self.manager.create_purchase_transaction([self.account], txo, FakeExchange())
++
++
++        self.assertEqual(len(tx.outputs), 3)
++        self.assertEqual(tx.outputs[0].amount, lbc_to_dewies("0.2"))
++        self.assertEqual(tx.outputs[0].get_address(self.ledger), txo.get_address(self.ledger))
++        self.assertEqual(self.output_addresses(tx)[1], "RETURN")
++        self.assert_purchase_metadata_for_claim(tx, txo)
++        await self.assert_change_to_account(tx, self.account)
++        await self.ledger.release_tx(tx)
++
++    async def test_non_lbc_price_uses_exchange_and_max_key_fee_error_is_specific(self):
++
++
++
++
++        txo = self.claim_output("usd", "2.00", currency="USD", fee_address=self.addresses[3], claim_address=self.addresses[6])
++        self.manager.config.max_key_fee = {"currency": "LBC", "amount": 1.0}
++        exchange = FakeExchange({("USD", "2"): 150000000})
++        initial_balance = await self.account.get_detailed_balance()
++
++        with self.assertRaises(KeyFeeAboveMaxAllowedError) as raised:
++            await self.manager.create_purchase_transaction([self.account], txo, exchange)
++
++
++        self.assertIn("1.5", str(raised.exception))
++        self.assertIn("1.0", str(raised.exception))
++        self.assert_called_to_dewies(exchange, "USD", "2.00")
++
++        self.assertEqual(await self.account.get_detailed_balance(), initial_balance)
++
++    async def test_override_max_key_fee_still_builds_usd_purchase(self):
++
++
++
++
++        txo = self.claim_output("usd", "2.00", currency="USD", fee_address=self.addresses[3], claim_address=self.addresses[6])
++        self.manager.config.max_key_fee = {"currency": "LBC", "amount": 1.0}
++        exchange = FakeExchange({("USD", "2"): 150000000})
++
++        random.seed(0)
++        tx = await self.manager.create_purchase_transaction([self.account], txo, exchange, override_max_key_fee=True)
++
++        self.assert_called_to_dewies(exchange, "USD", "2.00")
++
++        self.assertEqual(len(tx.outputs), 3)
++        self.assertEqual(tx.outputs[0].amount, 150000000)
++        self.assertEqual(tx.outputs[0].get_address(self.ledger), txo.claim.stream.fee.address)
++        self.assertEqual(self.output_addresses(tx)[1], "RETURN")
++        self.assert_purchase_metadata_for_claim(tx, txo)
++        await self.assert_change_to_account(tx, self.account)
++        await self.ledger.release_tx(tx)
++
++    async def test_empty_funding_accounts_is_ordering_error_and_does_not_reserve_outputs(self):
++
++
++
++
++        txo = self.claim_output("explicit", "0.2", fee_address=self.addresses[3])
++
++        self.assertEqual((await self.account.get_detailed_balance())["reserved"], 0)
++
++        with self.assertRaises(Exception):
++            await self.manager.create_purchase_transaction([], txo, FakeExchange())
++        self.assertEqual((await self.account.get_detailed_balance())["reserved"], 0)
++
++    async def test_two_managers_keep_account_state_independent(self):
++
++
++
++
++        other_wallet = Wallet()
++        other_account = Account.generate(self.ledger, other_wallet, "lbryum")
++        other_wallet.accounts.append(other_account)
++        other_manager = WalletManager([other_wallet], {self.ledger.__class__: self.ledger})
++        other_manager.config = SimpleNamespace(max_key_fee=None)
++
++        txo = self.claim_output("explicit", "0.2", fee_address=self.addresses[3])
++        random.seed(0)
++        tx = await self.manager.create_purchase_transaction([self.account], txo, FakeExchange())
++
++        await self.assert_change_to_account(tx, self.account)
++
++        other_balance = await other_account.get_detailed_balance()
++        self.assertEqual(other_balance["total"], 0)
++        self.assertEqual(other_balance["reserved"], 0)
++        await self.ledger.release_tx(tx)
++
++    async def test_release_cleanup_is_idempotent(self):
++
++
++
++
++        txo = self.claim_output("explicit", "0.2", fee_address=self.addresses[3])
++        random.seed(0)
++        initial_balance = await self.account.get_detailed_balance()
++        tx = await self.manager.create_purchase_transaction([self.account], txo, FakeExchange())
++
++        await self.ledger.release_tx(tx)
++
++        self.assertEqual(await self.account.get_detailed_balance(), initial_balance)
++        await self.ledger.release_tx(tx)
++
++        self.assertEqual(await self.account.get_detailed_balance(), initial_balance)
++
++    async def test_repeated_purchase_preview_and_cleanup_keeps_wallet_counters_bounded(self):
++
++
++
++
++        txo = self.claim_output("explicit", "0.2", fee_address=self.addresses[3])
++        initial_balance = await self.account.get_detailed_balance()
++
++        for _ in range(100):
++            random.seed(0)
++            tx = await self.manager.create_purchase_transaction([self.account], txo, FakeExchange())
++
++            self.assertEqual(tx.outputs[0].amount, lbc_to_dewies("0.2"))
++            self.assert_purchase_metadata_for_claim(tx, txo)
++            await self.ledger.release_tx(tx)
++
++
++        self.assertEqual(await self.account.get_detailed_balance(), initial_balance)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,15 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++cd /workspace/repo
++
++python /workspace/repo/usercase-test-coderl/test_purchase_transaction.py -v

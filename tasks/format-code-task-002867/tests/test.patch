@@ -1,0 +1,439 @@
+diff --git a/usercase-test-coderl/fixtures/gcp_credential_command.py b/usercase-test-coderl/fixtures/gcp_credential_command.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/fixtures/gcp_credential_command.py
+@@ -0,0 +1,20 @@
++import json
++import sys
++
++
++if sys.argv[1:] and sys.argv[1:] != ["--scope=alpha beta", "plain"]:
++
++
++    raise SystemExit(f"unexpected argv: {sys.argv[1:]!r}")
++
++print(
++    json.dumps(
++        {
++            "argv": sys.argv[1:],
++            "credential": {
++                "access_token": "cmd-token",
++                "token_expiry": "2040-05-06T07:08:09Z",
++            },
++        }
++    )
++)
+diff --git a/usercase-test-coderl/test_gcp_kubeconfig_loader.py b/usercase-test-coderl/test_gcp_kubeconfig_loader.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/test_gcp_kubeconfig_loader.py
+@@ -0,0 +1,384 @@
++import asyncio
++import copy
++import sys
++from types import SimpleNamespace
++
++import pytest
++
++from kubernetes_asyncio.client import Configuration
++from kubernetes_asyncio.config.kube_config import KubeConfigLoader, refresh_token
++
++
++FIXTURES = "/workspace/repo/usercase-test-coderl/fixtures"
++HOST_WITH_TRAILING_SLASH = "https://cluster.example.test/"
++
++
++def _gcp_config(user_config, current_context="ctx"):
++    return {
++        "apiVersion": "v1",
++        "kind": "Config",
++        "current-context": current_context,
++        "clusters": [
++            {"name": "cluster", "cluster": {"server": HOST_WITH_TRAILING_SLASH}},
++        ],
++        "contexts": [
++            {"name": "ctx", "context": {"cluster": "cluster", "user": "gcp-user"}},
++            {
++                "name": "other",
++                "context": {"cluster": "cluster", "user": "other-user"},
++            },
++        ],
++        "users": [
++            {
++                "name": "gcp-user",
++                "user": {"auth-provider": {"name": "gcp", "config": user_config}},
++            },
++            {
++                "name": "other-user",
++                "user": {
++                    "auth-provider": {
++                        "name": "gcp",
++                        "config": {
++                            "access-token": "other-cached",
++                            "expiry": "2999-01-01T00:00:00Z",
++                        },
++                    }
++                },
++            },
++        ],
++    }
++
++
++def _run(coro):
++    return asyncio.run(coro)
++
++
++def test_load_and_set_uses_cached_gcp_auth_provider_token():
++
++
++
++
++    async def scenario():
++        calls = []
++        loader = KubeConfigLoader(
++            _gcp_config(
++                {"access-token": "cached-token", "expiry": "2999-01-01T00:00:00Z"}
++            ),
++            active_context=None,
++            get_google_credentials=lambda: calls.append("called"),
++        )
++        client_configuration = Configuration()
++
++        assert loader.provider == "gcp"
++
++        assert callable(getattr(loader, "load_gcp_token", None))
++
++        await loader.load_and_set(client_configuration)
++
++        assert loader.token == "Bearer cached-token"
++        assert client_configuration.api_key["BearerToken"] == "Bearer cached-token"
++
++        assert client_configuration.api_key["BearerToken"] == loader.token
++        assert calls == []
++
++    _run(scenario())
++
++
++def test_load_gcp_token_returns_and_stores_unexpired_cached_token():
++
++
++
++
++    async def scenario():
++        loader = KubeConfigLoader(
++            _gcp_config(
++                {"access-token": "cached-token", "expiry": "2999-01-01T00:00:00Z"}
++            ),
++            get_google_credentials=lambda: (_ for _ in ()).throw(
++                AssertionError("called")
++            ),
++        )
++
++        result = await loader.load_gcp_token()
++
++        assert result == "Bearer cached-token"
++        assert loader.token == "Bearer cached-token"
++
++    _run(scenario())
++
++
++def test_expired_token_refreshes_with_regular_callable_and_persists_config():
++
++
++
++
++    async def scenario():
++        persisted = []
++        credentials = SimpleNamespace(
++            token="fresh-sync-token", expiry="2030-02-03T04:05:06Z"
++        )
++        loader = KubeConfigLoader(
++            _gcp_config(
++                {"access-token": "old-token", "expiry": "2000-01-01T00:00:00Z"}
++            ),
++            get_google_credentials=lambda: credentials,
++            config_persister=lambda data: persisted.append(copy.deepcopy(data)),
++        )
++
++        result = await loader.load_gcp_token()
++
++        assert result == "Bearer fresh-sync-token"
++        assert loader.token == "Bearer fresh-sync-token"
++
++
++        assert persisted
++        persisted_config = persisted[-1]["users"][0]["user"]["auth-provider"][
++            "config"
++        ]
++        assert persisted_config["access-token"] == "fresh-sync-token"
++        assert persisted_config["expiry"] == "2030-02-03T04:05:06Z"
++
++    _run(scenario())
++
++
++def test_missing_token_refreshes_with_async_callable_and_persists_config():
++
++
++
++
++    async def scenario():
++        persisted = []
++
++        async def credentials():
++            return SimpleNamespace(
++                token="fresh-async-token", expiry="2031-03-04T05:06:07Z"
++            )
++
++        loader = KubeConfigLoader(
++            _gcp_config({}),
++            get_google_credentials=credentials,
++            config_persister=lambda data: persisted.append(copy.deepcopy(data)),
++        )
++
++        result = await loader.load_gcp_token()
++
++        assert result == "Bearer fresh-async-token"
++        assert loader.token == "Bearer fresh-async-token"
++
++
++        assert persisted
++        persisted_config = persisted[-1]["users"][0]["user"]["auth-provider"][
++            "config"
++        ]
++        assert persisted_config["access-token"] == "fresh-async-token"
++        assert persisted_config["expiry"] == "2031-03-04T05:06:07Z"
++
++    _run(scenario())
++
++
++def test_command_provider_splits_args_and_stores_stdout_credentials():
++
++
++
++
++    async def scenario():
++        config = _gcp_config(
++            {
++                "cmd-path": sys.executable,
++                "cmd-args": (
++                    f"{FIXTURES}/gcp_credential_command.py "
++                    '--scope="alpha beta" plain'
++                ),
++            }
++        )
++        loader = KubeConfigLoader(config)
++
++        result = await loader.load_gcp_token()
++
++        assert result == "Bearer cmd-token"
++        assert loader.token == "Bearer cmd-token"
++
++
++
++        auth_config = config["users"][0]["user"]["auth-provider"]["config"]
++        assert auth_config["access-token"] == "cmd-token"
++        assert auth_config["expiry"] == "2040-05-06T07:08:09Z"
++
++    _run(scenario())
++
++
++@pytest.mark.parametrize(
++    "bad_config",
++    [
++        {"cmd-args": "arg"},
++        {"cmd-path": "/bin/echo"},
++        {"cmd-path": ["/bin/echo"], "cmd-args": "arg"},
++        {"cmd-path": "/bin/echo", "cmd-args": ["arg"]},
++    ],
++)
++def test_command_provider_invalid_config_raises_value_error(bad_config):
++
++
++
++
++    async def scenario():
++        loader = KubeConfigLoader(_gcp_config(bad_config))
++
++
++        with pytest.raises(ValueError):
++            await loader.load_gcp_token()
++
++    _run(scenario())
++
++
++def test_two_loaders_keep_gcp_token_state_independent():
++
++
++
++
++    async def scenario():
++        a = KubeConfigLoader(
++            _gcp_config(
++                {"access-token": "old-token", "expiry": "2000-01-01T00:00:00Z"}
++            ),
++            active_context="ctx",
++            get_google_credentials=lambda: SimpleNamespace(
++                token="a-token", expiry="2032-01-01T00:00:00Z"
++            ),
++        )
++        b = KubeConfigLoader(
++            _gcp_config(
++                {"access-token": "cached-token", "expiry": "2999-01-01T00:00:00Z"}
++            ),
++            active_context="other",
++            get_google_credentials=lambda: SimpleNamespace(
++                token="b-token", expiry="2033-01-01T00:00:00Z"
++            ),
++        )
++
++        assert a.provider == "gcp"
++        assert b.provider == "gcp"
++
++        assert callable(getattr(a, "load_gcp_token", None))
++        assert callable(getattr(b, "load_gcp_token", None))
++
++        a_result = await a.load_gcp_token()
++
++        assert a_result == "Bearer a-token"
++        assert a.token == "Bearer a-token"
++
++        assert callable(getattr(b, "load_gcp_token", None))
++
++        b_result = await b.load_gcp_token()
++
++        assert b_result == "Bearer other-cached"
++        assert a.token == "Bearer a-token"
++        assert b.token == "Bearer other-cached"
++
++    _run(scenario())
++
++
++def test_refresh_token_updates_gcp_loader_and_client_configuration_each_interval(
++    monkeypatch,
++):
++
++
++
++
++    async def scenario():
++        sleep_calls = []
++
++        async def fake_sleep(interval):
++            sleep_calls.append(interval)
++            if len(sleep_calls) == 2:
++                raise AssertionError("stop after update")
++
++        monkeypatch.setattr(asyncio, "sleep", fake_sleep)
++        loader = KubeConfigLoader(
++            _gcp_config(
++                {"access-token": "old-token", "expiry": "2000-01-01T00:00:00Z"}
++            ),
++            get_google_credentials=lambda: SimpleNamespace(
++                token="refresh-token", expiry="2035-01-02T03:04:05Z"
++            ),
++        )
++        client_configuration = Configuration()
++        client_configuration.api_key = {}
++
++        with pytest.raises(AssertionError):
++            await refresh_token(loader, client_configuration, interval=60)
++
++
++
++        assert sleep_calls
++        assert all(interval == 60 for interval in sleep_calls)
++        assert loader.token == "Bearer refresh-token"
++        assert client_configuration.api_key["BearerToken"] == "Bearer refresh-token"
++
++    _run(scenario())
++
++
++def test_refresh_token_task_cancellation_is_idempotent_cleanup(monkeypatch):
++
++
++
++
++    async def scenario():
++        sleep_calls = []
++
++        async def fake_sleep(interval):
++            sleep_calls.append(interval)
++            if len(sleep_calls) == 2:
++                raise asyncio.CancelledError()
++
++        monkeypatch.setattr(asyncio, "sleep", fake_sleep)
++        loader = KubeConfigLoader(
++            _gcp_config(
++                {"access-token": "old-token", "expiry": "2000-01-01T00:00:00Z"}
++            ),
++            get_google_credentials=lambda: SimpleNamespace(
++                token="cancel-token", expiry="2036-01-02T03:04:05Z"
++            ),
++        )
++        client_configuration = Configuration()
++        client_configuration.api_key = {}
++
++        with pytest.raises(asyncio.CancelledError):
++            await refresh_token(loader, client_configuration, interval=3600)
++
++
++        assert sleep_calls
++        assert all(interval == 3600 for interval in sleep_calls)
++        assert loader.token == "Bearer cancel-token"
++        assert client_configuration.api_key["BearerToken"] == "Bearer cancel-token"
++
++    _run(scenario())
++
++
++def test_command_provider_repeated_loads_parse_stdout_credentials():
++
++
++
++
++    async def scenario():
++        results = []
++
++
++
++        for _ in range(3):
++            loader = KubeConfigLoader(
++                _gcp_config(
++                    {
++                        "cmd-path": sys.executable,
++                        "cmd-args": f"{FIXTURES}/gcp_credential_command.py",
++                    }
++                )
++            )
++            result = await loader.load_gcp_token()
++            assert result == "Bearer cmd-token"
++            assert loader.token == "Bearer cmd-token"
++            results.append(result)
++
++        assert results == ["Bearer cmd-token"] * 3
++
++    _run(scenario())
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,20 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++
++cd /workspace/repo
++
++export PYTHONPATH="/workspace/repo${PYTHONPATH:+:${PYTHONPATH}}"
++export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
++export PIP_NO_INDEX=1
++
++exec /usr/local/bin/python -m pytest /workspace/repo/usercase-test-coderl/test_gcp_kubeconfig_loader.py -v

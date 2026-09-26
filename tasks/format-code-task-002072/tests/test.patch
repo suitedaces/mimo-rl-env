@@ -1,0 +1,424 @@
+diff --git a/usercase-test-coderl/test_condition_lingo_evaluation.py b/usercase-test-coderl/test_condition_lingo_evaluation.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/test_condition_lingo_evaluation.py
+@@ -0,0 +1,399 @@
++
++
++
++
++
++
++
++import copy
++import json
++import os
++import socket
++import subprocess
++import sys
++from http import HTTPStatus
++
++import pytest
++
++from nucypher.policy.conditions.exceptions import (
++    ConditionEvaluationFailed,
++    ContextVariableVerificationFailed,
++    InvalidCondition,
++    InvalidConditionLingo,
++    InvalidContextVariableData,
++    NoConnectionToChain,
++    RequiredContextVariable,
++    ReturnValueEvaluationError,
++)
++from nucypher.policy.conditions.lingo import ConditionLingo
++from nucypher.policy.conditions.utils import (
++    ConditionEvalError,
++    ConditionProviderManager,
++    evaluate_condition_lingo,
++)
++
++
++class RecordingLog:
++    def __init__(self):
++        self.infos = []
++        self.warnings = []
++
++    def info(self, message):
++        self.infos.append(str(message))
++
++    def warn(self, message):
++        self.warnings.append(str(message))
++
++
++class FakeParsedLingo:
++    def __init__(self, result=True, error=None, sink=None):
++        self.result = result
++        self.error = error
++        self.sink = sink
++
++    def eval(self, providers=None, **context):
++        if self.sink is not None:
++            self.sink["providers"] = providers.providers
++            self.sink["context"] = context
++        if self.error is not None:
++            raise self.error
++        return self.result
++
++
++def install_from_dict(monkeypatch, parsed=None, error=None, recorder=None):
++    def fake_from_dict(cls, data):
++        if recorder is not None:
++            recorder.append(copy.deepcopy(data))
++        if error is not None:
++            raise error
++        return parsed
++
++    monkeypatch.setattr(ConditionLingo, "from_dict", classmethod(fake_from_dict))
++
++
++def assert_condition_eval_error(exc_info, message, status_code):
++    error = exc_info.value
++    assert error.__class__.__name__ == "ConditionEvalError"
++    assert error.message == message
++    assert error.status_code == status_code
++
++
++def assert_condition_eval_error_with_prefix(exc_info, prefix, status_code):
++    error = exc_info.value
++    assert error.__class__.__name__ == "ConditionEvalError"
++
++    assert error.message.startswith(prefix)
++    assert error.status_code == status_code
++
++
++def test_successful_true_evaluation_returns_none_and_uses_empty_defaults(monkeypatch):
++
++
++
++
++    captured = {}
++    install_from_dict(
++        monkeypatch,
++        parsed=FakeParsedLingo(result=True, sink=captured),
++    )
++
++    actual = evaluate_condition_lingo({"condition": {"conditionType": "fixture"}})
++
++    assert actual is None
++    assert captured == {"providers": {}, "context": {}}
++
++
++def test_successful_true_evaluation_passes_supplied_providers_and_context(monkeypatch):
++
++
++
++
++    captured = {}
++    providers = ConditionProviderManager(providers={11155111: []})
++    context = {"wallet_address": "0xabc123", "tier": 3}
++    install_from_dict(
++        monkeypatch,
++        parsed=FakeParsedLingo(result=True, sink=captured),
++    )
++
++    actual = evaluate_condition_lingo(
++        {"condition": {"conditionType": "fixture"}},
++        providers=providers,
++        context=context,
++    )
++
++    assert actual is None
++    assert captured == {
++        "providers": {11155111: []},
++        "context": {"wallet_address": "0xabc123", "tier": 3},
++    }
++
++
++@pytest.mark.parametrize("falsy_lingo", [None, {}, [], "", 0])
++def test_falsy_condition_lingo_returns_none_without_parsing(monkeypatch, falsy_lingo):
++
++
++
++
++    calls = []
++    install_from_dict(monkeypatch, parsed=FakeParsedLingo(result=True), recorder=calls)
++
++    actual = evaluate_condition_lingo(falsy_lingo)
++
++    assert actual is None
++    assert calls == []
++
++
++def test_false_evaluation_raises_forbidden_denial(monkeypatch):
++
++
++
++
++    install_from_dict(monkeypatch, parsed=FakeParsedLingo(result=False))
++
++    with pytest.raises(ConditionEvalError) as exc_info:
++        evaluate_condition_lingo({"case": "denied"})
++
++    assert_condition_eval_error(
++        exc_info,
++        "Decryption conditions not satisfied",
++        HTTPStatus.FORBIDDEN,
++    )
++
++
++def test_invalid_grammar_raises_bad_request(monkeypatch):
++
++
++
++
++    install_from_dict(monkeypatch, error=InvalidConditionLingo("bad shape"))
++
++    with pytest.raises(ConditionEvalError) as exc_info:
++        evaluate_condition_lingo({"case": "grammar"})
++
++    assert_condition_eval_error_with_prefix(
++        exc_info,
++        "Invalid condition grammar:",
++        HTTPStatus.BAD_REQUEST,
++    )
++
++
++def test_invalid_condition_value_raises_bad_request(monkeypatch):
++
++
++
++
++    install_from_dict(monkeypatch, error=InvalidCondition("bad value"))
++
++    with pytest.raises(ConditionEvalError) as exc_info:
++        evaluate_condition_lingo({"case": "invalid-condition"})
++
++    assert_condition_eval_error_with_prefix(
++        exc_info,
++        "Incorrect value provided for condition:",
++        HTTPStatus.BAD_REQUEST,
++    )
++
++
++def test_missing_context_variables_raise_bad_request(monkeypatch):
++
++
++
++
++    install_from_dict(monkeypatch, error=RequiredContextVariable("wallet"))
++
++    with pytest.raises(ConditionEvalError) as exc_info:
++        evaluate_condition_lingo({"case": "missing-context"})
++
++    assert_condition_eval_error_with_prefix(
++        exc_info,
++        "Missing required inputs:",
++        HTTPStatus.BAD_REQUEST,
++    )
++
++
++def test_invalid_context_variable_data_raises_bad_request(monkeypatch):
++
++
++
++
++    install_from_dict(monkeypatch, error=InvalidContextVariableData("wallet"))
++
++    with pytest.raises(ConditionEvalError) as exc_info:
++        evaluate_condition_lingo({"case": "invalid-context-data"})
++
++    assert_condition_eval_error_with_prefix(
++        exc_info,
++        "Invalid data provided for context variable:",
++        HTTPStatus.BAD_REQUEST,
++    )
++
++
++def test_unverifiable_context_authentication_raises_forbidden(monkeypatch):
++
++
++
++
++    install_from_dict(monkeypatch, error=ContextVariableVerificationFailed("signature"))
++
++    with pytest.raises(ConditionEvalError) as exc_info:
++        evaluate_condition_lingo({"case": "unverifiable-context-authentication"})
++
++    assert_condition_eval_error_with_prefix(
++        exc_info,
++        "Context variable data could not be verified:",
++        HTTPStatus.FORBIDDEN,
++    )
++
++
++def test_missing_chain_connectivity_raises_not_implemented(monkeypatch):
++
++
++
++
++    install_from_dict(monkeypatch, error=NoConnectionToChain(chain=11155111))
++
++    with pytest.raises(ConditionEvalError) as exc_info:
++        evaluate_condition_lingo({"case": "missing-chain"})
++
++    assert_condition_eval_error(
++        exc_info,
++        "Node does not have a connection to chain ID 11155111",
++        HTTPStatus.NOT_IMPLEMENTED,
++    )
++
++
++def test_failed_return_value_processing_raises_bad_request(monkeypatch):
++
++
++
++
++    install_from_dict(monkeypatch, error=ReturnValueEvaluationError("bad index"))
++
++    with pytest.raises(ConditionEvalError) as exc_info:
++        evaluate_condition_lingo({"case": "return-value"})
++
++    assert_condition_eval_error_with_prefix(
++        exc_info,
++        "Unable to evaluate return value:",
++        HTTPStatus.BAD_REQUEST,
++    )
++
++
++def test_other_condition_evaluation_failures_raise_bad_request(monkeypatch):
++
++
++
++
++    install_from_dict(monkeypatch, error=ConditionEvaluationFailed("rpc reverted"))
++
++    with pytest.raises(ConditionEvalError) as exc_info:
++        evaluate_condition_lingo({"case": "condition-evaluation"})
++
++    assert_condition_eval_error_with_prefix(
++        exc_info,
++        "Decryption condition not evaluated:",
++        HTTPStatus.BAD_REQUEST,
++    )
++
++
++def test_unexpected_exceptions_raise_internal_server_error(monkeypatch):
++
++
++
++
++    log = RecordingLog()
++    install_from_dict(monkeypatch, error=RuntimeError("boom"))
++
++    with pytest.raises(ConditionEvalError) as exc_info:
++        evaluate_condition_lingo({"case": "unexpected"}, log=log)
++
++    error = exc_info.value
++    assert error.__class__.__name__ == "ConditionEvalError"
++    assert error.status_code == HTTPStatus.INTERNAL_SERVER_ERROR
++
++    assert "RuntimeError" in error.message
++    assert "boom" in error.message
++
++    assert isinstance(log.warnings, list)
++
++
++def test_referential_transparency_same_input_same_success(monkeypatch):
++    install_from_dict(monkeypatch, parsed=FakeParsedLingo(result=True))
++    condition = {"case": "referential", "condition": {"conditionType": "fixture"}}
++    providers = ConditionProviderManager(providers={1: []})
++    context = {"account": "0xabc123"}
++
++    first = evaluate_condition_lingo(condition, providers=providers, context=context)
++    second = evaluate_condition_lingo(condition, providers=providers, context=context)
++
++    assert first is None
++    assert second is None
++
++
++def test_same_mutable_inputs_can_be_reused(monkeypatch):
++    captured = {}
++    install_from_dict(monkeypatch, parsed=FakeParsedLingo(result=True, sink=captured))
++    condition = {
++        "version": "1.0.0",
++        "condition": {"conditionType": "fixture", "operands": [{"value": 7}]},
++    }
++    providers = ConditionProviderManager(providers={5: []})
++    context = {"nested": {"items": [1, 2, {"token": "abc"}]}}
++    first = evaluate_condition_lingo(condition, providers=providers, context=context)
++    second = evaluate_condition_lingo(condition, providers=providers, context=context)
++
++    assert first is None
++
++    assert second is None
++
++
++def test_no_global_state_matches_fresh_python_process(monkeypatch):
++    install_from_dict(monkeypatch, parsed=FakeParsedLingo(result=True))
++    in_process = evaluate_condition_lingo({"case": "fresh-process"})
++    script = """
++import json
++import sys
++sys.path.insert(0, '/workspace/repo')
++from nucypher.policy.conditions.lingo import ConditionLingo
++from nucypher.policy.conditions.utils import evaluate_condition_lingo
++
++class FakeParsedLingo:
++    def eval(self, providers=None, **context):
++        return True
++
++def fake_from_dict(cls, data):
++    return FakeParsedLingo()
++
++ConditionLingo.from_dict = classmethod(fake_from_dict)
++sys.stdout.write(json.dumps(evaluate_condition_lingo({'case': 'fresh-process'})))
++"""
++
++    completed = subprocess.run(
++        [sys.executable, "-c", script],
++        check=True,
++        stdout=subprocess.PIPE,
++        stderr=subprocess.PIPE,
++        text=True,
++    )
++
++    assert in_process is None
++    assert json.loads(completed.stdout) is None
++
++
++def test_no_undeclared_file_or_network_side_effects(monkeypatch, tmp_path):
++    install_from_dict(monkeypatch, parsed=FakeParsedLingo(result=True))
++
++    def blocked_socket(*args, **kwargs):
++        raise AssertionError("network access is not declared for evaluate_condition_lingo")
++
++    monkeypatch.setattr(socket, "socket", blocked_socket)
++    monkeypatch.chdir(tmp_path)
++    before = sorted(os.listdir(tmp_path))
++
++    actual = evaluate_condition_lingo({"case": "side-effects"})
++
++    after = sorted(os.listdir(tmp_path))
++    assert actual is None
++    assert before == []
++    assert after == []
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,15 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
++set -e
++cd /workspace/repo
++set -euo pipefail
++cd /workspace/repo
++python -m pytest /workspace/repo/usercase-test-coderl/test_condition_lingo_evaluation.py -v

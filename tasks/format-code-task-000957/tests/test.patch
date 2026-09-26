@@ -1,0 +1,416 @@
+diff --git a/tests/unit/test_find_unused_load_balancers_codespec.py b/tests/unit/test_find_unused_load_balancers_codespec.py
+new file mode 100644
+index 0000000..a0847e2
+--- /dev/null
++++ b/tests/unit/test_find_unused_load_balancers_codespec.py
+@@ -0,0 +1,399 @@
++import json
++import os
++import shutil
++import tempfile
++import unittest
++from urllib.parse import quote_plus
++
++from mock import patch
++
++import shared.find_unused as find_unused_module
++from shared.nodes import Account, Region
++
++
++class TestFindUnusedLoadBalancersCodeSpec(unittest.TestCase):
++    def setUp(self):
++        self.original_cwd = os.getcwd()
++        self.temp_dir = tempfile.mkdtemp()
++        os.chdir(self.temp_dir)
++        self.account_data = {"id": "111122223333", "name": "fixture"}
++
++    def tearDown(self):
++        os.chdir(self.original_cwd)
++        shutil.rmtree(self.temp_dir)
++
++    def write_json(self, relative_path, payload):
++        path = os.path.join(self.temp_dir, relative_path)
++        parent = os.path.dirname(path)
++        if not os.path.isdir(parent):
++            os.makedirs(parent)
++        with open(path, "w") as output:
++            json.dump(payload, output)
++
++    def write_query(self, region_name, query_name, payload):
++        self.write_json(
++            "account-data/{}/{}/{}.json".format(
++                self.account_data["name"], region_name, query_name
++            ),
++            payload,
++        )
++
++    def write_parameter(self, region_name, service, function, identifier, payload):
++        self.write_json(
++            "account-data/{}/{}/{}-{}/{}".format(
++                self.account_data["name"],
++                region_name,
++                service,
++                function,
++                quote_plus(identifier),
++            ),
++            payload,
++        )
++
++    def make_region(self, region_name="us-test-1"):
++        return Region(Account(None, self.account_data), {"RegionName": region_name})
++
++    def finder(self):
++        finder = getattr(find_unused_module, "find_unused_load_balancers", None)
++        self.assertTrue(
++            callable(finder),
++            "shared.find_unused.find_unused_load_balancers must be callable",
++        )
++        return finder
++
++    def test_codespec_classic_load_balancer_classification_and_order(self):
++        region_name = "us-test-1"
++        self.write_query(
++            region_name,
++            "elb-describe-load-balancers",
++            {
++                "LoadBalancerDescriptions": [
++                    {
++                        "LoadBalancerName": "classic-registered",
++                        "Instances": [{"InstanceId": "i-123"}],
++                    },
++                    {"LoadBalancerName": "classic-field-omitted"},
++                    {"LoadBalancerName": "classic-empty", "Instances": []},
++                ]
++            },
++        )
++        self.write_query(
++            region_name, "elbv2-describe-load-balancers", {"LoadBalancers": []}
++        )
++
++        self.assertEqual(
++            self.finder()(self.make_region(region_name)),
++            [
++                {
++                    "id": "classic-field-omitted",
++                    "name": "classic-field-omitted",
++                    "type": "classic",
++                },
++                {
++                    "id": "classic-empty",
++                    "name": "classic-empty",
++                    "type": "classic",
++                },
++            ],
++        )
++
++    def test_codespec_v2_registered_targets_and_empty_target_groups(self):
++        region_name = "us-test-2"
++        self.write_query(
++            region_name, "elb-describe-load-balancers", {"LoadBalancerDescriptions": []}
++        )
++        load_balancers = [
++            {
++                "LoadBalancerArn": "arn:lb:no-groups",
++                "LoadBalancerName": "no-groups",
++                "Type": "application",
++            },
++            {
++                "LoadBalancerArn": "arn:lb:all-empty",
++                "LoadBalancerName": "all-empty",
++                "Type": "network",
++            },
++            {
++                "LoadBalancerArn": "arn:lb:unhealthy-target",
++                "LoadBalancerName": "unhealthy-target",
++                "Type": "application",
++            },
++            {
++                "LoadBalancerArn": "arn:lb:mixed",
++                "LoadBalancerName": "mixed",
++                "Type": "network",
++            },
++        ]
++        self.write_query(
++            region_name,
++            "elbv2-describe-load-balancers",
++            {"LoadBalancers": load_balancers},
++        )
++        groups = {
++            "arn:lb:no-groups": [],
++            "arn:lb:all-empty": ["arn:tg:empty-a", "arn:tg:empty-b"],
++            "arn:lb:unhealthy-target": ["arn:tg:unhealthy"],
++            "arn:lb:mixed": ["arn:tg:mixed-empty", "arn:tg:mixed-registered"],
++        }
++        for load_balancer_arn, target_group_arns in groups.items():
++            self.write_parameter(
++                region_name,
++                "elbv2",
++                "describe-target-groups",
++                load_balancer_arn,
++                {
++                    "TargetGroups": [
++                        {"TargetGroupArn": target_group_arn}
++                        for target_group_arn in target_group_arns
++                    ]
++                },
++            )
++
++        for target_group_arn in [
++            "arn:tg:empty-a",
++            "arn:tg:empty-b",
++            "arn:tg:mixed-empty",
++        ]:
++            self.write_parameter(
++                region_name,
++                "elbv2",
++                "describe-target-health",
++                target_group_arn,
++                {"TargetHealthDescriptions": []},
++            )
++        self.write_parameter(
++            region_name,
++            "elbv2",
++            "describe-target-health",
++            "arn:tg:unhealthy",
++            {
++                "TargetHealthDescriptions": [
++                    {
++                        "Target": {"Id": "i-unhealthy"},
++                        "TargetHealth": {"State": "unhealthy"},
++                    }
++                ]
++            },
++        )
++        self.write_parameter(
++            region_name,
++            "elbv2",
++            "describe-target-health",
++            "arn:tg:mixed-registered",
++            {
++                "TargetHealthDescriptions": [
++                    {
++                        "Target": {"Id": "i-draining"},
++                        "TargetHealth": {"State": "draining"},
++                    }
++                ]
++            },
++        )
++
++        self.assertEqual(
++            self.finder()(self.make_region(region_name)),
++            [
++                {
++                    "id": "arn:lb:no-groups",
++                    "name": "no-groups",
++                    "type": "application",
++                },
++                {
++                    "id": "arn:lb:all-empty",
++                    "name": "all-empty",
++                    "type": "network",
++                },
++            ],
++        )
++
++    def test_codespec_v2_incomplete_collection_is_not_reported_unused(self):
++        region_name = "us-test-3"
++        self.write_query(
++            region_name, "elb-describe-load-balancers", {"LoadBalancerDescriptions": []}
++        )
++        self.write_query(
++            region_name,
++            "elbv2-describe-load-balancers",
++            {
++                "LoadBalancers": [
++                    {
++                        "LoadBalancerArn": "arn:lb:groups-missing",
++                        "LoadBalancerName": "groups-missing",
++                        "Type": "application",
++                    },
++                    {
++                        "LoadBalancerArn": "arn:lb:health-missing",
++                        "LoadBalancerName": "health-missing",
++                        "Type": "network",
++                    },
++                    {
++                        "LoadBalancerArn": "arn:lb:complete-empty",
++                        "LoadBalancerName": "complete-empty",
++                        "Type": "application",
++                    },
++                ]
++            },
++        )
++        self.write_parameter(
++            region_name,
++            "elbv2",
++            "describe-target-groups",
++            "arn:lb:health-missing",
++            {
++                "TargetGroups": [
++                    {"TargetGroupArn": "arn:tg:known-empty"},
++                    {"TargetGroupArn": "arn:tg:health-missing"},
++                ]
++            },
++        )
++        self.write_parameter(
++            region_name,
++            "elbv2",
++            "describe-target-health",
++            "arn:tg:known-empty",
++            {"TargetHealthDescriptions": []},
++        )
++        self.write_parameter(
++            region_name,
++            "elbv2",
++            "describe-target-groups",
++            "arn:lb:complete-empty",
++            {"TargetGroups": [{"TargetGroupArn": "arn:tg:complete-empty"}]},
++        )
++        self.write_parameter(
++            region_name,
++            "elbv2",
++            "describe-target-health",
++            "arn:tg:complete-empty",
++            {"TargetHealthDescriptions": []},
++        )
++
++        self.assertEqual(
++            self.finder()(self.make_region(region_name)),
++            [
++                {
++                    "id": "arn:lb:complete-empty",
++                    "name": "complete-empty",
++                    "type": "application",
++                }
++            ],
++        )
++
++    def write_region_basics(self, region_name):
++        self.write_query(
++            region_name, "ec2-describe-security-groups", {"SecurityGroups": []}
++        )
++        self.write_query(
++            region_name,
++            "ec2-describe-network-interfaces",
++            {"NetworkInterfaces": []},
++        )
++        self.write_query(region_name, "ec2-describe-volumes", {"Volumes": []})
++        self.write_query(region_name, "ec2-describe-addresses", {"Addresses": []})
++
++    def test_codespec_report_aggregation_and_empty_category_omission(self):
++        region_names = ["classic-region", "v2-region", "used-region"]
++        self.write_json(
++            "account-data/{}/describe-regions.json".format(
++                self.account_data["name"]
++            ),
++            {"Regions": [{"RegionName": name} for name in region_names]},
++        )
++        for region_name in region_names:
++            self.write_region_basics(region_name)
++
++        self.write_query(
++            "classic-region",
++            "elb-describe-load-balancers",
++            {
++                "LoadBalancerDescriptions": [
++                    {"LoadBalancerName": "classic-report", "Instances": []}
++                ]
++            },
++        )
++        self.write_query(
++            "classic-region", "elbv2-describe-load-balancers", {"LoadBalancers": []}
++        )
++
++        self.write_query(
++            "v2-region", "elb-describe-load-balancers", {"LoadBalancerDescriptions": []}
++        )
++        self.write_query(
++            "v2-region",
++            "elbv2-describe-load-balancers",
++            {
++                "LoadBalancers": [
++                    {
++                        "LoadBalancerArn": "arn:lb:v2-report",
++                        "LoadBalancerName": "v2-report",
++                        "Type": "application",
++                    }
++                ]
++            },
++        )
++        self.write_parameter(
++            "v2-region",
++            "elbv2",
++            "describe-target-groups",
++            "arn:lb:v2-report",
++            {"TargetGroups": []},
++        )
++
++        self.write_query(
++            "used-region",
++            "elb-describe-load-balancers",
++            {
++                "LoadBalancerDescriptions": [
++                    {
++                        "LoadBalancerName": "classic-used",
++                        "Instances": [{"InstanceId": "i-used"}],
++                    }
++                ]
++            },
++        )
++        self.write_query(
++            "used-region", "elbv2-describe-load-balancers", {"LoadBalancers": []}
++        )
++
++        with patch.object(find_unused_module, "get_resource_nodes", return_value={}):
++            report = find_unused_module.find_unused_resources([self.account_data])
++
++        self.assertEqual(
++            report,
++            [
++                {
++                    "account": {"id": "111122223333", "name": "fixture"},
++                    "regions": [
++                        {
++                            "region": "classic-region",
++                            "unused_resources": {
++                                "load_balancers": [
++                                    {
++                                        "id": "classic-report",
++                                        "name": "classic-report",
++                                        "type": "classic",
++                                    }
++                                ]
++                            },
++                        },
++                        {
++                            "region": "v2-region",
++                            "unused_resources": {
++                                "load_balancers": [
++                                    {
++                                        "id": "arn:lb:v2-report",
++                                        "name": "v2-report",
++                                        "type": "application",
++                                    }
++                                ]
++                            },
++                        },
++                        {"region": "used-region", "unused_resources": {}},
++                    ],
++                }
++            ],
++        )
++
++
++if __name__ == "__main__":
++    unittest.main()
+
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,5 @@
++#!/bin/bash
++set -euo pipefail
++
++
++nosetests tests/unit/test_find_unused.py tests/unit/test_find_unused_load_balancers_codespec.py

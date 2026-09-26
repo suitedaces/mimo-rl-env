@@ -1,0 +1,595 @@
+diff --git a/usercase-test-coderl/response_validation_test.go b/usercase-test-coderl/response_validation_test.go
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/response_validation_test.go
+@@ -0,0 +1,561 @@
++package usercase_test_coderl
++
++
++
++
++
++
++import (
++	"context"
++	"errors"
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++
++	"github.com/getkin/kin-openapi/openapi3"
++	"github.com/getkin/kin-openapi/openapi3filter"
++	"github.com/getkin/kin-openapi/routers/legacy"
++)
++
++func TestSetBodyBytesReplacesResponseBodyWithReadableBytes(t *testing.T) {
++
++
++	input := &openapi3filter.ResponseValidationInput{}
++
++	returned := input.SetBodyBytes([]byte("replacement"))
++
++	if returned != input {
++		t.Fatalf("SetBodyBytes returned %p, want %p", returned, input)
++	}
++	body := mustReadAll(t, input.Body)
++	if body != "replacement" {
++		t.Fatalf("body after SetBodyBytes = %q, want %q", body, "replacement")
++	}
++}
++
++func TestValidateResponseHeadRequestSkipsBodyValidation(t *testing.T) {
++
++
++	input := newResponseInput(t, responseCase{
++		method:    http.MethodHead,
++		status:    http.StatusOK,
++		content:   "text/plain",
++		body:      "not-json",
++		responses: responsesWithRequiredID(),
++		options:   &openapi3filter.Options{IncludeResponseStatus: true},
++	})
++
++	err := openapi3filter.ValidateResponse(context.Background(), input)
++
++	if err != nil {
++		t.Fatalf("ValidateResponse error = %v, want nil", err)
++	}
++
++}
++
++func TestValidateResponseRedirectAndNotModifiedStatusesSkipFurtherValidation(t *testing.T) {
++
++
++	for _, status := range []int{304, 301, 307, 308} {
++		input := newResponseInput(t, responseCase{
++			method:    http.MethodGet,
++			status:    status,
++			content:   "text/plain",
++			body:      "not-json",
++			responses: responsesWithRequiredID(),
++			options:   &openapi3filter.Options{IncludeResponseStatus: true},
++		})
++
++		err := openapi3filter.ValidateResponse(context.Background(), input)
++
++		if err != nil {
++			t.Fatalf("status %d error = %v, want nil", status, err)
++		}
++
++	}
++}
++
++func TestValidateResponseDocumentedJSONSuccessLeavesBodyReadable(t *testing.T) {
++
++
++	input := newResponseInput(t, responseCase{
++		method:    http.MethodGet,
++		status:    http.StatusOK,
++		content:   "application/json",
++		body:      `{"id":123}`,
++		responses: responsesWithRequiredID(),
++	})
++
++	err := openapi3filter.ValidateResponse(context.Background(), input)
++
++	if err != nil {
++		t.Fatalf("ValidateResponse error = %v, want nil", err)
++	}
++	body := mustReadAll(t, input.Body)
++	if body != `{"id":123}` {
++		t.Fatalf("body after validation = %q, want %q", body, `{"id":123}`)
++	}
++}
++
++func TestValidateResponseUsesDefaultResponseWhenConcreteStatusIsAbsent(t *testing.T) {
++
++
++	input := newResponseInput(t, responseCase{
++		method:    http.MethodGet,
++		status:    http.StatusCreated,
++		content:   "application/json",
++		body:      `{"fallback":"ok"}`,
++		responses: defaultOnlyResponses(),
++		options:   &openapi3filter.Options{IncludeResponseStatus: true},
++	})
++
++	err := openapi3filter.ValidateResponse(context.Background(), input)
++
++	if err != nil {
++		t.Fatalf("ValidateResponse error = %v, want nil", err)
++	}
++	body := mustReadAll(t, input.Body)
++	if body != `{"fallback":"ok"}` {
++		t.Fatalf("body after default response validation = %q, want %q", body, `{"fallback":"ok"}`)
++	}
++}
++
++func TestValidateResponseUndocumentedStatusAcceptedWhenIncludeStatusFalse(t *testing.T) {
++
++
++	input := newResponseInput(t, responseCase{
++		method:    http.MethodGet,
++		status:    http.StatusTeapot,
++		content:   "application/json",
++		body:      `{"id":123}`,
++		responses: responsesWithRequiredID(),
++		options:   &openapi3filter.Options{IncludeResponseStatus: false},
++	})
++
++	err := openapi3filter.ValidateResponse(context.Background(), input)
++
++	if err != nil {
++		t.Fatalf("ValidateResponse error = %v, want nil", err)
++	}
++}
++
++func TestValidateResponseUndocumentedStatusErrorsWhenIncludeStatusTrue(t *testing.T) {
++
++
++	input := newResponseInput(t, responseCase{
++		method:    http.MethodGet,
++		status:    http.StatusTeapot,
++		content:   "application/json",
++		body:      `{"id":123}`,
++		responses: responsesWithRequiredID(),
++		options:   &openapi3filter.Options{IncludeResponseStatus: true},
++	})
++
++	err := openapi3filter.ValidateResponse(context.Background(), input)
++
++	assertResponseError(t, err, "status is not supported", false)
++}
++
++func TestValidateResponseMissingRequiredHeaderReturnsResponseError(t *testing.T) {
++
++
++	input := newResponseInput(t, responseCase{
++		method:    http.MethodGet,
++		status:    http.StatusOK,
++		content:   "application/json",
++		body:      `{"id":123}`,
++		responses: responsesWithTraceHeader(),
++	})
++
++	err := openapi3filter.ValidateResponse(context.Background(), input)
++
++	assertResponseError(t, err, `response header "X-Trace" missing`, false)
++}
++
++func TestValidateResponseHeaderSchemaFailureReturnsResponseError(t *testing.T) {
++
++
++	input := newResponseInput(t, responseCase{
++		method:    http.MethodGet,
++		status:    http.StatusOK,
++		content:   "application/json",
++		body:      `{"id":123}`,
++		trace:     "ab",
++		responses: responsesWithTraceHeader(),
++	})
++
++	err := openapi3filter.ValidateResponse(context.Background(), input)
++
++
++	assertResponseErrorContains(t, err, true, "x-trace", "match", "schema")
++}
++
++func TestValidateResponseExcludeResponseBodyStillValidatesHeaderAndSkipsBody(t *testing.T) {
++
++
++	input := newResponseInput(t, responseCase{
++		method:    http.MethodGet,
++		status:    http.StatusOK,
++		content:   "application/json",
++		body:      `{"id":"abc"}`,
++		trace:     "abc",
++		responses: responsesWithTraceHeader(),
++		options:   &openapi3filter.Options{ExcludeResponseBody: true},
++	})
++
++	err := openapi3filter.ValidateResponse(context.Background(), input)
++
++	if err != nil {
++		t.Fatalf("ValidateResponse error = %v, want nil", err)
++	}
++
++}
++
++func TestValidateResponseExcludeResponseBodyStillReportsHeaderError(t *testing.T) {
++
++
++	input := newResponseInput(t, responseCase{
++		method:    http.MethodGet,
++		status:    http.StatusOK,
++		content:   "application/json",
++		body:      `{"id":"abc"}`,
++		responses: responsesWithTraceHeader(),
++		options:   &openapi3filter.Options{ExcludeResponseBody: true},
++	})
++
++	err := openapi3filter.ValidateResponse(context.Background(), input)
++
++	assertResponseError(t, err, `response header "X-Trace" missing`, false)
++}
++
++func TestValidateResponseExcludeResponseBodyStillReportsStatusError(t *testing.T) {
++
++
++	input := newResponseInput(t, responseCase{
++		method:    http.MethodGet,
++		status:    http.StatusTeapot,
++		content:   "application/json",
++		body:      `{"id":"abc"}`,
++		responses: responsesWithRequiredID(),
++		options:   &openapi3filter.Options{ExcludeResponseBody: true, IncludeResponseStatus: true},
++	})
++
++	err := openapi3filter.ValidateResponse(context.Background(), input)
++
++	assertResponseError(t, err, "status is not supported", false)
++}
++
++func TestValidateResponseUnexpectedContentTypeReturnsResponseError(t *testing.T) {
++
++
++	input := newResponseInput(t, responseCase{
++		method:    http.MethodGet,
++		status:    http.StatusOK,
++		content:   "text/plain",
++		body:      `{"id":123}`,
++		responses: responsesWithRequiredID(),
++	})
++
++	err := openapi3filter.ValidateResponse(context.Background(), input)
++
++	assertResponseError(t, err, `response header Content-Type has unexpected value: "text/plain"`, false)
++
++}
++
++func TestValidateResponseSchemaViolationReturnsResponseErrorWithUnwrap(t *testing.T) {
++
++
++	input := newResponseInput(t, responseCase{
++		method:    http.MethodGet,
++		status:    http.StatusOK,
++		content:   "application/json",
++		body:      `{"id":"abc"}`,
++		responses: responsesWithRequiredID(),
++	})
++
++	err := openapi3filter.ValidateResponse(context.Background(), input)
++
++
++	assertResponseErrorPrefix(t, err, "response body doesn't match schema", true)
++
++}
++
++func TestValidateResponseWriteOnlyRestrictionAndOption(t *testing.T) {
++
++
++	input := newResponseInput(t, responseCase{
++		method:    http.MethodGet,
++		status:    http.StatusOK,
++		content:   "application/json",
++		body:      `{"id":123,"secret":"leak"}`,
++		responses: responsesWithWriteOnlySecret(),
++	})
++
++	err := openapi3filter.ValidateResponse(context.Background(), input)
++
++
++	assertResponseErrorPrefix(t, err, "response body doesn't match schema", true)
++
++	excluded := newResponseInput(t, responseCase{
++		method:    http.MethodGet,
++		status:    http.StatusOK,
++		content:   "application/json",
++		body:      `{"id":123,"secret":"leak"}`,
++		responses: responsesWithWriteOnlySecret(),
++		options:   &openapi3filter.Options{ExcludeWriteOnlyValidations: true},
++	})
++	err = openapi3filter.ValidateResponse(context.Background(), excluded)
++	if err != nil {
++		t.Fatalf("ValidateResponse with ExcludeWriteOnlyValidations error = %v, want nil", err)
++	}
++}
++
++func TestValidateResponseReferentialTransparencySameInput(t *testing.T) {
++	input := newResponseInput(t, responseCase{
++		method:    http.MethodGet,
++		status:    http.StatusOK,
++		content:   "application/json",
++		body:      `{"id":123}`,
++		responses: responsesWithRequiredID(),
++	})
++
++	err1 := openapi3filter.ValidateResponse(context.Background(), input)
++	err2 := openapi3filter.ValidateResponse(context.Background(), input)
++
++	if err1 != nil || err2 != nil {
++		t.Fatalf("two calls returned (%v, %v), want (nil, nil)", err1, err2)
++	}
++	body := mustReadAll(t, input.Body)
++	if body != `{"id":123}` {
++		t.Fatalf("body after repeated validation = %q, want %q", body, `{"id":123}`)
++	}
++}
++
++func TestValidateResponseLeavesBodyReadableWithCallerOwnedFieldsPresent(t *testing.T) {
++	input := newResponseInput(t, responseCase{
++		method:    http.MethodGet,
++		status:    http.StatusOK,
++		content:   "application/json",
++		body:      `{"id":123}`,
++		responses: responsesWithRequiredID(),
++		options:   &openapi3filter.Options{IncludeResponseStatus: true},
++	})
++
++	err := openapi3filter.ValidateResponse(context.Background(), input)
++
++	if err != nil {
++		t.Fatalf("ValidateResponse error = %v, want nil", err)
++	}
++
++	body := mustReadAll(t, input.Body)
++	if body != `{"id":123}` {
++		t.Fatalf("body after mutation check = %q, want %q", body, `{"id":123}`)
++	}
++}
++
++func TestValidateResponseNoGlobalStateWithNoiseInjection(t *testing.T) {
++	input := newResponseInput(t, responseCase{
++		method:    http.MethodGet,
++		status:    http.StatusOK,
++		content:   "application/json",
++		body:      `{"id":123}`,
++		responses: responsesWithRequiredID(),
++	})
++
++	first := openapi3filter.ValidateResponse(context.Background(), input)
++	_ = openapi3filter.ValidateResponse(context.Background(), newResponseInput(t, responseCase{
++		method:    http.MethodGet,
++		status:    http.StatusOK,
++		content:   "text/plain",
++		body:      `{"id":123}`,
++		responses: responsesWithRequiredID(),
++	}))
++	_ = openapi3filter.ValidateResponse(context.Background(), newResponseInput(t, responseCase{
++		method:    http.MethodGet,
++		status:    http.StatusCreated,
++		content:   "application/json",
++		body:      `{"fallback":"ok"}`,
++		responses: defaultOnlyResponses(),
++	}))
++	second := openapi3filter.ValidateResponse(context.Background(), input)
++
++	if first != nil || second != nil {
++		t.Fatalf("same input around noisy calls returned (%v, %v), want (nil, nil)", first, second)
++	}
++}
++
++func TestValidateResponseBodyReadableAfterValidation(t *testing.T) {
++	input := newResponseInput(t, responseCase{
++		method:    http.MethodGet,
++		status:    http.StatusOK,
++		content:   "application/json",
++		body:      `{"id":123}`,
++		responses: responsesWithRequiredID(),
++	})
++
++	err := openapi3filter.ValidateResponse(context.Background(), input)
++
++	if err != nil {
++		t.Fatalf("ValidateResponse error = %v, want nil", err)
++	}
++
++	body := mustReadAll(t, input.Body)
++	if body != `{"id":123}` {
++		t.Fatalf("body after validation = %q, want %q", body, `{"id":123}`)
++	}
++}
++
++type responseCase struct {
++	method    string
++	status    int
++	content   string
++	body      string
++	trace     string
++	responses *openapi3.Responses
++	options   *openapi3filter.Options
++}
++
++func newResponseInput(t *testing.T, tc responseCase) *openapi3filter.ResponseValidationInput {
++	t.Helper()
++	doc := &openapi3.T{
++		OpenAPI: "3.0.3",
++		Info:    &openapi3.Info{Title: "acceptance", Version: "1.0.0"},
++		Paths:   openapi3.NewPaths(openapi3.WithPath("/items", &openapi3.PathItem{})),
++	}
++	pathItem := doc.Paths.Value("/items")
++	pathItem.SetOperation(tc.method, &openapi3.Operation{Responses: tc.responses})
++
++	router, err := legacy.NewRouter(doc)
++	if err != nil {
++		t.Fatalf("legacy.NewRouter error = %v", err)
++	}
++	req := httptest.NewRequest(tc.method, "http://example.test/items", nil)
++	route, pathParams, err := router.FindRoute(req)
++	if err != nil {
++		t.Fatalf("FindRoute error = %v", err)
++	}
++
++	header := http.Header{}
++	if tc.content != "" {
++		header.Set("Content-Type", tc.content)
++	}
++	if tc.trace != "" {
++		header.Set("X-Trace", tc.trace)
++	}
++	return &openapi3filter.ResponseValidationInput{
++		RequestValidationInput: &openapi3filter.RequestValidationInput{
++			Request:    req,
++			PathParams: pathParams,
++			Route:      route,
++		},
++		Status:  tc.status,
++		Header:  header,
++		Body:    io.NopCloser(strings.NewReader(tc.body)),
++		Options: tc.options,
++	}
++}
++
++func responsesWithRequiredID() *openapi3.Responses {
++	return openapi3.NewResponses(openapi3.WithStatus(http.StatusOK, &openapi3.ResponseRef{
++		Value: openapi3.NewResponse().WithDescription("ok").WithJSONSchema(requiredIDSchema()),
++	}))
++}
++
++func responsesWithTraceHeader() *openapi3.Responses {
++	response := openapi3.NewResponse().WithDescription("ok").WithJSONSchema(requiredIDSchema())
++	response.Headers = openapi3.Headers{
++		"X-Trace": {
++			Value: &openapi3.Header{
++				Parameter: openapi3.Parameter{
++					Required: true,
++					Schema:   openapi3.NewSchemaRef("", openapi3.NewStringSchema().WithMinLength(3)),
++				},
++			},
++		},
++	}
++	return openapi3.NewResponses(openapi3.WithStatus(http.StatusOK, &openapi3.ResponseRef{Value: response}))
++}
++
++func defaultOnlyResponses() *openapi3.Responses {
++	schema := openapi3.NewObjectSchema().
++		WithProperty("fallback", openapi3.NewStringSchema()).
++		WithRequired([]string{"fallback"})
++	return openapi3.NewResponses(openapi3.WithName("default", openapi3.NewResponse().WithDescription("fallback").WithJSONSchema(schema)))
++}
++
++func responsesWithWriteOnlySecret() *openapi3.Responses {
++	secret := openapi3.NewStringSchema()
++	secret.WriteOnly = true
++	schema := openapi3.NewObjectSchema().
++		WithProperty("id", openapi3.NewIntegerSchema()).
++		WithProperty("secret", secret).
++		WithRequired([]string{"id"})
++	return openapi3.NewResponses(openapi3.WithStatus(http.StatusOK, &openapi3.ResponseRef{
++		Value: openapi3.NewResponse().WithDescription("ok").WithJSONSchema(schema),
++	}))
++}
++
++func requiredIDSchema() *openapi3.Schema {
++	return openapi3.NewObjectSchema().
++		WithProperty("id", openapi3.NewIntegerSchema()).
++		WithRequired([]string{"id"})
++}
++
++func assertResponseError(t *testing.T, err error, want string, wantUnwrap bool) {
++	t.Helper()
++	var responseErr *openapi3filter.ResponseError
++	if !errors.As(err, &responseErr) {
++		t.Fatalf("error type = %T, want *openapi3filter.ResponseError", err)
++	}
++	if got := err.Error(); got != want {
++		t.Fatalf("error message = %q, want %q", got, want)
++	}
++	if got := errors.Unwrap(err) != nil; got != wantUnwrap {
++		t.Fatalf("errors.Unwrap(err) present = %v, want %v", got, wantUnwrap)
++	}
++}
++
++func assertResponseErrorPrefix(t *testing.T, err error, wantPrefix string, wantUnwrap bool) {
++	t.Helper()
++	var responseErr *openapi3filter.ResponseError
++	if !errors.As(err, &responseErr) {
++		t.Fatalf("error type = %T, want *openapi3filter.ResponseError", err)
++	}
++	if got := err.Error(); !strings.HasPrefix(got, wantPrefix) {
++		t.Fatalf("error message = %q, want prefix %q", got, wantPrefix)
++	}
++	if got := errors.Unwrap(err) != nil; got != wantUnwrap {
++		t.Fatalf("errors.Unwrap(err) present = %v, want %v", got, wantUnwrap)
++	}
++}
++
++func assertResponseErrorContains(t *testing.T, err error, wantUnwrap bool, fragments ...string) {
++	t.Helper()
++	var responseErr *openapi3filter.ResponseError
++	if !errors.As(err, &responseErr) {
++		t.Fatalf("error type = %T, want *openapi3filter.ResponseError", err)
++	}
++	got := strings.ToLower(err.Error())
++	for _, fragment := range fragments {
++		if !strings.Contains(got, strings.ToLower(fragment)) {
++			t.Fatalf("error message = %q, want fragment %q", err.Error(), fragment)
++		}
++	}
++	if gotUnwrap := errors.Unwrap(err) != nil; gotUnwrap != wantUnwrap {
++		t.Fatalf("errors.Unwrap(err) present = %v, want %v", gotUnwrap, wantUnwrap)
++	}
++}
++
++func mustReadAll(t *testing.T, rc io.ReadCloser) string {
++	t.Helper()
++	if rc == nil {
++		t.Fatal("body is nil")
++	}
++	data, err := io.ReadAll(rc)
++	if err != nil {
++		t.Fatalf("ReadAll error = %v", err)
++	}
++	return string(data)
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,24 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++
++
++set -euo pipefail
++cd /workspace/repo
++
++export GOPROXY=off
++export GOSUMDB=off
++export GONOPROXY=none
++export GOVCS=*:off
++export GOTOOLCHAIN=local
++export GOWORK=off
++export GOFLAGS="-mod=readonly"
++exec go test -v ./usercase-test-coderl/...

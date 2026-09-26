@@ -1,0 +1,910 @@
+diff --git a/usercase-test-coderl/write_acceptance_test.go b/usercase-test-coderl/write_acceptance_test.go
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/write_acceptance_test.go
+@@ -0,0 +1,880 @@
++package usercase_test_coderl
++
++import (
++	"bytes"
++	"encoding/binary"
++	"encoding/hex"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"os"
++	"path/filepath"
++	"reflect"
++	"strings"
++	"testing"
++
++	dicom "github.com/suyashkumar/dicom"
++	"github.com/suyashkumar/dicom/pkg/frame"
++	"github.com/suyashkumar/dicom/pkg/tag"
++	"github.com/suyashkumar/dicom/pkg/uid"
++)
++
++
++
++
++
++func TestWriteFullDatasetRoundTripsWithHeaderMetadataSequencesPrivateAndPixelData(t *testing.T) {
++
++
++	ds := fullDataset(uid.ImplicitVRLittleEndian)
++	written, parsed := mustWriteAndParse(t, ds, nil, nil)
++
++
++	assertDICOMHeaderAndComputedGroupLength(t, written)
++	assertSummaryJSON(t, parsed, fullDatasetSummaryJSON)
++}
++
++func TestWriteUsesDatasetTransferSyntaxForNonMetadataElements(t *testing.T) {
++	cases := []struct {
++		name           string
++		transferUID    string
++		wantDatasetHex []string
++		wantSummary    string
++		queryCovers    string
++	}{
++		{
++			name:        "explicit little endian",
++			transferUID: uid.ExplicitVRLittleEndian,
++			wantDatasetHex: []string{
++				"10001000504e0c0053796e7461785e4361736520",
++				"28001000555302000900",
++				"400061a1464408000000000000802240",
++			},
++			wantSummary: explicitLittleEndianSummaryJSON,
++			queryCovers: "transferSyntax=dataset-explicit-little-endian, datasetEncoding=explicit-vr-little-endian",
++		},
++		{
++			name:        "explicit big endian",
++			transferUID: uid.ExplicitVRBigEndian,
++			wantDatasetHex: []string{
++				"00100010504e000c53796e7461785e4361736520",
++				"00280010555300020009",
++				"0040a161464400084022800000000000",
++			},
++			wantSummary: explicitBigEndianSummaryJSON,
++			queryCovers: "transferSyntax=dataset-explicit-big-endian, datasetEncoding=explicit-vr-big-endian",
++		},
++	}
++
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++
++
++			written, parsed := mustWriteAndParse(t, transferSyntaxOnlyDataset(tc.transferUID), nil, nil)
++
++			datasetStart := assertDICOMHeaderAndComputedGroupLength(t, written)
++			for _, want := range tc.wantDatasetHex {
++				assertDatasetHexContains(t, written, datasetStart, want)
++			}
++			assertSummaryJSON(t, parsed, tc.wantSummary)
++		})
++	}
++}
++
++func TestWriteMissingTransferSyntaxOptions(t *testing.T) {
++	cases := []struct {
++		name           string
++		opt            dicom.WriteOption
++		wantTS         string
++		wantDatasetHex []string
++	}{
++		{
++			name:   "default missing transfer syntax",
++			opt:    dicom.DefaultMissingTransferSyntax(),
++			wantTS: "1.2.840.10008.1.2",
++			wantDatasetHex: []string{
++				"100010000e0000004d697373696e675e53796e746178",
++				"28001000020000004000",
++				"400061a1080000000000000000205040",
++			},
++		},
++		{
++			name:   "override implicit little endian",
++			opt:    dicom.OverrideMissingTransferSyntax(uid.ImplicitVRLittleEndian),
++			wantTS: "1.2.840.10008.1.2",
++			wantDatasetHex: []string{
++				"100010000e0000004d697373696e675e53796e746178",
++				"28001000020000004000",
++				"400061a1080000000000000000205040",
++			},
++		},
++		{
++			name:   "override explicit little endian",
++			opt:    dicom.OverrideMissingTransferSyntax(uid.ExplicitVRLittleEndian),
++			wantTS: "1.2.840.10008.1.2.1",
++			wantDatasetHex: []string{
++				"10001000504e0e004d697373696e675e53796e746178",
++				"28001000555302004000",
++				"400061a1464408000000000000205040",
++			},
++		},
++		{
++			name:   "override explicit big endian",
++			opt:    dicom.OverrideMissingTransferSyntax(uid.ExplicitVRBigEndian),
++			wantTS: "1.2.840.10008.1.2.2",
++			wantDatasetHex: []string{
++				"00100010504e000e4d697373696e675e53796e746178",
++				"00280010555300020040",
++				"0040a161464400084050200000000000",
++			},
++		},
++	}
++
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++
++
++			written, parsed := mustWriteAndParse(t, missingTransferSyntaxDataset(), []dicom.WriteOption{tc.opt}, nil)
++
++			datasetStart := assertDICOMHeaderAndComputedGroupLength(t, written)
++			for _, want := range tc.wantDatasetHex {
++				assertDatasetHexContains(t, written, datasetStart, want)
++			}
++			if got := transferSyntaxValue(t, parsed); got != tc.wantTS {
++				t.Fatalf("TransferSyntaxUID = %q, want %q", got, tc.wantTS)
++			}
++		})
++	}
++}
++
++func TestWriteRejectsMissingAndInvalidTransferSyntaxes(t *testing.T) {
++	t.Run("missing transfer syntax", func(t *testing.T) {
++
++
++		var b bytes.Buffer
++		err := dicom.Write(&b, missingTransferSyntaxDataset())
++		if !errors.Is(err, dicom.ErrorElementNotFound) {
++			t.Fatalf("error = %v, want wrapping ErrorElementNotFound", err)
++		}
++		if b.Len() != 0 {
++			t.Fatalf("bytes written = %d, want 0", b.Len())
++		}
++	})
++
++	for _, tc := range []struct {
++		name string
++		uid  string
++	}{
++		{
++			name: "unknown uid",
++			uid:  "1.2.3.4.5.6.7.8.9",
++		},
++		{
++			name: "non-transfer-syntax uid",
++			uid:  uid.VerificationSOPClass,
++		},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++
++
++			var b bytes.Buffer
++			err := dicom.Write(&b, missingTransferSyntaxDataset(), dicom.OverrideMissingTransferSyntax(tc.uid))
++
++			if err == nil {
++				t.Fatalf("error = nil, want rejection for transfer syntax uid %q", tc.uid)
++			}
++			if b.Len() != 0 {
++				t.Fatalf("bytes written = %d, want 0", b.Len())
++			}
++		})
++	}
++}
++
++func TestWriteRejectsOrSkipsVRAndValueTypeVerification(t *testing.T) {
++	t.Run("invalid VR rejected", func(t *testing.T) {
++
++
++		var b bytes.Buffer
++		err := dicom.Write(&b, invalidVRDataset())
++
++		if err == nil {
++			t.Fatalf("error = nil, want invalid VR rejection")
++		}
++	})
++
++	t.Run("invalid VR written when skipped", func(t *testing.T) {
++
++
++		_, parsed := mustWriteAndParse(t, invalidVRDataset(), []dicom.WriteOption{dicom.SkipVRVerification()}, nil)
++		assertSummaryJSON(t, parsed, skipVRSummaryJSON)
++	})
++
++	t.Run("invalid value type rejected", func(t *testing.T) {
++
++
++		var b bytes.Buffer
++		err := dicom.Write(&b, invalidValueTypeDataset())
++
++		if err == nil {
++			t.Fatalf("error = nil, want invalid value type rejection")
++		}
++	})
++
++	t.Run("invalid value type written when skipped", func(t *testing.T) {
++
++
++		written, parsed := mustWriteAndParse(t, invalidValueTypeDataset(), []dicom.WriteOption{dicom.SkipValueTypeVerification()}, nil)
++
++		assertDICOMHeaderAndComputedGroupLength(t, written)
++		elem, err := parsed.FindElementByTag(tag.Rows)
++		if err != nil {
++			t.Fatalf("Rows not found after SkipValueTypeVerification write: %v", err)
++		}
++		if elem.RawValueRepresentation != "US" || elem.Value.ValueType() != dicom.Ints {
++			t.Fatalf("Rows after SkipValueTypeVerification has rawVR=%q valueType=%v, want US/Ints", elem.RawValueRepresentation, elem.Value.ValueType())
++		}
++	})
++}
++
++func TestWriteSerializesPixelDataRepresentations(t *testing.T) {
++	cases := []struct {
++		name      string
++		ds        dicom.Dataset
++		parseOpts []dicom.ParseOption
++		want      pixelSummary
++		covers    string
++	}{
++		{
++			name:   "native 8 bit",
++			ds:     nativePixelDataset(8),
++			covers: "pixelData=native, bitsAllocated=8",
++			want: pixelSummary{Frames: []frameSummary{{
++				Encapsulated: false, Data: []int{1, 2, 3, 4}, Rows: 2, Cols: 2, Bits: 8, Samples: 1,
++			}}},
++		},
++		{
++			name:   "native 16 bit",
++			ds:     nativePixelDataset(16),
++			covers: "pixelData=native, bitsAllocated=16",
++			want: pixelSummary{Frames: []frameSummary{{
++				Encapsulated: false, Data: []int{258, 772, 1286, 1800}, Rows: 2, Cols: 2, Bits: 16, Samples: 1,
++			}}},
++		},
++		{
++			name:   "native 32 bit",
++			ds:     nativePixelDataset(32),
++			covers: "pixelData=native, bitsAllocated=32",
++			want: pixelSummary{Frames: []frameSummary{{
++				Encapsulated: false, Data: []int{65539, 131077, 196615, 262153}, Rows: 2, Cols: 2, Bits: 32, Samples: 1,
++			}}},
++		},
++		{
++			name:   "encapsulated undefined length frames",
++			ds:     encapsulatedPixelDataset(),
++			covers: "pixelData=encapsulated, valueLength=undefined, frameItems=two",
++			want: pixelSummary{IsEncapsulated: true, Frames: []frameSummary{
++				{Encapsulated: true, Data: []int{1, 2, 3, 4}},
++				{Encapsulated: true, Data: []int{5, 6, 7, 8}},
++			}},
++		},
++		{
++			name:      "intentionally unprocessed bytes",
++			ds:        unprocessedPixelDataset(),
++			parseOpts: []dicom.ParseOption{dicom.SkipProcessingPixelDataValue()},
++			covers:    "pixelData=intentionally-unprocessed",
++			want:      pixelSummary{IntentionallyUnprocessed: true, UnprocessedValueData: []int{11, 12, 13, 14}},
++		},
++		{
++			name:      "intentionally skipped native",
++			ds:        skippedNativePixelDataset(),
++			parseOpts: []dicom.ParseOption{dicom.SkipPixelData()},
++			covers:    "pixelData=intentionally-skipped-native",
++			want:      pixelSummary{IntentionallySkipped: true},
++		},
++		{
++			name:      "intentionally skipped encapsulated",
++			ds:        skippedEncapsulatedPixelDataset(),
++			parseOpts: []dicom.ParseOption{dicom.SkipPixelData()},
++			covers:    "pixelData=intentionally-skipped-encapsulated",
++			want:      pixelSummary{IsEncapsulated: true, IntentionallySkipped: true},
++		},
++	}
++
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++
++
++			_, parsed := mustWriteAndParse(t, tc.ds, nil, tc.parseOpts)
++			if got := pixelDataSummary(t, parsed); !reflect.DeepEqual(got, tc.want) {
++				t.Fatalf("pixel summary = %#v, want %#v", got, tc.want)
++			}
++		})
++	}
++}
++
++func TestWriteRejectsDeflatedExplicitVRLittleEndian(t *testing.T) {
++
++
++	var b bytes.Buffer
++	err := dicom.Write(&b, transferSyntaxOnlyDataset(uid.DeflatedExplicitVRLittleEndian))
++
++	if err == nil {
++		t.Fatalf("error = nil, want unsupported deflated transfer syntax error")
++	}
++	errText := strings.ToLower(fmt.Sprint(err))
++	if !strings.Contains(errText, "deflated") && !strings.Contains(errText, "unsupported") {
++		t.Fatalf("error = %q, want unsupported/deflated transfer syntax error", fmt.Sprint(err))
++	}
++	if b.Len() != 0 {
++		t.Fatalf("bytes written = %d, want 0", b.Len())
++	}
++}
++
++func TestWriteReferentialTransparency(t *testing.T) {
++	ds := fullDataset(uid.ImplicitVRLittleEndian)
++	first, parsedFirst := mustWriteAndParse(t, ds, nil, nil)
++	second, parsedSecond := mustWriteAndParse(t, ds, nil, nil)
++
++	assertDICOMHeaderAndComputedGroupLength(t, first)
++	assertDICOMHeaderAndComputedGroupLength(t, second)
++	assertSummaryJSON(t, parsedFirst, fullDatasetSummaryJSON)
++	assertSummaryJSON(t, parsedSecond, fullDatasetSummaryJSON)
++}
++
++func TestWriteDoesNotMutateInputDataset(t *testing.T) {
++	ds := fullDataset(uid.ImplicitVRLittleEndian)
++	before := summaryJSON(ds)
++	if before != fullDatasetSourceSummaryJSON {
++		t.Fatalf("source summary before Write = %s, want %s", before, fullDatasetSourceSummaryJSON)
++	}
++	var b bytes.Buffer
++	if err := dicom.Write(&b, ds); err != nil {
++		t.Fatalf("Write returned error: %v", err)
++	}
++	after := summaryJSON(ds)
++	if after != fullDatasetSourceSummaryJSON {
++		t.Fatalf("source summary after Write = %s, want %s", after, fullDatasetSourceSummaryJSON)
++	}
++}
++
++func TestWriteNoGlobalStateWithInProcessNoise(t *testing.T) {
++	baseline, parsedBaseline := mustWriteAndParse(t, fullDataset(uid.ImplicitVRLittleEndian), nil, nil)
++	mustWriteAndParse(t, transferSyntaxOnlyDataset(uid.ExplicitVRLittleEndian), nil, nil)
++	mustWriteAndParse(t, nativePixelDataset(32), nil, nil)
++	again, parsedAgain := mustWriteAndParse(t, fullDataset(uid.ImplicitVRLittleEndian), nil, nil)
++
++
++	assertDICOMHeaderAndComputedGroupLength(t, baseline)
++	assertDICOMHeaderAndComputedGroupLength(t, again)
++	assertSummaryJSON(t, parsedBaseline, fullDatasetSummaryJSON)
++	assertSummaryJSON(t, parsedAgain, fullDatasetSummaryJSON)
++}
++
++func TestWriteDoesNotCreateUndeclaredFilesInCwd(t *testing.T) {
++	tmp := t.TempDir()
++	originalWD, err := os.Getwd()
++	if err != nil {
++		t.Fatalf("Getwd: %v", err)
++	}
++	if err := os.Chdir(tmp); err != nil {
++		t.Fatalf("Chdir tmp: %v", err)
++	}
++	t.Cleanup(func() {
++		_ = os.Chdir(originalWD)
++	})
++
++	before := mustSnapshotDir(t, tmp)
++	var b bytes.Buffer
++	if err := dicom.Write(&b, fullDataset(uid.ImplicitVRLittleEndian)); err != nil {
++		t.Fatalf("Write returned error: %v", err)
++	}
++	after := mustSnapshotDir(t, tmp)
++	if !reflect.DeepEqual(after, before) {
++		t.Fatalf("cwd entries after Write = %#v, want %#v", after, before)
++	}
++
++	assertDICOMHeaderAndComputedGroupLength(t, b.Bytes())
++}
++
++func mustWriteAndParse(t *testing.T, ds dicom.Dataset, writeOpts []dicom.WriteOption, parseOpts []dicom.ParseOption) ([]byte, dicom.Dataset) {
++	t.Helper()
++	var b bytes.Buffer
++	if err := dicom.Write(&b, ds, writeOpts...); err != nil {
++		t.Fatalf("Write returned error: %v", err)
++	}
++	parsed, err := dicom.ParseUntilEOF(bytes.NewReader(b.Bytes()), nil, parseOpts...)
++	if err != nil {
++		t.Fatalf("ParseUntilEOF returned error: %v", err)
++	}
++	return b.Bytes(), parsed
++}
++
++func assertDICOMHeaderAndComputedGroupLength(t *testing.T, got []byte) int {
++	t.Helper()
++	if len(got) < 144 {
++		t.Fatalf("DICOM output length = %d, want at least 144 bytes for preamble, DICM, and group length", len(got))
++	}
++	if !bytes.Equal(got[:128], make([]byte, 128)) {
++		t.Fatalf("DICOM preamble is not 128 zero bytes")
++	}
++	if string(got[128:132]) != "DICM" {
++		t.Fatalf("DICOM magic = %q, want DICM", string(got[128:132]))
++	}
++	if binary.LittleEndian.Uint16(got[132:134]) != tag.FileMetaInformationGroupLength.Group ||
++		binary.LittleEndian.Uint16(got[134:136]) != tag.FileMetaInformationGroupLength.Element {
++		t.Fatalf("first metadata tag = (%04x,%04x), want %s",
++			binary.LittleEndian.Uint16(got[132:134]),
++			binary.LittleEndian.Uint16(got[134:136]),
++			tag.FileMetaInformationGroupLength)
++	}
++	if string(got[136:138]) != "UL" {
++		t.Fatalf("FileMetaInformationGroupLength VR = %q, want UL", string(got[136:138]))
++	}
++	if vl := binary.LittleEndian.Uint16(got[138:140]); vl != 4 {
++		t.Fatalf("FileMetaInformationGroupLength value length = %d, want 4", vl)
++	}
++	declaredMetaLen := int(binary.LittleEndian.Uint32(got[140:144]))
++	offset := 144
++	for {
++		if offset+8 > len(got) {
++			t.Fatalf("metadata element at offset %d is truncated", offset)
++		}
++		group := binary.LittleEndian.Uint16(got[offset : offset+2])
++		if group != tag.MetadataGroup {
++			break
++		}
++		vr := string(got[offset+4 : offset+6])
++		headerLen := 8
++		valueLen := int(binary.LittleEndian.Uint16(got[offset+6 : offset+8]))
++		if isLongExplicitVR(vr) {
++			if offset+12 > len(got) {
++				t.Fatalf("long-VR metadata element at offset %d is truncated", offset)
++			}
++			headerLen = 12
++			valueLen = int(binary.LittleEndian.Uint32(got[offset+8 : offset+12]))
++		}
++		offset += headerLen + valueLen
++		if offset > len(got) {
++			t.Fatalf("metadata element length extends beyond output")
++		}
++	}
++	if gotMetaLen := offset - 144; gotMetaLen != declaredMetaLen {
++		t.Fatalf("FileMetaInformationGroupLength = %d, want computed length %d", declaredMetaLen, gotMetaLen)
++	}
++	if offset == len(got) {
++		t.Fatalf("DICOM output has metadata but no dataset elements")
++	}
++	return offset
++}
++
++func isLongExplicitVR(vr string) bool {
++	switch vr {
++	case "OB", "OD", "OF", "OL", "OW", "SQ", "UC", "UR", "UT", "UN":
++		return true
++	default:
++		return false
++	}
++}
++
++func assertDatasetHexContains(t *testing.T, got []byte, datasetStart int, want string) {
++	t.Helper()
++	if gotHex := hex.EncodeToString(got[datasetStart:]); !strings.Contains(gotHex, want) {
++		t.Fatalf("dataset hex output does not contain %q; got %q", want, gotHex)
++	}
++}
++
++func assertSummaryJSON(t *testing.T, ds dicom.Dataset, want string) {
++	t.Helper()
++	got := summaryJSON(ds)
++
++	if !reflect.DeepEqual(summaryJSONCounts(t, got), summaryJSONCounts(t, want)) {
++		t.Fatalf("summary JSON:\n%s\nwant:\n%s", got, want)
++	}
++}
++
++func summaryJSONCounts(t *testing.T, s string) map[string]int {
++	t.Helper()
++	var raw []json.RawMessage
++	if err := json.Unmarshal([]byte(s), &raw); err != nil {
++		t.Fatalf("summary JSON did not unmarshal: %v", err)
++	}
++	counts := make(map[string]int, len(raw))
++	for _, item := range raw {
++		var normalized any
++		if err := json.Unmarshal(item, &normalized); err != nil {
++			t.Fatalf("summary element did not unmarshal: %v", err)
++		}
++		b, err := json.Marshal(normalized)
++		if err != nil {
++			t.Fatalf("summary element did not marshal: %v", err)
++		}
++		counts[string(b)]++
++	}
++	return counts
++}
++
++func transferSyntaxValue(t *testing.T, ds dicom.Dataset) string {
++	t.Helper()
++	elem, err := ds.FindElementByTag(tag.TransferSyntaxUID)
++	if err != nil {
++		t.Fatalf("TransferSyntaxUID not found: %v", err)
++	}
++	vals := dicom.MustGetStrings(elem.Value)
++	if len(vals) != 1 {
++		t.Fatalf("TransferSyntaxUID values = %#v, want one value", vals)
++	}
++	return vals[0]
++}
++
++func pixelDataSummary(t *testing.T, ds dicom.Dataset) pixelSummary {
++	t.Helper()
++	elem, err := ds.FindElementByTag(tag.PixelData)
++	if err != nil {
++		t.Fatalf("PixelData not found: %v", err)
++	}
++	got, ok := summarizeValue(elem.Value).(pixelSummary)
++	if !ok {
++		t.Fatalf("PixelData summary type = %T, want pixelSummary", summarizeValue(elem.Value))
++	}
++	return got
++}
++
++func mustSnapshotDir(t *testing.T, dir string) []string {
++	t.Helper()
++	entries, err := os.ReadDir(dir)
++	if err != nil {
++		t.Fatalf("ReadDir(%s): %v", dir, err)
++	}
++	out := make([]string, 0, len(entries))
++	for _, e := range entries {
++		out = append(out, filepath.Join(dir, e.Name()))
++	}
++	return out
++}
++
++type elementSummary struct {
++	Tag       string `json:"tag"`
++	RawVR     string `json:"rawVR"`
++	ValueKind string `json:"valueKind"`
++	Value     any    `json:"value"`
++}
++
++type pixelSummary struct {
++	IsEncapsulated           bool           `json:"isEncapsulated"`
++	IntentionallySkipped     bool           `json:"intentionallySkipped"`
++	IntentionallyUnprocessed bool           `json:"intentionallyUnprocessed"`
++	UnprocessedValueData     []int          `json:"unprocessedValueData,omitempty"`
++	Frames                   []frameSummary `json:"frames,omitempty"`
++}
++
++type frameSummary struct {
++	Encapsulated bool  `json:"encapsulated"`
++	Data         []int `json:"data,omitempty"`
++	Rows         int   `json:"rows,omitempty"`
++	Cols         int   `json:"cols,omitempty"`
++	Bits         int   `json:"bits,omitempty"`
++	Samples      int   `json:"samples,omitempty"`
++}
++
++func summaryJSON(ds dicom.Dataset) string {
++	var out []elementSummary
++	iter := ds.FlatStatefulIterator()
++	for iter.HasNext() {
++		e := iter.Next()
++		if e.Tag == tag.FileMetaInformationGroupLength {
++			continue
++		}
++		out = append(out, elementSummary{
++			Tag:       e.Tag.String(),
++			RawVR:     e.RawValueRepresentation,
++			ValueKind: valueKind(e.Value),
++			Value:     summarizeValue(e.Value),
++		})
++	}
++	b, err := json.Marshal(out)
++	if err != nil {
++		panic(err)
++	}
++	return string(b)
++}
++
++func valueKind(v dicom.Value) string {
++	switch v.ValueType() {
++	case dicom.Strings:
++		return "Strings"
++	case dicom.Bytes:
++		return "Bytes"
++	case dicom.Ints:
++		return "Ints"
++	case dicom.PixelData:
++		return "PixelData"
++	case dicom.Sequences:
++		return "Sequences"
++	case dicom.Floats:
++		return "Floats"
++	default:
++		return fmt.Sprintf("ValueType(%d)", v.ValueType())
++	}
++}
++
++func summarizeValue(v dicom.Value) any {
++	switch v.ValueType() {
++	case dicom.Strings:
++		return dicom.MustGetStrings(v)
++	case dicom.Bytes:
++		return byteInts(dicom.MustGetBytes(v))
++	case dicom.Ints:
++		return dicom.MustGetInts(v)
++	case dicom.Floats:
++		return dicom.MustGetFloats(v)
++	case dicom.Sequences:
++		return "sequence"
++	case dicom.PixelData:
++		p := dicom.MustGetPixelDataInfo(v)
++		ps := pixelSummary{
++			IsEncapsulated:           p.IsEncapsulated,
++			IntentionallySkipped:     p.IntentionallySkipped,
++			IntentionallyUnprocessed: p.IntentionallyUnprocessed,
++			UnprocessedValueData:     byteInts(p.UnprocessedValueData),
++		}
++		for _, fr := range p.Frames {
++			fs := frameSummary{Encapsulated: fr.Encapsulated}
++			if fr.Encapsulated {
++				fs.Data = byteInts(fr.EncapsulatedData.Data)
++			} else if fr.NativeData != nil {
++				fs.Rows = fr.NativeData.Rows()
++				fs.Cols = fr.NativeData.Cols()
++				fs.Bits = fr.NativeData.BitsPerSample()
++				fs.Samples = fr.NativeData.SamplesPerPixel()
++				fs.Data = nativeDataInts(fr.NativeData.RawDataSlice())
++			}
++			ps.Frames = append(ps.Frames, fs)
++		}
++		return ps
++	default:
++		return fmt.Sprintf("%v", v.GetValue())
++	}
++}
++
++func byteInts(b []byte) []int {
++	if len(b) == 0 {
++		return nil
++	}
++	out := make([]int, len(b))
++	for i, v := range b {
++		out[i] = int(v)
++	}
++	return out
++}
++
++func nativeDataInts(v any) []int {
++	switch x := v.(type) {
++	case []uint8:
++		out := make([]int, len(x))
++		for i, v := range x {
++			out[i] = int(v)
++		}
++		return out
++	case []uint16:
++		out := make([]int, len(x))
++		for i, v := range x {
++			out[i] = int(v)
++		}
++		return out
++	case []uint32:
++		out := make([]int, len(x))
++		for i, v := range x {
++			out[i] = int(v)
++		}
++		return out
++	default:
++		panic(fmt.Sprintf("unexpected native data %T", v))
++	}
++}
++
++func mustElement(t tag.Tag, data any) *dicom.Element {
++	e, err := dicom.NewElement(t, data)
++	if err != nil {
++		panic(err)
++	}
++	return e
++}
++
++func mustValue(data any) dicom.Value {
++	v, err := dicom.NewValue(data)
++	if err != nil {
++		panic(err)
++	}
++	return v
++}
++
++func fullDataset(ts string) dicom.Dataset {
++	return dicom.Dataset{Elements: []*dicom.Element{
++		mustElement(tag.MediaStorageSOPClassUID, []string{"1.2.840.10008.5.1.4.1.1.1.2"}),
++		mustElement(tag.MediaStorageSOPInstanceUID, []string{"1.2.826.0.1.3680043.10.543.1"}),
++		mustElement(tag.TransferSyntaxUID, []string{ts}),
++		mustElement(tag.PatientName, []string{"Alpha^Patient", "Beta^Patient"}),
++		mustElement(tag.Rows, []int{1}),
++		mustElement(tag.Columns, []int{2}),
++		mustElement(tag.BitsAllocated, []int{8}),
++		mustElement(tag.NumberOfFrames, []string{"1"}),
++		mustElement(tag.SamplesPerPixel, []int{1}),
++		mustElement(tag.FloatingPointValue, []float64{128.1}),
++		mustElement(tag.DimensionIndexPointer, []int{32, 36950}),
++		mustElement(tag.RedPaletteColorLookupTableData, []byte{1, 2, 3, 4}),
++		mustElement(tag.AddOtherSequence, [][]*dicom.Element{{
++			mustElement(tag.PatientName, []string{"Nested^One"}),
++			mustElement(tag.Rows, []int{7}),
++			mustElement(tag.AnatomicRegionSequence, [][]*dicom.Element{{mustElement(tag.PatientName, []string{"Deep^Name"})}}),
++		}}),
++		privateUnknownElement(),
++		mustElement(tag.PixelData, dicom.PixelDataInfo{
++			IsEncapsulated: false,
++			Frames: []*frame.Frame{{NativeData: &frame.NativeFrame[uint8]{
++				InternalBitsPerSample: 8, InternalRows: 1, InternalCols: 2, InternalSamplesPerPixel: 1, RawData: []uint8{9, 10},
++			}}},
++		}),
++	}}
++}
++
++func transferSyntaxOnlyDataset(ts string) dicom.Dataset {
++	return dicom.Dataset{Elements: []*dicom.Element{
++		mustElement(tag.MediaStorageSOPClassUID, []string{"1.2.840.10008.5.1.4.1.1.1.2"}),
++		mustElement(tag.MediaStorageSOPInstanceUID, []string{"1.2.826.0.1.3680043.10.543.2"}),
++		mustElement(tag.TransferSyntaxUID, []string{ts}),
++		mustElement(tag.PatientName, []string{"Syntax^Case"}),
++		mustElement(tag.Rows, []int{9}),
++		mustElement(tag.FloatingPointValue, []float64{9.25}),
++	}}
++}
++
++func missingTransferSyntaxDataset() dicom.Dataset {
++	return dicom.Dataset{Elements: []*dicom.Element{
++		mustElement(tag.MediaStorageSOPClassUID, []string{"1.2.840.10008.5.1.4.1.1.1.2"}),
++		mustElement(tag.MediaStorageSOPInstanceUID, []string{"1.2.826.0.1.3680043.10.543.3"}),
++		mustElement(tag.PatientName, []string{"Missing^Syntax"}),
++		mustElement(tag.Rows, []int{64}),
++		mustElement(tag.FloatingPointValue, []float64{64.5}),
++	}}
++}
++
++func nativePixelDataset(bits int) dicom.Dataset {
++	var pixel dicom.PixelDataInfo
++	switch bits {
++	case 8:
++		pixel = dicom.PixelDataInfo{Frames: []*frame.Frame{{NativeData: &frame.NativeFrame[uint8]{InternalBitsPerSample: 8, InternalRows: 2, InternalCols: 2, InternalSamplesPerPixel: 1, RawData: []uint8{1, 2, 3, 4}}}}}
++	case 16:
++		pixel = dicom.PixelDataInfo{Frames: []*frame.Frame{{NativeData: &frame.NativeFrame[uint16]{InternalBitsPerSample: 16, InternalRows: 2, InternalCols: 2, InternalSamplesPerPixel: 1, RawData: []uint16{258, 772, 1286, 1800}}}}}
++	case 32:
++		pixel = dicom.PixelDataInfo{Frames: []*frame.Frame{{NativeData: &frame.NativeFrame[uint32]{InternalBitsPerSample: 32, InternalRows: 2, InternalCols: 2, InternalSamplesPerPixel: 1, RawData: []uint32{65539, 131077, 196615, 262153}}}}}
++	default:
++		panic(fmt.Sprintf("unexpected bits %d", bits))
++	}
++	return dicom.Dataset{Elements: []*dicom.Element{
++		mustElement(tag.MediaStorageSOPClassUID, []string{"1.2.840.10008.5.1.4.1.1.1.2"}),
++		mustElement(tag.MediaStorageSOPInstanceUID, []string{fmt.Sprintf("1.2.826.0.1.3680043.10.543.%d", bits)}),
++		mustElement(tag.TransferSyntaxUID, []string{uid.ImplicitVRLittleEndian}),
++		mustElement(tag.Rows, []int{2}),
++		mustElement(tag.Columns, []int{2}),
++		mustElement(tag.BitsAllocated, []int{bits}),
++		mustElement(tag.NumberOfFrames, []string{"1"}),
++		mustElement(tag.SamplesPerPixel, []int{1}),
++		mustElement(tag.PixelData, pixel),
++	}}
++}
++
++func encapsulatedPixelDataset() dicom.Dataset {
++	pixel := mustElement(tag.PixelData, dicom.PixelDataInfo{
++		IsEncapsulated: true,
++		Frames: []*frame.Frame{
++			{Encapsulated: true, EncapsulatedData: frame.EncapsulatedFrame{Data: []byte{1, 2, 3, 4}}},
++			{Encapsulated: true, EncapsulatedData: frame.EncapsulatedFrame{Data: []byte{5, 6, 7, 8}}},
++		},
++	})
++	pixel.RawValueRepresentation = "OB"
++	pixel.ValueLength = tag.VLUndefinedLength
++	return dicom.Dataset{Elements: []*dicom.Element{
++		mustElement(tag.MediaStorageSOPClassUID, []string{"1.2.840.10008.5.1.4.1.1.1.2"}),
++		mustElement(tag.MediaStorageSOPInstanceUID, []string{"1.2.826.0.1.3680043.10.543.40"}),
++		mustElement(tag.TransferSyntaxUID, []string{uid.ExplicitVRLittleEndian}),
++		mustElement(tag.BitsAllocated, []int{8}),
++		pixel,
++	}}
++}
++
++func unprocessedPixelDataset() dicom.Dataset {
++	return dicom.Dataset{Elements: []*dicom.Element{
++		mustElement(tag.MediaStorageSOPClassUID, []string{"1.2.840.10008.5.1.4.1.1.1.2"}),
++		mustElement(tag.MediaStorageSOPInstanceUID, []string{"1.2.826.0.1.3680043.10.543.41"}),
++		mustElement(tag.TransferSyntaxUID, []string{uid.ImplicitVRLittleEndian}),
++		mustElement(tag.BitsAllocated, []int{8}),
++		mustElement(tag.PixelData, dicom.PixelDataInfo{IntentionallyUnprocessed: true, UnprocessedValueData: []byte{11, 12, 13, 14}}),
++	}}
++}
++
++func skippedNativePixelDataset() dicom.Dataset {
++	return dicom.Dataset{Elements: []*dicom.Element{
++		mustElement(tag.MediaStorageSOPClassUID, []string{"1.2.840.10008.5.1.4.1.1.1.2"}),
++		mustElement(tag.MediaStorageSOPInstanceUID, []string{"1.2.826.0.1.3680043.10.543.42"}),
++		mustElement(tag.TransferSyntaxUID, []string{uid.ImplicitVRLittleEndian}),
++		mustElement(tag.BitsAllocated, []int{8}),
++		mustElement(tag.PixelData, dicom.PixelDataInfo{IntentionallySkipped: true}),
++	}}
++}
++
++func skippedEncapsulatedPixelDataset() dicom.Dataset {
++	pixel := mustElement(tag.PixelData, dicom.PixelDataInfo{IntentionallySkipped: true, IsEncapsulated: true})
++	pixel.RawValueRepresentation = "OB"
++	pixel.ValueLength = tag.VLUndefinedLength
++	return dicom.Dataset{Elements: []*dicom.Element{
++		mustElement(tag.MediaStorageSOPClassUID, []string{"1.2.840.10008.5.1.4.1.1.1.2"}),
++		mustElement(tag.MediaStorageSOPInstanceUID, []string{"1.2.826.0.1.3680043.10.543.43"}),
++		mustElement(tag.TransferSyntaxUID, []string{uid.ExplicitVRLittleEndian}),
++		mustElement(tag.BitsAllocated, []int{8}),
++		pixel,
++	}}
++}
++
++func privateUnknownElement() *dicom.Element {
++	return &dicom.Element{
++		Tag:                    tag.Tag{Group: 0x0019, Element: 0x1027},
++		ValueRepresentation:    tag.VRUnknown,
++		RawValueRepresentation: "UN",
++		ValueLength:            4,
++		Value:                  mustValue([]byte{201, 202, 203, 204}),
++	}
++}
++
++func invalidVRDataset() dicom.Dataset {
++	e := mustElement(tag.PatientName, []string{"Invalid^VR"})
++	e.RawValueRepresentation = "DS"
++	e.ValueRepresentation = tag.GetVRKind(e.Tag, "DS")
++	return dicom.Dataset{Elements: []*dicom.Element{
++		mustElement(tag.MediaStorageSOPClassUID, []string{"1.2.840.10008.5.1.4.1.1.1.2"}),
++		mustElement(tag.MediaStorageSOPInstanceUID, []string{"1.2.826.0.1.3680043.10.543.50"}),
++		mustElement(tag.TransferSyntaxUID, []string{uid.ExplicitVRLittleEndian}),
++		e,
++	}}
++}
++
++func invalidValueTypeDataset() dicom.Dataset {
++	e := &dicom.Element{Tag: tag.Rows, ValueRepresentation: tag.GetVRKind(tag.Rows, "US"), RawValueRepresentation: "US", Value: mustValue([]string{"not-an-int"})}
++	return dicom.Dataset{Elements: []*dicom.Element{
++		mustElement(tag.MediaStorageSOPClassUID, []string{"1.2.840.10008.5.1.4.1.1.1.2"}),
++		mustElement(tag.MediaStorageSOPInstanceUID, []string{"1.2.826.0.1.3680043.10.543.51"}),
++		mustElement(tag.TransferSyntaxUID, []string{uid.ExplicitVRLittleEndian}),
++		e,
++	}}
++}
++
++const fullDatasetSummaryJSON = `[{"tag":"(0002,0002)","rawVR":"UI","valueKind":"Strings","value":["1.2.840.10008.5.1.4.1.1.1.2"]},{"tag":"(0002,0003)","rawVR":"UI","valueKind":"Strings","value":["1.2.826.0.1.3680043.10.543.1"]},{"tag":"(0002,0010)","rawVR":"UI","valueKind":"Strings","value":["1.2.840.10008.1.2"]},{"tag":"(0010,0010)","rawVR":"PN","valueKind":"Strings","value":["Alpha^Patient","Beta^Patient"]},{"tag":"(0028,0010)","rawVR":"US","valueKind":"Ints","value":[1]},{"tag":"(0028,0011)","rawVR":"US","valueKind":"Ints","value":[2]},{"tag":"(0028,0100)","rawVR":"US","valueKind":"Ints","value":[8]},{"tag":"(0028,0008)","rawVR":"IS","valueKind":"Strings","value":["1"]},{"tag":"(0028,0002)","rawVR":"US","valueKind":"Ints","value":[1]},{"tag":"(0040,a161)","rawVR":"FD","valueKind":"Floats","value":[128.1]},{"tag":"(0020,9165)","rawVR":"AT","valueKind":"Ints","value":[32,36950]},{"tag":"(0028,1201)","rawVR":"OW","valueKind":"Bytes","value":[1,2,3,4]},{"tag":"(0046,0102)","rawVR":"SQ","valueKind":"Sequences","value":"sequence"},{"tag":"(0010,0010)","rawVR":"PN","valueKind":"Strings","value":["Nested^One"]},{"tag":"(0028,0010)","rawVR":"US","valueKind":"Ints","value":[7]},{"tag":"(0008,2218)","rawVR":"SQ","valueKind":"Sequences","value":"sequence"},{"tag":"(0010,0010)","rawVR":"PN","valueKind":"Strings","value":["Deep^Name"]},{"tag":"(0019,1027)","rawVR":"UN","valueKind":"Bytes","value":[201,202,203,204]},{"tag":"(7fe0,0010)","rawVR":"OW","valueKind":"PixelData","value":{"isEncapsulated":false,"intentionallySkipped":false,"intentionallyUnprocessed":false,"frames":[{"encapsulated":false,"data":[9,10],"rows":1,"cols":2,"bits":8,"samples":1}]}}]`
++
++const fullDatasetSourceSummaryJSON = `[{"tag":"(0002,0002)","rawVR":"UI","valueKind":"Strings","value":["1.2.840.10008.5.1.4.1.1.1.2"]},{"tag":"(0002,0003)","rawVR":"UI","valueKind":"Strings","value":["1.2.826.0.1.3680043.10.543.1"]},{"tag":"(0002,0010)","rawVR":"UI","valueKind":"Strings","value":["1.2.840.10008.1.2"]},{"tag":"(0010,0010)","rawVR":"PN","valueKind":"Strings","value":["Alpha^Patient","Beta^Patient"]},{"tag":"(0028,0010)","rawVR":"US","valueKind":"Ints","value":[1]},{"tag":"(0028,0011)","rawVR":"US","valueKind":"Ints","value":[2]},{"tag":"(0028,0100)","rawVR":"US","valueKind":"Ints","value":[8]},{"tag":"(0028,0008)","rawVR":"IS","valueKind":"Strings","value":["1"]},{"tag":"(0028,0002)","rawVR":"US","valueKind":"Ints","value":[1]},{"tag":"(0040,a161)","rawVR":"FD","valueKind":"Floats","value":[128.1]},{"tag":"(0020,9165)","rawVR":"AT","valueKind":"Ints","value":[32,36950]},{"tag":"(0028,1201)","rawVR":"OW","valueKind":"Bytes","value":[1,2,3,4]},{"tag":"(0046,0102)","rawVR":"SQ","valueKind":"Sequences","value":"sequence"},{"tag":"(0010,0010)","rawVR":"PN","valueKind":"Strings","value":["Nested^One"]},{"tag":"(0028,0010)","rawVR":"US","valueKind":"Ints","value":[7]},{"tag":"(0008,2218)","rawVR":"SQ","valueKind":"Sequences","value":"sequence"},{"tag":"(0010,0010)","rawVR":"PN","valueKind":"Strings","value":["Deep^Name"]},{"tag":"(0019,1027)","rawVR":"UN","valueKind":"Bytes","value":[201,202,203,204]},{"tag":"(7fe0,0010)","rawVR":"OW","valueKind":"PixelData","value":{"isEncapsulated":false,"intentionallySkipped":false,"intentionallyUnprocessed":false,"frames":[{"encapsulated":false,"data":[9,10],"rows":1,"cols":2,"bits":8,"samples":1}]}}]`
++
++const explicitLittleEndianSummaryJSON = `[{"tag":"(0002,0002)","rawVR":"UI","valueKind":"Strings","value":["1.2.840.10008.5.1.4.1.1.1.2"]},{"tag":"(0002,0003)","rawVR":"UI","valueKind":"Strings","value":["1.2.826.0.1.3680043.10.543.2"]},{"tag":"(0002,0010)","rawVR":"UI","valueKind":"Strings","value":["1.2.840.10008.1.2.1"]},{"tag":"(0010,0010)","rawVR":"PN","valueKind":"Strings","value":["Syntax^Case"]},{"tag":"(0028,0010)","rawVR":"US","valueKind":"Ints","value":[9]},{"tag":"(0040,a161)","rawVR":"FD","valueKind":"Floats","value":[9.25]}]`
++
++const explicitBigEndianSummaryJSON = `[{"tag":"(0002,0002)","rawVR":"UI","valueKind":"Strings","value":["1.2.840.10008.5.1.4.1.1.1.2"]},{"tag":"(0002,0003)","rawVR":"UI","valueKind":"Strings","value":["1.2.826.0.1.3680043.10.543.2"]},{"tag":"(0002,0010)","rawVR":"UI","valueKind":"Strings","value":["1.2.840.10008.1.2.2"]},{"tag":"(0010,0010)","rawVR":"PN","valueKind":"Strings","value":["Syntax^Case"]},{"tag":"(0028,0010)","rawVR":"US","valueKind":"Ints","value":[9]},{"tag":"(0040,a161)","rawVR":"FD","valueKind":"Floats","value":[9.25]}]`
++
++const skipVRSummaryJSON = `[{"tag":"(0002,0002)","rawVR":"UI","valueKind":"Strings","value":["1.2.840.10008.5.1.4.1.1.1.2"]},{"tag":"(0002,0003)","rawVR":"UI","valueKind":"Strings","value":["1.2.826.0.1.3680043.10.543.50"]},{"tag":"(0002,0010)","rawVR":"UI","valueKind":"Strings","value":["1.2.840.10008.1.2.1"]},{"tag":"(0010,0010)","rawVR":"DS","valueKind":"Strings","value":["Invalid^VR"]}]`
++
++const skipValueTypeSummaryJSON = `[{"tag":"(0002,0002)","rawVR":"UI","valueKind":"Strings","value":["1.2.840.10008.5.1.4.1.1.1.2"]},{"tag":"(0002,0003)","rawVR":"UI","valueKind":"Strings","value":["1.2.826.0.1.3680043.10.543.51"]},{"tag":"(0002,0010)","rawVR":"UI","valueKind":"Strings","value":["1.2.840.10008.1.2.1"]},{"tag":"(0028,0010)","rawVR":"US","valueKind":"Ints","value":[28526,11636,28257,26925,29806]}]`
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,20 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++
++cd /workspace/repo
++export GOTOOLCHAIN=local
++export GOPROXY=off
++export GOSUMDB=off
++export GOVCS='*:off'
++export GOFLAGS="${GOFLAGS:-} -mod=readonly"
++exec go test -v ./usercase-test-coderl

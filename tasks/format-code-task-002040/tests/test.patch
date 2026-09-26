@@ -1,0 +1,551 @@
+diff --git a/usercase-test-coderl/roundtrip_test.go b/usercase-test-coderl/roundtrip_test.go
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/roundtrip_test.go
+@@ -0,0 +1,519 @@
++package usercase_test_coderl
++
++import (
++	"encoding/binary"
++	"errors"
++	"fmt"
++	"io"
++	"net"
++	"os"
++	"path/filepath"
++	"testing"
++	"time"
++
++	"github.com/neurlang/wayland/wl"
++	"github.com/neurlang/wayland/wlclient"
++)
++
++type mockCompositor struct {
++	t        *testing.T
++	dir      string
++	name     string
++	listener *net.UnixListener
++	conn     *net.UnixConn
++	accepted chan acceptResult
++}
++
++type acceptResult struct {
++	conn *net.UnixConn
++	err  error
++}
++
++type wireRequest struct {
++	pid     uint32
++	opcode  uint16
++	size    uint16
++	payload []byte
++}
++
++type externalError interface {
++	External() error
++}
++
++type registryRecorder struct {
++	globals []string
++}
++
++func (r *registryRecorder) HandleRegistryGlobal(ev wl.RegistryGlobalEvent) {
++	r.globals = append(r.globals, fmt.Sprintf("%d:%s:%d", ev.Name, ev.Interface, ev.Version))
++}
++
++type callbackRecorder struct {
++	doneData []uint32
++}
++
++func (r *callbackRecorder) HandleCallbackDone(ev wl.CallbackDoneEvent) {
++	r.doneData = append(r.doneData, ev.CallbackData)
++}
++
++func newMockCompositor(t *testing.T, name string) *mockCompositor {
++	t.Helper()
++
++	dir, err := os.MkdirTemp("", "wl-roundtrip-")
++	if err != nil {
++		t.Fatalf("MkdirTemp: %v", err)
++	}
++	t.Cleanup(func() {
++		_ = os.RemoveAll(dir)
++	})
++
++	return newMockCompositorInDir(t, dir, name)
++}
++
++func newMockCompositorInDir(t *testing.T, dir, name string) *mockCompositor {
++	t.Helper()
++
++	path := filepath.Join(dir, name)
++	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: path, Net: "unix"})
++	if err != nil {
++		t.Fatalf("ListenUnix(%q): %v", path, err)
++	}
++
++	m := &mockCompositor{
++		t:        t,
++		dir:      dir,
++		name:     name,
++		listener: listener,
++		accepted: make(chan acceptResult, 1),
++	}
++	go func() {
++		conn, err := listener.AcceptUnix()
++		m.accepted <- acceptResult{conn: conn, err: err}
++	}()
++
++	return m
++}
++
++func (m *mockCompositor) connectDisplay() *wl.Display {
++	m.t.Helper()
++
++	m.t.Setenv("XDG_RUNTIME_DIR", m.dir)
++	display, err := wl.Connect(m.name)
++	if err != nil {
++		m.t.Fatalf("wl.Connect(%q): %v", m.name, err)
++	}
++
++	select {
++	case accepted := <-m.accepted:
++		if accepted.err != nil {
++			m.t.Fatalf("AcceptUnix: %v", accepted.err)
++		}
++		m.conn = accepted.conn
++	case <-time.After(2 * time.Second):
++		m.t.Fatalf("timed out waiting for mock compositor accept")
++	}
++
++	return display
++}
++
++func (m *mockCompositor) close() {
++	if m.conn != nil {
++		_ = m.conn.Close()
++	}
++	if m.listener != nil {
++		_ = m.listener.Close()
++	}
++}
++
++func (m *mockCompositor) readRequest() wireRequest {
++	m.t.Helper()
++	if err := m.conn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
++		m.t.Fatalf("SetReadDeadline: %v", err)
++	}
++
++	header := make([]byte, 8)
++	if _, err := io.ReadFull(m.conn, header); err != nil {
++		m.t.Fatalf("read request header: %v", err)
++	}
++
++	req := wireRequest{
++		pid:    binary.NativeEndian.Uint32(header[0:4]),
++		opcode: binary.NativeEndian.Uint16(header[4:6]),
++		size:   binary.NativeEndian.Uint16(header[6:8]),
++	}
++	req.payload = make([]byte, int(req.size)-8)
++	if _, err := io.ReadFull(m.conn, req.payload); err != nil {
++		m.t.Fatalf("read request payload: %v", err)
++	}
++	return req
++}
++
++func (m *mockCompositor) writeEvent(pid uint32, opcode uint16, payload []byte) {
++	m.t.Helper()
++	if err := m.conn.SetWriteDeadline(time.Now().Add(2 * time.Second)); err != nil {
++		m.t.Fatalf("SetWriteDeadline: %v", err)
++	}
++	if _, err := m.conn.Write(eventFrame(pid, opcode, payload)); err != nil {
++		m.t.Fatalf("write event pid=%d opcode=%d: %v", pid, opcode, err)
++	}
++}
++
++func assertRequest(t *testing.T, got wireRequest, wantPID uint32, wantOpcode uint16, wantSize uint16, wantPayload []byte) {
++	t.Helper()
++	if got.pid != wantPID {
++		t.Fatalf("request pid = %d, want %d", got.pid, wantPID)
++	}
++	if got.opcode != wantOpcode {
++		t.Fatalf("request opcode = %d, want %d", got.opcode, wantOpcode)
++	}
++	if got.size != wantSize {
++		t.Fatalf("request size = %d, want %d", got.size, wantSize)
++	}
++	if fmt.Sprint(got.payload) != fmt.Sprint(wantPayload) {
++		t.Fatalf("request payload = %v, want %v", got.payload, wantPayload)
++	}
++}
++
++func assertSyncRequest(t *testing.T, got wireRequest) uint32 {
++	t.Helper()
++
++	if got.pid != 1 {
++		t.Fatalf("sync request pid = %d, want display object 1", got.pid)
++	}
++	if got.opcode != 0 {
++		t.Fatalf("sync request opcode = %d, want wl_display.sync opcode 0", got.opcode)
++	}
++	if got.size != 12 {
++		t.Fatalf("sync request size = %d, want 12", got.size)
++	}
++	if len(got.payload) != 4 {
++		t.Fatalf("sync request payload length = %d, want 4", len(got.payload))
++	}
++	callbackID := binary.NativeEndian.Uint32(got.payload)
++	if callbackID == 0 {
++		t.Fatalf("sync request callback id = 0, want nonzero object id")
++	}
++	return callbackID
++}
++
++func assertExternalError(t *testing.T, got error, want error) {
++	t.Helper()
++	var ext externalError
++	if !errors.As(got, &ext) {
++		t.Fatalf("error %T %v has no External method, want external marker %v", got, got, want)
++	}
++	if ext.External() != want {
++		t.Fatalf("external error = %v, want %v", ext.External(), want)
++	}
++}
++
++func u32(v uint32) []byte {
++	buf := make([]byte, 4)
++	binary.NativeEndian.PutUint32(buf, v)
++	return buf
++}
++
++func wlString(s string) []byte {
++	out := u32(uint32(len(s) + 1))
++	out = append(out, []byte(s)...)
++	out = append(out, make([]byte, 4-(len(s)&3))...)
++	return out
++}
++
++func eventFrame(pid uint32, opcode uint16, payload []byte) []byte {
++	header := make([]byte, 8)
++	binary.NativeEndian.PutUint32(header[0:4], pid)
++	binary.NativeEndian.PutUint16(header[4:6], opcode)
++	binary.NativeEndian.PutUint16(header[6:8], uint16(8+len(payload)))
++	return append(header, payload...)
++}
++
++func driveOneRoundtrip(t *testing.T, m *mockCompositor, d *wl.Display) uint32 {
++	t.Helper()
++	done := make(chan uint32, 1)
++	go func() {
++		req := m.readRequest()
++		callbackID := assertSyncRequest(t, req)
++		m.writeEvent(callbackID, 0, u32(0))
++		done <- callbackID
++	}()
++	if err := wlclient.DisplayRoundtrip(d); err != nil {
++		t.Fatalf("DisplayRoundtrip: %v", err)
++	}
++	select {
++	case callbackID := <-done:
++		return callbackID
++	case <-time.After(2 * time.Second):
++		t.Fatalf("timed out waiting for mock roundtrip exchange")
++	}
++	return 0
++}
++
++
++
++func TestDisplayRoundtripSendsSyncAndReturnsNilWhenCallbackIsReached(t *testing.T) {
++	m := newMockCompositor(t, "wayland-roundtrip")
++	defer m.close()
++
++	display := m.connectDisplay()
++	defer wlclient.DisplayDisconnect(display)
++
++	served := make(chan struct{})
++	go func() {
++		req := m.readRequest()
++
++		callbackID := assertSyncRequest(t, req)
++		m.writeEvent(callbackID, 0, []byte{44, 1, 0, 0})
++		close(served)
++	}()
++
++	if err := wlclient.DisplayRoundtrip(display); err != nil {
++		t.Fatalf("DisplayRoundtrip error = %v, want nil", err)
++	}
++	select {
++	case <-served:
++	case <-time.After(2 * time.Second):
++		t.Fatalf("mock compositor did not observe the sync request")
++	}
++}
++
++
++
++func TestRunTillDispatchesUnrelatedEventsAndStopsOnExactCallbackObject(t *testing.T) {
++	m := newMockCompositor(t, "wayland-runtill")
++	defer m.close()
++
++	display := m.connectDisplay()
++	defer wlclient.DisplayDisconnect(display)
++	registry, err := display.GetRegistry()
++	if err != nil {
++		t.Fatalf("GetRegistry: %v", err)
++	}
++
++	if registry.Id() == 0 {
++		t.Fatalf("registry id = 0, want nonzero object id")
++	}
++	assertRequest(t, m.readRequest(), 1, 1, 12, u32(uint32(registry.Id())))
++
++	registryEvents := &registryRecorder{}
++	registry.AddGlobalHandler(registryEvents)
++
++	firstCallback, err := display.Sync()
++	if err != nil {
++		t.Fatalf("first Sync: %v", err)
++	}
++
++	if firstCallback.Id() == 0 {
++		t.Fatalf("first callback id = 0, want nonzero object id")
++	}
++	firstDone := &callbackRecorder{}
++	firstCallback.AddDoneHandler(firstDone)
++	assertRequest(t, m.readRequest(), 1, 0, 12, u32(uint32(firstCallback.Id())))
++
++	targetCallback, err := display.Sync()
++	if err != nil {
++		t.Fatalf("target Sync: %v", err)
++	}
++
++	if targetCallback.Id() == 0 || targetCallback == firstCallback {
++		t.Fatalf("target callback = id %d pointer %p, want distinct nonzero callback", targetCallback.Id(), targetCallback)
++	}
++	assertRequest(t, m.readRequest(), 1, 0, 12, u32(uint32(targetCallback.Id())))
++
++	go func() {
++		m.writeEvent(uint32(firstCallback.Id()), 0, []byte{111, 0, 0, 0})
++		payload := append(u32(7), wlString("wl_seat")...)
++		payload = append(payload, []byte{9, 0, 0, 0}...)
++		m.writeEvent(uint32(registry.Id()), 0, payload)
++		m.writeEvent(uint32(targetCallback.Id()), 0, []byte{222, 0, 0, 0})
++	}()
++
++	if err := display.Context().RunTill(targetCallback); err != nil {
++		t.Fatalf("RunTill error = %v, want nil", err)
++	}
++	if fmt.Sprint(firstDone.doneData) != "[111]" {
++		t.Fatalf("first callback done data = %v, want [111]", firstDone.doneData)
++	}
++	if fmt.Sprint(registryEvents.globals) != "[7:wl_seat:9]" {
++		t.Fatalf("registry globals = %v, want [7:wl_seat:9]", registryEvents.globals)
++	}
++}
++
++
++
++func TestDisplayRoundtripReturnsSyncSendErrorWithoutWaiting(t *testing.T) {
++	m := newMockCompositor(t, "wayland-send-error")
++	display := m.connectDisplay()
++	defer wlclient.DisplayDisconnect(display)
++
++	m.close()
++	time.Sleep(50 * time.Millisecond)
++
++	err := wlclient.DisplayRoundtrip(display)
++	assertExternalError(t, err, wl.ErrContextSendRequestConn)
++
++	if err == nil || err.Error() == "" {
++		t.Fatalf("send error = %v, want non-empty sync-send error", err)
++	}
++}
++
++
++
++func TestRunTillOnNilContextReturnsExactNilContextError(t *testing.T) {
++	var ctx *wl.Context
++	err := ctx.RunTill(nil)
++	if !errors.Is(err, wl.ErrContextNil) {
++		t.Fatalf("RunTill nil context error = %v, want %v", err, wl.ErrContextNil)
++	}
++}
++
++
++
++func TestRunTillReturnsExactProxyNilErrorBeforeTargetCallback(t *testing.T) {
++	m := newMockCompositor(t, "wayland-proxy-nil")
++	defer m.close()
++
++	display := m.connectDisplay()
++	defer wlclient.DisplayDisconnect(display)
++	cb, err := display.Sync()
++	if err != nil {
++		t.Fatalf("Sync: %v", err)
++	}
++
++	assertRequest(t, m.readRequest(), 1, 0, 12, u32(uint32(cb.Id())))
++	m.writeEvent(77, 0, nil)
++
++	err = display.Context().RunTill(cb)
++	if !errors.Is(err, wl.ErrContextRunProxyNil) {
++		t.Fatalf("RunTill proxy nil error = %v, want %v", err, wl.ErrContextRunProxyNil)
++	}
++}
++
++
++
++func TestRunTillReturnsExactNotDispatchedErrorForRegisteredNonDispatcher(t *testing.T) {
++	m := newMockCompositor(t, "wayland-not-dispatched")
++	defer m.close()
++
++	display := m.connectDisplay()
++	defer wlclient.DisplayDisconnect(display)
++	plainProxy := &wl.BaseProxy{}
++	display.Context().Register(plainProxy)
++
++	if plainProxy.Id() == 0 {
++		t.Fatalf("plain proxy id = 0, want nonzero object id")
++	}
++
++	cb, err := display.Sync()
++	if err != nil {
++		t.Fatalf("Sync: %v", err)
++	}
++
++	if cb.Id() == 0 || cb.Id() == plainProxy.Id() {
++		t.Fatalf("callback id = %d, want nonzero id distinct from plain proxy id %d", cb.Id(), plainProxy.Id())
++	}
++	assertRequest(t, m.readRequest(), 1, 0, 12, u32(uint32(cb.Id())))
++	m.writeEvent(uint32(plainProxy.Id()), 0, nil)
++
++	err = display.Context().RunTill(cb)
++	if !errors.Is(err, wl.ErrContextRunNotDispatched) {
++		t.Fatalf("RunTill not-dispatched error = %v, want %v", err, wl.ErrContextRunNotDispatched)
++	}
++}
++
++
++
++func TestRunTillReturnsReadErrorWhenConnectionClosesBeforeCallback(t *testing.T) {
++	m := newMockCompositor(t, "wayland-read-error")
++	display := m.connectDisplay()
++	defer wlclient.DisplayDisconnect(display)
++
++	cb, err := display.Sync()
++	if err != nil {
++		t.Fatalf("Sync: %v", err)
++	}
++
++	assertRequest(t, m.readRequest(), 1, 0, 12, u32(uint32(cb.Id())))
++	m.close()
++
++	err = display.Context().RunTill(cb)
++	assertExternalError(t, err, wl.ErrContextRunEventReadingError)
++}
++
++
++
++func TestDisplayRoundtripCanRepeatOnStatefulConnection(t *testing.T) {
++	m := newMockCompositor(t, "wayland-repeat")
++	defer m.close()
++
++	display := m.connectDisplay()
++	defer wlclient.DisplayDisconnect(display)
++
++
++	firstCallbackID := driveOneRoundtrip(t, m, display)
++	secondCallbackID := driveOneRoundtrip(t, m, display)
++	if firstCallbackID == 0 || secondCallbackID == 0 {
++		t.Fatalf("roundtrip callback ids = %d, %d, want nonzero sync callback ids", firstCallbackID, secondCallbackID)
++	}
++}
++
++
++
++func TestTwoDisplayConnectionsCanRoundtripIndependently(t *testing.T) {
++	dir, err := os.MkdirTemp("", "wl-independent-")
++	if err != nil {
++		t.Fatalf("MkdirTemp: %v", err)
++	}
++	defer os.RemoveAll(dir)
++	t.Setenv("XDG_RUNTIME_DIR", dir)
++
++	aServer := newMockCompositorInDir(t, dir, "wayland-a")
++	defer aServer.close()
++	bServer := newMockCompositorInDir(t, dir, "wayland-b")
++	defer bServer.close()
++
++	a, err := wl.Connect("wayland-a")
++	if err != nil {
++		t.Fatalf("Connect a: %v", err)
++	}
++	aAccepted := <-aServer.accepted
++	if aAccepted.err != nil {
++		t.Fatalf("accept a: %v", aAccepted.err)
++	}
++	aServer.conn = aAccepted.conn
++	defer wlclient.DisplayDisconnect(a)
++
++	b, err := wl.Connect("wayland-b")
++	if err != nil {
++		t.Fatalf("Connect b: %v", err)
++	}
++	bAccepted := <-bServer.accepted
++	if bAccepted.err != nil {
++		t.Fatalf("accept b: %v", bAccepted.err)
++	}
++	bServer.conn = bAccepted.conn
++	defer wlclient.DisplayDisconnect(b)
++
++
++	aCallbackID := driveOneRoundtrip(t, aServer, a)
++	bCallbackID := driveOneRoundtrip(t, bServer, b)
++	if aCallbackID == 0 || bCallbackID == 0 {
++		t.Fatalf("independent roundtrip callback ids = %d, %d, want nonzero sync callback ids", aCallbackID, bCallbackID)
++	}
++}
++
++
++
++func TestDisplayRoundtripAcrossRepeatedConnectionCycles(t *testing.T) {
++	for i := 0; i < 8; i++ {
++		m := newMockCompositor(t, fmt.Sprintf("wayland-leak-%d", i))
++		display := m.connectDisplay()
++
++		callbackID := driveOneRoundtrip(t, m, display)
++		if callbackID == 0 {
++			t.Fatalf("cycle %d callback id = 0, want nonzero sync callback id", i)
++		}
++		wlclient.DisplayDisconnect(display)
++		m.close()
++	}
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,22 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++cd /workspace/repo
++
++export GOTOOLCHAIN=local
++export GOPROXY=off
++export GOSUMDB=off
++export GONOSUMDB='*'
++export GOVCS='*:off'
++export GOFLAGS='-mod=readonly'
++
++exec go test -v -count=1 ./usercase-test-coderl/...

@@ -1,0 +1,7 @@
+The tar-backed processed-crash store is used for offline exports and migrations, but its identifier handling and reader behavior are currently inconsistent with the rest of the crash-storage API. Make the public `TarFileWritingCrashStore` and `TarFileSequentialReadingCrashStore` interoperate with both historical processed-crash shapes and with repeated, ID-addressed access.
+
+When writing a processed crash, accept either a `crash_id` key or the canonical `uuid` key. Use the present identifier as the archive member basename (`<id>.jsonz`); when both keys are present they must agree, and a record with neither key or with conflicting values must be rejected without adding a member. Serialization must not mutate the caller's mapping, including nested values. Existing `crash_id`-only records must remain compatible.
+
+Reading must locate the member matching the requested crash ID regardless of its position in the tar stream. Calls may request IDs in any order, may repeat an earlier ID, and must continue to work after a failed lookup; an absent ID raises the storage layer's `CrashIDNotFound` exception. Expose `new_crashes()` as a repeatable iterator of IDs from root-level `.jsonz` members in archive order, ignoring directories, nested members, and unrelated files.
+
+Keep the base storage redaction contract: `get_processed()` returns a redacted copy according to the configured forbidden keys, while `get_unredacted_processed()` returns the complete record. Redacting one read must not alter what a later unredacted or redacted read returns.

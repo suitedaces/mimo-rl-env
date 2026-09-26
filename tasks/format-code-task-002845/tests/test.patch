@@ -1,0 +1,365 @@
+diff --git a/tsconfig.json b/tsconfig.json
+index dee4c88..1bebcde 100644
+--- a/tsconfig.json
++++ b/tsconfig.json
+@@ -15,6 +15,7 @@
+     },
+     "files": [
+         "typings/index.d.ts",
+-        "typings/commander-tests.ts"
++        "typings/commander-tests.ts",
++        "typings/codespec-async-lifecycle-tests.ts"
+     ]
+-}
+\ No newline at end of file
++}
+diff --git a/test/test.codespec.async-lifecycle.js b/test/test.codespec.async-lifecycle.js
+new file mode 100644
+index 0000000..4e816b6
+--- /dev/null
++++ b/test/test.codespec.async-lifecycle.js
+@@ -0,0 +1,298 @@
++'use strict';
++
++var assert = require('assert');
++var commander = require('../');
++
++function deferred() {
++  var resolve;
++  var reject;
++  var promise = new Promise(function(res, rej) {
++    resolve = res;
++    reject = rej;
++  });
++  return { promise: promise, resolve: resolve, reject: reject };
++}
++
++async function rejectionOf(promise) {
++  var didResolve = false;
++  var rejection;
++  try {
++    await promise;
++    didResolve = true;
++  } catch (err) {
++    rejection = err;
++  }
++  assert.strictEqual(didResolve, false, 'expected promise to reject');
++  return rejection;
++}
++
++async function testPublicSurfaceAndHookValidation() {
++  assert.strictEqual(
++    typeof commander.Command.prototype.parseAsync,
++    'function',
++    'Command#parseAsync must be available'
++  );
++  assert.strictEqual(
++    typeof commander.Command.prototype.hook,
++    'function',
++    'Command#hook must be available'
++  );
++  assert.strictEqual(
++    typeof commander.parseAsync,
++    'function',
++    'the exported program must expose parseAsync'
++  );
++
++  var program = new commander.Command('tool');
++  function noop() {}
++  assert.strictEqual(program.hook('preAction', noop), program);
++  assert.strictEqual(program.hook('postAction', noop), program);
++  assert.throws(function() {
++    program.hook('beforeAction', noop);
++  }, Error, 'unknown hook event names must be rejected');
++
++  var unusedHookCalls = 0;
++  var idle = new commander.Command('idle');
++  idle.hook('preAction', function() {
++    unusedHookCalls += 1;
++  });
++  var idleResult = await idle.parseAsync(['node', 'idle']);
++  assert.strictEqual(idleResult, idle);
++  assert.strictEqual(unusedHookCalls, 0, 'hooks only run around an action');
++}
++
++async function testTopLevelActionIsAwaited() {
++  var program = new commander.Command('tool');
++  var gate = deferred();
++  var trace = [];
++
++  program
++    .arguments('<value>')
++    .action(function(value, command) {
++      assert.strictEqual(this, program);
++      assert.strictEqual(command, program);
++      assert.strictEqual(value, 'alpha');
++      trace.push('action:start');
++      return gate.promise.then(function() {
++        trace.push('action:end');
++      });
++    });
++
++  var pending = program.parseAsync(['node', 'tool', 'alpha']);
++  assert.ok(pending instanceof Promise, 'parseAsync must return a Promise');
++  var settled = false;
++  pending.then(function() { settled = true; }, function() { settled = true; });
++  await Promise.resolve();
++  assert.strictEqual(settled, false, 'parseAsync resolved before its action');
++
++  gate.resolve();
++  var result = await pending;
++  assert.strictEqual(result, program);
++  assert.deepStrictEqual(trace, ['action:start', 'action:end']);
++}
++
++async function testHierarchicalHookOrderThroughAlias() {
++  var program = new commander.Command('tool');
++  var actionCommand = program.command('deploy <target>').alias('d');
++  var trace = [];
++
++  function checkedHook(owner, label, asynchronous) {
++    return function(thisCommand, selectedCommand) {
++      assert.strictEqual(thisCommand, owner);
++      assert.strictEqual(selectedCommand, actionCommand);
++      trace.push(label + ':start');
++      if (!asynchronous) {
++        trace.push(label + ':end');
++        return;
++      }
++      return Promise.resolve().then(function() {
++        trace.push(label + ':end');
++      });
++    };
++  }
++
++  program.hook('preAction', checkedHook(program, 'root-pre-1', true));
++  program.hook('preAction', checkedHook(program, 'root-pre-2', false));
++  actionCommand.hook('preAction', checkedHook(actionCommand, 'command-pre', true));
++  actionCommand.hook('postAction', checkedHook(actionCommand, 'command-post', true));
++  program.hook('postAction', checkedHook(program, 'root-post', true));
++
++  actionCommand.action(function(target, command) {
++    assert.strictEqual(this, actionCommand);
++    assert.strictEqual(command, actionCommand);
++    assert.strictEqual(target, 'production');
++    trace.push('action:start');
++    return Promise.resolve().then(function() {
++      trace.push('action:end');
++    });
++  });
++
++  var result = await program.parseAsync(['node', 'tool', 'd', 'production']);
++  assert.strictEqual(result, program);
++  assert.deepStrictEqual(trace, [
++    'root-pre-1:start',
++    'root-pre-1:end',
++    'root-pre-2:start',
++    'root-pre-2:end',
++    'command-pre:start',
++    'command-pre:end',
++    'action:start',
++    'action:end',
++    'command-post:start',
++    'command-post:end',
++    'root-post:start',
++    'root-post:end'
++  ]);
++}
++
++async function testWildcardThenableIsAwaited() {
++  var program = new commander.Command('tool');
++  var trace = [];
++
++  program.command('*').action(function(name) {
++    assert.strictEqual(name, 'missing-command');
++    trace.push('wildcard:start');
++    return {
++      then: function(resolve) {
++        Promise.resolve().then(function() {
++          trace.push('wildcard:end');
++          resolve();
++        });
++      }
++    };
++  });
++
++  var result = await program.parseAsync(['node', 'tool', 'missing-command']);
++  assert.strictEqual(result, program);
++  assert.deepStrictEqual(trace, ['wildcard:start', 'wildcard:end']);
++}
++
++async function testPreActionFailureShortCircuits() {
++  var reason = new Error('pre-action failed');
++  var program = new commander.Command('tool');
++  var actionCommand = program.command('run');
++  var trace = [];
++
++  program.hook('preAction', function() {
++    trace.push('root-pre');
++    return Promise.reject(reason);
++  });
++  actionCommand.hook('preAction', function() { trace.push('command-pre'); });
++  actionCommand.action(function() { trace.push('action'); });
++  actionCommand.hook('postAction', function() { trace.push('command-post'); });
++  program.hook('postAction', function() { trace.push('root-post'); });
++
++  var rejection = await rejectionOf(program.parseAsync(['node', 'tool', 'run']));
++  assert.strictEqual(rejection, reason);
++  assert.deepStrictEqual(trace, ['root-pre']);
++}
++
++async function testActionFailuresRejectAndSkipPostHooks() {
++  var thrownReason = new Error('synchronous action failure');
++  var thrownProgram = new commander.Command('tool');
++  var thrownPostCalled = false;
++  thrownProgram.arguments('<value>').action(function() {
++    throw thrownReason;
++  });
++  thrownProgram.hook('postAction', function() { thrownPostCalled = true; });
++
++  var thrownPending;
++  assert.doesNotThrow(function() {
++    thrownPending = thrownProgram.parseAsync(['node', 'tool', 'value']);
++  }, 'parseAsync must convert a synchronous action throw into rejection');
++  assert.strictEqual(await rejectionOf(thrownPending), thrownReason);
++  assert.strictEqual(thrownPostCalled, false);
++
++  var rejectedReason = new Error('asynchronous action failure');
++  var rejectedProgram = new commander.Command('tool');
++  var rejectedPostCalled = false;
++  rejectedProgram.action(function() {
++    return Promise.reject(rejectedReason);
++  });
++  rejectedProgram.hook('postAction', function() { rejectedPostCalled = true; });
++
++  assert.strictEqual(
++    await rejectionOf(rejectedProgram.parseAsync(['node', 'tool'])),
++    rejectedReason
++  );
++  assert.strictEqual(rejectedPostCalled, false);
++}
++
++async function testPostActionFailureStopsOuterHooks() {
++  var reason = new Error('command post-action failed');
++  var program = new commander.Command('tool');
++  var actionCommand = program.command('run');
++  var trace = [];
++
++  actionCommand.action(function() {
++    trace.push('action:start');
++    return Promise.resolve().then(function() { trace.push('action:end'); });
++  });
++  actionCommand.hook('postAction', function() {
++    trace.push('command-post');
++    return Promise.reject(reason);
++  });
++  program.hook('postAction', function() { trace.push('root-post'); });
++
++  var rejection = await rejectionOf(program.parseAsync(['node', 'tool', 'run']));
++  assert.strictEqual(rejection, reason);
++  assert.deepStrictEqual(trace, ['action:start', 'action:end', 'command-post']);
++}
++
++async function testParseInvocationsAreIsolated() {
++  var firstReason = new Error('first invocation failed');
++  var program = new commander.Command('tool');
++  var calls = [];
++
++  program.arguments('<value>').action(function(value) {
++    calls.push(value);
++    if (value === 'first') return Promise.reject(firstReason);
++    return Promise.resolve();
++  });
++
++  assert.strictEqual(
++    await rejectionOf(program.parseAsync(['node', 'tool', 'first'])),
++    firstReason
++  );
++  var secondResult = await program.parseAsync(['node', 'tool', 'second']);
++  assert.strictEqual(secondResult, program);
++  assert.deepStrictEqual(calls, ['first', 'second']);
++}
++
++async function testSynchronousParseCompatibility() {
++  var program = new commander.Command('tool');
++  var gate = deferred();
++  var trace = [];
++  var finished = false;
++
++  program.hook('preAction', function() { trace.push('pre'); });
++  program.action(function() {
++    trace.push('action');
++    return gate.promise.then(function() { finished = true; });
++  });
++  program.hook('postAction', function() { trace.push('post'); });
++
++  var result = program.parse(['node', 'tool']);
++  assert.strictEqual(result, program, 'parse must keep returning the Command');
++  assert.deepStrictEqual(trace, ['pre', 'action', 'post']);
++  assert.strictEqual(finished, false, 'parse must not wait for returned promises');
++  gate.resolve();
++  await gate.promise;
++}
++
++async function main() {
++  await testPublicSurfaceAndHookValidation();
++  await testTopLevelActionIsAwaited();
++  await testHierarchicalHookOrderThroughAlias();
++  await testWildcardThenableIsAwaited();
++  await testPreActionFailureShortCircuits();
++  await testActionFailuresRejectAndSkipPostHooks();
++  await testPostActionFailureStopsOuterHooks();
++  await testParseInvocationsAreIsolated();
++  await testSynchronousParseCompatibility();
++}
++
++main().catch(function(err) {
++  console.error(err && err.stack ? err.stack : err);
++  process.exitCode = 1;
++});
+diff --git a/typings/codespec-async-lifecycle-tests.ts b/typings/codespec-async-lifecycle-tests.ts
+new file mode 100644
+index 0000000..ec3359f
+--- /dev/null
++++ b/typings/codespec-async-lifecycle-tests.ts
+@@ -0,0 +1,27 @@
++import * as program from './index';
++
++const command = new program.Command('tool');
++
++command.action(async () => {
++    await Promise.resolve();
++});
++
++command.hook('preAction', async (thisCommand, actionCommand) => {
++    const owner: program.Command = thisCommand;
++    const selected: program.Command = actionCommand;
++    owner.name();
++    selected.name();
++    await Promise.resolve();
++});
++
++command.hook('postAction', (thisCommand, actionCommand) => {
++    const owner: program.Command = thisCommand;
++    const selected: program.Command = actionCommand;
++    owner.name();
++    selected.name();
++});
++
++const parsedCommand: Promise<program.Command> = command.parseAsync(['node', 'tool']);
++const parsedSingleton: Promise<program.Command> = program.parseAsync(['node', 'tool']);
++
++Promise.all([parsedCommand, parsedSingleton]);
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,8 @@
++#!/bin/bash
++set -euo pipefail
++
++
++node test/test.codespec.async-lifecycle.js
++node test/test.command.action.js
++node test/test.options.commands.js
++./node_modules/.bin/tsc -p tsconfig.json

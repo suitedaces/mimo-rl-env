@@ -1,0 +1,431 @@
+diff --git a/usercase-test-coderl/test_interferometry_natwt_linear_fit.py b/usercase-test-coderl/test_interferometry_natwt_linear_fit.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/test_interferometry_natwt_linear_fit.py
+@@ -0,0 +1,401 @@
++
++
++
++
++
++
++
++import numpy as np
++import numpy.testing as npt
++
++from lenstronomy.Data.imaging_data import ImageData
++from lenstronomy.Data.psf import PSF
++from lenstronomy.ImSim.Numerics.convolution import PixelKernelConvolution
++from lenstronomy.ImSim.differential_extinction import DifferentialExtinction
++from lenstronomy.ImSim.image_linear_solve import ImageLinearFit
++from lenstronomy.LightModel.light_model import LightModel
++from lenstronomy.PointSource.point_source import PointSource
++from lenstronomy.Util import primary_beam_util, util
++
++
++def _session(scale=1.0, with_primary_beam=True):
++    num_pix = 9
++    delta_pix = 0.1
++    image_data = (
++        scale
++        * np.arange(num_pix * num_pix, dtype=float).reshape(num_pix, num_pix)
++        / 10.0
++    )
++    kwargs_data = {
++        "image_data": image_data,
++        "exposure_time": np.inf,
++        "background_rms": 2.0,
++        "transform_pix2angle": np.array([[delta_pix, 0], [0, delta_pix]]),
++        "ra_at_xy_0": -(num_pix // 2) * delta_pix,
++        "dec_at_xy_0": -(num_pix // 2) * delta_pix,
++        "likelihood_method": "interferometry_natwt",
++    }
++    if with_primary_beam:
++        kwargs_data["antenna_primary_beam"] = np.linspace(
++            0.75, 1.15, num_pix * num_pix
++        ).reshape(num_pix, num_pix)
++
++    data_class = ImageData(**kwargs_data)
++    psf_class = PSF(
++        psf_type="PIXEL",
++        pixel_size=delta_pix,
++        kernel_point_source=np.array(
++            [[0.0, 0.1, 0.0], [0.1, 1.0, 0.1], [0.0, 0.1, 0.0]]
++        ),
++        kernel_point_source_normalisation=False,
++    )
++    source_model_class = LightModel(light_model_list=["GAUSSIAN"])
++    lens_light_model_class = LightModel(light_model_list=["SERSIC"])
++    point_source_class = PointSource(point_source_type_list=["UNLENSED"])
++    extinction_class = DifferentialExtinction(optical_depth_model=["GAUSSIAN"])
++
++    image_linear_fit = ImageLinearFit(
++        data_class,
++        psf_class,
++        source_model_class=source_model_class,
++        lens_light_model_class=lens_light_model_class,
++        point_source_class=point_source_class,
++        extinction_class=extinction_class,
++        kwargs_numerics={"supersampling_factor": 1, "supersampling_convolution": False},
++    )
++    kwargs_source = [
++        {"amp": 3.0, "sigma": 0.16, "center_x": 0.02, "center_y": -0.01}
++    ]
++    kwargs_lens_light = [
++        {
++            "amp": 4.0,
++            "R_sersic": 0.22,
++            "n_sersic": 1.5,
++            "center_x": -0.05,
++            "center_y": 0.04,
++        }
++    ]
++    kwargs_ps = [
++        {"ra_image": [0.11], "dec_image": [-0.09], "point_amp": [5.0]}
++    ]
++    kwargs_extinction = [
++        {"amp": 0.25, "sigma": 0.3, "center_x": 0.0, "center_y": 0.0}
++    ]
++    kwargs_special = {"tau0_list": [0.7]}
++    return (
++        image_linear_fit,
++        kwargs_source,
++        kwargs_lens_light,
++        kwargs_ps,
++        kwargs_extinction,
++        kwargs_special,
++    )
++
++
++def _manual_response_matrix(
++    fit,
++    kwargs_lens,
++    kwargs_source,
++    kwargs_lens_light,
++    kwargs_ps,
++    kwargs_extinction,
++    kwargs_special,
++):
++
++    x_grid, y_grid = fit.ImageNumerics.coordinates_evaluate
++    source_response, n_source = fit.source_mapping.image_flux_split(
++        x_grid, y_grid, kwargs_lens, kwargs_source, kwargs_special
++    )
++    lens_light_response, n_lens_light = fit.LensLightModel.functions_split(
++        x_grid, y_grid, kwargs_lens_light
++    )
++    extinction = fit._extinction.extinction(
++        x_grid,
++        y_grid,
++        kwargs_extinction=kwargs_extinction,
++        kwargs_special=kwargs_special,
++    )
++    ra_pos, dec_pos, amp, n_points = fit.point_source_linear_response_set(
++        kwargs_ps, kwargs_lens, kwargs_special, with_amp=False
++    )
++
++    rows = []
++    primary_beam = fit.Data.primary_beam
++    primary_beam_1d = None if primary_beam is None else util.image2array(primary_beam)
++
++    for i in range(n_source):
++        image = np.array(source_response[i], copy=True)
++        if primary_beam_1d is not None:
++            image *= primary_beam_1d
++        image *= extinction
++        image = fit.ImageNumerics.re_size_convolve(image, unconvolved=True)
++        rows.append(np.nan_to_num(fit.image2array_masked(image), copy=False))
++
++    for i in range(n_lens_light):
++        image = np.array(lens_light_response[i], copy=True)
++        if primary_beam_1d is not None:
++            image *= primary_beam_1d
++        image = fit.ImageNumerics.re_size_convolve(image, unconvolved=True)
++        rows.append(np.nan_to_num(fit.image2array_masked(image), copy=False))
++
++    for i in range(n_points):
++        amp_effective = amp[i]
++        if primary_beam is not None:
++            x_pos, y_pos = fit.Data.map_coord2pix(ra_pos[i], dec_pos[i])
++            amp_effective = amp[i] * primary_beam_util.primary_beam_value_at_coords(
++                x_pos, y_pos, primary_beam
++            )
++        image = fit.ImageNumerics.point_source_rendering_unconvolved_for_interferometry(
++            ra_pos[i], dec_pos[i], amp_effective
++        )
++        rows.append(np.nan_to_num(fit.image2array_masked(image), copy=False))
++
++    return np.asarray(rows) * getattr(fit, "_flux_scaling", 1)
++
++
++def _manual_convolved_responses(fit, response):
++    convolution = PixelKernelConvolution(kernel=fit.PSF.kernel_point_source)
++    return np.asarray(
++        [
++            util.image2array(convolution.convolution2d(util.array2image(row)))
++            for row in response
++        ]
++    )
++
++
++def _manual_natwt_solution(fit, response, inv_bool=False):
++
++    convolved_response = _manual_convolved_responses(fit, response)
++    background_rms = fit.Data.background_rms
++    matrix = response @ convolved_response.T / background_rms**2
++    vector = response @ fit.data_response / background_rms**2
++    param = np.linalg.solve(matrix, vector)
++    unconvolved_model = util.array2image(param @ response)
++    convolved_model = util.array2image(param @ convolved_response)
++    cov_param = np.linalg.inv(matrix) if inv_bool else None
++    return [unconvolved_model, convolved_model], cov_param, param
++
++
++def test_response_matrix_applies_primary_beam_extinction_and_point_source_scaling():
++
++
++
++    fit, kwargs_source, kwargs_lens_light, kwargs_ps, kwargs_extinction, special = (
++        _session(with_primary_beam=True)
++    )
++
++    response = fit.linear_response_matrix_interferometry_unconvolved(
++        None, kwargs_source, kwargs_lens_light, kwargs_ps, kwargs_extinction, special
++    )
++    expected = _manual_response_matrix(
++        fit, None, kwargs_source, kwargs_lens_light, kwargs_ps, kwargs_extinction, special
++    )
++
++    assert response.shape == (3, 81)
++
++
++    npt.assert_allclose(response, expected, rtol=1e-12, atol=1e-12)
++    assert np.count_nonzero(response[2]) == 4
++
++
++def test_response_matrix_without_primary_beam_uses_unscaled_basis_responses():
++
++
++
++    fit, kwargs_source, kwargs_lens_light, kwargs_ps, kwargs_extinction, special = (
++        _session(with_primary_beam=False)
++    )
++
++    response = fit.linear_response_matrix_interferometry_unconvolved(
++        None, kwargs_source, kwargs_lens_light, kwargs_ps, kwargs_extinction, special
++    )
++    expected = _manual_response_matrix(
++        fit, None, kwargs_source, kwargs_lens_light, kwargs_ps, kwargs_extinction, special
++    )
++
++    assert response.shape == (3, 81)
++
++
++    npt.assert_allclose(response, expected, rtol=1e-12, atol=1e-12)
++    assert np.count_nonzero(response[2]) == 4
++
++
++def test_image_linear_solve_returns_models_amplitudes_and_updates_kwargs():
++
++
++
++    fit, kwargs_source, kwargs_lens_light, kwargs_ps, kwargs_extinction, special = (
++        _session(with_primary_beam=True)
++    )
++
++    expected_response = _manual_response_matrix(
++        fit, None, kwargs_source, kwargs_lens_light, kwargs_ps, kwargs_extinction, special
++    )
++    expected_model, expected_cov, expected_param = _manual_natwt_solution(
++        fit, expected_response
++    )
++    model, model_error, cov_param, param = fit.image_linear_solve(
++        None, kwargs_source, kwargs_lens_light, kwargs_ps, kwargs_extinction, special
++    )
++
++    assert len(model) == 2
++    assert model[0].shape == (9, 9)
++    assert model[1].shape == (9, 9)
++    assert model_error == 0
++    assert cov_param is None
++    assert expected_cov is None
++
++
++    npt.assert_allclose(param, expected_param, rtol=1e-11, atol=1e-11)
++    npt.assert_allclose(model[0], expected_model[0], rtol=1e-11, atol=1e-11)
++    npt.assert_allclose(model[1], expected_model[1], rtol=1e-11, atol=1e-11)
++    npt.assert_allclose(kwargs_source[0]["amp"], expected_param[0], rtol=0, atol=1e-11)
++    npt.assert_allclose(
++        kwargs_lens_light[0]["amp"], expected_param[1], rtol=0, atol=1e-11
++    )
++    npt.assert_allclose(
++        kwargs_ps[0]["point_amp"], [expected_param[2]], rtol=0, atol=1e-11
++    )
++
++    repeated_model, repeated_error, repeated_cov, repeated_param = fit.image_linear_solve(
++        None, kwargs_source, kwargs_lens_light, kwargs_ps, kwargs_extinction, special
++    )
++    assert repeated_error == 0
++    assert repeated_cov is None
++    npt.assert_allclose(repeated_param, param, rtol=0, atol=1e-11)
++    npt.assert_allclose(repeated_model[0], model[0], rtol=0, atol=1e-11)
++    npt.assert_allclose(repeated_model[1], model[1], rtol=0, atol=1e-11)
++
++
++def test_image_linear_solve_with_inv_bool_returns_covariance_from_same_solution():
++
++
++
++    fit, kwargs_source, kwargs_lens_light, kwargs_ps, kwargs_extinction, special = (
++        _session(with_primary_beam=True)
++    )
++
++    expected_response = _manual_response_matrix(
++        fit, None, kwargs_source, kwargs_lens_light, kwargs_ps, kwargs_extinction, special
++    )
++    expected_model, expected_cov, expected_param = _manual_natwt_solution(
++        fit, expected_response, inv_bool=True
++    )
++    model, model_error, cov_param, param = fit.image_linear_solve(
++        None,
++        kwargs_source,
++        kwargs_lens_light,
++        kwargs_ps,
++        kwargs_extinction,
++        special,
++        inv_bool=True,
++    )
++
++    assert model_error == 0
++
++
++    npt.assert_allclose(param, expected_param, rtol=1e-11, atol=1e-11)
++    npt.assert_allclose(cov_param, expected_cov, rtol=1e-9, atol=1e-9)
++    npt.assert_allclose(model[0], expected_model[0], rtol=1e-11, atol=1e-11)
++    npt.assert_allclose(model[1], expected_model[1], rtol=1e-11, atol=1e-11)
++
++
++def test_two_image_linear_fit_instances_keep_independent_solved_state():
++
++
++
++    fit_a, a_source, a_lens_light, a_ps, a_extinction, a_special = _session(scale=1.0)
++    fit_b, b_source, b_lens_light, b_ps, b_extinction, b_special = _session(scale=0.5)
++
++    expected_a = _manual_natwt_solution(
++        fit_a,
++        _manual_response_matrix(
++            fit_a, None, a_source, a_lens_light, a_ps, a_extinction, a_special
++        ),
++    )[2]
++    expected_b = _manual_natwt_solution(
++        fit_b,
++        _manual_response_matrix(
++            fit_b, None, b_source, b_lens_light, b_ps, b_extinction, b_special
++        ),
++    )[2]
++    _, _, _, param_a = fit_a.image_linear_solve(
++        None, a_source, a_lens_light, a_ps, a_extinction, a_special
++    )
++    _, _, _, param_b = fit_b.image_linear_solve(
++        None, b_source, b_lens_light, b_ps, b_extinction, b_special
++    )
++
++
++
++    npt.assert_allclose(param_a, expected_a, rtol=1e-11, atol=1e-11)
++    npt.assert_allclose(param_b, expected_b, rtol=1e-11, atol=1e-11)
++    npt.assert_allclose(param_b, 0.5 * param_a, rtol=1e-11, atol=1e-11)
++    npt.assert_allclose(a_source[0]["amp"], param_a[0], rtol=0, atol=1e-11)
++    npt.assert_allclose(a_lens_light[0]["amp"], param_a[1], rtol=0, atol=1e-11)
++    npt.assert_allclose(a_ps[0]["point_amp"], [param_a[2]], rtol=0, atol=1e-11)
++    npt.assert_allclose(b_source[0]["amp"], param_b[0], rtol=0, atol=1e-11)
++    npt.assert_allclose(b_lens_light[0]["amp"], param_b[1], rtol=0, atol=1e-11)
++    npt.assert_allclose(b_ps[0]["point_amp"], [param_b[2]], rtol=0, atol=1e-11)
++
++
++def test_natwt_image_data_constructs_supported_linear_fit_session():
++
++
++
++
++
++    fit, kwargs_source, kwargs_lens_light, kwargs_ps, kwargs_extinction, special = _session()
++
++    assert fit.Data.likelihood_method() == "interferometry_natwt"
++    model, model_error, cov_param, param = fit.image_linear_solve(
++        None, kwargs_source, kwargs_lens_light, kwargs_ps, kwargs_extinction, special
++    )
++    assert len(model) == 2
++    assert model_error == 0
++    assert cov_param is None
++    assert param.shape == (3,)
++
++
++def test_construct_solve_cycles_remain_numerically_repeatable():
++
++
++
++    expected_param = None
++
++    for _ in range(5):
++        fit, kwargs_source, kwargs_lens_light, kwargs_ps, kwargs_extinction, special = (
++            _session()
++        )
++        expected_model, _, expected_param_for_fit = _manual_natwt_solution(
++            fit,
++            _manual_response_matrix(
++                fit,
++                None,
++                kwargs_source,
++                kwargs_lens_light,
++                kwargs_ps,
++                kwargs_extinction,
++                special,
++            ),
++        )
++        model, model_error, cov_param, param = fit.image_linear_solve(
++            None,
++            kwargs_source,
++            kwargs_lens_light,
++            kwargs_ps,
++            kwargs_extinction,
++            special,
++        )
++
++
++
++        assert model_error == 0
++        assert cov_param is None
++        npt.assert_allclose(param, expected_param_for_fit, rtol=1e-11, atol=1e-11)
++        npt.assert_allclose(model[0], expected_model[0], rtol=1e-11, atol=1e-11)
++        npt.assert_allclose(model[1], expected_model[1], rtol=1e-11, atol=1e-11)
++        if expected_param is None:
++            expected_param = param
++        else:
++            npt.assert_allclose(param, expected_param, rtol=1e-11, atol=1e-11)
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,20 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++cd /workspace/repo
++
++export PYTHONPATH="/workspace/repo${PYTHONPATH:+:${PYTHONPATH}}"
++export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
++export PIP_DISABLE_PIP_VERSION_CHECK=1
++export PIP_NO_INDEX=1
++
++exec python -m pytest -p no:cacheprovider /workspace/repo/usercase-test-coderl/test_interferometry_natwt_linear_fit.py -v

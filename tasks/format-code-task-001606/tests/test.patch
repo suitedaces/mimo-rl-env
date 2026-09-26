@@ -1,0 +1,413 @@
+diff --git a/usercase-test-coderl/test_history.py b/usercase-test-coderl/test_history.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/test_history.py
+@@ -0,0 +1,384 @@
++
++
++import math
++import re
++
++import numpy as np
++import pandas as pd
++import pytest
++
++from deepdow.experiments import History
++
++
++EXPECTED_COLUMNS = [
++    "model",
++    "metric",
++    "value",
++    "batch",
++    "epoch",
++    "dataloader",
++    "lookback",
++    "timestamp",
++    "current_time",
++]
++
++
++def expected_frame(rows):
++    return pd.DataFrame(rows, columns=EXPECTED_COLUMNS)
++
++
++
++def assert_history_frame(frame, expected_rows, *, ordered=True):
++    assert isinstance(frame, pd.DataFrame)
++    assert set(frame.columns) == set(EXPECTED_COLUMNS)
++    assert len(frame) == len(expected_rows)
++
++    actual_rows = frame[EXPECTED_COLUMNS].to_dict("records")
++
++    def rows_match(actual, expected):
++        for column in EXPECTED_COLUMNS:
++            if column == "current_time":
++                if pd.isna(actual[column]):
++                    return False
++            elif column == "value" and pd.isna(expected[column]):
++                if not pd.isna(actual[column]):
++                    return False
++            elif actual[column] != expected[column]:
++                return False
++        return True
++
++    if ordered:
++        assert all(
++            rows_match(actual, expected)
++            for actual, expected in zip(actual_rows, expected_rows)
++        )
++        return
++
++    unmatched = actual_rows.copy()
++    for expected in expected_rows:
++        match_index = next(
++            (index for index, actual in enumerate(unmatched) if rows_match(actual, expected)),
++            None,
++        )
++        assert match_index is not None
++        unmatched.pop(match_index)
++
++
++
++def assert_pretty_groups(output, expected_groups, absent_groups=()):
++    assert output.strip() != ""
++    for header in ["model", "metric", "epoch", "dataloader"]:
++        assert header in output
++
++    lines = [line for line in output.splitlines() if line.strip()]
++    for model, metric, epoch, dataloader, expected_value in expected_groups:
++        matching = [
++            line
++            for line in lines
++            if all(token in line for token in [model, metric, str(epoch), dataloader])
++        ]
++        assert matching
++        if math.isnan(expected_value):
++            assert re.search(r"\bnan\b", matching[0], flags=re.IGNORECASE)
++        else:
++            values = [
++                float(value)
++                for value in re.findall(r"(?<![A-Za-z])-?\d+(?:\.\d+)?", matching[0])
++            ]
++            assert any(math.isclose(value, expected_value) for value in values)
++
++    for model, metric, epoch, dataloader in absent_groups:
++        assert not any(
++            all(token in line for token in [model, metric, str(epoch), dataloader])
++            for line in lines
++        )
++
++
++def test_history_starts_empty_and_add_entry_appends_full_rows():
++
++
++
++    history = History()
++
++
++    assert isinstance(history.metrics, pd.DataFrame)
++    assert history.metrics.empty
++
++    history.add_entry(
++        model="main",
++        metric="loss",
++        value=1.5,
++        batch=0,
++        epoch=1,
++        dataloader="train",
++        lookback=12,
++        timestamp=100,
++    )
++
++    expected_epoch_1 = expected_frame(
++        [
++            {
++                "model": "main",
++                "metric": "loss",
++                "value": 1.5,
++                "batch": 0,
++                "epoch": 1,
++                "dataloader": "train",
++                "lookback": 12,
++                "timestamp": 100,
++                "current_time": None,
++            }
++        ]
++    )
++
++    assert_history_frame(history.metrics_per_epoch(1), expected_epoch_1.to_dict("records"))
++
++    assert_history_frame(history.metrics, expected_epoch_1.to_dict("records"), ordered=False)
++
++
++def test_repeated_add_entry_calls_accumulate_by_epoch_and_default_value_is_nan():
++
++
++
++    history = History()
++
++    history.add_entry(
++        model="main",
++        metric="loss",
++        value=1.5,
++        batch=0,
++        epoch=1,
++        dataloader="train",
++        lookback=12,
++        timestamp=100,
++    )
++    history.add_entry(
++        model="main",
++        metric="loss",
++        value=2.5,
++        batch=1,
++        epoch=1,
++        dataloader="train",
++        lookback=12,
++        timestamp=101,
++    )
++    history.add_entry(
++        model="benchmark",
++        metric="sharpe",
++        batch=0,
++        epoch=2,
++        dataloader="validation",
++        lookback=6,
++        timestamp=200,
++    )
++
++    expected_epoch_1 = expected_frame(
++        [
++            {
++                "model": "main",
++                "metric": "loss",
++                "value": 1.5,
++                "batch": 0,
++                "epoch": 1,
++                "dataloader": "train",
++                "lookback": 12,
++                "timestamp": 100,
++                "current_time": None,
++            },
++            {
++                "model": "main",
++                "metric": "loss",
++                "value": 2.5,
++                "batch": 1,
++                "epoch": 1,
++                "dataloader": "train",
++                "lookback": 12,
++                "timestamp": 101,
++                "current_time": None,
++            },
++        ]
++    )
++    expected_epoch_2 = expected_frame(
++        [
++            {
++                "model": "benchmark",
++                "metric": "sharpe",
++                "value": np.nan,
++                "batch": 0,
++                "epoch": 2,
++                "dataloader": "validation",
++                "lookback": 6,
++                "timestamp": 200,
++                "current_time": None,
++            }
++        ]
++    )
++    expected_all = pd.concat([expected_epoch_1, expected_epoch_2], ignore_index=True)
++
++
++    assert_history_frame(history.metrics_per_epoch(1), expected_epoch_1.to_dict("records"))
++
++    assert_history_frame(history.metrics_per_epoch(2), expected_epoch_2.to_dict("records"))
++
++    assert_history_frame(history.metrics, expected_all.to_dict("records"), ordered=False)
++
++
++def test_metrics_per_epoch_unknown_epoch_raises_key_error():
++
++
++
++    history = History()
++
++    with pytest.raises(KeyError) as excinfo:
++        history.metrics_per_epoch(99)
++
++
++    assert isinstance(excinfo.value, KeyError)
++
++
++def test_pretty_print_all_epochs_and_single_epoch(capsys):
++
++
++
++    history = History()
++    history.add_entry(
++        model="main",
++        metric="loss",
++        value=1.5,
++        batch=0,
++        epoch=1,
++        dataloader="train",
++        lookback=12,
++        timestamp=100,
++    )
++    history.add_entry(
++        model="main",
++        metric="loss",
++        value=2.5,
++        batch=1,
++        epoch=1,
++        dataloader="train",
++        lookback=12,
++        timestamp=101,
++    )
++    history.add_entry(
++        model="benchmark",
++        metric="sharpe",
++        batch=0,
++        epoch=2,
++        dataloader="validation",
++        lookback=6,
++        timestamp=200,
++    )
++
++    history.pretty_print(epoch=None)
++
++    assert_pretty_groups(
++        capsys.readouterr().out,
++        [
++            ("benchmark", "sharpe", 2, "validation", math.nan),
++            ("main", "loss", 1, "train", 2.0),
++        ],
++    )
++
++    history.pretty_print(epoch=1)
++
++    assert_pretty_groups(
++        capsys.readouterr().out,
++        [("main", "loss", 1, "train", 2.0)],
++        absent_groups=[("benchmark", "sharpe", 2, "validation")],
++    )
++
++
++def test_two_history_instances_keep_independent_rows():
++
++
++
++    first = History()
++    second = History()
++
++    first.add_entry(
++        model="main",
++        metric="loss",
++        value=9.0,
++        batch=0,
++        epoch=7,
++        dataloader="train",
++        lookback=2,
++        timestamp=1,
++    )
++    second.add_entry(
++        model="bench",
++        metric="risk",
++        value=4.0,
++        batch=3,
++        epoch=8,
++        dataloader="val",
++        lookback=5,
++        timestamp=2,
++    )
++
++    expected_first = expected_frame(
++        [
++            {
++                "model": "main",
++                "metric": "loss",
++                "value": 9.0,
++                "batch": 0,
++                "epoch": 7,
++                "dataloader": "train",
++                "lookback": 2,
++                "timestamp": 1,
++                "current_time": None,
++            }
++        ]
++    )
++    expected_second = expected_frame(
++        [
++            {
++                "model": "bench",
++                "metric": "risk",
++                "value": 4.0,
++                "batch": 3,
++                "epoch": 8,
++                "dataloader": "val",
++                "lookback": 5,
++                "timestamp": 2,
++                "current_time": None,
++            }
++        ]
++    )
++
++
++    assert_history_frame(first.metrics, expected_first.to_dict("records"), ordered=False)
++
++    assert_history_frame(second.metrics, expected_second.to_dict("records"), ordered=False)
++
++
++def test_repeated_history_sessions_do_not_retain_python_heap_after_reference_drop():
++
++
++
++
++    def run_cycles(cycles):
++        for cycle in range(cycles):
++            history = History()
++            history.add_entry(
++                model="main",
++                metric="loss",
++                value=1.0,
++                batch=cycle,
++                epoch=cycle,
++                dataloader="train",
++                lookback=1,
++                timestamp=cycle,
++            )
++            del history
++
++    run_cycles(100)
++
++    fresh_history = History()
++
++
++    assert isinstance(fresh_history.metrics, pd.DataFrame)
++    assert fresh_history.metrics.empty
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,19 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++
++cd /workspace/repo
++
++export PYTHONPATH="/workspace/repo${PYTHONPATH:+:${PYTHONPATH}}"
++export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
++
++exec python -m pytest -p pytest_cov /workspace/repo/usercase-test-coderl/test_history.py -v

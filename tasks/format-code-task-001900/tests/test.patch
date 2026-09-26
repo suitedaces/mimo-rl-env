@@ -1,0 +1,283 @@
+diff --git a/usercase-test-coderl/usecase.sh b/usercase-test-coderl/usecase.sh
+new file mode 100755
+--- /dev/null
++++ b/usercase-test-coderl/usecase.sh
+@@ -0,0 +1,259 @@
++#!/usr/bin/env bash
++
++set -u
++export LANG=C.UTF-8 LC_ALL=C.UTF-8 TZ=UTC
++export PIP_DISABLE_PIP_VERSION_CHECK=1
++export PIP_NO_INDEX=1
++
++
++( cd /workspace/repo && python -m pip install -e . --no-deps --no-build-isolation >/tmp/nnunet_fixture_pip.log 2>&1 ) \
++    || { echo "FAIL: build/install" >&2; cat /tmp/nnunet_fixture_pip.log >&2; exit 1; }
++
++BIN_PLAN="$(command -v nnUNetv2_plan_experiment || true)"
++BIN_PP="$(command -v nnUNetv2_plan_and_preprocess || true)"
++[ -n "$BIN_PLAN" ] || { echo "FAIL: nnUNetv2_plan_experiment not found" >&2; exit 1; }
++[ -n "$BIN_PP" ] || { echo "FAIL: nnUNetv2_plan_and_preprocess not found" >&2; exit 1; }
++
++TMP=$(mktemp -d)
++trap 'rm -rf "$TMP"' EXIT
++fail() { echo "FAIL: $*" >&2; exit 1; }
++
++make_dataset() {
++    local root="$1"
++    local shape0="$2"
++    local shape1="$3"
++    local shape2="$4"
++
++    mkdir -p "$root/raw/Dataset004_SpacingOverride/imagesTr" \
++             "$root/raw/Dataset004_SpacingOverride/labelsTr" \
++             "$root/pre/Dataset004_SpacingOverride" \
++             "$root/results"
++
++    cat > "$root/raw/Dataset004_SpacingOverride/dataset.json" <<'JSON'
++{
++  "channel_names": {"0": "CT"},
++  "labels": {"background": 0, "organ": 1},
++  "numTraining": 2,
++  "file_ending": ".nii.gz",
++  "overwrite_image_reader_writer": "SimpleITKIO",
++  "dataset": {
++    "case_000": {"images": ["imagesTr/case_000_0000.nii.gz"], "label": "labelsTr/case_000.nii.gz"},
++    "case_001": {"images": ["imagesTr/case_001_0000.nii.gz"], "label": "labelsTr/case_001.nii.gz"}
++  }
++}
++JSON
++
++    cat > "$root/pre/Dataset004_SpacingOverride/dataset_fingerprint.json" <<JSON
++{
++  "spacings": [[4.0, 3.0, 2.0], [4.0, 3.0, 2.0]],
++  "shapes_after_crop": [[$shape0, $shape1, $shape2], [$shape0, $shape1, $shape2]],
++  "foreground_intensity_properties_per_channel": {
++    "0": {
++      "mean": 1.0,
++      "median": 1.0,
++      "std": 0.25,
++      "min": 0.0,
++      "max": 2.0,
++      "percentile_99_5": 2.0,
++      "percentile_00_5": 0.0
++    }
++  },
++  "median_relative_size_after_cropping": 1.0
++}
++JSON
++}
++
++assert_plan_core() {
++    local plans_file="$1"
++
++    python - "$plans_file" <<'PY'
++import json
++import sys
++
++path = sys.argv[1]
++with open(path) as f:
++    plans = json.load(f)
++
++
++required_configs = {"2d", "3d_fullres"}
++configs = plans["configurations"]
++missing = required_configs.difference(configs)
++if missing:
++    print("missing configurations:", sorted(missing), file=sys.stderr)
++    sys.exit(1)
++checks = {
++    "transpose_forward": plans["transpose_forward"],
++    "fullres_spacing": configs["3d_fullres"]["spacing"],
++    "twod_spacing": configs["2d"]["spacing"],
++}
++expected = {
++    "transpose_forward": [2, 0, 1],
++    "fullres_spacing": [2.0, 1.0, 1.5],
++    "twod_spacing": [1.0, 1.5],
++}
++if checks != expected:
++    print("actual:", json.dumps(checks, sort_keys=True), file=sys.stderr)
++    print("expected:", json.dumps(expected, sort_keys=True), file=sys.stderr)
++    sys.exit(1)
++PY
++}
++
++assert_cascade_plan() {
++    local plans_file="$1"
++    python - "$plans_file" <<'PY'
++import json
++import sys
++
++with open(sys.argv[1]) as f:
++    plans = json.load(f)
++
++configs = plans["configurations"]
++
++for name in ("2d", "3d_fullres", "3d_cascade_fullres"):
++    if name not in configs:
++        print("missing configuration:", name, file=sys.stderr)
++        sys.exit(1)
++actual = {
++    "transpose_forward": plans["transpose_forward"],
++    "fullres_spacing": configs["3d_fullres"]["spacing"],
++    "twod_spacing": configs["2d"]["spacing"],
++    "cascade_inherits_from": configs["3d_cascade_fullres"].get("inherits_from"),
++}
++expected = {
++    "transpose_forward": [2, 0, 1],
++    "fullres_spacing": [2.0, 1.0, 1.5],
++    "twod_spacing": [1.0, 1.5],
++    "cascade_inherits_from": "3d_fullres",
++}
++if actual != expected:
++    print("actual:", json.dumps(actual, sort_keys=True), file=sys.stderr)
++    print("expected:", json.dumps(expected, sort_keys=True), file=sys.stderr)
++    sys.exit(1)
++PY
++}
++
++
++
++
++"$BIN_PLAN" --help >"$TMP/help_plan.out" 2>"$TMP/help_plan.err"; ec=$?
++[ "$ec" -eq 0 ] || fail "F_help_plan exit $ec; want 0"
++grep -q '^usage: nnUNetv2_plan_experiment ' "$TMP/help_plan.out" || fail "F_help_plan missing usage"
++
++grep -q -- '-overwrite_target_spacing' "$TMP/help_plan.out" || fail "F_help_plan missing overwrite_target_spacing flag"
++python - "$TMP/help_plan.out" <<'PY' || fail "F_help_plan missing three-number contract"
++import re
++import sys
++text = open(sys.argv[1]).read().lower()
++if not (("three" in text or re.search(r"\b3\b", text)) and re.search(r"number|numeric|float", text)):
++    sys.exit(1)
++PY
++
++
++
++
++"$BIN_PP" --help >"$TMP/help_pp.out" 2>"$TMP/help_pp.err"; ec=$?
++[ "$ec" -eq 0 ] || fail "F_help_pp exit $ec; want 0"
++grep -q '^usage: nnUNetv2_plan_and_preprocess ' "$TMP/help_pp.out" || fail "F_help_pp missing usage"
++
++grep -q -- '-overwrite_target_spacing' "$TMP/help_pp.out" || fail "F_help_pp missing overwrite_target_spacing flag"
++python - "$TMP/help_pp.out" <<'PY' || fail "F_help_pp missing three-number contract"
++import re
++import sys
++text = open(sys.argv[1]).read().lower()
++if not (("three" in text or re.search(r"\b3\b", text)) and re.search(r"number|numeric|float", text)):
++    sys.exit(1)
++PY
++
++
++
++
++ROOT_BASIC="$TMP/basic"
++make_dataset "$ROOT_BASIC" 40 48 56
++export nnUNet_raw="$ROOT_BASIC/raw" nnUNet_preprocessed="$ROOT_BASIC/pre" nnUNet_results="$ROOT_BASIC/results"
++"$BIN_PLAN" -d 4 -overwrite_target_spacing 1.0 1.5 2.0 -overwrite_plans_name CustomPlans \
++    >"$TMP/basic.out" 2>"$TMP/basic.err"; ec=$?
++[ "$ec" -eq 0 ] || fail "F_plan_basic exit $ec; want 0"
++
++[ -f "$ROOT_BASIC/pre/Dataset004_SpacingOverride/CustomPlans.json" ] || fail "F_plan_basic missing CustomPlans.json"
++assert_plan_core "$ROOT_BASIC/pre/Dataset004_SpacingOverride/CustomPlans.json" \
++    || fail "F_plan_basic plan fields differ"
++
++
++
++
++ROOT_PP="$TMP/pp"
++make_dataset "$ROOT_PP" 40 48 56
++export nnUNet_raw="$ROOT_PP/raw" nnUNet_preprocessed="$ROOT_PP/pre" nnUNet_results="$ROOT_PP/results"
++"$BIN_PP" -d 4 --no_pp -overwrite_target_spacing 1.0 1.5 2.0 -overwrite_plans_name CustomPlans \
++    >"$TMP/pp.out" 2>"$TMP/pp.err"; ec=$?
++[ "$ec" -eq 0 ] || fail "F_pp_no_pp exit $ec; want 0"
++
++[ -f "$ROOT_PP/pre/Dataset004_SpacingOverride/CustomPlans.json" ] || fail "F_pp_no_pp missing CustomPlans.json"
++assert_plan_core "$ROOT_PP/pre/Dataset004_SpacingOverride/CustomPlans.json" \
++    || fail "F_pp_no_pp plan fields differ"
++if find "$ROOT_PP/pre/Dataset004_SpacingOverride" -maxdepth 1 \( -name '*.npz' -o -name '*.npy' -o -name '*.pkl' \) | grep -q .; then
++    fail "F_pp_no_pp found preprocessing outputs"
++fi
++
++
++
++
++ROOT_CASCADE="$TMP/cascade"
++make_dataset "$ROOT_CASCADE" 256 512 384
++export nnUNet_raw="$ROOT_CASCADE/raw" nnUNet_preprocessed="$ROOT_CASCADE/pre" nnUNet_results="$ROOT_CASCADE/results"
++"$BIN_PLAN" -d 4 -overwrite_target_spacing 1.0 1.5 2.0 -overwrite_plans_name CascadePlans \
++    >"$TMP/cascade.out" 2>"$TMP/cascade.err"; ec=$?
++[ "$ec" -eq 0 ] || fail "F_cascade exit $ec; want 0"
++
++[ -f "$ROOT_CASCADE/pre/Dataset004_SpacingOverride/CascadePlans.json" ] || fail "F_cascade missing CascadePlans.json"
++assert_cascade_plan "$ROOT_CASCADE/pre/Dataset004_SpacingOverride/CascadePlans.json" \
++    || fail "F_cascade plan fields differ"
++
++
++
++
++ROOT_PL="$TMP/planners"
++make_dataset "$ROOT_PL" 40 48 56
++export nnUNet_raw="$ROOT_PL/raw" nnUNet_preprocessed="$ROOT_PL/pre" nnUNet_results="$ROOT_PL/results"
++planners=(
++    ExperimentPlanner
++    ResEncUNetPlanner
++    nnUNetPlannerResEncM
++    nnUNetPlannerResEncL
++    nnUNetPlannerResEncXL
++    nnUNetPlannerResEncL_noResampling
++    nnUNetPlannerResEncL_torchres
++    nnUNetPlannerResEncL_torchres_sepz
++    nnUNetPlanner_torchres
++)
++for pl in "${planners[@]}"; do
++    plan_name="Plans_${pl}"
++    "$BIN_PLAN" -d 4 -pl "$pl" -overwrite_target_spacing 1.0 1.5 2.0 -overwrite_plans_name "$plan_name" \
++        >"$TMP/pl_${pl}.out" 2>"$TMP/pl_${pl}.err"; ec=$?
++    [ "$ec" -eq 0 ] || fail "F_planners $pl exit $ec; want 0"
++
++    [ -f "$ROOT_PL/pre/Dataset004_SpacingOverride/${plan_name}.json" ] || fail "F_planners $pl missing plan file"
++
++    assert_plan_core "$ROOT_PL/pre/Dataset004_SpacingOverride/${plan_name}.json" \
++        || fail "F_planners $pl plan fields differ"
++done
++
++
++
++
++ROOT_BAD="$TMP/bad"
++make_dataset "$ROOT_BAD" 40 48 56
++export nnUNet_raw="$ROOT_BAD/raw" nnUNet_preprocessed="$ROOT_BAD/pre" nnUNet_results="$ROOT_BAD/results"
++"$BIN_PLAN" -d 4 -overwrite_target_spacing 1.0 nope 2.0 -overwrite_plans_name BadPlans \
++    >"$TMP/bad.out" 2>"$TMP/bad.err"; ec=$?
++[ "$ec" -ne 0 ] || fail "F_error_non_numeric exit 0; want nonzero"
++
++grep -qi 'convert\|float\|numeric\|number' "$TMP/bad.err" \
++    || fail "F_error_non_numeric missing conversion error context"
++grep -q 'nope' "$TMP/bad.err" \
++    || fail "F_error_non_numeric missing bad spacing value"
++[ ! -f "$ROOT_BAD/pre/Dataset004_SpacingOverride/BadPlans.json" ] \
++    || fail "F_error_non_numeric wrote BadPlans.json"
++
++echo "PASS"
++exit 0
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,14 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++export PIP_DISABLE_PIP_VERSION_CHECK=1
++export PIP_NO_INDEX=1
++set -e
++cd /workspace/repo
++exec bash /workspace/repo/usercase-test-coderl/usecase.sh

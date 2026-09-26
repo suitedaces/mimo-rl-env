@@ -1,0 +1,174 @@
+diff --git a/codespec_sse_configuration_test.go b/codespec_sse_configuration_test.go
+new file mode 100644
+index 0000000..cf5cf29
+--- /dev/null
++++ b/codespec_sse_configuration_test.go
+@@ -0,0 +1,157 @@
++//go:build unit
++
++package mcpgrafana
++
++import (
++	"context"
++	"io"
++	"net/http"
++	"net/url"
++	"strings"
++	"testing"
++
++	httptransport "github.com/go-openapi/runtime/client"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++)
++
++type codespecCaptureTransport struct {
++	request *http.Request
++}
++
++func (c *codespecCaptureTransport) RoundTrip(req *http.Request) (*http.Response, error) {
++	c.request = req.Clone(req.Context())
++	return &http.Response{
++		StatusCode: http.StatusOK,
++		Header:     http.Header{"Content-Type": []string{"application/json"}},
++		Body:       io.NopCloser(strings.NewReader(`{}`)),
++		Request:    req,
++	}, nil
++}
++
++func codespecAssertEffectiveConfiguration(t *testing.T, ctx context.Context, grafanaURL, apiKey string) {
++	t.Helper()
++
++	assert.Equal(t, grafanaURL, GrafanaURLFromContext(ctx))
++	assert.Equal(t, apiKey, GrafanaAPIKeyFromContext(ctx))
++
++	grafanaClient := GrafanaClientFromContext(ctx)
++	require.NotNil(t, grafanaClient)
++	runtime, ok := grafanaClient.Transport.(*httptransport.Runtime)
++	require.True(t, ok)
++	capture := &codespecCaptureTransport{}
++	runtime.Transport = capture
++
++	_, err := grafanaClient.Health.GetHealth()
++	require.NoError(t, err)
++	require.NotNil(t, capture.request)
++	assert.Equal(t, grafanaURL+"/api/health", capture.request.URL.String())
++	if apiKey == "" {
++		assert.Empty(t, capture.request.Header.Get("Authorization"))
++	} else {
++		assert.Equal(t, "Bearer "+apiKey, capture.request.Header.Get("Authorization"))
++	}
++
++	incidentClient := IncidentClientFromContext(ctx)
++	require.NotNil(t, incidentClient)
++	assert.Equal(t, grafanaURL+"/api/plugins/grafana-irm-app/resources/api/v1/", incidentClient.RemoteHost)
++	probe, err := http.NewRequest(http.MethodGet, incidentClient.RemoteHost+"probe", nil)
++	require.NoError(t, err)
++	require.NoError(t, incidentClient.BeforeRequest(probe))
++	if apiKey == "" {
++		assert.Empty(t, probe.Header.Get("Authorization"))
++	} else {
++		assert.Equal(t, "Bearer "+apiKey, probe.Header.Get("Authorization"))
++	}
++}
++
++func codespecSSEContext(t *testing.T, headers map[string]string) context.Context {
++	t.Helper()
++	req, err := http.NewRequest(http.MethodGet, "http://mcp.example/sse", nil)
++	require.NoError(t, err)
++	for name, value := range headers {
++		req.Header.Set(name, value)
++	}
++	return ComposedSSEContextFunc(context.Background(), req)
++}
++
++func TestCodespecSSEConfigurationEnvironmentParity(t *testing.T) {
++	t.Setenv("GRAFANA_URL", "http://env.example:3100/tenant/")
++	t.Setenv("GRAFANA_API_KEY", "env-secret")
++
++	sseCtx := codespecSSEContext(t, nil)
++	codespecAssertEffectiveConfiguration(t, sseCtx, "http://env.example:3100/tenant", "env-secret")
++
++	stdioCtx := ComposedStdioContextFunc(context.Background())
++	codespecAssertEffectiveConfiguration(t, stdioCtx, "http://env.example:3100/tenant", "env-secret")
++}
++
++func TestCodespecSSEConfigurationIndependentHeaderPrecedence(t *testing.T) {
++	t.Setenv("GRAFANA_URL", "https://env.example/env-root/")
++	t.Setenv("GRAFANA_API_KEY", "env-secret")
++
++	t.Run("URL header overrides only URL", func(t *testing.T) {
++		ctx := codespecSSEContext(t, map[string]string{
++			"X-Grafana-URL": "http://header.example:3200/header-root/",
++		})
++		codespecAssertEffectiveConfiguration(t, ctx, "http://header.example:3200/header-root", "env-secret")
++	})
++
++	t.Run("API key header overrides only API key", func(t *testing.T) {
++		ctx := codespecSSEContext(t, map[string]string{
++			"X-Grafana-API-Key": "header-secret",
++		})
++		codespecAssertEffectiveConfiguration(t, ctx, "https://env.example/env-root", "header-secret")
++	})
++
++	t.Run("both headers override both environment values", func(t *testing.T) {
++		ctx := codespecSSEContext(t, map[string]string{
++			"X-Grafana-URL":     "https://other.example/team/",
++			"X-Grafana-API-Key": "other-secret",
++		})
++		codespecAssertEffectiveConfiguration(t, ctx, "https://other.example/team", "other-secret")
++	})
++
++	t.Run("empty headers behave as missing", func(t *testing.T) {
++		ctx := codespecSSEContext(t, map[string]string{
++			"X-Grafana-URL":     "",
++			"X-Grafana-API-Key": "",
++		})
++		codespecAssertEffectiveConfiguration(t, ctx, "https://env.example/env-root", "env-secret")
++	})
++}
++
++func TestCodespecSSEConfigurationDefaultsWithoutCredentials(t *testing.T) {
++	t.Setenv("GRAFANA_URL", "")
++	t.Setenv("GRAFANA_API_KEY", "")
++
++	ctx := codespecSSEContext(t, nil)
++	codespecAssertEffectiveConfiguration(t, ctx, "http://localhost:3000", "")
++}
++
++func TestCodespecSSEConfigurationIsRequestScoped(t *testing.T) {
++	t.Setenv("GRAFANA_URL", "http://env.example/base/")
++	t.Setenv("GRAFANA_API_KEY", "env-secret")
++
++	headerCtx := codespecSSEContext(t, map[string]string{
++		"X-Grafana-URL":     "http://first.example/override/",
++		"X-Grafana-API-Key": "first-secret",
++	})
++	codespecAssertEffectiveConfiguration(t, headerCtx, "http://first.example/override", "first-secret")
++
++	plainCtx := codespecSSEContext(t, nil)
++	codespecAssertEffectiveConfiguration(t, plainCtx, "http://env.example/base", "env-secret")
++}
++
++func TestCodespecSSEConfigurationAcceptsURLWithEscapedPath(t *testing.T) {
++	t.Setenv("GRAFANA_URL", "")
++	t.Setenv("GRAFANA_API_KEY", "")
++
++	raw := "https://grafana.example/teams%20west/"
++	ctx := codespecSSEContext(t, map[string]string{"X-Grafana-URL": raw})
++	codespecAssertEffectiveConfiguration(t, ctx, strings.TrimRight(raw, "/"), "")
++
++	parsed, err := url.Parse(GrafanaURLFromContext(ctx))
++	require.NoError(t, err)
++	assert.Equal(t, "/teams west", parsed.Path)
++}
+
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,5 @@
++#!/bin/bash
++set -euo pipefail
++
++
++go test -tags unit . -run '^(TestCodespecSSEConfiguration|TestExtractGrafanaInfoFromHeaders|TestExtractGrafanaClientPath|TestExtractIncidentClientFromEnv)' -count=1

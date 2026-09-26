@@ -1,0 +1,558 @@
+diff --git a/usercase-test-coderl/test_notification_helpers.py b/usercase-test-coderl/test_notification_helpers.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/test_notification_helpers.py
+@@ -0,0 +1,532 @@
++import copy
++import json
++import subprocess
++import sys
++
++import pytest
++from django.conf import settings
++
++
++
++if not settings.configured:
++    settings.configure(
++        SECRET_KEY="fixture-notification-helpers",
++        INSTALLED_APPS=[
++            "django.contrib.auth",
++            "django.contrib.contenttypes",
++            "webpush",
++        ],
++        DATABASES={"default": {"ENGINE": "django.db.backends.sqlite3", "NAME": ":memory:"}},
++        DEFAULT_AUTO_FIELD="django.db.models.AutoField",
++        USE_TZ=True,
++        WEBPUSH_SETTINGS={},
++    )
++
++import django
++
++django.setup()
++
++from django.contrib.auth import get_user_model
++from django.db import connection
++
++from webpush import (
++    send_group_notification,
++    send_notification_to_group,
++    send_notification_to_user,
++    send_user_notification,
++)
++from webpush.models import Group as WebPushGroup
++from webpush.models import PushInformation, SubscriptionInfo
++import webpush.utils as webpush_utils
++
++
++User = get_user_model()
++
++
++def _create_schema():
++    with connection.schema_editor() as schema:
++        for model in (User, WebPushGroup, SubscriptionInfo, PushInformation):
++            schema.create_model(model)
++
++
++_create_schema()
++
++
++@pytest.fixture(autouse=True)
++def clean_database():
++    _clear_database()
++    yield
++    _clear_database()
++
++
++def _clear_database():
++    PushInformation.objects.all().delete()
++    SubscriptionInfo.objects.all().delete()
++    WebPushGroup.objects.all().delete()
++    with connection.cursor() as cursor:
++        cursor.execute('DELETE FROM "%s"' % User._meta.db_table)
++
++
++@pytest.fixture
++def captured_webpush(monkeypatch):
++    calls = []
++
++    def fake_webpush(subscription_info, data, ttl=0, **kwargs):
++        calls.append(
++            {
++                "subscription_info": subscription_info,
++                "data": data,
++                "ttl": ttl,
++                "kwargs": kwargs,
++            }
++        )
++        return "sent-%d" % len(calls)
++
++    monkeypatch.setattr(webpush_utils, "webpush", fake_webpush)
++    return calls
++
++
++def _subscription(browser, endpoint, auth, p256dh):
++    return SubscriptionInfo.objects.create(
++        browser=browser,
++        endpoint=endpoint,
++        auth=auth,
++        p256dh=p256dh,
++    )
++
++
++def _make_user_graph():
++    alice = User.objects.create_user(id=101, username="alice")
++    first = _subscription(
++        "Firefox",
++        "https://push.example.com/alice-1",
++        "auth-a1",
++        "key-a1",
++    )
++    second = _subscription(
++        "Chrome",
++        "https://push.example.com/alice-2",
++        "auth-a2",
++        "key-a2",
++    )
++    PushInformation.objects.create(user=alice, subscription=first)
++    PushInformation.objects.create(user=alice, subscription=second)
++    return alice
++
++
++def _make_group_graph():
++    alice = User.objects.create_user(id=101, username="alice")
++    bob = User.objects.create_user(id=202, username="bob")
++    group = WebPushGroup.objects.create(name="my_group")
++    first = _subscription(
++        "Edge",
++        "https://push.example.com/team-1",
++        "auth-t1",
++        "key-t1",
++    )
++    second = _subscription(
++        "Brave",
++        "https://push.example.com/team-2",
++        "auth-t2",
++        "key-t2",
++    )
++    PushInformation.objects.create(user=alice, group=group, subscription=first)
++    PushInformation.objects.create(user=bob, group=group, subscription=second)
++    return alice, bob, group
++
++
++def _normalized(calls):
++    return sorted(calls, key=lambda call: call["subscription_info"]["endpoint"])
++
++
++def _contract_calls(calls, decode_json=False):
++
++    normalized = []
++    for call in _normalized(calls):
++        data = json.loads(call["data"]) if decode_json else call["data"]
++        subscription_info = call["subscription_info"]
++        normalized.append(
++            {
++                "subscription_info": {
++                    "endpoint": subscription_info["endpoint"],
++                    "keys": {
++                        "p256dh": subscription_info["keys"]["p256dh"],
++                        "auth": subscription_info["keys"]["auth"],
++                    },
++                },
++                "data": data,
++                "ttl": call["ttl"],
++            }
++        )
++    return normalized
++
++
++def test_send_user_notification_serializes_payload_and_dispatches_every_user_subscription(captured_webpush):
++
++
++
++    user = _make_user_graph()
++
++    result = send_user_notification(user, {"head": "Welcome!", "body": "Hello World"}, ttl=1000)
++
++    assert result is None
++
++    assert _contract_calls(captured_webpush, decode_json=True) == [
++        {
++            "subscription_info": {
++                "endpoint": "https://push.example.com/alice-1",
++                "keys": {"p256dh": "key-a1", "auth": "auth-a1"},
++            },
++            "data": {"head": "Welcome!", "body": "Hello World"},
++            "ttl": 1000,
++        },
++        {
++            "subscription_info": {
++                "endpoint": "https://push.example.com/alice-2",
++                "keys": {"p256dh": "key-a2", "auth": "auth-a2"},
++            },
++            "data": {"head": "Welcome!", "body": "Hello World"},
++            "ttl": 1000,
++        },
++    ]
++
++
++def test_send_user_notification_preserves_rich_payload_keys_and_default_ttl(captured_webpush):
++
++
++
++    bob = User.objects.create_user(id=202, username="bob")
++    subscription = _subscription(
++        "Safari",
++        "https://push.example.com/bob-1",
++        "auth-b1",
++        "key-b1",
++    )
++    PushInformation.objects.create(user=bob, subscription=subscription)
++
++    result = send_user_notification(
++        bob,
++        {
++            "head": "Welcome!",
++            "body": "Hello World",
++            "icon": "https://example.com/icon.png",
++            "url": "https://example.com",
++        },
++    )
++
++    assert result is None
++
++    assert _contract_calls(captured_webpush, decode_json=True) == [
++        {
++            "subscription_info": {
++                "endpoint": "https://push.example.com/bob-1",
++                "keys": {"p256dh": "key-b1", "auth": "auth-b1"},
++            },
++            "data": {
++                "head": "Welcome!",
++                "body": "Hello World",
++                "icon": "https://example.com/icon.png",
++                "url": "https://example.com",
++            },
++            "ttl": 0,
++        }
++    ]
++
++
++def test_send_group_notification_dispatches_to_every_subscription_in_named_group(captured_webpush):
++
++
++
++    _make_group_graph()
++
++    result = send_group_notification("my_group", {"head": "Welcome!", "body": "Hello World"}, ttl=1000)
++
++    assert result is None
++
++    assert _contract_calls(captured_webpush, decode_json=True) == [
++        {
++            "subscription_info": {
++                "endpoint": "https://push.example.com/team-1",
++                "keys": {"p256dh": "key-t1", "auth": "auth-t1"},
++            },
++            "data": {"head": "Welcome!", "body": "Hello World"},
++            "ttl": 1000,
++        },
++        {
++            "subscription_info": {
++                "endpoint": "https://push.example.com/team-2",
++                "keys": {"p256dh": "key-t2", "auth": "auth-t2"},
++            },
++            "data": {"head": "Welcome!", "body": "Hello World"},
++            "ttl": 1000,
++        },
++    ]
++
++
++def test_send_group_notification_excludes_matching_user_id_only(captured_webpush):
++
++
++
++    _make_group_graph()
++
++    result = send_group_notification(
++        "my_group",
++        {"head": "Group", "body": "Only Bob"},
++        ttl=1000,
++        exclude_user_id=101,
++    )
++
++    assert result is None
++
++    assert _contract_calls(captured_webpush, decode_json=True) == [
++        {
++            "subscription_info": {
++                "endpoint": "https://push.example.com/team-2",
++                "keys": {"p256dh": "key-t2", "auth": "auth-t2"},
++            },
++            "data": {"head": "Group", "body": "Only Bob"},
++            "ttl": 1000,
++        }
++    ]
++
++
++def test_send_notification_to_user_forwards_already_serialized_payload_without_double_encoding(captured_webpush):
++
++
++
++    user = _make_user_graph()
++
++    result = send_notification_to_user(user, '{"already":"serialized","n":7}', ttl=55)
++
++    assert result is None
++
++    assert _contract_calls(captured_webpush) == [
++        {
++            "subscription_info": {
++                "endpoint": "https://push.example.com/alice-1",
++                "keys": {"p256dh": "key-a1", "auth": "auth-a1"},
++            },
++            "data": '{"already":"serialized","n":7}',
++            "ttl": 55,
++        },
++        {
++            "subscription_info": {
++                "endpoint": "https://push.example.com/alice-2",
++                "keys": {"p256dh": "key-a2", "auth": "auth-a2"},
++            },
++            "data": '{"already":"serialized","n":7}',
++            "ttl": 55,
++        },
++    ]
++
++
++def test_send_notification_to_group_forwards_serialized_payload_and_exclusion(captured_webpush):
++
++
++
++    _make_group_graph()
++
++    result = send_notification_to_group("my_group", '{"raw":true}', ttl=66, exclude_user_id=202)
++
++    assert result is None
++
++    assert _contract_calls(captured_webpush) == [
++        {
++            "subscription_info": {
++                "endpoint": "https://push.example.com/team-1",
++                "keys": {"p256dh": "key-t1", "auth": "auth-t1"},
++            },
++            "data": '{"raw":true}',
++            "ttl": 66,
++        }
++    ]
++
++
++def test_send_user_notification_non_serializable_payload_raises_type_error_before_sending(captured_webpush):
++
++
++
++    user = _make_user_graph()
++
++
++    with pytest.raises(TypeError):
++        send_user_notification(user, {"bad": {1, 2}})
++
++    assert captured_webpush == []
++
++
++def test_send_group_notification_missing_group_raises_group_does_not_exist(captured_webpush):
++
++
++
++
++    with pytest.raises(WebPushGroup.DoesNotExist):
++        send_group_notification("missing", {"head": "x"})
++
++    assert captured_webpush == []
++
++
++def test_referential_transparency_same_user_send_returns_same_value(captured_webpush):
++    user = _make_user_graph()
++
++    first = send_notification_to_user(user, '{"same":1}', ttl=12)
++    second = send_notification_to_user(user, '{"same":1}', ttl=12)
++
++    assert first is None
++    assert second is None
++
++    assert _contract_calls(captured_webpush) == [
++        {
++            "subscription_info": {
++                "endpoint": "https://push.example.com/alice-1",
++                "keys": {"p256dh": "key-a1", "auth": "auth-a1"},
++            },
++            "data": '{"same":1}',
++            "ttl": 12,
++        },
++        {
++            "subscription_info": {
++                "endpoint": "https://push.example.com/alice-1",
++                "keys": {"p256dh": "key-a1", "auth": "auth-a1"},
++            },
++            "data": '{"same":1}',
++            "ttl": 12,
++        },
++        {
++            "subscription_info": {
++                "endpoint": "https://push.example.com/alice-2",
++                "keys": {"p256dh": "key-a2", "auth": "auth-a2"},
++            },
++            "data": '{"same":1}',
++            "ttl": 12,
++        },
++        {
++            "subscription_info": {
++                "endpoint": "https://push.example.com/alice-2",
++                "keys": {"p256dh": "key-a2", "auth": "auth-a2"},
++            },
++            "data": '{"same":1}',
++            "ttl": 12,
++        },
++    ]
++
++
++def test_payload_input_is_not_mutated_by_json_serializing_helper(captured_webpush):
++    payload = {
++        "head": "Welcome!",
++        "body": "Hello World",
++        "actions": [{"title": "Open", "url": "https://example.com"}],
++    }
++    original = copy.deepcopy(payload)
++    user = _make_user_graph()
++
++    send_user_notification(user, payload, ttl=1000)
++
++
++    assert [call["data"] for call in _contract_calls(captured_webpush, decode_json=True)] == [original, original]
++
++
++def _capture_current_process_user_send(captured_webpush):
++    user = _make_user_graph()
++    send_user_notification(user, {"head": "Welcome!", "body": "Hello World"}, ttl=1000)
++    return _normalized(captured_webpush)
++
++
++def test_no_global_state_matches_fresh_process_for_same_user_send(captured_webpush):
++    in_process = _capture_current_process_user_send(captured_webpush)
++    script = r'''
++import json
++import sys
++sys.path.insert(0, "/workspace/repo")
++from django.conf import settings
++settings.configure(
++    SECRET_KEY="fixture-notification-helpers",
++    INSTALLED_APPS=["django.contrib.auth", "django.contrib.contenttypes", "webpush"],
++    DATABASES={"default": {"ENGINE": "django.db.backends.sqlite3", "NAME": ":memory:"}},
++    DEFAULT_AUTO_FIELD="django.db.models.AutoField",
++    USE_TZ=True,
++    WEBPUSH_SETTINGS={},
++)
++import django
++django.setup()
++from django.contrib.auth import get_user_model
++from django.db import connection
++from webpush import send_user_notification
++from webpush.models import Group as WebPushGroup, PushInformation, SubscriptionInfo
++import webpush.utils as webpush_utils
++User = get_user_model()
++with connection.schema_editor() as schema:
++    for model in (User, WebPushGroup, SubscriptionInfo, PushInformation):
++        schema.create_model(model)
++calls = []
++def fake_webpush(subscription_info, data, ttl=0, **kwargs):
++    calls.append({"subscription_info": subscription_info, "data": data, "ttl": ttl, "kwargs": kwargs})
++    return "sent-%d" % len(calls)
++webpush_utils.webpush = fake_webpush
++user = User.objects.create_user(id=101, username="alice")
++first = SubscriptionInfo.objects.create(browser="Firefox", endpoint="https://push.example.com/alice-1", auth="auth-a1", p256dh="key-a1")
++second = SubscriptionInfo.objects.create(browser="Chrome", endpoint="https://push.example.com/alice-2", auth="auth-a2", p256dh="key-a2")
++PushInformation.objects.create(user=user, subscription=first)
++PushInformation.objects.create(user=user, subscription=second)
++send_user_notification(user, {"head": "Welcome!", "body": "Hello World"}, ttl=1000)
++sys.stdout.write(json.dumps(sorted(calls, key=lambda call: call["subscription_info"]["endpoint"]), sort_keys=True))
++'''
++
++    fresh = json.loads(
++        subprocess.run(
++            [sys.executable, "-c", script],
++            check=True,
++            stdout=subprocess.PIPE,
++            stderr=subprocess.PIPE,
++            text=True,
++        ).stdout
++    )
++
++
++    assert _contract_calls(in_process, decode_json=True) == [
++        {
++            "subscription_info": {
++                "endpoint": "https://push.example.com/alice-1",
++                "keys": {"p256dh": "key-a1", "auth": "auth-a1"},
++            },
++            "data": {"head": "Welcome!", "body": "Hello World"},
++            "ttl": 1000,
++        },
++        {
++            "subscription_info": {
++                "endpoint": "https://push.example.com/alice-2",
++                "keys": {"p256dh": "key-a2", "auth": "auth-a2"},
++            },
++            "data": {"head": "Welcome!", "body": "Hello World"},
++            "ttl": 1000,
++        },
++    ]
++
++    assert _contract_calls(fresh, decode_json=True) == _contract_calls(in_process, decode_json=True)
++
++
++def test_send_user_notification_dispatches_from_arbitrary_working_directory(tmp_path, monkeypatch, captured_webpush):
++    user = _make_user_graph()
++    monkeypatch.chdir(tmp_path)
++
++    send_user_notification(user, {"head": "Side", "body": "Effects"}, ttl=4)
++
++
++    assert _contract_calls(captured_webpush, decode_json=True) == [
++        {
++            "subscription_info": {
++                "endpoint": "https://push.example.com/alice-1",
++                "keys": {"p256dh": "key-a1", "auth": "auth-a1"},
++            },
++            "data": {"head": "Side", "body": "Effects"},
++            "ttl": 4,
++        },
++        {
++            "subscription_info": {
++                "endpoint": "https://push.example.com/alice-2",
++                "keys": {"p256dh": "key-a2", "auth": "auth-a2"},
++            },
++            "data": {"head": "Side", "body": "Effects"},
++            "ttl": 4,
++        },
++    ]
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,16 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++cd /workspace/repo
++export PYTHONPATH="/workspace/repo${PYTHONPATH:+:${PYTHONPATH}}"
++export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
++exec python -m pytest /workspace/repo/usercase-test-coderl/test_notification_helpers.py -v

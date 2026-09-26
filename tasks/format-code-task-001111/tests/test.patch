@@ -1,0 +1,274 @@
+diff --git a/shared-libs/outbound/test/outbound-delivery-policy-codespec.spec.js b/shared-libs/outbound/test/outbound-delivery-policy-codespec.spec.js
+new file mode 100644
+index 000000000..6f85360ed
+--- /dev/null
++++ b/shared-libs/outbound/test/outbound-delivery-policy-codespec.spec.js
+@@ -0,0 +1,257 @@
++const { assert } = require('chai');
++const rewire = require('rewire');
++const sinon = require('sinon');
++
++const request = require('request-promise-native');
++const requestErrors = require('request-promise-native/errors');
++const secureSettings = require('@medic/settings');
++const outboundModule = rewire('../src/outbound');
++
++const logger = {
++  debug: sinon.stub(),
++  error: sinon.stub(),
++  info: sinon.stub(),
++  isDebugEnabled: () => false,
++};
++
++const destination = overrides => Object.assign({
++  base_url: 'https://receiver.example',
++  path: '/events',
++}, overrides);
++
++const config = destinationOverrides => ({
++  mapping: {
++    report_id: 'doc._id',
++    value: 'doc.value',
++  },
++  destination: destination(destinationOverrides),
++});
++
++const record = () => ({ _id: 'report-1', value: 42 });
++const info = () => ({ _id: 'report-1-info', completed_tasks: [] });
++
++const statusError = statusCode => {
++  const response = { statusCode, body: 'failed' };
++  return new requestErrors.StatusCodeError(statusCode, 'failed', {}, response);
++};
++
++const networkError = () => new requestErrors.RequestError(new Error('connection reset'), {}, undefined);
++
++describe('outbound delivery policy CodeSpec contract', () => {
++  let service;
++
++  beforeEach(() => {
++    service = outboundModule(logger);
++    logger.debug.resetHistory();
++    logger.error.resetHistory();
++    logger.info.resetHistory();
++  });
++
++  afterEach(() => sinon.restore());
++
++  it('retries configured transient statuses and records one completion after success', async () => {
++    const first = statusError(503);
++    const second = statusError(429);
++    const post = sinon.stub(request, 'post');
++    post.onCall(0).rejects(first);
++    post.onCall(1).rejects(second);
++    post.onCall(2).resolves({ accepted: true });
++    const recordInfo = info();
++    const outboundConfig = config({
++      retry: { max_attempts: 3, status_codes: [429, 503] },
++    });
++
++    const sent = await service.send(outboundConfig, 'district-feed', record(), recordInfo);
++
++    assert.strictEqual(sent, true);
++    assert.strictEqual(post.callCount, 3);
++    assert.lengthOf(recordInfo.completed_tasks, 1);
++    assert.strictEqual(recordInfo.completed_tasks[0].name, 'district-feed');
++    assert.match(recordInfo.completed_tasks[0].hash, /^[a-f0-9]{64}$/);
++    post.args.forEach(args => assert.deepEqual(args[0].body, { report_id: 'report-1', value: 42 }));
++  });
++
++  it('does not retry an HTTP status outside the configured allowlist', async () => {
++    const failure = statusError(400);
++    const post = sinon.stub(request, 'post').rejects(failure);
++    const recordInfo = info();
++
++    const thrown = await service.send(config({
++      retry: { max_attempts: 4, status_codes: [429, 503] },
++    }), 'district-feed', record(), recordInfo).catch(error => error);
++
++    assert.strictEqual(thrown, failure);
++    assert.strictEqual(post.callCount, 1);
++    assert.deepEqual(recordInfo.completed_tasks, []);
++  });
++
++  it('stops at max_attempts and leaves the infodoc unchanged', async () => {
++    const failure = statusError(503);
++    const post = sinon.stub(request, 'post').rejects(failure);
++    const recordInfo = info();
++
++    const thrown = await service.send(config({
++      retry: { max_attempts: 3, status_codes: [503] },
++    }), 'district-feed', record(), recordInfo).catch(error => error);
++
++    assert.strictEqual(thrown, failure);
++    assert.strictEqual(post.callCount, 3);
++    assert.deepEqual(recordInfo.completed_tasks, []);
++  });
++
++  it('retries network failures by default when retries are enabled', async () => {
++    const failure = networkError();
++    const post = sinon.stub(request, 'post');
++    post.onFirstCall().rejects(failure);
++    post.onSecondCall().resolves();
++
++    const sent = await service.send(config({
++      retry: { max_attempts: 2 },
++    }), 'district-feed', record(), info());
++
++    assert.strictEqual(sent, true);
++    assert.strictEqual(post.callCount, 2);
++  });
++
++  it('honors retry_on_network_error false', async () => {
++    const failure = networkError();
++    const post = sinon.stub(request, 'post').rejects(failure);
++
++    const thrown = await service.send(config({
++      retry: { max_attempts: 3, retry_on_network_error: false },
++    }), 'district-feed', record(), info()).catch(error => error);
++
++    assert.strictEqual(thrown, failure);
++    assert.strictEqual(post.callCount, 1);
++  });
++
++  it('merges static, credential, and stable idempotency headers on every attempt', async () => {
++    sinon.stub(secureSettings, 'getCredentials').withArgs('api-token').resolves('Bearer secret');
++    const post = sinon.stub(request, 'post');
++    post.onFirstCall().rejects(statusError(503));
++    post.onSecondCall().resolves();
++    const recordInfo = info();
++    const outboundConfig = config({
++      headers: {
++        'X-Project': 'alpha',
++        Authorization: 'stale credential',
++        'Idempotency-Key': 'caller supplied',
++      },
++      idempotency_key_header: 'Idempotency-Key',
++      auth: { type: 'Header', name: 'Authorization', value_key: 'api-token' },
++      retry: { max_attempts: 2, status_codes: [503] },
++    });
++
++    await service.send(outboundConfig, 'district-feed', record(), recordInfo);
++
++    assert.strictEqual(secureSettings.getCredentials.callCount, 1);
++    assert.strictEqual(post.callCount, 2);
++    const firstHeaders = post.firstCall.args[0].headers;
++    const secondHeaders = post.secondCall.args[0].headers;
++    assert.deepEqual(firstHeaders, secondHeaders);
++    assert.include(firstHeaders, {
++      'X-Project': 'alpha',
++      Authorization: 'Bearer secret',
++    });
++    assert.match(firstHeaders['Idempotency-Key'], /^[a-f0-9]{64}$/);
++    assert.strictEqual(firstHeaders['Idempotency-Key'], recordInfo.completed_tasks[0].hash);
++  });
++
++  it('derives the same idempotency key for equivalent payload object order', async () => {
++    const post = sinon.stub(request, 'post').resolves();
++    const firstConfig = {
++      mapping: { alpha: 'doc.alpha', beta: 'doc.beta' },
++      destination: destination({ idempotency_key_header: 'X-Delivery-Key' }),
++    };
++    const secondConfig = {
++      mapping: { beta: 'doc.beta', alpha: 'doc.alpha' },
++      destination: destination({ idempotency_key_header: 'X-Delivery-Key' }),
++    };
++    const source = { _id: 'report-1', alpha: 1, beta: 2 };
++
++    await service.send(firstConfig, 'first', source, info());
++    await service.send(secondConfig, 'second', source, info());
++
++    assert.strictEqual(
++      post.firstCall.args[0].headers['X-Delivery-Key'],
++      post.secondCall.args[0].headers['X-Delivery-Key']
++    );
++  });
++
++  it('rejects invalid retry policies before credentials or delivery are attempted', async () => {
++    const post = sinon.stub(request, 'post');
++    sinon.stub(secureSettings, 'getCredentials');
++    const invalidPolicies = [
++      {},
++      { max_attempts: 0 },
++      { max_attempts: 2.5 },
++      { max_attempts: '3' },
++      { max_attempts: 2, status_codes: [399] },
++      { max_attempts: 2, status_codes: [600] },
++      { max_attempts: 2, status_codes: [503, '429'] },
++      { max_attempts: 2, retry_on_network_error: 'yes' },
++    ];
++
++    for (const retry of invalidPolicies) {
++      const recordInfo = info();
++      const thrown = await service.send(config({
++        auth: { type: 'Header', name: 'Authorization', value_key: 'api-token' },
++        retry,
++      }), 'district-feed', record(), recordInfo).catch(error => error);
++
++      assert.instanceOf(thrown, Error);
++      assert.match(thrown.message, /retry/i);
++      assert.deepEqual(recordInfo.completed_tasks, []);
++    }
++
++    assert.strictEqual(post.callCount, 0);
++    assert.strictEqual(secureSettings.getCredentials.callCount, 0);
++  });
++
++  it('preserves one-shot behavior when no retry policy is configured', async () => {
++    const failure = statusError(503);
++    const post = sinon.stub(request, 'post').rejects(failure);
++
++    const thrown = await service.send(config(), 'district-feed', record(), info()).catch(error => error);
++
++    assert.strictEqual(thrown, failure);
++    assert.strictEqual(post.callCount, 1);
++  });
++
++  it('skips a duplicate before credentials or delivery and preserves the infodoc', async () => {
++    const post = sinon.stub(request, 'post').resolves();
++    sinon.stub(secureSettings, 'getCredentials');
++    const recordInfo = info();
++    const initialConfig = config({ idempotency_key_header: 'Idempotency-Key' });
++    await service.send(initialConfig, 'district-feed', record(), recordInfo);
++    const completedSnapshot = JSON.parse(JSON.stringify(recordInfo.completed_tasks));
++    post.resetHistory();
++
++    initialConfig.destination.auth = {
++      type: 'Header', name: 'Authorization', value_key: 'api-token'
++    };
++    const sent = await service.send(initialConfig, 'district-feed', record(), recordInfo);
++
++    assert.strictEqual(sent, false);
++    assert.strictEqual(post.callCount, 0);
++    assert.strictEqual(secureSettings.getCredentials.callCount, 0);
++    assert.deepEqual(recordInfo.completed_tasks, completedSnapshot);
++  });
++
++  it('does not retry mapping failures', async () => {
++    const post = sinon.stub(request, 'post');
++    const recordInfo = info();
++    const outboundConfig = config({
++      retry: { max_attempts: 3, status_codes: [503] },
++    });
++    outboundConfig.mapping.required_value = 'doc.missing';
++
++    const thrown = await service.send(
++      outboundConfig, 'district-feed', record(), recordInfo
++    ).catch(error => error);
++
++    assert.match(thrown.message, /Mapping error/);
++    assert.strictEqual(post.callCount, 0);
++    assert.deepEqual(recordInfo.completed_tasks, []);
++  });
++});
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,6 @@
++#!/bin/bash
++set -euo pipefail
++
++
++cd shared-libs/outbound
++npm test -- --reporter dot

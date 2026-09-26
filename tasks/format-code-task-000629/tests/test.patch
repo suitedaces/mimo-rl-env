@@ -1,0 +1,235 @@
+diff --git a/usercase-test-coderl/usecase.sh b/usercase-test-coderl/usecase.sh
+new file mode 100755
+--- /dev/null
++++ b/usercase-test-coderl/usecase.sh
+@@ -0,0 +1,211 @@
++#!/usr/bin/env bash
++
++set -u
++export LANG=C LC_ALL=C TZ=UTC
++
++unset CCACHE_REMOTE_STORAGE CCACHE_PREFIX CCACHE_PREFIX_CPP CCACHE_COMPILERCHECK
++
++ROOT=$(mktemp -d)
++trap 'rm -rf "$ROOT"' EXIT
++
++fail() { echo "FAIL: $*" >&2; exit 1; }
++
++BUILD_DIR="$ROOT/build"
++
++( cd /workspace/repo \
++  && cmake -S . -B "$BUILD_DIR" -DCMAKE_BUILD_TYPE=Release \
++       -DDEPS=LOCAL \
++       -DENABLE_TESTING=OFF -DENABLE_DOCUMENTATION=OFF \
++       -DREDIS_STORAGE_BACKEND=OFF -DHTTP_STORAGE_BACKEND=OFF \
++  && cmake --build "$BUILD_DIR" --target ccache -j2 ) \
++    || fail "build"
++BIN="$BUILD_DIR/ccache"
++[ -x "$BIN" ] || fail "built binary not found at $BIN"
++
++make_large_cache() {
++  local cache_dir=$1
++  local config_dir=$2
++  local work_dir=$3
++
++  mkdir -p "$cache_dir" "$config_dir" "$work_dir"
++  {
++    printf 'const char blob[] = "'
++    printf '%*s' 20000 '' | tr ' ' A
++    printf '";\nint answer(void) { return blob[0]; }\n'
++  } >"$work_dir/big.c"
++
++  (
++    cd "$work_dir" || exit 1
++    CCACHE_DIR="$cache_dir" CCACHE_CONFIGPATH="$config_dir/ccache.conf" \
++      "$BIN" gcc -c big.c -o big.o >compile1.out 2>compile1.err
++  ) || fail "populate cache first compile: $(cat "$work_dir/compile1.err")"
++
++  (
++    cd "$work_dir" || exit 1
++    CCACHE_DIR="$cache_dir" CCACHE_CONFIGPATH="$config_dir/ccache.conf" \
++      "$BIN" gcc -c big.c -o big2.o >compile2.out 2>compile2.err
++  ) || fail "populate cache second compile: $(cat "$work_dir/compile2.err")"
++
++  mkdir -p "$cache_dir/0/0"
++  printf 'not a ccache entry' >"$cache_dir/0/0/junk"
++  find "$cache_dir" -type f \
++    ! -name stats ! -name CACHEDIR.TAG ! -path "$cache_dir/tmp/*" \
++    -exec touch -h -d '@1577934245' {} +
++}
++
++cache_inventory() {
++  local cache_dir=$1
++  (
++    cd "$cache_dir" || exit 1
++    find . -type f \
++      ! -name stats ! -name CACHEDIR.TAG ! -path './tmp/*' \
++      -printf '%P %s %T@\n' | sort
++  )
++}
++
++cache_hashes() {
++  local cache_dir=$1
++  (
++    cd "$cache_dir" || exit 1
++    find . -type f \
++      ! -name stats ! -name CACHEDIR.TAG ! -path './tmp/*' \
++      -exec sha256sum {} + | sed 's#  ./#  #' | sort
++  )
++}
++
++expect_file() {
++  local label=$1
++  local path=$2
++  local expected=$3
++  local actual
++  actual=$(cat "$path")
++  [ "$actual" = "$expected" ] || fail "$label: got [$(cat "$path")]"
++}
++
++expect_report() {
++  local label=$1
++  local path=$2
++  shift 2
++  local -a lines
++  mapfile -t lines <"$path"
++  [ "${#lines[@]}" -eq "$#" ] \
++    || fail "$label: got ${#lines[@]} lines, want $#; output [$(cat "$path")]"
++  local i=0
++  local regex
++  for regex in "$@"; do
++    [[ "${lines[$i]}" =~ $regex ]] \
++      || fail "$label line $((i + 1)): got [${lines[$i]}], want regex [$regex]"
++    i=$((i + 1))
++  done
++}
++
++WORK="$ROOT/work"
++mkdir -p "$WORK"
++
++
++
++
++CACHE1="$WORK/cache-short"
++CONF1="$WORK/conf-short"
++make_large_cache "$CACHE1" "$CONF1" "$WORK/src-short"
++before_inventory=$(cache_inventory "$CACHE1")
++before_hashes=$(cache_hashes "$CACHE1")
++"$BIN" -d "$CACHE1" -x >"$WORK/f1.out" 2>"$WORK/f1.err"; ec=$?
++[ "$ec" -eq 0 ] || fail "F1 exit $ec; want 0"
++
++F1_REPORT_REGEX=(
++  '^Total data:[[:space:]]+12\.0[[:space:]]+KiB$'
++  '^Compressed data:[[:space:]]+8\.0[[:space:]]+KiB[[:space:]]+\(28\.6% of original size\)$'
++  '^  Original size:[[:space:]]+28\.0[[:space:]]+KiB$'
++  '^  Compression ratio:[[:space:]]+3\.500[[:space:]]+x[[:space:]]+\(71\.4% space savings\)$'
++  '^Incompressible data:[[:space:]]+4\.0[[:space:]]+KiB$'
++)
++expect_report "F1 stdout" "$WORK/f1.out" "${F1_REPORT_REGEX[@]}"
++[ ! -s "$WORK/f1.err" ] || fail "F1 unexpected stderr: $(cat "$WORK/f1.err")"
++[ "$(cache_inventory "$CACHE1")" = "$before_inventory" ] || fail "F1 changed cache file set, sizes, or mtimes"
++[ "$(cache_hashes "$CACHE1")" = "$before_hashes" ] || fail "F1 rewrote cache file contents"
++
++
++
++
++printf 'max_size=5GB\n' >"$CONF1/decimal.conf"
++"$BIN" --dir "$CACHE1" --config-path "$CONF1/decimal.conf" --threads 2 \
++  --show-compression >"$WORK/f2.out" 2>"$WORK/f2.err"; ec=$?
++[ "$ec" -eq 0 ] || fail "F2 exit $ec; want 0"
++
++expect_report "F2 stdout" "$WORK/f2.out" \
++  '^Total data:[[:space:]]+12\.3[[:space:]]+kB$' \
++  '^Compressed data:[[:space:]]+8\.2[[:space:]]+kB[[:space:]]+\(28\.6% of original size\)$' \
++  '^  Original size:[[:space:]]+28\.7[[:space:]]+kB$' \
++  '^  Compression ratio:[[:space:]]+3\.500[[:space:]]+x[[:space:]]+\(71\.4% space savings\)$' \
++  '^Incompressible data:[[:space:]]+4\.1[[:space:]]+kB$'
++[ ! -s "$WORK/f2.err" ] || fail "F2 unexpected stderr: $(cat "$WORK/f2.err")"
++
++
++
++
++EMPTY_CACHE="$WORK/cache-empty"
++mkdir -p "$EMPTY_CACHE"
++"$BIN" --dir "$EMPTY_CACHE" --show-compression >"$WORK/f3.out" 2>"$WORK/f3.err"; ec=$?
++[ "$ec" -eq 0 ] || fail "F3 exit $ec; want 0"
++
++expect_report "F3 stdout" "$WORK/f3.out" \
++  '^Total data:[[:space:]]+0[[:space:]]+bytes$' \
++  '^Compressed data:[[:space:]]+0[[:space:]]+bytes[[:space:]]+\([0-9]+(\.[0-9]+)?% of original size\)$' \
++  '^  Original size:[[:space:]]+0[[:space:]]+bytes$' \
++  '^  Compression ratio:[[:space:]]+0\.000[[:space:]]+x[[:space:]]+\(0\.0% space savings\)$' \
++  '^Incompressible data:[[:space:]]+0[[:space:]]+bytes$'
++[ ! -s "$WORK/f3.err" ] || fail "F3 unexpected stderr: $(cat "$WORK/f3.err")"
++
++
++
++
++if command -v script >/dev/null 2>&1; then
++  script -qfec "$BIN --dir '$CACHE1' --threads 1 --show-compression" /dev/null \
++    >"$WORK/f4.tty" 2>"$WORK/f4.err"; ec=$?
++  tr -d '\r' <"$WORK/f4.tty" >"$WORK/f4.norm"
++  [ "$ec" -eq 0 ] || fail "F4 exit $ec; want 0"
++  [ ! -s "$WORK/f4.err" ] || fail "F4 unexpected stderr: $(cat "$WORK/f4.err")"
++  grep -q 'Scanning...' "$WORK/f4.norm" || fail "F4 missing Scanning progress"
++  last_nonempty_before_table=$(awk '/^Total data:/{print last; exit} NF{last=$0}' "$WORK/f4.norm")
++  previous_line_before_table=$(awk '/^Total data:/{print prev; exit}{prev=$0}' "$WORK/f4.norm")
++
++  printf '%s\n' "$last_nonempty_before_table" | grep -Eq 'Scanning\.\.\..*100(\.0)?%' \
++    || fail "F4 progress did not reach completion"
++  [ -z "$previous_line_before_table" ] || fail "F4 missing blank line before final table"
++  sed -n '/^Total data:/,$p' "$WORK/f4.norm" >"$WORK/f4.table"
++
++  expect_report "F4 final table" "$WORK/f4.table" "${F1_REPORT_REGEX[@]}"
++else
++  fail "F4 requires script(1) to allocate a TTY"
++fi
++
++
++
++
++"$BIN" --help >"$WORK/f5.out" 2>"$WORK/f5.err"; ec=$?
++[ "$ec" -eq 0 ] || fail "F5 exit $ec; want 0"
++grep -q '^Common options:$' "$WORK/f5.out" || fail "F5 missing Common options section"
++
++awk '
++  /^Common options:$/ { in_common = 1; next }
++  /^[^[:space:]]/ { in_common = 0 }
++  in_common && /-x, --show-compression/ && /compression statistics/ { found = 1 }
++  END { exit found ? 0 : 1 }
++' "$WORK/f5.out" \
++  || fail "F5 missing show-compression help line"
++[ ! -s "$WORK/f5.err" ] || fail "F5 unexpected stderr: $(cat "$WORK/f5.err")"
++
++
++
++
++"$BIN" --dir "$CACHE1" --threads 0 --show-compression \
++  >"$WORK/ferr.out" 2>"$WORK/ferr.err"; ec=$?
++[ "$ec" -ne 0 ] || fail "F_err exit $ec; want non-zero"
++[ ! -s "$WORK/ferr.out" ] || fail "F_err unexpected stdout: $(cat "$WORK/ferr.out")"
++
++[ -s "$WORK/ferr.err" ] || fail "F_err expected stderr for invalid --threads"
++grep -qi 'thread' "$WORK/ferr.err" || fail "F_err stderr should identify --threads: $(cat "$WORK/ferr.err")"
++
++echo "PASS"
++exit 0
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,14 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++
++
++exec bash /workspace/repo/usercase-test-coderl/usecase.sh

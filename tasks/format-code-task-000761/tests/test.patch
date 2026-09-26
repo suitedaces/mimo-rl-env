@@ -1,0 +1,577 @@
+diff --git a/usercase-test-coderl/migration_helpers_test.go b/usercase-test-coderl/migration_helpers_test.go
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/migration_helpers_test.go
+@@ -0,0 +1,548 @@
++package usercase_test_coderl
++
++
++
++
++
++
++import (
++	"encoding/json"
++	"io"
++	"os"
++	"path/filepath"
++	"reflect"
++	"sort"
++	"testing"
++
++	config "github.com/datarhei/core/v16/config"
++	v2 "github.com/datarhei/core/v16/config/v2"
++	"github.com/datarhei/core/v16/config/value"
++	"github.com/datarhei/core/v16/io/fs"
++)
++
++type v3Summary struct {
++	Version       int64
++	ID            string
++	Name          string
++	HostName      []string
++	Routes        map[string]string
++	Allow         []string
++	Block         []string
++	MemoryLimit   int64
++	S3Len         int
++	APIAccessHTTP []string
++	Auth0Users    []string
++	SRTTopics     []string
++	Prefixes      []string
++}
++
++type v2Summary struct {
++	Version      int64
++	CacheTypes   []string
++	TLSEnable    bool
++	TLSAddress   string
++	TLSAuto      bool
++	TLSCertFile  string
++	TLSKeyFile   string
++	MimeTypes    string
++	MemoryAuth   bool
++	MemoryUser   string
++	MemoryPass   string
++	MemorySize   int64
++	MemoryPurge  bool
++	DebugProfile bool
++	DebugForceGC int
++	HostName     []string
++	Routes       map[string]string
++	Auth0Users   []string
++}
++
++
++
++func TestUpgradeV2ToV3SpecifiedFieldsAndDefaults(t *testing.T) {
++	mem := newMemFS(t)
++	src := v2SourceFixture()
++
++	actual, err := config.UpgradeV2ToV3(src, mem)
++	if err != nil {
++		t.Fatalf("UpgradeV2ToV3 returned error: %v", err)
++	}
++
++	want := v3Summary{
++		Version:       3,
++		ID:            "core-a",
++		Name:          "studio",
++		HostName:      []string{"example.com"},
++		Routes:        map[string]string{"/live": "/memfs/live"},
++		Allow:         []string{".ts", ".mp4"},
++		Block:         []string{".m3u8", ".mpd"},
++		MemoryLimit:   0,
++		S3Len:         0,
++		APIAccessHTTP: []string{"10.0.0.0/8"},
++		Auth0Users:    []string{"alice", "bob"},
++		SRTTopics:     []string{"connect", "stats"},
++		Prefixes:      []string{"/internal", "/debug"},
++	}
++	assertEqual(t, upgradeSummary(actual), want)
++}
++
++
++
++func TestMergeV2ToV3OverlaysCallerDestination(t *testing.T) {
++	mem := newMemFS(t)
++	src := v2SourceFixture()
++	dst := config.New(mem)
++	dst.Storage.Disk.Cache.Types.Block = []string{".deny"}
++
++	actual, err := config.MergeV2toV3(&dst.Data, src)
++	if err != nil {
++		t.Fatalf("MergeV2toV3 returned error: %v", err)
++	}
++	if actual != &dst.Data {
++		t.Fatalf("MergeV2toV3 returned same destination pointer = %v, want true", actual == &dst.Data)
++	}
++
++	want := v3Summary{
++		Version:       3,
++		ID:            "core-a",
++		Name:          "studio",
++		HostName:      []string{"example.com"},
++		Routes:        map[string]string{"/live": "/memfs/live"},
++		Allow:         []string{".ts", ".mp4"},
++		Block:         []string{".deny"},
++		MemoryLimit:   0,
++		S3Len:         0,
++		APIAccessHTTP: []string{"10.0.0.0/8"},
++		Auth0Users:    []string{"alice", "bob"},
++		SRTTopics:     []string{"connect", "stats"},
++		Prefixes:      []string{"/internal", "/debug"},
++	}
++	assertEqual(t, upgradeSummary(actual), want)
++}
++
++
++
++func TestDowngradeV3ToV2PreservesV2Fields(t *testing.T) {
++	src := v3SourceFixture()
++
++	actual, err := config.DowngradeV3toV2(src)
++	if err != nil {
++		t.Fatalf("DowngradeV3toV2 returned error: %v", err)
++	}
++
++	want := v2Summary{
++		Version:      2,
++		CacheTypes:   []string{".jpg", ".png"},
++		TLSEnable:    true,
++		TLSAddress:   ":9443",
++		TLSAuto:      true,
++		TLSCertFile:  "/certs/fullchain.pem",
++		TLSKeyFile:   "/certs/privkey.pem",
++		MimeTypes:    "/etc/core/mime.types",
++		MemoryAuth:   true,
++		MemoryUser:   "mem-user",
++		MemoryPass:   "mem-pass",
++		MemorySize:   512,
++		MemoryPurge:  true,
++		DebugProfile: true,
++		DebugForceGC: 45,
++		HostName:     []string{"v3.example.com"},
++		Routes:       map[string]string{"/vod": "/data/vod"},
++		Auth0Users:   []string{"carol"},
++	}
++	assertEqual(t, downgradeSummary(actual), want)
++}
++
++
++
++func TestReturnedSliceAndMapFieldsDoNotAliasSources(t *testing.T) {
++	mem := newMemFS(t)
++
++	upgradeSrc := v2SourceFixture()
++	upgraded, err := config.UpgradeV2ToV3(upgradeSrc, mem)
++	if err != nil {
++		t.Fatalf("UpgradeV2ToV3 returned error: %v", err)
++	}
++	mutateV3CopiedFields(upgraded)
++	assertV2SourceStillFixture(t, upgradeSrc)
++
++	mergeSrc := v2SourceFixture()
++	dst := config.New(mem)
++	merged, err := config.MergeV2toV3(&dst.Data, mergeSrc)
++	if err != nil {
++		t.Fatalf("MergeV2toV3 returned error: %v", err)
++	}
++	mutateV3CopiedFields(merged)
++	assertV2SourceStillFixture(t, mergeSrc)
++
++	downgradeSrc := v3SourceFixture()
++	downgraded, err := config.DowngradeV3toV2(downgradeSrc)
++	if err != nil {
++		t.Fatalf("DowngradeV3toV2 returned error: %v", err)
++	}
++	downgraded.Host.Name[0] = "mutated.example.com"
++	downgraded.API.Auth.Auth0.Tenants[0].Users[0] = "mutated"
++	downgraded.Router.Routes["/vod"] = "/mutated"
++	assertEqual(t, downgradeSrc.Host.Name, []string{"v3.example.com"})
++	assertEqual(t, downgradeSrc.API.Auth.Auth0.Tenants[0].Users, []string{"carol"})
++	assertEqual(t, downgradeSrc.Router.Routes, map[string]string{"/vod": "/data/vod"})
++}
++
++func TestNilV2SourceDoesNotWriteProvidedFilesystem(t *testing.T) {
++	mem := newMemFS(t)
++	rec := &recordingFS{Filesystem: mem, writes: []string{}}
++	defer func() {
++		_ = recover()
++
++		assertEqual(t, rec.writes, []string{})
++	}()
++
++	_, _ = config.UpgradeV2ToV3(nil, rec)
++
++	assertEqual(t, rec.writes, []string{})
++}
++
++func TestHelpersAreReferentiallyTransparentForEquivalentInputs(t *testing.T) {
++	mem := newMemFS(t)
++
++	up1, err := config.UpgradeV2ToV3(v2SourceFixture(), mem)
++	if err != nil {
++		t.Fatalf("UpgradeV2ToV3 returned error: %v", err)
++	}
++	up2, err := config.UpgradeV2ToV3(v2SourceFixture(), mem)
++	if err != nil {
++		t.Fatalf("UpgradeV2ToV3 returned error: %v", err)
++	}
++	wantUp := v3Summary{Version: 3, ID: "core-a", Name: "studio", HostName: []string{"example.com"}, Routes: map[string]string{"/live": "/memfs/live"}, Allow: []string{".ts", ".mp4"}, Block: []string{".m3u8", ".mpd"}, MemoryLimit: 0, S3Len: 0, APIAccessHTTP: []string{"10.0.0.0/8"}, Auth0Users: []string{"alice", "bob"}, SRTTopics: []string{"connect", "stats"}, Prefixes: []string{"/internal", "/debug"}}
++	assertEqual(t, upgradeSummary(up1), wantUp)
++	assertEqual(t, upgradeSummary(up2), wantUp)
++
++	down1, err := config.DowngradeV3toV2(v3SourceFixture())
++	if err != nil {
++		t.Fatalf("DowngradeV3toV2 returned error: %v", err)
++	}
++	down2, err := config.DowngradeV3toV2(v3SourceFixture())
++	if err != nil {
++		t.Fatalf("DowngradeV3toV2 returned error: %v", err)
++	}
++	wantDown := v2Summary{Version: 2, CacheTypes: []string{".jpg", ".png"}, TLSEnable: true, TLSAddress: ":9443", TLSAuto: true, TLSCertFile: "/certs/fullchain.pem", TLSKeyFile: "/certs/privkey.pem", MimeTypes: "/etc/core/mime.types", MemoryAuth: true, MemoryUser: "mem-user", MemoryPass: "mem-pass", MemorySize: 512, MemoryPurge: true, DebugProfile: true, DebugForceGC: 45, HostName: []string{"v3.example.com"}, Routes: map[string]string{"/vod": "/data/vod"}, Auth0Users: []string{"carol"}}
++	assertEqual(t, downgradeSummary(down1), wantDown)
++	assertEqual(t, downgradeSummary(down2), wantDown)
++}
++
++func TestHelpersDoNotMutateSourceStructs(t *testing.T) {
++	mem := newMemFS(t)
++
++	upgradeSrc := v2SourceFixture()
++	upgradeBefore := cloneJSON[v2.Data](t, upgradeSrc)
++	if _, err := config.UpgradeV2ToV3(upgradeSrc, mem); err != nil {
++		t.Fatalf("UpgradeV2ToV3 returned error: %v", err)
++	}
++	assertEqual(t, upgradeSrc, upgradeBefore)
++
++	mergeSrc := v2SourceFixture()
++	mergeBefore := cloneJSON[v2.Data](t, mergeSrc)
++	dst := config.New(mem)
++	if _, err := config.MergeV2toV3(&dst.Data, mergeSrc); err != nil {
++		t.Fatalf("MergeV2toV3 returned error: %v", err)
++	}
++	assertEqual(t, mergeSrc, mergeBefore)
++
++	downgradeSrc := v3SourceFixture()
++	downgradeBefore := cloneJSON[config.Data](t, downgradeSrc)
++	if _, err := config.DowngradeV3toV2(downgradeSrc); err != nil {
++		t.Fatalf("DowngradeV3toV2 returned error: %v", err)
++	}
++	assertEqual(t, downgradeSrc, downgradeBefore)
++}
++
++func TestHelpersDoNotUseHiddenGlobalStateAcrossCalls(t *testing.T) {
++	mem := newMemFS(t)
++
++	_, _ = config.UpgradeV2ToV3(noiseV2SourceFixture(), mem)
++	_, _ = config.DowngradeV3toV2(noiseV3SourceFixture())
++	upgraded, err := config.UpgradeV2ToV3(v2SourceFixture(), mem)
++	if err != nil {
++		t.Fatalf("UpgradeV2ToV3 returned error: %v", err)
++	}
++	wantUp := v3Summary{Version: 3, ID: "core-a", Name: "studio", HostName: []string{"example.com"}, Routes: map[string]string{"/live": "/memfs/live"}, Allow: []string{".ts", ".mp4"}, Block: []string{".m3u8", ".mpd"}, MemoryLimit: 0, S3Len: 0, APIAccessHTTP: []string{"10.0.0.0/8"}, Auth0Users: []string{"alice", "bob"}, SRTTopics: []string{"connect", "stats"}, Prefixes: []string{"/internal", "/debug"}}
++	assertEqual(t, upgradeSummary(upgraded), wantUp)
++
++	dst := config.New(mem)
++	dst.Storage.Disk.Cache.Types.Block = []string{".deny"}
++	_, _ = config.MergeV2toV3(&config.New(mem).Data, noiseV2SourceFixture())
++	merged, err := config.MergeV2toV3(&dst.Data, v2SourceFixture())
++	if err != nil {
++		t.Fatalf("MergeV2toV3 returned error: %v", err)
++	}
++	wantMerge := v3Summary{Version: 3, ID: "core-a", Name: "studio", HostName: []string{"example.com"}, Routes: map[string]string{"/live": "/memfs/live"}, Allow: []string{".ts", ".mp4"}, Block: []string{".deny"}, MemoryLimit: 0, S3Len: 0, APIAccessHTTP: []string{"10.0.0.0/8"}, Auth0Users: []string{"alice", "bob"}, SRTTopics: []string{"connect", "stats"}, Prefixes: []string{"/internal", "/debug"}}
++	assertEqual(t, upgradeSummary(merged), wantMerge)
++
++	_, _ = config.DowngradeV3toV2(noiseV3SourceFixture())
++	downgraded, err := config.DowngradeV3toV2(v3SourceFixture())
++	if err != nil {
++		t.Fatalf("DowngradeV3toV2 returned error: %v", err)
++	}
++	wantDown := v2Summary{Version: 2, CacheTypes: []string{".jpg", ".png"}, TLSEnable: true, TLSAddress: ":9443", TLSAuto: true, TLSCertFile: "/certs/fullchain.pem", TLSKeyFile: "/certs/privkey.pem", MimeTypes: "/etc/core/mime.types", MemoryAuth: true, MemoryUser: "mem-user", MemoryPass: "mem-pass", MemorySize: 512, MemoryPurge: true, DebugProfile: true, DebugForceGC: 45, HostName: []string{"v3.example.com"}, Routes: map[string]string{"/vod": "/data/vod"}, Auth0Users: []string{"carol"}}
++	assertEqual(t, downgradeSummary(downgraded), wantDown)
++}
++
++func TestHelpersDoNotWriteFilesOrReadEnvironmentOverrides(t *testing.T) {
++	mem := newMemFS(t)
++	rec := &recordingFS{Filesystem: mem, writes: []string{}}
++	t.Setenv("CORE_STORAGE_DISK_CACHE_TYPES_BLOCK", ".envblock")
++	t.Setenv("CORE_DEBUG_MEMORY_LIMIT_MBYTES", "999")
++	t.Setenv("CORE_STORAGE_S3", "https://access:secret@us-east-1.s3.example/bucket?name=envs3&mount=/env")
++
++	previousDir, err := os.Getwd()
++	if err != nil {
++		t.Fatalf("Getwd failed: %v", err)
++	}
++	tmp := t.TempDir()
++	if err := os.Chdir(tmp); err != nil {
++		t.Fatalf("Chdir temp failed: %v", err)
++	}
++	t.Cleanup(func() {
++		if err := os.Chdir(previousDir); err != nil {
++			t.Fatalf("restore cwd failed: %v", err)
++		}
++	})
++	before := snapshotCWD(t)
++
++	upgraded, err := config.UpgradeV2ToV3(v2SourceFixture(), rec)
++	if err != nil {
++		t.Fatalf("UpgradeV2ToV3 returned error: %v", err)
++	}
++	dst := config.New(rec)
++	dst.Storage.Disk.Cache.Types.Block = []string{".deny"}
++	if _, err := config.MergeV2toV3(&dst.Data, v2SourceFixture()); err != nil {
++		t.Fatalf("MergeV2toV3 returned error: %v", err)
++	}
++	if _, err := config.DowngradeV3toV2(v3SourceFixture()); err != nil {
++		t.Fatalf("DowngradeV3toV2 returned error: %v", err)
++	}
++
++	assertEqual(t, rec.writes, []string{})
++	assertEqual(t, snapshotCWD(t), before)
++	assertEqual(t, upgradeSummary(upgraded), v3Summary{Version: 3, ID: "core-a", Name: "studio", HostName: []string{"example.com"}, Routes: map[string]string{"/live": "/memfs/live"}, Allow: []string{".ts", ".mp4"}, Block: []string{".m3u8", ".mpd"}, MemoryLimit: 0, S3Len: 0, APIAccessHTTP: []string{"10.0.0.0/8"}, Auth0Users: []string{"alice", "bob"}, SRTTopics: []string{"connect", "stats"}, Prefixes: []string{"/internal", "/debug"}})
++}
++
++type recordingFS struct {
++	fs.Filesystem
++	writes []string
++}
++
++func (r *recordingFS) WriteFileReader(path string, data io.Reader) (int64, bool, error) {
++	r.writes = append(r.writes, "WriteFileReader:"+path)
++	return r.Filesystem.WriteFileReader(path, data)
++}
++
++func (r *recordingFS) WriteFile(path string, data []byte) (int64, bool, error) {
++	r.writes = append(r.writes, "WriteFile:"+path)
++	return r.Filesystem.WriteFile(path, data)
++}
++
++func (r *recordingFS) WriteFileSafe(path string, data []byte) (int64, bool, error) {
++	r.writes = append(r.writes, "WriteFileSafe:"+path)
++	return r.Filesystem.WriteFileSafe(path, data)
++}
++
++func (r *recordingFS) MkdirAll(path string, perm os.FileMode) error {
++	r.writes = append(r.writes, "MkdirAll:"+path)
++	return r.Filesystem.MkdirAll(path, perm)
++}
++
++func (r *recordingFS) Rename(src, dst string) error {
++	r.writes = append(r.writes, "Rename:"+src+"->"+dst)
++	return r.Filesystem.Rename(src, dst)
++}
++
++func (r *recordingFS) Copy(src, dst string) error {
++	r.writes = append(r.writes, "Copy:"+src+"->"+dst)
++	return r.Filesystem.Copy(src, dst)
++}
++
++func (r *recordingFS) Remove(path string) int64 {
++	r.writes = append(r.writes, "Remove:"+path)
++	return r.Filesystem.Remove(path)
++}
++
++func (r *recordingFS) RemoveAll() int64 {
++	r.writes = append(r.writes, "RemoveAll")
++	return r.Filesystem.RemoveAll()
++}
++
++func v2SourceFixture() *v2.Data {
++	src := &v2.Data{}
++	src.Version = 2
++	src.ID = "core-a"
++	src.Name = "studio"
++	src.Host.Name = []string{"example.com"}
++	src.API.Access.HTTP.Allow = []string{"10.0.0.0/8"}
++	src.API.Auth.Auth0.Tenants = []value.Auth0Tenant{{Domain: "tenant.example", Audience: "api", ClientID: "client-a", Users: []string{"alice", "bob"}}}
++	src.Storage.Disk.Cache.Types = []string{".ts", ".mp4"}
++	src.SRT.Log.Topics = []string{"connect", "stats"}
++	src.Router.BlockedPrefixes = []string{"/internal", "/debug"}
++	src.Router.Routes = map[string]string{"/live": "/memfs/live"}
++	return src
++}
++
++func noiseV2SourceFixture() *v2.Data {
++	src := &v2.Data{}
++	src.Version = 2
++	src.ID = "core-b"
++	src.Name = "control-room"
++	src.Host.Name = []string{"noise.example.net", "backup.example.net"}
++	src.Storage.Disk.Cache.Types = []string{".aac"}
++	src.Router.Routes = map[string]string{"/noise": "/memfs/noise"}
++	return src
++}
++
++func v3SourceFixture() *config.Data {
++	src := &config.Data{}
++	src.Version = 3
++	src.Storage.Disk.Cache.Types.Allow = []string{".jpg", ".png"}
++	src.TLS.Enable = true
++	src.TLS.Address = ":9443"
++	src.TLS.Auto = true
++	src.TLS.CertFile = "/certs/fullchain.pem"
++	src.TLS.KeyFile = "/certs/privkey.pem"
++	src.Storage.MimeTypes = "/etc/core/mime.types"
++	src.Storage.Memory.Auth.Enable = true
++	src.Storage.Memory.Auth.Username = "mem-user"
++	src.Storage.Memory.Auth.Password = "mem-pass"
++	src.Storage.Memory.Size = 512
++	src.Storage.Memory.Purge = true
++	src.Debug.Profiling = true
++	src.Debug.ForceGC = 45
++	src.Host.Name = []string{"v3.example.com"}
++	src.API.Auth.Auth0.Tenants = []value.Auth0Tenant{{Domain: "tenant-v3.example", Audience: "api-v3", ClientID: "client-v3", Users: []string{"carol"}}}
++	src.Router.Routes = map[string]string{"/vod": "/data/vod"}
++	return src
++}
++
++func noiseV3SourceFixture() *config.Data {
++	src := &config.Data{}
++	src.Version = 3
++	src.Storage.Disk.Cache.Types.Allow = []string{".webp"}
++	src.TLS.Address = ":10443"
++	src.Storage.MimeTypes = "/tmp/noise.types"
++	src.Debug.ForceGC = 7
++	src.Router.Routes = map[string]string{"/noise": "/data/noise"}
++	return src
++}
++
++func upgradeSummary(data *config.Data) v3Summary {
++	var auth0Users []string
++	if len(data.API.Auth.Auth0.Tenants) != 0 {
++		auth0Users = data.API.Auth.Auth0.Tenants[0].Users
++	}
++	return v3Summary{
++		Version:       data.Version,
++		ID:            data.ID,
++		Name:          data.Name,
++		HostName:      data.Host.Name,
++		Routes:        data.Router.Routes,
++		Allow:         data.Storage.Disk.Cache.Types.Allow,
++		Block:         data.Storage.Disk.Cache.Types.Block,
++		MemoryLimit:   data.Debug.MemoryLimit,
++		S3Len:         len(data.Storage.S3),
++		APIAccessHTTP: data.API.Access.HTTP.Allow,
++		Auth0Users:    auth0Users,
++		SRTTopics:     data.SRT.Log.Topics,
++		Prefixes:      data.Router.BlockedPrefixes,
++	}
++}
++
++func downgradeSummary(data *v2.Data) v2Summary {
++	var auth0Users []string
++	if len(data.API.Auth.Auth0.Tenants) != 0 {
++		auth0Users = data.API.Auth.Auth0.Tenants[0].Users
++	}
++	return v2Summary{
++		Version:      data.Version,
++		CacheTypes:   data.Storage.Disk.Cache.Types,
++		TLSEnable:    data.TLS.Enable,
++		TLSAddress:   data.TLS.Address,
++		TLSAuto:      data.TLS.Auto,
++		TLSCertFile:  data.TLS.CertFile,
++		TLSKeyFile:   data.TLS.KeyFile,
++		MimeTypes:    data.Storage.MimeTypes,
++		MemoryAuth:   data.Storage.Memory.Auth.Enable,
++		MemoryUser:   data.Storage.Memory.Auth.Username,
++		MemoryPass:   data.Storage.Memory.Auth.Password,
++		MemorySize:   data.Storage.Memory.Size,
++		MemoryPurge:  data.Storage.Memory.Purge,
++		DebugProfile: data.Debug.Profiling,
++		DebugForceGC: data.Debug.ForceGC,
++		HostName:     data.Host.Name,
++		Routes:       data.Router.Routes,
++		Auth0Users:   auth0Users,
++	}
++}
++
++func mutateV3CopiedFields(data *config.Data) {
++	data.Host.Name[0] = "mutated.example.com"
++	data.API.Access.HTTP.Allow[0] = "192.0.2.0/24"
++	data.API.Auth.Auth0.Tenants[0].Users[0] = "mutated"
++	data.SRT.Log.Topics[0] = "mutated"
++	data.Router.BlockedPrefixes[0] = "/mutated"
++	data.Router.Routes["/live"] = "/mutated"
++}
++
++func assertV2SourceStillFixture(t *testing.T, src *v2.Data) {
++	t.Helper()
++	assertEqual(t, src.Host.Name, []string{"example.com"})
++	assertEqual(t, src.API.Access.HTTP.Allow, []string{"10.0.0.0/8"})
++	assertEqual(t, src.API.Auth.Auth0.Tenants[0].Users, []string{"alice", "bob"})
++	assertEqual(t, src.SRT.Log.Topics, []string{"connect", "stats"})
++	assertEqual(t, src.Router.BlockedPrefixes, []string{"/internal", "/debug"})
++	assertEqual(t, src.Router.Routes, map[string]string{"/live": "/memfs/live"})
++}
++
++func cloneJSON[T any](t *testing.T, src *T) *T {
++	t.Helper()
++	data, err := json.Marshal(src)
++	if err != nil {
++		t.Fatalf("json marshal clone failed: %v", err)
++	}
++	var dst T
++	if err := json.Unmarshal(data, &dst); err != nil {
++		t.Fatalf("json unmarshal clone failed: %v", err)
++	}
++	return &dst
++}
++
++func snapshotCWD(t *testing.T) []string {
++	t.Helper()
++	var names []string
++	if err := filepath.WalkDir(".", func(path string, d os.DirEntry, err error) error {
++		if err != nil {
++			return err
++		}
++		if path != "." {
++			names = append(names, path)
++		}
++		return nil
++	}); err != nil {
++		t.Fatalf("walk cwd failed: %v", err)
++	}
++	sort.Strings(names)
++	return names
++}
++
++func newMemFS(t *testing.T) fs.Filesystem {
++	t.Helper()
++	mem, err := fs.NewMemFilesystem(fs.MemConfig{})
++	if err != nil {
++		t.Fatalf("NewMemFilesystem failed: %v", err)
++	}
++	return mem
++}
++
++func assertEqual[T any](t *testing.T, got, want T) {
++	t.Helper()
++	if !reflect.DeepEqual(got, want) {
++		t.Fatalf("got %#v, want %#v", got, want)
++	}
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,19 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++cd /workspace/repo
++export GOTOOLCHAIN=local
++export GOPROXY=off
++export GOSUMDB=off
++export GOVCS='*:off'
++export GOFLAGS='-mod=vendor'
++exec go test -mod=vendor -v ./usercase-test-coderl

@@ -1,0 +1,5 @@
+I want the Go client to support multi-key existence checks from an existing connected client with `func (clnt *Client) BatchExists(policy *BatchPolicy, keys []*Key) ([]bool, Error)`.
+
+When I call `exists, err := client.BatchExists(nil, []*Key{keyA, keyB, keyC})` and `keyA` and `keyC` exist while `keyB` does not, I should get `[]bool{true, false, true}` with a nil error. When I call it with two missing keys, I should get `[]bool{false, false}` with a nil error; a missing key is a per-key false result, not a failed batch call. The returned slice must always be in the same positional order as the input keys, and a nil policy must use the client's default batch policy.
+
+The method should perform the existence check as a batch operation that requests no bin data. It should honor batch read filtering by leaving filtered-out positions false and returning an error chain that includes `types.FILTERED_OUT`. If the server returns an unexpected per-key error, or returns bin data for an existence-only response, the method should return a non-nil `Error` instead of silently marking that key true.

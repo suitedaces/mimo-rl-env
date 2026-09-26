@@ -1,0 +1,298 @@
+diff --git a/tests/integration/test_mgmt_addressing_validation.py b/tests/integration/test_mgmt_addressing_validation.py
+new file mode 100644
+index 000000000..5716f3cae
+--- /dev/null
++++ b/tests/integration/test_mgmt_addressing_validation.py
+@@ -0,0 +1,270 @@
++import os
++import shlex
++import subprocess
++import tempfile
++import textwrap
++import unittest
++from pathlib import Path
++
++
++REPO_ROOT = Path(__file__).resolve().parents[2]
++
++
++def _netlab_cmd() -> list[str]:
++
++
++
++
++
++
++
++    configured = os.environ.get("NETLAB_CMD")
++    if configured:
++        return shlex.split(configured)
++    return [str(REPO_ROOT / "netlab")]
++
++
++class MgmtAddressingValidationTest(unittest.TestCase):
++    maxDiff = None
++
++    def run_netlab_create(self, topology: str) -> tuple[int, str, list[str]]:
++        with tempfile.TemporaryDirectory() as tmpdir:
++            workdir = Path(tmpdir)
++            topo_file = workdir / "topology.yml"
++            topo_file.write_text(textwrap.dedent(topology).lstrip(), encoding="utf-8")
++            result = subprocess.run(
++                _netlab_cmd() + ["create", "-q", str(topo_file)],
++                cwd=workdir,
++                env={**os.environ, "PYTHONPATH": str(REPO_ROOT)},
++                text=True,
++                stdout=subprocess.PIPE,
++                stderr=subprocess.PIPE,
++                timeout=60,
++            )
++            artifacts = sorted(
++                str(path.relative_to(workdir))
++                for path in workdir.rglob("*")
++                if path.is_file() and path.name != "topology.yml"
++            )
++        return result.returncode, result.stdout + result.stderr, artifacts
++
++    def assert_no_provider_output(self, artifacts: list[str]) -> None:
++        provider_outputs = {
++            "clab.yml",
++            "clab-augment.yml",
++            "Vagrantfile",
++            "netlab.snapshot.yml",
++            "hosts.yml",
++            "ansible.cfg",
++            "netlab-devices.yml",
++        }
++        self.assertFalse(
++            provider_outputs.intersection(artifacts),
++            msg=f"invalid management addressing should stop before provider/automation output; got {artifacts}",
++        )
++
++    def assert_created_provider_output(self, artifacts: list[str], *expected: str) -> None:
++        self.assertTrue(
++            set(expected).intersection(artifacts),
++            msg=f"expected one of provider outputs {expected!r}; got {artifacts}",
++        )
++        self.assertIn("netlab.snapshot.yml", artifacts, msg=f"expected transformed topology snapshot; got {artifacts}")
++
++    def test_mgmt_ipv6_prefix_exception(self) -> None:
++        for prefix, addr in [
++            ("2001:db8:42::/64", "2001:db8:42::11"),
++            ("2001:db8:60::/60", "2001:db8:60::11"),
++        ]:
++            rc, output, artifacts = self.run_netlab_create(
++                f"""
++                defaults.device: none
++                provider: clab
++                addressing.mgmt:
++                  ipv4: 192.168.42.0/24
++                  ipv6: {prefix}
++                nodes:
++                  mgmtv6:
++                    provider: clab
++                    mgmt.ipv6: {addr}
++                """
++            )
++            self.assertEqual(rc, 0, msg=f"management IPv6 pool {prefix} should be accepted:\n{output}")
++            self.assert_created_provider_output(artifacts, "clab.yml", "clab-augment.yml")
++
++        rc, output, artifacts = self.run_netlab_create(
++            """
++            defaults.device: none
++            addressing:
++              lan:
++                ipv6: 2001:db8:feed::/64
++            nodes:
++              n1:
++            links:
++            - n1:
++            """
++        )
++        self.assertNotEqual(rc, 0, msg=f"non-management IPv6 /64 pool should still fail:\n{output}")
++        self.assert_no_provider_output(artifacts)
++
++    def test_clab_accepts_ipv6_management_address(self) -> None:
++        rc, output, artifacts = self.run_netlab_create(
++            """
++            defaults.device: none
++            provider: clab
++            addressing.mgmt:
++              ipv4: 192.168.50.0/24
++              ipv6: 2001:db8:50::/64
++            nodes:
++              v6okc:
++                provider: clab
++                mgmt.ipv6: 2001:db8:50::22
++            """
++        )
++        self.assertEqual(rc, 0, msg=f"clab IPv6-only management address inside the mgmt subnet should pass:\n{output}")
++        self.assert_created_provider_output(artifacts, "clab.yml", "clab-augment.yml")
++
++    def test_libvirt_requires_ipv4_management_address(self) -> None:
++        rc, output, artifacts = self.run_netlab_create(
++            """
++            defaults.device: none
++            provider: libvirt
++            addressing.mgmt:
++              ipv4: 192.168.51.0/24
++              ipv6: 2001:db8:51::/64
++            nodes:
++              v6onlylv:
++                provider: libvirt
++                mgmt.ipv6: 2001:db8:51::23
++              dualoklv:
++                provider: libvirt
++                mgmt.ipv4: 192.168.51.24
++                mgmt.ipv6: 2001:db8:51::24
++            """
++        )
++        self.assertNotEqual(rc, 0, msg=f"IPv6-only libvirt management should fail:\n{output}")
++        self.assert_no_provider_output(artifacts)
++
++        rc, output, artifacts = self.run_netlab_create(
++            """
++            defaults.device: none
++            provider: libvirt
++            addressing.mgmt:
++              ipv4: 192.168.51.0/24
++              ipv6: 2001:db8:51::/64
++            nodes:
++              dualoklv:
++                provider: libvirt
++                mgmt.ipv4: 192.168.51.24
++                mgmt.ipv6: 2001:db8:51::24
++            """
++        )
++        self.assertEqual(rc, 0, msg=f"libvirt node with IPv4 management should pass:\n{output}")
++        self.assert_created_provider_output(artifacts, "Vagrantfile")
++
++    def test_ipv6_management_requires_matching_prefix(self) -> None:
++        rc, output, artifacts = self.run_netlab_create(
++            """
++            defaults.device: none
++            provider: clab
++            addressing.mgmt:
++              ipv4: 192.168.52.0/24
++            nodes:
++              clabv6nopfx:
++                provider: clab
++                mgmt.ipv6: 2001:db8:52::25
++            """
++        )
++        self.assertNotEqual(rc, 0, msg=f"IPv6 mgmt address without IPv6 mgmt pool should fail:\n{output}")
++        self.assert_no_provider_output(artifacts)
++
++        rc, output, artifacts = self.run_netlab_create(
++            """
++            defaults.device: none
++            provider: clab
++            addressing.mgmt:
++              ipv4: 192.168.52.0/24
++              ipv6: 2001:db8:52::/64
++            nodes:
++              clabv6ok:
++                provider: clab
++                mgmt.ipv6: 2001:db8:52::25
++            """
++        )
++        self.assertEqual(rc, 0, msg=f"matching IPv6 mgmt pool should make the same node valid:\n{output}")
++        self.assert_created_provider_output(artifacts, "clab.yml", "clab-augment.yml")
++
++    def test_management_addresses_must_be_in_subnet(self) -> None:
++        rc, output, artifacts = self.run_netlab_create(
++            """
++            defaults.device: none
++            provider: clab
++            addressing.mgmt:
++              ipv4: 192.168.70.0/24
++              ipv6: 2001:db8:70::/64
++            nodes:
++              badv4lv:
++                provider: libvirt
++                mgmt.ipv4: 192.168.77.9
++              okv4lv:
++                provider: libvirt
++                mgmt.ipv4: 192.168.70.10
++                mgmt.ipv6: 2001:db8:70::10
++              badv6c:
++                provider: clab
++                mgmt.ipv6: 2001:db8:99::9
++              okv6c:
++                provider: clab
++                mgmt.ipv6: 2001:db8:70::11
++            """
++        )
++        self.assertNotEqual(rc, 0, msg=f"out-of-subnet management addresses should fail:\n{output}")
++        self.assert_no_provider_output(artifacts)
++
++        rc, output, artifacts = self.run_netlab_create(
++            """
++            defaults.device: none
++            provider: clab
++            addressing.mgmt:
++              ipv4: 172.30.10.0/24
++              ipv6: 2001:db8:88::/64
++            nodes:
++              badv4b:
++                provider: libvirt
++                mgmt.ipv4: 172.30.99.9
++              okv4b:
++                provider: libvirt
++                mgmt.ipv4: 172.30.10.12
++              badv6b:
++                provider: clab
++                mgmt.ipv6: 2001:db8:89::12
++              okv6b:
++                provider: clab
++                mgmt.ipv6: 2001:db8:88::12
++            """
++        )
++        self.assertNotEqual(rc, 0, msg=f"second out-of-subnet management fixture should fail:\n{output}")
++        self.assert_no_provider_output(artifacts)
++
++        rc, output, artifacts = self.run_netlab_create(
++            """
++            defaults.device: none
++            provider: clab
++            addressing.mgmt:
++              ipv4: 172.30.10.0/24
++              ipv6: 2001:db8:88::/64
++            nodes:
++              okv4b:
++                provider: libvirt
++                mgmt.ipv4: 172.30.10.12
++              okv6b:
++                provider: clab
++                mgmt.ipv6: 2001:db8:88::12
++            """
++        )
++        self.assertEqual(rc, 0, msg=f"in-subnet management addresses should pass:\n{output}")
++        self.assert_created_provider_output(artifacts, "clab.yml", "clab-augment.yml")
++        self.assert_created_provider_output(artifacts, "Vagrantfile")
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,17 @@
++#!/bin/bash
++set -uo pipefail
++cd /testbed
++
++case "${1:-}" in
++  base)
++    cd tests
++    PYTHONPATH="../" python3 -m pytest -vvv test_transformation.py::test_error_cases
++    ;;
++  new)
++    PYTHONPATH="." python3 -m pytest -q tests/integration/test_mgmt_addressing_validation.py
++    ;;
++  *)
++    echo "usage: $0 base|new"
++    exit 2
++    ;;
++esac

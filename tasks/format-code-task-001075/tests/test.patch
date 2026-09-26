@@ -1,0 +1,191 @@
+diff --git a/altair/utils/tests/test_plugin_registry_scopes.py b/altair/utils/tests/test_plugin_registry_scopes.py
+new file mode 100644
+index 0000000..31d1c57
+--- /dev/null
++++ b/altair/utils/tests/test_plugin_registry_scopes.py
+@@ -0,0 +1,91 @@
++import pytest
++
++from altair.utils import PluginRegistry
++
++
++def test_codespec_registry_permanent_activation_and_options():
++    registry = PluginRegistry(entry_point_group='codespec.missing.plugins')
++
++    def affine(value, scale=1, offset=0):
++        return value * scale + offset
++
++    def identity(value):
++        return value
++
++    registry.register('affine', affine)
++    registry.register('identity', identity)
++
++    assert registry.active is None
++    assert registry.options == {}
++
++    activation = registry.enable('affine', scale=2, offset=3)
++    assert hasattr(activation, '__enter__')
++    assert hasattr(activation, '__exit__')
++    assert registry.active == 'affine'
++    assert registry.options == {'scale': 2, 'offset': 3}
++    assert registry.get()(4) == 11
++    assert registry.get()(4, scale=5) == 23
++
++    exposed_options = registry.options
++    exposed_options['scale'] = 100
++    assert registry.options == {'scale': 2, 'offset': 3}
++    assert registry.get()(4) == 11
++
++    registry.enable('identity')
++    assert registry.active == 'identity'
++    assert registry.options == {}
++    assert registry.get() is identity
++
++
++def test_codespec_registry_nested_scopes_restore_exact_state():
++    registry = PluginRegistry(entry_point_group='codespec.missing.plugins')
++
++    def decorate(value, left='<', right='>'):
++        return left + value + right
++
++    registry.register('decorate', decorate)
++    registry.register('upper', lambda value: value.upper())
++    registry.enable('decorate', left='[', right=']')
++
++    with registry.enable('upper'):
++        assert registry.active == 'upper'
++        assert registry.options == {}
++        assert registry.get()('inside') == 'INSIDE'
++
++        with registry.enable(None, left='{', right='}'):
++            assert registry.active == 'upper'
++            assert registry.options == {'left': '{', 'right': '}'}
++
++        assert registry.active == 'upper'
++        assert registry.options == {}
++        assert registry.get()('again') == 'AGAIN'
++
++    assert registry.active == 'decorate'
++    assert registry.options == {'left': '[', 'right': ']'}
++    assert registry.get()('outside') == '[outside]'
++
++
++def test_codespec_registry_exception_and_failed_enable_are_atomic():
++    registry = PluginRegistry(entry_point_group='codespec.missing.plugins')
++    registry.register('base', lambda value, prefix='': prefix + value)
++    registry.register('temporary', lambda value: value.upper())
++    registry.enable('base', prefix='saved:')
++
++    with pytest.raises(RuntimeError, match='scope failed'):
++        with registry.enable('temporary'):
++            assert registry.active == 'temporary'
++            raise RuntimeError('scope failed')
++
++    assert registry.active == 'base'
++    assert registry.options == {'prefix': 'saved:'}
++    assert registry.get()('value') == 'saved:value'
++
++    with pytest.raises(ValueError, match='unknown'):
++        registry.enable('unknown', discarded=True)
++    assert registry.active == 'base'
++    assert registry.options == {'prefix': 'saved:'}
++    assert registry.get()('value') == 'saved:value'
++
++    empty = PluginRegistry(entry_point_group='codespec.missing.plugins')
++    with pytest.raises(ValueError):
++        empty.enable(None, option=True)
+diff --git a/altair/vegalite/v2/tests/test_data_transformer_scopes.py b/altair/vegalite/v2/tests/test_data_transformer_scopes.py
+new file mode 100644
+index 0000000..7e6012e
+--- /dev/null
++++ b/altair/vegalite/v2/tests/test_data_transformer_scopes.py
+@@ -0,0 +1,75 @@
++import pandas as pd
++import pytest
++
++import altair.vegalite.v2 as alt
++from altair.vegalite.data import MaxRowsError
++
++
++def test_codespec_transformer_options_reach_chart_serialization():
++    plugin_name = 'codespec_option_transformer'
++    data = pd.DataFrame({'x': [1, 2]})
++
++    def annotate(data, label, multiplier=1):
++        records = data.to_dict(orient='records')
++        return {
++            'values': [dict(row, label=label, x=row['x'] * multiplier)
++                       for row in records]
++        }
++
++    alt.data_transformers.register(plugin_name, annotate)
++    try:
++        with alt.data_transformers.enable(plugin_name,
++                                          label='scoped', multiplier=10):
++            values = alt.Chart(data).mark_point().to_dict()['data']['values']
++            assert values == [
++                {'x': 10, 'label': 'scoped'},
++                {'x': 20, 'label': 'scoped'},
++            ]
++            assert alt.data_transformers.active == plugin_name
++            assert alt.data_transformers.options == {
++                'label': 'scoped', 'multiplier': 10
++            }
++
++        restored = alt.Chart(data).mark_point().to_dict()['data']['values']
++        assert restored == [{'x': 1}, {'x': 2}]
++        assert alt.data_transformers.active == 'default'
++        assert alt.data_transformers.options == {}
++    finally:
++        alt.data_transformers.enable('default')
++        alt.data_transformers.register(plugin_name, None)
++
++
++def test_codespec_default_transformer_honors_limit_and_zero():
++    data = pd.DataFrame({'x': [1, 2, 3]})
++
++    with alt.data_transformers.enable('default', max_rows=3):
++        values = alt.Chart(data).mark_point().to_dict()['data']['values']
++        assert values == [{'x': 1}, {'x': 2}, {'x': 3}]
++
++    with alt.data_transformers.enable('default', max_rows=2):
++        with pytest.raises(MaxRowsError, match='greater than the max of 2'):
++            alt.Chart(data).mark_point().to_dict()
++
++    with alt.data_transformers.enable('default', max_rows=0):
++        empty = pd.DataFrame({'x': []})
++        assert alt.Chart(empty).mark_point().to_dict()['data']['values'] == []
++        with pytest.raises(MaxRowsError, match='greater than the max of 0'):
++            alt.Chart(data.iloc[:1]).mark_point().to_dict()
++
++
++def test_codespec_default_transformer_none_disables_limit_temporarily():
++    oversized = pd.DataFrame({'x': range(5001)})
++
++    with pytest.raises(MaxRowsError):
++        alt.Chart(oversized).mark_point().to_dict()
++
++    with alt.data_transformers.enable('default', max_rows=None):
++        values = alt.Chart(oversized).mark_point().to_dict()['data']['values']
++        assert len(values) == 5001
++        assert values[0] == {'x': 0}
++        assert values[-1] == {'x': 5000}
++
++    assert alt.data_transformers.active == 'default'
++    assert alt.data_transformers.options == {}
++    with pytest.raises(MaxRowsError):
++        alt.Chart(oversized).mark_point().to_dict()
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,8 @@
++#!/bin/bash
++set -euo pipefail
++
++pytest -q \
++  altair/utils/tests/test_plugin_registry_scopes.py \
++  altair/vegalite/v2/tests/test_data_transformer_scopes.py \
++  altair/vegalite/tests/test_data.py \
++  altair/vegalite/v2/tests/test_api.py

@@ -1,0 +1,268 @@
+diff --git a/proxyd/integration_tests/consensus_test.go b/proxyd/integration_tests/consensus_test.go
+index 687511841b..129a0f307e 100644
+--- a/proxyd/integration_tests/consensus_test.go
++++ b/proxyd/integration_tests/consensus_test.go
+@@ -3,6 +3,7 @@ package integration_tests
+ import (
+ 	"context"
+ 	"encoding/json"
++	"fmt"
+ 	"net/http"
+ 	"os"
+ 	"path"
+@@ -47,6 +48,7 @@ func TestConsensus(t *testing.T) {
+ 	ctx := context.Background()
+ 	svr, shutdown, err := proxyd.Start(config)
+ 	require.NoError(t, err)
++	client := NewProxydClient(fmt.Sprintf("http://127.0.0.1:%d", config.Server.RPCPort))
+ 	defer shutdown()
+ 
+ 	bg := svr.BackendGroups["node"]
+@@ -355,6 +357,75 @@ func TestConsensus(t *testing.T) {
+ 		// should resolve to 0x1, the highest common ancestor
+ 		require.Equal(t, "0x1", bg.Consensus.GetConsensusBlockNumber().String())
+ 	})
++
++	t.Run("load balancing should distribute across healthy consensus members", func(t *testing.T) {
++		h1.ResetOverrides()
++		h2.ResetOverrides()
++		bg.Consensus.Unban()
++
++		for _, be := range bg.Backends {
++			bg.Consensus.UpdateBackend(ctx, be)
++		}
++		bg.Consensus.UpdateBackendGroupConsensus(ctx)
++
++		require.Equal(t, 2, len(bg.Consensus.GetConsensusGroup()))
++
++		node1.Reset()
++		node2.Reset()
++
++		totalRequests := 80
++		for i := 0; i < totalRequests; i++ {
++			_, statusCode, err := client.SendRPC("eth_getBlockByNumber", []interface{}{"0x1", false})
++			require.NoError(t, err)
++			require.Equal(t, 200, statusCode)
++		}
++
++		node1Requests := len(node1.Requests())
++		node2Requests := len(node2.Requests())
++		msg := fmt.Sprintf("node1=%d node2=%d total=%d", node1Requests, node2Requests, totalRequests)
++
++		require.Greater(t, node1Requests, 0, msg)
++		require.Greater(t, node2Requests, 0, msg)
++		require.Less(t, node1Requests, totalRequests, msg)
++	})
++
++	t.Run("load balancing should not hit if node is not healthy", func(t *testing.T) {
++		h1.ResetOverrides()
++		h2.ResetOverrides()
++		bg.Consensus.Unban()
++
++
++
++		h1.AddOverride(&ms.MethodTemplate{
++			Method:   "net_peerCount",
++			Block:    "",
++			Response: buildPeerCountResponse(1),
++		})
++
++		for _, be := range bg.Backends {
++			bg.Consensus.UpdateBackend(ctx, be)
++		}
++		bg.Consensus.UpdateBackendGroupConsensus(ctx)
++
++		require.Equal(t, 1, len(bg.Consensus.GetConsensusGroup()))
++
++		node1.Reset()
++		node2.Reset()
++
++		totalRequests := 12
++		for i := 0; i < totalRequests; i++ {
++			_, statusCode, err := client.SendRPC("eth_getBlockByNumber", []interface{}{"0x1", false})
++			require.NoError(t, err)
++			require.Equal(t, 200, statusCode)
++		}
++
++		node1Requests := len(node1.Requests())
++		node2Requests := len(node2.Requests())
++		msg := fmt.Sprintf("node1=%d node2=%d total=%d", node1Requests, node2Requests, totalRequests)
++
++		require.Equal(t, 0, node1Requests, msg)
++		require.Greater(t, node2Requests, 0, msg)
++	})
+ }
+ 
+ func backend(bg *proxyd.BackendGroup, name string) *proxyd.Backend {
+diff --git a/proxyd/integration_tests/consensus_degraded_test.go b/proxyd/integration_tests/consensus_degraded_test.go
+new file mode 100644
+index 0000000000..a20421804a
+--- /dev/null
++++ b/proxyd/integration_tests/consensus_degraded_test.go
+@@ -0,0 +1,139 @@
++package integration_tests
++
++import (
++	"context"
++	"fmt"
++	"net/http"
++	"os"
++	"path"
++	"testing"
++	"time"
++
++	"github.com/ethereum-optimism/optimism/proxyd"
++	ms "github.com/ethereum-optimism/optimism/proxyd/tools/mockserver/handler"
++	"github.com/stretchr/testify/require"
++)
++
++func TestConsensusAwareRoutingPrefersNonDegradedBeforeDegradedFallback(t *testing.T) {
++	node1 := NewMockBackend(nil)
++	defer node1.Close()
++	node2 := NewMockBackend(nil)
++	defer node2.Close()
++
++	dir, err := os.Getwd()
++	require.NoError(t, err)
++
++	responses := path.Join(dir, "testdata/consensus_responses.yml")
++
++	h1 := ms.MockedHandler{
++		Overrides:    []*ms.MethodTemplate{},
++		Autoload:     true,
++		AutoloadFile: responses,
++	}
++	h2 := ms.MockedHandler{
++		Overrides:    []*ms.MethodTemplate{},
++		Autoload:     true,
++		AutoloadFile: responses,
++	}
++
++	require.NoError(t, os.Setenv("NODE1_URL", node1.URL()))
++	require.NoError(t, os.Setenv("NODE2_URL", node2.URL()))
++
++	node1.SetHandler(http.HandlerFunc(h1.Handler))
++	node2.SetHandler(http.HandlerFunc(h2.Handler))
++
++	config := ReadConfig("consensus")
++	ctx := context.Background()
++	svr, shutdown, err := proxyd.Start(config)
++	require.NoError(t, err)
++	defer shutdown()
++
++	client := NewProxydClient(fmt.Sprintf("http://127.0.0.1:%d", config.Server.RPCPort))
++
++	bg := svr.BackendGroups["node"]
++	require.NotNil(t, bg)
++	require.NotNil(t, bg.Consensus)
++	require.GreaterOrEqual(t, len(bg.Backends), 2)
++
++	h1.ResetOverrides()
++	h2.ResetOverrides()
++	bg.Consensus.Unban()
++
++	h1.AddOverride(&ms.MethodTemplate{
++		Method:   "net_peerCount",
++		Block:    "",
++		Response: buildPeerCountResponse(3),
++	})
++	h2.AddOverride(&ms.MethodTemplate{
++		Method:   "net_peerCount",
++		Block:    "",
++		Response: buildPeerCountResponse(3),
++	})
++
++	for _, be := range bg.Backends {
++		bg.Consensus.UpdateBackend(ctx, be)
++	}
++	bg.Consensus.UpdateBackendGroupConsensus(ctx)
++
++	require.Equal(t, 2, len(bg.Consensus.GetConsensusGroup()))
++
++	slowNode1EnoughToBeDegraded(t, node1, node2, &h1)
++
++	node1.Reset()
++	node2.Reset()
++
++	firstPhaseRequests := 8
++	for i := 0; i < firstPhaseRequests; i++ {
++		_, statusCode, err := client.SendRPC("eth_getBlockByNumber", []interface{}{"0x1", false})
++		require.NoError(t, err)
++		require.Equal(t, 200, statusCode)
++	}
++
++	node1FirstPhase := len(node1.Requests())
++	node2FirstPhase := len(node2.Requests())
++	msg := fmt.Sprintf("first phase node1(degraded)=%d node2(non-degraded)=%d", node1FirstPhase, node2FirstPhase)
++
++	require.Greater(t, node2FirstPhase, 0, msg)
++
++	h2.AddOverride(&ms.MethodTemplate{
++		Method:   "eth_getBlockByNumber",
++		Block:    "0x1",
++		Response: "",
++	})
++
++	for _, be := range bg.Backends {
++		bg.Consensus.UpdateBackend(ctx, be)
++	}
++	bg.Consensus.UpdateBackendGroupConsensus(ctx)
++
++	node1.Reset()
++	node2.Reset()
++
++	_, _, _ = client.SendRPC("eth_getBlockByNumber", []interface{}{"0x1", false})
++
++	node1Fallback := len(node1.Requests())
++	node2Fallback := len(node2.Requests())
++	msg = fmt.Sprintf("fallback phase node1(degraded)=%d node2(non-degraded)=%d", node1Fallback, node2Fallback)
++
++	require.Greater(t, node1Fallback, 0, msg)
++}
++
++func slowNode1EnoughToBeDegraded(t *testing.T, node1 *MockBackend, node2 *MockBackend, h1 *ms.MockedHandler) {
++	t.Helper()
++
++	originalHandler := http.HandlerFunc(h1.Handler)
++	node1.SetHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		time.Sleep(6 * time.Second)
++		originalHandler.ServeHTTP(w, r)
++	}))
++
++	directClient := NewProxydClient(node1.URL())
++	_, statusCode, err := directClient.SendRPC("eth_getBlockByNumber", []interface{}{"0x1", false})
++	require.NoError(t, err)
++	require.Equal(t, 200, statusCode)
++	require.Greater(t, len(node1.Requests()), 0)
++
++	node1.SetHandler(originalHandler)
++	node1.Reset()
++	node2.Reset()
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,22 @@
++#!/bin/bash
++set -uo pipefail
++cd /testbed
++
++case "${1:-}" in
++  base)
++    cd proxyd
++    if [ -f integration_tests/consensus_degraded_test.go ]; then
++      mv integration_tests/consensus_degraded_test.go integration_tests/consensus_degraded_test.go.fixturea-disabled
++      trap 'mv integration_tests/consensus_degraded_test.go.fixturea-disabled integration_tests/consensus_degraded_test.go' EXIT
++    fi
++    go test -v -run '^TestConsensus/(initial consensus|prevent using a backend with low peer count|prevent using a backend not in sync|advance consensus|broken consensus|broken consensus with depth 2|fork in advanced block)$' ./integration_tests/
++    ;;
++  new)
++    cd proxyd
++    go test -v -run '^(TestConsensus|TestConsensus/(load balancing should distribute across healthy consensus members|load balancing should not hit if node is not healthy)|TestConsensusAwareRoutingPrefersNonDegradedBeforeDegradedFallback)$' ./integration_tests/
++    ;;
++  *)
++    echo "usage: $0 base|new"
++    exit 2
++    ;;
++esac

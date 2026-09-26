@@ -1,0 +1,387 @@
+diff --git a/flocker/control/test/test_httpapi.py b/flocker/control/test/test_httpapi.py
+index 806837648..9d7258ac9 100644
+--- a/flocker/control/test/test_httpapi.py
++++ b/flocker/control/test/test_httpapi.py
+@@ -173,6 +173,304 @@ RealTestsAPI, MemoryTestsAPI = buildIntegrationTests(
+     VersionTestsMixin, "API", _build_app)
+ 
+ 
++class CreateContainerTestsMixin(APITestsMixin):
++    """
++    Black-box tests for creating container configuration through the HTTP API.
++    """
++    def _request_json(self, method, path, body, expected_code):
++        """
++        Issue a JSON request through the existing HTTP API test harness and
++        return a ``Deferred`` firing with the decoded response body.
++
++        This helper intentionally does not inspect route handlers, decorators,
++        schemas, or private helpers.
++        """
++        requesting = self.assertResponseCode(
++            method, path, body, expected_code)
++        requesting.addCallback(readBody)
++        requesting.addCallback(loads)
++        return requesting
++
++    def _applications_for_host(self, host):
++        """
++        Return the configured applications for ``host`` from the persisted
++        configuration.
++        """
++        deployment = self.persistence_service.get()
++        matching = [
++            node for node in deployment.nodes
++            if node.hostname == host
++        ]
++        if not matching:
++            return []
++        return list(matching[0].applications)
++
++    def _configured_applications_named(self, name):
++        """
++        Return all configured applications with the supplied public container
++        name, across all hosts.
++        """
++        deployment = self.persistence_service.get()
++        return [
++            application
++            for node in deployment.nodes
++            for application in node.applications
++            if application.name == name
++        ]
++
++    def _assert_application_present(self, host, name, image):
++        """
++        Assert that the persisted configuration contains a container with the
++        supplied public values on ``host``.
++        """
++        expected_image = DockerImage.from_string(image)
++        matches = [
++            application for application in self._applications_for_host(host)
++            if application.name == name and application.image == expected_image
++        ]
++        self.assertEqual(
++            len(matches), 1,
++            "Expected exactly one configured container named {!r} with image "
++            "{!r} on host {!r}; found {!r}".format(
++                name, image, host, self._applications_for_host(host)))
++
++    def _assert_duplicate_name_conflict(self, response_json):
++        """
++        Assert only the public error shape and duplicate-name semantics.
++        The exact prose is intentionally not locked down because the reference
++        patch's docs and implementation disagree on the full sentence.
++        """
++
++
++        self.assertIn(u"description", response_json)
++        self.assertNotIn(u"message", response_json)
++        self.assertTrue(isinstance(response_json[u"description"], unicode))
++        self.assertTrue(response_json[u"description"])
++
++    def test_create_container_response_echoes_request(self):
++        """
++        Creating a container returns 201 Created and echoes the public
++        host/name/image values from the request body.
++        """
++        container_json = {
++            u"host": self.NODE_B,
++            u"name": u"postgres",
++            u"image": u"postgres",
++        }
++        return self.assertResult(
++            b"POST", b"/configuration/containers",
++            container_json, CREATED, container_json)
++
++    def test_create_container_persists_on_requested_existing_host(self):
++        """
++        Creating a container on an existing host persists it on that host and
++        preserves unrelated existing configuration.
++        """
++        saving = self.persistence_service.save(Deployment(
++            nodes={
++                Node(
++                    hostname=self.NODE_A,
++                    applications=[
++                        Application(
++                            name=u"postgres",
++                            image=DockerImage.from_string(u"postgres")),
++                    ]),
++                Node(hostname=self.NODE_B),
++            }))
++
++        def saved(_):
++            return self.assertResponseCode(
++                b"POST", b"/configuration/containers",
++                {
++                    u"host": self.NODE_A,
++                    u"name": u"another_postgres",
++                    u"image": u"postgres:latest",
++                },
++                CREATED)
++        saving.addCallback(saved)
++
++        def created(_):
++            self._assert_application_present(
++                self.NODE_A, u"postgres", u"postgres")
++            self._assert_application_present(
++                self.NODE_A, u"another_postgres", u"postgres:latest")
++            self.assertEqual(
++                [],
++                [
++                    application for application
++                    in self._applications_for_host(self.NODE_B)
++                    if application.name == u"another_postgres"
++                ])
++        saving.addCallback(created)
++        return saving
++
++    def test_create_container_persists_on_new_host(self):
++        """
++        Creating a container for a host absent from the current configuration
++        persists a host entry containing that container.
++        """
++        d = self.assertResponseCode(
++            b"POST", b"/configuration/containers",
++            {
++                u"host": self.NODE_B,
++                u"name": u"redis_cache",
++                u"image": u"redis:latest",
++            },
++            CREATED)
++
++        def created(_):
++            self._assert_application_present(
++                self.NODE_B, u"redis_cache", u"redis:latest")
++        d.addCallback(created)
++        return d
++
++    def test_create_container_persists_arbitrary_public_values(self):
++        """
++        Container creation is not limited to the fixture hosts, names, and
++        images used by other tests.
++        """
++        host = u"198.51.100.7"
++        name = u"api_worker"
++        image = u"clusterhq/api-worker:1.2.3"
++        container_json = {
++            u"host": host,
++            u"name": name,
++            u"image": image,
++        }
++        d = self.assertResult(
++            b"POST", b"/configuration/containers",
++            container_json, CREATED, container_json)
++
++        def created(_):
++            self._assert_application_present(host, name, image)
++        d.addCallback(created)
++        return d
++
++    def test_duplicate_container_name_rejected_on_same_host(self):
++        """
++        A second container with an existing name is rejected on the same host,
++        even if another public field differs.
++        """
++        first = {
++            u"host": self.NODE_A,
++            u"name": u"postgres",
++            u"image": u"postgres",
++        }
++        second = {
++            u"host": self.NODE_A,
++            u"name": u"postgres",
++            u"image": u"postgres:alternate",
++        }
++        d = self.assertResponseCode(
++            b"POST", b"/configuration/containers", first, CREATED)
++
++        def created(_):
++            return self._request_json(
++                b"POST", b"/configuration/containers", second, CONFLICT)
++        d.addCallback(created)
++
++        def conflicted(response_json):
++            self._assert_duplicate_name_conflict(response_json)
++            self.assertEqual(
++                1, len(self._configured_applications_named(u"postgres")))
++        d.addCallback(conflicted)
++        return d
++
++    def test_duplicate_container_name_rejected_on_different_host(self):
++        """
++        Container names are unique across configured hosts, not merely within
++        the target host.
++        """
++        first = {
++            u"host": self.NODE_A,
++            u"name": u"web",
++            u"image": u"nginx",
++        }
++        second = {
++            u"host": self.NODE_B,
++            u"name": u"web",
++            u"image": u"redis",
++        }
++        d = self.assertResponseCode(
++            b"POST", b"/configuration/containers", first, CREATED)
++
++        def created(_):
++            return self._request_json(
++                b"POST", b"/configuration/containers", second, CONFLICT)
++        d.addCallback(created)
++
++        def conflicted(response_json):
++            self._assert_duplicate_name_conflict(response_json)
++            self.assertEqual(
++                1, len(self._configured_applications_named(u"web")))
++        d.addCallback(conflicted)
++        return d
++
++    def test_duplicate_container_name_rejected_when_existing_on_other_host_first(self):
++        """
++        Duplicate-name detection is global even when the existing container is
++        on a different host than the original fixture order.
++        """
++        first = {
++            u"host": self.NODE_B,
++            u"name": u"api_worker",
++            u"image": u"clusterhq/api-worker:1.0",
++        }
++        second = {
++            u"host": self.NODE_A,
++            u"name": u"api_worker",
++            u"image": u"clusterhq/api-worker:2.0",
++        }
++        d = self.assertResponseCode(
++            b"POST", b"/configuration/containers", first, CREATED)
++
++        def created(_):
++            return self._request_json(
++                b"POST", b"/configuration/containers", second, CONFLICT)
++        d.addCallback(created)
++
++        def conflicted(response_json):
++            self._assert_duplicate_name_conflict(response_json)
++            self.assertEqual(
++                1, len(self._configured_applications_named(u"api_worker")))
++        d.addCallback(conflicted)
++        return d
++
++    def test_duplicate_container_name_rejected_with_same_image(self):
++        """
++        Duplicate-name detection is by name, not by the full container body.
++        """
++        first = {
++            u"host": self.NODE_A,
++            u"name": u"same_image_worker",
++            u"image": u"redis:latest",
++        }
++        second = {
++            u"host": self.NODE_B,
++            u"name": u"same_image_worker",
++            u"image": u"redis:latest",
++        }
++        d = self.assertResponseCode(
++            b"POST", b"/configuration/containers", first, CREATED)
++
++        def created(_):
++            return self._request_json(
++                b"POST", b"/configuration/containers", second, CONFLICT)
++        d.addCallback(created)
++
++        def conflicted(response_json):
++            self._assert_duplicate_name_conflict(response_json)
++            self.assertEqual(
++                1,
++                len(self._configured_applications_named(u"same_image_worker")))
++        d.addCallback(conflicted)
++        return d
++
++
++RealTestsCreateContainer, MemoryTestsCreateContainer = buildIntegrationTests(
++    CreateContainerTestsMixin, "CreateContainer", _build_app)
++
++
+ class CreateDatasetTestsMixin(APITestsMixin):
+     """
+     Tests for the dataset creation endpoint at ``/configuration/datasets``.
+@@ -276,6 +574,42 @@ class CreateDatasetTestsMixin(APITestsMixin):
+         """
+         return self._dataset_id_collision_test(self.NODE_A, unicode.title)
+ 
++    def test_duplicate_dataset_id_conflict_uses_description_not_message(self):
++        """
++        Duplicate dataset_id conflicts keep returning 409 but use the standard
++        ``description`` error field instead of the older ``message`` field.
++        """
++        dataset_id = unicode(uuid4())
++        first_dataset = {
++            u"primary": self.NODE_A,
++            u"dataset_id": dataset_id,
++        }
++        second_dataset = {
++            u"primary": self.NODE_B,
++            u"dataset_id": dataset_id,
++        }
++        d = self.assertResponseCode(
++            b"POST", b"/configuration/datasets", first_dataset, CREATED)
++
++        def created(_):
++            requesting = self.assertResponseCode(
++                b"POST", b"/configuration/datasets",
++                second_dataset, CONFLICT)
++            requesting.addCallback(readBody)
++            requesting.addCallback(loads)
++            return requesting
++        d.addCallback(created)
++
++        def conflicted(response_json):
++
++
++            self.assertIn(u"description", response_json)
++            self.assertNotIn(u"message", response_json)
++            self.assertTrue(isinstance(response_json[u"description"], unicode))
++            self.assertTrue(response_json[u"description"])
++        d.addCallback(conflicted)
++        return d
++
+     def test_unknown_primary_node(self):
+         """
+         If a ``POST`` request made to the endpoint indicates a non-existent
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,30 @@
++#!/bin/bash
++set -uo pipefail
++cd /testbed
++
++
++
++set +u
++source .build_env/.venv/bin/activate
++set -u
++
++
++case "${1:-}" in
++  base)
++    python -m pytest \
++      flocker/control/test/test_schemas.py \
++      flocker/control/test/test_httpapi.py \
++      -v \
++      -k "not CreateContainer and not test_duplicate_dataset_id_conflict_uses_description_not_message"
++    ;;
++  new)
++    python -m pytest \
++      flocker/control/test/test_httpapi.py \
++      -v \
++      -k "CreateContainer or test_duplicate_dataset_id_conflict_uses_description_not_message"
++    ;;
++  *)
++    echo "usage: $0 base|new"
++    exit 2
++    ;;
++esac

@@ -1,0 +1,267 @@
+diff --git a/tests/common/archive_security_contract_test.py b/tests/common/archive_security_contract_test.py
+new file mode 100644
+index 00000000..2cb29984
+--- /dev/null
++++ b/tests/common/archive_security_contract_test.py
+@@ -0,0 +1,251 @@
++import io
++import os
++import stat
++import tarfile
++import zipfile
++from pathlib import Path
++
++import pytest
++
++from allennlp.common.checks import ConfigurationError
++from allennlp.common.file_utils import cached_path
++from allennlp.models.archival import CONFIG_NAME, archive_model, extracted_archive
++
++
++def _write_tar(path: Path, members) -> None:
++    with tarfile.open(str(path), "w:gz") as archive:
++        for member in members:
++            info = tarfile.TarInfo(member[0])
++            kind = member[1]
++            if kind == "file":
++                data = member[2].encode("utf-8")
++                info.size = len(data)
++                archive.addfile(info, io.BytesIO(data))
++            elif kind == "symlink":
++                info.type = tarfile.SYMTYPE
++                info.linkname = member[2]
++                archive.addfile(info)
++            elif kind == "hardlink":
++                info.type = tarfile.LNKTYPE
++                info.linkname = member[2]
++                archive.addfile(info)
++            elif kind == "fifo":
++                info.type = tarfile.FIFOTYPE
++                archive.addfile(info)
++            elif kind == "device":
++                info.type = tarfile.CHRTYPE
++                archive.addfile(info)
++            elif kind == "dir":
++                info.type = tarfile.DIRTYPE
++                archive.addfile(info)
++            else:
++                raise AssertionError("unknown test member kind")
++
++
++def _write_zip(path: Path, members) -> None:
++    with zipfile.ZipFile(str(path), "w") as archive:
++        for member in members:
++            name, kind, value = member
++            if kind == "file":
++                archive.writestr(name, value)
++            elif kind == "dir":
++                archive.writestr(name, "")
++            elif kind == "symlink":
++                info = zipfile.ZipInfo(name)
++                info.create_system = 3
++                info.external_attr = (stat.S_IFLNK | 0o777) << 16
++                archive.writestr(info, value)
++            else:
++                raise AssertionError("unknown test member kind")
++
++
++def _make_serialization_dir(path: Path) -> None:
++    path.mkdir()
++    (path / CONFIG_NAME).write_text("{}", encoding="utf-8")
++    (path / "best.th").write_bytes(b"weights")
++    vocabulary = path / "vocabulary"
++    vocabulary.mkdir()
++    (vocabulary / "tokens.txt").write_text("@@UNKNOWN@@\n", encoding="utf-8")
++
++
++def test_archive_safety_allows_regular_nested_tar_and_zip_content(tmp_path):
++    cache = tmp_path / "cache"
++    tar_path = tmp_path / "safe.tar.gz"
++    zip_path = tmp_path / "safe.zip"
++    members = [("nested/", "dir", ""), ("nested/data.txt", "file", "safe payload")]
++    _write_tar(tar_path, members)
++    _write_zip(zip_path, members)
++
++    for archive_path in (tar_path, zip_path):
++        extracted = Path(cached_path(archive_path, cache_dir=cache, extract_archive=True))
++        assert (extracted / "nested" / "data.txt").read_text(encoding="utf-8") == "safe payload"
++
++    with extracted_archive(tar_path) as extracted:
++        assert (Path(extracted) / "nested" / "data.txt").read_text(encoding="utf-8") == "safe payload"
++
++
++@pytest.mark.parametrize(
++    "archive_kind,member",
++    [
++        ("tar", ("../pathtest-escape/payload.txt", "file", "escaped")),
++        ("tar", ("link", "symlink", "target")),
++        ("tar", ("hard", "hardlink", "target")),
++        ("tar", ("pipe", "fifo", "")),
++        ("tar", ("device", "device", "")),
++        ("zip", ("../zip-escape.txt", "file", "escaped")),
++        ("zip", ("/absolute-zip.txt", "file", "escaped")),
++        ("zip", ("link", "symlink", "target")),
++    ],
++)
++def test_cached_path_rejects_unsafe_member_classes_without_publishing_output(
++    tmp_path, archive_kind, member
++):
++    cache = tmp_path / "cache"
++    archive_path = tmp_path / ("unsafe.tar.gz" if archive_kind == "tar" else "unsafe.zip")
++    writer = _write_tar if archive_kind == "tar" else _write_zip
++    writer(archive_path, [("ordinary.txt", "file", "ordinary"), member])
++
++    with pytest.raises(ValueError, match=member[0].replace(".", r"\.")):
++        cached_path(archive_path, cache_dir=cache, extract_archive=True)
++
++    assert not list(cache.glob("*-extracted"))
++    assert not list(cache.glob("*-extracted.json"))
++    assert not (cache / "pathtest-escape" / "payload.txt").exists()
++    assert not (cache / "zip-escape.txt").exists()
++
++
++def test_absolute_member_is_rejected_by_model_archive_extraction(tmp_path):
++    archive_path = tmp_path / "model.tar.gz"
++    escaped = tmp_path / "absolute-escape.txt"
++    _write_tar(
++        archive_path,
++        [("ordinary.txt", "file", "ordinary"), (str(escaped), "file", "escaped")],
++    )
++
++    with pytest.raises(ValueError) as cached_error:
++        cached_path(archive_path, cache_dir=tmp_path / "cache", extract_archive=True)
++    assert str(escaped) in str(cached_error.value)
++    assert not escaped.exists()
++
++    error = None
++    try:
++        with extracted_archive(archive_path):
++            pass
++    except ValueError as exc:
++        error = exc
++
++    assert error is not None
++    assert str(escaped) in str(error)
++    assert not escaped.exists()
++
++
++def test_force_extract_is_transactional_and_member_selector_is_confined(tmp_path):
++    cache = tmp_path / "cache"
++    archive_path = tmp_path / "replace.tar.gz"
++    _write_tar(archive_path, [("nested/data.txt", "file", "original")])
++    original_mtime = archive_path.stat().st_mtime_ns
++    extracted = Path(cached_path(archive_path, cache_dir=cache, extract_archive=True))
++    metadata = Path(str(extracted) + ".json")
++    assert metadata.is_file()
++
++    _write_tar(
++        archive_path,
++        [
++            ("replacement.txt", "file", "replacement"),
++            ("../escape.txt", "file", "escaped"),
++        ],
++    )
++    os.utime(str(archive_path), ns=(original_mtime, original_mtime))
++
++    with pytest.raises(ValueError, match="escape.txt"):
++        cached_path(archive_path, cache_dir=cache, extract_archive=True, force_extract=True)
++
++    assert (extracted / "nested" / "data.txt").read_text(encoding="utf-8") == "original"
++    assert metadata.is_file()
++    assert not (cache / "escape.txt").exists()
++
++    selector_archive = tmp_path / "selector.zip"
++    _write_zip(selector_archive, [("nested/data.txt", "file", "selected")])
++    selected = cached_path(
++        str(selector_archive) + "!nested/data.txt", cache_dir=cache, extract_archive=True
++    )
++    assert Path(selected).read_text(encoding="utf-8") == "selected"
++    secret = cache / "secret.txt"
++    secret.write_text("must not be selected", encoding="utf-8")
++    with pytest.raises(ValueError) as exc_info:
++        cached_path(str(selector_archive) + "!../secret.txt", cache_dir=cache, extract_archive=True)
++    assert "../secret.txt" in str(exc_info.value)
++
++
++def test_archive_model_confines_additional_content_and_preserves_globs(tmp_path):
++    serialization = tmp_path / "serialization"
++    _make_serialization_dir(serialization)
++    artifacts = serialization / "artifacts"
++    artifacts.mkdir()
++    (artifacts / "one.json").write_text("one", encoding="utf-8")
++    (artifacts / "two.json").write_text("two", encoding="utf-8")
++    outside = tmp_path / "outside.txt"
++    outside.write_text("outside", encoding="utf-8")
++
++    safe_archive = tmp_path / "safe-model.tar.gz"
++    archive_model(
++        serialization,
++        archive_path=safe_archive,
++        include_in_archive=["artifacts/*.json"],
++    )
++    with tarfile.open(str(safe_archive), "r:gz") as archive:
++        names = set(archive.getnames())
++    assert "artifacts/one.json" in names
++    assert "artifacts/two.json" in names
++
++    safe_directory_archive = tmp_path / "safe-directory-model.tar.gz"
++    archive_model(
++        serialization,
++        archive_path=safe_directory_archive,
++        include_in_archive=["artifacts"],
++    )
++    with tarfile.open(str(safe_directory_archive), "r:gz") as archive:
++        directory_names = set(archive.getnames())
++    assert "artifacts/one.json" in directory_names
++    assert "artifacts/two.json" in directory_names
++
++    unsafe_targets = [
++        "../outside.txt",
++        str(outside),
++        CONFIG_NAME,
++        "weights.th",
++        "best.th",
++        "vocabulary",
++    ]
++    for index, target in enumerate(unsafe_targets):
++        output_path = tmp_path / ("unsafe-%d.tar.gz" % index)
++        with pytest.raises(ConfigurationError, match=Path(target).name):
++            archive_model(
++                serialization,
++                archive_path=output_path,
++                include_in_archive=[target],
++            )
++        assert not output_path.exists()
++
++    link = artifacts / "linked.txt"
++    internal_link = artifacts / "internal-linked.json"
++    internal_link.symlink_to("one.json")
++    internal_link_output = tmp_path / "unsafe-internal-link.tar.gz"
++    with pytest.raises(ConfigurationError, match="internal-linked.json"):
++        archive_model(
++            serialization,
++            archive_path=internal_link_output,
++            include_in_archive=["artifacts"],
++        )
++    assert not internal_link_output.exists()
++    internal_link.unlink()
++
++    link.symlink_to(outside)
++    linked_output = tmp_path / "unsafe-link.tar.gz"
++    with pytest.raises(ConfigurationError, match="linked.txt"):
++        archive_model(
++            serialization,
++            archive_path=linked_output,
++            include_in_archive=["artifacts"],
++        )
++    assert not linked_output.exists()
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,5 @@
++#!/bin/bash
++set -euo pipefail
++
++
++./.venv/bin/pytest -q tests/common/archive_security_contract_test.py

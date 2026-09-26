@@ -1,0 +1,280 @@
+diff --git a/usercase-test-coderl/test_cardinality_rule_stateful.py b/usercase-test-coderl/test_cardinality_rule_stateful.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/test_cardinality_rule_stateful.py
+@@ -0,0 +1,252 @@
++import datetime
++
++import pytest
++
++from elastalert.ruletypes import CardinalityRule
++from elastalert.util import EAException
++
++
++BASE = datetime.datetime(2024, 1, 1, 12, 0, 0)
++TIMEFRAME = datetime.timedelta(minutes=10)
++
++
++def at(minutes=0, seconds=0):
++    return BASE + datetime.timedelta(minutes=minutes, seconds=seconds)
++
++
++def assert_one_match(rule):
++    assert len(rule.matches) == 1
++    return rule.matches[0]
++
++
++def assert_timestamp_equivalent(value, expected):
++    if isinstance(value, datetime.datetime):
++        actual = value
++    else:
++        actual = datetime.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
++    if actual.tzinfo is not None:
++        actual = actual.astimezone(datetime.timezone.utc).replace(tzinfo=None)
++    assert actual == expected
++
++
++def assert_cardinality_message(message, kind, threshold, field):
++    assert isinstance(message, str)
++    text = message.strip().lower()
++    assert text
++    assert str(threshold) in text
++    assert field.lower() in text
++    if kind == "max":
++        assert any(token in text for token in ("max", "maximum", "above", "greater", "higher", "exceed"))
++    else:
++        assert any(token in text for token in ("min", "minimum", "below", "less", "lower", "under"))
++    assert any(token in text for token in ("timeframe", "window", "between", "since", "minute", "hour"))
++
++
++def max_rules(**overrides):
++    rules = {
++        "max_cardinality": 4,
++        "timeframe": TIMEFRAME,
++        "cardinality_field": "user",
++        "timestamp_field": "@timestamp",
++    }
++    rules.update(overrides)
++    return rules
++
++
++def min_rules(**overrides):
++    rules = {
++        "min_cardinality": 4,
++        "timeframe": TIMEFRAME,
++        "cardinality_field": "user",
++        "timestamp_field": "@timestamp",
++    }
++    rules.update(overrides)
++    return rules
++
++
++def test_max_cardinality_session_alerts_only_on_fifth_distinct_value():
++
++
++
++    rule = CardinalityRule(max_rules())
++    assert rule.matches == []
++
++    for minute, user in enumerate(["bill", "coach", "zoey", "louis"]):
++        rule.add_data([{"@timestamp": at(minute), "user": user, "seq": minute}])
++        assert rule.matches == []
++
++    rule.add_data([{"@timestamp": at(4), "user": "coach", "seq": 4}])
++    assert rule.matches == []
++
++    rule.add_data([{"@timestamp": at(5), "user": "francis", "seq": 5}])
++
++    match = assert_one_match(rule)
++    assert match["user"] == "francis"
++    assert match["seq"] == 5
++    assert_timestamp_equivalent(match["@timestamp"], at(5))
++
++    assert_cardinality_message(rule.get_match_str(match), "max", 4, "user")
++
++
++def test_min_cardinality_session_waits_until_timeframe_elapsed():
++
++
++
++    rule = CardinalityRule(min_rules())
++    assert rule.matches == []
++
++    rule.add_data(
++        [
++            {"@timestamp": at(0), "user": "bill"},
++            {"@timestamp": at(1), "user": "coach"},
++        ]
++    )
++    assert rule.matches == []
++
++    rule.garbage_collect(at(10))
++    assert rule.matches == []
++
++    rule.garbage_collect(at(10, 1))
++
++    match = assert_one_match(rule)
++    assert_timestamp_equivalent(match["@timestamp"], at(10, 1))
++
++    assert_cardinality_message(rule.get_match_str(match), "min", 4, "user")
++
++
++def test_query_key_dotted_field_missing_values_and_duplicates_are_isolated():
++
++
++
++    rule = CardinalityRule(
++        max_rules(max_cardinality=2, cardinality_field="d.ip", query_key="user")
++    )
++    assert rule.matches == []
++
++    for event in [
++        {"@timestamp": at(0), "user": "zoey", "d": {"ip": "10.0.0.1"}, "seq": 1},
++        {"@timestamp": at(1), "user": "coach", "d": {"ip": "10.0.1.1"}, "seq": 2},
++        {"@timestamp": at(2), "user": "zoey", "d": {"ip": "10.0.0.2"}, "seq": 3},
++        {"@timestamp": at(3), "user": "coach", "d": {"ip": "10.0.1.1"}, "seq": 4},
++        {"@timestamp": at(4), "user": "coach", "seq": 5},
++        {"@timestamp": at(5), "user": "coach", "d": {"ip": "10.0.1.2"}, "seq": 6},
++    ]:
++        rule.add_data([event])
++        assert rule.matches == []
++
++    rule.add_data(
++        [{"@timestamp": at(6), "user": "coach", "d": {"ip": "10.0.1.3"}, "seq": 7}]
++    )
++
++    match = assert_one_match(rule)
++    assert match["user"] == "coach"
++    assert match["d"]["ip"] == "10.0.1.3"
++    assert_timestamp_equivalent(match["@timestamp"], at(6))
++
++    assert_cardinality_message(rule.get_match_str(match), "max", 2, "d.ip")
++
++
++def test_garbage_collect_expires_values_before_next_max_cardinality_window():
++
++
++
++    rule = CardinalityRule(max_rules(max_cardinality=2))
++    rule.add_data(
++        [
++            {"@timestamp": at(0), "user": "bill", "seq": 1},
++            {"@timestamp": at(1), "user": "coach", "seq": 2},
++        ]
++    )
++    assert rule.matches == []
++
++    rule.garbage_collect(at(12))
++    assert rule.matches == []
++
++    rule.add_data([{"@timestamp": at(12), "user": "zoey", "seq": 3}])
++    assert rule.matches == []
++    rule.add_data([{"@timestamp": at(13), "user": "louis", "seq": 4}])
++    assert rule.matches == []
++    rule.add_data([{"@timestamp": at(14), "user": "francis", "seq": 5}])
++
++    match = assert_one_match(rule)
++    assert match["user"] == "francis"
++    assert match["seq"] == 5
++    assert_timestamp_equivalent(match["@timestamp"], at(14))
++
++
++def test_constructor_requires_a_cardinality_threshold():
++
++
++
++    with pytest.raises(EAException) as excinfo:
++        CardinalityRule(
++            {
++                "timeframe": TIMEFRAME,
++                "cardinality_field": "user",
++                "timestamp_field": "@timestamp",
++            }
++        )
++
++
++    assert isinstance(excinfo.value, EAException)
++
++
++def test_repeated_garbage_collect_at_same_timestamp_is_idempotent():
++
++
++
++    rule = CardinalityRule(min_rules())
++    rule.add_data([{"@timestamp": at(0), "user": "bill"}])
++    assert rule.matches == []
++
++    rule.garbage_collect(at(11))
++
++    first_match = assert_one_match(rule)
++    assert_timestamp_equivalent(first_match["@timestamp"], at(11))
++
++    rule.garbage_collect(at(11))
++
++    assert rule.matches
++    assert_cardinality_message(rule.get_match_str(rule.matches[-1]), "min", 4, "user")
++
++
++def test_two_rule_instances_keep_independent_match_state():
++
++
++
++    first = CardinalityRule(max_rules(max_cardinality=2))
++    second = CardinalityRule(max_rules(max_cardinality=2))
++
++    first.add_data(
++        [
++            {"@timestamp": at(0), "user": "bill"},
++            {"@timestamp": at(0), "user": "coach"},
++            {"@timestamp": at(0), "user": "zoey"},
++        ]
++    )
++
++    first_match = assert_one_match(first)
++    assert first_match["user"] == "zoey"
++    assert_timestamp_equivalent(first_match["@timestamp"], at(0))
++    assert second.matches == []
++
++    second.add_data([{"@timestamp": at(0), "user": "bill"}])
++    assert second.matches == []
++
++
++def test_construct_add_collect_cycles_have_bounded_python_heap_growth():
++
++
++
++
++    for cycle in range(100):
++        rule = CardinalityRule(max_rules(max_cardinality=2))
++        rule.add_data(
++            [
++                {"@timestamp": at(0), "user": f"old-{cycle}-a"},
++                {"@timestamp": at(1), "user": f"old-{cycle}-b"},
++            ]
++        )
++        rule.garbage_collect(at(12))
++        rule.add_data([{"@timestamp": at(12), "user": f"fresh-{cycle}"}])
++        assert rule.matches == []
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,18 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
++export AWS_EC2_METADATA_DISABLED=true
++set -e
++cd /workspace/repo
++set -euo pipefail
++
++cd /workspace/repo
++
++exec /opt/stage4a-venv/bin/python -m pytest /workspace/repo/usercase-test-coderl/test_cardinality_rule_stateful.py -v

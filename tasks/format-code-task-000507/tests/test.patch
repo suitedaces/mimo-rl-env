@@ -1,0 +1,262 @@
+diff --git a/feature/cloudfront/sign/policy_test.go b/feature/cloudfront/sign/policy_test.go
+index 4273c242e18..fe320f70f95 100644
+--- a/feature/cloudfront/sign/policy_test.go
++++ b/feature/cloudfront/sign/policy_test.go
+@@ -154,3 +154,91 @@ func TestAWSEscape(t *testing.T) {
+ 		t.Errorf("expect: %s, actual: %s", expect, string(actual))
+ 	}
+ }
++
++
++
++func TestEncodePolicyPreservesAmpersand(t *testing.T) {
++	p := NewCannedPolicy("https://example.com/a?b=1&c=2", testTime)
++
++	_, jsonPolicy, err := encodePolicy(p)
++	if err != nil {
++		t.Fatalf("unexpected error, %#v", err)
++	}
++
++	expected := `{"Statement":[{"Resource":"https://example.com/a?b=1&c=2","Condition":{"DateLessThan":{"AWS:EpochTime":1257894000}}}]}`
++	if string(jsonPolicy) != expected {
++		t.Errorf("expected JSON to preserve ampersand literally\nexpect: %s\nactual: %s", expected, string(jsonPolicy))
++	}
++}
++
++
++
++func TestEncodePolicyPreservesHTMLChars(t *testing.T) {
++	p := NewCannedPolicy("https://example.com/a?x=<y>&z=1", testTime)
++
++	_, jsonPolicy, err := encodePolicy(p)
++	if err != nil {
++		t.Fatalf("unexpected error, %#v", err)
++	}
++
++	for _, forbidden := range []string{"\\u0026", "\\u003c", "\\u003e"} {
++		if strings.Contains(string(jsonPolicy), forbidden) {
++			t.Errorf("policy JSON should not contain escape %q, got: %s", forbidden, jsonPolicy)
++		}
++	}
++	for _, required := range []string{"<y>", "&z=1"} {
++		if !strings.Contains(string(jsonPolicy), required) {
++			t.Errorf("policy JSON should contain literal %q, got: %s", required, jsonPolicy)
++		}
++	}
++}
++
++
++
++func TestEncodePolicySimpleURLUnchanged(t *testing.T) {
++	p := NewCannedPolicy("https://example.com/a", testTime)
++
++	b64Policy, jsonPolicy, err := encodePolicy(p)
++	if err != nil {
++		t.Fatalf("unexpected error, %#v", err)
++	}
++
++	if string(jsonPolicy) != expectedJSONPolicy {
++		t.Errorf("simple URL JSON must be unchanged\nexpect: %s\nactual: %s", expectedJSONPolicy, jsonPolicy)
++	}
++	if string(b64Policy) != expectedB64Policy {
++		t.Errorf("simple URL b64 must be unchanged\nexpect: %s\nactual: %s", expectedB64Policy, b64Policy)
++	}
++}
++
++
++
++func TestEncodePolicyNoTrailingNewline(t *testing.T) {
++	p := NewCannedPolicy("https://example.com/a?b=1&c=2", testTime)
++
++	_, jsonPolicy, err := encodePolicy(p)
++	if err != nil {
++		t.Fatalf("unexpected error, %#v", err)
++	}
++
++	if len(jsonPolicy) == 0 {
++		t.Fatal("jsonPolicy was empty")
++	}
++	last := jsonPolicy[len(jsonPolicy)-1]
++	if last == '\n' || last == ' ' || last == '\r' || last == '\t' {
++		t.Errorf("policy JSON should not end with whitespace, got trailing byte %q in %s", last, jsonPolicy)
++	}
++}
++
++
++
++func TestCreateResourceHTTPSPreservesAmpersand(t *testing.T) {
++	in := "https://example.com/a?b=1&c=2"
++	out, err := CreateResource("https", in)
++	if err != nil {
++		t.Fatalf("unexpected error, %#v", err)
++	}
++	if out != in {
++		t.Errorf("CreateResource should return URL unchanged\nexpect: %s\nactual: %s", in, out)
++	}
++}
+diff --git a/feature/cloudfront/sign/sign_url_test.go b/feature/cloudfront/sign/sign_url_test.go
+index cc8702c01fa..37c23b1bb82 100644
+--- a/feature/cloudfront/sign/sign_url_test.go
++++ b/feature/cloudfront/sign/sign_url_test.go
+@@ -1,6 +1,12 @@
+ package sign
+ 
+ import (
++	"crypto"
++	"crypto/rsa"
++	"crypto/sha1"
++	"encoding/base64"
++	"fmt"
++	"net/url"
+ 	"strings"
+ 	"testing"
+ 	"time"
+@@ -137,3 +143,126 @@ func TestValidateURL(t *testing.T) {
+ 		}
+ 	}
+ }
++
++
++
++func reverseAwsEscape(s string) string {
++	return strings.NewReplacer("-", "+", "_", "=", "~", "/").Replace(s)
++}
++
++
++
++func expectedCannedPolicyJSON(resource string, expires time.Time) string {
++	return fmt.Sprintf(
++		`{"Statement":[{"Resource":"%s","Condition":{"DateLessThan":{"AWS:EpochTime":%d}}}]}`,
++		resource, expires.UTC().Unix(),
++	)
++}
++
++
++
++
++func TestSignURLMultipleQueryParamsSignatureValid(t *testing.T) {
++	privKey := unit.RSAPrivateKey
++	s := NewURLSigner("KeyID", privKey)
++
++	rawURL := "https://example.com/a?b=1&c=2"
++	signedURL, err := s.Sign(rawURL, testSignTime)
++	if err != nil {
++		t.Fatalf("unexpected error, %#v", err)
++	}
++
++
++	if !strings.Contains(signedURL, "?b=1&c=2&Expires=") {
++		t.Errorf("signed URL should preserve original query params, got: %s", signedURL)
++	}
++
++	parsed, err := url.Parse(signedURL)
++	if err != nil {
++		t.Fatalf("could not parse signed URL: %v", err)
++	}
++	b64Sig := parsed.Query().Get("Signature")
++	if b64Sig == "" {
++		t.Fatalf("no Signature parameter in signed URL: %s", signedURL)
++	}
++	sig, err := base64.StdEncoding.DecodeString(reverseAwsEscape(b64Sig))
++	if err != nil {
++		t.Fatalf("could not base64-decode signature: %v", err)
++	}
++
++	expectedJSON := expectedCannedPolicyJSON(rawURL, testSignTime)
++	hash := sha1.New()
++	hash.Write([]byte(expectedJSON))
++
++	if err := rsa.VerifyPKCS1v15(&privKey.PublicKey, crypto.SHA1, hash.Sum(nil), sig); err != nil {
++		t.Errorf("signature should verify against JSON policy with original URL preserved: %v\nexpected JSON: %s", err, expectedJSON)
++	}
++}
++
++
++func TestSignURLSingleQueryParamSignatureValid(t *testing.T) {
++	privKey := unit.RSAPrivateKey
++	s := NewURLSigner("KeyID", privKey)
++
++	rawURL := "https://example.com/a?b=1"
++	signedURL, err := s.Sign(rawURL, testSignTime)
++	if err != nil {
++		t.Fatalf("unexpected error, %#v", err)
++	}
++
++	parsed, err := url.Parse(signedURL)
++	if err != nil {
++		t.Fatalf("could not parse signed URL: %v", err)
++	}
++	b64Sig := parsed.Query().Get("Signature")
++	sig, err := base64.StdEncoding.DecodeString(reverseAwsEscape(b64Sig))
++	if err != nil {
++		t.Fatalf("could not base64-decode signature: %v", err)
++	}
++
++	expectedJSON := expectedCannedPolicyJSON(rawURL, testSignTime)
++	hash := sha1.New()
++	hash.Write([]byte(expectedJSON))
++
++	if err := rsa.VerifyPKCS1v15(&privKey.PublicKey, crypto.SHA1, hash.Sum(nil), sig); err != nil {
++		t.Errorf("signature should verify for single-param URL: %v", err)
++	}
++}
++
++
++
++func TestSignWithPolicyPreservesAmpersand(t *testing.T) {
++	privKey := unit.RSAPrivateKey
++	s := NewURLSigner("KeyID", privKey)
++
++	rawURL := "https://example.com/a?b=1&c=2"
++	policy := NewCannedPolicy(rawURL, testSignTime)
++
++	signedURL, err := s.SignWithPolicy(rawURL, policy)
++	if err != nil {
++		t.Fatalf("unexpected error, %#v", err)
++	}
++
++	parsed, err := url.Parse(signedURL)
++	if err != nil {
++		t.Fatalf("could not parse signed URL: %v", err)
++	}
++	b64Policy := parsed.Query().Get("Policy")
++	if b64Policy == "" {
++		t.Fatalf("no Policy parameter in signed URL: %s", signedURL)
++	}
++	jsonPolicy, err := base64.StdEncoding.DecodeString(reverseAwsEscape(b64Policy))
++	if err != nil {
++		t.Fatalf("could not base64-decode policy: %v", err)
++	}
++
++	if !strings.Contains(string(jsonPolicy), `"https://example.com/a?b=1&c=2"`) {
++		t.Errorf("decoded policy should contain literal original URL with &, got: %s", jsonPolicy)
++	}
++	if strings.Contains(string(jsonPolicy), "\\u0026") {
++		t.Errorf("decoded policy should not contain unicode-escaped ampersand, got: %s", jsonPolicy)
++	}
++	if strings.Contains(string(jsonPolicy), "%26") {
++		t.Errorf("decoded policy should not contain %%26 URL encoding, got: %s", jsonPolicy)
++	}
++}
+diff --git a/test_commands.json b/test_commands.json
+new file mode 100644
+index 00000000000..8a3289f92da
+--- /dev/null
++++ b/test_commands.json
+@@ -0,0 +1,3 @@
++{
++  "test_commands": ["cd feature/cloudfront/sign && go test -run 'TestEncodePolicy|TestEncodePolicyPreservesAmpersand|TestEncodePolicyPreservesHTMLChars|TestEncodePolicySimpleURLUnchanged|TestEncodePolicyNoTrailingNewline|TestCreateResourceHTTPSPreservesAmpersand|TestSignURLMultipleQueryParamsSignatureValid|TestSignURLSingleQueryParamSignatureValid|TestSignWithPolicyPreservesAmpersand|TestSignURL|TestCreateResource|TestSignEncodedPolicy|TestAWSEscape' ./..."]
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,8 @@
++#!/usr/bin/env bash
++
++set -uo pipefail
++cd /testbed
++rc=0
++cd feature/cloudfront/sign && go test -run 'TestEncodePolicy|TestEncodePolicyPreservesAmpersand|TestEncodePolicyPreservesHTMLChars|TestEncodePolicySimpleURLUnchanged|TestEncodePolicyNoTrailingNewline|TestCreateResourceHTTPSPreservesAmpersand|TestSignURLMultipleQueryParamsSignatureValid|TestSignURLSingleQueryParamSignatureValid|TestSignWithPolicyPreservesAmpersand|TestSignURL|TestCreateResource|TestSignEncodedPolicy|TestAWSEscape' ./...
++rc=$(( rc | $? ))
++exit $rc

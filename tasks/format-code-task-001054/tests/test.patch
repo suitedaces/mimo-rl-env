@@ -1,0 +1,326 @@
+diff --git a/client/codespec_mutation_api_test.go b/client/codespec_mutation_api_test.go
+new file mode 100644
+index 000000000..14cf22da9
+--- /dev/null
++++ b/client/codespec_mutation_api_test.go
+@@ -0,0 +1,305 @@
++package client_test
++
++import (
++	"errors"
++	"io/ioutil"
++	"net/http"
++	"net/url"
++	"reflect"
++	"testing"
++	"time"
++
++	"github.com/coreos/etcd/Godeps/_workspace/src/golang.org/x/net/context"
++	"github.com/coreos/etcd/client"
++)
++
++type codespecRecordingHTTPClient struct {
++	endpoint url.URL
++	requests []*http.Request
++	status   int
++	header   http.Header
++	body     []byte
++	err      error
++}
++
++func newCodespecRecordingHTTPClient() *codespecRecordingHTTPClient {
++	return &codespecRecordingHTTPClient{
++		endpoint: url.URL{Scheme: "https", Host: "example.test", Path: "/gateway"},
++		status:   http.StatusOK,
++		header:   make(http.Header),
++		body:     []byte(`{"action":"set","node":{"key":"/alpha beta","value":"stored","modifiedIndex":9,"createdIndex":3}}`),
++	}
++}
++
++func (c *codespecRecordingHTTPClient) Do(_ context.Context, action client.HTTPAction) (*http.Response, []byte, error) {
++	if c.err != nil {
++		return nil, nil, c.err
++	}
++	req := action.HTTPRequest(c.endpoint)
++	c.requests = append(c.requests, req)
++	return &http.Response{StatusCode: c.status, Header: c.header}, c.body, nil
++}
++
++type codespecPutAPI interface {
++	Set(context.Context, string, string, time.Duration) (*client.Response, error)
++	Update(context.Context, string, string, time.Duration) (*client.Response, error)
++}
++
++type codespecDeleteAPI interface {
++	Delete(context.Context, string, bool) (*client.Response, error)
++}
++
++type codespecCompareAPI interface {
++	CompareAndSwap(context.Context, string, string, time.Duration, string, uint64) (*client.Response, error)
++	CompareAndDelete(context.Context, string, string, uint64) (*client.Response, error)
++}
++
++func TestCodespecMutationMethodsArePublic(t *testing.T) {
++	apiType := reflect.TypeOf((*client.KeysAPI)(nil)).Elem()
++	for _, name := range []string{"Set", "Update", "Delete", "CompareAndSwap", "CompareAndDelete"} {
++		if _, ok := apiType.MethodByName(name); !ok {
++			t.Errorf("client.KeysAPI is missing public method %s", name)
++		}
++	}
++}
++
++func TestCodespecSetAndUpdateRequests(t *testing.T) {
++	recorder := newCodespecRecordingHTTPClient()
++	recorder.header.Set("X-Etcd-Index", "41")
++	api, ok := client.NewKeysAPI(recorder).(codespecPutAPI)
++	if !ok {
++		t.Fatal("NewKeysAPI result does not implement Set and Update")
++	}
++
++	resp, err := api.Set(context.Background(), "/alpha beta", "hello world", -time.Second)
++	if err != nil {
++		t.Fatalf("Set returned error: %v", err)
++	}
++	if resp == nil || resp.Action != "set" || resp.Index != 41 || resp.Node == nil || resp.Node.Value != "stored" {
++		t.Fatalf("Set response = %#v, want decoded HTTP response", resp)
++	}
++	if len(recorder.requests) != 1 {
++		t.Fatalf("Set issued %d requests, want 1", len(recorder.requests))
++	}
++	assertCodespecRequest(t, recorder.requests[0], "PUT", "/gateway/v2/keys/alpha beta", url.Values{}, url.Values{"value": {"hello world"}})
++
++	resp, err = api.Update(context.Background(), "alpha beta", "replacement", 0)
++	if err != nil {
++		t.Fatalf("Update returned error: %v", err)
++	}
++	if resp.Index != 41 {
++		t.Fatalf("Update response index = %d, want 41", resp.Index)
++	}
++	if len(recorder.requests) != 2 {
++		t.Fatalf("Update issued %d total requests, want 2", len(recorder.requests))
++	}
++	assertCodespecRequest(t, recorder.requests[1], "PUT", "/gateway/v2/keys/alpha beta", url.Values{"prevExist": {"true"}}, url.Values{"value": {"replacement"}, "ttl": {"0"}})
++}
++
++func TestCodespecDeleteRecursiveModes(t *testing.T) {
++	recorder := newCodespecRecordingHTTPClient()
++	recorder.header.Set("X-Etcd-Index", "41")
++	api, ok := client.NewKeysAPI(recorder).(codespecDeleteAPI)
++	if !ok {
++		t.Fatal("NewKeysAPI result does not implement Delete")
++	}
++
++	for _, recursive := range []bool{false, true} {
++		resp, err := api.Delete(context.Background(), "/tree/item", recursive)
++		if err != nil {
++			t.Fatalf("Delete(%t) returned error: %v", recursive, err)
++		}
++		assertCodespecDecodedResponse(t, resp, "Delete")
++	}
++	if len(recorder.requests) != 2 {
++		t.Fatalf("Delete issued %d requests, want 2", len(recorder.requests))
++	}
++	assertCodespecRequest(t, recorder.requests[0], "DELETE", "/gateway/v2/keys/tree/item", url.Values{"recursive": {"false"}}, nil)
++	assertCodespecRequest(t, recorder.requests[1], "DELETE", "/gateway/v2/keys/tree/item", url.Values{"recursive": {"true"}}, nil)
++}
++
++func TestCodespecCompareAndSwapConditions(t *testing.T) {
++	recorder := newCodespecRecordingHTTPClient()
++	recorder.header.Set("X-Etcd-Index", "41")
++	api, ok := client.NewKeysAPI(recorder).(codespecCompareAPI)
++	if !ok {
++		t.Fatal("NewKeysAPI result does not implement compare operations")
++	}
++
++	resp, err := api.CompareAndSwap(context.Background(), "/item", "new", 2500*time.Millisecond, "old value", 0)
++	if err != nil {
++		t.Fatalf("CompareAndSwap with prevValue returned error: %v", err)
++	}
++	assertCodespecDecodedResponse(t, resp, "CompareAndSwap")
++	if len(recorder.requests) != 1 {
++		t.Fatalf("CompareAndSwap issued %d requests after prevValue case, want 1", len(recorder.requests))
++	}
++	assertCodespecRequest(t, recorder.requests[0], "PUT", "/gateway/v2/keys/item", url.Values{"prevValue": {"old value"}}, url.Values{"value": {"new"}, "ttl": {"2"}})
++
++	resp, err = api.CompareAndSwap(context.Background(), "/item", "newer", -time.Second, "", 17)
++	if err != nil {
++		t.Fatalf("CompareAndSwap with prevIndex returned error: %v", err)
++	}
++	assertCodespecDecodedResponse(t, resp, "CompareAndSwap")
++	if len(recorder.requests) != 2 {
++		t.Fatalf("CompareAndSwap issued %d total requests, want 2", len(recorder.requests))
++	}
++	assertCodespecRequest(t, recorder.requests[1], "PUT", "/gateway/v2/keys/item", url.Values{"prevIndex": {"17"}}, url.Values{"value": {"newer"}})
++
++	resp, err = api.CompareAndSwap(context.Background(), "/item", "newest", -time.Second, "oldest", 19)
++	if err != nil {
++		t.Fatalf("CompareAndSwap with both conditions returned error: %v", err)
++	}
++	assertCodespecDecodedResponse(t, resp, "CompareAndSwap")
++	if len(recorder.requests) != 3 {
++		t.Fatalf("CompareAndSwap issued %d total requests, want 3", len(recorder.requests))
++	}
++	assertCodespecRequest(t, recorder.requests[2], "PUT", "/gateway/v2/keys/item", url.Values{"prevIndex": {"19"}, "prevValue": {"oldest"}}, url.Values{"value": {"newest"}})
++}
++
++func TestCodespecCompareAndDeleteConditions(t *testing.T) {
++	recorder := newCodespecRecordingHTTPClient()
++	recorder.header.Set("X-Etcd-Index", "41")
++	api, ok := client.NewKeysAPI(recorder).(codespecCompareAPI)
++	if !ok {
++		t.Fatal("NewKeysAPI result does not implement compare operations")
++	}
++
++	resp, err := api.CompareAndDelete(context.Background(), "/item", "old & value", 0)
++	if err != nil {
++		t.Fatalf("CompareAndDelete with prevValue returned error: %v", err)
++	}
++	assertCodespecDecodedResponse(t, resp, "CompareAndDelete")
++	if len(recorder.requests) != 1 {
++		t.Fatalf("CompareAndDelete issued %d requests after prevValue case, want 1", len(recorder.requests))
++	}
++	assertCodespecRequest(t, recorder.requests[0], "DELETE", "/gateway/v2/keys/item", url.Values{"prevValue": {"old & value"}}, nil)
++
++	resp, err = api.CompareAndDelete(context.Background(), "/item", "", 23)
++	if err != nil {
++		t.Fatalf("CompareAndDelete with prevIndex returned error: %v", err)
++	}
++	assertCodespecDecodedResponse(t, resp, "CompareAndDelete")
++	if len(recorder.requests) != 2 {
++		t.Fatalf("CompareAndDelete issued %d total requests, want 2", len(recorder.requests))
++	}
++	assertCodespecRequest(t, recorder.requests[1], "DELETE", "/gateway/v2/keys/item", url.Values{"prevIndex": {"23"}}, nil)
++
++	resp, err = api.CompareAndDelete(context.Background(), "/item", "old", 29)
++	if err != nil {
++		t.Fatalf("CompareAndDelete with both conditions returned error: %v", err)
++	}
++	assertCodespecDecodedResponse(t, resp, "CompareAndDelete")
++	if len(recorder.requests) != 3 {
++		t.Fatalf("CompareAndDelete issued %d total requests, want 3", len(recorder.requests))
++	}
++	assertCodespecRequest(t, recorder.requests[2], "DELETE", "/gateway/v2/keys/item", url.Values{"prevIndex": {"29"}, "prevValue": {"old"}}, nil)
++}
++
++func TestCodespecCompareRequiresConditionBeforeIO(t *testing.T) {
++	recorder := newCodespecRecordingHTTPClient()
++	api, ok := client.NewKeysAPI(recorder).(codespecCompareAPI)
++	if !ok {
++		t.Fatal("NewKeysAPI result does not implement compare operations")
++	}
++
++	if _, err := api.CompareAndSwap(context.Background(), "/item", "new", -time.Second, "", 0); err == nil {
++		t.Error("CompareAndSwap without a condition returned nil error")
++	}
++	if _, err := api.CompareAndDelete(context.Background(), "/item", "", 0); err == nil {
++		t.Error("CompareAndDelete without a condition returned nil error")
++	}
++	if len(recorder.requests) != 0 {
++		t.Fatalf("condition validation issued %d HTTP requests, want 0", len(recorder.requests))
++	}
++}
++
++func TestCodespecMutationErrorsPropagate(t *testing.T) {
++	sentinel := errors.New("transport failed")
++	operations := []struct {
++		name string
++		call func(client.KeysAPI) error
++	}{
++		{"Set", func(api client.KeysAPI) error {
++			_, err := api.(codespecPutAPI).Set(context.Background(), "/item", "new", -time.Second)
++			return err
++		}},
++		{"Update", func(api client.KeysAPI) error {
++			_, err := api.(codespecPutAPI).Update(context.Background(), "/item", "new", -time.Second)
++			return err
++		}},
++		{"Delete", func(api client.KeysAPI) error {
++			_, err := api.(codespecDeleteAPI).Delete(context.Background(), "/item", false)
++			return err
++		}},
++		{"CompareAndSwap", func(api client.KeysAPI) error {
++			_, err := api.(codespecCompareAPI).CompareAndSwap(context.Background(), "/item", "new", -time.Second, "old", 0)
++			return err
++		}},
++		{"CompareAndDelete", func(api client.KeysAPI) error {
++			_, err := api.(codespecCompareAPI).CompareAndDelete(context.Background(), "/item", "old", 0)
++			return err
++		}},
++	}
++	for _, operation := range operations {
++		recorder := newCodespecRecordingHTTPClient()
++		api := client.NewKeysAPI(recorder)
++		_, hasPut := api.(codespecPutAPI)
++		_, hasDelete := api.(codespecDeleteAPI)
++		_, hasCompare := api.(codespecCompareAPI)
++		if !hasPut || !hasDelete || !hasCompare {
++			t.Fatal("NewKeysAPI result does not implement mutation operations")
++		}
++		recorder.status = http.StatusNotFound
++		if err := operation.call(api); err != client.ErrKeyNoExist {
++			t.Errorf("%s 404 error = %v, want %v", operation.name, err, client.ErrKeyNoExist)
++		}
++
++		recorder = newCodespecRecordingHTTPClient()
++		recorder.err = sentinel
++		api = client.NewKeysAPI(recorder)
++		if err := operation.call(api); err != sentinel {
++			t.Errorf("%s transport error = %v, want sentinel", operation.name, err)
++		}
++	}
++}
++
++func assertCodespecRequest(t *testing.T, req *http.Request, method, wantPath string, wantQuery, wantForm url.Values) {
++	t.Helper()
++	if req == nil {
++		t.Fatal("HTTPRequest returned nil")
++	}
++	if req.Method != method || req.URL.Path != wantPath {
++		t.Errorf("request = %s %s, want %s %s", req.Method, req.URL.Path, method, wantPath)
++	}
++	if !reflect.DeepEqual(req.URL.Query(), wantQuery) {
++		t.Errorf("query = %#v, want %#v", req.URL.Query(), wantQuery)
++	}
++	if wantForm == nil {
++		if req.Body != nil {
++			t.Error("request body is present, want none")
++		}
++		return
++	}
++	if got := req.Header.Get("Content-Type"); got != "application/x-www-form-urlencoded" {
++		t.Errorf("Content-Type = %q, want form encoding", got)
++	}
++	body, err := ioutil.ReadAll(req.Body)
++	if err != nil {
++		t.Fatalf("reading request body: %v", err)
++	}
++	gotForm, err := url.ParseQuery(string(body))
++	if err != nil {
++		t.Fatalf("parsing request body: %v", err)
++	}
++	if !reflect.DeepEqual(gotForm, wantForm) {
++		t.Errorf("form = %#v, want %#v", gotForm, wantForm)
++	}
++}
++
++func assertCodespecDecodedResponse(t *testing.T, resp *client.Response, operation string) {
++	t.Helper()
++	if resp == nil || resp.Index != 41 || resp.Node == nil || resp.Node.Value != "stored" {
++		t.Fatalf("%s response = %#v, want decoded HTTP response", operation, resp)
++	}
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,10 @@
++#!/bin/bash
++set -euo pipefail
++
++
++REPO_ROOT="$(git rev-parse --show-toplevel)"
++mkdir -p "${REPO_ROOT}/gopath/src/github.com/coreos"
++ln -sfn "${REPO_ROOT}" "${REPO_ROOT}/gopath/src/github.com/coreos/etcd"
++GO111MODULE=off \
++  GOPATH="${REPO_ROOT}/gopath:${REPO_ROOT}/Godeps/_workspace" \
++  go test github.com/coreos/etcd/client -run '^TestCodespec' -count=1

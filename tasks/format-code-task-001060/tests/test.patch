@@ -1,0 +1,299 @@
+diff --git a/packages/hw-transport-mocker/tests/orderedTranscript.codespec.test.js b/packages/hw-transport-mocker/tests/orderedTranscript.codespec.test.js
+new file mode 100644
+index 00000000..8df5cf8a
+--- /dev/null
++++ b/packages/hw-transport-mocker/tests/orderedTranscript.codespec.test.js
+@@ -0,0 +1,283 @@
++
++
++jest.mock(
++  "@ledgerhq/hw-transport",
++  () => require("../../hw-transport/src/Transport").default,
++  { virtual: true }
++);
++
++const {
++  RecordStore,
++  createTransportRecorder,
++  createTransportReplayer
++} = require("../src");
++
++const hex = value => Buffer.from(value, "hex");
++
++const deferred = () => {
++  let resolve;
++  const promise = new Promise(r => {
++    resolve = r;
++  });
++  return { promise, resolve };
++};
++
++test("codespec transcript consumes duplicate and distinct APDUs in exact order", () => {
++  const store = new RecordStore();
++  store.recordExchange(hex("e001"), hex("019000"));
++  store.recordExchange(hex("e001"), hex("029000"));
++  store.recordExchange(hex("e002"), hex("039000"));
++
++  expect(store.remaining()).toBe(3);
++  expect(store.reverseExchange(hex("e001"))).toEqual(hex("019000"));
++  expect(store.remaining()).toBe(2);
++  expect(store.reverseExchange(hex("e001"))).toEqual(hex("029000"));
++  expect(store.reverseExchange(hex("e002"))).toEqual(hex("039000"));
++  expect(store.remaining()).toBe(0);
++});
++
++test("codespec a mismatch reports both APDUs without consuming the record", () => {
++  const store = new RecordStore();
++  store.recordExchange(hex("e001"), hex("019000"));
++  store.recordExchange(hex("e002"), hex("029000"));
++
++  let mismatch;
++  try {
++    store.reverseExchange(hex("e002"));
++  } catch (e) {
++    mismatch = e;
++  }
++  expect(Boolean(mismatch)).toBe(true);
++  expect(mismatch instanceof Error).toBe(true);
++  expect(mismatch.message).toMatch(/expected/i);
++  expect(mismatch.message).toContain("e001");
++  expect(mismatch.message).toMatch(/received/i);
++  expect(mismatch.message).toContain("e002");
++  expect(store.remaining()).toBe(2);
++  expect(store.reverseExchange(hex("e001"))).toEqual(hex("019000"));
++});
++
++test("codespec exhaustion is stable and reset rewinds the transcript", () => {
++  const store = new RecordStore();
++  store.recordExchange(hex("e001"), hex("019000"));
++  expect(store.reverseExchange(hex("e001"))).toEqual(hex("019000"));
++
++  let exhausted;
++  try {
++    store.reverseExchange(hex("e001"));
++  } catch (e) {
++    exhausted = e;
++  }
++  expect(Boolean(exhausted)).toBe(true);
++  expect(exhausted instanceof Error).toBe(true);
++  expect(exhausted.message).toMatch(/exhausted/i);
++  expect(exhausted.message).toContain("e001");
++  expect(store.remaining()).toBe(0);
++
++  store.reset();
++  expect(store.remaining()).toBe(1);
++  expect(store.reverseExchange(hex("e001"))).toEqual(hex("019000"));
++});
++
++test("codespec transcript serialization includes full history but not cursor state", () => {
++  const store = new RecordStore();
++  store.recordExchange(hex("aa"), hex("119000"));
++  store.recordExchange(hex("aa"), hex("229000"));
++  store.reverseExchange(hex("aa"));
++
++  expect(store.toObject()).toEqual({
++    records: [
++      { apdu: "aa", out: "119000" },
++      { apdu: "aa", out: "229000" }
++    ]
++  });
++});
++
++test("codespec transcript buffers and serialized objects are defensive copies", () => {
++  const store = new RecordStore();
++  store.recordExchange(hex("aa"), hex("119000"));
++  const returned = store.reverseExchange(hex("aa"));
++  returned[0] = 0xff;
++
++  const serialized = store.toObject();
++  serialized.records[0].out = "ffff";
++  store.reset();
++  expect(store.reverseExchange(hex("aa"))).toEqual(hex("119000"));
++});
++
++test("codespec record snapshots import at the beginning without retaining caller data", () => {
++  const input = {
++    records: [
++      { apdu: "bb", out: "339000" },
++      { apdu: "bb", out: "449000" }
++    ]
++  };
++  const restored = RecordStore.fromObject(input);
++  input.records[0].out = "ffff";
++  expect(restored.remaining()).toBe(2);
++  expect(restored.reverseExchange(hex("bb"))).toEqual(hex("339000"));
++  expect(restored.toObject()).toEqual({
++    records: [
++      { apdu: "bb", out: "339000" },
++      { apdu: "bb", out: "449000" }
++    ]
++  });
++});
++
++test("codespec legacy cache snapshots retain keyed repeatable replay", () => {
++  const restored = RecordStore.fromObject({
++    cache: {
++      "01": "aa9000",
++      "02": "bb9000"
++    }
++  });
++
++  expect(restored.remaining()).toBe(null);
++  expect(restored.reverseExchange(hex("02"))).toEqual(hex("bb9000"));
++  expect(restored.reverseExchange(hex("01"))).toEqual(hex("aa9000"));
++  expect(restored.reverseExchange(hex("02"))).toEqual(hex("bb9000"));
++  restored.reset();
++  expect(restored.reverseExchange(hex("01"))).toEqual(hex("aa9000"));
++  expect(restored.toObject()).toEqual({
++    cache: {
++      "01": "aa9000",
++      "02": "bb9000"
++    }
++  });
++});
++
++test("codespec malformed snapshots remain rejected", () => {
++  expect(() => RecordStore.fromObject({})).toThrow(/invalid json/i);
++});
++
++test("codespec each opened replayer owns an independent replay session", async () => {
++  const store = new RecordStore();
++  store.recordExchange(hex("e010"), hex("019000"));
++  store.recordExchange(hex("e010"), hex("029000"));
++  store.reverseExchange(hex("e010"));
++  const Replayer = createTransportReplayer(store);
++
++  const first = await Replayer.open();
++  const second = await Replayer.open();
++
++  expect(await first.exchange(hex("e010"))).toEqual(hex("019000"));
++  expect(await first.exchange(hex("e010"))).toEqual(hex("029000"));
++  expect(await second.exchange(hex("e010"))).toEqual(hex("019000"));
++  expect(store.remaining()).toBe(1);
++
++  const mutable = await second.exchange(hex("e010"));
++  mutable[0] = 0xff;
++  const third = await Replayer.open();
++  expect(await third.exchange(hex("e010"))).toEqual(hex("019000"));
++  expect(await third.exchange(hex("e010"))).toEqual(hex("029000"));
++});
++
++test("codespec replayer mismatch rejects without advancing its session", async () => {
++  const store = new RecordStore();
++  store.recordExchange(hex("e010"), hex("019000"));
++  const Replayer = createTransportReplayer(store);
++  const replayer = await Replayer.open();
++
++  let mismatch;
++  try {
++    await replayer.exchange(hex("e011"));
++  } catch (e) {
++    mismatch = e;
++  }
++  expect(Boolean(mismatch)).toBe(true);
++  expect(mismatch instanceof Error).toBe(true);
++  expect(mismatch.message).toMatch(/expected/i);
++  expect(mismatch.message).toContain("e010");
++  expect(mismatch.message).toMatch(/received/i);
++  expect(mismatch.message).toContain("e011");
++  expect(await replayer.exchange(hex("e010"))).toEqual(hex("019000"));
++});
++
++test("codespec recorder preserves invocation order when responses settle out of order", async () => {
++  const pending = [];
++  const underlying = {
++    exchange: jest.fn(() => {
++      const item = deferred();
++      pending.push(item);
++      return item.promise;
++    }),
++    close: () => {
++      underlying.closed = true;
++      return Promise.resolve();
++    },
++    closed: false
++  };
++  class FakeTransport {
++    static isSupported = () => Promise.resolve(true);
++    static list = () => Promise.resolve(["device"]);
++    static listen = observer => ({ observer, unsubscribe: () => {} });
++    static open = () => Promise.resolve(underlying);
++  }
++
++  const store = new RecordStore();
++  const Recorder = createTransportRecorder(FakeTransport, store);
++  const recorder = await Recorder.open("device");
++  const first = recorder.exchange(hex("e02001"));
++  const second = recorder.exchange(hex("e02002"));
++
++  pending[1].resolve(hex("229000"));
++  expect(await second).toEqual(hex("229000"));
++  pending[0].resolve(hex("119000"));
++  expect(await first).toEqual(hex("119000"));
++
++  expect(store.toObject()).toEqual({
++    records: [
++      { apdu: "e02001", out: "119000" },
++      { apdu: "e02002", out: "229000" }
++    ]
++  });
++});
++
++test("codespec recorder snapshots APDU bytes when exchange is invoked", async () => {
++  const pending = deferred();
++  class FakeTransport {
++    static open = () =>
++      Promise.resolve({
++        exchange: () => pending.promise,
++        close: () => Promise.resolve()
++      });
++  }
++
++  const store = new RecordStore();
++  const Recorder = createTransportRecorder(FakeTransport, store);
++  const recorder = await Recorder.open();
++  const apdu = hex("e03001");
++  const exchange = recorder.exchange(apdu);
++  apdu[2] = 0xff;
++  pending.resolve(hex("339000"));
++  expect(await exchange).toEqual(hex("339000"));
++  expect(store.toObject()).toEqual({
++    records: [{ apdu: "e03001", out: "339000" }]
++  });
++});
++
++test("codespec recorder retains the decorated transport facade", async () => {
++  const underlying = {
++    exchange: () => Promise.resolve(hex("9000")),
++    close: () => {
++      underlying.closed = true;
++      return Promise.resolve();
++    },
++    closed: false
++  };
++  class FakeTransport {
++    static isSupported = () => Promise.resolve(true);
++    static list = () => Promise.resolve(["device"]);
++    static listen = observer => ({ observer, unsubscribe: () => {} });
++    static open = () => Promise.resolve(underlying);
++  }
++
++  const Recorder = createTransportRecorder(FakeTransport, new RecordStore());
++  const recorder = await Recorder.open("device");
++  expect(await Recorder.isSupported()).toBe(true);
++  expect(await Recorder.list()).toEqual(["device"]);
++  const observer = {};
++  expect(Recorder.listen(observer).observer).toBe(observer);
++  await recorder.close();
++  expect(underlying.closed).toBe(true);
++});
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,5 @@
++#!/bin/bash
++set -euo pipefail
++
++
++./node_modules/.bin/jest --runInBand packages/hw-transport-mocker/tests/orderedTranscript.codespec.test.js

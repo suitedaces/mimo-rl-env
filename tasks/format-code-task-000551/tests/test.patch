@@ -1,0 +1,638 @@
+diff --git a/usercase-test-coderl/strategy_monitor.test.ts b/usercase-test-coderl/strategy_monitor.test.ts
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/strategy_monitor.test.ts
+@@ -0,0 +1,575 @@
++import {beforeEach, describe, expect, it, vi} from 'vitest';
++
++
++
++
++
++
++
++
++
++
++const harness = vi.hoisted(() => {
++  type Handler = (...args: any[]) => any;
++
++  const account = {
++    apiKey: 'key',
++    apiSecret: 'secret',
++    exchange: 'alpaca',
++    id: 7,
++    isPaper: true,
++    marketDataAccountId: null,
++    name: 'Paper Alpaca',
++    userId: 'telegram:42',
++  };
++
++  const state = {
++    activeSessionResources: 0,
++    maxActiveSessionResources: 0,
++    createdSessions: [] as any[],
++    createdStrategies: [] as any[],
++    strategyQueue: [] as any[],
++  };
++
++  const createStrategyObject = (overrides: Record<string, unknown> = {}) => {
++    const strategy = {
++      config: {threshold: 10},
++      onFinish: undefined as (() => void | Promise<void>) | undefined,
++      onSave: undefined as (() => void) | undefined,
++      restoreState: vi.fn((persisted: Record<string, unknown>) => {
++        strategy.state = persisted;
++      }),
++      state: {position: 'long'},
++      ...overrides,
++    };
++    return strategy;
++  };
++
++  const mockAccountModel = {
++    findByPk: vi.fn(() => account),
++  };
++
++  const mockStrategyModel = {
++    destroy: vi.fn(),
++    findAllOrderedById: vi.fn(() => []),
++    findByAccountIds: vi.fn(() => []),
++    findByPk: vi.fn(),
++    updateConfig: vi.fn(),
++    updateState: vi.fn(),
++  };
++
++  const mockTradingPairFromString = vi.fn((pair: string, separator: string) => {
++    const [base, counter] = pair.split(separator);
++    return {base, counter, pair};
++  });
++
++  const mockGetAccountBrokerClient = vi.fn(() => ({brokerName: 'mock-broker'}));
++
++  const mockCreateStrategy = vi.fn((name: string, config: unknown) => {
++    if (name === 'bad-strategy') {
++      throw new SyntaxError('bad strategy config');
++    }
++    const strategy = state.strategyQueue.shift() ?? createStrategyObject({config});
++    state.createdStrategies.push(strategy);
++    return strategy;
++  });
++
++
++
++
++
++  // eslint-disable-next-line prefer-arrow-callback
++  const TradingSessionMock = vi.fn(function (this: any, options: Record<string, unknown>) {
++    const handlers = new Map<string, Handler>();
++    let running = false;
++    const session = {
++      handlers,
++      options,
++      on: vi.fn((event: string, handler: Handler) => {
++        handlers.set(event, handler);
++        return session;
++      }),
++      start: vi.fn(async () => {
++        if (!running) {
++          running = true;
++          state.activeSessionResources += 1;
++          state.maxActiveSessionResources = Math.max(
++            state.maxActiveSessionResources,
++            state.activeSessionResources
++          );
++        }
++      }),
++      stop: vi.fn(async () => {
++        if (running) {
++          running = false;
++          state.activeSessionResources -= 1;
++        }
++      }),
++    };
++    state.createdSessions.push(session);
++    return session;
++  });
++
++  return {
++    account,
++    createStrategyObject,
++    mockAccountModel,
++    mockCreateStrategy,
++    mockGetAccountBrokerClient,
++    mockStrategyModel,
++    mockTradingPairFromString,
++    state,
++    TradingSessionMock,
++  };
++});
++
++vi.mock('@typedtrader/exchange', () => ({
++  TradingPair: {fromString: harness.mockTradingPairFromString},
++  TradingSession: harness.TradingSessionMock,
++}));
++
++vi.mock('trading-strategies', () => ({
++  createStrategy: harness.mockCreateStrategy,
++}));
++
++vi.mock('../packages/messaging/src/broker/getAccountBrokerClient.js', () => ({
++  getAccountBrokerClient: harness.mockGetAccountBrokerClient,
++}));
++
++vi.mock('../packages/messaging/src/database/models/Account.js', () => ({
++  Account: harness.mockAccountModel,
++}));
++
++vi.mock('../packages/messaging/src/database/models/Strategy.js', () => ({
++  Strategy: harness.mockStrategyModel,
++}));
++
++vi.mock('../packages/messaging/src/logger.js', () => ({
++  logger: {debug: vi.fn(), error: vi.fn(), info: vi.fn(), warn: vi.fn()},
++}));
++
++const {PlatformDispatcher, StrategyMonitor} = await import('../packages/messaging/src/service/index.js');
++const {formatStrategyMessage} = await import('../packages/messaging/src/service/StrategyMonitor.js');
++
++function createPlatform() {
++  return {
++    commandList: [],
++    platformInfo: {botAddress: 'telegram:test-bot', sdkVersion: '1.0.0'},
++    registerCommand: vi.fn(),
++    sendMessage: vi.fn(async () => undefined),
++    start: vi.fn(),
++    stop: vi.fn(),
++  };
++}
++
++function createDispatcher() {
++  const platform = createPlatform();
++  return {
++    dispatcher: new PlatformDispatcher(new Map([['telegram', platform]])),
++    platform,
++  };
++}
++
++function createStrategyRow(overrides: Record<string, unknown> = {}) {
++  return {
++    accountId: 7,
++    config: '{"threshold":10}',
++    createdAt: null,
++    id: 1,
++    pair: 'BTC,USD',
++    state: null,
++    strategyName: '@typedtrader/strategy-trailing-stop',
++    ...overrides,
++  };
++}
++
++async function flushMicrotasks() {
++  await Promise.resolve();
++  await Promise.resolve();
++}
++
++
++function getSingleCallArg(mockFn: {mock: {calls: unknown[][]}}, callIndex: number, argIndex: number) {
++  return mockFn.mock.calls[callIndex]?.[argIndex];
++}
++
++beforeEach(() => {
++  vi.clearAllMocks();
++  harness.state.activeSessionResources = 0;
++  harness.state.maxActiveSessionResources = 0;
++  harness.state.createdSessions = [];
++  harness.state.createdStrategies = [];
++  harness.state.strategyQueue = [];
++  harness.mockAccountModel.findByPk.mockReturnValue(harness.account);
++  harness.mockStrategyModel.findAllOrderedById.mockReturnValue([]);
++  harness.mockStrategyModel.findByAccountIds.mockReturnValue([]);
++  harness.mockStrategyModel.findByPk.mockReturnValue(undefined);
++});
++
++describe('StrategyMonitor acceptance behavior', () => {
++  it('formats strategy messages while preserving text verbatim', () => {
++
++
++    expect(formatStrategyMessage('TrailingStop', 'BTC,USD', 'line one\nline two: 100%')).toBe(
++      'TrailingStop (BTC,USD): line one\nline two: 100%'
++    );
++  });
++
++  it('subscribes a persisted row once, restoring state and starting one live session', async () => {
++
++
++    const {dispatcher} = createDispatcher();
++    const monitor = new StrategyMonitor(dispatcher);
++    const row = createStrategyRow({
++      config: '{"threshold":12}',
++      id: 10,
++      pair: 'ETH,USD',
++      state: '{"armed":true,"peak":"101.5"}',
++    });
++
++    await monitor.subscribeToStrategy(row);
++
++    expect(harness.mockTradingPairFromString).toHaveBeenCalledWith('ETH,USD', ',');
++    expect(harness.mockCreateStrategy).toHaveBeenCalledWith('@typedtrader/strategy-trailing-stop', {threshold: 12});
++    expect(harness.state.createdStrategies[0].restoreState).toHaveBeenCalledWith({armed: true, peak: '101.5'});
++    expect(harness.mockGetAccountBrokerClient).toHaveBeenCalledWith(harness.account);
++    expect(harness.state.createdSessions.length).toBe(1);
++    expect(harness.state.createdSessions[0].start).toHaveBeenCalledTimes(1);
++    expect(harness.state.activeSessionResources).toBe(1);
++
++    await monitor.subscribeToStrategy(row);
++
++    expect(harness.state.createdSessions.length).toBe(1);
++    expect(harness.state.createdSessions[0].start).toHaveBeenCalledTimes(1);
++    expect(harness.state.activeSessionResources).toBe(1);
++
++    await monitor.stop();
++  });
++
++  it('skips a strategy row when the owning account no longer exists', async () => {
++
++
++    const {dispatcher} = createDispatcher();
++    harness.mockAccountModel.findByPk.mockReturnValue(undefined);
++    const monitor = new StrategyMonitor(dispatcher);
++
++    await monitor.subscribeToStrategy(createStrategyRow({id: 12}));
++
++    expect(harness.mockAccountModel.findByPk).toHaveBeenCalledWith(7);
++    expect(harness.mockCreateStrategy).toHaveBeenCalledTimes(0);
++    expect(harness.state.createdSessions.length).toBe(0);
++    expect(harness.state.activeSessionResources).toBe(0);
++  });
++
++  it('rejects a malformed JSON strategy config without starting a session', async () => {
++
++
++    const {dispatcher} = createDispatcher();
++    const monitor = new StrategyMonitor(dispatcher);
++
++
++    await expect(monitor.subscribeToStrategy(createStrategyRow({config: '{"threshold":'}))).rejects.toThrow();
++    expect(harness.state.createdSessions.length).toBe(0);
++    expect(harness.state.activeSessionResources).toBe(0);
++  });
++
++  it('coalesces duplicate save requests and persists current strategy state and config as JSON', async () => {
++
++
++    const {dispatcher} = createDispatcher();
++    const monitor = new StrategyMonitor(dispatcher);
++    await monitor.subscribeToStrategy(createStrategyRow({id: 11}));
++    const strategy = harness.state.createdStrategies[0];
++
++    strategy.state = {position: 'short', trailingPeak: '102.50'};
++    strategy.config = {threshold: 15, mode: 'tight'};
++    strategy.onSave();
++    strategy.onSave();
++    await flushMicrotasks();
++
++    expect(harness.mockStrategyModel.updateState).toHaveBeenCalledTimes(1);
++    expect(harness.mockStrategyModel.updateState).toHaveBeenCalledWith(11, expect.any(String));
++
++    expect(JSON.parse(harness.mockStrategyModel.updateState.mock.calls[0][1])).toEqual({
++      position: 'short',
++      trailingPeak: '102.50',
++    });
++    expect(harness.mockStrategyModel.updateConfig).toHaveBeenCalledTimes(1);
++    expect(harness.mockStrategyModel.updateConfig).toHaveBeenCalledWith(11, expect.any(String));
++
++    expect(JSON.parse(harness.mockStrategyModel.updateConfig.mock.calls[0][1])).toEqual({
++      mode: 'tight',
++      threshold: 15,
++    });
++
++    await monitor.stop();
++  });
++
++  it('starts persisted rows in id order, notifies successful starts, and continues past a failing row', async () => {
++
++
++    const {dispatcher, platform} = createDispatcher();
++    harness.mockStrategyModel.findAllOrderedById.mockReturnValue([
++      createStrategyRow({id: 1, strategyName: 'first-strategy'}),
++      createStrategyRow({id: 2, strategyName: 'bad-strategy'}),
++      createStrategyRow({id: 3, strategyName: 'third-strategy'}),
++    ]);
++    const monitor = new StrategyMonitor(dispatcher);
++
++    await monitor.start();
++
++    expect(harness.mockCreateStrategy.mock.calls.map(call => call[0])).toEqual([
++      'first-strategy',
++      'bad-strategy',
++      'third-strategy',
++    ]);
++    expect(platform.sendMessage).toHaveBeenCalledTimes(2);
++    expect(platform.sendMessage).toHaveBeenNthCalledWith(1, 'telegram:42', 'Strategy "1" started.');
++    expect(platform.sendMessage).toHaveBeenNthCalledWith(2, 'telegram:42', 'Strategy "3" started.');
++    expect(harness.state.createdSessions.length).toBe(2);
++    expect(harness.state.activeSessionResources).toBe(2);
++
++    await monitor.stop();
++  });
++
++  it('stops every active session without canceling open orders and is idempotent on a second stop', async () => {
++
++
++    const {dispatcher} = createDispatcher();
++    const monitor = new StrategyMonitor(dispatcher);
++
++    await monitor.subscribeToStrategy(createStrategyRow({id: 21}));
++    await monitor.subscribeToStrategy(createStrategyRow({id: 22}));
++    expect(harness.state.activeSessionResources).toBe(2);
++
++    await monitor.stop();
++
++    expect(harness.state.createdSessions[0].stop).toHaveBeenCalledWith({cancelOpenOrders: false});
++    expect(harness.state.createdSessions[1].stop).toHaveBeenCalledWith({cancelOpenOrders: false});
++    expect(harness.state.activeSessionResources).toBe(0);
++
++    await monitor.stop();
++
++    expect(harness.state.createdSessions[0].stop).toHaveBeenCalledTimes(1);
++    expect(harness.state.createdSessions[1].stop).toHaveBeenCalledTimes(1);
++    expect(harness.state.activeSessionResources).toBe(0);
++
++    await monitor.subscribeToStrategy(createStrategyRow({id: 21}));
++
++    expect(harness.state.createdSessions.length).toBe(3);
++    expect(harness.state.createdSessions[2].start).toHaveBeenCalledTimes(1);
++    expect(harness.state.activeSessionResources).toBe(1);
++
++    await monitor.stop();
++  });
++
++  it('unsubscribes only the requested active session and leaves missing ids as no-ops', async () => {
++
++
++    const {dispatcher} = createDispatcher();
++    const monitor = new StrategyMonitor(dispatcher);
++
++    await monitor.subscribeToStrategy(createStrategyRow({id: 31}));
++    await monitor.subscribeToStrategy(createStrategyRow({id: 32}));
++    expect(harness.state.activeSessionResources).toBe(2);
++
++    await monitor.unsubscribeFromStrategy(31);
++
++    expect(harness.state.createdSessions[0].stop).toHaveBeenCalledTimes(1);
++    expect(harness.state.createdSessions[0].stop).toHaveBeenCalledWith({cancelOpenOrders: true});
++    expect(harness.state.createdSessions[1].stop).toHaveBeenCalledTimes(0);
++    expect(harness.state.activeSessionResources).toBe(1);
++
++    await monitor.unsubscribeFromStrategy(404);
++
++    expect(harness.state.createdSessions[0].stop).toHaveBeenCalledTimes(1);
++    expect(harness.state.createdSessions[1].stop).toHaveBeenCalledTimes(0);
++    expect(harness.state.activeSessionResources).toBe(1);
++
++    await monitor.stop();
++  });
++
++  it('routes fill and strategy-message session events to the owning account', async () => {
++
++
++    const {dispatcher, platform} = createDispatcher();
++    const monitor = new StrategyMonitor(dispatcher);
++    await monitor.subscribeToStrategy(
++      createStrategyRow({id: 41, pair: 'BTC,USD', strategyName: 'TrailingStop'})
++    );
++    const session = harness.state.createdSessions[0];
++
++    await session.handlers.get('fill')({
++      fee: '0.10',
++      feeAsset: 'USD',
++      order_id: 'ord-123',
++      price: '101.25',
++      side: 'BUY',
++      size: '0.5',
++    });
++    await session.handlers.get('message')('trail moved\nkeep text verbatim');
++
++    expect(platform.sendMessage).toHaveBeenCalledTimes(2);
++    expect(platform.sendMessage).toHaveBeenNthCalledWith(
++      1,
++      'telegram:42',
++      'Order Filled!\n\nStrategy: TrailingStop\nPair: BTC,USD\nSide: BUY\nPrice: 101.25\nSize: 0.5\nFee: 0.10 USD\nOrder ID: ord-123'
++    );
++    expect(platform.sendMessage).toHaveBeenNthCalledWith(
++      2,
++      'telegram:42',
++      'TrailingStop (BTC,USD): trail moved\nkeep text verbatim'
++    );
++
++    await monitor.stop();
++  });
++
++  it('finishes a strategy by canceling open orders, deleting the row, and notifying the account', async () => {
++
++
++    const {dispatcher, platform} = createDispatcher();
++    const monitor = new StrategyMonitor(dispatcher);
++    await monitor.subscribeToStrategy(createStrategyRow({id: 51, pair: 'ETH,USD', strategyName: 'Trail'}));
++    const session = harness.state.createdSessions[0];
++    const strategy = harness.state.createdStrategies[0];
++
++    await strategy.onFinish();
++
++    expect(session.stop).toHaveBeenCalledWith({cancelOpenOrders: true});
++    expect(harness.mockStrategyModel.destroy).toHaveBeenCalledWith(51);
++    expect(platform.sendMessage).toHaveBeenCalledWith('telegram:42', expect.any(String));
++    const finishMessage = getSingleCallArg(platform.sendMessage, 0, 1);
++
++    expect(finishMessage).toContain('Strategy finished and removed.');
++    expect(finishMessage).toContain('51');
++    expect(finishMessage).toContain('Trail');
++    expect(finishMessage).toContain('ETH,USD');
++    expect(harness.state.activeSessionResources).toBe(0);
++
++    await monitor.unsubscribeFromStrategy(51);
++    expect(session.stop).toHaveBeenCalledTimes(1);
++  });
++
++  it('tears down a repeated unrecoverable session error only once and keeps the persisted row', async () => {
++
++
++    const {dispatcher, platform} = createDispatcher();
++    const monitor = new StrategyMonitor(dispatcher);
++    await monitor.subscribeToStrategy(createStrategyRow({id: 61, pair: 'SOL,USD', strategyName: 'MeanReversion'}));
++    const session = harness.state.createdSessions[0];
++
++    session.handlers.get('error')(new Error('exchange rejected order'));
++    session.handlers.get('error')(new Error('second error'));
++
++    await vi.waitFor(() => expect(platform.sendMessage).toHaveBeenCalledTimes(1));
++    expect(session.stop).toHaveBeenCalledTimes(1);
++    expect(session.stop).toHaveBeenCalledWith({cancelOpenOrders: true});
++    expect(harness.mockStrategyModel.destroy).toHaveBeenCalledTimes(0);
++    expect(platform.sendMessage).toHaveBeenCalledWith('telegram:42', expect.any(String));
++    const errorMessage = getSingleCallArg(platform.sendMessage, 0, 1);
++
++    expect(errorMessage).toContain('Strategy stopped due to an error.');
++    expect(errorMessage).toContain('61');
++    expect(errorMessage).toContain('MeanReversion');
++    expect(errorMessage).toContain('SOL,USD');
++    expect(errorMessage).toContain('exchange rejected order');
++    expect(errorMessage).toContain('Fix the cause and restart it when ready.');
++    expect(harness.state.activeSessionResources).toBe(0);
++  });
++
++  it('restarts only active rows for an account after persisting current state and config', async () => {
++
++
++    const {dispatcher} = createDispatcher();
++    const monitor = new StrategyMonitor(dispatcher);
++    await monitor.subscribeToStrategy(createStrategyRow({id: 71}));
++    const oldSession = harness.state.createdSessions[0];
++    const oldStrategy = harness.state.createdStrategies[0];
++    oldStrategy.state = {live: 'state'};
++    oldStrategy.config = {risk: 'reduced'};
++    const freshStrategy = harness.createStrategyObject({config: {threshold: 99}, state: {fresh: true}});
++    harness.state.strategyQueue.push(freshStrategy);
++    harness.mockStrategyModel.findByAccountIds.mockReturnValue([
++      createStrategyRow({id: 71}),
++      createStrategyRow({id: 72}),
++    ]);
++    harness.mockStrategyModel.findByPk.mockReturnValue(
++      createStrategyRow({config: '{"threshold":99}', id: 71, state: '{"fresh":true}'})
++    );
++
++    await monitor.restartForAccount(7);
++
++    expect(harness.mockStrategyModel.updateState).toHaveBeenCalledWith(71, expect.any(String));
++
++    expect(JSON.parse(harness.mockStrategyModel.updateState.mock.calls[0][1])).toEqual({live: 'state'});
++    expect(harness.mockStrategyModel.updateConfig).toHaveBeenCalledWith(71, expect.any(String));
++
++    expect(JSON.parse(harness.mockStrategyModel.updateConfig.mock.calls[0][1])).toEqual({risk: 'reduced'});
++    expect(oldSession.stop).toHaveBeenCalledWith({cancelOpenOrders: false});
++    expect(harness.mockStrategyModel.findByPk).toHaveBeenCalledTimes(1);
++    expect(harness.mockStrategyModel.findByPk).toHaveBeenCalledWith(71);
++    expect(harness.state.createdSessions.length).toBe(2);
++    expect(freshStrategy.restoreState).toHaveBeenCalledWith({fresh: true});
++    expect(harness.state.activeSessionResources).toBe(1);
++
++    await monitor.stop();
++  });
++
++  it('keeps independent active-session state for two monitor instances using the same strategy id', async () => {
++
++
++    const {dispatcher} = createDispatcher();
++    const firstMonitor = new StrategyMonitor(dispatcher);
++    const secondMonitor = new StrategyMonitor(dispatcher);
++    const row = createStrategyRow({id: 81});
++
++    await firstMonitor.subscribeToStrategy(row);
++    await secondMonitor.subscribeToStrategy(row);
++
++    expect(harness.state.createdSessions.length).toBe(2);
++    expect(harness.state.activeSessionResources).toBe(2);
++
++    await firstMonitor.unsubscribeFromStrategy(81);
++
++    expect(harness.state.createdSessions[0].stop).toHaveBeenCalledTimes(1);
++    expect(harness.state.createdSessions[1].stop).toHaveBeenCalledTimes(0);
++    expect(harness.state.activeSessionResources).toBe(1);
++
++    await secondMonitor.unsubscribeFromStrategy(81);
++
++    expect(harness.state.createdSessions[1].stop).toHaveBeenCalledTimes(1);
++    expect(harness.state.activeSessionResources).toBe(0);
++  });
++
++  it('keeps the session resource counter bounded across repeated construct-use-cleanup cycles', async () => {
++
++
++    const {dispatcher} = createDispatcher();
++
++    for (let i = 0; i < 100; i += 1) {
++      const monitor = new StrategyMonitor(dispatcher);
++      await monitor.subscribeToStrategy(createStrategyRow({id: 1000 + i}));
++      await monitor.stop();
++    }
++
++    expect(harness.state.createdSessions.length).toBe(100);
++    expect(harness.state.maxActiveSessionResources).toBe(1);
++    expect(harness.state.activeSessionResources).toBe(0);
++    expect(harness.state.createdSessions.map(session => session.stop.mock.calls.length)).toEqual(Array(100).fill(1));
++  });
++
++  it('skips account restart rows that were never subscribed', async () => {
++
++
++    const {dispatcher} = createDispatcher();
++    const monitor = new StrategyMonitor(dispatcher);
++    harness.mockStrategyModel.findByAccountIds.mockReturnValue([createStrategyRow({id: 91})]);
++
++    await monitor.restartForAccount(7);
++
++    expect(harness.mockStrategyModel.findByPk).toHaveBeenCalledTimes(0);
++    expect(harness.mockStrategyModel.updateState).toHaveBeenCalledTimes(0);
++    expect(harness.state.createdSessions.length).toBe(0);
++    expect(harness.state.activeSessionResources).toBe(0);
++  });
++});
+diff --git a/usercase-test-coderl/vitest.offline.config.ts b/usercase-test-coderl/vitest.offline.config.ts
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/vitest.offline.config.ts
+@@ -0,0 +1,22 @@
++import {defineConfig} from 'vitest/config';
++
++
++
++export default defineConfig({
++  esbuild: {
++    target: 'es2022',
++  },
++  resolve: {
++    alias: {
++      '@typedtrader/candles': '/workspace/repo/packages/candles/src/index.ts',
++      '@typedtrader/exchange': '/workspace/repo/packages/exchange/src/index.ts',
++      'trading-signals': '/workspace/repo/packages/trading-signals/src/index.ts',
++      'trading-strategies': '/workspace/repo/packages/trading-strategies/src/index.ts',
++    },
++  },
++  test: {
++    bail: 1,
++    environment: 'node',
++    globals: true,
++  },
++});
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,26 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++
++cd /workspace/repo
++
++export npm_config_offline=true
++export npm_config_audit=false
++export npm_config_fund=false
++export npm_config_update_notifier=false
++
++if [ ! -x /workspace/repo/node_modules/.bin/vitest ]; then
++  echo "Missing preinstalled Vitest binary at /workspace/repo/node_modules/.bin/vitest" >&2
++  exit 1
++fi
++
++exec /workspace/repo/node_modules/.bin/vitest run /workspace/repo/usercase-test-coderl/strategy_monitor.test.ts --root /workspace/repo

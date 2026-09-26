@@ -1,0 +1,304 @@
+diff --git a/supervisor/tests/test_synth_eventlistener_delivery.py b/supervisor/tests/test_synth_eventlistener_delivery.py
+new file mode 100644
+index 0000000..a7f2c61
+--- /dev/null
++++ b/supervisor/tests/test_synth_eventlistener_delivery.py
+@@ -0,0 +1,283 @@
++import errno
++
++import pytest
++
++from supervisor import events
++from supervisor.options import ServerOptions
++from supervisor.options import UnhosedConfigParser
++from supervisor.process import EventListenerPool
++from supervisor.states import EventListenerStates
++from supervisor.tests.base import DummyOptions
++from supervisor.tests.base import DummyPConfig
++from supervisor.tests.base import DummyPGroupConfig
++from supervisor.tests.base import DummyLogger
++
++
++class SynthDeliveryEvent(events.Event):
++    def __init__(self, label):
++        self.label = label
++
++    def payload(self):
++        return self.label
++
++
++events.register('SYNTH_DELIVERY_EVENT', SynthDeliveryEvent)
++
++
++class LevelRecordingLogger(DummyLogger):
++    def __init__(self):
++        DummyLogger.__init__(self)
++        self.errors = []
++
++    def error(self, message, **kw):
++        if kw:
++            message = message % kw
++        self.errors.append(message)
++        self.data.append(message)
++
++
++@pytest.fixture(autouse=True)
++def isolate_event_subscriptions():
++    events.clear()
++    yield
++    events.clear()
++
++
++def parse_listener_config(extra=''):
++    parser = UnhosedConfigParser()
++    parser.read_string(
++        '[eventlistener:delivery]\n'
++        'events=SYNTH_DELIVERY_EVENT\n'
++        'command=/bin/delivery-listener\n' + extra
++    )
++    configs = ServerOptions().process_groups_from_parser(parser)
++    assert len(configs) == 1
++    return configs[0]
++
++
++def make_pool(buffer_size=10, buffer_overflow='discard_oldest',
++              event_retries=-1, name='delivery'):
++    options = DummyOptions()
++    options.logger = LevelRecordingLogger()
++    pconfig = DummyPConfig(options, 'listener', '/bin/listener')
++    gconfig = DummyPGroupConfig(options, name=name, pconfigs=[pconfig])
++    gconfig.pool_events = (SynthDeliveryEvent,)
++    gconfig.buffer_size = buffer_size
++    gconfig.buffer_overflow = buffer_overflow
++    gconfig.event_retries = event_retries
++    pool = EventListenerPool(gconfig)
++    return pool, pool.processes['listener'], options
++
++
++def publish(label):
++    event = SynthDeliveryEvent(label)
++    events.notify(event)
++    return event
++
++
++def dispatch_one(pool, process):
++    process.listener_state = EventListenerStates.READY
++    process.event = None
++    process.stdin_buffer = b''
++    pool.dispatch()
++    assert process.listener_state == EventListenerStates.BUSY
++    header, payload = process.stdin_buffer.split(b'\n', 1)
++    assert b'eventname:SYNTH_DELIVERY_EVENT' in header
++    return payload.decode('ascii')
++
++
++def dispatch_many(pool, process, count):
++    return [dispatch_one(pool, process) for unused in range(count)]
++
++
++def assert_no_delivery(pool, process):
++    process.listener_state = EventListenerStates.READY
++    process.event = None
++    process.stdin_buffer = b''
++    pool.dispatch()
++    assert process.listener_state == EventListenerStates.READY
++    assert process.stdin_buffer == b''
++
++
++def reject(process, event):
++    events.notify(events.EventRejectedEvent(process, event))
++
++
++def test_config_defaults_and_explicit_delivery_controls():
++    default = parse_listener_config()
++    assert getattr(default, 'buffer_overflow', None) == 'discard_oldest'
++    assert getattr(default, 'event_retries', None) == -1
++
++    configured = parse_listener_config(
++        'buffer_overflow=Discard_Newest\n'
++        'event_retries=3\n'
++    )
++    assert configured.buffer_overflow == 'discard_newest'
++    assert configured.event_retries == 3
++
++
++@pytest.mark.parametrize('value', ['anything', 'oldest', 'newest'])
++def test_config_rejects_unknown_overflow_policy(value):
++    with pytest.raises(ValueError) as excinfo:
++        parse_listener_config('buffer_overflow=%s\n' % value)
++    message = str(excinfo.value)
++    assert 'eventlistener:delivery' in message
++    assert 'buffer_overflow' in message
++    assert value in message
++
++
++@pytest.mark.parametrize('value', ['-2', 'many'])
++def test_config_rejects_invalid_retry_values(value):
++    with pytest.raises(ValueError) as excinfo:
++        parse_listener_config('event_retries=%s\n' % value)
++    message = str(excinfo.value)
++    assert 'eventlistener:delivery' in message
++    assert 'event_retries' in message
++    assert value in message
++
++
++def test_reload_comparison_includes_both_delivery_controls():
++    baseline = parse_listener_config()
++    overflow_changed = parse_listener_config(
++        'buffer_overflow=discard_newest\n'
++    )
++    retries_changed = parse_listener_config('event_retries=2\n')
++    assert baseline != overflow_changed
++    assert baseline != retries_changed
++
++
++def test_default_overflow_discards_oldest_and_keeps_fifo_order():
++    pool, process, options = make_pool(buffer_size=2)
++    first = publish('first')
++    publish('second')
++    publish('third')
++
++    assert dispatch_many(pool, process, 2) == ['second', 'third']
++    assert_no_delivery(pool, process)
++    assert any(
++        'pool delivery event buffer overflowed' in message
++        and str(first.serial) in message
++        for message in options.logger.errors
++    )
++
++
++def test_discard_newest_preserves_already_buffered_fifo_order():
++    pool, process, options = make_pool(
++        buffer_size=2, buffer_overflow='discard_newest')
++    publish('first')
++    publish('second')
++    newest = publish('third')
++
++    assert dispatch_many(pool, process, 2) == ['first', 'second']
++    assert_no_delivery(pool, process)
++    assert any(
++        'pool delivery event buffer overflowed' in message
++        and str(newest.serial) in message
++        for message in options.logger.errors
++    )
++
++
++def test_discard_newest_prioritizes_a_rejected_inflight_event():
++    pool, process, options = make_pool(
++        buffer_size=2, buffer_overflow='discard_newest')
++    inflight = publish('inflight')
++    assert dispatch_one(pool, process) == 'inflight'
++    publish('queued-first')
++    displaced = publish('queued-newest')
++
++    reject(process, inflight)
++
++    assert dispatch_many(pool, process, 2) == ['inflight', 'queued-first']
++    assert_no_delivery(pool, process)
++    assert any(
++        'pool delivery event buffer overflowed' in message
++        and str(displaced.serial) in message
++        for message in options.logger.errors
++    )
++
++
++def test_zero_retries_discards_on_first_rejection_and_moves_on():
++    pool, process, options = make_pool(event_retries=0)
++    failed = publish('failed')
++    assert dispatch_one(pool, process) == 'failed'
++    publish('next')
++
++    reject(process, failed)
++
++    assert dispatch_one(pool, process) == 'next'
++    assert_no_delivery(pool, process)
++    assert any(
++        'pool delivery' in message
++        and str(failed.serial) in message
++        and ('retry' in message.lower() or 'redeliver' in message.lower())
++        and 'limit' in message.lower()
++        for message in options.logger.errors
++    )
++
++
++def test_unlimited_retries_allow_repeated_redelivery():
++    pool, process, unused = make_pool(event_retries=-1)
++    failed = publish('persistent')
++    sequence = [dispatch_one(pool, process)]
++
++    for unused_attempt in range(3):
++        reject(process, failed)
++        sequence.append(dispatch_one(pool, process))
++
++    assert sequence == ['persistent'] * 4
++    assert_no_delivery(pool, process)
++
++
++def test_retry_limit_counts_redeliveries_not_initial_delivery():
++    pool, process, options = make_pool(event_retries=1)
++    failed = publish('failed')
++    sequence = [dispatch_one(pool, process)]
++    publish('next')
++
++    reject(process, failed)
++    sequence.append(dispatch_one(pool, process))
++    reject(process, failed)
++    sequence.append(dispatch_one(pool, process))
++    assert_no_delivery(pool, process)
++
++    assert sequence == ['failed', 'failed', 'next']
++    assert any(
++        'pool delivery' in message
++        and str(failed.serial) in message
++        and ('retry' in message.lower() or 'redeliver' in message.lower())
++        and 'limit' in message.lower()
++        for message in options.logger.errors
++    )
++
++
++def test_epipe_rebuffering_does_not_consume_rejection_retries():
++    pool, process, unused = make_pool(event_retries=0)
++    publish('temporary-write-failure')
++    process.listener_state = EventListenerStates.READY
++    process.write_error = errno.EPIPE
++
++    pool.dispatch()
++
++    assert process.listener_state == EventListenerStates.READY
++    process.write_error = None
++    assert dispatch_one(pool, process) == 'temporary-write-failure'
++    assert_no_delivery(pool, process)
++
++
++def test_retry_accounting_is_independent_for_each_pool():
++    pool_a, process_a, unused_a = make_pool(event_retries=1, name='pool-a')
++    pool_b, process_b, unused_b = make_pool(event_retries=1, name='pool-b')
++    shared = publish('shared')
++    assert dispatch_one(pool_a, process_a) == 'shared'
++    assert dispatch_one(pool_b, process_b) == 'shared'
++
++    reject(process_a, shared)
++    assert dispatch_one(pool_a, process_a) == 'shared'
++    reject(process_a, shared)
++    followup = publish('after-a')
++    assert dispatch_one(pool_a, process_a) == 'after-a'
++    assert_no_delivery(pool_a, process_a)
++
++    reject(process_b, shared)
++    assert dispatch_one(pool_b, process_b) == 'shared'
++    assert dispatch_one(pool_b, process_b) == 'after-a'
++    assert_no_delivery(pool_b, process_b)
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,9 @@
++#!/bin/bash
++set -euo pipefail
++
++
++pytest -q \
++  supervisor/tests/test_synth_eventlistener_delivery.py \
++  supervisor/tests/test_process.py::EventListenerPoolTests \
++  supervisor/tests/test_options.py::ServerOptionsTests \
++  supervisor/tests/test_options.py::EventListenerPoolConfigTests

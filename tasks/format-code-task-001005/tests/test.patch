@@ -1,0 +1,430 @@
+diff --git a/test_checkout_branching_codespec.py b/test_checkout_branching_codespec.py
+new file mode 100644
+index 0000000..135f569
+--- /dev/null
++++ b/test_checkout_branching_codespec.py
+@@ -0,0 +1,414 @@
++import importlib.metadata
++import contextlib
++import inspect
++import subprocess
++import sys
++import tempfile
++import types
++import typing
++import unittest
++from pathlib import Path
++from types import SimpleNamespace
++from typing import Any, Dict
++from unittest import mock
++
++
++
++
++
++importlib_metadata = types.ModuleType("importlib_metadata")
++importlib_metadata.version = lambda name: "0.test"  # type: ignore[attr-defined]
++sys.modules.setdefault("importlib_metadata", importlib_metadata)
++
++typing_extensions = types.ModuleType("typing_extensions")
++typing_extensions.TypedDict = typing.TypedDict  # type: ignore[attr-defined]
++sys.modules.setdefault("typing_extensions", typing_extensions)
++
++import ghstack.checkout
++import ghstack.shell
++
++
++def install_cli_dependency_stub(name: str, **attributes: Any) -> None:
++    module = types.ModuleType(name)
++    for attribute, value in attributes.items():
++        setattr(module, attribute, value)
++    sys.modules.setdefault(name, module)
++    setattr(sys.modules["ghstack"], name.rsplit(".", 1)[1], sys.modules[name])
++
++
++install_cli_dependency_stub(
++    "ghstack.circleci_real", CircleCIEndpoint=lambda **kwargs: object()
++)
++install_cli_dependency_stub(
++    "ghstack.github_real", RealGitHubEndpoint=lambda **kwargs: object()
++)
++install_cli_dependency_stub("ghstack.status", main=lambda **kwargs: None)
++
++import ghstack.__main__
++
++
++class CheckoutEndpoint:
++    def __init__(self, head_ref: str) -> None:
++        self.head_ref = head_ref
++
++    def graphql(self, query: str, **kwargs: Any) -> Dict[str, Any]:
++        return {
++            "data": {
++                "repository": {
++                    "pullRequest": {"headRefName": self.head_ref},
++                },
++            },
++        }
++
++
++class TestCheckoutBranchSynchronization(unittest.TestCase):
++    pr_url = "https://github.com/acme/widgets/pull/7"
++    orig_ref = "gh/alice/7/orig"
++    default_local_branch = "ghstack/acme/widgets/7"
++
++    def setUp(self) -> None:
++        self._tmp = tempfile.TemporaryDirectory(dir="/dev/shm")
++        self.addCleanup(self._tmp.cleanup)
++        root = Path(self._tmp.name)
++        self.remote = root / "remote.git"
++        self.publisher = root / "publisher"
++        self.local = root / "local"
++
++        self.run_git(root, "init", "--bare", "--initial-branch=master", str(self.remote))
++        self.run_git(root, "clone", str(self.remote), str(self.publisher))
++        self.configure_identity(self.publisher)
++
++        self.write(self.publisher, "base.txt", "base\n")
++        self.run_git(self.publisher, "add", "base.txt")
++        self.run_git(self.publisher, "commit", "-m", "Base")
++        self.run_git(self.publisher, "push", "origin", "master")
++
++        self.write(self.publisher, "lower.txt", "lower\n")
++        self.run_git(self.publisher, "add", "lower.txt")
++        self.run_git(self.publisher, "commit", "-m", "Lower stack commit")
++        self.write(self.publisher, "top.txt", "top v1\n")
++        self.run_git(self.publisher, "add", "top.txt")
++        self.run_git(self.publisher, "commit", "-m", "Top stack commit")
++        self.run_git(
++            self.publisher,
++            "push",
++            "origin",
++            "HEAD:refs/heads/" + self.orig_ref,
++            "HEAD:refs/heads/gh/alice/7/head",
++            "HEAD:refs/heads/feature/manual",
++        )
++
++        self.run_git(root, "clone", str(self.remote), str(self.local))
++        self.configure_identity(self.local)
++        self.endpoint = CheckoutEndpoint("gh/alice/7/head")
++
++    def run_git(
++        self,
++        cwd: Path,
++        *args: str,
++        check: bool = True,
++    ) -> subprocess.CompletedProcess[str]:
++        return subprocess.run(
++            ("git",) + args,
++            cwd=str(cwd),
++            check=check,
++            text=True,
++            stdout=subprocess.PIPE,
++            stderr=subprocess.PIPE,
++        )
++
++    def git(self, *args: str, check: bool = True) -> str:
++        return self.run_git(self.local, *args, check=check).stdout.strip()
++
++    def configure_identity(self, repo: Path) -> None:
++        self.run_git(repo, "config", "user.name", "Checkout Test")
++        self.run_git(repo, "config", "user.email", "checkout@example.com")
++
++    def write(self, repo: Path, name: str, contents: str) -> None:
++        (repo / name).write_text(contents, encoding="utf-8")
++
++    def invoke(self, **kwargs: Any) -> None:
++        signature = inspect.signature(ghstack.checkout.main)
++        unsupported = [name for name in kwargs if name not in signature.parameters]
++        if unsupported:
++            self.fail(
++                "checkout.main does not expose required option(s): {}".format(
++                    ", ".join(sorted(unsupported))
++                )
++            )
++        ghstack.checkout.main(
++            pull_request=self.pr_url,
++            github=self.endpoint,
++            sh=ghstack.shell.Shell(cwd=str(self.local), testing=True),
++            remote_name="origin",
++            **kwargs,
++        )
++
++    def current_branch(self) -> str:
++        result = self.run_git(
++            self.local, "symbolic-ref", "--quiet", "--short", "HEAD", check=False
++        )
++        return result.stdout.strip() if result.returncode == 0 else ""
++
++    def branch_exists(self, branch: str) -> bool:
++        result = self.run_git(
++            self.local,
++            "show-ref",
++            "--verify",
++            "--quiet",
++            "refs/heads/" + branch,
++            check=False,
++        )
++        return result.returncode == 0
++
++    def remote_orig(self, remote_name: str = "origin") -> str:
++        return self.git("rev-parse", remote_name + "/" + self.orig_ref)
++
++    def advance_remote_orig(self) -> str:
++        self.write(self.publisher, "top.txt", "top v2\n")
++        self.write(self.publisher, "remote-only.txt", "remote\n")
++        self.run_git(self.publisher, "add", "top.txt", "remote-only.txt")
++        self.run_git(self.publisher, "commit", "-m", "Advance remote stack")
++        self.run_git(
++            self.publisher,
++            "push",
++            "origin",
++            "HEAD:refs/heads/" + self.orig_ref,
++        )
++        return self.run_git(self.publisher, "rev-parse", "HEAD").stdout.strip()
++
++    def add_local_commit(self) -> str:
++        self.write(self.local, "local-only.txt", "local\n")
++        self.git("add", "local-only.txt")
++        self.git("commit", "-m", "Local checkout work")
++        return self.git("rev-parse", "HEAD")
++
++    def test_default_creates_editable_tracking_branch(self) -> None:
++        self.invoke()
++
++        self.assertEqual(self.current_branch(), self.default_local_branch)
++        self.assertEqual(self.git("rev-parse", "HEAD"), self.remote_orig())
++        self.assertEqual(
++            self.git("rev-parse", "--abbrev-ref", "@{upstream}"),
++            "origin/" + self.orig_ref,
++        )
++        self.assertEqual((self.local / "lower.txt").read_text(), "lower\n")
++        self.assertEqual((self.local / "top.txt").read_text(), "top v1\n")
++
++    def test_custom_branch_and_remote_name_are_honored(self) -> None:
++        self.git("remote", "rename", "origin", "review")
++        signature = inspect.signature(ghstack.checkout.main)
++        if "branch" not in signature.parameters:
++            self.fail("checkout.main does not expose the required branch option")
++        ghstack.checkout.main(
++            pull_request=self.pr_url,
++            github=self.endpoint,
++            sh=ghstack.shell.Shell(cwd=str(self.local), testing=True),
++            remote_name="review",
++            branch="review/alice-stack",
++        )
++
++        self.assertEqual(self.current_branch(), "review/alice-stack")
++        self.assertEqual(self.git("rev-parse", "HEAD"), self.remote_orig("review"))
++        self.assertEqual(
++            self.git("rev-parse", "--abbrev-ref", "@{upstream}"),
++            "review/" + self.orig_ref,
++        )
++
++    def test_existing_branch_fast_forwards_after_fetch(self) -> None:
++        self.invoke()
++        original = self.git("rev-parse", "HEAD")
++        advanced = self.advance_remote_orig()
++
++        self.invoke()
++
++        self.assertNotEqual(original, advanced)
++        self.assertEqual(self.current_branch(), self.default_local_branch)
++        self.assertEqual(self.git("rev-parse", "HEAD"), advanced)
++        self.assertEqual((self.local / "remote-only.txt").read_text(), "remote\n")
++
++    def test_unchanged_existing_branch_is_idempotent(self) -> None:
++        self.invoke()
++        original = self.git("rev-parse", "HEAD")
++        status = self.git("status", "--porcelain")
++
++        self.invoke()
++
++        self.assertEqual(self.current_branch(), self.default_local_branch)
++        self.assertEqual(self.git("rev-parse", "HEAD"), original)
++        self.assertEqual(self.git("status", "--porcelain"), status)
++
++    def test_local_ahead_branch_is_reused_without_discarding_work(self) -> None:
++        self.invoke()
++        local_tip = self.add_local_commit()
++
++        self.invoke()
++
++        self.assertEqual(self.current_branch(), self.default_local_branch)
++        self.assertEqual(self.git("rev-parse", "HEAD"), local_tip)
++        self.assertEqual((self.local / "local-only.txt").read_text(), "local\n")
++
++    def test_diverged_branch_is_not_discarded(self) -> None:
++        self.invoke()
++        local_tip = self.add_local_commit()
++        self.advance_remote_orig()
++
++        with self.assertRaises(RuntimeError):
++            self.invoke()
++
++        self.assertEqual(self.current_branch(), self.default_local_branch)
++        self.assertEqual(self.git("rev-parse", "HEAD"), local_tip)
++        self.assertEqual((self.local / "local-only.txt").read_text(), "local\n")
++        self.assertFalse((self.local / "remote-only.txt").exists())
++
++    def test_force_replaces_diverged_branch_with_remote_orig(self) -> None:
++        self.invoke()
++        self.add_local_commit()
++        advanced = self.advance_remote_orig()
++
++        self.invoke(force=True)
++
++        self.assertEqual(self.current_branch(), self.default_local_branch)
++        self.assertEqual(self.git("rev-parse", "HEAD"), advanced)
++        self.assertFalse((self.local / "local-only.txt").exists())
++        self.assertEqual((self.local / "remote-only.txt").read_text(), "remote\n")
++
++    def test_tracked_dirty_worktree_is_rejected_before_branch_creation(self) -> None:
++        self.write(self.local, "base.txt", "unsaved tracked edit\n")
++
++        with self.assertRaises(RuntimeError):
++            self.invoke()
++
++        self.assertEqual(self.current_branch(), "master")
++        self.assertEqual((self.local / "base.txt").read_text(), "unsaved tracked edit\n")
++        self.assertFalse(self.branch_exists(self.default_local_branch))
++
++    def test_staged_dirty_worktree_is_rejected_before_branch_creation(self) -> None:
++        self.write(self.local, "base.txt", "unsaved staged edit\n")
++        self.git("add", "base.txt")
++
++        with self.assertRaises(RuntimeError):
++            self.invoke()
++
++        self.assertEqual(self.current_branch(), "master")
++        self.assertEqual(self.git("diff", "--cached", "--name-only"), "base.txt")
++        self.assertEqual((self.local / "base.txt").read_text(), "unsaved staged edit\n")
++        self.assertFalse(self.branch_exists(self.default_local_branch))
++
++    def test_untracked_dirty_worktree_is_rejected_before_branch_creation(self) -> None:
++        self.write(self.local, "notes.tmp", "unsaved untracked file\n")
++
++        with self.assertRaises(RuntimeError):
++            self.invoke()
++
++        self.assertEqual(self.current_branch(), "master")
++        self.assertEqual((self.local / "notes.tmp").read_text(), "unsaved untracked file\n")
++        self.assertFalse(self.branch_exists(self.default_local_branch))
++
++    def test_non_ghstack_head_ref_is_rejected_without_checkout(self) -> None:
++        self.endpoint.head_ref = "feature/manual"
++        original = self.git("rev-parse", "HEAD")
++
++        with self.assertRaises(RuntimeError):
++            self.invoke()
++
++        self.assertEqual(self.current_branch(), "master")
++        self.assertEqual(self.git("rev-parse", "HEAD"), original)
++        self.assertFalse(self.branch_exists(self.default_local_branch))
++
++    def test_detach_mode_preserves_legacy_checkout_shape(self) -> None:
++        self.invoke(detach=True)
++
++        self.assertEqual(self.current_branch(), "")
++        self.assertEqual(self.git("rev-parse", "HEAD"), self.remote_orig())
++        self.assertFalse(self.branch_exists(self.default_local_branch))
++        self.assertEqual((self.local / "top.txt").read_text(), "top v1\n")
++
++    def test_detach_and_explicit_branch_are_mutually_exclusive(self) -> None:
++        original = self.git("rev-parse", "HEAD")
++
++        with self.assertRaises(RuntimeError):
++            self.invoke(detach=True, branch="review/conflict")
++
++        self.assertEqual(self.current_branch(), "master")
++        self.assertEqual(self.git("rev-parse", "HEAD"), original)
++        self.assertFalse(self.branch_exists("review/conflict"))
++
++
++class TestCheckoutCommandOptions(unittest.TestCase):
++    pr_url = "https://github.com/acme/widgets/pull/7"
++
++    def invoke_command(self, *options: str) -> Dict[str, Any]:
++        observed: Dict[str, Any] = {}
++        fake_config = SimpleNamespace(
++            github_oauth="token",
++            proxy=None,
++            github_url="github.example",
++            remote_name="review",
++        )
++        fake_endpoint = object()
++        fake_shell = object()
++
++        def record_checkout(**kwargs: Any) -> None:
++            observed.update(kwargs)
++
++        argv = ["ghstack", "checkout", self.pr_url] + list(options)
++        with mock.patch.object(sys, "argv", argv), \
++             mock.patch.object(
++                 ghstack.__main__.ghstack.logs,
++                 "manager",
++                 return_value=contextlib.nullcontext(),
++             ), \
++             mock.patch.object(
++                 ghstack.__main__.ghstack.config,
++                 "read_config",
++                 return_value=fake_config,
++             ), \
++             mock.patch.object(
++                 ghstack.__main__.ghstack.github_real,
++                 "RealGitHubEndpoint",
++                 return_value=fake_endpoint,
++             ), \
++             mock.patch.object(
++                 ghstack.__main__.ghstack.shell,
++                 "Shell",
++                 return_value=fake_shell,
++             ), \
++             mock.patch.object(
++                 ghstack.__main__.ghstack.checkout,
++                 "main",
++                 side_effect=record_checkout,
++             ):
++            try:
++                ghstack.__main__.main()
++            except SystemExit as error:
++                self.fail(
++                    "checkout command did not accept the requested options "
++                    "(exit status {})".format(error.code)
++                )
++
++        self.assertEqual(observed["pull_request"], self.pr_url)
++        self.assertIs(observed["github"], fake_endpoint)
++        self.assertIs(observed["sh"], fake_shell)
++        self.assertEqual(observed["remote_name"], "review")
++        return observed
++
++    def test_cli_forwards_named_branch_and_force(self) -> None:
++        observed = self.invoke_command(
++            "--branch", "review/alice-stack", "--force"
++        )
++
++        self.assertEqual(observed["branch"], "review/alice-stack")
++        self.assertIs(observed["force"], True)
++        self.assertIs(observed["detach"], False)
++
++    def test_cli_forwards_detach_mode(self) -> None:
++        observed = self.invoke_command("--detach")
++
++        self.assertIsNone(observed["branch"])
++        self.assertIs(observed["force"], False)
++        self.assertIs(observed["detach"], True)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,5 @@
++#!/bin/bash
++set -euo pipefail
++
++
++python3 -m unittest -v test_checkout_branching_codespec

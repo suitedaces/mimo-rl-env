@@ -1,0 +1,418 @@
+diff --git a/usercase-test-coderl/test_aws_xray_lambda_propagator.py b/usercase-test-coderl/test_aws_xray_lambda_propagator.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/test_aws_xray_lambda_propagator.py
+@@ -0,0 +1,380 @@
++
++
++
++
++
++
++import copy
++import importlib
++import json
++import subprocess
++import sys
++import textwrap
++import tomllib
++from pathlib import Path
++
++from opentelemetry import trace
++from opentelemetry.context import Context
++from opentelemetry.propagators import aws as aws_propagators
++from opentelemetry.propagators.aws import AwsXRayLambdaPropagator
++from opentelemetry.propagators.textmap import default_getter
++from opentelemetry.trace import (
++    NonRecordingSpan,
++    SpanContext,
++    TraceFlags,
++    TraceState,
++    set_span_in_context,
++)
++
++
++TRACE_HEADER_KEY = "X-Amzn-Trace-Id"
++ENV_KEY = "_X_AMZN_TRACE_ID"
++AWS_XRAY_PACKAGE_ROOT = (
++    Path(__file__).resolve().parents[1] / "propagator" / "opentelemetry-propagator-aws-xray"
++)
++
++
++def _context_summary(context):
++    span_context = trace.get_current_span(context).get_span_context()
++    return {
++        "trace_id": span_context.trace_id,
++        "span_id": span_context.span_id,
++        "is_remote": span_context.is_remote,
++        "trace_flags": int(span_context.trace_flags),
++        "trace_state": list(span_context.trace_state.items()),
++        "is_valid": span_context.is_valid,
++    }
++
++
++def _valid_context(trace_id=1, span_id=2):
++    span_context = SpanContext(
++        trace_id,
++        span_id,
++        is_remote=False,
++        trace_flags=TraceFlags(0),
++        trace_state=TraceState(),
++    )
++    return set_span_in_context(NonRecordingSpan(span_context), context=Context())
++
++
++def test_extract_uses_supplied_xray_carrier(monkeypatch):
++
++
++
++    monkeypatch.delenv(ENV_KEY, raising=False)
++    carrier = {
++        TRACE_HEADER_KEY: (
++            "Root=1-00000002-aaaaaaaaaaaaaaaaaaaaaaaa;"
++            "Parent=1111111111111111;Sampled=0"
++        )
++    }
++
++    actual = _context_summary(AwsXRayLambdaPropagator().extract(carrier))
++
++    assert actual == {
++        "trace_id": 211275100038038233582783867562,
++        "span_id": 1229782938247303441,
++        "is_remote": True,
++        "trace_flags": 0,
++        "trace_state": [],
++        "is_valid": True,
++    }
++
++
++def test_extract_keeps_valid_current_context_without_lambda_fallback(monkeypatch):
++
++
++
++    monkeypatch.setenv(
++        ENV_KEY,
++        "Root=1-00000001-d188f8fa79d48a391a778fa6;"
++        "Parent=53995c3f42cd8ad8;Sampled=1;Foo=Bar",
++    )
++
++    actual = _context_summary(
++        AwsXRayLambdaPropagator().extract({}, context=_valid_context())
++    )
++
++    assert actual == {
++        "trace_id": 1,
++        "span_id": 2,
++        "is_remote": False,
++        "trace_flags": 0,
++        "trace_state": [],
++        "is_valid": True,
++    }
++
++
++def test_extract_falls_back_to_lambda_environment_for_invalid_context(monkeypatch):
++
++
++
++    monkeypatch.setenv(
++        ENV_KEY,
++        "Root=1-00000001-d188f8fa79d48a391a778fa6;"
++        "Parent=53995c3f42cd8ad8;Sampled=1;Foo=Bar",
++    )
++
++    actual = _context_summary(AwsXRayLambdaPropagator().extract({}))
++
++    assert actual == {
++        "trace_id": 144076119245745610175697883046,
++        "span_id": 6023947403358210776,
++        "is_remote": True,
++        "trace_flags": 1,
++        "trace_state": [],
++        "is_valid": True,
++    }
++
++
++def test_extract_leaves_default_context_invalid_when_no_header_exists(monkeypatch):
++
++
++
++    monkeypatch.delenv(ENV_KEY, raising=False)
++
++    actual = _context_summary(AwsXRayLambdaPropagator().extract({}))
++
++    assert actual == {
++        "trace_id": 0,
++        "span_id": 0,
++        "is_remote": False,
++        "trace_flags": 0,
++        "trace_state": [],
++        "is_valid": False,
++    }
++
++
++def test_extract_leaves_context_invalid_when_environment_header_is_malformed(monkeypatch):
++
++
++
++    monkeypatch.setenv(
++        ENV_KEY,
++        "Root=1-bad;Parent=53995c3f42cd8ad8;Sampled=1",
++    )
++
++    actual = _context_summary(AwsXRayLambdaPropagator().extract({}))
++
++    assert actual == {
++        "trace_id": 0,
++        "span_id": 0,
++        "is_remote": False,
++        "trace_flags": 0,
++        "trace_state": [],
++        "is_valid": False,
++    }
++
++
++def test_extract_uses_supplied_getter_for_carrier_lookup(monkeypatch):
++
++
++
++    monkeypatch.setenv(
++        ENV_KEY,
++        "Root=1-00000001-d188f8fa79d48a391a778fa6;"
++        "Parent=53995c3f42cd8ad8;Sampled=0",
++    )
++
++    class LowercaseGetter:
++        def get(self, carrier, key):
++            if key.lower() in carrier:
++                return [carrier[key.lower()]]
++            return []
++
++    carrier = {
++        "x-amzn-trace-id": (
++            "Root=1-00000003-bbbbbbbbbbbbbbbbbbbbbbbb;"
++            "Parent=2222222222222222;Sampled=1"
++        )
++    }
++
++    actual = _context_summary(
++        AwsXRayLambdaPropagator().extract(carrier, getter=LowercaseGetter())
++    )
++
++    assert actual == {
++        "trace_id": 295785140053253527015897414587,
++        "span_id": 2459565876494606882,
++        "is_remote": True,
++        "trace_flags": 1,
++        "trace_state": [],
++        "is_valid": True,
++    }
++
++
++def test_lambda_propagator_is_publicly_exported_from_aws_package():
++
++
++
++
++    assert aws_propagators.AwsXRayLambdaPropagator is AwsXRayLambdaPropagator
++    assert AwsXRayLambdaPropagator.__name__ == "AwsXRayLambdaPropagator"
++
++
++def test_lambda_propagator_is_registered_as_xray_lambda_entry_point():
++
++
++
++
++
++    pyproject = AWS_XRAY_PACKAGE_ROOT / "pyproject.toml"
++    metadata = tomllib.loads(pyproject.read_text())
++    entry_points = metadata["project"]["entry-points"]["opentelemetry_propagator"]
++    entry_value = entry_points["xray-lambda"]
++
++    module_name, object_name = entry_value.split(":", 1)
++
++    assert getattr(importlib.import_module(module_name), object_name) is AwsXRayLambdaPropagator
++
++
++def test_extract_accepts_documented_default_getter(monkeypatch):
++
++    monkeypatch.delenv(ENV_KEY, raising=False)
++
++    actual = _context_summary(
++        AwsXRayLambdaPropagator().extract({}, getter=default_getter)
++    )
++
++    assert actual == {
++        "trace_id": 0,
++        "span_id": 0,
++        "is_remote": False,
++        "trace_flags": 0,
++        "trace_state": [],
++        "is_valid": False,
++    }
++
++
++def test_extract_is_referentially_transparent_for_same_inputs(monkeypatch):
++    monkeypatch.setenv(
++        ENV_KEY,
++        "Root=1-00000001-d188f8fa79d48a391a778fa6;"
++        "Parent=53995c3f42cd8ad8;Sampled=1;Foo=Bar",
++    )
++    carrier = {}
++    context = Context()
++
++    first = _context_summary(
++        AwsXRayLambdaPropagator().extract(
++            carrier, context=context, getter=default_getter
++        )
++    )
++    second = _context_summary(
++        AwsXRayLambdaPropagator().extract(
++            carrier, context=context, getter=default_getter
++        )
++    )
++
++    assert first == second
++    assert second == {
++        "trace_id": 144076119245745610175697883046,
++        "span_id": 6023947403358210776,
++        "is_remote": True,
++        "trace_flags": 1,
++        "trace_state": [],
++        "is_valid": True,
++    }
++
++
++def test_extract_does_not_mutate_carrier(monkeypatch):
++    monkeypatch.delenv(ENV_KEY, raising=False)
++    carrier = {
++        TRACE_HEADER_KEY: (
++            "Root=1-00000002-aaaaaaaaaaaaaaaaaaaaaaaa;"
++            "Parent=1111111111111111;Sampled=0"
++        ),
++        "other": ["unchanged", {"nested": "value"}],
++    }
++    before = copy.deepcopy(carrier)
++
++    actual = _context_summary(AwsXRayLambdaPropagator().extract(carrier))
++
++    assert carrier == before
++    assert actual == {
++        "trace_id": 211275100038038233582783867562,
++        "span_id": 1229782938247303441,
++        "is_remote": True,
++        "trace_flags": 0,
++        "trace_state": [],
++        "is_valid": True,
++    }
++
++
++def test_extract_matches_fresh_process_result_for_same_inputs(monkeypatch):
++    monkeypatch.setenv(
++        ENV_KEY,
++        "Root=1-00000001-d188f8fa79d48a391a778fa6;"
++        "Parent=53995c3f42cd8ad8;Sampled=1;Foo=Bar",
++    )
++    expected = {
++        "trace_id": 144076119245745610175697883046,
++        "span_id": 6023947403358210776,
++        "is_remote": True,
++        "trace_flags": 1,
++        "trace_state": [],
++        "is_valid": True,
++    }
++
++    in_process = _context_summary(AwsXRayLambdaPropagator().extract({}))
++    script = textwrap.dedent(
++        """
++        import json
++        import os
++        from opentelemetry import trace
++        from opentelemetry.propagators.aws import AwsXRayLambdaPropagator
++
++        os.environ["_X_AMZN_TRACE_ID"] = (
++            "Root=1-00000001-d188f8fa79d48a391a778fa6;"
++            "Parent=53995c3f42cd8ad8;Sampled=1;Foo=Bar"
++        )
++        ctx = AwsXRayLambdaPropagator().extract({})
++        sc = trace.get_current_span(ctx).get_span_context()
++        print(json.dumps({
++            "trace_id": sc.trace_id,
++            "span_id": sc.span_id,
++            "is_remote": sc.is_remote,
++            "trace_flags": int(sc.trace_flags),
++            "trace_state": list(sc.trace_state.items()),
++            "is_valid": sc.is_valid,
++        }, sort_keys=True))
++        """
++    )
++
++    completed = subprocess.run(
++        [sys.executable, "-c", script],
++        check=True,
++        text=True,
++        capture_output=True,
++    )
++    fresh_process = json.loads(completed.stdout)
++
++    assert in_process == expected
++    assert fresh_process == expected
++    assert fresh_process == in_process
++
++
++def test_extract_preserves_specified_inputs_and_result_stability(monkeypatch):
++
++
++    monkeypatch.setenv(
++        ENV_KEY,
++        "Root=1-00000001-d188f8fa79d48a391a778fa6;"
++        "Parent=53995c3f42cd8ad8;Sampled=1;Foo=Bar",
++    )
++    carrier = {}
++    before = copy.deepcopy(carrier)
++
++    actual = _context_summary(AwsXRayLambdaPropagator().extract(carrier))
++    repeated = _context_summary(AwsXRayLambdaPropagator().extract(carrier))
++
++    assert carrier == before
++    assert repeated == actual
++    assert actual == {
++        "trace_id": 144076119245745610175697883046,
++        "span_id": 6023947403358210776,
++        "is_remote": True,
++        "trace_flags": 1,
++        "trace_state": [],
++        "is_valid": True,
++    }
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,28 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++
++
++set -euo pipefail
++
++VENV=/workspace/.venv-stage3
++
++if [ ! -x "$VENV/bin/python" ]; then
++  echo "local offline venv is missing: $VENV" >&2
++  exit 1
++fi
++
++export PIP_NO_INDEX=1
++export PIP_DISABLE_PIP_VERSION_CHECK=1
++export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
++
++cd /workspace/repo
++exec "$VENV/bin/python" -m pytest /workspace/repo/usercase-test-coderl/test_aws_xray_lambda_propagator.py -v

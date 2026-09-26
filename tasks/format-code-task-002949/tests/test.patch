@@ -1,0 +1,411 @@
+diff --git a/internal/objectstore/codespec_apply_yaml_preflight_test.go b/internal/objectstore/codespec_apply_yaml_preflight_test.go
+new file mode 100644
+index 00000000..b4be1f20
+--- /dev/null
++++ b/internal/objectstore/codespec_apply_yaml_preflight_test.go
+@@ -0,0 +1,394 @@
++
++
++
++
++
++package objectstore
++
++import (
++	"context"
++	"errors"
++	"testing"
++
++	"github.com/golang/mock/gomock"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++	kerrors "k8s.io/apimachinery/pkg/api/errors"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
++	"k8s.io/apimachinery/pkg/runtime/schema"
++	"k8s.io/apimachinery/pkg/types"
++
++	clusterFake "github.com/vmware-tanzu/octant/internal/cluster/fake"
++	"github.com/vmware-tanzu/octant/pkg/store"
++)
++
++type codespecApplyRecorder struct {
++	gets    []store.Key
++	creates []*unstructured.Unstructured
++}
++
++func (r *codespecApplyRecorder) get(_ context.Context, key store.Key) (*unstructured.Unstructured, error) {
++	r.gets = append(r.gets, key)
++	return nil, kerrors.NewNotFound(schema.GroupResource{Group: key.GroupVersionKind().Group}, key.Name)
++}
++
++func (r *codespecApplyRecorder) create(_ context.Context, object *unstructured.Unstructured) error {
++	r.creates = append(r.creates, object.DeepCopy())
++	return nil
++}
++
++func codespecApplyClient(t *testing.T) (*gomock.Controller, *clusterFake.MockClientInterface) {
++	t.Helper()
++	controller := gomock.NewController(t)
++	client := clusterFake.NewMockClientInterface(controller)
++	client.EXPECT().Resource(gomock.Any()).DoAndReturn(
++		func(gk schema.GroupKind) (schema.GroupVersionResource, bool, error) {
++			switch gk.Kind {
++			case "ConfigMap":
++				return schema.GroupVersionResource{Group: gk.Group, Version: "v1", Resource: "configmaps"}, true, nil
++			case "Secret":
++				return schema.GroupVersionResource{Group: gk.Group, Version: "v1", Resource: "secrets"}, true, nil
++			case "Namespace":
++				return schema.GroupVersionResource{Group: gk.Group, Version: "v1", Resource: "namespaces"}, false, nil
++			default:
++				return schema.GroupVersionResource{Group: gk.Group, Version: "v1", Resource: "unknown"}, false, nil
++			}
++		}).AnyTimes()
++	return controller, client
++}
++
++func TestCodespecApplyYAMLPreflightMalformedTailIsSideEffectFree(t *testing.T) {
++	controller, client := codespecApplyClient(t)
++	defer controller.Finish()
++	recorder := &codespecApplyRecorder{}
++
++	input := `
++apiVersion: v1
++kind: ConfigMap
++metadata:
++  name: first
++---
++apiVersion: v1
++kind: Secret
++metadata:
++  name: broken
++data: [
++`
++	results, err := CreateOrUpdateFromHandler(context.Background(), "default", input, recorder.get, recorder.create, client)
++
++	require.Error(t, err)
++	assert.Empty(t, results)
++	assert.Empty(t, recorder.gets, "preflight errors must occur before object lookup")
++	assert.Empty(t, recorder.creates, "preflight errors must occur before object creation")
++}
++
++func TestCodespecApplyYAMLPreflightRejectsInvalidResourcesAndDuplicates(t *testing.T) {
++	tests := []struct {
++		name  string
++		input string
++	}{
++		{
++			name: "missing apiVersion",
++			input: `kind: ConfigMap
++metadata:
++  name: missing-version
++`,
++		},
++		{
++			name: "missing kind",
++			input: `apiVersion: v1
++metadata:
++  name: missing-kind
++`,
++		},
++		{
++			name: "missing name",
++			input: `apiVersion: v1
++kind: ConfigMap
++metadata: {}
++`,
++		},
++		{
++			name: "list item is not an object",
++			input: `apiVersion: v1
++kind: List
++items:
++  - not-an-object
++`,
++		},
++		{
++			name: "list has no items array",
++			input: `apiVersion: v1
++kind: List
++metadata:
++  name: invalid-list
++`,
++		},
++		{
++			name: "namespace escapes selected namespace",
++			input: `apiVersion: v1
++kind: ConfigMap
++metadata:
++  name: cross-namespace
++  namespace: other
++`,
++		},
++		{
++			name: "duplicate after list expansion and namespace defaulting",
++			input: `apiVersion: v1
++kind: List
++items:
++  - apiVersion: v1
++    kind: ConfigMap
++    metadata:
++      name: repeated
++---
++apiVersion: v1
++kind: ConfigMap
++metadata:
++  name: repeated
++  namespace: default
++`,
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			controller, client := codespecApplyClient(t)
++			defer controller.Finish()
++			recorder := &codespecApplyRecorder{}
++
++			results, err := CreateOrUpdateFromHandler(context.Background(), "default", tt.input, recorder.get, recorder.create, client)
++
++			require.Error(t, err)
++			assert.Empty(t, results)
++			assert.Empty(t, recorder.gets)
++			assert.Empty(t, recorder.creates)
++		})
++	}
++}
++
++func TestCodespecApplyYAMLExpandsListsInStreamOrder(t *testing.T) {
++	controller, client := codespecApplyClient(t)
++	defer controller.Finish()
++	recorder := &codespecApplyRecorder{}
++
++	input := `
++apiVersion: v1
++kind: List
++items:
++  - apiVersion: v1
++    kind: ConfigMap
++    metadata:
++      name: first
++  - apiVersion: v1
++    kind: List
++    items:
++      - apiVersion: v1
++        kind: Namespace
++        metadata:
++          name: team-a
++      - apiVersion: v1
++        kind: Secret
++        metadata:
++          name: credentials
++          namespace: default
++---
++apiVersion: v1
++kind: ConfigMap
++metadata:
++  name: last
++`
++	results, err := CreateOrUpdateFromHandler(context.Background(), "default", input, recorder.get, recorder.create, client)
++
++	require.NoError(t, err)
++	assert.Equal(t, []string{
++		"Created ConfigMap (v1) first in default",
++		"Created Namespace (v1) team-a",
++		"Created Secret (v1) credentials in default",
++		"Created ConfigMap (v1) last in default",
++	}, results)
++	require.Len(t, recorder.creates, 4)
++	assert.Equal(t, []string{"first", "team-a", "credentials", "last"}, []string{
++		recorder.creates[0].GetName(),
++		recorder.creates[1].GetName(),
++		recorder.creates[2].GetName(),
++		recorder.creates[3].GetName(),
++	})
++	assert.Equal(t, "default", recorder.creates[0].GetNamespace())
++	assert.Empty(t, recorder.creates[1].GetNamespace(), "cluster-scoped resources must not receive the selected namespace")
++	assert.Equal(t, "default", recorder.creates[2].GetNamespace())
++	assert.Equal(t, "default", recorder.creates[3].GetNamespace())
++}
++
++func TestCodespecApplyYAMLEmptyDocumentsAndListsAreNoOps(t *testing.T) {
++	controller, client := codespecApplyClient(t)
++	defer controller.Finish()
++	recorder := &codespecApplyRecorder{}
++
++	input := `
++---
++apiVersion: v1
++kind: List
++items: []
++---
++`
++	results, err := CreateOrUpdateFromHandler(context.Background(), "default", input, recorder.get, recorder.create, client)
++
++	require.NoError(t, err)
++	assert.Empty(t, results)
++	assert.Empty(t, recorder.gets)
++	assert.Empty(t, recorder.creates)
++}
++
++func TestCodespecApplyYAMLLookupFailureKeepsEarlierResults(t *testing.T) {
++	controller, client := codespecApplyClient(t)
++	defer controller.Finish()
++	var creates []*unstructured.Unstructured
++	getCount := 0
++	get := func(_ context.Context, key store.Key) (*unstructured.Unstructured, error) {
++		getCount++
++		if getCount == 2 {
++			return nil, errors.New("lookup unavailable")
++		}
++		return nil, kerrors.NewNotFound(schema.GroupResource{}, key.Name)
++	}
++	create := func(_ context.Context, object *unstructured.Unstructured) error {
++		creates = append(creates, object.DeepCopy())
++		return nil
++	}
++
++	input := `
++apiVersion: v1
++kind: ConfigMap
++metadata:
++  name: completed
++---
++apiVersion: v1
++kind: ConfigMap
++metadata:
++  name: fails-at-runtime
++`
++	results, err := CreateOrUpdateFromHandler(context.Background(), "default", input, get, create, client)
++
++	require.Error(t, err)
++	assert.Contains(t, err.Error(), "lookup unavailable")
++	assert.Equal(t, []string{"Created ConfigMap (v1) completed in default"}, results)
++	require.Len(t, creates, 1)
++	assert.Equal(t, "completed", creates[0].GetName())
++}
++
++func TestCodespecApplyYAMLDiscoveryFailureKeepsEarlierResults(t *testing.T) {
++	controller := gomock.NewController(t)
++	defer controller.Finish()
++	client := clusterFake.NewMockClientInterface(controller)
++	client.EXPECT().Resource(schema.GroupKind{Kind: "ConfigMap"}).Return(
++		schema.GroupVersionResource{Version: "v1", Resource: "configmaps"}, true, nil)
++	client.EXPECT().Resource(schema.GroupKind{Kind: "Secret"}).Return(
++		schema.GroupVersionResource{}, false, errors.New("discovery unavailable"))
++	recorder := &codespecApplyRecorder{}
++
++	input := `
++apiVersion: v1
++kind: ConfigMap
++metadata:
++  name: completed
++---
++apiVersion: v1
++kind: Secret
++metadata:
++  name: fails-at-discovery
++`
++	results, err := CreateOrUpdateFromHandler(context.Background(), "default", input, recorder.get, recorder.create, client)
++
++	require.Error(t, err)
++	assert.Contains(t, err.Error(), "discovery unavailable")
++	assert.Equal(t, []string{"Created ConfigMap (v1) completed in default"}, results)
++	require.Len(t, recorder.creates, 1)
++	assert.Equal(t, "completed", recorder.creates[0].GetName())
++}
++
++func TestCodespecApplyYAMLCreateFailureKeepsEarlierResults(t *testing.T) {
++	controller, client := codespecApplyClient(t)
++	defer controller.Finish()
++	var creates []*unstructured.Unstructured
++	create := func(_ context.Context, object *unstructured.Unstructured) error {
++		if object.GetName() == "fails-at-create" {
++			return errors.New("create unavailable")
++		}
++		creates = append(creates, object.DeepCopy())
++		return nil
++	}
++	recorder := &codespecApplyRecorder{}
++
++	input := `
++apiVersion: v1
++kind: ConfigMap
++metadata:
++  name: completed
++---
++apiVersion: v1
++kind: Secret
++metadata:
++  name: fails-at-create
++`
++	results, err := CreateOrUpdateFromHandler(context.Background(), "default", input, recorder.get, create, client)
++
++	require.Error(t, err)
++	assert.Contains(t, err.Error(), "create unavailable")
++	assert.Equal(t, []string{"Created ConfigMap (v1) completed in default"}, results)
++	require.Len(t, creates, 1)
++	assert.Equal(t, "completed", creates[0].GetName())
++}
++
++func TestCodespecApplyYAMLPatchFailureKeepsEarlierResults(t *testing.T) {
++	controller := gomock.NewController(t)
++	defer controller.Finish()
++	client := clusterFake.NewMockClientInterface(controller)
++	dynamicClient := clusterFake.NewMockDynamicInterface(controller)
++	resourceClient := clusterFake.NewMockNamespaceableResourceInterface(controller)
++	gvr := schema.GroupVersionResource{Version: "v1", Resource: "configmaps"}
++	client.EXPECT().Resource(schema.GroupKind{Kind: "ConfigMap"}).Return(gvr, true, nil).Times(2)
++	client.EXPECT().DynamicClient().Return(dynamicClient, nil)
++	dynamicClient.EXPECT().Resource(gvr).Return(resourceClient)
++	resourceClient.EXPECT().Namespace("default").Return(resourceClient)
++	resourceClient.EXPECT().Patch(
++		gomock.Any(), "fails-at-patch", types.ApplyPatchType, gomock.Any(),
++		metav1.PatchOptions{FieldManager: "octant", Force: func() *bool { v := true; return &v }()},
++		gomock.Any(),
++	).Return(nil, errors.New("patch unavailable"))
++
++	getCount := 0
++	get := func(_ context.Context, key store.Key) (*unstructured.Unstructured, error) {
++		getCount++
++		if getCount == 1 {
++			return nil, kerrors.NewNotFound(schema.GroupResource{}, key.Name)
++		}
++		return &unstructured.Unstructured{}, nil
++	}
++	var creates []*unstructured.Unstructured
++	create := func(_ context.Context, object *unstructured.Unstructured) error {
++		creates = append(creates, object.DeepCopy())
++		return nil
++	}
++
++	input := `
++apiVersion: v1
++kind: ConfigMap
++metadata:
++  name: completed
++---
++apiVersion: v1
++kind: ConfigMap
++metadata:
++  name: fails-at-patch
++`
++	results, err := CreateOrUpdateFromHandler(context.Background(), "default", input, get, create, client)
++
++	require.Error(t, err)
++	assert.Contains(t, err.Error(), "patch unavailable")
++	assert.Equal(t, []string{"Created ConfigMap (v1) completed in default"}, results)
++	require.Len(t, creates, 1)
++	assert.Equal(t, "completed", creates[0].GetName())
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,6 @@
++#!/bin/bash
++set -euo pipefail
++
++
++go test ./internal/objectstore ./internal/octant \
++  -run '^(TestCodespecApplyYAML|TestNewApplyYaml_)' -count=1

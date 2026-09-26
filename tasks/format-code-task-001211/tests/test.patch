@@ -1,0 +1,642 @@
+diff --git a/usercase-test-coderl/forwarding_lifecycle_test.go b/usercase-test-coderl/forwarding_lifecycle_test.go
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/forwarding_lifecycle_test.go
+@@ -0,0 +1,613 @@
++package usercase_test_coderl
++
++import (
++	"bytes"
++	"context"
++	"crypto/rand"
++	"crypto/rsa"
++	"crypto/tls"
++	"crypto/x509"
++	"crypto/x509/pkix"
++	"encoding/pem"
++	"errors"
++	"io"
++	"math/big"
++	"net"
++	"net/http"
++	"testing"
++	"time"
++
++	ssh3 "github.com/francoismichel/ssh3"
++	"github.com/francoismichel/ssh3/util"
++	"github.com/quic-go/quic-go"
++	"github.com/quic-go/quic-go/http3"
++)
++
++
++
++
++type memoryStream struct {
++	id         quic.StreamID
++	read       *bytes.Reader
++	written    bytes.Buffer
++	closeCalls int
++}
++
++func newMemoryStream(id int64, payload []byte) *memoryStream {
++	return &memoryStream{id: quic.StreamID(id), read: bytes.NewReader(payload)}
++}
++
++func (s *memoryStream) StreamID() quic.StreamID          { return s.id }
++func (s *memoryStream) Read(p []byte) (int, error)       { return s.read.Read(p) }
++func (s *memoryStream) Write(p []byte) (int, error)      { return s.written.Write(p) }
++func (s *memoryStream) Close() error                     { s.closeCalls++; return nil }
++func (s *memoryStream) CancelRead(quic.StreamErrorCode)  {}
++func (s *memoryStream) CancelWrite(quic.StreamErrorCode) {}
++func (s *memoryStream) Context() context.Context         { return context.Background() }
++func (s *memoryStream) SetDeadline(time.Time) error      { return nil }
++func (s *memoryStream) SetReadDeadline(time.Time) error  { return nil }
++func (s *memoryStream) SetWriteDeadline(time.Time) error { return nil }
++
++type fakeConnection struct {
++	ctx       context.Context
++	tlsState  tls.ConnectionState
++	control   *memoryStream
++	nextID    int64
++	opened    []*memoryStream
++	datagrams [][]byte
++	openErr   error
++}
++
++func newFakeConnection(t *testing.T, controlID int64, nextID int64) *fakeConnection {
++	t.Helper()
++	return &fakeConnection{
++		ctx:      context.Background(),
++		tlsState: realTLSState(t),
++		control:  newMemoryStream(controlID, nil),
++		nextID:   nextID,
++	}
++}
++
++func (c *fakeConnection) AcceptStream(context.Context) (quic.Stream, error) {
++	return nil, io.EOF
++}
++
++func (c *fakeConnection) AcceptUniStream(context.Context) (quic.ReceiveStream, error) {
++	return nil, io.EOF
++}
++
++func (c *fakeConnection) OpenStream() (quic.Stream, error) {
++	if c.openErr != nil {
++		return nil, c.openErr
++	}
++	stream := newMemoryStream(c.nextID, nil)
++	c.nextID += 4
++	c.opened = append(c.opened, stream)
++	return stream, nil
++}
++
++func (c *fakeConnection) OpenStreamSync(context.Context) (quic.Stream, error) {
++	return c.OpenStream()
++}
++
++func (c *fakeConnection) OpenUniStream() (quic.SendStream, error) {
++	return c.OpenStream()
++}
++
++func (c *fakeConnection) OpenUniStreamSync(context.Context) (quic.SendStream, error) {
++	return c.OpenStream()
++}
++
++func (c *fakeConnection) LocalAddr() net.Addr {
++	return &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1111}
++}
++
++func (c *fakeConnection) RemoteAddr() net.Addr {
++	return &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 2222}
++}
++
++func (c *fakeConnection) CloseWithError(quic.ApplicationErrorCode, string) error {
++	return nil
++}
++
++func (c *fakeConnection) Context() context.Context {
++	return c.ctx
++}
++
++func (c *fakeConnection) ConnectionState() quic.ConnectionState {
++	return quic.ConnectionState{TLS: c.tlsState}
++}
++
++func (c *fakeConnection) SendDatagram(payload []byte) error {
++	c.datagrams = append(c.datagrams, append([]byte(nil), payload...))
++	return nil
++}
++
++func (c *fakeConnection) ReceiveDatagram(context.Context) ([]byte, error) {
++	return nil, io.EOF
++}
++
++type responseRecorderHijacker struct {
++	conn   *fakeConnection
++	status int
++}
++
++func (r *responseRecorderHijacker) Header() http.Header {
++	return http.Header{}
++}
++
++func (r *responseRecorderHijacker) Write(p []byte) (int, error) {
++	return len(p), nil
++}
++
++func (r *responseRecorderHijacker) WriteHeader(statusCode int) {
++	r.status = statusCode
++}
++
++func (r *responseRecorderHijacker) StreamCreator() http3.StreamCreator {
++	return r.conn
++}
++
++func realTLSState(t *testing.T) tls.ConnectionState {
++	t.Helper()
++	certPEM, keyPEM := selfSignedCert(t)
++	cert, err := tls.X509KeyPair(certPEM, keyPEM)
++	if err != nil {
++		t.Fatalf("build cert: %v", err)
++	}
++	serverCfg := &tls.Config{Certificates: []tls.Certificate{cert}, NextProtos: []string{"ssh3-test"}}
++	clientCfg := &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"ssh3-test"}}
++	clientConn, serverConn := net.Pipe()
++	defer clientConn.Close()
++	defer serverConn.Close()
++	clientTLS := tls.Client(clientConn, clientCfg)
++	serverTLS := tls.Server(serverConn, serverCfg)
++	errc := make(chan error, 2)
++	go func() { errc <- clientTLS.Handshake() }()
++	go func() { errc <- serverTLS.Handshake() }()
++	for i := 0; i < 2; i++ {
++		if err := <-errc; err != nil {
++			t.Fatalf("TLS handshake: %v", err)
++		}
++	}
++	return serverTLS.ConnectionState()
++}
++
++func selfSignedCert(t *testing.T) ([]byte, []byte) {
++	t.Helper()
++	key, err := rsa.GenerateKey(rand.Reader, 1024)
++	if err != nil {
++		t.Fatalf("generate key: %v", err)
++	}
++	template := &x509.Certificate{
++		SerialNumber: big.NewInt(1),
++		Subject:      pkix.Name{CommonName: "ssh3 usercase"},
++		NotBefore:    time.Unix(1700000000, 0),
++		NotAfter:     time.Unix(1893456000, 0),
++		KeyUsage:     x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
++	}
++	der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
++	if err != nil {
++		t.Fatalf("create cert: %v", err)
++	}
++	keyBytes := x509.MarshalPKCS1PrivateKey(key)
++	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}),
++		pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: keyBytes})
++}
++
++func newServerConversation(t *testing.T, conn *fakeConnection, maxPacketSize uint64) *ssh3.Conversation {
++	t.Helper()
++	conv, err := ssh3.NewServerConversation(context.Background(), conn.control, conn, conn, maxPacketSize, ssh3.ThisVersion())
++	if err != nil {
++		t.Fatalf("NewServerConversation: %v", err)
++	}
++	return conv
++}
++
++func registerConversation(t *testing.T, server *ssh3.Server, conn *fakeConnection, conv *ssh3.Conversation) {
++	t.Helper()
++	req, err := http.NewRequest(http.MethodConnect, "https://ssh3.example/ssh", nil)
++	if err != nil {
++		t.Fatal(err)
++	}
++	req.Proto = "ssh3"
++	rec := &responseRecorderHijacker{conn: conn}
++	server.GetHTTPHandlerFunc(context.Background())("alice", conv, rec, req)
++	if rec.status != 200 {
++		t.Fatalf("registered status = %d, want 200", rec.status)
++	}
++}
++
++func buildIncomingHeader(conversationStreamID uint64, channelType string, maxPacketSize uint64, extra []byte) []byte {
++	buf := util.AppendVarInt(nil, conversationStreamID)
++	sshString := make([]byte, util.SSHStringLen(channelType))
++	if _, err := util.WriteSSHString(sshString, channelType); err != nil {
++		panic(err)
++	}
++	buf = append(buf, sshString...)
++	buf = util.AppendVarInt(buf, maxPacketSize)
++	buf = append(buf, extra...)
++	return buf
++}
++
++func decodeOutboundHeader(t *testing.T, data []byte) (uint64, uint64, string, uint64, []byte) {
++	t.Helper()
++	reader := util.NewReader(bytes.NewReader(data))
++	frameType, err := util.ReadVarInt(reader)
++	if err != nil {
++		t.Fatalf("frame type: %v", err)
++	}
++	conversationID, err := util.ReadVarInt(reader)
++	if err != nil {
++		t.Fatalf("conversation id: %v", err)
++	}
++	channelType, err := util.ParseSSHString(reader)
++	if err != nil {
++		t.Fatalf("channel type: %v", err)
++	}
++	maxPacketSize, err := util.ReadVarInt(reader)
++	if err != nil {
++		t.Fatalf("max packet size: %v", err)
++	}
++	remaining, err := io.ReadAll(reader)
++	if err != nil {
++		t.Fatalf("remaining bytes: %v", err)
++	}
++	return frameType, conversationID, channelType, maxPacketSize, remaining
++}
++
++func TestOpenUDPForwardingChannelWritesHeaderRegistersStateAndSendsDatagrams(t *testing.T) {
++
++
++	conn := newFakeConnection(t, 7, 11)
++	conv := newServerConversation(t, conn, 4096)
++	remote := &net.UDPAddr{IP: net.IPv4(192, 0, 2, 9).To4(), Port: 4242}
++	local := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 5353}
++
++	channel, err := conv.OpenUDPForwardingChannel(1200, 5, local, remote)
++	if err != nil {
++		t.Fatalf("OpenUDPForwardingChannel: %v", err)
++	}
++	udpChannel, ok := channel.(*ssh3.UDPForwardingChannelImpl)
++	if !ok {
++		t.Fatalf("channel type = %T, want *ssh3.UDPForwardingChannelImpl", channel)
++	}
++	if channel.ChannelID() != 11 {
++		t.Fatalf("ChannelID = %d, want 11", channel.ChannelID())
++	}
++	if channel.ConversationStreamID() != 7 {
++		t.Fatalf("ConversationStreamID = %d, want 7", channel.ConversationStreamID())
++	}
++	if channel.ChannelType() != "direct-udp" {
++		t.Fatalf("ChannelType = %q, want %q", channel.ChannelType(), "direct-udp")
++	}
++	if channel.MaxPacketSize() != 1200 {
++		t.Fatalf("MaxPacketSize = %d, want 1200", channel.MaxPacketSize())
++	}
++	if udpChannel.RemoteAddr.String() != "192.0.2.9:4242" {
++		t.Fatalf("RemoteAddr = %q, want %q", udpChannel.RemoteAddr.String(), "192.0.2.9:4242")
++	}
++	if len(conn.opened) != 1 {
++		t.Fatalf("opened stream count = %d, want 1", len(conn.opened))
++	}
++
++	frameType, conversationID, channelType, maxPacketSize, extra := decodeOutboundHeader(t, conn.opened[0].written.Bytes())
++	if frameType != 2939561958 {
++		t.Fatalf("frame type = %d, want 2939561958", frameType)
++	}
++	if conversationID != 7 {
++		t.Fatalf("wire conversation id = %d, want 7", conversationID)
++	}
++	if channelType != "direct-udp" {
++		t.Fatalf("wire channel type = %q, want %q", channelType, "direct-udp")
++	}
++	if maxPacketSize != 1200 {
++		t.Fatalf("wire max packet size = %d, want 1200", maxPacketSize)
++	}
++	if !bytes.Equal(extra, []byte{4, 192, 0, 2, 9, 16, 146}) {
++		t.Fatalf("wire forwarding bytes = %v, want [4 192 0 2 9 16 146]", extra)
++	}
++
++	if err := channel.SendDatagram([]byte{170, 187}); err != nil {
++		t.Fatalf("SendDatagram: %v", err)
++	}
++	if len(conn.datagrams) != 1 {
++		t.Fatalf("sent datagram count = %d, want 1", len(conn.datagrams))
++	}
++	if !bytes.Equal(conn.datagrams[0], []byte{7, 11, 170, 187}) {
++		t.Fatalf("sent datagram = %v, want [7 11 170 187]", conn.datagrams[0])
++	}
++}
++
++func TestOpenTCPForwardingChannelWritesIPv6HeaderAndKeepsIndependentState(t *testing.T) {
++
++
++	connA := newFakeConnection(t, 7, 11)
++	connB := newFakeConnection(t, 17, 21)
++	convA := newServerConversation(t, connA, 4096)
++	convB := newServerConversation(t, connB, 2048)
++	remoteA := &net.TCPAddr{IP: net.ParseIP("2001:db8::2"), Port: 2222}
++	remoteB := &net.TCPAddr{IP: net.ParseIP("2001:db8::3"), Port: 2223}
++	local := &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0}
++
++	channelA, err := convA.OpenTCPForwardingChannel(2048, 6, local, remoteA)
++	if err != nil {
++		t.Fatalf("OpenTCPForwardingChannel A: %v", err)
++	}
++	channelB, err := convB.OpenTCPForwardingChannel(512, 4, local, remoteB)
++	if err != nil {
++		t.Fatalf("OpenTCPForwardingChannel B: %v", err)
++	}
++	tcpA, ok := channelA.(*ssh3.TCPForwardingChannelImpl)
++	if !ok {
++		t.Fatalf("channel A type = %T, want *ssh3.TCPForwardingChannelImpl", channelA)
++	}
++	tcpB, ok := channelB.(*ssh3.TCPForwardingChannelImpl)
++	if !ok {
++		t.Fatalf("channel B type = %T, want *ssh3.TCPForwardingChannelImpl", channelB)
++	}
++	if channelA.ChannelID() != 11 {
++		t.Fatalf("channel A id = %d, want 11", channelA.ChannelID())
++	}
++	if channelB.ChannelID() != 21 {
++		t.Fatalf("channel B id = %d, want 21", channelB.ChannelID())
++	}
++	if channelA.ConversationStreamID() != 7 {
++		t.Fatalf("channel A conversation stream = %d, want 7", channelA.ConversationStreamID())
++	}
++	if channelB.ConversationStreamID() != 17 {
++		t.Fatalf("channel B conversation stream = %d, want 17", channelB.ConversationStreamID())
++	}
++	if channelA.ChannelType() != "direct-tcp" {
++		t.Fatalf("channel A type = %q, want %q", channelA.ChannelType(), "direct-tcp")
++	}
++	if channelB.ChannelType() != "direct-tcp" {
++		t.Fatalf("channel B type = %q, want %q", channelB.ChannelType(), "direct-tcp")
++	}
++	if tcpA.RemoteAddr.String() != "[2001:db8::2]:2222" {
++		t.Fatalf("channel A remote = %q, want %q", tcpA.RemoteAddr.String(), "[2001:db8::2]:2222")
++	}
++	if tcpB.RemoteAddr.String() != "[2001:db8::3]:2223" {
++		t.Fatalf("channel B remote = %q, want %q", tcpB.RemoteAddr.String(), "[2001:db8::3]:2223")
++	}
++
++	_, conversationID, channelType, maxPacketSize, extra := decodeOutboundHeader(t, connA.opened[0].written.Bytes())
++	if conversationID != 7 {
++		t.Fatalf("wire conversation id = %d, want 7", conversationID)
++	}
++	if channelType != "direct-tcp" {
++		t.Fatalf("wire channel type = %q, want %q", channelType, "direct-tcp")
++	}
++	if maxPacketSize != 2048 {
++		t.Fatalf("wire max packet size = %d, want 2048", maxPacketSize)
++	}
++	if !bytes.Equal(extra, []byte{6, 32, 1, 13, 184, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 8, 174}) {
++		t.Fatalf("wire forwarding bytes = %v, want [6 32 1 13 184 0 0 0 0 0 0 0 0 0 0 0 2 8 174]", extra)
++	}
++}
++
++func TestForwardingOpenStreamFailureReturnsNilAndDoesNotRegisterChannel(t *testing.T) {
++
++
++	conn := newFakeConnection(t, 7, 11)
++	conn.openErr = errors.New("open stream exploded")
++	conv := newServerConversation(t, conn, 4096)
++	remote := &net.UDPAddr{IP: net.IPv4(203, 0, 113, 2).To4(), Port: 6000}
++	local := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 5353}
++
++	channel, err := conv.OpenUDPForwardingChannel(1200, 5, local, remote)
++	if channel != nil {
++		t.Fatalf("channel = %v, want nil", channel)
++	}
++	if err == nil {
++		t.Fatal("err = nil, want open stream error")
++	}
++
++	if !errors.Is(err, conn.openErr) {
++		t.Fatalf("err = %T %v, want original open stream error", err, err)
++	}
++	if len(conn.opened) != 0 {
++		t.Fatalf("opened stream count = %d, want 0", len(conn.opened))
++	}
++
++	ctx, cancel := context.WithCancel(context.Background())
++	cancel()
++	accepted, acceptErr := conv.AcceptChannel(ctx)
++	if accepted != nil {
++		t.Fatalf("accepted channel = %v, want nil", accepted)
++	}
++	if !errors.Is(acceptErr, context.Canceled) {
++		t.Fatalf("accept err = %T %v, want context.Canceled", acceptErr, acceptErr)
++	}
++}
++
++func TestAcceptChannelReturnsUDPForwardingWrapperAndQueuedDatagram(t *testing.T) {
++
++
++	conn := newFakeConnection(t, 7, 11)
++	conv := newServerConversation(t, conn, 4096)
++	h3Server := &http3.Server{}
++	server := ssh3.NewServer(4096, 3, h3Server, func(string, *ssh3.Conversation) error { return nil })
++	registerConversation(t, server, conn, conv)
++
++	if err := conv.AddDatagram(context.Background(), []byte{11, 222, 173}); err == nil {
++		t.Fatal("AddDatagram err = nil, want ChannelNotFound")
++	} else {
++		var notFound util.ChannelNotFound
++		if !errors.As(err, &notFound) {
++			t.Fatalf("AddDatagram err = %T, want util.ChannelNotFound", err)
++		}
++	}
++	incoming := newMemoryStream(11, buildIncomingHeader(7, "direct-udp", 900, []byte{4, 198, 51, 100, 4, 15, 160}))
++	hijacked, err := h3Server.StreamHijacker(ssh3.SSH_FRAME_TYPE, conn, incoming, nil)
++	if err != nil {
++		t.Fatalf("hijack direct-udp: %v", err)
++	}
++	if hijacked != true {
++		t.Fatalf("hijacked = %v, want true", hijacked)
++	}
++	accepted, err := conv.AcceptChannel(context.Background())
++	if err != nil {
++		t.Fatalf("AcceptChannel: %v", err)
++	}
++	udp, ok := accepted.(*ssh3.UDPForwardingChannelImpl)
++	if !ok {
++		t.Fatalf("accepted type = %T, want *ssh3.UDPForwardingChannelImpl", accepted)
++	}
++	if accepted.ChannelID() != 11 {
++		t.Fatalf("accepted channel id = %d, want 11", accepted.ChannelID())
++	}
++	if accepted.ChannelType() != "direct-udp" {
++		t.Fatalf("accepted channel type = %q, want %q", accepted.ChannelType(), "direct-udp")
++	}
++	if accepted.MaxPacketSize() != 900 {
++		t.Fatalf("accepted max packet size = %d, want 900", accepted.MaxPacketSize())
++	}
++	if udp.RemoteAddr.String() != "198.51.100.4:4000" {
++		t.Fatalf("accepted remote = %q, want %q", udp.RemoteAddr.String(), "198.51.100.4:4000")
++	}
++	if !bytes.Equal(incoming.written.Bytes(), []byte{64, 91, 80, 0}) {
++		t.Fatalf("confirmation bytes = %v, want [64 91 80 0]", incoming.written.Bytes())
++	}
++	datagram, err := accepted.ReceiveDatagram(context.Background())
++	if err != nil {
++		t.Fatalf("ReceiveDatagram: %v", err)
++	}
++	if !bytes.Equal(datagram, []byte{222, 173}) {
++		t.Fatalf("queued datagram = %v, want [222 173]", datagram)
++	}
++	if err := accepted.SendDatagram([]byte{1, 2}); err != nil {
++		t.Fatalf("SendDatagram on accepted UDP channel: %v", err)
++	}
++	if !bytes.Equal(conn.datagrams[0], []byte{7, 11, 1, 2}) {
++		t.Fatalf("accepted sent datagram = %v, want [7 11 1 2]", conn.datagrams[0])
++	}
++}
++
++func TestAcceptChannelReturnsTCPForwardingWrapper(t *testing.T) {
++
++
++	conn := newFakeConnection(t, 7, 11)
++	conv := newServerConversation(t, conn, 4096)
++	h3Server := &http3.Server{}
++	server := ssh3.NewServer(4096, 3, h3Server, func(string, *ssh3.Conversation) error { return nil })
++	registerConversation(t, server, conn, conv)
++
++	extra := []byte{6, 32, 1, 13, 184, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5, 0, 80}
++	incoming := newMemoryStream(15, buildIncomingHeader(7, "direct-tcp", 901, extra))
++	hijacked, err := h3Server.StreamHijacker(ssh3.SSH_FRAME_TYPE, conn, incoming, nil)
++	if err != nil {
++		t.Fatalf("hijack direct-tcp: %v", err)
++	}
++	if hijacked != true {
++		t.Fatalf("hijacked = %v, want true", hijacked)
++	}
++	accepted, err := conv.AcceptChannel(context.Background())
++	if err != nil {
++		t.Fatalf("AcceptChannel: %v", err)
++	}
++	tcp, ok := accepted.(*ssh3.TCPForwardingChannelImpl)
++	if !ok {
++		t.Fatalf("accepted type = %T, want *ssh3.TCPForwardingChannelImpl", accepted)
++	}
++	if accepted.ChannelID() != 15 {
++		t.Fatalf("accepted channel id = %d, want 15", accepted.ChannelID())
++	}
++	if accepted.ChannelType() != "direct-tcp" {
++		t.Fatalf("accepted channel type = %q, want %q", accepted.ChannelType(), "direct-tcp")
++	}
++	if tcp.RemoteAddr.String() != "[2001:db8::5]:80" {
++		t.Fatalf("accepted remote = %q, want %q", tcp.RemoteAddr.String(), "[2001:db8::5]:80")
++	}
++}
++
++func TestInvalidForwardingHeaderReturnsErrorAndDoesNotQueueChannel(t *testing.T) {
++
++
++	conn := newFakeConnection(t, 7, 11)
++	conv := newServerConversation(t, conn, 4096)
++	h3Server := &http3.Server{}
++	server := ssh3.NewServer(4096, 3, h3Server, func(string, *ssh3.Conversation) error { return nil })
++	registerConversation(t, server, conn, conv)
++
++	badFamily := newMemoryStream(11, buildIncomingHeader(7, "direct-udp", 900, []byte{5, 198, 51, 100, 4, 15, 160}))
++	hijacked, err := h3Server.StreamHijacker(ssh3.SSH_FRAME_TYPE, conn, badFamily, nil)
++	if hijacked != false {
++		t.Fatalf("bad-family hijacked = %v, want false", hijacked)
++	}
++
++	if err == nil {
++		t.Fatal("bad-family err = nil, want invalid address family error")
++	}
++
++	shortIPv4 := newMemoryStream(15, buildIncomingHeader(7, "direct-tcp", 900, []byte{4, 203, 0, 113}))
++	hijacked, err = h3Server.StreamHijacker(ssh3.SSH_FRAME_TYPE, conn, shortIPv4, nil)
++	if hijacked != false {
++		t.Fatalf("short-header hijacked = %v, want false", hijacked)
++	}
++
++	if err == nil {
++		t.Fatal("short-header err = nil, want error")
++	}
++
++	ctx, cancel := context.WithCancel(context.Background())
++	cancel()
++	accepted, acceptErr := conv.AcceptChannel(ctx)
++	if accepted != nil {
++		t.Fatalf("accepted channel = %v, want nil", accepted)
++	}
++	if !errors.Is(acceptErr, context.Canceled) {
++		t.Fatalf("accept err = %T %v, want context.Canceled", acceptErr, acceptErr)
++	}
++}
++
++func TestForwardingChannelCloseUsesEmbeddedChannel(t *testing.T) {
++
++
++	conn := newFakeConnection(t, 7, 11)
++	conv := newServerConversation(t, conn, 4096)
++	remote := &net.TCPAddr{IP: net.IPv4(192, 0, 2, 44).To4(), Port: 2222}
++	local := &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0}
++
++	channel, err := conv.OpenTCPForwardingChannel(1200, 0, local, remote)
++	if err != nil {
++		t.Fatalf("OpenTCPForwardingChannel: %v", err)
++	}
++	channel.Close()
++
++	if len(conn.opened) != 1 {
++		t.Fatalf("opened stream count = %d, want 1", len(conn.opened))
++	}
++	if conn.opened[0].closeCalls != 1 {
++		t.Fatalf("forwarding channel close calls = %d, want 1", conn.opened[0].closeCalls)
++	}
++}
++
++func TestForwardingLifecycleRepeatedConstructUseCleanupCycles(t *testing.T) {
++
++
++	for i := 0; i < 100; i++ {
++		conn := newFakeConnection(t, 7, 11)
++		conv := newServerConversation(t, conn, 4096)
++		remote := &net.UDPAddr{IP: net.IPv4(192, 0, 2, byte(10+i%20)).To4(), Port: 4242}
++		local := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 5353}
++		channel, err := conv.OpenUDPForwardingChannel(1200, 5, local, remote)
++		if err != nil {
++			t.Fatalf("cycle %d open UDP forwarding: %v", i, err)
++		}
++		if err := channel.SendDatagram([]byte{1}); err != nil {
++			t.Fatalf("cycle %d send datagram: %v", i, err)
++		}
++		channel.Close()
++
++		if len(conn.opened) != 1 {
++			t.Fatalf("cycle %d opened stream count = %d, want 1", i, len(conn.opened))
++		}
++		if conn.opened[0].closeCalls != 1 {
++			t.Fatalf("cycle %d stream close calls = %d, want 1", i, conn.opened[0].closeCalls)
++		}
++		if len(conn.datagrams) != 1 || !bytes.Equal(conn.datagrams[0], []byte{7, 11, 1}) {
++			t.Fatalf("cycle %d sent datagrams = %v, want [[7 11 1]]", i, conn.datagrams)
++		}
++	}
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,19 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++
++export GOTOOLCHAIN=local
++export GOPROXY=off
++export GOSUMDB=off
++
++cd /workspace/repo
++exec go test -v -count=1 ./usercase-test-coderl

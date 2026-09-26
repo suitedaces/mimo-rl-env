@@ -1,0 +1,242 @@
+diff --git a/netbox/extras/tests/test_runscript_command.py b/netbox/extras/tests/test_runscript_command.py
+new file mode 100644
+index 000000000..7eb7b07bd
+--- /dev/null
++++ b/netbox/extras/tests/test_runscript_command.py
+@@ -0,0 +1,195 @@
++import io
++import json
++import tempfile
++import uuid
++from contextlib import redirect_stdout
++
++from django.contrib.auth.models import User
++from django.core.management import call_command
++from django.test import TestCase, override_settings
++
++from dcim.models import Site
++
++
++_UNSET = object()
++
++
++SCRIPT_MODULE = """
++from dcim.models import Site
++from extras.scripts import Script
++
++
++class EchoScript(Script):
++    class Meta:
++        name = "Echo script"
++
++    def run(self, data, commit):
++        self.log_info("ECHO:{token}:{count}".format(
++            token=data.get("token"),
++            count=data.get("count"),
++        ))
++
++
++class CreateSiteScript(Script):
++    class Meta:
++        name = "Create site script"
++
++    def run(self, data, commit):
++        Site.objects.create(
++            name=data["name"],
++            slug=data["slug"],
++        )
++        self.log_success("CREATED:{slug}".format(slug=data["slug"]))
++
++
++class LoggingScript(Script):
++    class Meta:
++        name = "Logging script"
++
++    def run(self, data, commit):
++        self.log_debug("DEBUG-MESSAGE:{token}".format(token=data["token"]))
++        self.log_warning("WARNING-MESSAGE:{token}".format(token=data["token"]))
++"""
++
++
++class RunscriptCliTest(TestCase):
++
++    @classmethod
++    def setUpTestData(cls):
++        User.objects.create(username="runscript-test", is_superuser=True, is_staff=True)
++
++    @classmethod
++    def setUpClass(cls):
++        super().setUpClass()
++        cls.scripts_root = tempfile.TemporaryDirectory()
++        cls.settings_override = override_settings(SCRIPTS_ROOT=cls.scripts_root.name)
++        cls.settings_override.enable()
++
++        with open(f"{cls.scripts_root.name}/cli_probe.py", "w") as script_file:
++            script_file.write(SCRIPT_MODULE)
++        with open(f"{cls.scripts_root.name}/secondary_probe.py", "w") as script_file:
++            script_file.write(SCRIPT_MODULE)
++
++    @classmethod
++    def tearDownClass(cls):
++        cls.settings_override.disable()
++        cls.scripts_root.cleanup()
++        super().tearDownClass()
++
++    def _token(self):
++        return uuid.uuid4().hex
++
++    def _call_runscript(self, script_name, *, data=_UNSET, commit=False, loglevel=_UNSET):
++        stdout = io.StringIO()
++        cli_args = []
++        if data is not _UNSET:
++            cli_args.extend(("--data", json.dumps(data)))
++        if commit:
++            cli_args.append("--commit")
++        if loglevel is not _UNSET:
++            cli_args.extend(("--loglevel", loglevel))
++        cli_args.append(script_name)
++
++        with redirect_stdout(stdout):
++            call_command("runscript", *cli_args, stdout=stdout)
++        return stdout.getvalue()
++
++    def test_runscript_executes_named_script_from_cli(self):
++        token = self._token()
++
++        output = self._call_runscript(
++            "cli_probe.EchoScript",
++            data={"token": token, "count": 11},
++        )
++
++        self.assertIn(f"ECHO:{token}:11", output)
++
++    def test_runscript_executes_named_script_from_another_module(self):
++        token = self._token()
++
++        output = self._call_runscript(
++            "secondary_probe.EchoScript",
++            data={"token": token, "count": 23},
++        )
++
++        self.assertIn(f"ECHO:{token}:23", output)
++
++    def test_runscript_passes_json_data_to_script(self):
++        token = self._token()
++
++        output = self._call_runscript(
++            "cli_probe.EchoScript",
++            data={
++                "token": token,
++                "count": 37,
++            },
++        )
++
++        self.assertIn(token, output)
++        self.assertIn("ECHO:", output)
++        self.assertIn(":37", output)
++
++    def test_runscript_defaults_to_rollback(self):
++        slug = f"cli-rollback-{self._token()}"
++
++        output = self._call_runscript(
++            "cli_probe.CreateSiteScript",
++            data={"name": f"CLI rollback {slug}", "slug": slug},
++        )
++
++        self.assertIn(f"CREATED:{slug}", output)
++        self.assertFalse(
++            Site.objects.filter(slug=slug).exists(),
++            "runscript must not persist database writes unless --commit is supplied",
++        )
++
++    def test_runscript_commit_persists_changes(self):
++        slug = f"cli-commit-{self._token()}"
++
++        output = self._call_runscript(
++            "cli_probe.CreateSiteScript",
++            data={"name": f"CLI commit {slug}", "slug": slug},
++            commit=True,
++        )
++
++        self.assertIn(f"CREATED:{slug}", output)
++        self.assertTrue(Site.objects.filter(slug=slug).exists())
++        self.assertEqual(Site.objects.get(slug=slug).name, f"CLI commit {slug}")
++
++    def test_runscript_commit_persists_regular_script_changes(self):
++        slug = f"regular-commit-{self._token()}"
++
++        output = self._call_runscript(
++            "cli_probe.CreateSiteScript",
++            data={"name": f"Regular commit {slug}", "slug": slug},
++            commit=True,
++        )
++
++        self.assertIn(f"CREATED:{slug}", output)
++        self.assertTrue(Site.objects.filter(slug=slug).exists())
++
++    def test_runscript_loglevel_filters_console_output(self):
++        warning_token = self._token()
++
++        warning_output = self._call_runscript(
++            "cli_probe.LoggingScript",
++            data={"token": warning_token},
++            loglevel="warning",
++        )
++
++        self.assertIn(f"WARNING-MESSAGE:{warning_token}", warning_output)
++        self.assertNotIn(f"DEBUG-MESSAGE:{warning_token}", warning_output)
++
++        debug_token = self._token()
++        debug_output = self._call_runscript(
++            "cli_probe.LoggingScript",
++            data={"token": debug_token},
++            loglevel="debug",
++        )
++
++        self.assertIn(f"DEBUG-MESSAGE:{debug_token}", debug_output)
++        self.assertIn(f"WARNING-MESSAGE:{debug_token}", debug_output)
++
++    def test_runscript_rejects_unknown_script(self):
++        with self.assertRaises(Exception):
++            self._call_runscript("cli_probe.NoSuchScript")
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,36 @@
++#!/bin/bash
++set -uo pipefail
++
++cd /testbed
++
++
++set +u
++export PATH="$HOME/.pyenv/bin:$PATH"
++eval "$(pyenv init -)"
++
++
++source /testbed/.build_env/venv/bin/activate
++set -u
++
++
++if [ ! -f /testbed/netbox/netbox/configuration.py ]; then
++    ln -s /testbed/netbox/netbox/configuration.testing.py /testbed/netbox/netbox/configuration.py
++fi
++
++
++pg_ctlcluster 16 main start 2>/dev/null || true
++
++cd /testbed/netbox
++
++case "${1:-}" in
++  base)
++    python manage.py test extras.tests.test_scripts --verbosity=2 --keepdb
++    ;;
++  new)
++    python manage.py test extras.tests.test_runscript_command --verbosity=2 --keepdb
++    ;;
++  *)
++    echo "usage: $0 base|new"
++    exit 2
++    ;;
++esac

@@ -1,0 +1,259 @@
+diff --git a/cli/azd/internal/vsrpc/handler_test.go b/cli/azd/internal/vsrpc/handler_test.go
+index a4f33297f..9d78cc34d 100644
+--- a/cli/azd/internal/vsrpc/handler_test.go
++++ b/cli/azd/internal/vsrpc/handler_test.go
+@@ -3,6 +3,7 @@ package vsrpc
+ import (
+ 	"context"
+ 	"errors"
++	"strings"
+ 	"testing"
+ 
+ 	"github.com/stretchr/testify/require"
+@@ -83,6 +84,144 @@ func TestHandler(t *testing.T) {
+ 	t.Run("HandlerFunc3", func(t *testing.T) { runHandlerSuite(t, newHandlerFunc3, []any{"arg0", "arg1", "arg2"}, "ok") })
+ }
+ 
++type panicHandlerCase struct {
++	name    string
++	message string
++	handler Handler
++	request jsonrpc2.Request
++}
++
++func TestPanicRecoveredAcrossHandlerAdapters(t *testing.T) {
++	cases := []panicHandlerCase{
++		{
++			name:    "action zero args",
++			message: "hidden action zero panic",
++			handler: HandlerAction0(func(context.Context) error {
++				panicRpcTestFrame("hidden action zero panic")
++				return nil
++			}),
++			request: requestWithParams(t),
++		},
++		{
++			name:    "action one arg",
++			message: "hidden action one panic",
++			handler: HandlerAction1(func(ctx context.Context, value string) error {
++				require.Equal(t, "alpha", value)
++				panicRpcTestFrame("hidden action one panic")
++				return nil
++			}),
++			request: requestWithParams(t, "alpha"),
++		},
++		{
++			name:    "action two args",
++			message: "hidden action two panic",
++			handler: HandlerAction2(func(ctx context.Context, value string, count int) error {
++				require.Equal(t, "bravo", value)
++				require.Equal(t, 42, count)
++				panicRpcTestFrame("hidden action two panic")
++				return nil
++			}),
++			request: requestWithParams(t, "bravo", 42),
++		},
++		{
++			name:    "action three args",
++			message: "hidden action three panic",
++			handler: HandlerAction3(func(ctx context.Context, value string, count int, flag bool) error {
++				require.Equal(t, "charlie", value)
++				require.Equal(t, 7, count)
++				require.True(t, flag)
++				panicRpcTestFrame("hidden action three panic")
++				return nil
++			}),
++			request: requestWithParams(t, "charlie", 7, true),
++		},
++		{
++			name:    "func zero args",
++			message: "hidden func zero panic",
++			handler: HandlerFunc0(func(context.Context) (string, error) {
++				panicRpcTestFrame("hidden func zero panic")
++				return "", nil
++			}),
++			request: requestWithParams(t),
++		},
++		{
++			name:    "func one arg",
++			message: "hidden func one panic",
++			handler: HandlerFunc1(func(ctx context.Context, value string) (string, error) {
++				require.Equal(t, "delta", value)
++				panicRpcTestFrame("hidden func one panic")
++				return "", nil
++			}),
++			request: requestWithParams(t, "delta"),
++		},
++		{
++			name:    "func two args",
++			message: "hidden func two panic",
++			handler: HandlerFunc2(func(ctx context.Context, value string, count int) (string, error) {
++				require.Equal(t, "echo", value)
++				require.Equal(t, 84, count)
++				panicRpcTestFrame("hidden func two panic")
++				return "", nil
++			}),
++			request: requestWithParams(t, "echo", 84),
++		},
++		{
++			name:    "func three args",
++			message: "hidden func three panic",
++			handler: HandlerFunc3(func(ctx context.Context, value string, count int, flag bool) (string, error) {
++				require.Equal(t, "foxtrot", value)
++				require.Equal(t, 21, count)
++				require.False(t, flag)
++				panicRpcTestFrame("hidden func three panic")
++				return "", nil
++			}),
++			request: requestWithParams(t, "foxtrot", 21, false),
++		},
++	}
++
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			var repliedErr error
++			reply := func(ctx context.Context, result any, err error) error {
++				repliedErr = err
++				return err
++			}
++
++			var handlerErr error
++			require.NotPanics(t, func() {
++				handlerErr = tc.handler(context.Background(), nil, reply, tc.request)
++			})
++
++			require.Error(t, handlerErr)
++			require.Same(t, repliedErr, handlerErr)
++			assertPanicRpcError(t, handlerErr, tc.message)
++		})
++	}
++}
++
++func requestWithParams(t *testing.T, params ...any) jsonrpc2.Request {
++	t.Helper()
++
++	req, err := jsonrpc2.NewCall(jsonrpc2.NewNumberID(1), "hidden/test", params)
++	require.NoError(t, err)
++
++	return req
++}
++
++func assertPanicRpcError(t *testing.T, err error, panicMessage string) {
++	t.Helper()
++
++	var rpcErr *jsonrpc2.Error
++	require.True(t, errors.As(err, &rpcErr), "expected JSON-RPC error, got %T: %v", err, err)
++	require.Equal(t, jsonrpc2.InternalError, rpcErr.Code)
++	require.True(t, strings.HasPrefix(rpcErr.Message, "panic:"), "message should start with panic:, got %q", rpcErr.Message)
++	require.Contains(t, rpcErr.Message, panicMessage)
++}
++
++func panicRpcTestFrame(message string) {
++	panic(message)
++}
++
+ func newHandlerAction0(t *testing.T, tc handlerTestCase) Handler {
+ 	return HandlerAction0(func(ctx context.Context) error {
+ 		select {
+diff --git a/cli/azd/internal/vsrpc/server_test.go b/cli/azd/internal/vsrpc/server_test.go
+index 4ed8aad0e..3f5a3016c 100644
+--- a/cli/azd/internal/vsrpc/server_test.go
++++ b/cli/azd/internal/vsrpc/server_test.go
+@@ -6,8 +6,10 @@ import (
+ 	"errors"
+ 	"net/http/httptest"
+ 	"net/url"
++	"strings"
+ 	"sync"
+ 	"testing"
++	"time"
+ 
+ 	"github.com/gorilla/websocket"
+ 	"github.com/stretchr/testify/require"
+@@ -132,3 +134,64 @@ func TestObserverable(t *testing.T) {
+ 	// The onCompleted message takes no parameters and the args value is empty.
+ 	require.Len(t, onCompletedParams[0], 0)
+ }
++
++func TestDebugServicePanicErrorDetails(t *testing.T) {
++	rpcConn := debugRpcConn(t)
++
++	err := callTestPanicAsync(t, rpcConn, "panic probe alpha hidden")
++	assertDebugPanicError(t, err, "panic probe alpha hidden")
++}
++
++func TestDebugServicePanicDoesNotCloseConnection(t *testing.T) {
++	rpcConn := debugRpcConn(t)
++
++	firstErr := callTestPanicAsync(t, rpcConn, "panic probe beta one hidden")
++	assertDebugPanicError(t, firstErr, "panic probe beta one hidden")
++
++	secondErr := callTestPanicAsync(t, rpcConn, "panic probe beta two hidden")
++	assertDebugPanicError(t, secondErr, "panic probe beta two hidden")
++}
++
++func debugRpcConn(t *testing.T) jsonrpc2.Conn {
++	t.Helper()
++
++	debugServer := httptest.NewServer(newDebugService())
++	t.Cleanup(debugServer.Close)
++
++	serverUrl, err := url.Parse(debugServer.URL)
++	require.NoError(t, err)
++	serverUrl.Scheme = "ws"
++
++	wsConn, _, err := websocket.DefaultDialer.Dial(serverUrl.String(), nil)
++	require.NoError(t, err)
++	t.Cleanup(func() {
++		require.NoError(t, wsConn.Close())
++	})
++
++	rpcConn := jsonrpc2.NewConn(newWebSocketStream(wsConn))
++	rpcConn.Go(context.Background(), nil)
++
++	return rpcConn
++}
++
++func callTestPanicAsync(t *testing.T, rpcConn jsonrpc2.Conn, message string) error {
++	t.Helper()
++
++	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
++	defer cancel()
++
++	_, err := rpcConn.Call(ctx, "TestPanicAsync", []any{message}, nil)
++	require.Error(t, err)
++
++	return err
++}
++
++func assertDebugPanicError(t *testing.T, err error, panicMessage string) {
++	t.Helper()
++
++	var rpcErr *jsonrpc2.Error
++	require.True(t, errors.As(err, &rpcErr), "expected JSON-RPC error, got %T: %v", err, err)
++	require.Equal(t, jsonrpc2.InternalError, rpcErr.Code)
++	require.True(t, strings.HasPrefix(rpcErr.Message, "panic:"), "message should start with panic:, got %q", rpcErr.Message)
++	require.Contains(t, rpcErr.Message, panicMessage)
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,17 @@
++#!/bin/bash
++set -uo pipefail
++
++cd /testbed
++
++case "${1:-}" in
++  base)
++    go test github.com/azure/azure-dev/cli/azd/internal/vsrpc -v -count=1 -run '^(TestHandler|TestCancellation|TestObserverable)$'
++    ;;
++  new)
++    go test github.com/azure/azure-dev/cli/azd/internal/vsrpc -v -count=1 -run '^(TestPanicRecoveredAcrossHandlerAdapters|TestDebugServicePanicErrorDetails|TestDebugServicePanicDoesNotCloseConnection)$'
++    ;;
++  *)
++    echo "usage: $0 base|new"
++    exit 2
++    ;;
++esac

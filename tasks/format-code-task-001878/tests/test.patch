@@ -1,0 +1,276 @@
+diff --git a/usercase-test-coderl/fixtures/fake_lib/datasets/__init__.py b/usercase-test-coderl/fixtures/fake_lib/datasets/__init__.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/fixtures/fake_lib/datasets/__init__.py
+@@ -0,0 +1,40 @@
++import json
++import os
++
++import pyarrow as pa
++import pyarrow.parquet as pq
++
++
++def load_dataset(*args, **kwargs):
++    if args:
++        kwargs = dict(kwargs)
++        kwargs.setdefault("path", args[0])
++    if kwargs.get("revision") is None:
++        kwargs.pop("revision", None)
++
++    log_path = os.environ.get("AM_FAKE_LOG")
++    if log_path:
++        with open(log_path, "w", encoding="utf-8") as handle:
++            json.dump(kwargs, handle, sort_keys=True, separators=(",", ":"))
++
++    data_path = os.environ["AM_FAKE_DATA"]
++    with open(data_path, "r", encoding="utf-8") as handle:
++        return json.load(handle)
++
++
++class Dataset:
++    def __init__(self, rows):
++        self.rows = list(rows)
++
++    @classmethod
++    def from_list(cls, rows):
++        return cls(rows)
++
++    def __len__(self):
++        return len(self.rows)
++
++    def to_parquet(self, output_path):
++
++
++        table = pa.Table.from_pylist(self.rows)
++        pq.write_table(table, output_path)
+diff --git a/usercase-test-coderl/fixtures/fake_lib/tqdm/__init__.py b/usercase-test-coderl/fixtures/fake_lib/tqdm/__init__.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/fixtures/fake_lib/tqdm/__init__.py
+@@ -0,0 +1,8 @@
++import sys
++
++
++def tqdm(iterable, desc=None):
++    if desc is not None:
++        sys.stderr.write(f"{desc}\n")
++    for item in iterable:
++        yield item
+diff --git a/usercase-test-coderl/fixtures/fake_lib/tqdm/auto.py b/usercase-test-coderl/fixtures/fake_lib/tqdm/auto.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/fixtures/fake_lib/tqdm/auto.py
+@@ -0,0 +1,1 @@
++from . import tqdm
+diff --git a/usercase-test-coderl/usecase.sh b/usercase-test-coderl/usecase.sh
+new file mode 100755
+--- /dev/null
++++ b/usercase-test-coderl/usecase.sh
+@@ -0,0 +1,184 @@
++#!/usr/bin/env bash
++
++set -u
++export LANG=C.UTF-8 LC_ALL=C.UTF-8 TZ=UTC
++export PYTHONDONTWRITEBYTECODE=1
++
++
++export PIP_NO_INDEX=1
++export HF_DATASETS_OFFLINE=1
++export HF_HUB_OFFLINE=1
++export TRANSFORMERS_OFFLINE=1
++export WANDB_DISABLED=true
++export PYTHONPATH="/workspace/repo/usercase-test-coderl/fixtures/fake_lib${PYTHONPATH:+:$PYTHONPATH}"
++
++( cd /workspace/repo && python -m py_compile get_am_dataset.py ) \
++    || { echo "FAIL: build" >&2; exit 1; }
++BIN="/workspace/repo/get_am_dataset.py"
++
++TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
++cd "$TMP" || exit 1
++fail() { echo "FAIL: $*" >&2; exit 1; }
++
++read_parquet_json() {
++    python - "$1" <<'PY'
++import json
++import sys
++import pyarrow.parquet as pq
++
++rows = pq.read_table(sys.argv[1]).to_pylist()
++print(json.dumps(rows, sort_keys=True, separators=(",", ":")))
++PY
++}
++
++assert_progress_label() {
++
++
++    grep -q 'Processing stream' out err || fail "$1 missing progress label; stdout=$(cat out) stderr=$(cat err)"
++}
++
++assert_stdout_includes() {
++
++    grep -Fq "$2" out || fail "$1 stdout: $(cat out)"
++}
++
++assert_load_args() {
++
++
++    python - "$1" "$2" <<'PY' || fail "$3 load args: $(cat "$1")"
++import json
++import sys
++
++actual_path, expected_json = sys.argv[1:3]
++with open(actual_path, "r", encoding="utf-8") as handle:
++    actual = json.load(handle)
++expected = json.loads(expected_json)
++for key, value in expected.items():
++    if actual.get(key) != value:
++        raise SystemExit(f"{key}: got {actual.get(key)!r}, want {value!r}")
++if "revision" not in expected and "revision" in actual:
++    raise SystemExit(f"unexpected revision: {actual['revision']!r}")
++PY
++}
++
++assert_parquet_rows_match() {
++
++
++    python - "$1" "$2" <<'PY' || fail "$3 parquet rows: $(read_parquet_json "$1")"
++from collections import Counter
++import json
++import sys
++import pyarrow.parquet as pq
++
++rows = pq.read_table(sys.argv[1]).to_pylist()
++expected = json.loads(sys.argv[2])
++
++def canon(row):
++    return json.dumps(row, sort_keys=True, separators=(",", ":"))
++
++if Counter(canon(row) for row in rows) != Counter(canon(row) for row in expected):
++    raise SystemExit(f"got {rows!r}, want {expected!r}")
++PY
++}
++
++
++
++
++mkdir -p data
++cat >input_two.json <<'JSON'
++[
++  {
++    "id": "first",
++    "conversations": [
++      {"from": "human", "value": "What is 2+2?", "private": "drop-me"},
++      {"from": "gpt", "value": "4", "trace": {"hidden": true}}
++    ],
++    "source": "fixture"
++  },
++  {
++    "id": "second",
++    "conversations": [
++      {"from": "system", "value": "Use short answers.", "ignored": 7},
++      {"from": "human", "value": "Name a color.", "ignored": 8},
++      {"from": "gpt", "value": "blue", "ignored": 9}
++    ],
++    "unused": "top-level"
++  }
++]
++JSON
++export AM_FAKE_DATA="$TMP/input_two.json"
++export AM_FAKE_LOG="$TMP/load_two.json"
++python "$BIN" --revision 3697c1829816a2b8d4d25995ed6d5d27ffb49b30 data/AM-Thinking-3697c18.parquet >out 2>err; ec=$?
++EXPECTED_OUT="Written 2 records to data/AM-Thinking-3697c18.parquet"
++EXPECTED_LOG='{"path":"a-m-team/AM-Thinking-v1-Distilled","revision":"3697c1829816a2b8d4d25995ed6d5d27ffb49b30","split":"train","streaming":true}'
++EXPECTED_ROWS='[{"conversations":[{"from":"human","value":"What is 2+2?"},{"from":"gpt","value":"4"}]},{"conversations":[{"from":"system","value":"Use short answers."},{"from":"human","value":"Name a color."},{"from":"gpt","value":"blue"}]}]'
++[ "$ec" -eq 0 ] || fail "F1 exit $ec; want 0"
++assert_stdout_includes "F1" "$EXPECTED_OUT"
++assert_progress_label "F1"
++assert_load_args "$AM_FAKE_LOG" "$EXPECTED_LOG" "F1"
++assert_parquet_rows_match data/AM-Thinking-3697c18.parquet "$EXPECTED_ROWS" "F1"
++
++
++
++
++cat >input_one.json <<'JSON'
++[
++  {
++    "conversations": [
++      {"from": "human", "value": "single turn", "hidden": "removed"}
++    ],
++    "other_column": "removed"
++  }
++]
++JSON
++export AM_FAKE_DATA="$TMP/input_one.json"
++export AM_FAKE_LOG="$TMP/load_one.json"
++python "$BIN" "$TMP/default.parquet" >out 2>err; ec=$?
++EXPECTED_OUT="Written 1 records to $TMP/default.parquet"
++EXPECTED_LOG='{"path":"a-m-team/AM-Thinking-v1-Distilled","split":"train","streaming":true}'
++EXPECTED_ROWS='[{"conversations":[{"from":"human","value":"single turn"}]}]'
++[ "$ec" -eq 0 ] || fail "F2 exit $ec; want 0"
++assert_stdout_includes "F2" "$EXPECTED_OUT"
++assert_progress_label "F2"
++assert_load_args "$AM_FAKE_LOG" "$EXPECTED_LOG" "F2"
++assert_parquet_rows_match "$TMP/default.parquet" "$EXPECTED_ROWS" "F2"
++
++
++
++
++printf '[]\n' >input_empty.json
++export AM_FAKE_DATA="$TMP/input_empty.json"
++export AM_FAKE_LOG="$TMP/load_empty.json"
++python "$BIN" empty.parquet >out 2>err; ec=$?
++EXPECTED_OUT="Written 0 records to empty.parquet"
++EXPECTED_ROWS='[]'
++[ "$ec" -eq 0 ] || fail "F3 exit $ec; want 0"
++assert_stdout_includes "F3" "$EXPECTED_OUT"
++assert_progress_label "F3"
++assert_parquet_rows_match empty.parquet "$EXPECTED_ROWS" "F3"
++
++
++
++
++python "$BIN" --help >out 2>err; ec=$?
++[ "$ec" -eq 0 ] || fail "F4 exit $ec; want 0"
++cat out err >help_all
++
++grep -qi '^usage:' help_all || fail "F4 missing usage information: $(cat help_all)"
++grep -q -- '--revision' help_all || fail "F4 missing --revision help"
++grep -q 'output_path' help_all || fail "F4 missing output_path help"
++
++
++
++
++python "$BIN" >out 2>err; ec=$?
++[ "$ec" -ne 0 ] || fail "F5 exit $ec; want nonzero"
++cat out err >missing_arg_all
++
++grep -qi '^usage:' missing_arg_all || fail "F5 missing usage: $(cat missing_arg_all)"
++grep -qi 'error:' missing_arg_all || fail "F5 missing error marker: $(cat missing_arg_all)"
++grep -qi 'required' missing_arg_all || fail "F5 missing required wording: $(cat missing_arg_all)"
++grep -q 'output_path' missing_arg_all || fail "F5 missing output_path error: $(cat missing_arg_all)"
++
++echo "PASS"
++exit 0
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,18 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++
++export PIP_NO_INDEX=1
++export HF_DATASETS_OFFLINE=1
++export HF_HUB_OFFLINE=1
++export TRANSFORMERS_OFFLINE=1
++export WANDB_DISABLED=true
++set -e
++cd /workspace/repo
++exec bash /workspace/repo/usercase-test-coderl/usecase.sh

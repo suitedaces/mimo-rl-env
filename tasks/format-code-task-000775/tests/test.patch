@@ -1,0 +1,565 @@
+diff --git a/usercase-test-coderl/icode_api_test.go b/usercase-test-coderl/icode_api_test.go
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/icode_api_test.go
+@@ -0,0 +1,533 @@
++package usercase_test_coderl
++
++import (
++	"errors"
++	"reflect"
++	"testing"
++
++	"github.com/it-chain/engine/ivm"
++	"github.com/it-chain/engine/ivm/api"
++)
++
++
++
++
++
++
++
++
++var (
++	errClone      = errors.New("clone failed")
++	errRawClone   = errors.New("raw clone failed")
++	errStart      = errors.New("start failed")
++	errStop       = errors.New("stop failed")
++	errNotRunning = errors.New("not running")
++	errPublish    = errors.New("publish failed")
++	errRequestTwo = errors.New("request two failed")
++)
++
++var (
++	icodeAlpha = ivm.ICode{
++		ID:             "icode-alpha",
++		RepositoryName: "alpha",
++		GitUrl:         "github.com/acme/alpha",
++		Path:           "/tmp/alpha",
++		CommitHash:     "abc123",
++		Version:        "abc123",
++		Language:       "go",
++		FolderName:     "alpha",
++	}
++	icodeRaw = ivm.ICode{
++		ID:             "icode-raw",
++		RepositoryName: "rawrepo",
++		GitUrl:         "github.com/acme/rawrepo",
++		Path:           "/tmp/rawrepo",
++		CommitHash:     "def456",
++		Version:        "def456",
++		Language:       "go",
++		FolderName:     "rawrepo",
++	}
++	zeroICode = ivm.ICode{}
++)
++
++type publishRecord struct {
++	topic string
++	event interface{}
++}
++
++type fakeEventService struct {
++	records    []publishRecord
++	publishErr error
++	closeCalls int
++}
++
++func (f *fakeEventService) Publish(topic string, payload interface{}) error {
++	f.records = append(f.records, publishRecord{topic: topic, event: payload})
++	return f.publishErr
++}
++
++func (f *fakeEventService) Close() {
++	f.closeCalls++
++}
++
++type fakeGitService struct {
++	pathICode ivm.ICode
++	rawICode  ivm.ICode
++
++	cloneErr error
++	rawErr   error
++
++	cloneCalls int
++	rawCalls   int
++
++	lastBase     string
++	lastURL      string
++	lastSSHPath  string
++	lastPassword string
++	lastRaw      []byte
++}
++
++func (f *fakeGitService) Clone(baseSavePath string, repositoryUrl string, sshPath string, password string) (ivm.ICode, error) {
++	f.cloneCalls++
++	f.lastBase = baseSavePath
++	f.lastURL = repositoryUrl
++	f.lastSSHPath = sshPath
++	f.lastPassword = password
++	return f.pathICode, f.cloneErr
++}
++
++func (f *fakeGitService) CloneFromRawSsh(baseSavePath string, repositoryUrl string, rawSsh []byte, password string) (ivm.ICode, error) {
++	f.rawCalls++
++	f.lastBase = baseSavePath
++	f.lastURL = repositoryUrl
++	f.lastRaw = append([]byte(nil), rawSsh...)
++	f.lastPassword = password
++	return f.rawICode, f.rawErr
++}
++
++type fakeContainerService struct {
++	running []ivm.ICode
++
++	startErr error
++	stopErr  error
++
++	resultByFunction map[string]ivm.Result
++	errByFunction    map[string]error
++
++	startCalls   int
++	stopCalls    int
++	executeCalls int
++
++	started  []ivm.ICode
++	stopped  []ivm.ID
++	requests []ivm.Request
++}
++
++func (f *fakeContainerService) StartContainer(icode ivm.ICode) error {
++	f.startCalls++
++	f.started = append(f.started, icode)
++	if f.startErr != nil {
++		return f.startErr
++	}
++	f.running = append(f.running, icode)
++	return nil
++}
++
++func (f *fakeContainerService) StopContainer(id ivm.ID) error {
++	f.stopCalls++
++	f.stopped = append(f.stopped, id)
++	if f.stopErr != nil {
++		return f.stopErr
++	}
++	for index, icode := range f.running {
++		if icode.ID == id {
++			f.running = append(f.running[:index], f.running[index+1:]...)
++			return nil
++		}
++	}
++	return errNotRunning
++}
++
++func (f *fakeContainerService) ExecuteRequest(request ivm.Request) (ivm.Result, error) {
++	f.executeCalls++
++	f.requests = append(f.requests, request)
++	if err := f.errByFunction[request.Function]; err != nil {
++		return ivm.Result{}, err
++	}
++	if result, ok := f.resultByFunction[request.Function]; ok {
++		return result, nil
++	}
++	return ivm.Result{Data: map[string]string{"default": "ok"}}, nil
++}
++
++func (f *fakeContainerService) GetRunningICodeList() []ivm.ICode {
++	copied := make([]ivm.ICode, len(f.running))
++	copy(copied, f.running)
++	return copied
++}
++
++func newHarness() (*fakeContainerService, *fakeGitService, *fakeEventService, api.ICodeApi) {
++	container := &fakeContainerService{
++		resultByFunction: map[string]ivm.Result{
++			"init": {Data: map[string]string{"state": "initialized"}},
++			"get":  {Data: map[string]string{"value": "42"}},
++		},
++		errByFunction: map[string]error{},
++	}
++	git := &fakeGitService{pathICode: icodeAlpha, rawICode: icodeRaw}
++	events := &fakeEventService{}
++	return container, git, events, api.NewICodeApi(container, git, events)
++}
++
++func requireEqual(t *testing.T, name string, got interface{}, want interface{}) {
++	t.Helper()
++	if !reflect.DeepEqual(got, want) {
++		t.Fatalf("%s = %#v, want %#v", name, got, want)
++	}
++}
++
++func requireNoError(t *testing.T, name string, err error) {
++	t.Helper()
++	if err != nil {
++		t.Fatalf("%s = %v, want nil", name, err)
++	}
++}
++
++func requireErrorIs(t *testing.T, name string, err error, target error) {
++	t.Helper()
++	if !errors.Is(err, target) {
++		t.Fatalf("%s = %v, want errors.Is(..., %v)", name, err, target)
++	}
++}
++
++func requireCreatedEventPayload(t *testing.T, name string, payload interface{}, want ivm.ICode) {
++	t.Helper()
++	fields := requireEventFields(t, name, payload)
++	requireAnyFieldValue(t, name, fields, []string{"ID", "ICodeID"}, string(want.ID))
++	requireAnyFieldValue(t, name, fields, []string{"RepositoryName"}, want.RepositoryName)
++	requireAnyFieldValue(t, name, fields, []string{"GitUrl", "GitURL"}, want.GitUrl)
++	requireAnyFieldValue(t, name, fields, []string{"Path"}, want.Path)
++	requireAnyFieldValue(t, name, fields, []string{"CommitHash"}, want.CommitHash)
++	requireAnyFieldValue(t, name, fields, []string{"Version"}, string(want.Version))
++}
++
++func requireDeletedEventPayload(t *testing.T, name string, payload interface{}, wantID ivm.ID) {
++	t.Helper()
++	fields := requireEventFields(t, name, payload)
++	requireAnyFieldValue(t, name, fields, []string{"ICodeID", "ID"}, string(wantID))
++}
++
++func requireEventFields(t *testing.T, name string, payload interface{}) map[string]string {
++	t.Helper()
++	value := reflect.ValueOf(payload)
++	if !value.IsValid() || value.Kind() != reflect.Struct {
++		t.Fatalf("%s = %#v, want struct event payload", name, payload)
++	}
++	fields := make(map[string]string)
++	payloadType := value.Type()
++	for index := 0; index < value.NumField(); index++ {
++		field := payloadType.Field(index)
++		if field.PkgPath != "" || value.Field(index).Kind() != reflect.String {
++			continue
++		}
++		fields[field.Name] = value.Field(index).String()
++	}
++	return fields
++}
++
++func requireAnyFieldValue(t *testing.T, name string, fields map[string]string, aliases []string, want string) {
++	t.Helper()
++	for _, alias := range aliases {
++		if got, ok := fields[alias]; ok {
++			if got != want {
++				t.Fatalf("%s.%s = %q, want %q", name, alias, got, want)
++			}
++			return
++		}
++	}
++	t.Fatalf("%s missing any field in %v", name, aliases)
++}
++
++func TestICodeApiSessionDeployExecuteListAndUndeploy(t *testing.T) {
++
++
++
++
++	container, git, events, facade := newHarness()
++
++	requireEqual(t, "fresh running list", facade.GetRunningICodeList(), []ivm.ICode{})
++
++	deployed, err := facade.Deploy("/base", "github.com/acme/alpha", "/keys/id_rsa", "pw")
++	requireNoError(t, "Deploy error", err)
++	requireEqual(t, "deployed ICode", deployed, icodeAlpha)
++	requireEqual(t, "clone calls", git.cloneCalls, 1)
++	requireEqual(t, "clone base", git.lastBase, "/base")
++	requireEqual(t, "clone url", git.lastURL, "github.com/acme/alpha")
++	requireEqual(t, "clone ssh path", git.lastSSHPath, "/keys/id_rsa")
++	requireEqual(t, "clone password", git.lastPassword, "pw")
++	requireEqual(t, "start calls", container.startCalls, 1)
++	requireEqual(t, "running after deploy", facade.GetRunningICodeList(), []ivm.ICode{icodeAlpha})
++	requireEqual(t, "created event count", len(events.records), 1)
++	requireEqual(t, "created event topic", events.records[0].topic, "icode.created")
++
++	requireCreatedEventPayload(t, "created event payload", events.records[0].event, icodeAlpha)
++
++	result, err := facade.ExecuteRequest(ivm.Request{ICodeID: "icode-alpha", Function: "get", Type: "query", Args: []string{"A"}})
++	requireNoError(t, "ExecuteRequest error", err)
++	requireEqual(t, "ExecuteRequest result", result, ivm.Result{Data: map[string]string{"value": "42"}})
++	requireEqual(t, "execute call count", container.executeCalls, 1)
++	requireEqual(t, "forwarded request", container.requests[0], ivm.Request{ICodeID: "icode-alpha", Function: "get", Type: "query", Args: []string{"A"}})
++
++	err = facade.UnDeploy("icode-alpha")
++	requireNoError(t, "UnDeploy error", err)
++	requireEqual(t, "stop calls", container.stopCalls, 1)
++	requireEqual(t, "stopped id", container.stopped, []ivm.ID{"icode-alpha"})
++	requireEqual(t, "running after undeploy", facade.GetRunningICodeList(), []ivm.ICode{})
++	requireEqual(t, "event count after undeploy", len(events.records), 2)
++	requireEqual(t, "deleted event topic", events.records[1].topic, "icode.deleted")
++
++	requireDeletedEventPayload(t, "deleted event payload", events.records[1].event, "icode-alpha")
++}
++
++func TestDeployFromRawSshPreservesRawKeyAndPublishesCreatedEvent(t *testing.T) {
++
++
++
++
++	_, git, events, facade := newHarness()
++
++	deployed, err := facade.DeployFromRawSsh("/rawbase", "github.com/acme/rawrepo", []byte{1, 2, 3, 4}, "rawpw")
++	requireNoError(t, "DeployFromRawSsh error", err)
++	requireEqual(t, "raw deployed ICode", deployed, icodeRaw)
++	requireEqual(t, "raw clone calls", git.rawCalls, 1)
++	requireEqual(t, "raw clone base", git.lastBase, "/rawbase")
++	requireEqual(t, "raw clone url", git.lastURL, "github.com/acme/rawrepo")
++	requireEqual(t, "raw clone bytes", git.lastRaw, []byte{1, 2, 3, 4})
++	requireEqual(t, "raw clone password", git.lastPassword, "rawpw")
++	requireEqual(t, "created event count", len(events.records), 1)
++	requireEqual(t, "created event topic", events.records[0].topic, "icode.created")
++
++	requireCreatedEventPayload(t, "created event payload", events.records[0].event, icodeRaw)
++}
++
++func TestDeployCloneFailureStopsBeforeContainerAndEvent(t *testing.T) {
++
++
++
++
++	container, git, events, facade := newHarness()
++	git.cloneErr = errClone
++
++	deployed, err := facade.Deploy("/base", "github.com/acme/alpha", "/keys/id_rsa", "pw")
++	requireErrorIs(t, "Deploy clone error", err, errClone)
++	requireEqual(t, "deployed ICode on clone failure", deployed, zeroICode)
++	requireEqual(t, "start calls on clone failure", container.startCalls, 0)
++	requireEqual(t, "publish count on clone failure", len(events.records), 0)
++	requireEqual(t, "running count on clone failure", len(facade.GetRunningICodeList()), 0)
++}
++
++func TestDeployRawCloneFailureStopsBeforeContainerAndEvent(t *testing.T) {
++
++
++
++
++	container, git, events, facade := newHarness()
++	git.rawErr = errRawClone
++
++	deployed, err := facade.DeployFromRawSsh("/rawbase", "github.com/acme/rawrepo", []byte{1, 2, 3, 4}, "rawpw")
++	requireErrorIs(t, "DeployFromRawSsh clone error", err, errRawClone)
++	requireEqual(t, "deployed ICode on raw clone failure", deployed, zeroICode)
++	requireEqual(t, "start calls on raw clone failure", container.startCalls, 0)
++	requireEqual(t, "publish count on raw clone failure", len(events.records), 0)
++	requireEqual(t, "running count on raw clone failure", len(facade.GetRunningICodeList()), 0)
++}
++
++func TestDeployContainerStartFailureStopsBeforeEvent(t *testing.T) {
++
++
++
++
++	container, _, events, facade := newHarness()
++	container.startErr = errStart
++
++	deployed, err := facade.Deploy("/base", "github.com/acme/alpha", "/keys/id_rsa", "pw")
++	requireErrorIs(t, "Deploy start error", err, errStart)
++	requireEqual(t, "deployed ICode on start failure", deployed, zeroICode)
++	requireEqual(t, "start calls on start failure", container.startCalls, 1)
++	requireEqual(t, "publish count on start failure", len(events.records), 0)
++	requireEqual(t, "running count on start failure", len(facade.GetRunningICodeList()), 0)
++}
++
++func TestDeployCreatedEventFailureReturnsZeroICodeWithNilError(t *testing.T) {
++
++
++
++
++	container, _, events, facade := newHarness()
++	events.publishErr = errPublish
++
++	deployed, err := facade.Deploy("/base", "github.com/acme/alpha", "/keys/id_rsa", "pw")
++	requireNoError(t, "Deploy publish error", err)
++	requireEqual(t, "deployed ICode on publish failure", deployed, zeroICode)
++	requireEqual(t, "start calls before publish failure", container.startCalls, 1)
++	requireEqual(t, "publish count on publish failure", len(events.records), 1)
++	requireEqual(t, "running count after publish failure", len(facade.GetRunningICodeList()), 1)
++}
++
++func TestUnDeployStopFailureReturnsSpecificErrorAndPublishesNothing(t *testing.T) {
++
++
++
++
++	container, _, events, facade := newHarness()
++	container.stopErr = errStop
++	container.running = []ivm.ICode{icodeAlpha}
++
++	err := facade.UnDeploy("icode-alpha")
++	requireErrorIs(t, "UnDeploy stop error", err, errStop)
++	requireEqual(t, "stop calls on stop failure", container.stopCalls, 1)
++	requireEqual(t, "publish count on stop failure", len(events.records), 0)
++	requireEqual(t, "running count after stop failure", len(facade.GetRunningICodeList()), 1)
++}
++
++func TestUnDeployPublishFailureReturnsPublishErrorAfterStop(t *testing.T) {
++
++
++
++
++	container, _, events, facade := newHarness()
++	container.running = []ivm.ICode{icodeAlpha}
++	events.publishErr = errPublish
++
++	err := facade.UnDeploy("icode-alpha")
++	requireErrorIs(t, "UnDeploy publish error", err, errPublish)
++	requireEqual(t, "stop calls before publish error", container.stopCalls, 1)
++	requireEqual(t, "publish count on delete publish failure", len(events.records), 1)
++	requireEqual(t, "running count after delete publish failure", len(facade.GetRunningICodeList()), 0)
++
++	requireDeletedEventPayload(t, "deleted event payload on publish failure", events.records[0].event, "icode-alpha")
++}
++
++func TestExecuteRequestListKeepsOrderAndConvertsIndividualErrors(t *testing.T) {
++
++
++
++
++	container, _, _, facade := newHarness()
++	container.resultByFunction = map[string]ivm.Result{
++		"one":   {Data: map[string]string{"fn": "one"}},
++		"three": {Data: map[string]string{"fn": "three"}},
++	}
++	container.errByFunction = map[string]error{"bad": errRequestTwo}
++
++	results := facade.ExecuteRequestList([]ivm.Request{
++		{ICodeID: "icode-alpha", Function: "one", Type: "invoke"},
++		{ICodeID: "icode-alpha", Function: "bad", Type: "invoke"},
++		{ICodeID: "icode-alpha", Function: "three", Type: "query", Args: []string{"k"}},
++	})
++
++	requireEqual(t, "ExecuteRequestList results", results, []ivm.Result{
++		{Data: map[string]string{"fn": "one"}},
++		{Err: "request two failed"},
++		{Data: map[string]string{"fn": "three"}},
++	})
++	requireEqual(t, "ExecuteRequestList call count", container.executeCalls, 3)
++	requireEqual(t, "ExecuteRequestList forwarded requests", container.requests, []ivm.Request{
++		{ICodeID: "icode-alpha", Function: "one", Type: "invoke"},
++		{ICodeID: "icode-alpha", Function: "bad", Type: "invoke"},
++		{ICodeID: "icode-alpha", Function: "three", Type: "query", Args: []string{"k"}},
++	})
++}
++
++func TestExecuteBeforeDeployReturnsSpecificContainerError(t *testing.T) {
++
++
++
++
++	container, _, _, facade := newHarness()
++	container.errByFunction = map[string]error{"get": errNotRunning}
++
++	result, err := facade.ExecuteRequest(ivm.Request{ICodeID: "missing", Function: "get", Type: "query"})
++	requireErrorIs(t, "ExecuteRequest before deploy error", err, errNotRunning)
++	requireEqual(t, "ExecuteRequest before deploy result", result, ivm.Result{})
++	requireEqual(t, "ExecuteRequest before deploy call count", container.executeCalls, 1)
++	requireEqual(t, "ExecuteRequest before deploy forwarded request", container.requests[0], ivm.Request{ICodeID: "missing", Function: "get", Type: "query"})
++}
++
++func TestUnDeployTwiceReportsSpecificMissingContainerError(t *testing.T) {
++
++
++
++
++	container, _, events, facade := newHarness()
++	container.running = []ivm.ICode{icodeAlpha}
++
++	err := facade.UnDeploy("icode-alpha")
++	requireNoError(t, "first UnDeploy error", err)
++	err = facade.UnDeploy("icode-alpha")
++	requireErrorIs(t, "second UnDeploy error", err, errNotRunning)
++	requireEqual(t, "stop calls after double undeploy", container.stopCalls, 2)
++	requireEqual(t, "publish count after double undeploy", len(events.records), 1)
++	requireEqual(t, "running count after double undeploy", len(facade.GetRunningICodeList()), 0)
++}
++
++func TestTwoICodeApiInstancesKeepIndependentRunningState(t *testing.T) {
++
++
++
++
++	containerA, gitA, eventsA, facadeA := newHarness()
++	containerB, gitB, eventsB, facadeB := newHarness()
++	gitA.pathICode = ivm.ICode{ID: "icode-a", RepositoryName: "repo-a", GitUrl: "github.com/acme/repo-a", Path: "/tmp/repo-a", CommitHash: "aaa111", Version: "aaa111", FolderName: "repo-a"}
++	gitB.pathICode = ivm.ICode{ID: "icode-b", RepositoryName: "repo-b", GitUrl: "github.com/acme/repo-b", Path: "/tmp/repo-b", CommitHash: "bbb222", Version: "bbb222", FolderName: "repo-b"}
++
++	deployedA, err := facadeA.Deploy("/base-a", "github.com/acme/repo-a", "", "")
++	requireNoError(t, "Deploy A error", err)
++	requireEqual(t, "A deployed ICode", deployedA, ivm.ICode{ID: "icode-a", RepositoryName: "repo-a", GitUrl: "github.com/acme/repo-a", Path: "/tmp/repo-a", CommitHash: "aaa111", Version: "aaa111", FolderName: "repo-a"})
++	requireEqual(t, "A running after A deploy", facadeA.GetRunningICodeList(), []ivm.ICode{{ID: "icode-a", RepositoryName: "repo-a", GitUrl: "github.com/acme/repo-a", Path: "/tmp/repo-a", CommitHash: "aaa111", Version: "aaa111", FolderName: "repo-a"}})
++	requireEqual(t, "B running before B deploy", facadeB.GetRunningICodeList(), []ivm.ICode{})
++	requireEqual(t, "A event count after A deploy", len(eventsA.records), 1)
++	requireEqual(t, "B event count before B deploy", len(eventsB.records), 0)
++	requireEqual(t, "A container starts", containerA.startCalls, 1)
++	requireEqual(t, "B container starts before B deploy", containerB.startCalls, 0)
++
++	deployedB, err := facadeB.Deploy("/base-b", "github.com/acme/repo-b", "", "")
++	requireNoError(t, "Deploy B error", err)
++	requireEqual(t, "B deployed ICode", deployedB, ivm.ICode{ID: "icode-b", RepositoryName: "repo-b", GitUrl: "github.com/acme/repo-b", Path: "/tmp/repo-b", CommitHash: "bbb222", Version: "bbb222", FolderName: "repo-b"})
++	requireEqual(t, "A running after B deploy", facadeA.GetRunningICodeList(), []ivm.ICode{{ID: "icode-a", RepositoryName: "repo-a", GitUrl: "github.com/acme/repo-a", Path: "/tmp/repo-a", CommitHash: "aaa111", Version: "aaa111", FolderName: "repo-a"}})
++	requireEqual(t, "B running after B deploy", facadeB.GetRunningICodeList(), []ivm.ICode{{ID: "icode-b", RepositoryName: "repo-b", GitUrl: "github.com/acme/repo-b", Path: "/tmp/repo-b", CommitHash: "bbb222", Version: "bbb222", FolderName: "repo-b"}})
++	requireEqual(t, "A event count after B deploy", len(eventsA.records), 1)
++	requireEqual(t, "B event count after B deploy", len(eventsB.records), 1)
++}
++
++func TestDeployUndeployCyclesLeaveRunningListBounded(t *testing.T) {
++
++
++
++
++	container := &fakeContainerService{
++		resultByFunction: map[string]ivm.Result{"touch": {Data: map[string]string{"ok": "true"}}},
++		errByFunction:    map[string]error{},
++	}
++	git := &fakeGitService{pathICode: icodeAlpha}
++	events := &fakeEventService{}
++	facade := api.NewICodeApi(container, git, events)
++
++	for cycle := 0; cycle < 100; cycle++ {
++		deployed, err := facade.Deploy("/base", "github.com/acme/alpha", "", "")
++		requireNoError(t, "cycle Deploy error", err)
++		requireEqual(t, "cycle deployed ICode", deployed, icodeAlpha)
++		result, err := facade.ExecuteRequest(ivm.Request{ICodeID: "icode-alpha", Function: "touch", Type: "invoke"})
++		requireNoError(t, "cycle ExecuteRequest error", err)
++		requireEqual(t, "cycle ExecuteRequest result", result, ivm.Result{Data: map[string]string{"ok": "true"}})
++		err = facade.UnDeploy("icode-alpha")
++		requireNoError(t, "cycle UnDeploy error", err)
++		requireEqual(t, "cycle running count after cleanup", len(facade.GetRunningICodeList()), 0)
++	}
++
++	requireEqual(t, "leak floor start calls", container.startCalls, 100)
++	requireEqual(t, "leak floor stop calls", container.stopCalls, 100)
++	requireEqual(t, "leak floor execute calls", container.executeCalls, 100)
++	requireEqual(t, "leak floor running count", len(facade.GetRunningICodeList()), 0)
++	requireEqual(t, "leak floor event count", len(events.records), 200)
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,22 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++
++
++export GOPROXY=off
++export GONOPROXY=none
++export GOSUMDB=off
++export GOVCS="*:off"
++export GOFLAGS="${GOFLAGS:-} -mod=readonly"
++
++cd /workspace/repo
++exec go test -v -count=1 ./usercase-test-coderl/...

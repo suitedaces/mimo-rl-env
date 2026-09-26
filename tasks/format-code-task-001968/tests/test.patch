@@ -1,0 +1,229 @@
+diff --git a/usercase-test-coderl/usecase.sh b/usercase-test-coderl/usecase.sh
+new file mode 100755
+--- /dev/null
++++ b/usercase-test-coderl/usecase.sh
+@@ -0,0 +1,201 @@
++#!/usr/bin/env bash
++
++set -u
++export LANG=C.UTF-8 LC_ALL=C.UTF-8 TZ=UTC
++
++fail() { echo "FAIL: $*" >&2; exit 1; }
++
++command -v script >/dev/null 2>&1 || fail "script(1) is required for interactive prompts"
++
++( cd /workspace/repo/mini-star && ../node_modules/.bin/tsc -p ./tsconfig.build.json ) \
++  || fail "build"
++BIN="node /workspace/repo/mini-star/lib/cli/index.js"
++
++TMP=$(mktemp -d)
++REPO_CFG="/workspace/repo/.ministarrc.json"
++REPO_CFG_BACKUP="$TMP/repo.ministarrc.backup"
++REPO_CFG_HAD=0
++if [ -e "$REPO_CFG" ]; then
++  cp "$REPO_CFG" "$REPO_CFG_BACKUP" || fail "backup existing repo config"
++  REPO_CFG_HAD=1
++fi
++cleanup() {
++  if [ "$REPO_CFG_HAD" -eq 1 ]; then
++    mv "$REPO_CFG_BACKUP" "$REPO_CFG"
++  else
++    rm -f "$REPO_CFG"
++  fi
++  rm -rf "$TMP"
++}
++trap cleanup EXIT
++
++run_pty() {
++  local cwd="$1"
++  local input_script="$2"
++  local command="$3"
++  local out_file="$4"
++  local err_file="$5"
++  local script_err="$out_file.script.err"
++
++  (
++    cd "$cwd" || exit 125
++    eval "$input_script"
++  ) | script -q -e -c "cd '$cwd' && $command 2> '$err_file'" /dev/null >"$out_file" 2>"$script_err"
++  local ec=$?
++  [ ! -s "$script_err" ] || fail "script wrapper stderr: $(cat "$script_err")"
++  return "$ec"
++}
++
++clean_out() {
++  perl -pe 's/\e\[[0-9;?]*[ -\/]*[@-~]//g; s/\r//g' "$1"
++}
++
++
++assert_file_contains() {
++  local file="$1"
++  local expected="$2"
++  [ -f "$file" ] || fail "missing file $file"
++  grep -Fq "$expected" "$file" || fail "content mismatch for $file: $(cat "$file")"
++}
++
++assert_package_spec() {
++  local file="$1"
++  local expected_name="$2"
++  local expected_main="$3"
++  local expected_author="${4-__localb_absent__}"
++  local expected_license="${5-__localb_absent__}"
++  [ -f "$file" ] || fail "missing file $file"
++
++  node -e '
++    const fs = require("fs");
++    const pkg = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
++    const [expectedName, expectedMain, expectedAuthor, expectedLicense] = process.argv.slice(2);
++    function check(cond, msg) {
++      if (!cond) {
++        console.error(msg, JSON.stringify(pkg));
++        process.exit(1);
++      }
++    }
++    check(pkg.name === expectedName, "name mismatch");
++    check(pkg.main === expectedMain, "main mismatch");
++    check(pkg.version === "0.0.0", "version mismatch");
++    check(pkg.private === true, "private mismatch");
++    check(pkg.dependencies && typeof pkg.dependencies === "object" && !Array.isArray(pkg.dependencies) && Object.keys(pkg.dependencies).length === 0, "dependencies mismatch");
++    if (expectedAuthor !== "__localb_absent__") check(pkg.author === expectedAuthor, "author mismatch");
++    if (expectedLicense !== "__localb_absent__") check(pkg.license === expectedLicense, "license mismatch");
++  ' "$file" "$expected_name" "$expected_main" "$expected_author" "$expected_license" \
++    || fail "package metadata mismatch for $file"
++}
++
++assert_tsconfig_spec() {
++  local file="$1"
++  [ -f "$file" ] || fail "missing file $file"
++
++  node -e '
++    const fs = require("fs");
++    const cfg = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
++    if (cfg.extends !== "../../tsconfig.json" || !cfg.compilerOptions || cfg.compilerOptions.rootDir !== "./src") {
++      console.error(JSON.stringify(cfg));
++      process.exit(1);
++    }
++  ' "$file" || fail "tsconfig mismatch for $file"
++}
++
++
++
++
++F1="$TMP/f1"
++mkdir -p "$F1"
++cat >"$F1/.ministarrc.json" <<EOF
++{"pluginRoot":"$F1/root","scope":"team"}
++EOF
++run_pty "$F1" "sleep 1; printf '\r'; sleep 1; printf 'valid\r'; sleep 1; printf '\r'; sleep 1; printf 'n\r'; sleep 1" "$BIN createPlugin" "$F1/out" "$F1/err"; ec=$?
++[ "$ec" -eq 0 ] || fail "F1 exit $ec; want 0"
++CLEAN_F1="$F1/clean.out"
++clean_out "$F1/out" >"$CLEAN_F1"
++grep -Fq "Require Plugin Name!" "$CLEAN_F1" || fail "F1 missing empty-name validation"
++
++grep -Fq "Language" "$CLEAN_F1" || fail "F1 missing Language prompt"
++
++grep -Fq "Ensure to create plugin: [valid] ?" "$CLEAN_F1" || fail "F1 missing declined confirmation prompt"
++! grep -Fq "create completed" "$CLEAN_F1" || fail "F1 printed completion despite decline"
++[ ! -e "$F1/root/plugins/valid" ] || fail "F1 created plugin files despite decline"
++
++
++
++
++F2="$TMP/f2"
++mkdir -p "$F2"
++cat >"$F2/.ministarrc.json" <<EOF
++{"pluginRoot":"$F2/root","scope":"acme","author":"Ada","license":"Apache-2.0"}
++EOF
++run_pty "$F2" "sleep 1; printf 'demo\r'; sleep 1; printf '\033[B'; sleep 0.3; printf '\r'; sleep 1; printf 'y\r'; sleep 1" "$BIN createPlugin" "$F2/out" "$F2/err"; ec=$?
++[ "$ec" -eq 0 ] || fail "F2 exit $ec; want 0"
++CLEAN_F2="$F2/clean.out"
++clean_out "$F2/out" >"$CLEAN_F2"
++
++grep -Fq "Plugin Name" "$CLEAN_F2" || fail "F2 missing Plugin Name prompt"
++grep -Fq "Language" "$CLEAN_F2" || fail "F2 missing Language prompt"
++
++grep -Fq "Ensure to create plugin: [demo] ?" "$CLEAN_F2" || fail "F2 missing accepted confirmation prompt"
++grep -Fxq "Plugin [demo] create completed: $F2/root/plugins/demo/src/index.js" "$CLEAN_F2" || fail "F2 missing exact completion line"
++assert_package_spec "$F2/root/plugins/demo/package.json" "@acme/demo" "src/index.js" "Ada" "Apache-2.0"
++assert_file_contains "$F2/root/plugins/demo/src/index.js" 'console.log("Hello World!")'
++[ ! -e "$F2/root/plugins/demo/tsconfig.json" ] || fail "F2 wrote tsconfig for JavaScript plugin"
++
++
++
++
++F3="$TMP/f3"
++mkdir -p "$F3"
++cat >"$F3/.ministarrc.json" <<EOF
++{"pluginRoot":"$F3/root","scope":"team"}
++EOF
++run_pty "$F3" "sleep 1; printf 'typed\r'; sleep 1; printf '\r'; sleep 1; printf 'y\r'; sleep 1" "$BIN createPlugin" "$F3/out" "$F3/err"; ec=$?
++[ "$ec" -eq 0 ] || fail "F3 exit $ec; want 0"
++CLEAN_F3="$F3/clean.out"
++clean_out "$F3/out" >"$CLEAN_F3"
++
++grep -Fq "Language" "$CLEAN_F3" || fail "F3 missing Language prompt"
++grep -Fxq "Plugin [typed] create completed: $F3/root/plugins/typed/src/index.ts" "$CLEAN_F3" || fail "F3 missing exact completion line"
++assert_package_spec "$F3/root/plugins/typed/package.json" "@team/typed" "src/index.ts"
++assert_file_contains "$F3/root/plugins/typed/src/index.ts" 'console.log("Hello World!")'
++assert_tsconfig_spec "$F3/root/plugins/typed/tsconfig.json"
++
++
++
++
++F4="$TMP/f4"
++mkdir -p "$F4/root/plugins/demo"
++printf 'keep me' >"$F4/root/plugins/demo/sentinel.txt"
++cat >"$F4/.ministarrc.json" <<EOF
++{"pluginRoot":"$F4/root","scope":"team"}
++EOF
++run_pty "$F4" "sleep 1; printf 'demo\r'; sleep 1; printf '\033[B'; sleep 0.3; printf '\r'; sleep 1; printf 'y\r'; sleep 1" "$BIN createPlugin" "$F4/out" "$F4/err"; ec=$?
++[ "$ec" -ne 0 ] || fail "F4 exit 0; want non-zero"
++
++[ "$(cat "$F4/root/plugins/demo/sentinel.txt")" = "keep me" ] || fail "F4 modified existing plugin directory contents"
++[ ! -e "$F4/root/plugins/demo/package.json" ] || fail "F4 overwrote existing directory with package.json"
++[ ! -e "$F4/root/plugins/demo/src/index.js" ] || fail "F4 overwrote existing directory with source"
++
++
++
++
++F5="$TMP/f5"
++mkdir -p "$F5"
++cat >"$REPO_CFG" <<EOF
++{"pluginRoot":"$F5/root","scope":"shortcut"}
++EOF
++run_pty "/workspace/repo" "sleep 1; printf 'via-npm\r'; sleep 1; printf '\033[B'; sleep 0.3; printf '\r'; sleep 1; printf 'y\r'; sleep 1" "TS_NODE_TRANSPILE_ONLY=1 npm run -s plugin:new" "$F5/out" "$F5/err"; ec=$?
++[ "$ec" -eq 0 ] || fail "F5 exit $ec; want 0"
++CLEAN_F5="$F5/clean.out"
++clean_out "$F5/out" >"$CLEAN_F5"
++
++grep -Fq "Plugin Name" "$CLEAN_F5" || fail "F5 missing Plugin Name prompt through npm shortcut"
++grep -Fq "Language" "$CLEAN_F5" || fail "F5 missing Language prompt through npm shortcut"
++grep -Fxq "Plugin [via-npm] create completed: $F5/root/plugins/via-npm/src/index.js" "$CLEAN_F5" || fail "F5 missing exact completion line"
++assert_package_spec "$F5/root/plugins/via-npm/package.json" "@shortcut/via-npm" "src/index.js"
++assert_file_contains "$F5/root/plugins/via-npm/src/index.js" 'console.log("Hello World!")'
++
++echo "PASS"
++exit 0
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,18 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++
++export NPM_CONFIG_OFFLINE=true
++export NPM_CONFIG_AUDIT=false
++export NPM_CONFIG_FUND=false
++export NPM_CONFIG_UPDATE_NOTIFIER=false
++export COREPACK_ENABLE_NETWORK=0
++set -e
++cd /workspace/repo
++exec bash /workspace/repo/usercase-test-coderl/usecase.sh

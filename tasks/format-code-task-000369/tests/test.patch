@@ -1,0 +1,534 @@
+diff --git a/usercase-test-coderl/execute_command_test.go b/usercase-test-coderl/execute_command_test.go
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/execute_command_test.go
+@@ -0,0 +1,505 @@
++package usercase_test_coderl
++
++import (
++	"bytes"
++	"crypto/ed25519"
++	"crypto/rand"
++	"encoding/pem"
++	"errors"
++	"fmt"
++	"io"
++	"net"
++	"os"
++	"path/filepath"
++	"strings"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	dashboard "github.com/alpindale/ssh-dashboard/internal"
++	"golang.org/x/crypto/ssh"
++	"golang.org/x/crypto/ssh/knownhosts"
++)
++
++
++
++
++
++func TestExecuteCommandAllowedSuccessUsesFreshSessionAndOriginalCommand(t *testing.T) {
++
++
++	srv, host := newDashboardSSHServer(t, func(_ int32, cmd string) commandResult {
++		switch cmd {
++		case "\t free -m | grep Mem: \n":
++			return commandResult{output: "Mem: 1000 400 600\n"}
++		case "top -bn1 | grep 'Cpu(s)'":
++			return commandResult{output: "Cpu(s): 12.5 us\n"}
++		default:
++			return commandResult{output: "unexpected command: " + cmd + "\n", exitStatus: 9}
++		}
++	})
++
++	client, err := dashboard.NewSSHClient(host)
++	if err != nil {
++		t.Fatalf("NewSSHClient() error: %v", err)
++	}
++	defer client.Close()
++
++	out, err := client.ExecuteCommand("\t free -m | grep Mem: \n")
++	if err != nil {
++		t.Fatalf("ExecuteCommand(free) error: %v", err)
++	}
++	if out != "Mem: 1000 400 600\n" {
++		t.Fatalf("ExecuteCommand(free) output = %q, want %q", out, "Mem: 1000 400 600\n")
++	}
++
++	out, err = client.ExecuteCommand("top -bn1 | grep 'Cpu(s)'")
++	if err != nil {
++		t.Fatalf("ExecuteCommand(top) error: %v", err)
++	}
++	if out != "Cpu(s): 12.5 us\n" {
++		t.Fatalf("ExecuteCommand(top) output = %q, want %q", out, "Cpu(s): 12.5 us\n")
++	}
++
++	if got := srv.sessionCount.Load(); got != 2 {
++		t.Fatalf("server session count = %d, want 2", got)
++	}
++	if got := srv.commands(); !stringSlicesEqual(got, []string{"\t free -m | grep Mem: \n", "top -bn1 | grep 'Cpu(s)'"}) {
++		t.Fatalf("server commands = %#v, want %#v", got, []string{"\t free -m | grep Mem: \n", "top -bn1 | grep 'Cpu(s)'"})
++	}
++}
++
++func TestExecuteCommandAllowedNonZeroExitReturnsOutputAndSSHError(t *testing.T) {
++
++
++	_, host := newDashboardSSHServer(t, func(_ int32, cmd string) commandResult {
++		if cmd == "df -h | grep -E '^/dev/'" {
++			return commandResult{output: "warn\n", exitStatus: 7}
++		}
++		return commandResult{output: "unexpected\n", exitStatus: 9}
++	})
++
++	client, err := dashboard.NewSSHClient(host)
++	if err != nil {
++		t.Fatalf("NewSSHClient() error: %v", err)
++	}
++	defer client.Close()
++
++	out, err := client.ExecuteCommand("df -h | grep -E '^/dev/'")
++	if out != "warn\n" {
++		t.Fatalf("ExecuteCommand(df) output = %q, want %q", out, "warn\n")
++	}
++	if err == nil {
++		t.Fatal("ExecuteCommand(df) error = nil, want non-zero SSH exit error")
++	}
++	var exitErr *ssh.ExitError
++
++	if !errors.As(err, &exitErr) {
++		t.Fatalf("ExecuteCommand(df) error type = %T, want *ssh.ExitError", err)
++	}
++}
++
++func TestExecuteCommandRejectsDisallowedBeforeOpeningSession(t *testing.T) {
++
++
++	srv, host := newDashboardSSHServer(t, func(_ int32, cmd string) commandResult {
++		return commandResult{output: "should not run " + cmd + "\n"}
++	})
++
++	client, err := dashboard.NewSSHClient(host)
++	if err != nil {
++		t.Fatalf("NewSSHClient() error: %v", err)
++	}
++	defer client.Close()
++
++	out, err := client.ExecuteCommand("  uname -a  ")
++	if out != "" {
++		t.Fatalf("ExecuteCommand(uname) output = %q, want empty string", out)
++	}
++	if err == nil {
++		t.Fatal("ExecuteCommand(uname) error = nil, want allowlist error")
++	}
++	if err.Error() != "command not in allowed list:   uname -a  " {
++		t.Fatalf("ExecuteCommand(uname) error = %q, want %q", err.Error(), "command not in allowed list:   uname -a  ")
++	}
++	if got := srv.sessionCount.Load(); got != 0 {
++		t.Fatalf("server session count = %d, want 0", got)
++	}
++	if got := srv.commands(); len(got) != 0 {
++		t.Fatalf("server commands = %#v, want empty list", got)
++	}
++}
++
++func TestExecuteCommandReturnsSessionCreationError(t *testing.T) {
++
++
++	_, host := newDashboardSSHServerWithOptions(t, serverOptions{
++		rejectSessions: true,
++		rejectReason:   "session creation disabled",
++	})
++
++	client, err := dashboard.NewSSHClient(host)
++	if err != nil {
++		t.Fatalf("NewSSHClient() error: %v", err)
++	}
++	defer client.Close()
++
++	out, err := client.ExecuteCommand("which nvidia-smi")
++	if out != "" {
++		t.Fatalf("ExecuteCommand(which) output = %q, want empty string", out)
++	}
++	if err == nil {
++		t.Fatal("ExecuteCommand(which) error = nil, want session creation error")
++	}
++	var openErr *ssh.OpenChannelError
++
++	if !errors.As(err, &openErr) {
++		t.Fatalf("ExecuteCommand(which) error type = %T, want *ssh.OpenChannelError", err)
++	}
++}
++
++func TestExecuteCommandAllowedNvidiaSmiReturnsCapturedOutput(t *testing.T) {
++
++
++	srv, host := newDashboardSSHServer(t, func(_ int32, cmd string) commandResult {
++		return commandResult{output: "GPU 0\n"}
++	})
++
++	client, err := dashboard.NewSSHClient(host)
++	if err != nil {
++		t.Fatalf("NewSSHClient() error: %v", err)
++	}
++	defer client.Close()
++	out, err := client.ExecuteCommand("nvidia-smi --query-gpu=name")
++	if err != nil {
++		t.Fatalf("ExecuteCommand(nvidia-smi) error: %v", err)
++	}
++	if out != "GPU 0\n" {
++		t.Fatalf("ExecuteCommand(nvidia-smi) output = %q, want %q", out, "GPU 0\n")
++	}
++
++	if got := srv.sessionCount.Load(); got != 1 {
++		t.Fatalf("server session count = %d, want 1", got)
++	}
++}
++
++func TestSSHClientsUseIndependentConnections(t *testing.T) {
++
++
++	_, host := newDashboardSSHServer(t, func(connID int32, cmd string) commandResult {
++		return commandResult{output: fmt.Sprintf("conn=%d command=%s\n", connID, cmd)}
++	})
++
++	a, err := dashboard.NewSSHClient(host)
++	if err != nil {
++		t.Fatalf("NewSSHClient(a) error: %v", err)
++	}
++	defer a.Close()
++	b, err := dashboard.NewSSHClient(host)
++	if err != nil {
++		t.Fatalf("NewSSHClient(b) error: %v", err)
++	}
++	defer b.Close()
++
++	outA, err := a.ExecuteCommand("amd-smi monitor")
++	if err != nil {
++		t.Fatalf("ExecuteCommand(a) error: %v", err)
++	}
++	if outA != "conn=1 command=amd-smi monitor\n" {
++		t.Fatalf("ExecuteCommand(a) output = %q, want %q", outA, "conn=1 command=amd-smi monitor\n")
++	}
++
++	outB, err := b.ExecuteCommand("rocm-smi --showuse")
++	if err != nil {
++		t.Fatalf("ExecuteCommand(b) error: %v", err)
++	}
++	if outB != "conn=2 command=rocm-smi --showuse\n" {
++		t.Fatalf("ExecuteCommand(b) output = %q, want %q", outB, "conn=2 command=rocm-smi --showuse\n")
++	}
++}
++
++func TestExecuteCommandRepeatedCallsUseFreshSessions(t *testing.T) {
++
++
++	srv, host := newDashboardSSHServer(t, func(_ int32, cmd string) commandResult {
++		if strings.HasPrefix(cmd, "free -") {
++			return commandResult{output: "Mem: 1000 400 600\n"}
++		}
++		return commandResult{output: "unexpected\n", exitStatus: 9}
++	})
++
++	client, err := dashboard.NewSSHClient(host)
++	if err != nil {
++		t.Fatalf("NewSSHClient() error: %v", err)
++	}
++	defer client.Close()
++
++	const calls = 10
++	for i := 0; i < calls; i++ {
++		out, err := client.ExecuteCommand("free -m | grep Mem:")
++		if err != nil {
++			t.Fatalf("cycle %d ExecuteCommand() error: %v", i, err)
++		}
++		if out != "Mem: 1000 400 600\n" {
++			t.Fatalf("cycle %d output = %q, want %q", i, out, "Mem: 1000 400 600\n")
++		}
++	}
++
++
++	if got := srv.sessionCount.Load(); got != calls {
++		t.Fatalf("server session count = %d, want %d", got, calls)
++	}
++}
++
++type commandResult struct {
++	output     string
++	exitStatus uint32
++}
++
++type serverOptions struct {
++	rejectSessions bool
++	rejectReason   string
++	handler        func(connID int32, cmd string) commandResult
++}
++
++type testSSHServer struct {
++	listener     net.Listener
++	connsMu      sync.Mutex
++	conns        map[net.Conn]struct{}
++	wg           sync.WaitGroup
++	connCount    atomic.Int32
++	sessionCount atomic.Int32
++	commandsMu   sync.Mutex
++	commandLog   []string
++	hostKey      ssh.PublicKey
++}
++
++func newDashboardSSHServer(t *testing.T, handler func(connID int32, cmd string) commandResult) (*testSSHServer, dashboard.SSHHost) {
++	t.Helper()
++	return newDashboardSSHServerWithOptions(t, serverOptions{handler: handler})
++}
++
++func newDashboardSSHServerWithOptions(t *testing.T, opts serverOptions) (*testSSHServer, dashboard.SSHHost) {
++	t.Helper()
++
++	home := t.TempDir()
++	sshDir := filepath.Join(home, ".ssh")
++	if err := os.MkdirAll(sshDir, 0700); err != nil {
++		t.Fatalf("create .ssh directory: %v", err)
++	}
++
++	_, clientKey, err := ed25519.GenerateKey(rand.Reader)
++	if err != nil {
++		t.Fatalf("generate client key: %v", err)
++	}
++	identityPath := filepath.Join(sshDir, "id_ed25519")
++	writePrivateKey(t, identityPath, clientKey)
++	acceptedSigner, err := ssh.NewSignerFromKey(clientKey)
++	if err != nil {
++		t.Fatalf("create accepted signer: %v", err)
++	}
++
++	serverConfig := &ssh.ServerConfig{
++		PublicKeyCallback: func(_ ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
++			if !bytes.Equal(key.Marshal(), acceptedSigner.PublicKey().Marshal()) {
++				return nil, fmt.Errorf("unknown key")
++			}
++			return nil, nil
++		},
++	}
++
++	srv := startSSHServer(t, serverConfig, opts)
++	knownHosts := knownhosts.Line([]string{srv.listener.Addr().String()}, srv.hostKey) + "\n"
++	if err := os.WriteFile(filepath.Join(sshDir, "known_hosts"), []byte(knownHosts), 0600); err != nil {
++		t.Fatalf("write known_hosts: %v", err)
++	}
++
++	hostName, port, err := net.SplitHostPort(srv.listener.Addr().String())
++	if err != nil {
++		t.Fatalf("split SSH server address: %v", err)
++	}
++	t.Setenv("HOME", home)
++	t.Setenv("SSH_AUTH_SOCK", "")
++	t.Setenv("SSH_DASHBOARD_TIMEOUT", "2")
++
++	return srv, dashboard.SSHHost{
++		Name:         "target",
++		Hostname:     hostName,
++		User:         "test",
++		Port:         port,
++		IdentityFile: identityPath,
++	}
++}
++
++func startSSHServer(t *testing.T, serverConfig *ssh.ServerConfig, opts serverOptions) *testSSHServer {
++	t.Helper()
++
++	_, hostPrivateKey, err := ed25519.GenerateKey(rand.Reader)
++	if err != nil {
++		t.Fatalf("generate host key: %v", err)
++	}
++	hostSigner, err := ssh.NewSignerFromKey(hostPrivateKey)
++	if err != nil {
++		t.Fatalf("create host signer: %v", err)
++	}
++	serverConfig.AddHostKey(hostSigner)
++
++	listener, err := net.Listen("tcp", "127.0.0.1:0")
++	if err != nil {
++		t.Fatalf("listen: %v", err)
++	}
++	srv := &testSSHServer{
++		listener: listener,
++		conns:    make(map[net.Conn]struct{}),
++		hostKey:  hostSigner.PublicKey(),
++	}
++
++	srv.wg.Add(1)
++	go func() {
++		defer srv.wg.Done()
++		for {
++			conn, err := listener.Accept()
++			if err != nil {
++				return
++			}
++			srv.connsMu.Lock()
++			srv.conns[conn] = struct{}{}
++			srv.connsMu.Unlock()
++			connID := srv.connCount.Add(1)
++			srv.wg.Add(1)
++			go srv.handleConn(conn, serverConfig, opts, connID)
++		}
++	}()
++
++	t.Cleanup(func() {
++		listener.Close()
++		srv.closeActiveConns()
++		done := make(chan struct{})
++		go func() {
++			srv.wg.Wait()
++			close(done)
++		}()
++		select {
++		case <-done:
++		case <-time.After(2 * time.Second):
++			t.Error("test SSH server did not stop")
++		}
++	})
++
++	return srv
++}
++
++func (s *testSSHServer) handleConn(conn net.Conn, config *ssh.ServerConfig, opts serverOptions, connID int32) {
++	defer s.wg.Done()
++	defer func() {
++		s.connsMu.Lock()
++		delete(s.conns, conn)
++		s.connsMu.Unlock()
++		conn.Close()
++	}()
++
++	serverConn, channels, requests, err := ssh.NewServerConn(conn, config)
++	if err != nil {
++		return
++	}
++	defer serverConn.Close()
++	go ssh.DiscardRequests(requests)
++
++	for newChannel := range channels {
++		if newChannel.ChannelType() != "session" {
++			_ = newChannel.Reject(ssh.UnknownChannelType, "unsupported channel")
++			continue
++		}
++		if opts.rejectSessions {
++			reason := opts.rejectReason
++			if reason == "" {
++				reason = "session rejected"
++			}
++			_ = newChannel.Reject(ssh.Prohibited, reason)
++			continue
++		}
++		s.wg.Add(1)
++		go s.handleSession(newChannel, opts.handler, connID)
++	}
++}
++
++func (s *testSSHServer) handleSession(newChannel ssh.NewChannel, handler func(connID int32, cmd string) commandResult, connID int32) {
++	defer s.wg.Done()
++	s.sessionCount.Add(1)
++	channel, requests, err := newChannel.Accept()
++	if err != nil {
++		return
++	}
++	defer channel.Close()
++
++	for req := range requests {
++		switch req.Type {
++		case "exec":
++			var payload struct {
++				Command string
++			}
++			if err := ssh.Unmarshal(req.Payload, &payload); err != nil {
++				req.Reply(false, nil)
++				continue
++			}
++			s.commandsMu.Lock()
++			s.commandLog = append(s.commandLog, payload.Command)
++			s.commandsMu.Unlock()
++			req.Reply(true, nil)
++
++			result := commandResult{}
++			if handler != nil {
++				result = handler(connID, payload.Command)
++			}
++			if result.output != "" {
++				_, _ = io.WriteString(channel, result.output)
++			}
++			_, _ = channel.SendRequest("exit-status", false, ssh.Marshal(struct {
++				Status uint32
++			}{Status: result.exitStatus}))
++			return
++		default:
++			req.Reply(false, nil)
++		}
++	}
++}
++
++func (s *testSSHServer) closeActiveConns() {
++	s.connsMu.Lock()
++	defer s.connsMu.Unlock()
++	for conn := range s.conns {
++		conn.Close()
++	}
++}
++
++func (s *testSSHServer) commands() []string {
++	s.commandsMu.Lock()
++	defer s.commandsMu.Unlock()
++	out := make([]string, len(s.commandLog))
++	copy(out, s.commandLog)
++	return out
++}
++
++func writePrivateKey(t *testing.T, path string, key ed25519.PrivateKey) {
++	t.Helper()
++	block, err := ssh.MarshalPrivateKey(key, "test key")
++	if err != nil {
++		t.Fatalf("marshal private key: %v", err)
++	}
++	if err := os.WriteFile(path, pem.EncodeToMemory(block), 0600); err != nil {
++		t.Fatalf("write private key: %v", err)
++	}
++}
++
++func stringSlicesEqual(a, b []string) bool {
++	if len(a) != len(b) {
++		return false
++	}
++	for i := range a {
++		if a[i] != b[i] {
++			return false
++		}
++	}
++	return true
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,19 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++
++cd /workspace/repo
++export GOTOOLCHAIN=local
++export GOPROXY=off
++export GOSUMDB=off
++export GOFLAGS="${GOFLAGS:-} -mod=readonly"
++go test -v -count=1 ./usercase-test-coderl/...

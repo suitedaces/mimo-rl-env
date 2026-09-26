@@ -1,0 +1,482 @@
+diff --git a/usercase-test-coderl/usecase.sh b/usercase-test-coderl/usecase.sh
+new file mode 100755
+--- /dev/null
++++ b/usercase-test-coderl/usecase.sh
+@@ -0,0 +1,460 @@
++#!/usr/bin/env bash
++
++set -u
++export LANG=C LC_ALL=C TZ=UTC
++
++export GOPROXY=off
++export GOSUMDB=off
++export GOTOOLCHAIN=local
++
++fail() {
++  echo "FAIL: $*" >&2
++  exit 1
++}
++
++TMP=$(mktemp -d)
++trap 'rm -rf "$TMP"' EXIT
++
++BUILD_LOG="$TMP/build.log"
++
++
++for chart in \
++  /workspace/repo/pkg/render/gatewayapi/gateway-helm.tgz \
++  /workspace/repo/pkg/render/istio/base.tgz \
++  /workspace/repo/pkg/render/istio/istiod.tgz \
++  /workspace/repo/pkg/render/istio/cni.tgz \
++  /workspace/repo/pkg/render/istio/ztunnel.tgz
++do
++  [ -f "$chart" ] || fail "offline chart artifact missing: $chart"
++done
++
++(
++  cd /workspace/repo || exit 1
++  mkdir -p build/_output/bin
++  CGO_ENABLED=1 GOEXPERIMENT=boringcrypto GOOS=linux GOARCH=amd64 \
++    go build -buildvcs=false -v \
++      -o build/_output/bin/operator-amd64 \
++      -tags "osusergo,netgo" \
++      -ldflags "-X github.com/tigera/operator/version.VERSION=locala-offline -s -w" \
++      ./cmd/
++  strings build/_output/bin/operator-amd64 | grep '_Cfunc__goboringcrypto_' >/dev/null
++) >"$BUILD_LOG" 2>&1 || {
++  cat "$BUILD_LOG" >&2
++  fail "build"
++}
++BIN=/workspace/repo/build/_output/bin/operator-amd64
++[ -x "$BIN" ] || fail "operator binary not found at $BIN"
++
++cd "$TMP" || fail "cd temp"
++
++
++
++VERIFY_SRC="$TMP/verify_crds.go"
++cat >"$VERIFY_SRC" <<'GOEOF'
++package main
++
++import (
++	"bytes"
++	"bufio"
++	"encoding/json"
++	"fmt"
++	"os"
++	"path/filepath"
++	"sort"
++	"strings"
++
++	apiextv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
++	"sigs.k8s.io/yaml"
++)
++
++const repo = "/workspace/repo"
++
++type printedCRD struct {
++	name string
++	body string
++}
++
++func fail(format string, args ...interface{}) {
++	fmt.Fprintf(os.Stderr, format+"\n", args...)
++	os.Exit(1)
++}
++
++func main() {
++	if len(os.Args) < 6 {
++		fail("usage: verify_crds <bundle|prefix> <calico|enterprise> <v1|v3> <output> <expected-count> [prefix]")
++	}
++	mode, variant, api, output := os.Args[1], os.Args[2], os.Args[3], os.Args[4]
++	expectedCount := atoi(os.Args[5])
++	expected := loadExpected(variant, api == "v3")
++
++	wanted := expected
++	if mode == "prefix" {
++		if len(os.Args) != 7 {
++			fail("prefix mode requires a prefix argument")
++		}
++		prefix := os.Args[6]
++		wanted = map[string]string{}
++		for name, canonical := range expected {
++			if strings.HasPrefix(name, prefix) {
++				wanted[name] = canonical
++			}
++		}
++		if len(wanted) == 0 {
++			fail("test prefix %q unexpectedly matches no bundled CRDs", prefix)
++		}
++		if len(wanted) != expectedCount {
++			fail("prefix matched %d bundled CRDs; test expects %d", len(wanted), expectedCount)
++		}
++	} else if mode != "bundle" {
++		fail("unknown mode %q", mode)
++	} else if len(expected) != expectedCount {
++		fail("expected bundle fixture has %d CRDs; test expects %d", len(expected), expectedCount)
++	}
++
++	printed := readPrinted(output)
++	if len(printed) != len(wanted) {
++		fail("printed %d CRDs; want %d", len(printed), len(wanted))
++	}
++
++	seen := map[string]bool{}
++	for _, item := range printed {
++		if seen[item.name] {
++			fail("duplicate printed CRD %s", item.name)
++		}
++		seen[item.name] = true
++		want, ok := wanted[item.name]
++		if !ok {
++			fail("printed unexpected CRD %s", item.name)
++		}
++		gotCRD := decodeCRD([]byte(item.body), item.name)
++		if gotCRD.Name != item.name {
++			fail("comment name %s does not match CRD metadata.name %s", item.name, gotCRD.Name)
++		}
++		if gotCRD.TypeMeta.APIVersion != "apiextensions.k8s.io/v1" || gotCRD.TypeMeta.Kind != "CustomResourceDefinition" {
++			fail("%s is not serialized as an apiextensions.k8s.io/v1 CustomResourceDefinition", item.name)
++		}
++		if got := canonical(gotCRD); got != want {
++			fail("printed CRD %s does not match the bundled CRD content", item.name)
++		}
++	}
++	for name := range wanted {
++		if !seen[name] {
++			fail("missing bundled CRD %s", name)
++		}
++	}
++}
++
++func atoi(s string) int {
++	var n int
++	if _, err := fmt.Sscanf(s, "%d", &n); err != nil {
++		fail("invalid integer %q: %v", s, err)
++	}
++	return n
++}
++
++func loadExpected(variant string, v3 bool) map[string]string {
++	out := map[string]string{}
++	if variant == "calico" {
++		if v3 {
++			addDir(out, "pkg/imports/crds/calico/v3.projectcalico.org")
++		} else {
++			addDir(out, "pkg/imports/crds/calico/v1.crd.projectcalico.org")
++		}
++		addDir(out, "pkg/imports/crds/calico/policy.networking.k8s.io")
++		addOperator(out, true)
++		return out
++	}
++	if variant == "enterprise" {
++		if v3 {
++			addDir(out, "pkg/imports/crds/enterprise/v3.projectcalico.org")
++		} else {
++			addDir(out, "pkg/imports/crds/enterprise/v1.crd.projectcalico.org")
++		}
++		addFile(out, "pkg/imports/crds/enterprise/01-crd-eck-bundle.yaml")
++		addDir(out, "pkg/imports/crds/enterprise/policy.networking.k8s.io")
++		addOperator(out, false)
++		addDir(out, "pkg/imports/crds/enterprise/applicationlayer.projectcalico.org")
++		return out
++	}
++	fail("unknown variant %q", variant)
++	return nil
++}
++
++func addOperator(out map[string]string, calicoOnly bool) {
++	allowed := []string{"installation", "apiserver", "gatewayapi", "imageset", "tigerastatus", "whisker", "goldmane", "managementclusterconnection", "istio"}
++	dir := filepath.Join(repo, "pkg/imports/crds/operator")
++	entries, err := os.ReadDir(dir)
++	if err != nil {
++		fail("read operator CRDs: %v", err)
++	}
++	for _, entry := range entries {
++		if entry.IsDir() {
++			continue
++		}
++		if calicoOnly {
++			ok := false
++			for _, needle := range allowed {
++				if strings.Contains(entry.Name(), needle) {
++					ok = true
++					break
++				}
++			}
++			if !ok {
++				continue
++			}
++		}
++		addFile(out, filepath.Join("pkg/imports/crds/operator", entry.Name()))
++	}
++}
++
++func addDir(out map[string]string, rel string) {
++	dir := filepath.Join(repo, rel)
++	entries, err := os.ReadDir(dir)
++	if err != nil {
++		fail("read CRD dir %s: %v", rel, err)
++	}
++	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
++	for _, entry := range entries {
++		if !entry.IsDir() {
++			addFile(out, filepath.Join(rel, entry.Name()))
++		}
++	}
++}
++
++func addFile(out map[string]string, rel string) {
++	data, err := os.ReadFile(filepath.Join(repo, rel))
++	if err != nil {
++		fail("read CRD file %s: %v", rel, err)
++	}
++	for i, doc := range bytes.Split(data, []byte("\n---")) {
++		if strings.TrimSpace(string(doc)) == "" {
++			continue
++		}
++		crd := decodeCRD(doc, fmt.Sprintf("%s doc %d", rel, i))
++		if crd.Name == "tenants.operator.tigera.io" {
++			continue
++		}
++		if _, exists := out[crd.Name]; exists {
++			fail("duplicate expected CRD %s from %s", crd.Name, rel)
++		}
++		out[crd.Name] = canonical(crd)
++	}
++}
++
++func decodeCRD(data []byte, label string) *apiextv1.CustomResourceDefinition {
++	crd := &apiextv1.CustomResourceDefinition{}
++	if err := yaml.Unmarshal(data, crd); err != nil {
++		fail("parse CRD YAML for %s: %v", label, err)
++	}
++	if crd.Spec.Names.Plural != "" && crd.Spec.Group != "" {
++		crd.Name = fmt.Sprintf("%s.%s", crd.Spec.Names.Plural, crd.Spec.Group)
++	}
++	return crd
++}
++
++func canonical(crd *apiextv1.CustomResourceDefinition) string {
++	data, err := json.Marshal(crd)
++	if err != nil {
++		fail("canonicalize %s: %v", crd.Name, err)
++	}
++	return string(data)
++}
++
++func readPrinted(path string) []printedCRD {
++	f, err := os.Open(path)
++	if err != nil {
++		fail("open output %s: %v", path, err)
++	}
++	defer f.Close()
++
++	var docs []printedCRD
++	var curName string
++	var body strings.Builder
++	separators := 0
++	scanner := bufio.NewScanner(f)
++	scanner.Buffer(make([]byte, 64*1024), 32*1024*1024)
++	for scanner.Scan() {
++		line := scanner.Text()
++		switch {
++		case line == "---":
++			if curName == "" {
++				fail("separator before first CRD")
++			}
++			if strings.TrimSpace(body.String()) == "" {
++				fail("empty YAML for %s", curName)
++			}
++			docs = append(docs, printedCRD{name: curName, body: body.String()})
++			curName = ""
++			body.Reset()
++			separators++
++		case strings.HasPrefix(line, "# "):
++			if curName != "" {
++				fail("missing separator before CRD comment %q", line)
++			}
++			curName = strings.TrimSpace(strings.TrimPrefix(line, "# "))
++			if curName == "" {
++				fail("empty CRD comment name")
++			}
++		default:
++			if curName == "" {
++				if strings.TrimSpace(line) == "" && len(docs) == 0 {
++					continue
++				}
++				fail("content before CRD comment: %q", line)
++			}
++			body.WriteString(line)
++			body.WriteByte('\n')
++		}
++	}
++	if err := scanner.Err(); err != nil {
++		fail("read output: %v", err)
++	}
++	if curName != "" {
++		if strings.TrimSpace(body.String()) == "" {
++			fail("empty YAML for %s", curName)
++		}
++		docs = append(docs, printedCRD{name: curName, body: body.String()})
++	}
++	if separators != len(docs)-1 {
++		fail("separator count %d; want %d", separators, len(docs)-1)
++	}
++	return docs
++}
++GOEOF
++
++VERIFY_CRDS="$TMP/verify-crds"
++(
++  cd /workspace/repo || exit 1
++  CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -buildvcs=false -o "$VERIFY_CRDS" "$VERIFY_SRC"
++) >"$TMP/verify-build.log" 2>&1 || {
++  cat "$TMP/verify-build.log" >&2
++  fail "build verifier"
++}
++
++assert_bundle() {
++  label=$1
++  file=$2
++  variant=$3
++  api=$4
++  expected_count=$5
++
++  comments=$(grep -c '^# ' "$file" || true)
++  separators=$(grep -c '^---$' "$file" || true)
++
++  [ "$comments" -eq "$expected_count" ] \
++    || fail "$label CRD count $comments; want $expected_count"
++  [ "$separators" -eq "$((expected_count - 1))" ] \
++    || fail "$label separator count $separators; want $((expected_count - 1))"
++
++  "$VERIFY_CRDS" bundle "$variant" "$api" "$file" "$expected_count" \
++    || fail "$label CRD semantic verification"
++}
++
++assert_prefix_stdout() {
++  label=$1
++  file=$2
++  variant=$3
++  api=$4
++  prefix=$5
++  expected_count=$6
++
++  [ "$(grep -c '^# ' "$file" || true)" -eq "$expected_count" ] \
++    || fail "$label CRD count $(grep -c '^# ' "$file" || true); want $expected_count"
++  [ "$(grep -c '^---$' "$file" || true)" -eq "$((expected_count - 1))" ] \
++    || fail "$label separator count $(grep -c '^---$' "$file" || true); want $((expected_count - 1))"
++
++  "$VERIFY_CRDS" prefix "$variant" "$api" "$file" "$expected_count" "$prefix" \
++    || fail "$label CRD semantic verification"
++}
++
++
++
++
++"$BIN" --help >help.out 2>help.err; ec=$?
++[ "$ec" -eq 0 ] || fail "F1 exit $ec; want 0"
++
++cat help.out help.err >help.combined
++grep -q -- 'print-calico-crds' help.combined \
++  || fail "F1 missing --print-calico-crds help"
++grep -q -- 'print-enterprise-crds' help.combined \
++  || fail "F1 missing --print-enterprise-crds help"
++grep -qi -- 'all' help.combined \
++  || fail "F1 help should mention all as an accepted value"
++grep -qi -- 'prefix' help.combined \
++  || fail "F1 help should mention CRD prefixes as accepted values"
++
++
++
++
++env -u CALICO_API_GROUP "$BIN" --print-calico-crds all >calico_all.out 2>calico_all.err; ec=$?
++[ "$ec" -eq 0 ] || fail "F2 exit $ec; want 0"
++assert_bundle F2 calico_all.out calico v1 32
++
++
++
++
++env -u CALICO_API_GROUP "$BIN" --print-enterprise-crds all >enterprise_all.out 2>enterprise_all.err; ec=$?
++[ "$ec" -eq 0 ] || fail "F3 exit $ec; want 0"
++assert_bundle F3 enterprise_all.out enterprise v1 86
++
++
++
++
++env -u CALICO_API_GROUP "$BIN" --print-calico-crds ippools >calico_ippools.out 2>calico_ippools.err; ec=$?
++[ "$ec" -eq 0 ] || fail "F4 exit $ec; want 0"
++assert_prefix_stdout F4 calico_ippools.out calico v1 ippools 1
++
++
++
++
++env -u CALICO_API_GROUP "$BIN" --print-enterprise-crds installations >enterprise_installations.out 2>enterprise_installations.err; ec=$?
++[ "$ec" -eq 0 ] || fail "F5 exit $ec; want 0"
++assert_prefix_stdout F5 enterprise_installations.out enterprise v1 installations 1
++
++
++
++
++env -u CALICO_API_GROUP "$BIN" --print-calico-crds no-such-prefix-coderl >calico_none.out 2>calico_none.err; ec=$?
++[ "$ec" -eq 1 ] || fail "F6 exit $ec; want 1"
++EXPECTED_NO_MATCH='no CRD matching no-such-prefix-coderl'
++[ "$(cat calico_none.out)" = "$EXPECTED_NO_MATCH" ] \
++  || fail "F6 stdout: $(cat calico_none.out)"
++
++
++
++
++env -u CALICO_API_GROUP "$BIN" --print-enterprise-crds no-such-prefix-coderl >enterprise_none.out 2>enterprise_none.err; ec=$?
++[ "$ec" -eq 1 ] || fail "F7 exit $ec; want 1"
++[ "$(cat enterprise_none.out)" = "$EXPECTED_NO_MATCH" ] \
++  || fail "F7 stdout: $(cat enterprise_none.out)"
++
++
++
++
++CALICO_API_GROUP=projectcalico.org/v3 "$BIN" --print-calico-crds all >calico_all_v3.out 2>calico_all_v3.err; ec=$?
++[ "$ec" -eq 0 ] || fail "F8 exit $ec; want 0"
++assert_bundle F8 calico_all_v3.out calico v3 32
++
++
++
++
++CALICO_API_GROUP=projectcalico.org/v3 "$BIN" --print-enterprise-crds all >enterprise_all_v3.out 2>enterprise_all_v3.err; ec=$?
++[ "$ec" -eq 0 ] || fail "F9 exit $ec; want 0"
++assert_bundle F9 enterprise_all_v3.out enterprise v3 86
++
++
++
++
++CALICO_API_GROUP=projectcalico.org/v3 "$BIN" --print-calico-crds ippools >calico_ippools_v3.out 2>calico_ippools_v3.err; ec=$?
++[ "$ec" -eq 0 ] || fail "F10 exit $ec; want 0"
++assert_prefix_stdout F10 calico_ippools_v3.out calico v3 ippools 1
++
++
++
++
++CALICO_API_GROUP=projectcalico.org/v3 "$BIN" --print-enterprise-crds installations >enterprise_installations_v3.out 2>enterprise_installations_v3.err; ec=$?
++[ "$ec" -eq 0 ] || fail "F11 exit $ec; want 0"
++assert_prefix_stdout F11 enterprise_installations_v3.out enterprise v3 installations 1
++
++echo "PASS"
++exit 0
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,12 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++exec bash /workspace/repo/usercase-test-coderl/usecase.sh

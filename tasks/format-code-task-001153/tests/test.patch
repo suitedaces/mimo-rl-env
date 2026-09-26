@@ -1,0 +1,127 @@
+diff --git a/x/evm/types/tx_args_contract_test.go b/x/evm/types/tx_args_contract_test.go
+new file mode 100644
+index 00000000..b721a898
+--- /dev/null
++++ b/x/evm/types/tx_args_contract_test.go
+@@ -0,0 +1,112 @@
++package types
++
++import (
++	"math/big"
++	"testing"
++
++	"github.com/ethereum/go-ethereum/common"
++	"github.com/ethereum/go-ethereum/common/hexutil"
++	ethtypes "github.com/ethereum/go-ethereum/core/types"
++	"github.com/stretchr/testify/require"
++)
++
++func txBig(v int64) *hexutil.Big { b := hexutil.Big(*big.NewInt(v)); return &b }
++func txUint(v uint64) *hexutil.Uint64 { u := hexutil.Uint64(v); return &u }
++
++func TestTransactionArgsContract_EncodingModes(t *testing.T) {
++	to := common.HexToAddress("0x1111111111111111111111111111111111111111")
++	t.Run("legacy when no typed fee or access list", func(t *testing.T) {
++		args := TransactionArgs{To: &to, Gas: txUint(21000), GasPrice: txBig(7), Value: txBig(3), Nonce: txUint(9)}
++		tx := args.ToTransaction().AsTransaction()
++		require.Equal(t, uint8(ethtypes.LegacyTxType), tx.Type())
++		require.Equal(t, uint64(9), tx.Nonce())
++		require.Equal(t, uint64(21000), tx.Gas())
++		require.Equal(t, big.NewInt(7), tx.GasPrice())
++		require.Equal(t, big.NewInt(3), tx.Value())
++	})
++	t.Run("access list selects typed transaction", func(t *testing.T) {
++		args := TransactionArgs{To: &to, Gas: txUint(50000), GasPrice: txBig(2), AccessList: &ethtypes.AccessList{{Address: to}}}
++		tx := args.ToTransaction().AsTransaction()
++		require.Equal(t, uint8(ethtypes.AccessListTxType), tx.Type())
++		require.Len(t, tx.AccessList(), 1)
++	})
++	t.Run("either dynamic fee field selects EIP-1559", func(t *testing.T) {
++		args := TransactionArgs{To: &to, Gas: txUint(50000), MaxPriorityFeePerGas: txBig(4), ChainID: txBig(99)}
++		tx := args.ToTransaction().AsTransaction()
++		require.Equal(t, uint8(ethtypes.DynamicFeeTxType), tx.Type())
++		require.Equal(t, big.NewInt(4), tx.GasTipCap())
++		require.Equal(t, big.NewInt(99), tx.ChainId())
++	})
++	t.Run("max fee alone still selects EIP-1559 with zero tip", func(t *testing.T) {
++		args := TransactionArgs{To: &to, Gas: txUint(50000), MaxFeePerGas: txBig(12)}
++		tx := args.ToTransaction().AsTransaction()
++		require.Equal(t, uint8(ethtypes.DynamicFeeTxType), tx.Type())
++		require.Equal(t, big.NewInt(12), tx.GasFeeCap())
++		require.Equal(t, big.NewInt(0), tx.GasTipCap())
++	})
++}
++
++func TestTransactionArgsContract_DataCompatibility(t *testing.T) {
++	to := common.HexToAddress("0x2222222222222222222222222222222222222222")
++	data := hexutil.Bytes{0xaa, 0xbb}
++	empty := hexutil.Bytes{}
++	t.Run("input takes precedence when both are present", func(t *testing.T) {
++		args := TransactionArgs{To: &to, Data: &data, Input: &hexutil.Bytes{0x01}}
++		require.Equal(t, []byte{0x01}, args.GetData())
++		require.Equal(t, []byte{0x01}, args.ToTransaction().AsTransaction().Data())
++	})
++	t.Run("explicit empty input is preserved", func(t *testing.T) {
++		args := TransactionArgs{To: &to, Data: &data, Input: &empty}
++		require.Empty(t, args.GetData())
++		require.Empty(t, args.ToTransaction().AsTransaction().Data())
++	})
++	t.Run("neither data field yields nil calldata", func(t *testing.T) {
++		args := TransactionArgs{To: &to}
++		require.Nil(t, args.GetData())
++		require.Nil(t, args.ToTransaction().AsTransaction().Data())
++	})
++}
++
++func TestTransactionArgsContract_ToMessageFees(t *testing.T) {
++	from := common.HexToAddress("0x3333333333333333333333333333333333333333")
++	to := common.HexToAddress("0x4444444444444444444444444444444444444444")
++	t.Run("mixed legacy and dynamic fees are rejected", func(t *testing.T) {
++		args := TransactionArgs{From: &from, To: &to, GasPrice: txBig(10), MaxFeePerGas: txBig(20)}
++		_, err := args.ToMessage(100000, big.NewInt(1))
++		require.EqualError(t, err, "both gasPrice and (maxFeePerGas or maxPriorityFeePerGas) specified")
++	})
++	t.Run("gas cap limits requested gas", func(t *testing.T) {
++		args := TransactionArgs{From: &from, To: &to, Gas: txUint(90000), GasPrice: txBig(2), Value: txBig(5)}
++		msg, err := args.ToMessage(50000, nil)
++		require.NoError(t, err)
++		require.Equal(t, uint64(50000), msg.Gas())
++		require.Equal(t, big.NewInt(2), msg.GasPrice())
++	})
++	t.Run("base fee backfills effective gas price", func(t *testing.T) {
++		args := TransactionArgs{From: &from, To: &to, MaxFeePerGas: txBig(100), MaxPriorityFeePerGas: txBig(7)}
++		msg, err := args.ToMessage(0, big.NewInt(30))
++		require.NoError(t, err)
++		require.Equal(t, big.NewInt(37), msg.GasPrice())
++		require.Equal(t, big.NewInt(100), msg.GasFeeCap())
++		require.Equal(t, big.NewInt(7), msg.GasTipCap())
++	})
++	t.Run("dynamic fees require a base fee", func(t *testing.T) {
++		args := TransactionArgs{From: &from, To: &to, MaxFeePerGas: txBig(100), MaxPriorityFeePerGas: txBig(7)}
++		_, err := args.ToMessage(0, nil)
++		require.Error(t, err)
++		require.Contains(t, err.Error(), "maxFeePerGas or maxPriorityFeePerGas specified but london is not active yet")
++	})
++	t.Run("fee cap cannot be below tip", func(t *testing.T) {
++		args := TransactionArgs{From: &from, To: &to, MaxFeePerGas: txBig(6), MaxPriorityFeePerGas: txBig(7)}
++		_, err := args.ToMessage(0, big.NewInt(1))
++		require.Error(t, err)
++		require.Contains(t, err.Error(), "maxFeePerGas")
++		require.Contains(t, err.Error(), "maxPriorityFeePerGas")
++	})
++	t.Run("explicit zero gas is not replaced by cap", func(t *testing.T) {
++		args := TransactionArgs{From: &from, To: &to, Gas: txUint(0), GasPrice: txBig(2)}
++		msg, err := args.ToMessage(50000, nil)
++		require.NoError(t, err)
++		require.Equal(t, uint64(0), msg.Gas())
++	})
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,4 @@
++#!/bin/bash
++set -euo pipefail
++
++go test ./x/evm/types

@@ -1,0 +1,5 @@
+I want `celery.schedules.crontab.from_string(crontab: str) -> crontab` so application code can build a Celery crontab schedule from a standard five-field cron expression string. The string fields should be interpreted in this order: minute, hour, day of month, month of year, day of week, and the returned object should be equal to constructing `crontab` with those same fields in Celery's normal constructor order.
+
+For example, `crontab.from_string('* * * * *')` should return the same schedule as `crontab()`. `crontab.from_string('* * * * SUN')` should return the same schedule as `crontab(day_of_week='SUN')`. `crontab.from_string('0 8 5 * *')` should return the same schedule as `crontab(minute='0', hour='8', day_of_month='5')`.
+
+If the input does not contain exactly five space-separated fields, such as `crontab.from_string('*')`, it should raise `ValueError`. Calling it repeatedly with the same string should produce equal schedule objects, and it should not perform filesystem or network side effects.

@@ -1,0 +1,646 @@
+diff --git a/fixieai/agents/agent_base_test.py b/fixieai/agents/agent_base_test.py
+index fff3365..452a9fa 100644
+--- a/fixieai/agents/agent_base_test.py
++++ b/fixieai/agents/agent_base_test.py
+@@ -9,16 +9,99 @@ from pydantic import dataclasses as pydantic_dataclasses
+ import fixieai
+ from fixieai import agents
+ from fixieai.agents import agent_base
++from fixieai.agents import exceptions
++from fixieai.agents import token
+ 
+ agent_id = "dummy"
+ 
+ 
++class _FakeClaims:
++    def __init__(self, *, anonymous=False, agent_id="fake agent id", bearer="fake token"):
++        self.agent_id = agent_id
++        self.agent_identity = agent_id
++        self.token = bearer
++        self.bearer_token = bearer
++        self.access_token = bearer
++        self.is_anonymous = anonymous
++        self.anonymous = anonymous
++
++
++def _claims(*, anonymous=False, agent_id="fake agent id", bearer="fake token"):
++    attempts = (
++        lambda: token.VerifiedTokenClaims(
++            agent_id=agent_id, is_anonymous=anonymous, token=bearer
++        ),
++        lambda: token.VerifiedTokenClaims(agent_id, anonymous, bearer),
++        lambda: token.VerifiedTokenClaims(
++            agent_id=agent_id, anonymous=anonymous, bearer_token=bearer
++        ),
++    )
++    for make_claims in attempts:
++        try:
++            return make_claims()
++        except TypeError:
++            pass
++    return _FakeClaims(anonymous=anonymous, agent_id=agent_id, bearer=bearer)
++
++
++def _make_agent_exception(
++    response_message,
++    error_code,
++    error_message,
++    http_status_code,
++    **details,
++):
++    attempts = (
++        lambda: exceptions.AgentException(
++            response_message=response_message,
++            error_code=error_code,
++            error_message=error_message,
++            http_status_code=http_status_code,
++            **details,
++        ),
++        lambda: exceptions.AgentException(
++            response_message, error_code, error_message, http_status_code, **details
++        ),
++        lambda: exceptions.AgentException(
++            message=response_message,
++            code=error_code,
++            error_message=error_message,
++            status_code=http_status_code,
++            details=details,
++        ),
++    )
++    for make_exception in attempts:
++        try:
++            return make_exception()
++        except TypeError:
++            pass
++    raise AssertionError("AgentException did not accept a structured public payload")
++
++
++def _walk_values(obj):
++    yield obj
++    if isinstance(obj, dict):
++        for value in obj.values():
++            yield from _walk_values(value)
++    elif isinstance(obj, (list, tuple)):
++        for value in obj:
++            yield from _walk_values(value)
++
++
++def _text_blob(obj):
++    return " ".join(str(value) for value in _walk_values(obj))
++
++
++def _contains_value(obj, expected):
++    return any(value == expected for value in _walk_values(obj))
++
++
+ @pytest.fixture(autouse=True)
+ def mock_token_verifier(mocker):
+     return mocker.patch.object(
+-        agent_base.VerifiedTokenClaims,
++        token.VerifiedTokenClaims,
+         "from_token",
+-        return_value=agent_base.VerifiedTokenClaims(agent_id="fake agent id"),
++        return_value=_claims(),
+     )
+ 
+ 
+@@ -59,6 +142,28 @@ def dummy_agent(mocker):
+     def simple3(query):
+         return "Simple response custom"
+ 
++    @agent.register_func()
++    def raises_agent_exception(query):
++        raise _make_agent_exception(
++            "Please try the custom path again.",
++            "ERR_CUSTOM_VISIBLE",
++            "The custom failure was intentional.",
++            409,
++            retry_after_seconds=7,
++        )
++
++    @agent.register_func()
++    def raises_value_error(query):
++        raise ValueError("first synthetic failure")
++
++    @agent.register_func()
++    def raises_runtime_error(query):
++        raise RuntimeError("second synthetic failure")
++
++    @agent.register_func()
++    def needs_user_storage(storage: agents.UserStorage):
++        return "storage was available"
++
+     return agent
+ 
+ 
+@@ -78,10 +183,7 @@ def test_simple_agent_handshake(dummy_agent, mocker):
+ 
+ 
+ def test_simple_agent_func_calls(dummy_agent, mock_token_verifier):
+-    fast_api = fastapi.FastAPI()
+-    fast_api.include_router(dummy_agent.api_router())
+-
+-    client = testclient.TestClient(fast_api, raise_server_exceptions=False)
++    client = testclient.TestClient(dummy_agent.app(), raise_server_exceptions=False)
+     headers = {"Authorization": "Bearer fixie-test-token"}
+ 
+     # Test Func[simple1]
+@@ -90,10 +192,9 @@ def test_simple_agent_func_calls(dummy_agent, mock_token_verifier):
+     )
+     assert response.status_code == 200
+     json = response.json()
+-    assert json == {"message": {"text": "Simple response 1", "embeds": {}}}
+-    mock_token_verifier.assert_called_once_with(
+-        "fixie-test-token", dummy_agent._jwks_client, dummy_agent._allowed_agent_id
+-    )
++    assert json["message"]["text"] == "Simple response 1"
++    assert mock_token_verifier.call_count >= 1
++    assert mock_token_verifier.call_args.args[0] == "fixie-test-token"
+ 
+     # Test Func[simple2]
+     response = client.post(
+@@ -101,7 +202,7 @@ def test_simple_agent_func_calls(dummy_agent, mock_token_verifier):
+     )
+     assert response.status_code == 200
+     json = response.json()
+-    assert json == {"message": {"text": "Simple response 2", "embeds": {}}}
++    assert json["message"]["text"] == "Simple response 2"
+ 
+     # Test Func[custom]
+     response = client.post(
+@@ -109,13 +210,7 @@ def test_simple_agent_func_calls(dummy_agent, mock_token_verifier):
+     )
+     assert response.status_code == 200
+     json = response.json()
+-    assert json == {"message": {"text": "Simple response custom", "embeds": {}}}
+-
+-    # Test non-existing Func[] returns 404: Not Found
+-    response = client.post(
+-        "/simple3", json={"message": {"text": "Howdy"}}, headers=headers
+-    )
+-    assert response.status_code == 404
++    assert json["message"]["text"] == "Simple response custom"
+ 
+     # Test Func[simple1] with bad arguments returns 422: Unprocessable Entity
+     response = client.post(
+@@ -134,6 +229,99 @@ def test_simple_agent_func_calls(dummy_agent, mock_token_verifier):
+     assert response.status_code == 403
+ 
+ 
++def _assert_agent_error_shape(body):
++    assert isinstance(body, dict)
++    assert isinstance(body.get("message"), dict)
++    assert isinstance(body["message"].get("text"), str)
++    assert body["message"]["text"]
++    nested_payloads = [
++        value
++        for key, value in body.items()
++        if key != "message" and isinstance(value, dict)
++    ]
++    assert nested_payloads
++    assert any(
++        isinstance(value, str) and value
++        for payload in nested_payloads
++        for value in payload.values()
++    )
++
++
++def _diagnostic_text(body):
++    return _text_blob(body)
++
++
++def test_agent_exception_is_returned_as_structured_response(dummy_agent):
++    client = testclient.TestClient(dummy_agent.app(), raise_server_exceptions=False)
++    response = client.post(
++        "/raises_agent_exception",
++        json={"message": {"text": "Howdy"}},
++        headers={"Authorization": "Bearer fixie-test-token"},
++    )
++
++    assert response.status_code == 409
++    body = response.json()
++    _assert_agent_error_shape(body)
++    assert body["message"]["text"] == "Please try the custom path again."
++    assert _contains_value(body, "ERR_CUSTOM_VISIBLE")
++    assert _contains_value(body, "The custom failure was intentional.")
++    assert _contains_value(body, 7)
++
++
++def test_unknown_func_returns_structured_agent_response(dummy_agent):
++    client = testclient.TestClient(dummy_agent.app(), raise_server_exceptions=False)
++    headers = {"Authorization": "Bearer fixie-test-token"}
++
++    for missing_name in ("not_registered_alpha", "not_registered_beta"):
++        response = client.post(
++            f"/{missing_name}",
++            json={"message": {"text": "Howdy"}},
++            headers=headers,
++        )
++
++        assert response.status_code == 404
++        body = response.json()
++        _assert_agent_error_shape(body)
++        assert missing_name in _text_blob(body)
++
++
++@pytest.mark.parametrize(
++    "func_name",
++    [
++        "raises_value_error",
++        "raises_runtime_error",
++    ],
++)
++def test_unhandled_func_exception_returns_structured_error(dummy_agent, func_name):
++    client = testclient.TestClient(dummy_agent.app(), raise_server_exceptions=False)
++    response = client.post(
++        f"/{func_name}",
++        json={"message": {"text": "Howdy"}},
++        headers={"Authorization": "Bearer fixie-test-token"},
++    )
++
++    assert response.status_code >= 500
++    body = response.json()
++    _assert_agent_error_shape(body)
++
++
++def test_user_storage_rejects_anonymous_request_through_agent_route(
++    dummy_agent, mock_token_verifier
++):
++    mock_token_verifier.return_value = _claims(anonymous=True)
++    client = testclient.TestClient(dummy_agent.app(), raise_server_exceptions=False)
++
++    response = client.post(
++        "/needs_user_storage",
++        json={"message": {"text": "Howdy"}},
++        headers={"Authorization": "Bearer fixie-test-token"},
++    )
++
++    assert response.status_code >= 400
++    body = response.json()
++    _assert_agent_error_shape(body)
++
++
+ def test_registering_func_with_custom_name(dummy_agent):
+     dummy_agent.register_func(lambda query: "1", func_name="name1")
+     dummy_agent.register_func(lambda query: "2", func_name="name2")
+diff --git a/fixieai/agents/agent_func_test.py b/fixieai/agents/agent_func_test.py
+index ac9e205..49ef304 100644
+--- a/fixieai/agents/agent_func_test.py
++++ b/fixieai/agents/agent_func_test.py
+@@ -6,6 +6,45 @@ import fixieai
+ from fixieai.agents import agent_func
+ from fixieai.agents import api
+ from fixieai.agents import oauth
++from fixieai.agents import token
++
++
++class _FakeClaims:
++    def __init__(
++        self, *, anonymous=False, agent_id="test-agent-id", bearer="FAKE_TOKEN"
++    ):
++        self.agent_id = agent_id
++        self.agent_identity = agent_id
++        self.token = bearer
++        self.bearer_token = bearer
++        self.access_token = bearer
++        self.is_anonymous = anonymous
++        self.anonymous = anonymous
++
++
++def _claims(*, anonymous=False, agent_id="test-agent-id", bearer="FAKE_TOKEN"):
++    attempts = (
++        lambda: token.VerifiedTokenClaims(
++            agent_id=agent_id, is_anonymous=anonymous, token=bearer
++        ),
++        lambda: token.VerifiedTokenClaims(agent_id, anonymous, bearer),
++        lambda: token.VerifiedTokenClaims(
++            agent_id=agent_id, anonymous=anonymous, bearer_token=bearer
++        ),
++    )
++    for make_claims in attempts:
++        try:
++            return make_claims()
++        except TypeError:
++            pass
++    return _FakeClaims(anonymous=anonymous, agent_id=agent_id, bearer=bearer)
++
++
++def _claim_value(claims, *names):
++    for name in names:
++        if hasattr(claims, name):
++            return getattr(claims, name)
++    raise AssertionError(f"missing claim attribute among {names!r}")
+ 
+ 
+ @pytest.fixture
+@@ -32,7 +71,8 @@ def test_create_from_python_type_coercion(oauth_params):
+             )
+             query_text = "Test query"
+             result = normalized(
+-                api.AgentQuery(api.Message(text=query_text)), "test-agent-id"
++                api.AgentQuery(api.Message(text=query_text)),
++                _claims(),
+             )
+ 
+             expected_results = (
+@@ -217,3 +257,44 @@ def test_create_from_python_type_coercion(oauth_params):
+     @invalid(TypeError, "returns", allow_generator=True)
+     def generator_invalid_generic() -> Generator[int, None, None]:
+         yield 1
++
++
++def test_custom_argument_mapper_receives_verified_claims():
++    observed = {}
++
++    claims = _claims(
++        agent_id="agent-from-claims",
++        anonymous=True,
++        bearer="bearer-token-from-claims",
++    )
++
++    def mapper(query, received_claims):
++        observed["claims"] = received_claims
++        observed["agent_id"] = _claim_value(
++            received_claims, "agent_id", "agent_identity"
++        )
++        observed["bearer"] = _claim_value(
++            received_claims, "token", "bearer_token", "access_token"
++        )
++        observed["anonymous"] = _claim_value(
++            received_claims, "is_anonymous", "anonymous"
++        )
++        return "claims observed"
++
++    def impl(mapped_claim_data):
++        return mapped_claim_data
++
++    func = agent_func.AgentFunc(
++        impl=impl,
++        argument_mappers=[("mapped_claim_data", mapper)],
++        allow_multiple_responses=False,
++    )
++
++    responses = list(func(api.AgentQuery(api.Message("ignored")), claims))
++
++    observed_claims = observed["claims"]
++    assert observed_claims is claims
++    assert observed["agent_id"] == "agent-from-claims"
++    assert observed["bearer"] == "bearer-token-from-claims"
++    assert observed["anonymous"] is True
++    assert responses[0].message.text == "claims observed"
+diff --git a/fixieai/agents/standalone_test.py b/fixieai/agents/standalone_test.py
+index bb3ec92..3579607 100644
+--- a/fixieai/agents/standalone_test.py
++++ b/fixieai/agents/standalone_test.py
+@@ -1,21 +1,51 @@
+ import os
++import json
+ 
+ import fastapi
+ import pytest
+ import yaml
+ from fastapi import testclient
+ 
+-from fixieai.agents import agent_base
+ from fixieai.agents import api
+ from fixieai.agents import standalone
++from fixieai.agents import token
++
++
++class _FakeClaims:
++    def __init__(self, *, anonymous=False, agent_id="fake agent id", bearer="fake token"):
++        self.agent_id = agent_id
++        self.agent_identity = agent_id
++        self.token = bearer
++        self.bearer_token = bearer
++        self.access_token = bearer
++        self.is_anonymous = anonymous
++        self.anonymous = anonymous
++
++
++def _claims(*, anonymous=False, agent_id="fake agent id", bearer="fake token"):
++    attempts = (
++        lambda: token.VerifiedTokenClaims(
++            agent_id=agent_id, is_anonymous=anonymous, token=bearer
++        ),
++        lambda: token.VerifiedTokenClaims(agent_id, anonymous, bearer),
++        lambda: token.VerifiedTokenClaims(
++            agent_id=agent_id, anonymous=anonymous, bearer_token=bearer
++        ),
++    )
++    for make_claims in attempts:
++        try:
++            return make_claims()
++        except TypeError:
++            pass
++    return _FakeClaims(anonymous=anonymous, agent_id=agent_id, bearer=bearer)
+ 
+ 
+ @pytest.fixture(autouse=True)
+ def mock_token_verifier(mocker):
+     return mocker.patch.object(
+-        agent_base.VerifiedTokenClaims,
++        token.VerifiedTokenClaims,
+         "from_token",
+-        return_value=agent_base.VerifiedTokenClaims(agent_id="fake agent id"),
++        return_value=_claims(),
+     )
+ 
+ 
+@@ -44,9 +74,7 @@ def standalone_agent_stream(mocker):
+ 
+ 
+ def test_standalone_handshake(standalone_agent_single):
+-    fast_api = fastapi.FastAPI()
+-    fast_api.include_router(standalone_agent_single.api_router())
+-    client = testclient.TestClient(fast_api)
++    client = testclient.TestClient(standalone_agent_single.app())
+ 
+     response = client.get("/", headers={"Authorization": "Bearer fixie-test-token"})
+     assert response.status_code == 200
+@@ -64,10 +92,43 @@ def test_standalone_query_stream(standalone_agent_stream):
+     _standalone_query(standalone_agent_stream)
+ 
+ 
++def test_streaming_func_exception_yields_error_response(mocker):
++    def stream_then_fail(query):
++        yield api.AgentResponse(api.Message(query.text.upper()))
++        raise LookupError("stream failed after first response")
++
++    mocker.patch.dict(os.environ, {"FIXIE_ALLOWED_AGENT_ID": "fake agent id"})
++    agent = standalone.StandaloneAgent(
++        handle_message=stream_then_fail, sample_queries=["sample query"]
++    )
++    client = testclient.TestClient(agent.app(), raise_server_exceptions=False)
++
++    with client.stream(
++        "POST",
++        "/",
++        headers={"Authorization": "Bearer fixie-test-token"},
++        json={"message": {"text": "sample text", "embeds": {}}},
++    ) as response:
++        assert response.status_code == 200
++        lines = list(response.iter_lines())
++
++    assert len(lines) == 2
++    first = json.loads(lines[0])
++    assert first["message"]["text"] == "SAMPLE TEXT"
++
++    second = json.loads(lines[1])
++    assert isinstance(second.get("message", {}).get("text"), str)
++    assert second["message"]["text"]
++    nested_payloads = [
++        value
++        for key, value in second.items()
++        if key != "message" and isinstance(value, dict)
++    ]
++    assert nested_payloads
++
++
+ def _standalone_query(agent: standalone.StandaloneAgent):
+-    fast_api = fastapi.FastAPI()
+-    fast_api.include_router(agent.api_router())
+-    client = testclient.TestClient(fast_api)
++    client = testclient.TestClient(agent.app())
+ 
+     response = client.post(
+         "/",
+@@ -76,7 +137,7 @@ def _standalone_query(agent: standalone.StandaloneAgent):
+     )
+     assert response.status_code == 200
+     json = response.json()
+-    assert json == {"message": {"text": "SAMPLE TEXT", "embeds": {}}}
++    assert json["message"]["text"] == "SAMPLE TEXT"
+ 
+ 
+ def test_invalid_token(standalone_agent_single, mock_token_verifier):
+diff --git a/fixieai/agents/user_storage_test.py b/fixieai/agents/user_storage_test.py
+index 61489ba..6046ce7 100644
+--- a/fixieai/agents/user_storage_test.py
++++ b/fixieai/agents/user_storage_test.py
+@@ -4,13 +4,44 @@ import re
+ import pytest
+ 
+ from fixieai import constants
+-from fixieai.agents import api
++from fixieai.agents import token
+ from fixieai.agents import user_storage
+ 
+ FAKE_AGENT_ID = "fake-agent"
+ FAKE_ACCESS_TOKEN = "fake-access-token"
+ 
+ 
++class _FakeClaims:
++    def __init__(
++        self, *, anonymous=False, agent_id=FAKE_AGENT_ID, bearer=FAKE_ACCESS_TOKEN
++    ):
++        self.agent_id = agent_id
++        self.agent_identity = agent_id
++        self.token = bearer
++        self.bearer_token = bearer
++        self.access_token = bearer
++        self.is_anonymous = anonymous
++        self.anonymous = anonymous
++
++
++def _claims(*, anonymous=False, agent_id=FAKE_AGENT_ID, bearer=FAKE_ACCESS_TOKEN):
++    attempts = (
++        lambda: token.VerifiedTokenClaims(
++            agent_id=agent_id, is_anonymous=anonymous, token=bearer
++        ),
++        lambda: token.VerifiedTokenClaims(agent_id, anonymous, bearer),
++        lambda: token.VerifiedTokenClaims(
++            agent_id=agent_id, anonymous=anonymous, bearer_token=bearer
++        ),
++    )
++    for make_claims in attempts:
++        try:
++            return make_claims()
++        except TypeError:
++            pass
++    return _FakeClaims(anonymous=anonymous, agent_id=agent_id, bearer=bearer)
++
++
+ class MockUserStorageService:
+     """Mocks /api/userstorage behavior."""
+ 
+@@ -81,10 +112,7 @@ VALUES_TO_TEST = [
+ 
+ @pytest.mark.parametrize("test_value", VALUES_TO_TEST)
+ def test_user_storage(mock_user_storage_urls, test_value):
+-    query = api.AgentQuery(
+-        message=api.Message("sample query"), access_token=FAKE_ACCESS_TOKEN
+-    )
+-    storage = user_storage.UserStorage(query, agent_id=FAKE_AGENT_ID)
++    storage = user_storage.UserStorage(_claims())
+ 
+     # Add the value and test its existence
+     storage["key"] = test_value
+@@ -105,3 +133,18 @@ def test_user_storage(mock_user_storage_urls, test_value):
+ 
+ def test_doctest(mock_user_storage_urls):
+     doctest.testmod(user_storage, raise_on_error=True)
++
++
++def test_user_storage_constructor_rejects_anonymous_claims():
++    anonymous_claims = _claims(
++        agent_id="agent-for-anonymous-test",
++        anonymous=True,
++        bearer="bearer-token",
++    )
++
++    with pytest.raises(Exception) as exc_info:
++        user_storage.UserStorage(anonymous_claims)
++
++    if hasattr(exc_info.value, "to_response"):
++        response = exc_info.value.to_response()
++        assert response.message.text
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,44 @@
++#!/bin/bash
++set -uo pipefail
++
++cd /testbed
++
++
++set +u
++source /testbed/.build_env/venv/bin/activate
++set -u
++
++
++
++pip install --no-input /testbed 2>&1 | tail -3
++
++case "${1:-}" in
++  base)
++    python -m pytest \
++      --import-mode=importlib \
++      fixieai/agents/agent_base_test.py::test_registering_func_with_custom_name \
++      fixieai/agents/agent_base_test.py::test_invalid_token \
++      fixieai/agents/standalone_test.py::test_invalid_token \
++      -v
++    ;;
++  new)
++    python -m pytest \
++      --import-mode=importlib \
++      fixieai/agents/agent_base_test.py::test_simple_agent_func_calls \
++      fixieai/agents/agent_base_test.py::test_agent_exception_is_returned_as_structured_response \
++      fixieai/agents/agent_base_test.py::test_unknown_func_returns_structured_agent_response \
++      fixieai/agents/agent_base_test.py::test_unhandled_func_exception_returns_structured_error \
++      fixieai/agents/agent_base_test.py::test_user_storage_rejects_anonymous_request_through_agent_route \
++      fixieai/agents/agent_func_test.py::test_create_from_python_type_coercion \
++      fixieai/agents/agent_func_test.py::test_custom_argument_mapper_receives_verified_claims \
++      fixieai/agents/standalone_test.py::test_standalone_query_stream \
++      fixieai/agents/standalone_test.py::test_streaming_func_exception_yields_error_response \
++      fixieai/agents/user_storage_test.py::test_user_storage \
++      fixieai/agents/user_storage_test.py::test_user_storage_constructor_rejects_anonymous_claims \
++      -v
++    ;;
++  *)
++    echo "usage: $0 base|new"
++    exit 2
++    ;;
++esac

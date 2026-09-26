@@ -1,0 +1,242 @@
+diff --git a/tests/factories/test_urlscan.py b/tests/factories/test_urlscan.py
+new file mode 100644
+index 0000000..cddba84
+--- /dev/null
++++ b/tests/factories/test_urlscan.py
+@@ -0,0 +1,214 @@
++import json
++import re
++from urllib.parse import unquote
++
++import httpx
++import pytest
++
++from app.factories.urlscan import UrlscanVerdictFactory
++
++
++
++
++
++SCANS = {
++    "http://malware-one.example/": {
++        "uuid": "uuid-mal-1",
++        "malicious": True,
++        "score": 100,
++    },
++    "http://malware-two.example/": {
++        "uuid": "uuid-mal-2",
++        "malicious": True,
++        "score": 80,
++    },
++    "http://benign.example/": {
++        "uuid": "uuid-ben",
++        "malicious": False,
++        "score": 0,
++    },
++    "http://no-results.example/": None,
++    "http://search-error.example/": "ERROR",
++    "http://result-error.example/": "RESULT_ERROR",
++}
++
++
++def _response(request, status_code, payload):
++    return httpx.Response(
++        status_code, request=request, content=json.dumps(payload).encode()
++    )
++
++
++def _make_fake_get():
++
++
++
++
++
++    seen_headers = []
++
++    async def fake_get(self, url, *, params=None, headers=None, **kwargs):
++        seen_headers.append(headers or {})
++
++        full = str(url)
++        if params:
++
++            full += "?" + "&".join(f"{k}={v}" for k, v in params.items())
++        decoded = unquote(full)
++
++        request = httpx.Request("GET", str(url))
++
++        if "/search" in decoded:
++            for target, scan in SCANS.items():
++                if target in decoded:
++                    if scan == "ERROR":
++                        return _response(request, 429, {})
++                    if scan is None:
++                        return _response(request, 200, {"results": [], "total": 0})
++                    return _response(
++                        request,
++                        200,
++                        {
++                            "results": [
++                                {
++                                    "_id": scan["uuid"],
++                                    "task": {"uuid": scan["uuid"], "url": target},
++                                }
++                            ],
++                            "total": 1,
++                        },
++                    )
++            return _response(request, 200, {"results": [], "total": 0})
++
++        if "/result/" in decoded:
++            match = re.search(r"/result/([^/?]+)", decoded)
++            uuid = match.group(1) if match else ""
++            for target, scan in SCANS.items():
++                if isinstance(scan, dict) and scan["uuid"] == uuid:
++                    return _response(
++                        request,
++                        200,
++                        {
++                            "task": {"uuid": scan["uuid"], "url": target},
++                            "verdicts": {
++                                "overall": {
++                                    "malicious": scan["malicious"],
++                                    "score": scan["score"],
++                                }
++                            },
++                        },
++                    )
++                if scan == "RESULT_ERROR":
++                    return _response(request, 500, {})
++            return _response(request, 404, {})
++
++        return _response(request, 404, {})
++
++    fake_get.seen_headers = seen_headers
++    return fake_get
++
++
++@pytest.fixture
++def fake_urlscan(monkeypatch):
++    fake_get = _make_fake_get()
++    monkeypatch.setattr(httpx.AsyncClient, "get", fake_get)
++    return fake_get
++
++
++@pytest.mark.asyncio
++async def test_no_urls_is_benign(fake_urlscan):
++    verdict = await UrlscanVerdictFactory.from_urls([])
++
++    assert verdict.name == "urlscan.io"
++    assert verdict.malicious is False
++    assert verdict.score is None
++    assert len(verdict.details) == 1
++
++
++@pytest.mark.asyncio
++async def test_benign_urls(fake_urlscan):
++    verdict = await UrlscanVerdictFactory.from_urls(
++        ["http://benign.example/", "http://no-results.example/"]
++    )
++
++    assert verdict.name == "urlscan.io"
++    assert verdict.malicious is False
++    assert verdict.score is None
++    assert len(verdict.details) == 1
++
++
++@pytest.mark.asyncio
++async def test_single_malicious_url(fake_urlscan):
++    verdict = await UrlscanVerdictFactory.from_urls(["http://malware-one.example/"])
++
++    assert verdict.name == "urlscan.io"
++    assert verdict.malicious is True
++    assert verdict.score == 100
++    assert len(verdict.details) == 1
++
++    detail = verdict.details[0]
++    assert detail.key == "http://malware-one.example/"
++    assert detail.score == 100
++    assert "http://malware-one.example/" in detail.description
++    assert "https://urlscan.io/result/uuid-mal-1" in detail.description
++
++
++@pytest.mark.asyncio
++async def test_mixed_urls_reports_only_malicious(fake_urlscan):
++    verdict = await UrlscanVerdictFactory.from_urls(
++        [
++            "http://benign.example/",
++            "http://malware-one.example/",
++            "http://malware-two.example/",
++            "http://no-results.example/",
++        ]
++    )
++
++    assert verdict.malicious is True
++    assert verdict.score == 100
++    assert len(verdict.details) == 2
++
++    keys = {detail.key for detail in verdict.details}
++    assert keys == {"http://malware-one.example/", "http://malware-two.example/"}
++
++    by_key = {detail.key: detail for detail in verdict.details}
++    assert by_key["http://malware-one.example/"].score == 100
++    assert by_key["http://malware-two.example/"].score == 80
++
++
++@pytest.mark.asyncio
++async def test_http_errors_are_swallowed(fake_urlscan):
++    verdict = await UrlscanVerdictFactory.from_urls(
++        [
++            "http://search-error.example/",
++            "http://result-error.example/",
++            "http://malware-one.example/",
++        ]
++    )
++
++
++    assert verdict.malicious is True
++    assert verdict.score == 100
++    assert len(verdict.details) == 1
++    assert verdict.details[0].key == "http://malware-one.example/"
++
++
++@pytest.mark.asyncio
++async def test_all_errors_is_benign(fake_urlscan):
++    verdict = await UrlscanVerdictFactory.from_urls(
++        ["http://search-error.example/", "http://result-error.example/"]
++    )
++
++    assert verdict.malicious is False
++    assert verdict.score is None
++    assert len(verdict.details) == 1
++
++
++@pytest.mark.asyncio
++async def test_requests_send_api_key_header(fake_urlscan):
++    await UrlscanVerdictFactory.from_urls(["http://malware-one.example/"])
++
++    assert len(fake_urlscan.seen_headers) >= 1
++    for headers in fake_urlscan.seen_headers:
++        lowered = {str(k).lower(): v for k, v in dict(headers).items()}
++        assert "api-key" in lowered
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,17 @@
++#!/usr/bin/env bash
++
++
++set -euo pipefail
++HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++cd /testbed
++
++
++
++PYTEST="/testbed/.venv/bin/python -m pytest -o addopts= -p no:randomly -q"
++
++
++$PYTEST tests/factories/test_eml.py tests/factories/test_oleid.py \
++    tests/services/test_oleid.py tests/schemas/test_payload.py
++
++
++$PYTEST tests/factories/test_urlscan.py

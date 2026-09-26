@@ -1,0 +1,266 @@
+diff --git a/usercase-test-coderl/test_due_card_rollover.py b/usercase-test-coderl/test_due_card_rollover.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/test_due_card_rollover.py
+@@ -0,0 +1,238 @@
++import sqlite3
++import sys
++from unittest.mock import patch
++
++
++sys.path.insert(0, "/workspace/repo/src/main/python")
++from database import Database  # noqa: E402
++
++
++def _new_database(tmp_path, name="data.db"):
++    filename = tmp_path / name
++    return Database(filename=str(filename)), filename
++
++
++def _due_by_card_id(db, list_id):
++
++    cards = {}
++    for line in db.runCommand(f"show-cards {list_id}").splitlines()[1:]:
++        card_id, due, *_ = line.split("\t")
++        cards[int(card_id)] = int(due)
++    return cards
++
++
++def _assert_due_state(db, list_id, expected):
++
++    assert _due_by_card_id(db, list_id) == expected
++
++
++def _destination_card_indexes(filename, list_id=2):
++    with sqlite3.connect(str(filename)) as conn:
++        return list(
++            conn.execute(
++                "SELECT ROWID, idx FROM cards WHERE list=? ORDER BY idx ASC",
++                (list_id,),
++            )
++        )
++
++
++def _assert_destination_normalized(filename, list_id, expected_card_ids):
++
++    rows = _destination_card_indexes(filename, list_id)
++    assert {row_id for row_id, _ in rows} == set(expected_card_ids)
++    assert [idx for _, idx in rows] == list(range(len(rows)))
++
++
++def _assert_invalid_command_fails_without_change(db, command, expected_by_list):
++    before = {list_id: _due_by_card_id(db, list_id) for list_id in expected_by_list}
++
++    assert before == expected_by_list
++    failed = False
++    try:
++        result = db.runCommand(command)
++    except Exception:
++        failed = True
++    else:
++
++        failed = result is not None
++    assert failed
++    assert before == {list_id: _due_by_card_id(db, list_id) for list_id in expected_by_list}
++
++
++def test_set_due_date_stores_absolute_timestamp_and_clears_with_minus_one(tmp_path):
++
++
++
++
++    db, _ = _new_database(tmp_path)
++    try:
++        db.runCommand('add-card "card one":"":-1 to 1')
++
++        db.runCommand("set-due-date 1 1234567890")
++
++        _assert_due_state(db, 1, {1: 1234567890})
++
++        db.runCommand("set-due-date 1 -1")
++
++        _assert_due_state(db, 1, {1: -1})
++    finally:
++        db.close()
++
++
++def test_set_due_in_uses_fixed_second_coefficients_for_all_supported_units(tmp_path):
++
++
++
++
++    db, _ = _new_database(tmp_path)
++    try:
++        db.runCommand('add-card "relative":"":-1 to 1')
++
++        with patch("time.time", return_value=1700000000):
++            db.runCommand("set-due-in 1 2d")
++
++        _assert_due_state(db, 1, {1: 1700172800})
++
++        with patch("time.time", return_value=1700000000):
++            db.runCommand("set-due-in 1 3w")
++
++        _assert_due_state(db, 1, {1: 1701814400})
++
++        with patch("time.time", return_value=1700000000):
++            db.runCommand("set-due-in 1 4m")
++
++        _assert_due_state(db, 1, {1: 1710368000})
++
++        with patch("time.time", return_value=1700000000):
++            db.runCommand("set-due-in 1 1y")
++
++        _assert_due_state(db, 1, {1: 1731536000})
++    finally:
++        db.close()
++
++
++def test_single_source_rollover_moves_only_positive_past_due_cards(tmp_path):
++
++
++
++
++    db, _ = _new_database(tmp_path)
++    try:
++        db.runCommand('add-card "overdue":"":1 to 1')
++        db.runCommand('add-card "future":"":32503680000 to 1')
++        db.runCommand('add-card "undated":"":-1 to 1')
++
++        _assert_due_state(db, 1, {1: 1, 2: 32503680000, 3: -1})
++        _assert_due_state(db, 2, {})
++
++        with patch("time.time", return_value=1700000000):
++            db.runCommand("move-due-cards 1 to 2")
++
++
++        _assert_due_state(db, 1, {2: 32503680000, 3: -1})
++        _assert_due_state(db, 2, {1: 1})
++    finally:
++        db.close()
++
++
++def test_multiple_source_rollover_moves_all_overdue_cards_and_normalizes_destination_indexes(tmp_path):
++
++
++
++
++    db, filename = _new_database(tmp_path)
++    try:
++        db.runCommand('add-card "dest preexisting":"":-1 to 2')
++        db.runCommand('add-card "l1 old":"":1 to 1')
++        db.runCommand('add-card "l1 future":"":32503680000 to 1')
++        db.runCommand('add-card "l3 old":"":2 to 3')
++        db.runCommand('add-card "l3 none":"":-1 to 3')
++
++
++        _assert_due_state(db, 1, {2: 1, 3: 32503680000})
++        _assert_due_state(db, 2, {1: -1})
++        _assert_due_state(db, 3, {4: 2, 5: -1})
++
++        with patch("time.time", return_value=1700000000):
++            db.runCommand("move-due-cards 1,3 to 2")
++
++
++        _assert_due_state(db, 1, {3: 32503680000})
++        _assert_due_state(db, 2, {1: -1, 2: 1, 4: 2})
++        _assert_due_state(db, 3, {5: -1})
++        _assert_destination_normalized(filename, 2, [1, 2, 4])
++    finally:
++        db.close()
++
++
++def test_invalid_due_rollover_command_forms_fail_without_changing_cards(tmp_path):
++
++
++
++
++    db, _ = _new_database(tmp_path)
++    try:
++        db.runCommand('add-card "bad":"":-1 to 1')
++        expected = {1: {1: -1}}
++
++
++        _assert_invalid_command_fails_without_change(db, "set-due-in 1 5h", expected)
++        _assert_invalid_command_fails_without_change(db, "set-due-date 1 abc", expected)
++        _assert_invalid_command_fails_without_change(db, "move-due-cards 1 to x", expected)
++        _assert_invalid_command_fails_without_change(db, "not-a-command", expected)
++    finally:
++        db.close()
++
++
++def test_incomplete_due_commands_fail_without_changing_cards(tmp_path):
++
++
++
++
++    db, _ = _new_database(tmp_path)
++    try:
++        db.runCommand('add-card "incomplete":"":99 to 1')
++        expected = {1: {1: 99}}
++
++
++        _assert_invalid_command_fails_without_change(db, "set-due-date 1", expected)
++        _assert_invalid_command_fails_without_change(db, "set-due-in 1 d", expected)
++        _assert_invalid_command_fails_without_change(db, "set-due-in 1 5", expected)
++    finally:
++        db.close()
++
++
++def test_set_due_date_can_update_a_future_timestamp_to_clear_state(tmp_path):
++
++
++
++
++    db, _ = _new_database(tmp_path)
++    try:
++        db.runCommand('add-card "future clear":"":-1 to 1')
++
++        db.runCommand("set-due-date 1 32503680000")
++
++        _assert_due_state(db, 1, {1: 32503680000})
++
++        db.runCommand("set-due-date 1 -1")
++
++        _assert_due_state(db, 1, {1: -1})
++    finally:
++        db.close()
++
++
++def test_malformed_move_due_cards_source_list_fails_without_moving_cards(tmp_path):
++
++
++
++
++    db, _ = _new_database(tmp_path)
++    try:
++        db.runCommand('add-card "stays put":"":1 to 1')
++        expected = {1: {1: 1}, 2: {}}
++
++
++        _assert_invalid_command_fails_without_change(db, "move-due-cards 1, to 2", expected)
++    finally:
++        db.close()
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,18 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++
++cd /workspace/repo
++export PYTHONPATH="/workspace/repo/src/main/python${PYTHONPATH:+:${PYTHONPATH}}"
++export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
++
++exec python -m pytest /workspace/repo/usercase-test-coderl/test_due_card_rollover.py -v

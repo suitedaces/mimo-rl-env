@@ -1,0 +1,331 @@
+diff --git a/tests/components/alexa/test_proactive_delta_codespec.py b/tests/components/alexa/test_proactive_delta_codespec.py
+new file mode 100644
+index 00000000000..03ee608971d
+--- /dev/null
++++ b/tests/components/alexa/test_proactive_delta_codespec.py
+@@ -0,0 +1,310 @@
++
++import logging
++
++import pytest
++
++from homeassistant.components import climate
++from homeassistant.components import light
++from homeassistant.components.alexa import smart_home, state_report
++from homeassistant.const import (
++    STATE_UNAVAILABLE,
++    STATE_UNKNOWN,
++    TEMP_CELSIUS,
++)
++
++from . import DEFAULT_CONFIG, TEST_URL, get_new_request
++
++
++def _property_values(properties):
++
++    return {
++        (prop["namespace"], prop["name"]): prop["value"]
++        for prop in properties
++    }
++
++
++def _single_change_report(aioclient_mock):
++
++    assert len(aioclient_mock.mock_calls) == 1
++    message = aioclient_mock.mock_calls[0][2]
++    assert message["event"]["header"]["name"] == "ChangeReport"
++    return message
++
++
++async def _reported_values(hass, endpoint):
++
++    request = get_new_request("Alexa", "ReportState", endpoint)
++    response = await smart_home.async_handle_message(hass, DEFAULT_CONFIG, request)
++    assert response["event"]["header"]["name"] == "StateReport"
++    return _property_values(response["context"]["properties"])
++
++
++async def test_codespec_endpoint_health_is_proactive_in_discovery(hass):
++
++    hass.states.async_set(
++        "sensor.room_temperature",
++        "20",
++        {"unit_of_measurement": TEMP_CELSIUS},
++    )
++
++    request = get_new_request("Alexa.Discovery", "Discover")
++    response = await smart_home.async_handle_message(hass, DEFAULT_CONFIG, request)
++    endpoint = response["event"]["payload"]["endpoints"][0]
++    health = next(
++        capability
++        for capability in endpoint["capabilities"]
++        if capability["interface"] == "Alexa.EndpointHealth"
++    )
++
++    assert health["properties"]["proactivelyReported"] is True
++
++
++async def test_codespec_change_report_partitions_delta_and_context(
++    hass, aioclient_mock
++):
++
++    aioclient_mock.post(TEST_URL, json={}, status=202)
++    attrs = {"device_class": "door", "friendly_name": "Patio door"}
++    hass.states.async_set("binary_sensor.patio", "off", attrs)
++    await state_report.async_enable_proactive_mode(hass, DEFAULT_CONFIG)
++
++    hass.states.async_set("binary_sensor.patio", "on", attrs)
++    await hass.async_block_till_done()
++
++    message = _single_change_report(aioclient_mock)
++    changed = _property_values(
++        message["event"]["payload"]["change"]["properties"]
++    )
++    context = _property_values(message["context"]["properties"])
++
++    assert changed == {
++        ("Alexa.ContactSensor", "detectionState"): "DETECTED"
++    }
++    assert context == {
++        ("Alexa.EndpointHealth", "connectivity"): {"value": "OK"}
++    }
++
++
++async def test_codespec_irrelevant_update_does_not_post(hass, aioclient_mock):
++
++    aioclient_mock.post(TEST_URL, json={}, status=202)
++    hass.states.async_set(
++        "binary_sensor.patio",
++        "off",
++        {"device_class": "door", "friendly_name": "Patio door"},
++    )
++    await state_report.async_enable_proactive_mode(hass, DEFAULT_CONFIG)
++
++    hass.states.async_set(
++        "binary_sensor.patio",
++        "off",
++        {"device_class": "door", "friendly_name": "Back patio door"},
++    )
++    await hass.async_block_till_done()
++
++    assert aioclient_mock.mock_calls == []
++
++
++async def test_codespec_non_proactive_property_change_does_not_post(
++    hass, aioclient_mock
++):
++
++    aioclient_mock.post(TEST_URL, json={}, status=202)
++    hass.states.async_set(
++        "light.accent",
++        "on",
++        {
++            "brightness": 255,
++            "hs_color": (0, 100),
++            "supported_features": light.SUPPORT_COLOR,
++        },
++    )
++    await state_report.async_enable_proactive_mode(hass, DEFAULT_CONFIG)
++
++    hass.states.async_set(
++        "light.accent",
++        "on",
++        {
++            "brightness": 255,
++            "hs_color": (120, 100),
++            "supported_features": light.SUPPORT_COLOR,
++        },
++    )
++    await hass.async_block_till_done()
++
++    assert aioclient_mock.mock_calls == []
++
++
++async def test_codespec_all_changed_properties_are_reported(hass, aioclient_mock):
++
++    aioclient_mock.post(TEST_URL, json={}, status=202)
++    base_attrs = {
++        "current_temperature": 20,
++        "temperature": 21,
++        "supported_features": climate.const.SUPPORT_TARGET_TEMPERATURE,
++        "hvac_modes": [climate.const.HVAC_MODE_COOL],
++    }
++    hass.states.async_set("climate.study", climate.const.HVAC_MODE_COOL, base_attrs)
++    await state_report.async_enable_proactive_mode(hass, DEFAULT_CONFIG)
++
++    changed_attrs = dict(base_attrs, current_temperature=22, temperature=23)
++    hass.states.async_set("climate.study", climate.const.HVAC_MODE_COOL, changed_attrs)
++    await hass.async_block_till_done()
++
++    message = _single_change_report(aioclient_mock)
++    changed = _property_values(
++        message["event"]["payload"]["change"]["properties"]
++    )
++    context = _property_values(message["context"]["properties"])
++
++    assert changed == {
++        ("Alexa.TemperatureSensor", "temperature"): {
++            "value": 22.0,
++            "scale": "CELSIUS",
++        },
++        ("Alexa.ThermostatController", "targetSetpoint"): {
++            "value": 23.0,
++            "scale": "CELSIUS",
++        },
++    }
++    assert context == {
++        ("Alexa.ThermostatController", "thermostatMode"): "COOL",
++        ("Alexa.EndpointHealth", "connectivity"): {"value": "OK"},
++    }
++
++
++async def test_codespec_unavailable_reports_health_without_temperature(
++    hass, aioclient_mock
++):
++
++    aioclient_mock.post(TEST_URL, json={}, status=202)
++    attrs = {"unit_of_measurement": TEMP_CELSIUS}
++    hass.states.async_set("sensor.room_temperature", "20", attrs)
++    await state_report.async_enable_proactive_mode(hass, DEFAULT_CONFIG)
++
++    hass.states.async_set("sensor.room_temperature", STATE_UNAVAILABLE, attrs)
++    await hass.async_block_till_done()
++
++    message = _single_change_report(aioclient_mock)
++    changed = _property_values(
++        message["event"]["payload"]["change"]["properties"]
++    )
++    context = message.get("context", {}).get("properties", [])
++
++    assert changed == {
++        ("Alexa.EndpointHealth", "connectivity"): {"value": "UNREACHABLE"}
++    }
++    assert context == []
++
++
++@pytest.mark.parametrize(
++    "state,health",
++    [
++        (STATE_UNKNOWN, "OK"),
++        (STATE_UNAVAILABLE, "UNREACHABLE"),
++        ("not-a-number", "OK"),
++        ("nan", "OK"),
++        ("inf", "OK"),
++        ("-inf", "OK"),
++    ],
++)
++async def test_codespec_invalid_sensor_temperature_is_omitted(hass, state, health):
++
++    hass.states.async_set(
++        "sensor.room_temperature",
++        state,
++        {"unit_of_measurement": TEMP_CELSIUS},
++    )
++
++    values = await _reported_values(hass, "sensor#room_temperature")
++
++    assert values == {
++        ("Alexa.EndpointHealth", "connectivity"): {"value": health}
++    }
++
++
++@pytest.mark.parametrize("current_temperature", [None, STATE_UNKNOWN, "nan"])
++async def test_codespec_invalid_climate_temperature_preserves_other_properties(
++    hass, current_temperature
++):
++
++    hass.states.async_set(
++        "climate.study",
++        climate.const.HVAC_MODE_COOL,
++        {
++            "current_temperature": current_temperature,
++            "temperature": 21,
++            "supported_features": climate.const.SUPPORT_TARGET_TEMPERATURE,
++            "hvac_modes": [climate.const.HVAC_MODE_COOL],
++        },
++    )
++
++    values = await _reported_values(hass, "climate#study")
++
++    assert ("Alexa.TemperatureSensor", "temperature") not in values
++    assert values[("Alexa.ThermostatController", "thermostatMode")] == "COOL"
++    assert values[("Alexa.ThermostatController", "targetSetpoint")] == {
++        "value": 21.0,
++        "scale": "CELSIUS",
++    }
++    assert values[("Alexa.EndpointHealth", "connectivity")] == {"value": "OK"}
++
++
++async def test_codespec_zero_temperature_is_valid(hass):
++
++    hass.states.async_set(
++        "sensor.freezer_temperature",
++        "0",
++        {"unit_of_measurement": TEMP_CELSIUS},
++    )
++
++    values = await _reported_values(hass, "sensor#freezer_temperature")
++
++    assert values[("Alexa.TemperatureSensor", "temperature")] == {
++        "value": 0.0,
++        "scale": "CELSIUS",
++    }
++
++
++async def test_codespec_newly_valid_temperature_is_a_delta(hass, aioclient_mock):
++
++    aioclient_mock.post(TEST_URL, json={}, status=202)
++    attrs = {"unit_of_measurement": TEMP_CELSIUS}
++    hass.states.async_set("sensor.freezer_temperature", STATE_UNKNOWN, attrs)
++    await state_report.async_enable_proactive_mode(hass, DEFAULT_CONFIG)
++
++    hass.states.async_set("sensor.freezer_temperature", "0", attrs)
++    await hass.async_block_till_done()
++
++    message = _single_change_report(aioclient_mock)
++    changed = _property_values(
++        message["event"]["payload"]["change"]["properties"]
++    )
++    context = _property_values(message["context"]["properties"])
++
++    assert changed == {
++        ("Alexa.TemperatureSensor", "temperature"): {
++            "value": 0.0,
++            "scale": "CELSIUS",
++        }
++    }
++    assert context == {
++        ("Alexa.EndpointHealth", "connectivity"): {"value": "OK"}
++    }
++
++
++async def test_codespec_newly_invalid_temperature_without_other_delta_is_silent(
++    hass, aioclient_mock, caplog
++):
++
++    aioclient_mock.post(TEST_URL, json={}, status=202)
++    attrs = {"unit_of_measurement": TEMP_CELSIUS}
++    hass.states.async_set("sensor.room_temperature", "20", attrs)
++    await state_report.async_enable_proactive_mode(hass, DEFAULT_CONFIG)
++    caplog.clear()
++
++    hass.states.async_set("sensor.room_temperature", STATE_UNKNOWN, attrs)
++    await hass.async_block_till_done()
++
++    assert aioclient_mock.mock_calls == []
++    assert [record for record in caplog.records if record.levelno >= logging.ERROR] == []
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,10 @@
++#!/bin/bash
++set -euo pipefail
++
++
++pytest -q \
++  tests/components/alexa/test_proactive_delta_codespec.py \
++  tests/components/alexa/test_state_report.py::test_report_state \
++  tests/components/alexa/test_smart_home.py::test_temp_sensor \
++  tests/components/alexa/test_smart_home.py::test_endpoint_good_health \
++  tests/components/alexa/test_smart_home.py::test_endpoint_bad_health

@@ -1,0 +1,1 @@
+In [this commit](https://github.com/Propaganistas/Laravel-Phone/commit/99f2d320a15f1a7e5d196a3e8e17b586756ab44f#diff-48e28eb93ccfcade09cdb083d128c8a87e08516d3f2b182445f1877626f8bff9), the `mobile` and `fixed-line` string parameters were removed from `Phone::setParameters()`. This breaks backwards compatibility (so should be a major release) and I don't think is intended.

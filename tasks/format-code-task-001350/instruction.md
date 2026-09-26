@@ -1,0 +1,7 @@
+I want `grumpc <script.py>` to compile Python call expressions into runnable Go source. When the input file contains `def add(a, b): return a + b` followed by `result = add(2, 3)`, `grumpc -modname=sample sample.py` should exit 0 and write valid Go source to stdout that evaluates the callee expression, passes the two positional arguments in order, and stores the call result in `result` when the generated module runs.
+
+Calls with explicit keyword arguments should also compile. For example, a source file with `def pair(a, b): return (a, b)` and `result = pair(b="bee", a="aye")` should produce Go source that preserves the keyword names and values so the generated module binds `a` to `"aye"` and `b` to `"bee"`.
+
+The compiler should support Python splat call syntax in the same call-expression path. A source file containing `result = f(1, *more)` should compile so the generated code appends the iterable contents of `more` after the explicit positional argument before invoking `f`; a source file containing `result = f(x=1, **extra)` should compile so the generated code merges the explicit keyword with the dictionary keywords before invoking `f`.
+
+If a call expression contains an unsupported subexpression inside the callee or any argument, `grumpc` should still report the normal compile error for that subexpression and exit non-zero rather than emitting partial or invalid call code. Valid call expressions should not print diagnostics to stderr.

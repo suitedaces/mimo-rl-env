@@ -1,0 +1,636 @@
+diff --git a/usercase-test-coderl/client_announce_lifecycle.test.js b/usercase-test-coderl/client_announce_lifecycle.test.js
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/client_announce_lifecycle.test.js
+@@ -0,0 +1,565 @@
++import test from 'tape'
++import { Client, Server } from '../index.js'
++
++
++
++
++
++
++
++
++
++const INFO_HASH = '0123456789012345678901234567890123456789'
++const PEER_ID = '1234567890123456789012345678901234567890'
++const ALT_INFO_HASH = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
++const ALT_PEER_ID = 'abcdefabcdefabcdefabcdefabcdefabcdefabcd'
++const PORT = 6881
++
++function createTrackerServer (serverType, opts = {}) {
++  return new Promise((resolve, reject) => {
++    const server = new Server({
++      http: serverType === 'http',
++      udp: serverType === 'udp',
++      ws: serverType === 'ws',
++      stats: false,
++      ...opts
++    })
++    server.once('error', reject)
++    server.on('warning', reject)
++    server.listen(0, () => {
++      const port = server[serverType].address().port
++      const announce = serverType === 'http'
++        ? `http://127.0.0.1:${port}/announce`
++        : serverType === 'udp'
++          ? `udp://127.0.0.1:${port}`
++          : `ws://127.0.0.1:${port}`
++      resolve({ server, announce })
++    })
++  })
++}
++
++function closeServer (server) {
++  return new Promise(resolve => server.close(() => resolve()))
++}
++
++function destroyClient (client) {
++  return new Promise(resolve => client.destroy(() => resolve()))
++}
++
++function wait (ms) {
++  return new Promise(resolve => setTimeout(resolve, ms))
++}
++
++function newClient (announce, opts = {}) {
++  return new Client({
++    infoHash: opts.infoHash || INFO_HASH,
++    peerId: opts.peerId || PEER_ID,
++    announce,
++    port: opts.port || PORT,
++    getAnnounceOpts: opts.getAnnounceOpts,
++    wrtc: {}
++  })
++}
++
++function observeClient (t, client, updates) {
++  client.on('update', data => {
++    updates.push({
++      announce: data.announce,
++      complete: data.complete,
++      incomplete: data.incomplete
++    })
++  })
++  client.on('warning', err => {
++    t.fail(`unexpected warning: ${err.message}`)
++  })
++  client.on('error', err => {
++    t.fail(`unexpected error: ${err.message}`)
++  })
++}
++
++async function cleanup (server, client) {
++  if (client && !client.destroyed) await destroyClient(client)
++  if (server && !server.destroyed) await closeServer(server)
++}
++
++test('public Client constructor exposes lifecycle interval control', t => {
++  t.plan(1)
++
++
++
++
++  const client = newClient('http://127.0.0.1:1/announce')
++
++  t.equal(typeof client.setInterval, 'function')
++  client.destroy(() => {})
++})
++
++test('destroy is idempotent when called twice on a started client', async t => {
++  t.plan(2)
++
++
++
++
++  const { server, announce } = await createTrackerServer('http')
++  const client = newClient(announce, {
++    getAnnounceOpts () {
++      return { numwant: 0 }
++    }
++  })
++  const updates = []
++  observeClient(t, client, updates)
++
++  client.setInterval(100)
++  client.start({ left: 11 })
++  await wait(80)
++  await destroyClient(client)
++  t.deepEqual(updates, [
++    { announce, complete: 0, incomplete: 1 }
++  ])
++  await wait(140)
++
++  t.equal(updates.length, 1)
++  await closeServer(server)
++})
++
++test('start schedules protocol default recurring announce cadences', async t => {
++  t.plan(2)
++
++
++
++
++  const http = await createTrackerServer('http')
++  const udp = await createTrackerServer('udp')
++  const ws = await createTrackerServer('ws')
++  const originalSetInterval = globalThis.setInterval
++  const originalClearInterval = globalThis.clearInterval
++  const scheduled = []
++  globalThis.setInterval = (fn, ms, ...args) => {
++    const handle = originalSetInterval(fn, 60 * 60 * 1000, ...args)
++    scheduled.push(ms)
++    return handle
++  }
++  globalThis.clearInterval = handle => originalClearInterval(handle)
++
++  const client = newClient([http.announce, udp.announce, ws.announce], {
++    getAnnounceOpts () {
++      return { numwant: 0 }
++    }
++  })
++  client.on('warning', err => {
++    t.fail(`unexpected warning: ${err.message}`)
++  })
++  client.on('error', err => {
++    t.fail(`unexpected error: ${err.message}`)
++  })
++
++  try {
++    client.start({ numwant: 0, left: 9 })
++
++    t.deepEqual(scheduled.slice(0, 3).sort((a, b) => a - b), [30000, 1800000, 1800000])
++    await destroyClient(client)
++
++    t.equal(scheduled.length, 3)
++  } finally {
++    globalThis.setInterval = originalSetInterval
++    globalThis.clearInterval = originalClearInterval
++    await closeServer(http.server)
++    await closeServer(udp.server)
++    await closeServer(ws.server)
++  }
++})
++
++test('http announce response interval drives recurring announces and refreshes getAnnounceOpts', async t => {
++  t.plan(3)
++
++
++
++
++  const { server, announce } = await createTrackerServer('http', { interval: 1000 })
++  const seenEvents = []
++  const seenLeft = []
++  let left = 99
++  const client = newClient(announce, {
++    getAnnounceOpts () {
++      left += 1
++      return { left }
++    }
++  })
++  const updates = []
++  observeClient(t, client, updates)
++  server.on('start', (peer, params) => {
++    seenEvents.push('started')
++    seenLeft.push(params.left)
++  })
++  server.on('update', (peer, params) => {
++    seenEvents.push('update')
++    seenLeft.push(params.left)
++  })
++
++  client.start()
++  await wait(2250)
++
++
++  t.deepEqual({
++    first: seenEvents[0],
++    total: seenEvents.length,
++    updates: seenEvents.filter(event => event === 'update').length
++  }, { first: 'started', total: 3, updates: 2 })
++  const updateLefts = seenEvents
++    .map((event, index) => event === 'update' ? seenLeft[index] : null)
++    .filter(left => left != null)
++
++  t.ok(updateLefts.length === 2 && updateLefts[1] > updateLefts[0])
++  t.deepEqual(updates, [
++    { announce, complete: 0, incomplete: 1 },
++    { announce, complete: 0, incomplete: 1 },
++    { announce, complete: 0, incomplete: 1 }
++  ])
++
++  await cleanup(server, client)
++})
++
++test('udp start adopts UDP announce interval response for recurring announces', async t => {
++  t.plan(3)
++
++
++
++
++  const { server, announce } = await createTrackerServer('udp', { interval: 1000 })
++  const seenEvents = []
++  const seenDownloaded = []
++  const client = newClient(announce, {
++    getAnnounceOpts () {
++      return { numwant: 0 }
++    }
++  })
++  const updates = []
++  observeClient(t, client, updates)
++  server.on('start', (peer, params) => {
++    seenEvents.push('started')
++    seenDownloaded.push(params.downloaded)
++  })
++  server.on('update', (peer, params) => {
++    seenEvents.push('update')
++    seenDownloaded.push(params.downloaded)
++  })
++
++  client.start({ downloaded: 7, left: 12 })
++  await wait(2250)
++
++
++  t.deepEqual({
++    first: seenEvents[0],
++    total: seenEvents.length,
++    updates: seenEvents.filter(event => event === 'update').length
++  }, { first: 'started', total: 3, updates: 2 })
++
++  t.equal(seenDownloaded[0], 7)
++  t.deepEqual(updates, [
++    { announce, complete: 0, incomplete: 1 },
++    { announce, complete: 0, incomplete: 1 },
++    { announce, complete: 0, incomplete: 1 }
++  ])
++
++  await cleanup(server, client)
++})
++
++test('websocket start uses response interval and public numwant zero without private offer mocks', async t => {
++  t.plan(3)
++
++
++
++
++  const { server, announce } = await createTrackerServer('ws', { interval: 1000 })
++  const seenEvents = []
++  const seenNumwant = []
++  const client = newClient(announce, {
++    getAnnounceOpts () {
++      return { numwant: 0 }
++    }
++  })
++  const updates = []
++  observeClient(t, client, updates)
++  server.on('start', (peer, params) => {
++    seenEvents.push('started')
++    seenNumwant.push(params.numwant)
++  })
++  server.on('update', (peer, params) => {
++    seenEvents.push('update')
++    seenNumwant.push(params.numwant)
++  })
++
++  client.start({ numwant: 0, left: 13 })
++  await wait(2250)
++
++
++  t.deepEqual({
++    first: seenEvents[0],
++    total: seenEvents.length,
++    updates: seenEvents.filter(event => event === 'update').length
++  }, { first: 'started', total: 3, updates: 2 })
++  t.deepEqual(seenNumwant, [0, 0, 0])
++  t.deepEqual(updates, [
++    { announce, complete: 0, incomplete: 1 },
++    { announce, complete: 0, incomplete: 1 },
++    { announce, complete: 0, incomplete: 1 }
++  ])
++
++  await cleanup(server, client)
++})
++
++test('setInterval before start changes cadence for later scheduled http announces', async t => {
++  t.plan(3)
++
++
++
++
++  const { server, announce } = await createTrackerServer('http')
++  const seenEvents = []
++  const client = newClient(announce)
++  const updates = []
++  observeClient(t, client, updates)
++  server.on('start', () => seenEvents.push('started'))
++  server.on('update', () => seenEvents.push('update'))
++
++  client.setInterval(120)
++  await wait(270)
++  client.start({ left: 21 })
++  await wait(190)
++
++
++  t.ok(seenEvents.includes('started') && seenEvents.includes('update'))
++
++  t.equal(seenEvents.filter(event => event === 'update').length, 1)
++
++  t.equal(updates.length, 2)
++
++  await cleanup(server, client)
++})
++
++test('setInterval after start replaces the existing timer instead of duplicating it', async t => {
++  t.plan(3)
++
++
++
++
++  const { server, announce } = await createTrackerServer('http')
++  const seenEvents = []
++  const client = newClient(announce)
++  const updates = []
++  observeClient(t, client, updates)
++  server.on('start', () => seenEvents.push('started'))
++  server.on('update', () => seenEvents.push('update'))
++
++  client.start({ left: 31 })
++  await wait(70)
++  client.setInterval(90)
++  await wait(35)
++  client.setInterval(90)
++  await wait(310)
++
++
++  t.deepEqual({
++    first: seenEvents[0],
++    total: seenEvents.length,
++    updates: seenEvents.filter(event => event === 'update').length
++  }, { first: 'started', total: 2, updates: 1 })
++  t.deepEqual(updates, [
++    { announce, complete: 0, incomplete: 1 },
++    { announce, complete: 0, incomplete: 1 }
++  ])
++
++  t.equal(updates.length, 2)
++
++  await cleanup(server, client)
++})
++
++test('setInterval zero disables recurring announce timer', async t => {
++  t.plan(3)
++
++
++
++
++  const { server, announce } = await createTrackerServer('http')
++  const seenEvents = []
++  const client = newClient(announce)
++  const updates = []
++  observeClient(t, client, updates)
++  server.on('start', () => seenEvents.push('started'))
++  server.on('update', () => seenEvents.push('update'))
++
++  client.start({ left: 41 })
++  await wait(70)
++  client.setInterval(80)
++  await wait(130)
++  client.setInterval(0)
++  await wait(260)
++
++
++  t.deepEqual({
++    first: seenEvents[0],
++    total: seenEvents.length,
++    updates: seenEvents.filter(event => event === 'update').length
++  }, { first: 'started', total: 2, updates: 1 })
++  t.deepEqual(updates, [
++    { announce, complete: 0, incomplete: 1 },
++    { announce, complete: 0, incomplete: 1 }
++  ])
++
++  t.equal(updates.length, 2)
++
++  await cleanup(server, client)
++})
++
++test('two clients keep independent recurring announce timers and default options', async t => {
++  t.plan(4)
++
++
++
++
++  const { server, announce } = await createTrackerServer('http')
++  const seenByPeer = {
++    [PEER_ID]: [],
++    [ALT_PEER_ID]: []
++  }
++  const clientA = newClient(announce, {
++    getAnnounceOpts () {
++      return { left: 201 }
++    }
++  })
++  const clientB = newClient(announce, {
++    infoHash: ALT_INFO_HASH,
++    peerId: ALT_PEER_ID,
++    port: PORT + 1,
++    getAnnounceOpts () {
++      return { left: 301 }
++    }
++  })
++  const updatesA = []
++  const updatesB = []
++  observeClient(t, clientA, updatesA)
++  observeClient(t, clientB, updatesB)
++  server.on('start', (peer, params) => {
++    seenByPeer[params.peer_id].push(`started:${params.left}`)
++  })
++  server.on('update', (peer, params) => {
++    seenByPeer[params.peer_id].push(`update:${params.left}`)
++  })
++
++  clientA.start()
++  clientB.start()
++  await wait(70)
++  clientA.setInterval(80)
++  clientB.setInterval(140)
++  await wait(110)
++
++
++  t.deepEqual({
++    aStarts: seenByPeer[PEER_ID].filter(event => event === 'started:201').length,
++    aUpdates: seenByPeer[PEER_ID].filter(event => event === 'update:201').length
++  }, { aStarts: 1, aUpdates: 1 })
++
++  t.deepEqual({
++    bStarts: seenByPeer[ALT_PEER_ID].filter(event => event === 'started:301').length,
++    bUpdates: seenByPeer[ALT_PEER_ID].filter(event => event === 'update:301').length
++  }, { bStarts: 1, bUpdates: 0 })
++  await wait(70)
++
++  t.deepEqual({
++    bStarts: seenByPeer[ALT_PEER_ID].filter(event => event === 'started:301').length,
++    bUpdates: seenByPeer[ALT_PEER_ID].filter(event => event === 'update:301').length
++  }, { bStarts: 1, bUpdates: 1 })
++  t.equal(updatesA.length, 2)
++
++  await destroyClient(clientA)
++  await cleanup(server, clientB)
++})
++
++test('destroy clears all recurring announce timers so no later events are emitted', async t => {
++  t.plan(4)
++
++
++
++
++  const { server, announce } = await createTrackerServer('http')
++  const client = newClient(announce)
++  const updates = []
++  const postDestroy = {
++    update: 0,
++    peer: 0,
++    warning: 0
++  }
++  observeClient(t, client, updates)
++
++  client.start({ left: 51 })
++  await wait(70)
++  client.setInterval(80)
++  await wait(120)
++  await destroyClient(client)
++  client.on('update', () => { postDestroy.update += 1 })
++  client.on('peer', () => { postDestroy.peer += 1 })
++  client.on('warning', () => { postDestroy.warning += 1 })
++  await wait(240)
++
++  t.deepEqual(updates, [
++    { announce, complete: 0, incomplete: 1 },
++    { announce, complete: 0, incomplete: 1 }
++  ])
++  t.equal(postDestroy.update, 0)
++  t.equal(postDestroy.peer, 0)
++  t.equal(postDestroy.warning, 0)
++
++  await closeServer(server)
++})
++
++test('leak floor: 100 construct-use-destroy cycles clear all interval handles', async t => {
++  t.plan(3)
++
++
++
++
++  const { server, announce } = await createTrackerServer('http')
++  const originalSetInterval = globalThis.setInterval
++  const originalClearInterval = globalThis.clearInterval
++  const activeIntervals = new Set()
++  let starts = 0
++  let updates = 0
++  server.on('start', () => { starts += 1 })
++  server.on('update', () => { updates += 1 })
++
++  globalThis.setInterval = (fn, ms, ...args) => {
++    const handle = originalSetInterval(fn, ms, ...args)
++    activeIntervals.add(handle)
++    return handle
++  }
++  globalThis.clearInterval = handle => {
++    activeIntervals.delete(handle)
++    return originalClearInterval(handle)
++  }
++
++  try {
++    for (let i = 0; i < 100; i += 1) {
++      const client = newClient(announce, {
++        peerId: (BigInt(`0x${PEER_ID}`) + BigInt(i)).toString(16).padStart(40, '0'),
++        port: PORT + (i % 100)
++      })
++      client.on('warning', err => {
++        t.fail(`unexpected warning during leak floor: ${err.message}`)
++      })
++      client.on('error', err => {
++        t.fail(`unexpected error during leak floor: ${err.message}`)
++      })
++      client.start({ left: 61 })
++      await destroyClient(client)
++    }
++  } finally {
++    globalThis.setInterval = originalSetInterval
++    globalThis.clearInterval = originalClearInterval
++  }
++
++  t.equal(starts, 100)
++  t.equal(updates, 0)
++  t.equal(activeIntervals.size, 0)
++
++  await closeServer(server)
++})
+diff --git a/usercase-test-coderl/run_client_announce_lifecycle.cjs b/usercase-test-coderl/run_client_announce_lifecycle.cjs
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/run_client_announce_lifecycle.cjs
+@@ -0,0 +1,25 @@
++#!/usr/bin/env node
++'use strict'
++
++const path = require('path')
++const { pathToFileURL } = require('url')
++const tape = require('tape')
++
++const testFile = path.resolve(__dirname, 'client_announce_lifecycle.test.js')
++
++tape.wait()
++tape.createStream().pipe(process.stdout)
++tape.onFinish(() => {
++
++
++  process.exit(tape.getHarness()._exitCode)
++})
++
++import(pathToFileURL(testFile).href)
++  .then(() => {
++    tape.run()
++  })
++  .catch(err => {
++    console.error(err)
++    process.exit(1)
++  })
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,31 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++
++cd /workspace/repo
++
++export npm_config_offline=true
++export npm_config_audit=false
++export npm_config_fund=false
++export npm_config_update_notifier=false
++
++if [ ! -d /workspace/repo/node_modules ]; then
++  echo "isolated offline setup error: /workspace/repo/node_modules is missing" >&2
++  exit 1
++fi
++
++if [ ! -x /workspace/repo/node_modules/.bin/tape ]; then
++  echo "isolated offline setup error: local tape binary is missing" >&2
++  exit 1
++fi
++
++exec node /workspace/repo/usercase-test-coderl/run_client_announce_lifecycle.cjs

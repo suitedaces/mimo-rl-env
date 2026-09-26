@@ -1,0 +1,204 @@
+diff --git a/tests/test_response_times_codespec.py b/tests/test_response_times_codespec.py
+new file mode 100644
+index 0000000..dda02e4
+--- /dev/null
++++ b/tests/test_response_times_codespec.py
+@@ -0,0 +1,184 @@
++import httpx
++import pytest
++from pytest import Testdir
++
++from pytest_httpx import HTTPXMock
++
++
++@pytest.mark.httpx_mock(assert_all_requests_were_expected=False)
++def test_codespec_times_keeps_registration_active_until_quota_is_exhausted(
++    httpx_mock: HTTPXMock,
++) -> None:
++    httpx_mock.add_response(text="first", times=2)
++    httpx_mock.add_response(text="next")
++
++    with httpx.Client() as client:
++        assert [client.get("https://example.test").text for _ in range(3)] == [
++            "first",
++            "first",
++            "next",
++        ]
++        with pytest.raises(httpx.TimeoutException) as error:
++            client.get("https://example.test")
++
++    assert "No response can be found" in str(error.value)
++
++
++def test_codespec_nonmatching_request_does_not_consume_quota(
++    httpx_mock: HTTPXMock,
++) -> None:
++    httpx_mock.add_response(url="https://target.test", text="target", times=2)
++    httpx_mock.add_response(url="https://other.test", text="other")
++
++    with httpx.Client() as client:
++        assert client.get("https://other.test").text == "other"
++        assert client.get("https://target.test").text == "target"
++        assert client.get("https://target.test").text == "target"
++
++
++@pytest.mark.httpx_mock(can_send_already_matched_responses=True)
++def test_codespec_explicit_quota_overrides_global_unbounded_reuse(
++    httpx_mock: HTTPXMock,
++) -> None:
++    httpx_mock.add_response(text="bounded", times=2)
++    httpx_mock.add_response(text="global fallback")
++
++    with httpx.Client() as client:
++        assert [client.get("https://example.test").text for _ in range(4)] == [
++            "bounded",
++            "bounded",
++            "global fallback",
++            "global fallback",
++        ]
++
++
++def test_codespec_sync_callback_honors_times(httpx_mock: HTTPXMock) -> None:
++    calls = 0
++
++    def callback(request: httpx.Request) -> httpx.Response:
++        nonlocal calls
++        calls += 1
++        return httpx.Response(200, text=f"callback {calls}")
++
++    httpx_mock.add_callback(callback, times=2)
++    httpx_mock.add_response(text="after callback")
++
++    with httpx.Client() as client:
++        assert [client.get("https://example.test").text for _ in range(3)] == [
++            "callback 1",
++            "callback 2",
++            "after callback",
++        ]
++
++
++@pytest.mark.asyncio
++async def test_codespec_async_callback_honors_times(httpx_mock: HTTPXMock) -> None:
++    calls = 0
++
++    async def callback(request: httpx.Request) -> httpx.Response:
++        nonlocal calls
++        calls += 1
++        return httpx.Response(200, text=f"async callback {calls}")
++
++    httpx_mock.add_callback(callback, times=2)
++    httpx_mock.add_response(text="after async callback")
++
++    async with httpx.AsyncClient() as client:
++        responses = [await client.get("https://example.test") for _ in range(3)]
++
++    assert [response.text for response in responses] == [
++        "async callback 1",
++        "async callback 2",
++        "after async callback",
++    ]
++
++
++def test_codespec_exception_registration_honors_times(
++    httpx_mock: HTTPXMock,
++) -> None:
++    httpx_mock.add_exception(httpx.ConnectError("offline"), times=2)
++    httpx_mock.add_response(text="recovered")
++
++    with httpx.Client() as client:
++        for _ in range(2):
++            with pytest.raises(httpx.ConnectError, match="offline") as error:
++                client.get("https://example.test")
++            assert error.value.request is not None
++        assert client.get("https://example.test").text == "recovered"
++
++
++def test_codespec_optional_quota_allows_partial_use(httpx_mock: HTTPXMock) -> None:
++    httpx_mock.add_response(text="optional", times=3, assert_requested=False)
++
++    with httpx.Client() as client:
++        assert client.get("https://example.test").text == "optional"
++
++
++def test_codespec_required_quota_reports_partial_use(testdir: Testdir) -> None:
++    testdir.makepyfile(
++        """
++        import httpx
++        import pytest
++
++        @pytest.mark.httpx_mock(assert_all_responses_were_requested=False)
++        def test_partial_quota(httpx_mock):
++            httpx_mock.add_response(
++                url="https://quota.test", times=3, assert_requested=True
++            )
++            httpx.get("https://quota.test")
++        """
++    )
++
++    result = testdir.runpytest("-q")
++    result.assert_outcomes(passed=1, errors=1)
++    assert "https://quota.test" in result.stdout.str()
++    assert "responses are mocked but not requested" in result.stdout.str()
++
++
++@pytest.mark.parametrize("value", [0, -1])
++@pytest.mark.parametrize("register", ["response", "callback", "exception"])
++def test_codespec_times_rejects_nonpositive_integers(
++    httpx_mock: HTTPXMock, value: int, register: str
++) -> None:
++    with pytest.raises(ValueError, match="times"):
++        if register == "response":
++            httpx_mock.add_response(times=value)
++        elif register == "callback":
++            httpx_mock.add_callback(lambda request: httpx.Response(200), times=value)
++        else:
++            httpx_mock.add_exception(RuntimeError("boom"), times=value)
++
++
++@pytest.mark.parametrize("value", [True, 1.5, "2"])
++@pytest.mark.parametrize("register", ["response", "callback", "exception"])
++def test_codespec_times_rejects_non_integer_values(
++    httpx_mock: HTTPXMock, value: object, register: str
++) -> None:
++    with pytest.raises(TypeError, match="times"):
++        if register == "response":
++            httpx_mock.add_response(times=value)
++        elif register == "callback":
++            httpx_mock.add_callback(lambda request: httpx.Response(200), times=value)
++        else:
++            httpx_mock.add_exception(RuntimeError("boom"), times=value)
++
++
++def test_codespec_times_and_explicit_reuse_validation(
++    httpx_mock: HTTPXMock,
++) -> None:
++    with pytest.raises(ValueError, match="can_send_already_matched"):
++        httpx_mock.add_response(times=2, can_send_already_matched=True)
++
++    httpx_mock.add_response(
++        text="bounded", times=2, can_send_already_matched=False
++    )
++    with httpx.Client() as client:
++        assert client.get("https://example.test").text == "bounded"
++        assert client.get("https://example.test").text == "bounded"
++
++
++def test_codespec_times_is_registration_only(httpx_mock: HTTPXMock) -> None:
++    with pytest.raises(TypeError, match="times"):
++        httpx_mock.get_requests(times=1)
++    with pytest.raises(TypeError, match="times"):
++        httpx_mock.get_request(times=1)
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,9 @@
++#!/bin/bash
++set -euo pipefail
++
++
++pytest -q \
++  tests/test_response_times_codespec.py \
++  tests/test_httpx_sync.py::test_reusing_one_response \
++  tests/test_httpx_sync.py::test_callback_executed_twice \
++  tests/test_httpx_async.py::test_reusing_one_response

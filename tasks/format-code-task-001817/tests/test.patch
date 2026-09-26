@@ -1,0 +1,214 @@
+diff --git a/usercase-test-coderl/fixtures/config-dump-plugin.js b/usercase-test-coderl/fixtures/config-dump-plugin.js
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/fixtures/config-dump-plugin.js
+@@ -0,0 +1,19 @@
++const fs = require("fs");
++const PackemPlugin = require("/workspace/repo/src/PackemPlugin");
++
++module.exports = class ConfigDumpPlugin extends PackemPlugin {
++  onStart(config) {
++    const selected = {
++      mode: config.mode,
++      format: config.format,
++      inputPaths: config.inputPaths,
++      outputPath: config.outputPath,
++      outputDir: config.outputDir,
++      outputPathFileStem: config.outputPathFileStem,
++      outputDirExistsOnStart: fs.existsSync(config.outputDir)
++    };
++
++    fs.writeFileSync("observed.json", JSON.stringify(selected, null, 2));
++    process.exit(0);
++  }
++};
+diff --git a/usercase-test-coderl/usecase.sh b/usercase-test-coderl/usecase.sh
+new file mode 100755
+--- /dev/null
++++ b/usercase-test-coderl/usecase.sh
+@@ -0,0 +1,168 @@
++#!/usr/bin/env bash
++
++set -u
++export LANG=C LC_ALL=C TZ=UTC
++
++fail() { echo "FAIL: $*" >&2; exit 1; }
++
++REPO=/workspace/repo
++FIXTURES="$REPO/usercase-test-coderl/fixtures"
++WORK=/tmp/packem-fixture-coderl
++
++ensure_node_deps() {
++  local dep_path="$REPO/node_modules"
++
++
++  (cd "$REPO" && NODE_PATH="$dep_path" node -e 'require("fs-extra"); require("chalk"); require("js-yaml"); require("make-dir"); require("@babel/core"); require("@babel/preset-env");' >/dev/null 2>&1) \
++    || fail "preinstalled node dependencies missing"
++  export NODE_PATH="$dep_path${NODE_PATH:+:$NODE_PATH}"
++}
++
++ensure_node_deps
++( cd "$REPO" && node ./scripts/build.js >/dev/null ) || fail "build"
++BIN="$REPO/scripts/cli.js"
++
++rm -rf "$WORK"
++mkdir -p "$WORK"
++trap 'rm -rf "$WORK"' EXIT
++
++install_config_dump_plugin() {
++  local project=$1
++  mkdir -p "$project/node_modules/config-dump"
++  cp "$FIXTURES/config-dump-plugin.js" "$project/node_modules/config-dump/index.js"
++}
++
++assert_diagnostic() {
++  local file=$1
++
++  grep -F 'NoConfigFoundError' "$file" >/dev/null || fail "F1 diagnostic missing NoConfigFoundError: $(cat "$file")"
++  grep -F '.packemrc' "$file" >/dev/null || fail "F1 diagnostic missing .packemrc: $(cat "$file")"
++  grep -Fi 'configuration file' "$file" >/dev/null || fail "F1 diagnostic missing configuration-file wording: $(cat "$file")"
++  grep -Fi 'detected in this scope' "$file" >/dev/null || fail "F1 diagnostic missing scope wording: $(cat "$file")"
++}
++
++assert_config_json() {
++  local actual=$1
++  local mode=$2
++  local format=$3
++  local output_path=$4
++  local output_dir=$5
++  local output_file_stem=$6
++  local input_paths_json=$7
++
++
++  node - "$actual" "$mode" "$format" "$output_path" "$output_dir" "$output_file_stem" "$input_paths_json" <<'NODE' \
++    || fail "config JSON assertion failed for $actual"
++const fs = require("fs");
++const path = require("path");
++
++const [
++  actualPath,
++  expectedMode,
++  expectedFormat,
++  expectedOutputPath,
++  expectedOutputDir,
++  expectedOutputPathFileStem,
++  expectedInputPathsJson
++] = process.argv.slice(2);
++
++const observed = JSON.parse(fs.readFileSync(actualPath, "utf8"));
++const expectedInputPaths = JSON.parse(expectedInputPathsJson);
++
++function check(condition, message) {
++  if (!condition) {
++    console.error(message);
++    process.exit(1);
++  }
++}
++
++check(observed.mode === expectedMode, `mode: ${observed.mode}`);
++check(observed.format === expectedFormat, `format: ${observed.format}`);
++check(Array.isArray(observed.inputPaths), "inputPaths is not an array");
++check(
++  observed.inputPaths.length === expectedInputPaths.length,
++  `inputPaths length: ${JSON.stringify(observed.inputPaths)}`
++);
++for (let i = 0; i < expectedInputPaths.length; i++) {
++  check(observed.inputPaths[i] === expectedInputPaths[i], `inputPaths[${i}]: ${observed.inputPaths[i]}`);
++  check(path.isAbsolute(observed.inputPaths[i]), `inputPaths[${i}] is not absolute`);
++}
++check(observed.outputPath === expectedOutputPath, `outputPath: ${observed.outputPath}`);
++check(path.isAbsolute(observed.outputPath), "outputPath is not absolute");
++check(observed.outputDir === expectedOutputDir, `outputDir: ${observed.outputDir}`);
++check(path.isAbsolute(observed.outputDir), "outputDir is not absolute");
++check(observed.outputPathFileStem === expectedOutputPathFileStem, `outputPathFileStem: ${observed.outputPathFileStem}`);
++check(observed.outputDirExistsOnStart === true, "outputDir did not exist before onStart");
++NODE
++}
++
++
++
++
++PROJECT="$WORK/no-config"
++mkdir -p "$PROJECT"
++cd "$PROJECT" || fail "cd F1"
++node "$BIN" >out 2>err; ec=$?
++cat out err >diagnostic
++assert_diagnostic diagnostic
++[ ! -e "$PROJECT/build" ] || fail "F1 should not create default build directory without config"
++[ ! -e "$PROJECT/dist" ] || fail "F1 should not create dist directory without config"
++
++
++
++
++PROJECT="$WORK/single-file-output"
++mkdir -p "$PROJECT/src"
++install_config_dump_plugin "$PROJECT"
++printf 'console.log("hello")\n' >"$PROJECT/src/index.js"
++cat >"$PROJECT/.packemrc" <<'EOF'
++input: src/index.js
++output: dist/app.js
++plugins:
++  config-dump: {}
++EOF
++cd "$PROJECT" || fail "cd F2"
++node "$BIN" >out 2>err; ec=$?
++[ "$ec" -eq 0 ] || fail "F2 exit $ec; want 0"
++[ -d "$PROJECT/dist" ] || fail "F2 output directory was not created"
++[ -f observed.json ] || fail "F2 config dump plugin did not run"
++assert_config_json \
++  observed.json \
++  production \
++  iife \
++  "$PROJECT/dist/app.js" \
++  "$PROJECT/dist" \
++  app \
++  "[\"$PROJECT/src/index.js\"]"
++
++
++
++
++PROJECT="$WORK/list-default-output"
++mkdir -p "$PROJECT/src"
++install_config_dump_plugin "$PROJECT"
++printf 'console.log("a")\n' >"$PROJECT/src/a.js"
++printf 'console.log("b")\n' >"$PROJECT/src/b.js"
++cat >"$PROJECT/.packemrc" <<'EOF'
++input: [src/a.js, ./src/a.js, src/b.js]
++mode: development
++format: cjs
++plugins:
++  config-dump: {}
++EOF
++cd "$PROJECT" || fail "cd F3"
++node "$BIN" >out 2>err; ec=$?
++[ "$ec" -eq 0 ] || fail "F3 exit $ec; want 0"
++[ -d "$PROJECT/build" ] || fail "F3 default build directory was not created"
++[ -f observed.json ] || fail "F3 config dump plugin did not run"
++assert_config_json \
++  observed.json \
++  development \
++  cjs \
++  "$PROJECT/build" \
++  "$PROJECT/build" \
++  "" \
++  "[\"$PROJECT/src/a.js\",\"$PROJECT/src/b.js\"]"
++
++echo "PASS"
++exit 0
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,12 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++exec bash /workspace/repo/usercase-test-coderl/usecase.sh

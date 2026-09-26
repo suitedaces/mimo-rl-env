@@ -1,0 +1,268 @@
+diff --git a/wagtail/tests/test_feature_dependencies.py b/wagtail/tests/test_feature_dependencies.py
+new file mode 100644
+index 0000000000..f426260cf2
+--- /dev/null
++++ b/wagtail/tests/test_feature_dependencies.py
+@@ -0,0 +1,249 @@
++import json
++import warnings
++
++from django.core.exceptions import ImproperlyConfigured
++from django.forms import Media
++from django.test import SimpleTestCase
++
++from wagtail.admin.rich_text.converters.contentstate import ContentstateConverter
++from wagtail.admin.rich_text.converters.editor_html import (
++    EditorHTMLConverter,
++    WhitelistRule,
++)
++from wagtail.admin.rich_text.editors.draftail import DraftailRichTextArea
++from wagtail.rich_text import features as global_features
++from wagtail.rich_text.feature_registry import FeatureRegistry
++from wagtail.whitelist import allow_without_attributes
++
++
++def register_dependency(test_case, registry, feature_name, dependencies):
++    test_case.assertTrue(
++        hasattr(registry, "register_feature_dependency"),
++        "FeatureRegistry must expose register_feature_dependency()",
++    )
++    registry.register_feature_dependency(feature_name, dependencies)
++
++
++class RecordingPlugin:
++    media = Media()
++
++    def __init__(self, label):
++        self.label = label
++
++    def construct_options(self, options):
++        options.setdefault("codespec_dependency_order", []).append(self.label)
++
++
++class FeatureDependencyResolutionTests(SimpleTestCase):
++    def test_transitive_order_merging_deduplication_and_input_preservation(self):
++        registry = FeatureRegistry()
++        register_dependency(
++            self,
++            registry,
++            "codespec-root",
++            ("codespec-branch", "codespec-leaf"),
++        )
++        register_dependency(self, registry, "codespec-branch", "codespec-seed")
++        register_dependency(
++            self,
++            registry,
++            "codespec-root",
++            ["codespec-leaf", "codespec-extra"],
++        )
++        requested = [
++            "codespec-root",
++            "codespec-tail",
++            "codespec-branch",
++            "codespec-root",
++        ]
++
++        resolved = registry.resolve_features(requested)
++
++        self.assertEqual(
++            resolved,
++            [
++                "codespec-seed",
++                "codespec-branch",
++                "codespec-leaf",
++                "codespec-extra",
++                "codespec-root",
++                "codespec-tail",
++            ],
++        )
++        self.assertEqual(
++            requested,
++            [
++                "codespec-root",
++                "codespec-tail",
++                "codespec-branch",
++                "codespec-root",
++            ],
++        )
++
++    def test_default_empty_and_fresh_result_semantics(self):
++        registry = FeatureRegistry()
++        registry.get_default_features()
++        registry.default_features.clear()
++        registry.default_features.extend(["codespec-default-root", "codespec-plain"])
++        register_dependency(
++            self,
++            registry,
++            "codespec-default-root",
++            "codespec-default-base",
++        )
++
++        first = registry.get_default_features()
++        self.assertEqual(
++            first,
++            ["codespec-default-base", "codespec-default-root", "codespec-plain"],
++        )
++        self.assertEqual(registry.resolve_features([]), [])
++
++        first.append("codespec-caller-mutation")
++        self.assertEqual(
++            registry.get_default_features(),
++            ["codespec-default-base", "codespec-default-root", "codespec-plain"],
++        )
++
++    def test_cycle_reports_the_traversal_chain(self):
++        registry = FeatureRegistry()
++        register_dependency(
++            self, registry, "codespec-cycle-a", "codespec-cycle-b"
++        )
++        register_dependency(
++            self, registry, "codespec-cycle-b", "codespec-cycle-c"
++        )
++
++        with self.assertRaisesRegex(
++            ImproperlyConfigured,
++            r"^Cyclic rich text feature dependency: "
++            r"(?:codespec-cycle-a -> codespec-cycle-b -> codespec-cycle-c -> codespec-cycle-a|"
++            r"codespec-cycle-b -> codespec-cycle-c -> codespec-cycle-a -> codespec-cycle-b|"
++            r"codespec-cycle-c -> codespec-cycle-a -> codespec-cycle-b -> codespec-cycle-c)$",
++        ):
++            register_dependency(
++                self, registry, "codespec-cycle-c", "codespec-cycle-a"
++            )
++            registry.resolve_features(["codespec-cycle-a"])
++
++
++class FeatureDependencyConsumerTests(SimpleTestCase):
++    def test_draftail_constructs_prerequisite_plugins_first(self):
++        base = "codespec-draftail-base"
++        dependent = "codespec-draftail-dependent"
++        register_dependency(self, global_features, dependent, base)
++        global_features.register_editor_plugin(
++            "draftail", base, RecordingPlugin("base")
++        )
++        global_features.register_editor_plugin(
++            "draftail", dependent, RecordingPlugin("dependent")
++        )
++
++        widget = DraftailRichTextArea(features=[dependent, base, dependent])
++
++        self.assertEqual(widget.features, [base, dependent])
++        self.assertEqual(
++            widget.options["codespec_dependency_order"], ["base", "dependent"]
++        )
++
++        global_features.default_features.append(dependent)
++        try:
++            default_widget = DraftailRichTextArea()
++        finally:
++            global_features.default_features.remove(dependent)
++        self.assertLess(
++            default_widget.features.index(base),
++            default_widget.features.index(dependent),
++        )
++        self.assertEqual(
++            default_widget.options["codespec_dependency_order"],
++            ["base", "dependent"],
++        )
++
++    def test_draftail_retains_unknown_dependencies_and_warns_once(self):
++        missing = "codespec-missing-plugin-dependency"
++        dependent = "codespec-plugin-with-missing-dependency"
++        register_dependency(self, global_features, dependent, [missing, missing])
++        global_features.register_editor_plugin(
++            "draftail", dependent, RecordingPlugin("dependent")
++        )
++
++        with warnings.catch_warnings(record=True) as caught:
++            warnings.simplefilter("always")
++            widget = DraftailRichTextArea(
++                features=[dependent, missing, dependent, missing]
++            )
++
++        matching_warnings = [
++            warning
++            for warning in caught
++            if missing in str(warning.message)
++            and issubclass(warning.category, RuntimeWarning)
++        ]
++        self.assertEqual(widget.features, [missing, dependent])
++        self.assertEqual(len(matching_warnings), 1)
++        self.assertEqual(widget.options["codespec_dependency_order"], ["dependent"])
++
++    def test_editorhtml_applies_dependency_rules_explicitly_and_by_default(self):
++        base = "codespec-editorhtml-base"
++        dependent = "codespec-editorhtml-dependent"
++        register_dependency(self, global_features, dependent, base)
++        global_features.register_converter_rule(
++            "editorhtml",
++            base,
++            [WhitelistRule("kbd", allow_without_attributes)],
++        )
++        global_features.register_converter_rule(
++            "editorhtml",
++            dependent,
++            [WhitelistRule("mark", allow_without_attributes)],
++        )
++        source = "<p><kbd>base</kbd><mark>dependent</mark><s>disabled</s></p>"
++
++        explicit_result = EditorHTMLConverter(
++            features=[dependent]
++        ).to_database_format(source)
++
++        global_features.default_features.append(dependent)
++        try:
++            default_converter = EditorHTMLConverter()
++        finally:
++            global_features.default_features.remove(dependent)
++        default_result = default_converter.to_database_format(source)
++
++        for result in (explicit_result, default_result):
++            self.assertIn("<kbd>base</kbd>", result)
++            self.assertIn("<mark>dependent</mark>", result)
++            self.assertNotIn("<s>", result)
++
++    def test_contentstate_applies_dependency_rules_in_both_directions(self):
++        dependent = "codespec-contentstate-dependent"
++        register_dependency(self, global_features, dependent, "code")
++
++        converter = ContentstateConverter(features=[dependent])
++        contentstate_json = converter.from_database_format(
++            "<p><code>important</code></p>"
++        )
++        contentstate = json.loads(contentstate_json)
++
++        self.assertEqual(converter.features, ["code", dependent])
++        self.assertEqual(
++            contentstate["blocks"][0]["inlineStyleRanges"],
++            [{"offset": 0, "length": 9, "style": "CODE"}],
++        )
++        self.assertIn(
++            "<code>important</code>", converter.to_database_format(contentstate_json)
++        )
++
++        global_features.default_features.append(dependent)
++        try:
++            default_converter = ContentstateConverter()
++        finally:
++            global_features.default_features.remove(dependent)
++        default_contentstate = default_converter.from_database_format(
++            "<p><code>default</code></p>"
++        )
++        self.assertEqual(
++            json.loads(default_contentstate)["blocks"][0]["inlineStyleRanges"],
++            [{"offset": 0, "length": 7, "style": "CODE"}],
++        )
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,8 @@
++#!/bin/bash
++set -euo pipefail
++
++
++.venv/bin/python runtests.py --deprecation=none \
++  wagtail.tests.test_feature_dependencies \
++  wagtail.tests.test_rich_text.TestFeatureRegistry \
++  -v 1

@@ -1,0 +1,198 @@
+diff --git a/planner/core/mpp_left_semi_blacklist_test.go b/planner/core/mpp_left_semi_blacklist_test.go
+new file mode 100644
+index 0000000000..84bfedb857
+--- /dev/null
++++ b/planner/core/mpp_left_semi_blacklist_test.go
+@@ -0,0 +1,168 @@
++package core_test
++
++import (
++	"strings"
++
++	. "github.com/pingcap/check"
++	"github.com/pingcap/tidb/domain"
++	"github.com/pingcap/tidb/parser/model"
++	"github.com/pingcap/tidb/util/testkit"
++)
++
++func mppPlanText(rows [][]interface{}) string {
++	parts := make([]string, 0, len(rows))
++	for _, row := range rows {
++		cols := make([]string, 0, len(row))
++		for _, col := range row {
++			cols = append(cols, col.(string))
++		}
++		parts = append(parts, strings.Join(cols, " "))
++	}
++	return strings.Join(parts, "\n")
++}
++
++func mppWarningCount(tk *testkit.TestKit) int {
++	return len(tk.Se.GetSessionVars().StmtCtx.GetWarnings())
++}
++
++func hasTiFlashHashJoinLine(plan string, label string) bool {
++	for _, line := range strings.Split(plan, "\n") {
++		if strings.Contains(line, "HashJoin") &&
++			strings.Contains(line, "cop[tiflash]") &&
++			strings.Contains(line, label) {
++			return true
++		}
++	}
++	return false
++}
++
++func assertTiFlashMPPJoin(c *C, plan string, label string) {
++	c.Assert(hasTiFlashHashJoinLine(plan, label), IsTrue, Commentf("plan does not contain TiFlash MPP HashJoin for %s:\n%s", label, plan))
++}
++
++func assertNoTiFlashMPPJoin(c *C, plan string, label string) {
++	c.Assert(hasTiFlashHashJoinLine(plan, label), IsFalse, Commentf("plan still contains disabled TiFlash MPP HashJoin for %s:\n%s", label, plan))
++}
++
++func prepareMPPLeftSemiJoinTest(tk *testkit.TestKit, c *C) {
++	tk.MustExec("use test")
++	tk.MustExec("drop table if exists mpp_lsj")
++	tk.MustExec("create table mpp_lsj(a int not null, b int null)")
++	tk.MustExec("set @@tidb_allow_mpp = 1")
++	tk.MustExec("set @@tidb_enforce_mpp = 1")
++	tk.MustExec("set @@tidb_broadcast_join_threshold_size = 104857600")
++	tk.MustExec("set @@tidb_opt_broadcast_cartesian_join = 0")
++
++	dom := domain.GetDomain(tk.Se)
++	is := dom.InfoSchema()
++	db, exists := is.SchemaByName(model.NewCIStr("test"))
++	c.Assert(exists, IsTrue)
++	for _, tblInfo := range db.Tables {
++		if tblInfo.Name.L == "mpp_lsj" {
++			tblInfo.TiFlashReplica = &model.TiFlashReplicaInfo{
++				Count:     1,
++				Available: true,
++			}
++		}
++	}
++}
++
++func explainPlanAndWarningCount(tk *testkit.TestKit, sql string) (string, int) {
++	rows := tk.MustQuery(sql).Rows()
++	return mppPlanText(rows), mppWarningCount(tk)
++}
++
++func (s *testIntegrationSerialSuite) TestMPPLeftOuterSemiJoinExplain(c *C) {
++	tk := testkit.NewTestKit(c, s.store)
++	prepareMPPLeftSemiJoinTest(tk, c)
++
++	cases := []string{
++		"explain format = 'brief' select * from test.mpp_lsj t1 where t1.a > 1 or t1.a in (select a from test.mpp_lsj)",
++		"explain format = 'brief' select * from test.mpp_lsj t1 where t1.a > 5 or t1.a in (select a from test.mpp_lsj where b < t1.b)",
++	}
++	for _, sql := range cases {
++		plan, warningCount := explainPlanAndWarningCount(tk, sql)
++		assertTiFlashMPPJoin(c, plan, "left outer semi join")
++		c.Assert(warningCount, Equals, 0, Commentf("expected supported MPP plan without warnings for %s:\n%s", sql, plan))
++	}
++}
++
++func (s *testIntegrationSerialSuite) TestMPPAntiLeftOuterSemiJoinExplain(c *C) {
++	tk := testkit.NewTestKit(c, s.store)
++	prepareMPPLeftSemiJoinTest(tk, c)
++
++	cases := []string{
++		"explain format = 'brief' select * from test.mpp_lsj t1 where t1.a > 1 or t1.a not in (select a from test.mpp_lsj)",
++		"explain format = 'brief' select * from test.mpp_lsj t1 where t1.a > 5 or t1.a not in (select a from test.mpp_lsj where b < t1.b)",
++	}
++	for _, sql := range cases {
++		plan, warningCount := explainPlanAndWarningCount(tk, sql)
++		assertTiFlashMPPJoin(c, plan, "anti left outer semi join")
++		c.Assert(warningCount, Equals, 0, Commentf("expected supported MPP plan without warnings for %s:\n%s", sql, plan))
++	}
++}
++
++func (s *testIntegrationSerialSuite) TestMPPCartesianLeftOuterSemiJoinExplain(c *C) {
++	tk := testkit.NewTestKit(c, s.store)
++	prepareMPPLeftSemiJoinTest(tk, c)
++	tk.MustExec("set @@tidb_opt_broadcast_cartesian_join = 1")
++	tk.MustExec("set @@tidb_broadcast_join_threshold_size = 104857600")
++
++	leftPlan, leftWarningCount := explainPlanAndWarningCount(tk,
++		"explain format = 'brief' select * from test.mpp_lsj t1 where t1.a > 1 or t1.b in (select a from test.mpp_lsj)")
++	assertTiFlashMPPJoin(c, leftPlan, "left outer semi join")
++	c.Assert(strings.Contains(leftPlan, "CARTESIAN"), IsTrue, Commentf("cartesian marker missing from plan:\n%s", leftPlan))
++	c.Assert(leftWarningCount, Equals, 0, Commentf("expected cartesian MPP plan without warnings:\n%s", leftPlan))
++
++	antiPlan, antiWarningCount := explainPlanAndWarningCount(tk,
++		"explain format = 'brief' select * from test.mpp_lsj t1 where t1.a > 1 or t1.b not in (select a from test.mpp_lsj)")
++	assertTiFlashMPPJoin(c, antiPlan, "anti left outer semi join")
++	c.Assert(strings.Contains(antiPlan, "CARTESIAN"), IsTrue, Commentf("cartesian marker missing from plan:\n%s", antiPlan))
++	c.Assert(antiWarningCount, Equals, 0, Commentf("expected cartesian MPP plan without warnings:\n%s", antiPlan))
++}
++
++func setJoinTypeBlacklist(tk *testkit.TestKit, joinType string) {
++	tk.MustExec("delete from mysql.expr_pushdown_blacklist where store_type = 'tiflash'")
++	tk.MustExec("admin reload expr_pushdown_blacklist")
++	tk.MustExec("insert into mysql.expr_pushdown_blacklist values('" + joinType + "', 'tiflash', 'test')")
++	tk.MustExec("admin reload expr_pushdown_blacklist")
++}
++
++func assertBlacklistBlockedMPPJoin(c *C, plan string, warningCount int, joinType string) {
++	assertNoTiFlashMPPJoin(c, plan, joinType)
++	c.Assert(warningCount > 0, IsTrue, Commentf("blacklisted %s should emit an explain warning; plan:\n%s", joinType, plan))
++}
++
++func (s *testIntegrationSerialSuite) TestMPPJoinTypeBlacklistBlocksHashJoin(c *C) {
++	tk := testkit.NewTestKit(c, s.store)
++	prepareMPPLeftSemiJoinTest(tk, c)
++	defer func() {
++		tk.MustExec("delete from mysql.expr_pushdown_blacklist where store_type = 'tiflash'")
++		tk.MustExec("admin reload expr_pushdown_blacklist")
++	}()
++
++	setJoinTypeBlacklist(tk, "left outer semi join")
++	leftPlan, leftWarningCount := explainPlanAndWarningCount(tk,
++		"explain format = 'brief' select * from test.mpp_lsj t1 where t1.a > 1 or t1.a in (select a from test.mpp_lsj)")
++	assertBlacklistBlockedMPPJoin(c, leftPlan, leftWarningCount, "left outer semi join")
++
++	setJoinTypeBlacklist(tk, "anti left outer semi join")
++	antiPlan, antiWarningCount := explainPlanAndWarningCount(tk,
++		"explain format = 'brief' select * from test.mpp_lsj t1 where t1.a > 1 or t1.a not in (select a from test.mpp_lsj)")
++	assertBlacklistBlockedMPPJoin(c, antiPlan, antiWarningCount, "anti left outer semi join")
++
++	setJoinTypeBlacklist(tk, "inner join")
++	innerPlan, innerWarningCount := explainPlanAndWarningCount(tk,
++		"explain format = 'brief' select * from test.mpp_lsj t1 join test.mpp_lsj t2 on t1.a = t2.a")
++	assertBlacklistBlockedMPPJoin(c, innerPlan, innerWarningCount, "inner join")
++}
++
++func (s *testIntegrationSerialSuite) TestMPPUnsupportedJoinWarningStillReported(c *C) {
++	tk := testkit.NewTestKit(c, s.store)
++	prepareMPPLeftSemiJoinTest(tk, c)
++
++	plan, warningCount := explainPlanAndWarningCount(tk,
++		"explain format = 'brief' select a from test.mpp_lsj where a not in (select a from test.mpp_lsj s where test.mpp_lsj.a < 1)")
++	assertNoTiFlashMPPJoin(c, plan, "anti left outer semi join")
++	c.Assert(warningCount > 0, IsTrue, Commentf("unsupported MPP join should emit an explain warning; plan:\n%s", plan))
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,19 @@
++#!/bin/bash
++set -uo pipefail
++cd /testbed
++
++
++
++
++case "${1:-}" in
++  base)
++    go test '-ldflags=-checklinkname=0' -v -count=1 -run 'TestT$' ./planner/core/ -args -check.f 'TestMPPJoin$'
++    ;;
++  new)
++    go test '-ldflags=-checklinkname=0' -v -count=1 -run 'TestT$' ./planner/core/ -args -check.f 'TestMPPLeftOuterSemiJoinExplain|TestMPPAntiLeftOuterSemiJoinExplain|TestMPPCartesianLeftOuterSemiJoinExplain|TestMPPJoinTypeBlacklistBlocksHashJoin|TestMPPUnsupportedJoinWarningStillReported'
++    ;;
++  *)
++    echo "usage: $0 base|new"
++    exit 2
++    ;;
++esac

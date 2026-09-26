@@ -1,0 +1,455 @@
+diff --git a/usercase-test-coderl/retry_test.go b/usercase-test-coderl/retry_test.go
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/retry_test.go
+@@ -0,0 +1,427 @@
++package usercase_test_coderl
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"reflect"
++	"strings"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/go-kit/kit/endpoint"
++	"github.com/go-kit/kit/sd/lb"
++)
++
++type sequenceBalancer struct {
++	mu        sync.Mutex
++	endpoints []endpoint.Endpoint
++	calls     int
++}
++
++func (b *sequenceBalancer) Endpoint() (endpoint.Endpoint, error) {
++	b.mu.Lock()
++	defer b.mu.Unlock()
++	if len(b.endpoints) == 0 {
++		return nil, lb.ErrNoEndpoints
++	}
++	e := b.endpoints[b.calls%len(b.endpoints)]
++	b.calls++
++	return e, nil
++}
++
++func (b *sequenceBalancer) Calls() int {
++	b.mu.Lock()
++	defer b.mu.Unlock()
++	return b.calls
++}
++
++func responseEndpoint(response interface{}) endpoint.Endpoint {
++	return func(context.Context, interface{}) (interface{}, error) {
++		return response, nil
++	}
++}
++
++func errorEndpoint(err error) endpoint.Endpoint {
++	return func(context.Context, interface{}) (interface{}, error) {
++		return nil, err
++	}
++}
++
++func blockingEndpoint(started chan<- struct{}) endpoint.Endpoint {
++	return func(ctx context.Context, request interface{}) (interface{}, error) {
++		close(started)
++		<-ctx.Done()
++		return nil, errors.New("endpoint returned after timeout")
++	}
++}
++
++func requestFixture() map[string]interface{} {
++	return map[string]interface{}{
++		"id":   "request-17",
++		"tags": []string{"alpha", "beta"},
++	}
++}
++
++func copyRequest(in map[string]interface{}) map[string]interface{} {
++	out := make(map[string]interface{}, len(in))
++	for k, v := range in {
++		switch typed := v.(type) {
++		case []string:
++			out[k] = append([]string(nil), typed...)
++		default:
++			out[k] = typed
++		}
++	}
++	return out
++}
++
++func retryErrorValue(t *testing.T, err error) lb.RetryError {
++	t.Helper()
++
++
++	switch retryErr := err.(type) {
++	case lb.RetryError:
++		return retryErr
++	case *lb.RetryError:
++		if retryErr == nil {
++			t.Fatalf("expected lb.RetryError, got nil *lb.RetryError")
++		}
++		return *retryErr
++	default:
++		t.Fatalf("expected lb.RetryError, got %T: %v", err, err)
++		return lb.RetryError{}
++	}
++}
++
++func assertRetryErrorFields(t *testing.T, retryErr lb.RetryError, final string, raw []string) {
++	t.Helper()
++
++	if retryErr.Final == nil || retryErr.Final.Error() != final {
++		t.Fatalf("RetryError.Final = %v, want %q", retryErr.Final, final)
++	}
++	if len(retryErr.RawErrors) != len(raw) {
++		t.Fatalf("len(RawErrors) = %d, want %d", len(retryErr.RawErrors), len(raw))
++	}
++	for i, want := range raw {
++		if retryErr.RawErrors[i] == nil || retryErr.RawErrors[i].Error() != want {
++			t.Fatalf("RawErrors[%d] = %v, want %q", i, retryErr.RawErrors[i], want)
++		}
++	}
++}
++
++func assertRetryError(t *testing.T, err error, final string, raw []string, full string) {
++	t.Helper()
++	retryErr := retryErrorValue(t, err)
++	assertRetryErrorFields(t, retryErr, final, raw)
++	if retryErr.Error() != full {
++		t.Fatalf("RetryError.Error() = %q, want %q", retryErr.Error(), full)
++	}
++}
++
++func assertRetryErrorContains(t *testing.T, err error, final string, raw []string, substrings ...string) {
++	t.Helper()
++	retryErr := retryErrorValue(t, err)
++	assertRetryErrorFields(t, retryErr, final, raw)
++	for _, substring := range substrings {
++		if !strings.Contains(retryErr.Error(), substring) {
++			t.Fatalf("RetryError.Error() = %q, want substring %q", retryErr.Error(), substring)
++		}
++	}
++}
++
++func TestRetrySucceedsOnThirdAttempt(t *testing.T) {
++
++
++	req := requestFixture()
++	balancer := &sequenceBalancer{endpoints: []endpoint.Endpoint{
++		errorEndpoint(errors.New("error one")),
++		errorEndpoint(errors.New("error two")),
++		responseEndpoint("ok"),
++	}}
++
++	resp, err := lb.Retry(3, time.Second, balancer)(context.Background(), req)
++
++	if err != nil {
++		t.Fatalf("err = %v, want nil", err)
++	}
++	if resp != "ok" {
++		t.Fatalf("resp = %#v, want %q", resp, "ok")
++	}
++	if balancer.Calls() != 3 {
++		t.Fatalf("balancer calls = %d, want 3", balancer.Calls())
++	}
++}
++
++func TestRetryStopsAtAttemptLimitWithAggregatedRetryError(t *testing.T) {
++
++
++	balancer := &sequenceBalancer{endpoints: []endpoint.Endpoint{
++		errorEndpoint(errors.New("error one")),
++		errorEndpoint(errors.New("error two")),
++		responseEndpoint("ok"),
++	}}
++
++	resp, err := lb.Retry(2, time.Second, balancer)(context.Background(), requestFixture())
++
++	if resp != nil {
++		t.Fatalf("resp = %#v, want nil", resp)
++	}
++	assertRetryError(t, err, "error two", []string{"error one", "error two"}, "error two (previously: error one)")
++	if balancer.Calls() != 2 {
++		t.Fatalf("balancer calls = %d, want 2", balancer.Calls())
++	}
++}
++
++func TestRetrySurfacesNoEndpointsThroughRetryPath(t *testing.T) {
++
++
++	balancer := &sequenceBalancer{}
++
++	resp, err := lb.Retry(3, time.Second, balancer)(context.Background(), requestFixture())
++
++	if resp != nil {
++		t.Fatalf("resp = %#v, want nil", resp)
++	}
++	assertRetryError(t, err, "no endpoints available", []string{
++		"no endpoints available",
++		"no endpoints available",
++		"no endpoints available",
++	}, "no endpoints available (previously: no endpoints available; no endpoints available)")
++}
++
++func TestRetryReturnsDeadlineExceededWhenAttemptOutlivesTimeout(t *testing.T) {
++
++
++	started := make(chan struct{})
++	balancer := &sequenceBalancer{endpoints: []endpoint.Endpoint{blockingEndpoint(started)}}
++
++	respCh := make(chan interface{}, 1)
++	errCh := make(chan error, 1)
++	go func() {
++		resp, err := lb.Retry(5, 20*time.Millisecond, balancer)(context.Background(), requestFixture())
++		respCh <- resp
++		errCh <- err
++	}()
++	<-started
++
++	resp := <-respCh
++	err := <-errCh
++	if resp != nil {
++		t.Fatalf("resp = %#v, want nil", resp)
++	}
++	if !errors.Is(err, context.DeadlineExceeded) {
++		t.Fatalf("err = %T %v, want context deadline exceeded", err, err)
++	}
++}
++
++func TestRetryWithCallbackStopsImmediatelyWithoutReplacement(t *testing.T) {
++
++
++	attempts := []string{}
++	balancer := &sequenceBalancer{endpoints: []endpoint.Endpoint{
++		errorEndpoint(errors.New("error one")),
++		errorEndpoint(errors.New("error two")),
++	}}
++	cb := func(n int, received error) (bool, error) {
++		attempts = append(attempts, fmt.Sprintf("%d:%s", n, received.Error()))
++		return false, nil
++	}
++
++	resp, err := lb.RetryWithCallback(time.Second, balancer, cb)(context.Background(), requestFixture())
++
++	if resp != nil {
++		t.Fatalf("resp = %#v, want nil", resp)
++	}
++	assertRetryError(t, err, "error one", []string{"error one"}, "error one")
++	if !reflect.DeepEqual(attempts, []string{"1:error one"}) {
++		t.Fatalf("callback attempts = %#v, want %#v", attempts, []string{"1:error one"})
++	}
++	if balancer.Calls() != 1 {
++		t.Fatalf("balancer calls = %d, want 1", balancer.Calls())
++	}
++}
++
++func TestRetryWithCallbackUsesReplacementErrorAsFinal(t *testing.T) {
++
++
++	attempts := []string{}
++	replacement := errors.New("replacement final")
++	balancer := &sequenceBalancer{endpoints: []endpoint.Endpoint{
++		errorEndpoint(errors.New("error one")),
++		errorEndpoint(errors.New("error three")),
++		responseEndpoint("late"),
++	}}
++	cb := func(n int, received error) (bool, error) {
++		attempts = append(attempts, fmt.Sprintf("%d:%s", n, received.Error()))
++		if n == 2 {
++			return false, replacement
++		}
++		return true, nil
++	}
++
++	resp, err := lb.RetryWithCallback(time.Second, balancer, cb)(context.Background(), requestFixture())
++
++	if resp != nil {
++		t.Fatalf("resp = %#v, want nil", resp)
++	}
++
++	assertRetryErrorContains(t, err, "replacement final", []string{"error one", "error three"}, "replacement final", "previously:", "error one")
++	if !reflect.DeepEqual(attempts, []string{"1:error one", "2:error three"}) {
++		t.Fatalf("callback attempts = %#v, want %#v", attempts, []string{"1:error one", "2:error three"})
++	}
++}
++
++func TestRetryWithNilCallbackRetriesUntilSuccess(t *testing.T) {
++
++
++	balancer := &sequenceBalancer{endpoints: []endpoint.Endpoint{
++		errorEndpoint(errors.New("error one")),
++		errorEndpoint(errors.New("error two")),
++		responseEndpoint("eventual"),
++	}}
++
++	resp, err := lb.RetryWithCallback(time.Second, balancer, nil)(context.Background(), requestFixture())
++
++	if err != nil {
++		t.Fatalf("err = %v, want nil", err)
++	}
++	if resp != "eventual" {
++		t.Fatalf("resp = %#v, want %q", resp, "eventual")
++	}
++	if balancer.Calls() != 3 {
++		t.Fatalf("balancer calls = %d, want 3", balancer.Calls())
++	}
++}
++
++func TestRetryWithCallbackPanicsOnNilBalancer(t *testing.T) {
++
++
++	defer func() {
++		got := recover()
++		if got != "nil Balancer" {
++			t.Fatalf("panic = %#v, want %#v", got, "nil Balancer")
++		}
++	}()
++
++	_ = lb.RetryWithCallback(time.Second, nil, nil)
++}
++
++func TestRetryErrorStringWithSingleAndMultipleFailures(t *testing.T) {
++
++
++	oneFailure := lb.RetryError{
++		RawErrors: []error{errors.New("error one")},
++		Final:     errors.New("error one"),
++	}
++	threeFailures := lb.RetryError{
++		RawErrors: []error{errors.New("error one"), errors.New("error two"), errors.New("error three")},
++		Final:     errors.New("error three"),
++	}
++
++	if oneFailure.Error() != "error one" {
++		t.Fatalf("single failure Error() = %q, want %q", oneFailure.Error(), "error one")
++	}
++	if threeFailures.Error() != "error three (previously: error one; error two)" {
++		t.Fatalf("three failure Error() = %q, want %q", threeFailures.Error(), "error three (previously: error one; error two)")
++	}
++}
++
++func TestRetryEndpointIsReferentiallyTransparentForSameInput(t *testing.T) {
++	req := requestFixture()
++	makeRetry := func() endpoint.Endpoint {
++		return lb.Retry(3, time.Second, &sequenceBalancer{endpoints: []endpoint.Endpoint{
++			errorEndpoint(errors.New("error one")),
++			errorEndpoint(errors.New("error two")),
++			responseEndpoint("ok"),
++		}})
++	}
++
++	resp1, err1 := makeRetry()(context.Background(), req)
++	resp2, err2 := makeRetry()(context.Background(), req)
++
++	if resp1 != "ok" || err1 != nil {
++		t.Fatalf("first call = (%#v, %v), want (%q, nil)", resp1, err1, "ok")
++	}
++	if resp2 != "ok" || err2 != nil {
++		t.Fatalf("second call = (%#v, %v), want (%q, nil)", resp2, err2, "ok")
++	}
++}
++
++func TestRetryDoesNotMutateCallerRequest(t *testing.T) {
++	req := requestFixture()
++	before := copyRequest(req)
++	balancer := &sequenceBalancer{endpoints: []endpoint.Endpoint{
++		errorEndpoint(errors.New("error one")),
++		responseEndpoint("ok"),
++	}}
++
++	resp, err := lb.Retry(2, time.Second, balancer)(context.Background(), req)
++
++	if resp != "ok" || err != nil {
++		t.Fatalf("call = (%#v, %v), want (%q, nil)", resp, err, "ok")
++	}
++	if !reflect.DeepEqual(req, before) {
++		t.Fatalf("request mutated: got %#v, want %#v", req, before)
++	}
++}
++
++func TestRetryResultSurvivesInProcessNoise(t *testing.T) {
++	makeRetry := func() endpoint.Endpoint {
++		return lb.Retry(3, time.Second, &sequenceBalancer{endpoints: []endpoint.Endpoint{
++			errorEndpoint(errors.New("error one")),
++			errorEndpoint(errors.New("error two")),
++			responseEndpoint("ok"),
++		}})
++	}
++	baselineResp, baselineErr := makeRetry()(context.Background(), requestFixture())
++
++	noiseResp, noiseErr := lb.RetryWithCallback(time.Second, &sequenceBalancer{endpoints: []endpoint.Endpoint{
++		errorEndpoint(errors.New("noise one")),
++		responseEndpoint("noise ok"),
++	}}, nil)(context.Background(), map[string]interface{}{"id": "noise"})
++	if noiseResp != "noise ok" || noiseErr != nil {
++		t.Fatalf("noise call = (%#v, %v), want (%q, nil)", noiseResp, noiseErr, "noise ok")
++	}
++	_, _ = lb.Retry(1, time.Second, &sequenceBalancer{})(context.Background(), map[string]interface{}{"id": "empty-noise"})
++
++	repeatedResp, repeatedErr := makeRetry()(context.Background(), requestFixture())
++
++	if baselineResp != "ok" || baselineErr != nil {
++		t.Fatalf("baseline = (%#v, %v), want (%q, nil)", baselineResp, baselineErr, "ok")
++	}
++	if repeatedResp != "ok" || repeatedErr != nil {
++		t.Fatalf("repeated = (%#v, %v), want (%q, nil)", repeatedResp, repeatedErr, "ok")
++	}
++}
++
++func TestRetryPassesSameRequestToEveryAttempt(t *testing.T) {
++	req := &struct {
++		ID string
++	}{ID: "request-17"}
++	seen := 0
++	checkSameRequest := func(response interface{}, err error) endpoint.Endpoint {
++		return func(_ context.Context, got interface{}) (interface{}, error) {
++			if got != req {
++				t.Fatalf("endpoint request = %#v, want original request %#v", got, req)
++			}
++			seen++
++			return response, err
++		}
++	}
++
++	resp, err := lb.Retry(3, time.Second, &sequenceBalancer{endpoints: []endpoint.Endpoint{
++		checkSameRequest(nil, errors.New("error one")),
++		checkSameRequest(nil, errors.New("error two")),
++		checkSameRequest("ok", nil),
++	}})(context.Background(), req)
++
++	if resp != "ok" || err != nil {
++		t.Fatalf("call = (%#v, %v), want (%q, nil)", resp, err, "ok")
++	}
++
++	if seen != 3 {
++		t.Fatalf("endpoint calls = %d, want 3", seen)
++	}
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,18 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++cd /workspace/repo
++
++export GOPROXY=off
++export GOSUMDB=off
++export GOTOOLCHAIN=local
++exec go test -mod=readonly -v ./usercase-test-coderl/...

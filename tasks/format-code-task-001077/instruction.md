@@ -1,0 +1,9 @@
+Harden GradebookNG's grade-file import so browser metadata, international names, and ordinary assignment titles do not make valid CSV uploads fail or produce false updates.
+
+The public import entry point must continue to accept the existing CSV media types (`text/csv`, `text/plain`, `text/comma-separated-values`, and `application/csv`) and the existing XLS/XLSX media types. Media-type matching must be case-insensitive, and optional parameters after a semicolon (including surrounding whitespace, such as `text/csv ; charset=UTF-8`) must not affect dispatch. A genuinely unsupported base media type must still be rejected with `GbImportExportInvalidFileTypeException`; do not silently treat arbitrary uploads as CSV.
+
+Decode CSV bytes as UTF-8 rather than the host JVM's default charset so non-ASCII student names and other cell text survive unchanged. Keep the existing CSV field mapping behavior and Excel import compatibility.
+
+Broaden grade-column header handling without weakening its structure. A points-bearing header is an arbitrary nonblank assignment title followed by a final ` [points]` suffix, where points is a decimal number. Preserve the complete title and the complete points text; punctuation inside titles, including hyphens and parentheses, is valid. A comment header is `* ` followed by that same assignment title, and its value must be associated with the corresponding grade item. Existing plain item headers and ignored columns must continue to work, while malformed or blank headers remain invalid.
+
+Finally, avoid presenting formatting-only score changes to instructors as updates. When an imported finite decimal score and the existing score differ only by insignificant trailing fractional zeros (for example, `7.00` versus `7`), the processed grade item must be `SKIP`. A real numeric change such as `7.01` versus `7` must still be `UPDATE`.

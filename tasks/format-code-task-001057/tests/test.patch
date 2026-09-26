@@ -1,0 +1,243 @@
+diff --git a/tests/python_on_whales/components/test_config_secret_contract.py b/tests/python_on_whales/components/test_config_secret_contract.py
+new file mode 100644
+index 0000000..04e96b0
+--- /dev/null
++++ b/tests/python_on_whales/components/test_config_secret_contract.py
+@@ -0,0 +1,228 @@
++import base64
++import json
++import os
++import stat
++from pathlib import Path
++
++import pytest
++
++from python_on_whales import DockerClient
++from python_on_whales.client_config import ClientConfig
++
++
++FAKE_DOCKER = r'''#!/usr/bin/env python3
++import base64
++import json
++import os
++import sys
++from datetime import datetime
++
++state_path = os.environ["PW_FAKE_STATE"]
++with open(os.environ["PW_FAKE_LOG"], "a") as log:
++    log.write(json.dumps(sys.argv[1:]) + "\n")
++try:
++    with open(state_path) as f:
++        state = json.load(f)
++except FileNotFoundError:
++    state = {"config": {}, "secret": {}, "next": 1}
++
++def save():
++    with open(state_path, "w") as f:
++        json.dump(state, f)
++
++def resource(kind, ident):
++    table = state[kind]
++    if ident in table:
++        return table[ident]
++    for item in table.values():
++        if item["name"] == ident:
++            return item
++    raise SystemExit("unknown resource")
++
++def inspect(kind, ident):
++    item = resource(kind, ident)
++    spec = {"Name": item["name"], "Labels": item["labels"]}
++    if kind == "config":
++        spec["Data"] = base64.b64encode(bytes(item["data"])).decode()
++    else:
++        spec["Data"] = base64.b64encode(bytes(item["data"])).decode()
++        if item["driver"] is not None:
++            spec["Driver"] = {"Name": item["driver"]}
++    if item["template"] is not None:
++        spec["Templating"] = {"Name": item["template"]}
++    return [{"ID": item["id"], "Version": {"Index": 1},
++             "CreatedAt": "2020-01-01T00:00:00Z",
++             "UpdatedAt": "2020-01-01T00:00:00Z", "Spec": spec}]
++
++args = sys.argv[1:]
++if not args:
++    raise SystemExit("missing command")
++kind = args[0]
++if kind not in ("config", "secret"):
++    raise SystemExit("unsupported command")
++action = args[1] if len(args) > 1 else ""
++if action == "create":
++    labels = {}
++    template = None
++    driver = None
++    i = 2
++    while i < len(args) - 2:
++        if args[i] == "--label":
++            key, value = args[i + 1].split("=", 1)
++            labels[key] = value
++            i += 2
++        elif args[i] == "--template-driver":
++            template = args[i + 1]
++            i += 2
++        elif args[i] == "--driver":
++            driver = args[i + 1]
++            i += 2
++        else:
++            raise SystemExit("bad create option")
++    name, source = args[-2:]
++    data = sys.stdin.buffer.read() if source == "-" else open(source, "rb").read()
++    ident = ("cfg-" if kind == "config" else "sec-") + str(state["next"])
++    state["next"] += 1
++    state[kind][ident] = {"id": ident, "name": name, "labels": labels,
++                          "template": template, "driver": driver, "data": list(data)}
++    save()
++    print(ident)
++elif action == "inspect":
++    output = inspect(kind, args[2])
++    print(json.dumps(output))
++elif action == "list":
++    filters = []
++    i = 2
++    while i < len(args):
++        if args[i] == "--filter":
++            filters.append(args[i + 1])
++            i += 2
++        else:
++            i += 1
++    values = []
++    for item in state[kind].values():
++        ok = True
++        for flt in filters:
++            key, value = flt.split("=", 1)
++            if key == "name" and item["name"] != value:
++                ok = False
++            elif key == "label":
++                label_key, _, label_value = value.partition("=")
++                if item["labels"].get(label_key) != label_value:
++                    ok = False
++        if ok:
++            values.append(item["id"])
++    print("\n".join(values))
++elif action == "remove":
++    for ident in args[2:]:
++        item = resource(kind, ident)
++        del state[kind][item["id"]]
++    save()
++else:
++    raise SystemExit("unsupported action")
++'''
++
++
++def make_client(tmp_path, monkeypatch):
++    fake = tmp_path / "docker-fake"
++    fake.write_text(FAKE_DOCKER)
++    fake.chmod(fake.stat().st_mode | stat.S_IXUSR)
++    state = tmp_path / "state.json"
++    log = tmp_path / "invocations.log"
++    monkeypatch.setenv("PW_FAKE_STATE", str(state))
++    monkeypatch.setenv("PW_FAKE_LOG", str(log))
++    return DockerClient(client_config=ClientConfig(client_binary_path=fake)), state
++
++
++def read_state(path):
++    return json.loads(path.read_text())
++
++
++def test_config_data_round_trip_and_inspect_projection(tmp_path, monkeypatch):
++    client, state = make_client(tmp_path, monkeypatch)
++    try:
++        config = client.config.create(
++            "app-config", data="port=8080\n", labels={"team": "edge"},
++            template_driver="golang"
++        )
++    except (NotImplementedError, TypeError):
++        pytest.fail("docker.config.create must implement the public config API")
++    assert config.id.startswith("cfg-")
++    inspected = client.config.inspect(config.id)
++    assert inspected.id == config.id
++    assert inspected.version["Index"] == 1
++    assert inspected.created_at.year == 2020 and inspected.updated_at.year == 2020
++    assert inspected.spec.name == "app-config"
++    assert inspected.spec.labels == {"team": "edge"}
++    assert inspected.spec.data == base64.b64encode(b"port=8080\n").decode()
++    assert inspected.spec.templating.name == "golang"
++    assert read_state(state)["config"][config.id]["data"] == list(b"port=8080\n")
++    invocation = json.loads((state.parent / "invocations.log").read_text().splitlines()[0])
++    assert "--label" in invocation and "team=edge" in invocation
++    assert "--template-driver" in invocation and "golang" in invocation
++
++
++def test_secret_binary_payload_and_legacy_file_call(tmp_path, monkeypatch):
++    client, state = make_client(tmp_path, monkeypatch)
++    secret = client.secret.create(
++        "api-secret", data=b"token=\x00\xff", driver="external",
++        labels={"team": "edge"}, template_driver="raw"
++    )
++    file_path = tmp_path / "legacy payload.bin"
++    file_path.write_bytes(b"from-file")
++    legacy = client.secret.create("legacy-secret", file_path)
++    secret_inspected = client.secret.inspect(secret)
++    assert secret_inspected.version["Index"] == 1
++    assert secret_inspected.created_at.year == 2020 and secret_inspected.updated_at.year == 2020
++    assert secret_inspected.spec.name == "api-secret"
++    assert secret_inspected.spec.data == base64.b64encode(b"token=\x00\xff").decode()
++    assert secret_inspected.spec.driver.name == "external"
++    values = read_state(state)["secret"]
++    assert values[secret.id]["data"] == list(b"token=\x00\xff")
++    assert values[legacy.id]["data"] == list(b"from-file")
++    invocations = [json.loads(line) for line in (state.parent / "invocations.log").read_text().splitlines()]
++    assert "--driver" in invocations[0] and "external" in invocations[0]
++    assert "--template-driver" not in invocations[1]
++    assert str(file_path) in invocations[1]
++    assert client.secret.inspect(legacy).spec.templating is None
++    assert client.secret.inspect(legacy).spec.driver is None
++    client.secret.remove(secret)
++    assert secret.id not in read_state(state)["secret"]
++
++
++def test_list_filters_inspect_many_and_remove_objects(tmp_path, monkeypatch):
++    client, state = make_client(tmp_path, monkeypatch)
++    first = client.config.create("one", data="1", labels={"team": "edge"})
++    second = client.config.create("two", data="2", labels={"team": "ops"})
++    assert [x.id for x in client.config.list({"label": "team=edge"})] == [first.id]
++    assert client.config.list({"name": "missing"}) == []
++    many = client.config.inspect([first.id, second.id])
++    assert [x.spec.name for x in many] == ["one", "two"]
++    assert many[0].spec.templating is None
++    client.config.remove(first)
++    assert first.id not in read_state(state)["config"]
++    client.config.remove([second])
++    assert read_state(state)["config"] == {}
++
++
++def test_payload_source_validation_and_context_cleanup(tmp_path, monkeypatch):
++    client, state = make_client(tmp_path, monkeypatch)
++    with pytest.raises(ValueError):
++        client.config.create("neither")
++    with pytest.raises(ValueError):
++        client.config.create("both", file=tmp_path / "x", data="x")
++    with pytest.raises(ValueError):
++        client.secret.create("neither")
++    with pytest.raises(ValueError):
++        client.secret.create("both", file=tmp_path / "x", data=b"x")
++    empty = client.config.create("empty", data="")
++    assert read_state(state)["config"][empty.id]["data"] == []
++    assert len((state.parent / "invocations.log").read_text().splitlines()) == 1
++    with pytest.raises(RuntimeError):
++        with client.secret.create("temporary", data=b"x") as secret:
++            raise RuntimeError("body failed")
++    assert "temporary" not in [v["name"] for v in read_state(state)["secret"].values()]
++    with pytest.raises(RuntimeError):
++        with client.config.create("temporary-config", data="x"):
++            raise RuntimeError("body failed")
++    assert "temporary-config" not in [v["name"] for v in read_state(state)["config"].values()]
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,4 @@
++#!/bin/bash
++set -euo pipefail
++
++PYTHONPATH=. pytest -q tests/python_on_whales/components/test_config_secret_contract.py

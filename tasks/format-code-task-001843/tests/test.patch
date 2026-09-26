@@ -1,0 +1,242 @@
+diff --git a/usercase-test-coderl/usecase.sh b/usercase-test-coderl/usecase.sh
+new file mode 100755
+--- /dev/null
++++ b/usercase-test-coderl/usecase.sh
+@@ -0,0 +1,214 @@
++#!/usr/bin/env bash
++
++set -u
++export LANG=C.UTF-8 LC_ALL=C.UTF-8 TZ=UTC
++
++
++PYTHON=${PYTHON:-/usr/bin/python}
++export PIP_NO_INDEX=1
++export PIP_DISABLE_PIP_VERSION_CHECK=1
++export PYTHONNOUSERSITE=1
++"$PYTHON" - <<'PY'
++from importlib import metadata
++
++def version_tuple(version):
++    return tuple(int(part) for part in version.split(".") if part.isdigit())
++
++if version_tuple(metadata.version("Opcodes")) < (0, 3, 13):
++    raise SystemExit("Opcodes>=0.3.13 is required")
++metadata.version("six")
++PY
++[ "$?" -eq 0 ] || exit 1
++
++BUILD_REPO=/tmp/peachpy-fixture-repo-coderl
++rm -rf "$BUILD_REPO"
++cp -a /workspace/repo "$BUILD_REPO"
++( cd "$BUILD_REPO" && "$PYTHON" setup.py generate >/tmp/peachpy-fixture-build.log 2>&1 ) \
++    || { echo "FAIL: build; see /tmp/peachpy-fixture-build.log" >&2; exit 1; }
++
++export PYTHONPATH=$BUILD_REPO${PYTHONPATH:+:$PYTHONPATH}
++BIN=("$PYTHON" -m peachpy.x86_64)
++
++TMP=/tmp/peachpy-fixture-coderl
++rm -rf "$TMP"
++mkdir -p "$TMP/src" "$TMP/inc" "$TMP/outside" "$TMP/build"
++trap 'rm -rf "$TMP" "$BUILD_REPO"' EXIT
++
++fail() { echo "FAIL: $*" >&2; exit 1; }
++
++assert_elf_object() {
++    "$PYTHON" - "$1" <<'PY'
++import pathlib
++import sys
++
++path = pathlib.Path(sys.argv[1])
++if not path.is_file():
++    raise SystemExit("missing object file: %s" % path)
++data = path.read_bytes()
++if not data.startswith(b"\x7fELF"):
++    raise SystemExit("not an ELF object file: %s" % path)
++if len(data) <= 4:
++    raise SystemExit("empty ELF object file: %s" % path)
++PY
++}
++
++assert_depfile() {
++    "$PYTHON" - "$@" <<'PY'
++import os
++import pathlib
++import sys
++
++depfile, target, first_dep, *expected_rest = sys.argv[1:]
++path = pathlib.Path(depfile)
++if not path.is_file():
++    raise SystemExit("missing dependency file: %s" % depfile)
++raw = path.read_text()
++if "\\\n" not in raw:
++    raise SystemExit("dependency file does not use backslash continuations: %r" % raw)
++logical_lines = [line.strip() for line in raw.replace("\\\n", " ").splitlines() if line.strip()]
++if len(logical_lines) != 1:
++    raise SystemExit("dependency file should contain one Makefile rule: %r" % raw)
++rule = logical_lines[0]
++if ":" not in rule:
++    raise SystemExit("dependency rule has no target separator: %r" % raw)
++actual_target, deps_text = rule.split(":", 1)
++if actual_target != target:
++    raise SystemExit("dependency target %r; want %r" % (actual_target, target))
++deps = deps_text.split()
++if not deps:
++    raise SystemExit("dependency rule has no prerequisites: %r" % raw)
++if deps[0] != first_dep:
++    raise SystemExit("first dependency %r; want %r" % (deps[0], first_dep))
++
++actual_rest = [os.path.abspath(dep) for dep in deps[1:]]
++expected_abs = [os.path.abspath(dep) for dep in expected_rest]
++if actual_rest != expected_abs:
++    raise SystemExit("remaining dependencies %r; want %r" % (actual_rest, expected_abs))
++if len(set(actual_rest)) != len(actual_rest):
++    raise SystemExit("duplicate dependencies: %r" % deps[1:])
++if any(dep.endswith((".pyc", ".pyo")) for dep in deps[1:]):
++    raise SystemExit("bytecode dependency reported instead of source: %r" % deps[1:])
++if any(not dep.endswith(".py") for dep in deps):
++    raise SystemExit("non-Python dependency reported: %r" % deps)
++PY
++}
++
++cat > "$TMP/src/local_a.py" <<'PY'
++VALUE = 11
++PY
++cat > "$TMP/src/local_b.py" <<'PY'
++VALUE = 22
++PY
++cat > "$TMP/src/shared.py" <<'PY'
++VALUE = 33
++PY
++cat > "$TMP/inc/inc_a.py" <<'PY'
++VALUE = 44
++PY
++cat > "$TMP/inc/alias_target.py" <<'PY'
++VALUE = 55
++PY
++cat > "$TMP/inc/cached_dep.py" <<'PY'
++VALUE = 66
++PY
++cat > "$TMP/outside/outside_dep.py" <<'PY'
++VALUE = 77
++PY
++
++cd "$TMP" || fail "cd scratch"
++"${BIN[@]}" --help >"$TMP/help.out" 2>"$TMP/help.err"; ec=$?
++cat "$TMP/help.out" "$TMP/help.err" >"$TMP/help.all"
++
++
++
++
++[ "$ec" -eq 0 ] || fail "F_help exit $ec; want 0"
++
++grep -q -- "-MMD" "$TMP/help.all" \
++    || fail "F_help missing -MMD option"
++grep -qi -- "makefile.*depend" "$TMP/help.all" \
++    || fail "F_help missing dependency-generation description"
++grep -q -- "-MF" "$TMP/help.all" \
++    || fail "F_help missing -MF option"
++grep -qi -- "depend.*path\\|path.*depend" "$TMP/help.all" \
++    || fail "F_help missing dependency output path description"
++
++"$PYTHON" - <<'PY'
++import py_compile
++py_compile.compile('/tmp/peachpy-fixture-coderl/inc/cached_dep.py', cfile='/tmp/peachpy-fixture-coderl/inc/cached_dep.pyc')
++PY
++
++cat > "$TMP/src/kernel_complex.py" <<'PY'
++from peachpy import *
++from peachpy.x86_64 import *
++import local_b
++import local_a
++import shared as shared_one
++import importlib.util
++import inc_a
++import alias_target
++import sys
++sys.modules["alias_again"] = alias_target
++spec = importlib.util.spec_from_file_location("cached_dep_loaded", "/tmp/peachpy-fixture-coderl/inc/cached_dep.pyc")
++cached_dep_loaded = importlib.util.module_from_spec(spec)
++sys.modules["cached_dep_loaded"] = cached_dep_loaded
++spec.loader.exec_module(cached_dep_loaded)
++sys.path.insert(0, "/tmp/peachpy-fixture-coderl/outside")
++import outside_dep
++with Function("kernel_complex", tuple()):
++    RETURN()
++PY
++
++
++
++
++
++
++
++"${BIN[@]}" -MMD -MF build/complex.d -I inc -mabi=sysv -mimage-format=elf -o build/complex.o src/kernel_complex.py >out 2>err; ec=$?
++[ "$ec" -eq 0 ] || fail "F_complex exit $ec; want 0; stderr: $(cat err)"
++
++assert_elf_object build/complex.o || fail "F_complex object file is not a valid ELF object"
++
++assert_depfile build/complex.d build/complex.o src/kernel_complex.py \
++    /tmp/peachpy-fixture-coderl/inc/alias_target.py \
++    /tmp/peachpy-fixture-coderl/inc/cached_dep.py \
++    /tmp/peachpy-fixture-coderl/inc/inc_a.py \
++    /tmp/peachpy-fixture-coderl/src/local_a.py \
++    /tmp/peachpy-fixture-coderl/src/local_b.py \
++    /tmp/peachpy-fixture-coderl/src/shared.py \
++    || fail "F_complex dependency file did not match spec: $(cat build/complex.d 2>/dev/null || true)"
++! grep -q 'outside_dep.py' build/complex.d || fail "F_complex included outside monitored directory"
++! grep -q 'cached_dep.pyc' build/complex.d || fail "F_complex reported .pyc instead of .py"
++
++cat > "$TMP/src/kernel_default.py" <<'PY'
++from peachpy import *
++from peachpy.x86_64 import *
++with Function("kernel_default", tuple()):
++    RETURN()
++PY
++
++
++
++
++"${BIN[@]}" -MMD -mabi=sysv -mimage-format=elf -o build/default.o src/kernel_default.py >out2 2>err2; ec=$?
++[ "$ec" -eq 0 ] || fail "F_default exit $ec; want 0; stderr: $(cat err2)"
++
++assert_elf_object build/default.o || fail "F_default object file is not a valid ELF object"
++[ ! -f build/default.d ] || fail "F_default wrote unexpected dependency filename"
++
++assert_depfile build/default.o.d build/default.o src/kernel_default.py \
++    || fail "F_default dependency file did not match spec: $(cat build/default.o.d 2>/dev/null || true)"
++
++
++
++
++"${BIN[@]}" -MMD -MF -mabi=sysv -mimage-format=elf -o build/bad.o src/kernel_default.py >out3 2>err3; ec=$?
++[ "$ec" -ne 0 ] || fail "F_mf_error exit $ec; want non-zero"
++
++grep -q -- "-MF" err3 \
++    || fail "F_mf_error stderr should identify -MF: $(cat err3)"
++[ ! -f build/bad.o ] || fail "F_mf_error wrote object despite missing -MF path"
++
++echo "PASS"
++exit 0
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,18 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++
++
++export PYTHON="${PYTHON:-/usr/bin/python}"
++export PIP_NO_INDEX=1
++export PIP_DISABLE_PIP_VERSION_CHECK=1
++export PYTHONNOUSERSITE=1
++set -e
++cd /workspace/repo
++exec bash /workspace/repo/usercase-test-coderl/usecase.sh

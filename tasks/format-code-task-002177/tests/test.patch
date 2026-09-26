@@ -1,0 +1,418 @@
+diff --git a/clients/githubrepo/token_failover_codespec_test.go b/clients/githubrepo/token_failover_codespec_test.go
+new file mode 100644
+index 00000000..358be3aa
+--- /dev/null
++++ b/clients/githubrepo/token_failover_codespec_test.go
+@@ -0,0 +1,402 @@
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++package githubrepo_test
++
++import (
++	"context"
++	"errors"
++	"io"
++	"net/http"
++	"strings"
++	"testing"
++
++	"github.com/ossf/scorecard/v2/clients/githubrepo"
++)
++
++type codeSpecRoundTripFunc func(*http.Request) (*http.Response, error)
++
++func (fn codeSpecRoundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
++	return fn(req)
++}
++
++type codeSpecTrackedBody struct {
++	reader io.Reader
++	closed bool
++}
++
++func codeSpecBody(contents string) *codeSpecTrackedBody {
++	return &codeSpecTrackedBody{reader: strings.NewReader(contents)}
++}
++
++func (body *codeSpecTrackedBody) Read(p []byte) (int, error) {
++	return body.reader.Read(p)
++}
++
++func (body *codeSpecTrackedBody) Close() error {
++	body.closed = true
++	return nil
++}
++
++func codeSpecResponse(status int, remaining string, body *codeSpecTrackedBody) *http.Response {
++	header := make(http.Header)
++	if remaining != "" {
++		header.Set("X-RateLimit-Remaining", remaining)
++	}
++	return &http.Response{StatusCode: status, Header: header, Body: body}
++}
++
++func codeSpecRequest(t *testing.T, method string, body io.Reader) *http.Request {
++	t.Helper()
++	req, err := http.NewRequest(method, "https://api.github.com/repos/o/r", body)
++	if err != nil {
++		t.Fatalf("NewRequest() error: %v", err)
++	}
++	return req
++}
++
++func codeSpecBearer(t *testing.T, req *http.Request) string {
++	t.Helper()
++	values := req.Header.Values("Authorization")
++	if len(values) != 1 {
++		t.Fatalf("sent request has %d Authorization values, want exactly one: %q", len(values), values)
++	}
++	return values[0]
++}
++
++func codeSpecRoundTripRecoverPanic(transport http.RoundTripper, req *http.Request) (
++	resp *http.Response, err error, panicValue interface{},
++) {
++	defer func() {
++		panicValue = recover()
++	}()
++	resp, err = transport.RoundTrip(req)
++	return resp, err, nil
++}
++
++func TestCodeSpecGitHubTransportNormalizesAndRotatesTokens(t *testing.T) {
++	var got []string
++	inner := codeSpecRoundTripFunc(func(req *http.Request) (*http.Response, error) {
++		got = append(got, codeSpecBearer(t, req))
++		return codeSpecResponse(http.StatusOK, "10", codeSpecBody("ok")), nil
++	})
++	transport := githubrepo.MakeGitHubTransport(inner,
++		[]string{" alpha ", "", "beta", "alpha", "  ", "gamma", "beta"})
++
++	for i := 0; i < 4; i++ {
++		resp, err := transport.RoundTrip(codeSpecRequest(t, http.MethodGet, nil))
++		if err != nil {
++			t.Fatalf("RoundTrip() request %d error: %v", i, err)
++		}
++		resp.Body.Close()
++	}
++
++	want := []string{"Bearer alpha", "Bearer beta", "Bearer gamma", "Bearer alpha"}
++	if strings.Join(got, ",") != strings.Join(want, ",") {
++		t.Fatalf("authorization sequence = %q, want %q", got, want)
++	}
++}
++
++func TestCodeSpecGitHubTransportDoesNotMutateCallerRequest(t *testing.T) {
++	req := codeSpecRequest(t, http.MethodGet, nil)
++	req.Header["Authorization"] = []string{"Basic caller", "Custom caller"}
++	req.Header.Set("X-Caller", "unchanged")
++
++	inner := codeSpecRoundTripFunc(func(sent *http.Request) (*http.Response, error) {
++		if sent == req {
++			t.Fatal("inner transport received the caller's request pointer")
++		}
++		if got := codeSpecBearer(t, sent); got != "Bearer token" {
++			t.Fatalf("sent Authorization = %q, want %q", got, "Bearer token")
++		}
++		if got := sent.Header.Get("X-Caller"); got != "unchanged" {
++			t.Fatalf("sent X-Caller = %q, want unchanged", got)
++		}
++		return codeSpecResponse(http.StatusOK, "1", codeSpecBody("ok")), nil
++	})
++	transport := githubrepo.MakeGitHubTransport(inner, []string{"token"})
++
++	resp, err := transport.RoundTrip(req)
++	if err != nil {
++		t.Fatalf("RoundTrip() error: %v", err)
++	}
++	resp.Body.Close()
++	if got := req.Header.Values("Authorization"); strings.Join(got, ",") != "Basic caller,Custom caller" {
++		t.Fatalf("caller Authorization mutated to %q", got)
++	}
++	if got := req.Header.Get("X-Caller"); got != "unchanged" {
++		t.Fatalf("caller X-Caller mutated to %q", got)
++	}
++}
++
++func TestCodeSpecGitHubTransportFailsOverAndClosesDiscardedResponses(t *testing.T) {
++	firstBody := codeSpecBody("limited-a")
++	secondBody := codeSpecBody("limited-b")
++	finalBody := codeSpecBody("success")
++	responses := []*http.Response{
++		codeSpecResponse(http.StatusForbidden, "0", firstBody),
++		codeSpecResponse(http.StatusTooManyRequests, "00", secondBody),
++		codeSpecResponse(http.StatusOK, "12", finalBody),
++	}
++	var got []string
++	inner := codeSpecRoundTripFunc(func(req *http.Request) (*http.Response, error) {
++		got = append(got, codeSpecBearer(t, req))
++		return responses[len(got)-1], nil
++	})
++	transport := githubrepo.MakeGitHubTransport(inner, []string{"a", "b", "c"})
++
++	resp, err := transport.RoundTrip(codeSpecRequest(t, http.MethodGet, nil))
++	if err != nil {
++		t.Fatalf("RoundTrip() error: %v", err)
++	}
++	if resp != responses[2] {
++		t.Fatalf("RoundTrip() returned response %p, want final response %p", resp, responses[2])
++	}
++	if want := "Bearer a,Bearer b,Bearer c"; strings.Join(got, ",") != want {
++		t.Fatalf("authorization sequence = %q, want %q", got, want)
++	}
++	if !firstBody.closed || !secondBody.closed {
++		t.Fatalf("discarded response bodies closed = (%v, %v), want (true, true)",
++			firstBody.closed, secondBody.closed)
++	}
++	if finalBody.closed {
++		t.Fatal("returned final response body was closed by transport")
++	}
++	resp.Body.Close()
++}
++
++func TestCodeSpecGitHubTransportAdvancesStartOncePerLogicalRequest(t *testing.T) {
++	var got []string
++	inner := codeSpecRoundTripFunc(func(req *http.Request) (*http.Response, error) {
++		got = append(got, codeSpecBearer(t, req))
++		if len(got) == 1 {
++			return codeSpecResponse(http.StatusForbidden, "0", codeSpecBody("limited")), nil
++		}
++		return codeSpecResponse(http.StatusOK, "2", codeSpecBody("ok")), nil
++	})
++	transport := githubrepo.MakeGitHubTransport(inner, []string{"a", "b", "c"})
++
++	for i := 0; i < 2; i++ {
++		resp, err := transport.RoundTrip(codeSpecRequest(t, http.MethodGet, nil))
++		if err != nil {
++			t.Fatalf("RoundTrip() request %d error: %v", i, err)
++		}
++		resp.Body.Close()
++	}
++
++	if want := "Bearer a,Bearer b,Bearer b"; strings.Join(got, ",") != want {
++		t.Fatalf("authorization sequence = %q, want %q", got, want)
++	}
++}
++
++func TestCodeSpecGitHubTransportReturnsFinalLimitedResponseAfterPoolExhaustion(t *testing.T) {
++	firstBody := codeSpecBody("first")
++	lastBody := codeSpecBody("last")
++	responses := []*http.Response{
++		codeSpecResponse(http.StatusForbidden, "0", firstBody),
++		codeSpecResponse(http.StatusTooManyRequests, "0", lastBody),
++	}
++	calls := 0
++	inner := codeSpecRoundTripFunc(func(req *http.Request) (*http.Response, error) {
++		_ = codeSpecBearer(t, req)
++		resp := responses[calls]
++		calls++
++		return resp, nil
++	})
++	transport := githubrepo.MakeGitHubTransport(inner, []string{"a", "b"})
++
++	resp, err := transport.RoundTrip(codeSpecRequest(t, http.MethodGet, nil))
++	if err != nil {
++		t.Fatalf("RoundTrip() error: %v", err)
++	}
++	if calls != 2 {
++		t.Fatalf("inner transport calls = %d, want 2", calls)
++	}
++	if resp != responses[1] {
++		t.Fatalf("returned response = %p, want last limited response %p", resp, responses[1])
++	}
++	if !firstBody.closed {
++		t.Fatal("discarded first response body was not closed")
++	}
++	if lastBody.closed {
++		t.Fatal("returned last response body was closed")
++	}
++	resp.Body.Close()
++}
++
++func TestCodeSpecGitHubTransportDoesNotRetryNearbyResponses(t *testing.T) {
++	tests := []struct {
++		name      string
++		status    int
++		remaining string
++	}{
++		{name: "success with zero remaining", status: http.StatusOK, remaining: "0"},
++		{name: "forbidden with quota", status: http.StatusForbidden, remaining: "1"},
++		{name: "too many requests without remaining header", status: http.StatusTooManyRequests},
++	}
++	for _, tc := range tests {
++		tc := tc
++		t.Run(tc.name, func(t *testing.T) {
++			calls := 0
++			body := codeSpecBody("returned")
++			inner := codeSpecRoundTripFunc(func(req *http.Request) (*http.Response, error) {
++				calls++
++				return codeSpecResponse(tc.status, tc.remaining, body), nil
++			})
++			transport := githubrepo.MakeGitHubTransport(inner, []string{"a", "b"})
++
++			resp, err := transport.RoundTrip(codeSpecRequest(t, http.MethodGet, nil))
++			if err != nil {
++				t.Fatalf("RoundTrip() error: %v", err)
++			}
++			if calls != 1 {
++				t.Fatalf("inner transport calls = %d, want 1", calls)
++			}
++			if resp.Body != body || body.closed {
++				t.Fatal("non-retried response was not returned open to caller")
++			}
++			resp.Body.Close()
++		})
++	}
++}
++
++func TestCodeSpecGitHubTransportReplaysRequestBodyOnFailover(t *testing.T) {
++	payload := "payload that must be replayed"
++	var gotTokens, gotBodies []string
++	calls := 0
++	inner := codeSpecRoundTripFunc(func(req *http.Request) (*http.Response, error) {
++		gotTokens = append(gotTokens, codeSpecBearer(t, req))
++		contents, err := io.ReadAll(req.Body)
++		if err != nil {
++			t.Fatalf("ReadAll(request body) error: %v", err)
++		}
++		gotBodies = append(gotBodies, string(contents))
++		calls++
++		if calls == 1 {
++			return codeSpecResponse(http.StatusForbidden, "0", codeSpecBody("limited")), nil
++		}
++		return codeSpecResponse(http.StatusOK, "4", codeSpecBody("ok")), nil
++	})
++	req := codeSpecRequest(t, http.MethodPost, strings.NewReader(payload))
++	transport := githubrepo.MakeGitHubTransport(inner, []string{"a", "b"})
++
++	resp, err := transport.RoundTrip(req)
++	if err != nil {
++		t.Fatalf("RoundTrip() error: %v", err)
++	}
++	resp.Body.Close()
++	if want := "Bearer a,Bearer b"; strings.Join(gotTokens, ",") != want {
++		t.Fatalf("authorization sequence = %q, want %q", gotTokens, want)
++	}
++	if len(gotBodies) != 2 || gotBodies[0] != payload || gotBodies[1] != payload {
++		t.Fatalf("request bodies = %q, want payload on both attempts", gotBodies)
++	}
++}
++
++func TestCodeSpecGitHubTransportDoesNotRetryNonReplayableBody(t *testing.T) {
++	returnedBody := codeSpecBody("limited")
++	calls := 0
++	inner := codeSpecRoundTripFunc(func(req *http.Request) (*http.Response, error) {
++		calls++
++		return codeSpecResponse(http.StatusForbidden, "0", returnedBody), nil
++	})
++	req := codeSpecRequest(t, http.MethodPost, io.NopCloser(strings.NewReader("stream")))
++	if req.GetBody != nil {
++		t.Fatal("test setup produced a replayable request body")
++	}
++	transport := githubrepo.MakeGitHubTransport(inner, []string{"a", "b"})
++
++	resp, err := transport.RoundTrip(req)
++	if err != nil {
++		t.Fatalf("RoundTrip() error: %v", err)
++	}
++	if calls != 1 {
++		t.Fatalf("inner transport calls = %d, want 1", calls)
++	}
++	if resp.Body != returnedBody || returnedBody.closed {
++		t.Fatal("limited response for non-replayable request was not returned open")
++	}
++	resp.Body.Close()
++}
++
++func TestCodeSpecGitHubTransportHonorsCancellationBeforeFailover(t *testing.T) {
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	discardedBody := codeSpecBody("limited")
++	calls := 0
++	inner := codeSpecRoundTripFunc(func(req *http.Request) (*http.Response, error) {
++		calls++
++		cancel()
++		return codeSpecResponse(http.StatusForbidden, "0", discardedBody), nil
++	})
++	req := codeSpecRequest(t, http.MethodGet, nil).WithContext(ctx)
++	transport := githubrepo.MakeGitHubTransport(inner, []string{"a", "b"})
++
++	resp, err := transport.RoundTrip(req)
++	if !errors.Is(err, context.Canceled) {
++		t.Fatalf("RoundTrip() error = %v, want context.Canceled", err)
++	}
++	if resp != nil {
++		t.Fatalf("RoundTrip() response = %v, want nil on cancellation", resp)
++	}
++	if calls != 1 {
++		t.Fatalf("inner transport calls = %d, want 1", calls)
++	}
++	if !discardedBody.closed {
++		t.Fatal("response discarded due to cancellation was not closed")
++	}
++}
++
++func TestCodeSpecGitHubTransportRejectsEmptyTokenPool(t *testing.T) {
++	for _, tokens := range [][]string{nil, {}, {"", "  ", "\t"}} {
++		calls := 0
++		inner := codeSpecRoundTripFunc(func(req *http.Request) (*http.Response, error) {
++			calls++
++			return codeSpecResponse(http.StatusOK, "1", codeSpecBody("unexpected")), nil
++		})
++		transport := githubrepo.MakeGitHubTransport(inner, tokens)
++
++		resp, err, panicValue := codeSpecRoundTripRecoverPanic(transport,
++			codeSpecRequest(t, http.MethodGet, nil))
++		if panicValue != nil {
++			t.Errorf("RoundTrip() panicked for empty token pool: %v", panicValue)
++			continue
++		}
++		if err == nil || !strings.Contains(err.Error(), "no usable GitHub access tokens") {
++			t.Fatalf("RoundTrip() error = %v, want error containing %q", err,
++				"no usable GitHub access tokens")
++		}
++		if resp != nil || calls != 0 {
++			t.Fatalf("empty pool result = (%v, %d calls), want (nil, 0 calls)", resp, calls)
++		}
++	}
++}
++
++func TestCodeSpecGitHubTransportPreservesUnderlyingError(t *testing.T) {
++	sentinel := errors.New("sentinel transport failure")
++	calls := 0
++	inner := codeSpecRoundTripFunc(func(req *http.Request) (*http.Response, error) {
++		calls++
++		return nil, sentinel
++	})
++	transport := githubrepo.MakeGitHubTransport(inner, []string{"a", "b"})
++
++	resp, err := transport.RoundTrip(codeSpecRequest(t, http.MethodGet, nil))
++	if !errors.Is(err, sentinel) {
++		t.Fatalf("RoundTrip() error = %v, want errors.Is(error, sentinel)", err)
++	}
++	if resp != nil || calls != 1 {
++		t.Fatalf("underlying failure result = (%v, %d calls), want (nil, 1 call)", resp, calls)
++	}
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,5 @@
++#!/bin/bash
++set -euo pipefail
++
++
++go test -vet=off ./clients/githubrepo -count=1

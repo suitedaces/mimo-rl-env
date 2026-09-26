@@ -1,0 +1,480 @@
+diff --git a/app/oauth_test.go b/app/oauth_test.go
+index b525c180fb..1b7a70ccf5 100644
+--- a/app/oauth_test.go
++++ b/app/oauth_test.go
+@@ -633,3 +633,190 @@ func TestDeactivatedUserOAuthApp(t *testing.T) {
+ 	require.Equal(t, http.StatusBadRequest, accErr.StatusCode)
+ 	assert.Equal(t, "api.oauth.get_access_token.expired_code.app_error", accErr.Id)
+ }
++
++func newOAuthAppForDeauthorizeCleanupTest(t *testing.T, th *TestHelper, creatorID string) *model.OAuthApp {
++	t.Helper()
++
++	oapp := &model.OAuthApp{
++		Name:         "oauth-deauth-" + model.NewRandomString(10),
++		CreatorId:    creatorID,
++		Homepage:     "https://example.com",
++		Description:  "deauthorization cleanup test",
++		CallbackUrls: []string{"https://example.com/callback"},
++	}
++
++	oapp, err := th.App.CreateOAuthApp(oapp)
++	require.Nil(t, err)
++	require.NotEmpty(t, oapp.Id)
++	return oapp
++}
++
++func authorizeOAuthAppAndReturnCodeForCleanupTest(t *testing.T, th *TestHelper, userID string, oapp *model.OAuthApp) string {
++	t.Helper()
++
++	authRequest := &model.AuthorizeRequest{
++		ResponseType: model.AuthCodeResponseType,
++		ClientId:     oapp.Id,
++		RedirectURI:  oapp.CallbackUrls[0],
++		Scope:        "",
++		State:        model.NewRandomString(8),
++	}
++
++	redirectURL, err := th.App.AllowOAuthAppAccessToUser(userID, authRequest)
++	require.Nil(t, err)
++
++	uri, parseErr := url.Parse(redirectURL)
++	require.NoError(t, parseErr)
++
++	code := uri.Query().Get("code")
++	require.NotEmpty(t, code)
++	return code
++}
++
++func exchangeOAuthCodeForCleanupTest(t *testing.T, th *TestHelper, oapp *model.OAuthApp, code string) (*model.AccessResponse, *model.AppError) {
++	t.Helper()
++
++	return th.App.GetOAuthAccessTokenForCodeFlow(oapp.Id, model.AccessTokenGrantType, oapp.CallbackUrls[0], code, oapp.ClientSecret, "")
++}
++
++func TestDeauthorizeOAuthApp(t *testing.T) {
++	th := Setup(t).InitBasic()
++	defer th.TearDown()
++
++	th.App.UpdateConfig(func(cfg *model.Config) {
++		*cfg.ServiceSettings.EnableOAuthServiceProvider = true
++	})
++
++	oapp := newOAuthAppForDeauthorizeCleanupTest(t, th, th.BasicUser2.Id)
++	code := authorizeOAuthAppAndReturnCodeForCleanupTest(t, th, th.BasicUser.Id, oapp)
++
++	dErr := th.App.DeauthorizeOAuthAppForUser(th.BasicUser.Id, oapp.Id)
++	require.Nil(t, dErr)
++
++	resp, accErr := exchangeOAuthCodeForCleanupTest(t, th, oapp, code)
++	require.Nil(t, resp)
++	require.NotNil(t, accErr)
++}
++
++func TestDeauthorizeOAuthAppInvalidatesExistingAuthorizationCode(t *testing.T) {
++	th := Setup(t).InitBasic()
++	defer th.TearDown()
++
++	th.App.UpdateConfig(func(cfg *model.Config) {
++		*cfg.ServiceSettings.EnableOAuthServiceProvider = true
++	})
++
++	oapp := newOAuthAppForDeauthorizeCleanupTest(t, th, th.BasicUser2.Id)
++	code := authorizeOAuthAppAndReturnCodeForCleanupTest(t, th, th.BasicUser.Id, oapp)
++
++	dErr := th.App.DeauthorizeOAuthAppForUser(th.BasicUser.Id, oapp.Id)
++	require.Nil(t, dErr)
++
++	resp, accErr := exchangeOAuthCodeForCleanupTest(t, th, oapp, code)
++	require.Nil(t, resp)
++	require.NotNil(t, accErr)
++}
++
++func TestDeauthorizeOAuthAppDoesNotAffectOtherUsersOrApps(t *testing.T) {
++	th := Setup(t).InitBasic()
++	defer th.TearDown()
++
++	th.App.UpdateConfig(func(cfg *model.Config) {
++		*cfg.ServiceSettings.EnableOAuthServiceProvider = true
++	})
++
++	targetApp := newOAuthAppForDeauthorizeCleanupTest(t, th, th.BasicUser2.Id)
++	otherApp := newOAuthAppForDeauthorizeCleanupTest(t, th, th.BasicUser2.Id)
++
++	targetCode := authorizeOAuthAppAndReturnCodeForCleanupTest(t, th, th.BasicUser.Id, targetApp)
++	otherAppCode := authorizeOAuthAppAndReturnCodeForCleanupTest(t, th, th.BasicUser.Id, otherApp)
++	otherUserCode := authorizeOAuthAppAndReturnCodeForCleanupTest(t, th, th.BasicUser2.Id, targetApp)
++
++	dErr := th.App.DeauthorizeOAuthAppForUser(th.BasicUser.Id, targetApp.Id)
++	require.Nil(t, dErr)
++
++	targetResp, targetErr := exchangeOAuthCodeForCleanupTest(t, th, targetApp, targetCode)
++	require.Nil(t, targetResp)
++	require.NotNil(t, targetErr)
++
++	otherAppResp, otherAppErr := exchangeOAuthCodeForCleanupTest(t, th, otherApp, otherAppCode)
++	require.Nil(t, otherAppErr)
++	require.NotNil(t, otherAppResp)
++	otherAppSession, appSessionErr := th.App.GetSession(otherAppResp.AccessToken)
++	require.Nil(t, appSessionErr)
++	require.NotNil(t, otherAppSession)
++
++	otherUserResp, otherUserErr := exchangeOAuthCodeForCleanupTest(t, th, targetApp, otherUserCode)
++	require.Nil(t, otherUserErr)
++	require.NotNil(t, otherUserResp)
++	otherUserSession, userSessionErr := th.App.GetSession(otherUserResp.AccessToken)
++	require.Nil(t, userSessionErr)
++	require.NotNil(t, otherUserSession)
++}
++
++func TestDeauthorizeOAuthAppInvalidatesExistingTokenAndSession(t *testing.T) {
++	th := Setup(t).InitBasic()
++	defer th.TearDown()
++
++	th.App.UpdateConfig(func(cfg *model.Config) {
++		*cfg.ServiceSettings.EnableOAuthServiceProvider = true
++	})
++
++	oapp := newOAuthAppForDeauthorizeCleanupTest(t, th, th.BasicUser2.Id)
++	code := authorizeOAuthAppAndReturnCodeForCleanupTest(t, th, th.BasicUser.Id, oapp)
++
++	resp, accErr := exchangeOAuthCodeForCleanupTest(t, th, oapp, code)
++	require.Nil(t, accErr)
++	require.NotNil(t, resp)
++	_, sessionErr := th.App.GetSession(resp.AccessToken)
++	require.Nil(t, sessionErr)
++
++	dErr := th.App.DeauthorizeOAuthAppForUser(th.BasicUser.Id, oapp.Id)
++	require.Nil(t, dErr)
++
++	session, getSessionErr := th.App.GetSession(resp.AccessToken)
++	require.NotNil(t, getSessionErr)
++	require.Nil(t, session)
++	accessData, getAccessErr := th.App.Srv().Store.OAuth().GetAccessData(resp.AccessToken)
++	require.Error(t, getAccessErr)
++	require.Nil(t, accessData)
++}
++
++func TestDeauthorizeOAuthAppFailsWhenAuthorizationArtifactInvalidationFails(t *testing.T) {
++	th := Setup(t).InitBasic()
++	defer th.TearDown()
++
++	th.App.UpdateConfig(func(cfg *model.Config) {
++		*cfg.ServiceSettings.EnableOAuthServiceProvider = true
++	})
++
++	oapp := newOAuthAppForDeauthorizeCleanupTest(t, th, th.BasicUser2.Id)
++	_ = authorizeOAuthAppAndReturnCodeForCleanupTest(t, th, th.BasicUser.Id, oapp)
++
++	sqlStore := mainHelper.GetSQLStore()
++
++	_, err := sqlStore.GetMasterX().Exec(`
++		CREATE OR REPLACE FUNCTION fixture_fail_oauth_authdata_change()
++		RETURNS trigger AS $$
++		BEGIN
++			RAISE EXCEPTION 'fixture oauth auth data invalidation failure';
++		END;
++		$$ LANGUAGE plpgsql;
++		DROP TRIGGER IF EXISTS fixture_fail_oauth_authdata_change ON OAuthAuthData;
++		CREATE TRIGGER fixture_fail_oauth_authdata_change
++		BEFORE UPDATE OR DELETE ON OAuthAuthData
++		FOR EACH ROW EXECUTE FUNCTION fixture_fail_oauth_authdata_change();
++	`)
++	require.NoError(t, err)
++	defer func() {
++		_, _ = sqlStore.GetMasterX().Exec(`
++			DROP TRIGGER IF EXISTS fixture_fail_oauth_authdata_change ON OAuthAuthData;
++			DROP FUNCTION IF EXISTS fixture_fail_oauth_authdata_change();
++		`)
++	}()
++
++	dErr := th.App.DeauthorizeOAuthAppForUser(th.BasicUser.Id, oapp.Id)
++	require.NotNil(t, dErr)
++
++	require.Equal(t, "Unable to remove oauth data.", dErr.Message)
++}
+diff --git a/store/sqlstore/oauth_cleanup_migration_test.go b/store/sqlstore/oauth_cleanup_migration_test.go
+new file mode 100644
+index 0000000000..02ec3f2bce
+--- /dev/null
++++ b/store/sqlstore/oauth_cleanup_migration_test.go
+@@ -0,0 +1,244 @@
++
++
++
++package sqlstore
++
++import (
++	"fmt"
++	"path/filepath"
++	"strconv"
++	"strings"
++	"testing"
++
++	"github.com/stretchr/testify/require"
++
++	"github.com/mattermost/mattermost-server/v6/db"
++	"github.com/mattermost/mattermost-server/v6/model"
++	"github.com/mattermost/mattermost-server/v6/store"
++)
++
++type oauthCleanupFixture struct {
++	UserID   string
++	ClientID string
++	Token    string
++}
++
++func seedOAuthAccessDataForCleanupTest(t *testing.T, sqlStore *SqlStore, f oauthCleanupFixture) {
++	t.Helper()
++
++	_, err := sqlStore.GetMasterX().Exec(
++		`INSERT INTO OAuthAccessData
++			(ClientId, UserId, Token, RefreshToken, RedirectUri, ExpiresAt, Scope)
++		VALUES
++			(?, ?, ?, ?, ?, ?, ?)`,
++		f.ClientID,
++		f.UserID,
++		f.Token,
++		model.NewId(),
++		"https://example.com/callback",
++		model.GetMillis()+3600000,
++		"",
++	)
++	require.NoError(t, err)
++}
++
++func seedSessionForCleanupTest(t *testing.T, sqlStore *SqlStore, userID string, token string) {
++	t.Helper()
++
++	_, err := sqlStore.GetMasterX().Exec(
++		`INSERT INTO Sessions
++			(Id, Token, UserId, CreateAt, ExpiresAt, LastActivityAt, Roles, Props)
++		VALUES
++			(?, ?, ?, ?, ?, ?, ?, ?)`,
++		model.NewId(),
++		token,
++		userID,
++		model.GetMillis(),
++		model.GetMillis()+3600000,
++		model.GetMillis(),
++		"",
++		"{}",
++	)
++	require.NoError(t, err)
++}
++
++func seedAuthorizedOAuthAppForCleanupTest(t *testing.T, sqlStore *SqlStore, userID string, clientID string) {
++	t.Helper()
++
++	_, err := sqlStore.GetMasterX().Exec(
++		`INSERT INTO Preferences
++			(UserId, Category, Name, Value)
++		VALUES
++			(?, ?, ?, ?)`,
++		userID,
++		model.PreferenceCategoryAuthorizedOAuthApp,
++		clientID,
++		"true",
++	)
++	require.NoError(t, err)
++}
++
++func resetOAuthCleanupMigrationArtifactsForCleanupTest(t *testing.T, sqlStore *SqlStore) {
++	t.Helper()
++
++	sqlStore.RemoveTableIfExists("oauth_token_cleanup_backup")
++}
++
++func latestMigrationForCleanupTest(t *testing.T, sqlStore *SqlStore) (int, string) {
++	t.Helper()
++
++	assetsList, err := db.Assets().ReadDir(filepath.Join("migrations", sqlStore.DriverName()))
++	require.NoError(t, err)
++
++	latestVersion := 0
++	latestName := ""
++	for _, entry := range assetsList {
++		name := entry.Name()
++		if !strings.HasSuffix(name, ".up.sql") {
++			continue
++		}
++		versionString := strings.Split(name, "_")[0]
++		version, err := strconv.Atoi(versionString)
++		require.NoError(t, err)
++		if version > latestVersion {
++			latestVersion = version
++			latestName = name
++		}
++	}
++
++	require.NotZero(t, latestVersion)
++	require.NotEmpty(t, latestName)
++	return latestVersion, latestName
++}
++
++func rerunLatestMigrationForOAuthCleanupTest(t *testing.T, sqlStore *SqlStore) {
++	t.Helper()
++
++	latestVersion, _ := latestMigrationForCleanupTest(t, sqlStore)
++	resetOAuthCleanupMigrationArtifactsForCleanupTest(t, sqlStore)
++
++	_, err := sqlStore.GetMasterX().Exec("DELETE FROM db_migrations WHERE Version = ?", latestVersion)
++	require.NoError(t, err)
++
++	require.NoError(t, sqlStore.migrate(migrationsDirectionUp))
++}
++
++func runLatestDownMigrationForOAuthCleanupTest(t *testing.T, sqlStore *SqlStore) {
++	t.Helper()
++
++	_, latestUpName := latestMigrationForCleanupTest(t, sqlStore)
++	latestDownName := strings.TrimSuffix(latestUpName, ".up.sql") + ".down.sql"
++	downSQL, err := db.Assets().ReadFile(filepath.Join("migrations", sqlStore.DriverName(), latestDownName))
++	require.NoError(t, err)
++
++	if strings.TrimSpace(string(downSQL)) == "" {
++		return
++	}
++
++	_, err = sqlStore.GetMasterX().Exec(string(downSQL))
++	require.NoError(t, err)
++}
++
++func countRowsForCleanupTest(t *testing.T, sqlStore *SqlStore, table string, column string, value string) int {
++	t.Helper()
++
++	var count int
++	query := fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE %s = ?", table, column)
++	err := sqlStore.GetReplicaX().Get(&count, query, value)
++	require.NoError(t, err)
++	return count
++}
++
++func requireOAuthTokenAbsentForCleanupTest(t *testing.T, sqlStore *SqlStore, token string) {
++	t.Helper()
++	require.Equal(t, 0, countRowsForCleanupTest(t, sqlStore, "OAuthAccessData", "Token", token))
++}
++
++func requireSessionAbsentForCleanupTest(t *testing.T, sqlStore *SqlStore, token string) {
++	t.Helper()
++	require.Equal(t, 0, countRowsForCleanupTest(t, sqlStore, "Sessions", "Token", token))
++}
++
++func requireOAuthTokenPresentForCleanupTest(t *testing.T, sqlStore *SqlStore, token string) {
++	t.Helper()
++	require.Equal(t, 1, countRowsForCleanupTest(t, sqlStore, "OAuthAccessData", "Token", token))
++}
++
++func requireSessionPresentForCleanupTest(t *testing.T, sqlStore *SqlStore, token string) {
++	t.Helper()
++	require.Equal(t, 1, countRowsForCleanupTest(t, sqlStore, "Sessions", "Token", token))
++}
++
++func TestOAuthUpgradeCleanupRemovesStaleTokensAndSessions(t *testing.T) {
++	StoreTest(t, func(t *testing.T, ss store.Store) {
++		sqlStore := ss.(*SqlStore)
++		stale := oauthCleanupFixture{
++			UserID:   model.NewId(),
++			ClientID: model.NewId(),
++			Token:    model.NewId(),
++		}
++		crossUserSameClient := oauthCleanupFixture{
++			UserID:   model.NewId(),
++			ClientID: stale.ClientID,
++			Token:    model.NewId(),
++		}
++		authorizedOtherUser := model.NewId()
++
++		seedOAuthAccessDataForCleanupTest(t, sqlStore, stale)
++		seedSessionForCleanupTest(t, sqlStore, stale.UserID, stale.Token)
++
++		seedAuthorizedOAuthAppForCleanupTest(t, sqlStore, authorizedOtherUser, stale.ClientID)
++		seedOAuthAccessDataForCleanupTest(t, sqlStore, crossUserSameClient)
++		seedSessionForCleanupTest(t, sqlStore, crossUserSameClient.UserID, crossUserSameClient.Token)
++
++		rerunLatestMigrationForOAuthCleanupTest(t, sqlStore)
++
++		requireOAuthTokenAbsentForCleanupTest(t, sqlStore, stale.Token)
++		requireSessionAbsentForCleanupTest(t, sqlStore, stale.Token)
++		requireOAuthTokenAbsentForCleanupTest(t, sqlStore, crossUserSameClient.Token)
++		requireSessionAbsentForCleanupTest(t, sqlStore, crossUserSameClient.Token)
++	})
++}
++
++func TestOAuthUpgradeCleanupPreservesAuthorizedTokensAndSessions(t *testing.T) {
++	StoreTest(t, func(t *testing.T, ss store.Store) {
++		sqlStore := ss.(*SqlStore)
++		authorized := oauthCleanupFixture{
++			UserID:   model.NewId(),
++			ClientID: model.NewId(),
++			Token:    model.NewId(),
++		}
++
++		seedAuthorizedOAuthAppForCleanupTest(t, sqlStore, authorized.UserID, authorized.ClientID)
++		seedOAuthAccessDataForCleanupTest(t, sqlStore, authorized)
++		seedSessionForCleanupTest(t, sqlStore, authorized.UserID, authorized.Token)
++
++		rerunLatestMigrationForOAuthCleanupTest(t, sqlStore)
++
++		requireOAuthTokenPresentForCleanupTest(t, sqlStore, authorized.Token)
++		requireSessionPresentForCleanupTest(t, sqlStore, authorized.Token)
++	})
++}
++
++func TestOAuthCleanupMigrationDownDoesNotRestoreDeletedData(t *testing.T) {
++	StoreTest(t, func(t *testing.T, ss store.Store) {
++		sqlStore := ss.(*SqlStore)
++		stale := oauthCleanupFixture{
++			UserID:   model.NewId(),
++			ClientID: model.NewId(),
++			Token:    model.NewId(),
++		}
++
++		seedOAuthAccessDataForCleanupTest(t, sqlStore, stale)
++		seedSessionForCleanupTest(t, sqlStore, stale.UserID, stale.Token)
++
++		rerunLatestMigrationForOAuthCleanupTest(t, sqlStore)
++		requireOAuthTokenAbsentForCleanupTest(t, sqlStore, stale.Token)
++		requireSessionAbsentForCleanupTest(t, sqlStore, stale.Token)
++
++		runLatestDownMigrationForOAuthCleanupTest(t, sqlStore)
++
++		requireOAuthTokenAbsentForCleanupTest(t, sqlStore, stale.Token)
++		requireSessionAbsentForCleanupTest(t, sqlStore, stale.Token)
++	})
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,30 @@
++#!/bin/bash
++set -euo pipefail
++cd /testbed
++
++
++pg_ctlcluster 16 main start 2>/dev/null || true
++pg_isready -q || { echo "PostgreSQL not ready"; exit 1; }
++
++su - postgres -c "psql -c \"SELECT 1 FROM pg_roles WHERE rolname='mmuser'\" | grep -q 1" 2>/dev/null || \
++  su - postgres -c "psql -c \"CREATE USER mmuser WITH PASSWORD 'mostest' CREATEDB;\"" 2>/dev/null
++su - postgres -c "psql -c \"SELECT 1 FROM pg_database WHERE datname='mattermost_test'\" | grep -q 1" 2>/dev/null || \
++  su - postgres -c "psql -c \"CREATE DATABASE mattermost_test OWNER mmuser;\"" 2>/dev/null
++
++export MM_SQLSETTINGS_DRIVERNAME=postgres
++export IS_CI=true
++
++
++case "${1:-}" in
++  base)
++    go test -v -run '^TestDeactivatedUserOAuthApp$' -count=1 -timeout 300s ./app/
++    ;;
++  new)
++    go test -v -run '^TestDeauthorizeOAuthApp$|^TestDeauthorizeOAuthApp(InvalidatesExistingAuthorizationCode|DoesNotAffectOtherUsersOrApps|InvalidatesExistingTokenAndSession|FailsWhenAuthorizationArtifactInvalidationFails)$' -count=1 -timeout 300s ./app/
++    go test -v -run '^(TestOAuthUpgradeCleanup(RemovesStaleTokensAndSessions|PreservesAuthorizedTokensAndSessions)|TestOAuthCleanupMigrationDownDoesNotRestoreDeletedData)$' -count=1 -timeout 300s ./store/sqlstore/
++    ;;
++  *)
++    echo "usage: $0 base|new"
++    exit 2
++    ;;
++esac

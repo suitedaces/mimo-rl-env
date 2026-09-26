@@ -1,0 +1,371 @@
+diff --git a/usercase-test-coderl/key_iterator_test.go b/usercase-test-coderl/key_iterator_test.go
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/key_iterator_test.go
+@@ -0,0 +1,342 @@
++package usercase_test_coderl
++
++import (
++	"fmt"
++	"testing"
++
++	badger "github.com/dgraph-io/badger/v4"
++)
++
++type observedItem struct {
++	Key     string
++	Value   string
++	Version uint64
++}
++
++func openDB(t *testing.T) *badger.DB {
++	t.Helper()
++	db, err := badger.Open(badger.DefaultOptions("").
++		WithInMemory(true).
++		WithLogger(nil).
++		WithNumVersionsToKeep(5))
++	if err != nil {
++		t.Fatalf("open badger: %v", err)
++	}
++	t.Cleanup(func() {
++		if err := db.Close(); err != nil {
++			t.Fatalf("close badger: %v", err)
++		}
++	})
++	seedAccountKeys(t, db)
++	return db
++}
++
++func seedAccountKeys(t *testing.T, db *badger.DB) {
++	t.Helper()
++	for _, kv := range []observedItem{
++		{Key: "acct", Value: "v1"},
++		{Key: "acct", Value: "v2"},
++		{Key: "acct:meta", Value: "meta"},
++		{Key: "other", Value: "other"},
++	} {
++		if err := db.Update(func(txn *badger.Txn) error {
++			return txn.Set([]byte(kv.Key), []byte(kv.Value))
++		}); err != nil {
++			t.Fatalf("seed %q: %v", kv.Key, err)
++		}
++	}
++}
++
++func readCurrentItem(t *testing.T, it *badger.Iterator) observedItem {
++	t.Helper()
++	item := it.Item()
++	val, err := item.ValueCopy(nil)
++	if err != nil {
++		t.Fatalf("value copy: %v", err)
++	}
++	return observedItem{
++		Key:     string(item.Key()),
++		Value:   string(val),
++		Version: item.Version(),
++	}
++}
++
++func assertObservedKeyValue(t *testing.T, label string, got observedItem, wantKey, wantValue string) {
++	t.Helper()
++	if got.Key != wantKey || got.Value != wantValue {
++		t.Fatalf("%s = %#v, want key/value %q/%q", label, got, wantKey, wantValue)
++	}
++}
++
++func assertPanicValue(t *testing.T, want any, fn func()) {
++	t.Helper()
++	defer func() {
++		got := recover()
++		if got != want {
++			t.Fatalf("panic value mismatch: got %#v, want %#v", got, want)
++		}
++	}()
++	fn()
++	t.Fatalf("expected panic value %#v", want)
++}
++
++func assertPanics(t *testing.T, fn func()) {
++	t.Helper()
++	defer func() {
++		if recover() == nil {
++			t.Fatalf("expected panic")
++		}
++	}()
++	fn()
++}
++
++func TestNewKeyIteratorDefaultExactKeyHistoricalSession(t *testing.T) {
++
++
++	db := openDB(t)
++
++	if err := db.View(func(txn *badger.Txn) error {
++		it := txn.NewKeyIterator([]byte("acct"), badger.DefaultIteratorOptions)
++		defer it.Close()
++
++		if it.Valid() != false {
++			t.Fatalf("fresh Valid() = %t, want false", it.Valid())
++		}
++
++		it.Rewind()
++		if it.Valid() != true {
++			t.Fatalf("after Rewind Valid() = %t, want true", it.Valid())
++		}
++
++		assertObservedKeyValue(t, "first item", readCurrentItem(t, it), "acct", "v2")
++
++		it.Next()
++		if it.Valid() != true {
++			t.Fatalf("after first Next Valid() = %t, want true", it.Valid())
++		}
++
++		assertObservedKeyValue(t, "second item", readCurrentItem(t, it), "acct", "v1")
++
++		it.Next()
++		if it.Valid() != false {
++			t.Fatalf("after second Next Valid() = %t, want false", it.Valid())
++		}
++		return nil
++	}); err != nil {
++		t.Fatalf("view: %v", err)
++	}
++}
++
++func TestNewKeyIteratorSeekStopsAtPrefixSharingKey(t *testing.T) {
++
++
++	db := openDB(t)
++
++	if err := db.View(func(txn *badger.Txn) error {
++		it := txn.NewKeyIterator([]byte("acct"), badger.DefaultIteratorOptions)
++		defer it.Close()
++
++		it.Seek([]byte("acct:meta"))
++		if it.Valid() != false {
++			t.Fatalf("Seek(acct:meta) Valid() = %t, want false", it.Valid())
++		}
++
++		it.Seek([]byte("acct"))
++		if it.Valid() != true {
++			t.Fatalf("Seek(acct) Valid() = %t, want true", it.Valid())
++		}
++
++		assertObservedKeyValue(t, "Seek(acct) item", readCurrentItem(t, it), "acct", "v2")
++		return nil
++	}); err != nil {
++		t.Fatalf("view: %v", err)
++	}
++}
++
++func TestNewKeyIteratorForwardsReverseAndPrefetchOptions(t *testing.T) {
++
++
++	db := openDB(t)
++
++	if err := db.View(func(txn *badger.Txn) error {
++		opt := badger.DefaultIteratorOptions
++		opt.PrefetchValues = false
++		opt.Reverse = true
++		it := txn.NewKeyIterator([]byte("acct"), opt)
++		defer it.Close()
++
++		it.Rewind()
++		if it.Valid() != true {
++			t.Fatalf("reverse Rewind Valid() = %t, want true", it.Valid())
++		}
++
++		assertObservedKeyValue(t, "reverse first item", readCurrentItem(t, it), "acct", "v1")
++
++		it.Next()
++		if it.Valid() != true {
++			t.Fatalf("reverse first Next Valid() = %t, want true", it.Valid())
++		}
++
++		assertObservedKeyValue(t, "reverse second item", readCurrentItem(t, it), "acct", "v2")
++
++		it.Next()
++		if it.Valid() != false {
++			t.Fatalf("reverse exhausted Valid() = %t, want false", it.Valid())
++		}
++		return nil
++	}); err != nil {
++		t.Fatalf("view: %v", err)
++	}
++}
++
++func TestNewKeyIteratorForwardsSinceTsCutoff(t *testing.T) {
++
++
++	db := openDB(t)
++
++	if err := db.View(func(txn *badger.Txn) error {
++		all := txn.NewKeyIterator([]byte("acct"), badger.DefaultIteratorOptions)
++		all.Rewind()
++		if all.Valid() != true {
++			t.Fatalf("baseline Rewind Valid() = %t, want true", all.Valid())
++		}
++
++		newest := readCurrentItem(t, all)
++		assertObservedKeyValue(t, "baseline first item", newest, "acct", "v2")
++		all.Next()
++		if all.Valid() != true {
++			t.Fatalf("baseline first Next Valid() = %t, want true", all.Valid())
++		}
++
++		oldest := readCurrentItem(t, all)
++		assertObservedKeyValue(t, "baseline second item", oldest, "acct", "v1")
++		all.Close()
++
++		opt := badger.DefaultIteratorOptions
++		opt.SinceTs = oldest.Version
++		it := txn.NewKeyIterator([]byte("acct"), opt)
++		defer it.Close()
++
++		it.Rewind()
++		if it.Valid() != true {
++			t.Fatalf("SinceTs Rewind Valid() = %t, want true", it.Valid())
++		}
++
++		got := readCurrentItem(t, it)
++		assertObservedKeyValue(t, "SinceTs first item", got, "acct", "v2")
++		if got.Version <= oldest.Version {
++			t.Fatalf("SinceTs first item version = %d, want > cutoff %d", got.Version, oldest.Version)
++		}
++
++		it.Next()
++		if it.Valid() != false {
++			t.Fatalf("SinceTs exhausted Valid() = %t, want false", it.Valid())
++		}
++		return nil
++	}); err != nil {
++		t.Fatalf("view: %v", err)
++	}
++}
++
++func TestNewKeyIteratorPanicsWhenPrefixAlreadySet(t *testing.T) {
++
++
++	db := openDB(t)
++
++	if err := db.View(func(txn *badger.Txn) error {
++		assertPanicValue(t, "opt.Prefix should be nil for NewKeyIterator.", func() {
++			opt := badger.DefaultIteratorOptions
++			opt.Prefix = []byte("acct")
++			_ = txn.NewKeyIterator([]byte("acct"), opt)
++		})
++		return nil
++	}); err != nil {
++		t.Fatalf("view: %v", err)
++	}
++}
++
++func TestNewKeyIteratorPanicsAfterTransactionDiscard(t *testing.T) {
++
++
++	db := openDB(t)
++
++	txn := db.NewTransaction(false)
++	txn.Discard()
++
++	assertPanics(t, func() {
++		_ = txn.NewKeyIterator([]byte("acct"), badger.DefaultIteratorOptions)
++	})
++}
++
++func TestNewKeyIteratorCloseIsIdempotent(t *testing.T) {
++
++
++	db := openDB(t)
++
++	if err := db.View(func(txn *badger.Txn) error {
++		it := txn.NewKeyIterator([]byte("acct"), badger.DefaultIteratorOptions)
++		it.Rewind()
++		if it.Valid() != true {
++			t.Fatalf("before Close Valid() = %t, want true", it.Valid())
++		}
++		it.Close()
++		it.Close()
++		return nil
++	}); err != nil {
++		t.Fatalf("view: %v", err)
++	}
++}
++
++func TestNewKeyIteratorInstancesHaveIndependentCursorState(t *testing.T) {
++
++
++	db := openDB(t)
++
++	if err := db.View(func(txn *badger.Txn) error {
++		a := txn.NewKeyIterator([]byte("acct"), badger.DefaultIteratorOptions)
++		defer a.Close()
++		b := txn.NewKeyIterator([]byte("acct:meta"), badger.DefaultIteratorOptions)
++		defer b.Close()
++
++		a.Rewind()
++		b.Rewind()
++
++		assertObservedKeyValue(t, "iterator a initial item", readCurrentItem(t, a), "acct", "v2")
++
++		assertObservedKeyValue(t, "iterator b initial item", readCurrentItem(t, b), "acct:meta", "meta")
++
++		a.Next()
++
++		assertObservedKeyValue(t, "iterator a after Next", readCurrentItem(t, a), "acct", "v1")
++
++		assertObservedKeyValue(t, "iterator b after a.Next", readCurrentItem(t, b), "acct:meta", "meta")
++		return nil
++	}); err != nil {
++		t.Fatalf("view: %v", err)
++	}
++}
++
++func TestNewKeyIteratorRepeatedCloseReleasesTransactionIterator(t *testing.T) {
++
++
++	db := openDB(t)
++
++
++	for i := 0; i < 120; i++ {
++		if err := db.View(func(txn *badger.Txn) error {
++			it := txn.NewKeyIterator([]byte("acct"), badger.DefaultIteratorOptions)
++			it.Rewind()
++			if it.Valid() != true {
++				return fmt.Errorf("cycle %d Valid() = %t, want true", i, it.Valid())
++			}
++
++			if got := readCurrentItem(t, it); got.Key != "acct" || got.Value != "v2" {
++				return fmt.Errorf("cycle %d item = %#v, want key/value acct/v2", i, got)
++			}
++			it.Close()
++			return nil
++		}); err != nil {
++			t.Fatalf("cycle %d view: %v", i, err)
++		}
++	}
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,19 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++
++cd /workspace/repo
++export GOTOOLCHAIN=local
++export GOPROXY=off
++export GOSUMDB=off
++export GOFLAGS="${GOFLAGS:-} -mod=readonly"
++exec go test -v -count=1 ./usercase-test-coderl/...

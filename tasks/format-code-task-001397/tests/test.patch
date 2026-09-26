@@ -1,0 +1,124 @@
+diff --git a/grai-integrations/source-dbt/tests/test_relationship_metadata_contract.py b/grai-integrations/source-dbt/tests/test_relationship_metadata_contract.py
+new file mode 100644
+index 000000000..4a055d19b
+--- /dev/null
++++ b/grai-integrations/source-dbt/tests/test_relationship_metadata_contract.py
+@@ -0,0 +1,107 @@
++import pytest
++
++from grai_schemas.v1 import EdgeV1
++from grai_schemas.v1.metadata.edges import (
++    ColumnToColumnMetadata,
++    GenericEdgeMetadataV1,
++    TableToColumnMetadata,
++    TableToTableAttributes,
++    TableToTableMetadata,
++)
++from grai_source_dbt.adapters import adapt_to_client
++from grai_source_dbt.models.nodes import Column, Edge, Table
++from grai_source_dbt.models.shared import Constraint
++from grai_source_dbt.package_definitions import config
++from grai_source_dbt.utils import load_dbt_graph
++
++
++def graph_endpoints():
++    graph = load_dbt_graph()
++    tables = [node for node in graph.nodes if isinstance(node, Table)]
++    columns = [node for node in graph.nodes if isinstance(node, Column)]
++    return tables[0], tables[1], columns[0], columns[1]
++
++
++def make_relationship(source, destination, **values):
++    return Edge(
++        source=source,
++        destination=destination,
++        constraint_type=values.pop("constraint_type", Constraint.dbt_model),
++        definition=values.pop("definition", "select 1"),
++        metadata=values.pop("metadata", None),
++        **values,
++    )
++
++
++def test_table_to_table_metadata_is_a_valid_v1_edge_payload():
++    edge = EdgeV1.from_spec(
++        {
++            "name": "analytics.orders -> analytics.customers",
++            "namespace": "warehouse",
++            "data_source": "grai_source_dbt",
++            "source": {"name": "analytics.orders", "namespace": "warehouse"},
++            "destination": {"name": "analytics.customers", "namespace": "warehouse"},
++            "metadata": {"grai": {"edge_type": "TableToTable", "edge_attributes": {}}},
++        }
++    )
++
++    assert isinstance(edge.spec.metadata.grai, TableToTableMetadata)
++    assert isinstance(edge.spec.metadata.grai.edge_attributes, TableToTableAttributes)
++
++
++@pytest.mark.parametrize(
++    ("source_index", "destination_index", "metadata_type", "edge_type"),
++    [
++        (0, 1, TableToTableMetadata, "TableToTable"),
++        (0, 2, TableToColumnMetadata, "TableToColumn"),
++        (2, 3, ColumnToColumnMetadata, "ColumnToColumn"),
++        (2, 0, GenericEdgeMetadataV1, "Edge"),
++    ],
++    ids=["table-to-table", "table-to-column", "column-to-column", "unsupported-direction"],
++)
++def test_relationship_core_metadata_follows_endpoint_kinds(source_index, destination_index, metadata_type, edge_type):
++    table_one, table_two, column_one, column_two = graph_endpoints()
++    endpoints = [table_one, table_two, column_one, column_two]
++    relationship = make_relationship(endpoints[source_index], endpoints[destination_index])
++
++    exported = adapt_to_client(relationship, "v1")
++
++    assert isinstance(exported.spec.metadata.grai, metadata_type)
++    assert exported.spec.metadata.grai.edge_type == edge_type
++    assert exported.spec.source.name == relationship.source.full_name
++    assert exported.spec.source.namespace == relationship.source.namespace
++    assert exported.spec.destination.name == relationship.destination.full_name
++    assert exported.spec.destination.namespace == relationship.destination.namespace
++
++
++def test_relationship_metadata_keeps_custom_values_without_overriding_canonical_fields():
++    table_one, table_two, _, _ = graph_endpoints()
++    relationship = make_relationship(
++        table_one,
++        table_two,
++        definition="select * from upstream_orders",
++        metadata={
++            "owner": "analytics",
++            "definition": "untrusted definition",
++            "constraint_type": "untrusted constraint",
++        },
++    )
++
++    exported = adapt_to_client(relationship, "v1")
++    dbt_metadata = getattr(exported.spec.metadata, config.metadata_id)
++
++    assert dbt_metadata["owner"] == "analytics"
++    assert dbt_metadata["definition"] == "select * from upstream_orders"
++    assert dbt_metadata["constraint_type"] == "dbtm"
++
++
++def test_manifest_relationships_export_as_typed_v1_edges():
++    graph = load_dbt_graph()
++    exported = adapt_to_client(graph.edges, "v1")
++    dependency_edges = [edge for edge in exported if edge.spec.metadata.grai_source_dbt["constraint_type"] == "dbtm"]
++    membership_edges = [edge for edge in exported if edge.spec.metadata.grai_source_dbt["constraint_type"] == "bt"]
++
++    assert dependency_edges
++    assert membership_edges
++    assert all(isinstance(edge.spec.metadata.grai, TableToTableMetadata) for edge in dependency_edges)
++    assert all(isinstance(edge.spec.metadata.grai, TableToColumnMetadata) for edge in membership_edges)
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,6 @@
++#!/bin/bash
++set -euo pipefail
++
++
++PYTHONPATH="grai-schemas/src:grai-integrations/source-dbt/src" /testbed/.venv/bin/pytest -q \
++  grai-integrations/source-dbt/tests/test_relationship_metadata_contract.py

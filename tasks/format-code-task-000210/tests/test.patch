@@ -1,0 +1,223 @@
+diff --git a/plugin-server/src/cdp/segment/segment-translate.test.ts b/plugin-server/src/cdp/segment/segment-translate.test.ts
+new file mode 100644
+index 00000000000..525ecfd2c67
+--- /dev/null
++++ b/plugin-server/src/cdp/segment/segment-translate.test.ts
+@@ -0,0 +1,190 @@
++import { translateFilters, translateInputs } from './segment-templates'
++
++describe('segment config translation', () => {
++    describe('translateFilters', () => {
++        const getKey = (subscribe: string): string => {
++            const result = translateFilters(subscribe)
++            return (result.events[0].properties as any[])[0].key
++        }
++
++        it('wraps the translation in a single "All events" hogql filter', () => {
++            const result = translateFilters('type = "track"')
++            expect(result.events).toHaveLength(1)
++            const event = result.events[0]
++            expect(event.id).toEqual('All events')
++            expect(event.name).toEqual('All events')
++            expect(event.type).toEqual('events')
++            expect(event.order).toEqual(0)
++            expect(event.properties).toHaveLength(1)
++            const property = (event.properties as any[])[0]
++            expect(property.type).toEqual('hogql')
++            expect(property.value).toBeNull()
++        })
++
++        it.each([
++            ['type = "page"', `event = '$pageview'`],
++            ['type = "screen"', `event = '$screen'`],
++            ['type = "identify"', `event in ('$identify', '$set')`],
++            ['type = "group"', `event = '$groupidentify'`],
++            [
++                'type = "track"',
++                `event not in ('$pageview', '$screen', '$alias', '$identify', '$set', '$groupidentify')`,
++            ],
++            ['type = "alias"', `event = '$alias'`],
++        ])('translates event type %s', (subscribe, expected) => {
++            expect(getKey(subscribe)).toEqual(expected)
++        })
++
++        it('converts remaining double quotes to single quotes', () => {
++            expect(getKey('name = "Order Completed"')).toEqual(`name = 'Order Completed'`)
++        })
++
++        it('translates every occurrence in a compound expression', () => {
++            expect(getKey('type = "page" or type = "screen"')).toEqual(
++                `event = '$pageview' or event = '$screen'`
++            )
++        })
++
++        it('translates a type clause joined with a passthrough clause', () => {
++            expect(getKey('type = "track" and event = "Order Completed"')).toEqual(
++                `event not in ('$pageview', '$screen', '$alias', '$identify', '$set', '$groupidentify') and event = 'Order Completed'`
++            )
++        })
++    })
++
++    describe('translateInputs', () => {
++        it('returns strings unchanged', () => {
++            expect(translateInputs('hello world')).toEqual('hello world')
++        })
++
++        it('returns booleans unchanged', () => {
++            expect(translateInputs(true)).toEqual(true)
++            expect(translateInputs(false)).toEqual(false)
++        })
++
++        describe('@path', () => {
++            it('rewrites $. to event. and wraps in braces', () => {
++                expect(translateInputs({ '@path': '$.properties.revenue' })).toEqual('{event.properties.revenue}')
++            })
++
++            it('wraps in array braces when multiple', () => {
++                expect(translateInputs({ '@path': '$.properties.revenue' }, true)).toEqual(
++                    '{[event.properties.revenue]}'
++                )
++            })
++
++            it.each([
++                ['$.traits.email', '{person.properties.email}'],
++                ['$.context.traits.name', '{person.properties.name}'],
++                ['$.userId', '{person.id}'],
++                ['$.anonymousId', '{event.distinct_id}'],
++                ['$.messageId', '{event.uuid}'],
++                ['$.context.os.name', '{event.properties.$os}'],
++                ['$.context.os.version', '{event.properties.$os_version}'],
++                ['$.context.page.url', '{event.properties.$current_url}'],
++                ['$.context.page.path', '{event.properties.$pathname}'],
++                ['$.context.page.referrer', '{event.properties.$referrer}'],
++                ['$.context.campaign.source', '{event.properties.utm_source}'],
++                ['$.context.ip', '{event.properties.$ip}'],
++                ['$.context.locale', '{event.properties.$locale}'],
++                ['$.context.userAgent', '{event.properties.$raw_user_agent}'],
++            ])('normalizes %s', (path, expected) => {
++                expect(translateInputs({ '@path': path })).toEqual(expected)
++            })
++
++            it('passes an unmapped context.* reference through unchanged', () => {
++                expect(translateInputs({ '@path': '$.context.something.custom' })).toEqual(
++                    '{event.context.something.custom}'
++                )
++            })
++
++            it.each([['$.context.device.brand'], ['$.context.network.wifi'], ['$.context.device.advertisingId']])(
++                'drops unsupported field %s',
++                (path) => {
++                    expect(translateInputs({ '@path': path })).toEqual('')
++                }
++            )
++        })
++
++        describe('@if', () => {
++            it('combines then and else with a fallback when both resolve', () => {
++                expect(
++                    translateInputs({
++                        '@if': {
++                            exists: { '@path': '$.userId' },
++                            then: { '@path': '$.userId' },
++                            else: { '@path': '$.anonymousId' },
++                        },
++                    })
++                ).toEqual('{person.id ?? event.distinct_id}')
++            })
++
++            it('wraps the fallback expression in brackets when multiple', () => {
++                expect(
++                    translateInputs(
++                        {
++                            '@if': {
++                                exists: { '@path': '$.userId' },
++                                then: { '@path': '$.userId' },
++                                else: { '@path': '$.anonymousId' },
++                            },
++                        },
++                        true
++                    )
++                ).toEqual('{[person.id ?? event.distinct_id]}')
++            })
++
++            it('wraps a string then/else in single quotes', () => {
++                expect(
++                    translateInputs({
++                        '@if': {
++                            exists: 'track',
++                            then: 'track',
++                            else: 'identify',
++                        },
++                    })
++                ).toEqual(`{'track' ?? 'identify'}`)
++            })
++
++            it('uses only the primary when the fallback resolves empty', () => {
++                expect(
++                    translateInputs({
++                        '@if': {
++                            exists: { '@path': '$.userId' },
++                            then: { '@path': '$.userId' },
++                            else: { '@path': '$.context.device.brand' },
++                        },
++                    })
++                ).toEqual('{person.id}')
++            })
++
++            it('uses only the fallback when the primary resolves empty', () => {
++                expect(
++                    translateInputs({
++                        '@if': {
++                            exists: { '@path': '$.context.device.brand' },
++                            then: { '@path': '$.context.device.brand' },
++                            else: { '@path': '$.userId' },
++                        },
++                    })
++                ).toEqual('{person.id}')
++            })
++
++            it('returns the raw JSON when exists and then differ', () => {
++                const input = {
++                    '@if': {
++                        exists: { '@path': '$.userId' },
++                        then: { '@path': '$.anonymousId' },
++                        else: { '@path': '$.messageId' },
++                    },
++                }
++                expect(translateInputs(input)).toEqual(JSON.stringify(input))
++            })
++        })
++
++        it('returns the raw JSON for an unrecognised object', () => {
++            const input = { foo: 'bar' }
++            expect(translateInputs(input)).toEqual(JSON.stringify(input))
++        })
++    })
++})
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,22 @@
++#!/usr/bin/env bash
++
++
++
++set -euo pipefail
++HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++cd /testbed
++
++
++
++cd /testbed/plugin-server
++
++
++node_modules/.bin/jest \
++    src/cdp/legacy-plugins/_transformations/downsampling-plugin/index.test.ts \
++    src/cdp/legacy-plugins/_transformations/posthog-url-normalizer-plugin/index.test.ts \
++    --runInBand
++
++
++node_modules/.bin/jest \
++    src/cdp/segment/segment-translate.test.ts \
++    --runInBand

@@ -1,0 +1,7 @@
+Add inbound server-synchronized draft support to the web client. The backend already includes recent drafts in the initial page payload and sends `drafts` add, update, and remove events, but the web app currently ignores both sources.
+
+When the user's `enable_drafts_synchronization` setting is enabled, initialization must load every record from the initial `page_params.drafts` array into the existing web draft model, keyed by its server-provided ID. Live draft events must then keep that same model current: an add event imports every draft in the batch, an update replaces the draft with that ID (and also makes an omitted/not-yet-loaded draft available), and a remove deletes only the named ID. Removing an unknown ID is a no-op.
+
+Normalize server draft records to the model shape that existing compose and drafts-overlay consumers already understand. Preserve `id`, `type`, `topic`, and `content`; convert the server timestamp in seconds to the model's millisecond `updatedAt`; map a stream draft's single `to` ID to `stream_id`; and resolve a direct-message draft's `to` user IDs to the existing comma-separated email recipient representation so that `restore_message` can open it normally.
+
+The synchronization setting is a hard compatibility boundary. When it is disabled, initialization must leave existing local drafts intact and must not import the page payload, and incoming draft events must not alter local draft state. Keep the established local draft model, compose snapshot/restore, expiry, formatting, rename, and delete behavior working unchanged.

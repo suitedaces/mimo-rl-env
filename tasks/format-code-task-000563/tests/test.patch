@@ -1,0 +1,404 @@
+diff --git a/test/lib/transports/ws2-lossless-ob.js b/test/lib/transports/ws2-lossless-ob.js
+new file mode 100644
+index 0000000..422fb5d
+--- /dev/null
++++ b/test/lib/transports/ws2-lossless-ob.js
+@@ -0,0 +1,374 @@
++/* eslint-env mocha */
++'use strict'
++
++const assert = require('assert')
++const CRC = require('crc-32')
++const http = require('http')
++const WebSocket = require('ws')
++const WSv2 = require('../../../lib/transports/ws2')
++
++function makeChecksum (entries) {
++  const bids = entries
++    .filter(e => e.amount[0] !== '-')
++    .sort((a, b) => Number(b.price) - Number(a.price))
++  const asks = entries
++    .filter(e => e.amount[0] === '-')
++    .sort((a, b) => Number(a.price) - Number(b.price))
++
++  const parts = []
++
++  for (let i = 0; i < 25; i += 1) {
++    if (bids[i]) parts.push(bids[i].price, bids[i].amount)
++    if (asks[i]) parts.push(asks[i].price, asks[i].amount)
++  }
++
++  return CRC.str(parts.join(':'))
++}
++
++function findEntry (ob, price) {
++  return ob.bids.concat(ob.asks).find((entry) => {
++    return entryPrice(entry) === price
++  })
++}
++
++function entryPrice (entry) {
++  if (Array.isArray(entry)) {
++    return entry[0]
++  }
++
++  return Object.prototype.hasOwnProperty.call(entry, 'price')
++    ? entry.price
++    : entry.rate
++}
++
++function entryAmount (entry) {
++  return Array.isArray(entry) ? entry[2] : entry.amount
++}
++
++function waitForEvent (emitter, eventName) {
++  return new Promise((resolve) => {
++    emitter.once(eventName, resolve)
++  })
++}
++
++function sendAndWaitForOB (stream, packetJSON) {
++  const nextOB = waitForEvent(stream.ws, 'orderbook')
++  stream.serverClient.send(packetJSON)
++  return nextOB
++}
++
++function sendAndWaitForChecksum (stream, packetJSON) {
++  const nextCS = waitForEvent(stream.ws, 'cs')
++  stream.serverClient.send(packetJSON)
++  return nextCS
++}
++
++function delay (ms) {
++  return new Promise(resolve => setTimeout(resolve, ms))
++}
++
++async function closeStream (stream) {
++  if (!stream) return
++
++  if (stream.ws && stream.ws.isOpen()) {
++    try {
++      await stream.ws.close()
++    } catch (e) {}
++  }
++
++  if (stream.wss) {
++    await new Promise((resolve) => stream.wss.close(resolve))
++  }
++
++  if (stream.server) {
++    await new Promise((resolve) => stream.server.close(resolve))
++  }
++}
++
++function openBookStream (opts = {}) {
++  const {
++    manageOrderBooks = true,
++    symbol = 'tETHBTC',
++    prec = 'P0'
++  } = opts
++
++  return new Promise((resolve, reject) => {
++    const server = http.createServer()
++    const wss = new WebSocket.Server({ server })
++
++    server.listen(0, () => {
++      const { port } = server.address()
++      const ws = new WSv2({
++        manageOrderBooks,
++        url: `ws://127.0.0.1:${port}`
++      })
++      let serverClient = null
++      let settled = false
++
++      const fail = (err) => {
++        if (settled) return
++        settled = true
++        closeStream({ ws, wss, server }).then(() => reject(err))
++      }
++
++      wss.on('connection', (client) => {
++        serverClient = client
++        client.send(JSON.stringify({ event: 'info', version: 2 }))
++        client.on('message', (packetJSON) => {
++          const msg = JSON.parse(packetJSON)
++
++          if (msg.event === 'subscribe' && msg.channel === 'book') {
++            client.send(JSON.stringify({
++              event: 'subscribed',
++              chanId: 42,
++              channel: 'book',
++              symbol: msg.symbol,
++              prec: msg.prec,
++              len: msg.len
++            }))
++          }
++        })
++      })
++
++      ws.once('open', () => {
++        ws.subscribeOrderBook(symbol, prec, '25')
++      })
++
++      ws.once('subscribed', () => {
++        settled = true
++        resolve({ ws, wss, server, serverClient })
++      })
++
++      ws.once('error', fail)
++      ws.open().catch(fail)
++    })
++  })
++}
++
++describe('WSv2 managed lossless order books', () => {
++  it('returns_lossless_order_book_entries_as_original_strings_after_managed_snapshot', async () => {
++    const stream = await openBookStream({ symbol: 'tETHBTC' })
++
++    try {
++      await sendAndWaitForOB(
++        stream,
++        '[42,[[0.00001000,1,2.50000000],[0.00001010,1,-3.75000000]]]'
++      )
++
++      const ob = stream.ws.getLosslessOB('tETHBTC')
++      assert(ob, 'expected a managed lossless order book')
++
++      const bid = findEntry(ob, '0.00001000')
++      const ask = findEntry(ob, '0.00001010')
++
++      assert(bid, 'expected bid entry to be readable by its original string price')
++      assert(ask, 'expected ask entry to be readable by its original string price')
++      assert.strictEqual(entryPrice(bid), '0.00001000')
++      assert.strictEqual(entryAmount(bid), '2.50000000')
++      assert.strictEqual(entryPrice(ask), '0.00001010')
++      assert.strictEqual(entryAmount(ask), '-3.75000000')
++    } finally {
++      await closeStream(stream)
++    }
++  })
++
++  it('keeps_lossless_order_book_updated_after_incremental_updates', async () => {
++    const stream = await openBookStream({ symbol: 'tLTCBTC' })
++
++    try {
++      await sendAndWaitForOB(
++        stream,
++        '[42,[[0.00002000,1,4.00000000],[0.00002010,1,-5.00000000]]]'
++      )
++      await sendAndWaitForOB(stream, '[42,[0.00001990,1,1.23000000]]')
++      await sendAndWaitForOB(stream, '[42,[0.00002010,0,-1]]')
++
++      const ob = stream.ws.getLosslessOB('tLTCBTC')
++      assert(ob, 'expected a managed lossless order book after updates')
++
++      const addedBid = findEntry(ob, '0.00001990')
++      const deletedAsk = findEntry(ob, '0.00002010')
++
++      assert(addedBid, 'expected incremental bid to be present')
++      assert.strictEqual(entryPrice(addedBid), '0.00001990')
++      assert.strictEqual(entryAmount(addedBid), '1.23000000')
++      assert.strictEqual(deletedAsk, undefined)
++    } finally {
++      await closeStream(stream)
++    }
++  })
++
++  it('returns_null_when_lossless_order_book_is_not_available', async () => {
++    const managedStream = await openBookStream({ symbol: 'tETHBTC' })
++
++    try {
++      assert.strictEqual(managedStream.ws.getLosslessOB('tUNKNOWN'), null)
++      assert.strictEqual(managedStream.ws.getLosslessOB('tETHBTC'), null)
++    } finally {
++      await closeStream(managedStream)
++    }
++
++    const unmanagedStream = await openBookStream({
++      manageOrderBooks: false,
++      symbol: 'tETHBTC'
++    })
++
++    try {
++      await sendAndWaitForOB(
++        unmanagedStream,
++        '[42,[[0.00001000,1,2.50000000]]]'
++      )
++      assert.strictEqual(unmanagedStream.ws.getLosslessOB('tETHBTC'), null)
++    } finally {
++      await closeStream(unmanagedStream)
++    }
++  })
++
++  it('does_not_emit_checksum_error_for_precision_sensitive_valid_order_book', async () => {
++    const stream = await openBookStream({ symbol: 'tXRPBTC' })
++    const errors = []
++
++    stream.ws.on('error', (err) => {
++      errors.push(err)
++    })
++
++    try {
++      const rawEntries = [
++        { price: '0.00001000', amount: '2.50000000' },
++        { price: '0.00001010', amount: '-3.75000000' }
++      ]
++      const checksum = makeChecksum(rawEntries)
++
++      await sendAndWaitForOB(
++        stream,
++        '[42,[[0.00001000,1,2.50000000],[0.00001010,1,-3.75000000]]]'
++      )
++      await sendAndWaitForChecksum(stream, `[42,"cs",${checksum}]`)
++      await delay(10)
++
++      assert.deepStrictEqual(errors, [])
++      assert(stream.ws.getLosslessOB('tXRPBTC'), 'expected order book to still be managed')
++    } finally {
++      await closeStream(stream)
++    }
++  })
++
++  it('rejects_invalid_checksum_for_same_precision_sensitive_book', async () => {
++    const stream = await openBookStream({ symbol: 'tXRPBTC' })
++    const errors = []
++
++    stream.ws.on('error', (err) => {
++      errors.push(err)
++    })
++
++    try {
++      const rawEntries = [
++        { price: '0.00001000', amount: '2.50000000' },
++        { price: '0.00001010', amount: '-3.75000000' }
++      ]
++      const invalidChecksum = makeChecksum(rawEntries) + 1
++
++      await sendAndWaitForOB(
++        stream,
++        '[42,[[0.00001000,1,2.50000000],[0.00001010,1,-3.75000000]]]'
++      )
++      await sendAndWaitForChecksum(stream, `[42,"cs",${invalidChecksum}]`)
++      await delay(10)
++
++      assert.strictEqual(errors.length, 1)
++    } finally {
++      await closeStream(stream)
++    }
++  })
++
++  it('handles_non_fixture_symbol_depth_and_checksum_with_exact_strings', async () => {
++    const stream = await openBookStream({ symbol: 'tDOGEBTC' })
++    const errors = []
++
++    stream.ws.on('error', (err) => {
++      errors.push(err)
++    })
++
++    try {
++      const rawEntries = [
++        { price: '0.00003000', amount: '7.50000000' },
++        { price: '0.00002990', amount: '1.12500000' },
++        { price: '0.00003010', amount: '-8.25000000' }
++      ]
++      const checksum = makeChecksum(rawEntries)
++
++      await sendAndWaitForOB(
++        stream,
++        '[42,[[0.00003000,1,7.50000000],[0.00002990,1,1.12500000],[0.00003010,1,-8.25000000]]]'
++      )
++
++      const ob = stream.ws.getLosslessOB('tDOGEBTC')
++      assert(ob, 'expected lossless book for non-fixture symbol')
++
++      const firstBid = findEntry(ob, '0.00003000')
++      const secondBid = findEntry(ob, '0.00002990')
++      const ask = findEntry(ob, '0.00003010')
++
++      assert(firstBid, 'expected first bid with exact raw string price')
++      assert(secondBid, 'expected second bid beyond two-level happy path')
++      assert(ask, 'expected ask with exact raw string price')
++      assert.strictEqual(entryAmount(firstBid), '7.50000000')
++      assert.strictEqual(entryAmount(secondBid), '1.12500000')
++      assert.strictEqual(entryAmount(ask), '-8.25000000')
++
++      await sendAndWaitForChecksum(stream, `[42,"cs",${checksum}]`)
++      await delay(10)
++
++      assert.deepStrictEqual(errors, [])
++    } finally {
++      await closeStream(stream)
++    }
++  })
++
++  it('returns_null_for_unavailable_funding_and_unknown_after_other_book', async () => {
++    const fundingStream = await openBookStream({ symbol: 'fUSD' })
++
++    try {
++      assert.strictEqual(fundingStream.ws.getLosslessOB('fUSD'), null)
++    } finally {
++      await closeStream(fundingStream)
++    }
++
++    const stream = await openBookStream({ symbol: 'tETHBTC' })
++
++    try {
++      await sendAndWaitForOB(
++        stream,
++        '[42,[[0.00001000,1,2.50000000]]]'
++      )
++      assert.strictEqual(stream.ws.getLosslessOB('tUNSEEN'), null)
++    } finally {
++      await closeStream(stream)
++    }
++  })
++
++  it('preserves_existing_numeric_get_ob_view', async () => {
++    const stream = await openBookStream({ symbol: 'tETHBTC' })
++
++    try {
++      await sendAndWaitForOB(
++        stream,
++        '[42,[[0.00001000,1,2.50000000],[0.00001010,1,-3.75000000]]]'
++      )
++
++      const numericOB = stream.ws.getOB('tETHBTC')
++      const losslessOB = stream.ws.getLosslessOB('tETHBTC')
++      const numericBid = findEntry(numericOB, 0.00001)
++      const losslessBid = findEntry(losslessOB, '0.00001000')
++
++      assert(numericBid, 'expected numeric getOB entry')
++      assert(losslessBid, 'expected lossless getLosslessOB entry')
++      assert.strictEqual(typeof entryPrice(numericBid), 'number')
++      assert.strictEqual(typeof entryAmount(numericBid), 'number')
++      assert.strictEqual(entryPrice(losslessBid), '0.00001000')
++      assert.strictEqual(entryAmount(losslessBid), '2.50000000')
++    } finally {
++      await closeStream(stream)
++    }
++  })
++})
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,19 @@
++#!/bin/bash
++set -euo pipefail
++cd /testbed
++
++
++npm install --silent
++
++case "${1:-}" in
++  base)
++    NODE_ENV=test npx mocha -b test/lib/transports/ws2-unit.js --grep '_handleOBMessage|_updateManagedOB' --invert
++    ;;
++  new)
++    NODE_ENV=test npx mocha -b test/lib/transports/ws2-lossless-ob.js
++    ;;
++  *)
++    echo "usage: $0 base|new"
++    exit 2
++    ;;
++esac

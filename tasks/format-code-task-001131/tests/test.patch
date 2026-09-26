@@ -1,0 +1,379 @@
+diff --git a/codespec_metadata_v8_test.go b/codespec_metadata_v8_test.go
+new file mode 100644
+index 0000000..d0f701a
+--- /dev/null
++++ b/codespec_metadata_v8_test.go
+@@ -0,0 +1,364 @@
++package sarama
++
++import (
++	"bytes"
++	"reflect"
++	"testing"
++)
++
++func codespecSetExportedField(t *testing.T, target interface{}, name string, value interface{}) {
++	t.Helper()
++	v := reflect.ValueOf(target)
++	if v.Kind() != reflect.Ptr || v.IsNil() {
++		t.Fatalf("%s target must be a non-nil pointer", name)
++	}
++	f := v.Elem().FieldByName(name)
++	if !f.IsValid() || !f.CanSet() {
++		t.Fatalf("%T must expose a settable public field named %s", target, name)
++	}
++	want := reflect.ValueOf(value)
++	if !want.Type().AssignableTo(f.Type()) {
++		t.Fatalf("%T.%s has type %s; want %s", target, name, f.Type(), want.Type())
++	}
++	f.Set(want)
++}
++
++func codespecExportedField(t *testing.T, target interface{}, name string) interface{} {
++	t.Helper()
++	v := reflect.ValueOf(target)
++	if v.Kind() == reflect.Ptr {
++		if v.IsNil() {
++			t.Fatalf("cannot inspect %s on nil %T", name, target)
++		}
++		v = v.Elem()
++	}
++	f := v.FieldByName(name)
++	if !f.IsValid() || !f.CanInterface() {
++		t.Fatalf("%T must expose a public field named %s", target, name)
++	}
++	return f.Interface()
++}
++
++func codespecEncodeBody(t *testing.T, body encoder) []byte {
++	t.Helper()
++	encoded, err := encode(body, nil)
++	if err != nil {
++		t.Fatalf("encode failed: %v", err)
++	}
++	return encoded
++}
++
++func TestCodespecMetadataRequestVersionsAndFlags(t *testing.T) {
++	legacyBody := []byte{0xff, 0xff, 0xff, 0xff, 0x01}
++	for _, version := range []int16{6, 7} {
++		req := &MetadataRequest{Version: version, AllowAutoTopicCreation: true}
++		got := codespecEncodeBody(t, req)
++		if !bytes.Equal(got, legacyBody) {
++			t.Errorf("metadata request v%d body = %v; want v5-compatible %v", version, got, legacyBody)
++		}
++		decoded := &MetadataRequest{}
++		if err := versionedDecode(got, decoded, version); err != nil {
++			t.Fatalf("decode metadata request v%d: %v", version, err)
++		}
++		if !reflect.DeepEqual(decoded, req) {
++			t.Errorf("metadata request v%d round trip = %#v; want %#v", version, decoded, req)
++		}
++	}
++
++	flagCases := []struct {
++		name         string
++		clusterFlag  bool
++		topicFlag    bool
++		trailingWire []byte
++	}{
++		{"cluster-only", true, false, []byte{0x01, 0x00}},
++		{"topic-only", false, true, []byte{0x00, 0x01}},
++	}
++	for _, tc := range flagCases {
++		t.Run(tc.name, func(t *testing.T) {
++			req := &MetadataRequest{Version: 8, Topics: []string{"orders"}}
++			codespecSetExportedField(t, req, "IncludeClusterAuthorizedOperations", tc.clusterFlag)
++			codespecSetExportedField(t, req, "IncludeTopicAuthorizedOperations", tc.topicFlag)
++			wantV8 := append([]byte{
++				0x00, 0x00, 0x00, 0x01,
++				0x00, 0x06, 'o', 'r', 'd', 'e', 'r', 's',
++				0x00,
++			}, tc.trailingWire...)
++			encoded := codespecEncodeBody(t, req)
++			if !bytes.Equal(encoded, wantV8) {
++				t.Fatalf("metadata request v8 body = %v; want %v", encoded, wantV8)
++			}
++
++			decoded := &MetadataRequest{}
++			if err := versionedDecode(encoded, decoded, 8); err != nil {
++				t.Fatalf("decode v8 request: %v", err)
++			}
++			if !reflect.DeepEqual(decoded.Topics, []string{"orders"}) || decoded.AllowAutoTopicCreation {
++				t.Fatalf("decoded v8 base fields = %#v", decoded)
++			}
++			if got := codespecExportedField(t, decoded, "IncludeClusterAuthorizedOperations"); got != tc.clusterFlag {
++				t.Errorf("decoded IncludeClusterAuthorizedOperations = %v; want %v", got, tc.clusterFlag)
++			}
++			if got := codespecExportedField(t, decoded, "IncludeTopicAuthorizedOperations"); got != tc.topicFlag {
++				t.Errorf("decoded IncludeTopicAuthorizedOperations = %v; want %v", got, tc.topicFlag)
++			}
++		})
++	}
++
++	if _, err := encode(&MetadataRequest{Version: 9}, nil); err == nil {
++		t.Error("metadata request v9 encoded successfully; versions above 8 must remain unsupported")
++	}
++}
++
++func TestCodespecMetadataRequestMinimumBrokerVersions(t *testing.T) {
++	cases := []struct {
++		name          string
++		request       int16
++		brokerVersion KafkaVersion
++	}{
++		{"v6-before-2.0", 6, V1_1_1_0},
++		{"v7-before-2.1", 7, V2_0_1_0},
++		{"v8-before-2.3", 8, V2_2_0_0},
++	}
++	for i, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			mock := NewMockBroker(t, int32(50+i))
++			defer mock.Close()
++			mock.SetHandlerByMap(map[string]MockResponse{
++				"MetadataRequest": NewMockMetadataResponse(t),
++			})
++			broker := NewBroker(mock.Addr())
++			config := NewConfig()
++			config.Version = tc.brokerVersion
++			if err := broker.Open(config); err != nil {
++				t.Fatalf("open broker: %v", err)
++			}
++			defer safeClose(t, broker)
++			if _, err := broker.GetMetadata(&MetadataRequest{Version: tc.request}); err != ErrUnsupportedVersion {
++				t.Errorf("metadata v%d against Kafka %s returned %v; want ErrUnsupportedVersion", tc.request, tc.name, err)
++			}
++		})
++	}
++}
++
++func TestCodespecMetadataResponseV6Compatibility(t *testing.T) {
++	wire := []byte{
++		0x00, 0x00, 0x00, 0x05,
++		0x00, 0x00, 0x00, 0x00,
++		0x00, 0x09, 'c', 'l', 'u', 's', 't', 'e', 'r', 'I', 'd',
++		0x00, 0x00, 0x00, 0x02,
++		0x00, 0x00, 0x00, 0x00,
++	}
++	response := &MetadataResponse{}
++	if err := versionedDecode(wire, response, 6); err != nil {
++		t.Fatalf("decode v6 response: %v", err)
++	}
++	if response.Version != 6 || response.ThrottleTimeMs != 5 || response.ControllerID != 2 || response.ClusterID == nil || *response.ClusterID != "clusterId" {
++		t.Fatalf("decoded v6 response = %#v", response)
++	}
++	if got := codespecEncodeBody(t, response); !bytes.Equal(got, wire) {
++		t.Errorf("re-encoded v6 response = %v; want %v", got, wire)
++	}
++}
++
++func TestCodespecMetadataResponseV7LeaderEpoch(t *testing.T) {
++	wire := []byte{
++		0x00, 0x00, 0x00, 0x05,
++		0x00, 0x00, 0x00, 0x00,
++		0xff, 0xff,
++		0x00, 0x00, 0x00, 0x02,
++		0x00, 0x00, 0x00, 0x01,
++		0x00, 0x00,
++		0x00, 0x03, 'f', 'o', 'o',
++		0x00,
++		0x00, 0x00, 0x00, 0x01,
++		0x00, 0x04,
++		0x00, 0x00, 0x00, 0x01,
++		0x00, 0x00, 0x00, 0x07,
++		0x00, 0x00, 0x00, 0x09,
++		0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x02,
++		0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
++		0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x02,
++	}
++	response := &MetadataResponse{}
++	if err := versionedDecode(wire, response, 7); err != nil {
++		t.Fatalf("decode v7 response: %v", err)
++	}
++	if len(response.Topics) != 1 || len(response.Topics[0].Partitions) != 1 {
++		t.Fatalf("decoded v7 topics = %#v", response.Topics)
++	}
++	partition := response.Topics[0].Partitions[0]
++	if got := codespecExportedField(t, partition, "LeaderEpoch"); got != int32(9) {
++		t.Errorf("decoded LeaderEpoch = %v; want 9", got)
++	}
++	if got := codespecEncodeBody(t, response); !bytes.Equal(got, wire) {
++		t.Errorf("re-encoded v7 response = %v; want %v", got, wire)
++	}
++}
++
++func TestCodespecMetadataResponseV8AuthorizedOperations(t *testing.T) {
++	wire := []byte{
++		0x00, 0x00, 0x00, 0x03,
++		0x00, 0x00, 0x00, 0x00,
++		0xff, 0xff,
++		0x00, 0x00, 0x00, 0x02,
++		0x01, 0x02, 0x03, 0x04,
++		0x00, 0x00, 0x00, 0x01,
++		0x00, 0x00,
++		0x00, 0x03, 'f', 'o', 'o',
++		0x01,
++		0x00, 0x00, 0x00, 0x01,
++		0x00, 0x00,
++		0x00, 0x00, 0x00, 0x03,
++		0x00, 0x00, 0x00, 0x05,
++		0x00, 0x00, 0x00, 0x0b,
++		0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x05,
++		0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x05,
++		0x00, 0x00, 0x00, 0x00,
++		0x80, 0x00, 0x00, 0x00,
++	}
++	response := &MetadataResponse{}
++	if err := versionedDecode(wire, response, 8); err != nil {
++		t.Fatalf("decode v8 response: %v", err)
++	}
++	if got := codespecExportedField(t, response, "ClusterAuthorizedOperations"); got != int32(0x01020304) {
++		t.Errorf("decoded ClusterAuthorizedOperations = %v; want 0x01020304", got)
++	}
++	if len(response.Topics) != 1 || !response.Topics[0].IsInternal {
++		t.Fatalf("decoded v8 topics = %#v", response.Topics)
++	}
++	if len(response.Topics[0].Partitions) != 1 {
++		t.Fatalf("decoded v8 partitions = %#v", response.Topics[0].Partitions)
++	}
++	if got := codespecExportedField(t, response.Topics[0].Partitions[0], "LeaderEpoch"); got != int32(11) {
++		t.Errorf("decoded v8 LeaderEpoch = %v; want 11", got)
++	}
++	if got := codespecExportedField(t, response.Topics[0], "TopicAuthorizedOperations"); got != int32(-2147483648) {
++		t.Errorf("decoded TopicAuthorizedOperations = %v; want -2147483648", got)
++	}
++	if got := codespecEncodeBody(t, response); !bytes.Equal(got, wire) {
++		t.Errorf("re-encoded v8 response = %v; want %v", got, wire)
++	}
++}
++
++func TestCodespecMetadataClientVersionSelection(t *testing.T) {
++	cases := []struct {
++		name  string
++		kafka KafkaVersion
++		want  int16
++	}{
++		{"pre-0.10", V0_9_0_1, 0},
++		{"0.10", V0_10_0_0, 1},
++		{"0.11", V0_11_0_2, 1},
++		{"1.0", V1_0_0_0, 5},
++		{"1.1", V1_1_1_0, 5},
++		{"2.0", V2_0_0_0, 6},
++		{"2.1", V2_1_0_0, 7},
++		{"2.2", V2_2_0_0, 7},
++		{"2.3", V2_3_0_0, 8},
++		{"2.4", V2_4_0_0, 8},
++	}
++	for i, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			mock := NewMockBroker(t, int32(100+i))
++			defer mock.Close()
++			mock.SetHandlerByMap(map[string]MockResponse{
++				"MetadataRequest": NewMockMetadataResponse(t),
++			})
++			config := NewConfig()
++			config.Version = tc.kafka
++			config.Metadata.Retry.Max = 0
++			client, err := NewClient([]string{mock.Addr()}, config)
++			if err != nil {
++				t.Fatalf("NewClient: %v", err)
++			}
++			defer safeClose(t, client)
++
++			requests := codespecMetadataRequests(mock.History())
++			if len(requests) == 0 {
++				t.Fatal("client sent no metadata request")
++			}
++			got := requests[0]
++			if got.Version != tc.want {
++				t.Errorf("Kafka %s client metadata version = %d; want %d", tc.name, got.Version, tc.want)
++			}
++			if tc.want == 8 {
++				if value := codespecExportedField(t, got, "IncludeClusterAuthorizedOperations"); value != false {
++					t.Errorf("client requested cluster authorized operations: %v", value)
++				}
++				if value := codespecExportedField(t, got, "IncludeTopicAuthorizedOperations"); value != false {
++					t.Errorf("client requested topic authorized operations: %v", value)
++				}
++			}
++		})
++	}
++}
++
++func codespecMetadataRequests(history []RequestResponse) []*MetadataRequest {
++	var requests []*MetadataRequest
++	for _, exchange := range history {
++		if request, ok := exchange.Request.(*MetadataRequest); ok {
++			requests = append(requests, request)
++		}
++	}
++	return requests
++}
++
++func TestCodespecMetadataAdminVersionSelection(t *testing.T) {
++	cases := []struct {
++		name  string
++		kafka KafkaVersion
++		want  int16
++	}{
++		{"1.0", V1_0_0_0, 5},
++		{"1.1", V1_1_1_0, 5},
++		{"2.0", V2_0_0_0, 6},
++		{"2.1", V2_1_0_0, 7},
++		{"2.2", V2_2_0_0, 7},
++		{"2.3", V2_3_0_0, 8},
++		{"2.4", V2_4_0_0, 8},
++	}
++	for caseIndex, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			mock := NewMockBroker(t, int32(200+caseIndex))
++			defer mock.Close()
++			mock.SetHandlerByMap(map[string]MockResponse{
++				"MetadataRequest": NewMockMetadataResponse(t).
++					SetController(mock.BrokerID()).
++					SetBroker(mock.Addr(), mock.BrokerID()),
++			})
++			config := NewConfig()
++			config.Version = tc.kafka
++			config.Metadata.Retry.Max = 0
++			admin, err := NewClusterAdmin([]string{mock.Addr()}, config)
++			if err != nil {
++				t.Fatalf("NewClusterAdmin: %v", err)
++			}
++			defer safeClose(t, admin)
++			if _, err := admin.DescribeTopics([]string{"orders"}); err != nil {
++				t.Fatalf("DescribeTopics: %v", err)
++			}
++			if _, _, err := admin.DescribeCluster(); err != nil {
++				t.Fatalf("DescribeCluster: %v", err)
++			}
++
++			requests := codespecMetadataRequests(mock.History())
++			if len(requests) != 3 {
++				t.Fatalf("metadata request count = %d; want initial refresh plus two admin calls", len(requests))
++			}
++			for i, request := range requests {
++				if request.Version != tc.want {
++					t.Errorf("metadata request %d version = %d; want %d", i, request.Version, tc.want)
++				}
++				if tc.want == 8 {
++					if value := codespecExportedField(t, request, "IncludeClusterAuthorizedOperations"); value != false {
++						t.Errorf("metadata request %d cluster flag = %v; want false", i, value)
++					}
++					if value := codespecExportedField(t, request, "IncludeTopicAuthorizedOperations"); value != false {
++						t.Errorf("metadata request %d topic flag = %v; want false", i, value)
++					}
++				}
++			}
++		})
++	}
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,4 @@
++#!/bin/bash
++set -euo pipefail
++
++go test -count=1 -run '^(TestCodespecMetadata.*|TestMetadataRequestV[0-5]|TestEmptyMetadataResponseV0|TestMetadataResponseWithBrokersV1|TestMetadataResponseWithOfflineReplicasV5)$' .

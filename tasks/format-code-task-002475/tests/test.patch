@@ -1,0 +1,579 @@
+diff --git a/usercase-test-coderl/listview-states.test.js b/usercase-test-coderl/listview-states.test.js
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/listview-states.test.js
+@@ -0,0 +1,532 @@
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++const assert = require("assert");
++const childProcess = require("child_process");
++const fs = require("fs");
++const Module = require("module");
++const path = require("path");
++
++function installSourceHarness() {
++  if (global.__USERCASE_LISTVIEW_HARNESS__) return;
++  global.__USERCASE_LISTVIEW_HARNESS__ = true;
++
++  require.extensions[".scss"] = function ignoreScss(module) {
++    module.exports = {};
++  };
++
++  const originalResolve = Module._resolveFilename;
++  const originalLoad = Module._load;
++
++  function isFile(candidate) {
++    try {
++      return fs.statSync(candidate).isFile();
++    } catch (_) {
++      return false;
++    }
++  }
++
++  function resolveSourceFile(base) {
++    const candidates = [
++      base,
++      `${base}.tsx`,
++      `${base}.ts`,
++      `${base}.jsx`,
++      `${base}.js`,
++      path.join(base, "index.tsx"),
++      path.join(base, "index.ts"),
++      path.join(base, "index.js"),
++    ];
++    return candidates.find(isFile) || base;
++  }
++
++  Module._resolveFilename = function resolveWorkspaceSource(request, parent, isMain, options) {
++    if (request === "components") {
++      return "/workspace/repo/src/components/index.ts";
++    }
++    if (request.startsWith("components/")) {
++      return resolveSourceFile(path.join("/workspace/repo/src/components", request.slice("components/".length)));
++    }
++    if (
++      (request.startsWith("./") || request.startsWith("../")) &&
++      parent &&
++      parent.filename &&
++      parent.filename.startsWith("/workspace/repo/src/")
++    ) {
++      return resolveSourceFile(path.resolve(path.dirname(parent.filename), request));
++    }
++    return originalResolve.call(this, request, parent, isMain, options);
++  };
++
++  function makeSelectorQuery() {
++    return {
++      in() {
++        return this;
++      },
++      select() {
++        return this;
++      },
++      selectAll() {
++        return this;
++      },
++      boundingClientRect() {
++        return this;
++      },
++      exec(cb) {
++        if (cb) cb([[]]);
++      },
++    };
++  }
++
++  const taro = {
++    getEnv: () => "WEAPP",
++    createSelectorQuery: makeSelectorQuery,
++    Current: {},
++    eventCenter: { on() {}, off() {}, trigger() {} },
++  };
++
++  Module._load = function loadHarnessModule(request, parent, isMain) {
++    if (request === "@tarojs/components") {
++      return { View: "View", ScrollView: "ScrollView" };
++    }
++    if (request === "@tarojs/taro") {
++      return Object.assign({ default: taro }, taro);
++    }
++    return originalLoad.call(this, request, parent, isMain);
++  };
++
++  require("@babel/register")({
++    cache: false,
++    babelrc: false,
++    configFile: false,
++    cwd: "/workspace/repo",
++    extensions: [".js", ".jsx", ".ts", ".tsx"],
++    ignore: [/node_modules/],
++    presets: [
++      [require.resolve("@babel/preset-typescript"), { isTSX: true, allExtensions: true }],
++      [require.resolve("@babel/preset-react"), { runtime: "classic" }],
++    ],
++    plugins: [require.resolve("@babel/plugin-transform-modules-commonjs")],
++  });
++}
++
++installSourceHarness();
++
++const React = require("react");
++const ReactDOMServer = require("react-dom/server");
++const { ListView } = require("/workspace/repo/src/index.ts");
++const DEFAULT_ERROR_TEXT = "啊哦，网络悄悄跑到外星球去了~";
++const RETRY_TEXT = "重新加载";
++
++function renderSummary(props) {
++  const summary = renderWithCapturedEvents(props);
++  return {
++    html: summary.html,
++    textContent: summary.textContent,
++    visibleTextContent: summary.visibleTextContent,
++    clickTexts: summary.clickTexts,
++  };
++}
++
++function decodeHtml(value) {
++  return String(value)
++    .replace(/&nbsp;/g, " ")
++    .replace(/&amp;/g, "&")
++    .replace(/&lt;/g, "<")
++    .replace(/&gt;/g, ">")
++    .replace(/&quot;/g, '"')
++    .replace(/&#x27;/g, "'")
++    .replace(/&#(\d+);/g, (_, code) => String.fromCharCode(Number(code)));
++}
++
++function textFromHtml(html) {
++  return decodeHtml(String(html).replace(/<[^>]*>/g, ""));
++}
++
++function visibleTextFromHtml(html) {
++  const tokens = String(html).match(/<[^>]+>|[^<]+/g) || [];
++  const hiddenStack = [];
++  let text = "";
++  for (const token of tokens) {
++    if (token.startsWith("<")) {
++      if (/^<\//.test(token)) {
++        hiddenStack.pop();
++        continue;
++      }
++      const styleMatch = token.match(/\sstyle="([^"]*)"/);
++      const style = styleMatch ? styleMatch[1].replace(/\s/g, "").toLowerCase() : "";
++      const selfHidden =
++        /\shidden(?:\s|=|>)/i.test(token) ||
++        style.includes("display:none") ||
++        style.includes("visibility:hidden") ||
++        style.includes("opacity:0");
++      const parentHidden = hiddenStack.length > 0 && hiddenStack[hiddenStack.length - 1];
++      const selfClosing = /\/>$/.test(token);
++      if (!selfClosing) hiddenStack.push(Boolean(parentHidden || selfHidden));
++    } else if (!(hiddenStack.length > 0 && hiddenStack[hiddenStack.length - 1])) {
++      text += token;
++    }
++  }
++  return decodeHtml(text);
++}
++
++function textOfReactNode(node) {
++  if (node == null || node === false) return "";
++  if (typeof node === "string" || typeof node === "number") return String(node);
++  if (Array.isArray(node)) return node.map(textOfReactNode).join("");
++  if (React.isValidElement(node)) return textOfReactNode(node.props && node.props.children);
++  return "";
++}
++
++function renderWithCapturedEvents(props) {
++  const merged = Object.assign({}, ListView.defaultProps || {}, props);
++  const clickTargets = [];
++  const originalCreateElement = React.createElement;
++  const originalConsoleError = console.error;
++  React.createElement = function captureCreateElement(type, elementProps, ...children) {
++    const element = originalCreateElement.apply(this, arguments);
++    if (elementProps && typeof elementProps.onClick === "function") {
++      clickTargets.push({
++        text: textOfReactNode(children.length <= 1 ? children[0] : children),
++        onClick: elementProps.onClick,
++      });
++    }
++    return element;
++  };
++  console.error = (...args) => {
++    if (String(args[0] || "").startsWith("Warning:")) return;
++    originalConsoleError.apply(console, args);
++  };
++  try {
++    const html = ReactDOMServer.renderToStaticMarkup(React.createElement(ListView, merged));
++    return {
++      html,
++      textContent: textFromHtml(html),
++      visibleTextContent: visibleTextFromHtml(html),
++      clickTargets,
++      clickTexts: clickTargets.map((target) => target.text),
++    };
++  } finally {
++    React.createElement = originalCreateElement;
++    console.error = originalConsoleError;
++  }
++}
++
++function assertVisibleText(summary, text) {
++  assert(
++    summary.visibleTextContent.includes(text),
++    `expected visible text ${JSON.stringify(text)} in ${JSON.stringify(summary.visibleTextContent)}`
++  );
++}
++
++function assertNoVisibleText(summary, text) {
++  assert(
++    !summary.visibleTextContent.includes(text),
++    `did not expect visible text ${JSON.stringify(text)} in ${JSON.stringify(summary.visibleTextContent)}`
++  );
++}
++
++function assertClickText(summary, text) {
++  assert(
++    summary.clickTexts.includes(text),
++    `expected click target ${JSON.stringify(text)} in ${JSON.stringify(summary.clickTexts)}`
++  );
++}
++
++const tests = [];
++function test(name, fn) {
++  tests.push({ name, fn });
++}
++
++test("default empty state hides children and loading footer", () => {
++
++
++
++
++  const actual = renderSummary({
++    isEmpty: true,
++    isError: false,
++    emptyText: "No orders yet",
++    hasMore: true,
++    footerLoadingText: "Loading more",
++    children: React.createElement("Row", { className: "normal-row" }, "normal row"),
++    launch: {},
++  });
++
++  assertVisibleText(actual, "No orders yet");
++  assertNoVisibleText(actual, "normal row");
++  assertNoVisibleText(actual, "Loading more");
++  assertNoVisibleText(actual, DEFAULT_ERROR_TEXT);
++  assert(!actual.clickTexts.includes(RETRY_TEXT));
++});
++
++test("custom empty state works in autoHeight and hides loaded footer", () => {
++
++
++
++
++  const actual = renderSummary({
++    autoHeight: true,
++    isEmpty: true,
++    isError: false,
++    emptyText: "No orders yet",
++    hasMore: false,
++    footerLoadedText: "All loaded",
++    children: React.createElement("Row", { className: "normal-row" }, "normal row"),
++    launch: { launchEmpty: true },
++    renderEmpty: React.createElement("EmptyCustom", { className: "custom-empty" }, "Custom empty panel"),
++  });
++
++  assertVisibleText(actual, "Custom empty panel");
++  assertNoVisibleText(actual, "No orders yet");
++  assertNoVisibleText(actual, "normal row");
++  assertNoVisibleText(actual, "All loaded");
++  assertNoVisibleText(actual, DEFAULT_ERROR_TEXT);
++  assert(!actual.clickTexts.includes(RETRY_TEXT));
++});
++
++test("default error state takes precedence over empty and exposes retry", () => {
++
++
++
++
++  const actual = renderSummary({
++    isEmpty: true,
++    isError: true,
++    emptyText: "No orders yet",
++    hasMore: true,
++    footerLoadingText: "Loading more",
++    children: React.createElement("Row", { className: "normal-row" }, "normal row"),
++    launch: {},
++  });
++
++  assertVisibleText(actual, DEFAULT_ERROR_TEXT);
++  assertVisibleText(actual, RETRY_TEXT);
++  assertClickText(actual, RETRY_TEXT);
++  assertNoVisibleText(actual, "No orders yet");
++  assertNoVisibleText(actual, "normal row");
++  assertNoVisibleText(actual, "Loading more");
++});
++
++test("custom error state wins over custom empty in autoHeight", () => {
++
++
++
++
++  const actual = renderSummary({
++    autoHeight: true,
++    isEmpty: true,
++    isError: true,
++    emptyText: "No orders yet",
++    hasMore: false,
++    footerLoadedText: "All loaded",
++    children: React.createElement("Row", { className: "normal-row" }, "normal row"),
++    launch: { launchError: true, launchEmpty: true },
++    renderError: React.createElement("ErrorCustom", { className: "custom-error" }, "Custom error panel"),
++    renderEmpty: React.createElement("EmptyCustom", { className: "custom-empty" }, "Custom empty panel"),
++  });
++
++  assertVisibleText(actual, "Custom error panel");
++  assertNoVisibleText(actual, "Custom empty panel");
++  assertNoVisibleText(actual, "No orders yet");
++  assertNoVisibleText(actual, "normal row");
++  assertNoVisibleText(actual, "All loaded");
++  assertNoVisibleText(actual, DEFAULT_ERROR_TEXT);
++  assert(!actual.clickTexts.includes(RETRY_TEXT));
++});
++
++test("error state is visible while isLoaded is false", () => {
++
++
++
++
++  const actual = renderSummary({
++    isError: true,
++    isLoaded: false,
++    hasMore: true,
++    children: React.createElement("Row", null, "normal row"),
++    launch: {},
++  });
++
++  assertVisibleText(actual, DEFAULT_ERROR_TEXT);
++  assertVisibleText(actual, RETRY_TEXT);
++  assertClickText(actual, RETRY_TEXT);
++  assertNoVisibleText(actual, "normal row");
++});
++
++test("normal loaded footer still renders when no empty or error state is active", () => {
++
++
++
++
++  const actual = renderSummary({
++    isEmpty: false,
++    isError: false,
++    hasMore: false,
++    footerLoadedText: "All loaded",
++    children: React.createElement("Row", { className: "normal-row" }, "normal row"),
++    launch: {},
++  });
++
++  assertVisibleText(actual, "normal row");
++  assertVisibleText(actual, "All loaded");
++  assertNoVisibleText(actual, DEFAULT_ERROR_TEXT);
++  assert(!actual.clickTexts.includes(RETRY_TEXT));
++});
++
++test("normal loading footer still renders when no empty or error state is active", () => {
++
++
++
++
++  const actual = renderSummary({
++    isEmpty: false,
++    isError: false,
++    hasMore: true,
++    footerLoadingText: "Loading more",
++    children: React.createElement("Row", { className: "normal-row" }, "normal row"),
++    launch: {},
++  });
++
++  assertVisibleText(actual, "normal row");
++  assertVisibleText(actual, "Loading more");
++  assertNoVisibleText(actual, DEFAULT_ERROR_TEXT);
++  assert(!actual.clickTexts.includes(RETRY_TEXT));
++});
++
++test("retry control invokes the refresh flow", async () => {
++
++
++
++
++  let refreshCalls = 0;
++  const actual = renderWithCapturedEvents({
++    isError: true,
++    onPullDownRefresh: async () => {
++      refreshCalls += 1;
++      return "ok";
++    },
++    launch: {},
++  });
++
++  assertVisibleText(actual, DEFAULT_ERROR_TEXT);
++  assertClickText(actual, RETRY_TEXT);
++  const clickRetry = actual.clickTargets.find((target) => target.text === RETRY_TEXT);
++  assert(clickRetry, "expected retry click target to be captured");
++  assert.strictEqual(typeof clickRetry.onClick, "function");
++  await clickRetry.onClick();
++  assert.strictEqual(refreshCalls, 1);
++});
++
++test("referential transparency for identical props", () => {
++  const props = {
++    isEmpty: true,
++    isError: false,
++    emptyText: "Stable empty",
++    hasMore: true,
++    footerLoadingText: "Loading more",
++    children: React.createElement("Row", { className: "normal-row" }, "normal row"),
++    launch: {},
++  };
++
++  for (const actual of [renderSummary(props), renderSummary(props)]) {
++    assertVisibleText(actual, "Stable empty");
++    assertNoVisibleText(actual, "normal row");
++    assertNoVisibleText(actual, "Loading more");
++  }
++});
++
++test("does not mutate caller props", () => {
++  const props = {
++    isEmpty: true,
++    isError: false,
++    emptyText: "Mutation empty",
++    hasMore: false,
++    footerLoadedText: "Done",
++    launch: { launchEmpty: false },
++    children: "caller child",
++  };
++  const actual = renderSummary(props);
++
++  assertVisibleText(actual, "Mutation empty");
++  assertNoVisibleText(actual, "caller child");
++  assertNoVisibleText(actual, "Done");
++});
++
++test("fresh process render matches in-process render", () => {
++  const props = {
++    isEmpty: true,
++    isError: true,
++    emptyText: "Fresh process empty",
++    hasMore: true,
++    footerLoadingText: "Loading more",
++    children: React.createElement("Row", { className: "normal-row" }, "normal row"),
++    launch: {},
++  };
++  const inProcess = renderSummary(props);
++  const childOutput = childProcess.execFileSync(process.execPath, [__filename, "--child-summary"], {
++    cwd: "/workspace/repo",
++    encoding: "utf8",
++  });
++  const childSummary = JSON.parse(childOutput);
++
++  for (const actual of [inProcess, childSummary]) {
++    assertVisibleText(actual, DEFAULT_ERROR_TEXT);
++    assertVisibleText(actual, RETRY_TEXT);
++    assertNoVisibleText(actual, "Fresh process empty");
++    assertNoVisibleText(actual, "normal row");
++    assertNoVisibleText(actual, "Loading more");
++  }
++});
++
++test("default empty state works with minimal props", () => {
++  const actual = renderSummary({
++    isEmpty: true,
++    isError: false,
++    emptyText: "Minimal empty",
++    hasMore: true,
++    launch: {},
++  });
++
++  assertVisibleText(actual, "Minimal empty");
++  assertNoVisibleText(actual, DEFAULT_ERROR_TEXT);
++  assert(!actual.clickTexts.includes(RETRY_TEXT));
++});
++
++async function runTests() {
++  if (process.argv[2] === "--child-summary") {
++    const summary = renderSummary({
++      isEmpty: true,
++      isError: true,
++      emptyText: "Fresh process empty",
++      hasMore: true,
++      footerLoadingText: "Loading more",
++      children: React.createElement("Row", { className: "normal-row" }, "normal row"),
++      launch: {},
++    });
++    process.stdout.write(JSON.stringify(summary));
++    return;
++  }
++
++  for (const entry of tests) {
++    await entry.fn();
++    process.stdout.write(`ok - ${entry.name}\n`);
++  }
++  process.stdout.write(`${tests.length} tests passed\n`);
++}
++
++runTests().catch((error) => {
++  console.error(error && error.stack ? error.stack : error);
++  process.exit(1);
++});
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,37 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++export npm_config_offline=true
++export npm_config_audit=false
++export npm_config_fund=false
++export YARN_ENABLE_NETWORK=0
++
++if [ ! -d node_modules ]; then
++  echo "node_modules is required for offline test execution" >&2
++  exit 1
++fi
++
++node - <<'NODE'
++const required = [
++  "@babel/register",
++  "@babel/preset-typescript",
++  "@babel/preset-react",
++  "@babel/plugin-transform-modules-commonjs",
++  "@babel/runtime/helpers/interopRequireDefault",
++  "react",
++  "classnames",
++];
++for (const id of required) {
++  require.resolve(id);
++}
++NODE
++exec node /workspace/repo/usercase-test-coderl/listview-states.test.js

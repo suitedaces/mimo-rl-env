@@ -1,0 +1,2 @@
+Support signs for number format spec?
+Would it be possible to allow numeric fields to include a sign? e.g. `parse.parse("{:+05d}", "+1234")`.  I realize that `parse` handles signs just fine without even having to specify the sign, but this request is so that the same string can be used both for parsing and for formatting; in other words, I am suggesting that a leading sign in the field spec just be ignored.

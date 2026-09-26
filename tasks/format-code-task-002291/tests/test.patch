@@ -1,0 +1,321 @@
+diff --git a/test/backend/Datastores.spec.js b/test/backend/Datastores.spec.js
+index 12e1fed..90ca163 100644
+--- a/test/backend/Datastores.spec.js
++++ b/test/backend/Datastores.spec.js
+@@ -1,8 +1,10 @@
+ import {expect, assert} from 'chai';
+-import {head, last, range} from 'ramda';
++import {head, last, merge, range} from 'ramda';
++import Sequelize from 'sequelize';
+ 
+ import {
+     sqlConnections,
++    mssqlConnection,
+     elasticsearchConnections,
+     publicReadableS3Connections,
+     apacheDrillConnections,
+@@ -77,6 +79,71 @@ describe('SQL - ', function () {
+ 
+ });
+ 
++function expectDialectOption(options, key, expectedValue) {
++    expect(options).to.have.property('dialectOptions');
++    expect(options.dialectOptions).to.have.property(key, expectedValue);
++}
++
++function captureNextQueryOptions(run) {
++    const originalQuery = Sequelize.prototype.query;
++    const capturedOptions = [];
++
++    Sequelize.prototype.query = function patchedQuery() {
++        capturedOptions.push(this.options);
++        return Promise.resolve([]);
++    };
++
++    return Promise.resolve()
++        .then(run)
++        .then(() => capturedOptions)
++        .then(captured => {
++            Sequelize.prototype.query = originalQuery;
++            return captured;
++        }, error => {
++            Sequelize.prototype.query = originalQuery;
++            throw error;
++        });
++}
++
++describe('MSSQL timeout configuration - ', function () {
++    it('passes_mssql_timeout_options_to_connection_driver', function () {
++        const firstConnection = merge(mssqlConnection, {
++            connectTimeout: 18000,
++            requestTimeout: 22000
++        });
++        const secondConnection = merge(mssqlConnection, {
++            connectTimeout: 31000,
++            requestTimeout: 45000
++        });
++        const thirdConnection = merge(mssqlConnection, {
++            connectTimeout: 12000,
++            requestTimeout: 34000
++        });
++        const previousNodeEnv = process.env.NODE_ENV;
++
++        process.env.NODE_ENV = 'production';
++
++        return captureNextQueryOptions(() => (
++            query('select 1', firstConnection)
++                .then(() => query('select 1', secondConnection))
++                .then(() => query('select 1', thirdConnection))
++        )).then(capturedOptions => {
++            process.env.NODE_ENV = previousNodeEnv;
++            expect(capturedOptions).to.have.length(3);
++
++            expectDialectOption(capturedOptions[0], 'connectTimeout', 18000);
++            expectDialectOption(capturedOptions[0], 'requestTimeout', 22000);
++            expectDialectOption(capturedOptions[1], 'connectTimeout', 31000);
++            expectDialectOption(capturedOptions[1], 'requestTimeout', 45000);
++            expectDialectOption(capturedOptions[2], 'connectTimeout', 12000);
++            expectDialectOption(capturedOptions[2], 'requestTimeout', 34000);
++        }, error => {
++            process.env.NODE_ENV = previousNodeEnv;
++            throw error;
++        });
++    });
++});
++
+ 
+ describe('Elasticsearch - ', function () {
+     it('connect connects to an index', function(done) {
+diff --git a/test/components/UserConnections.spec.js b/test/components/UserConnections.spec.js
+new file mode 100644
+index 0000000..fce818a
+--- /dev/null
++++ b/test/components/UserConnections.spec.js
+@@ -0,0 +1,186 @@
++import React from 'react';
++import ReactDOM from 'react-dom';
++import TestUtils from 'react-addons-test-utils';
++import {expect} from 'chai';
++
++import {DIALECTS} from '../../app/constants/constants';
++
++const electronDialog = {
++    showOpenDialog(options, callback) {
++        callback(['/tmp/falcon.sqlite']);
++    }
++};
++
++window.require = () => ({
++    remote: {
++        dialog: electronDialog
++    }
++});
++
++const UserConnectionsModule = require(
++    '../../app/components/Settings/UserConnections/UserConnections.react'
++);
++const UserConnections = UserConnectionsModule.default || UserConnectionsModule;
++
++function renderConnectionForm(connectionOverrides = {}, updateConnection = () => {}) {
++    const connectionObject = Object.assign({
++        dialect: DIALECTS.MSSQL,
++        username: 'sa',
++        password: 'secret',
++        host: 'localhost',
++        port: '1433',
++        database: 'falcon'
++    }, connectionOverrides);
++
++    const component = TestUtils.renderIntoDocument(
++        <UserConnections
++            connectionObject={connectionObject}
++            updateConnection={updateConnection}
++        />
++    );
++
++    return ReactDOM.findDOMNode(component);
++}
++
++function byId(root, id) {
++    return root.querySelector(`#${id}`);
++}
++
++function changeInput(input, value) {
++    TestUtils.Simulate.change(input, {target: {value}});
++}
++
++function cleanText(text) {
++    return (text || '').replace(/\s+/g, ' ').trim();
++}
++
++function fieldText(root, input) {
++    let node = input;
++    let best = '';
++    while (node && node !== root.parentNode) {
++        const text = cleanText(node.textContent);
++        if (text.length > best.length && text.length < 250) {
++            best = text;
++        }
++        if (node === root) {
++            break;
++        }
++        node = node.parentNode;
++    }
++    return best;
++}
++
++function expectReadableFieldText(root, input, rawKey) {
++    const text = fieldText(root, input);
++    expect(text.length).to.be.above(rawKey.length);
++    expect(text).to.not.equal(rawKey);
++    expect(text.toLowerCase()).to.not.equal(rawKey.toLowerCase());
++    expect(text.indexOf(' ')).to.be.above(-1);
++}
++
++describe('UserConnections MSSQL timeout fields - ', function () {
++    it('renders_mssql_timeout_fields', function () {
++        const updates = [];
++        const root = renderConnectionForm({}, update => updates.push(update));
++
++        const connectTimeout = byId(root, 'test-input-connectTimeout');
++        const requestTimeout = byId(root, 'test-input-requestTimeout');
++
++        expect(connectTimeout).to.exist;
++        expect(requestTimeout).to.exist;
++        expect(connectTimeout.tagName.toLowerCase()).to.equal('input');
++        expect(requestTimeout.tagName.toLowerCase()).to.equal('input');
++        expect(connectTimeout.getAttribute('type')).to.equal('number');
++        expect(requestTimeout.getAttribute('type')).to.equal('number');
++
++        changeInput(connectTimeout, '31000');
++        changeInput(requestTimeout, '45000');
++
++        expect(updates).to.deep.include({connectTimeout: '31000'});
++        expect(updates).to.deep.include({requestTimeout: '45000'});
++
++        const previousNodeEnv = process.env.NODE_ENV;
++        process.env.NODE_ENV = 'production';
++        try {
++            const productionRoot = renderConnectionForm({
++                database: 'customerdb',
++                host: 'remote-sql.example.com'
++            });
++            const productionConnectTimeout = byId(productionRoot, 'test-input-connectTimeout');
++            const productionRequestTimeout = byId(productionRoot, 'test-input-requestTimeout');
++
++            expect(productionConnectTimeout).to.exist;
++            expect(productionRequestTimeout).to.exist;
++            expect(productionConnectTimeout.getAttribute('type')).to.equal('number');
++            expect(productionRequestTimeout.getAttribute('type')).to.equal('number');
++        } finally {
++            process.env.NODE_ENV = previousNodeEnv;
++        }
++    });
++
++    it('renders_clearer_field_information', function () {
++        const root = renderConnectionForm();
++        const portInput = byId(root, 'test-input-port');
++        const connectTimeout = byId(root, 'test-input-connectTimeout');
++        const requestTimeout = byId(root, 'test-input-requestTimeout');
++
++        expectReadableFieldText(root, portInput, 'port');
++        expectReadableFieldText(root, connectTimeout, 'connectTimeout');
++        expectReadableFieldText(root, requestTimeout, 'requestTimeout');
++
++        const s3Root = renderConnectionForm({
++            dialect: DIALECTS.S3,
++            bucket: '',
++            accessKeyId: '',
++            secretAccessKey: ''
++        });
++
++        expectReadableFieldText(
++            s3Root,
++            byId(s3Root, 'test-input-accessKeyId'),
++            'accessKeyId'
++        );
++        expectReadableFieldText(
++            s3Root,
++            byId(s3Root, 'test-input-secretAccessKey'),
++            'secretAccessKey'
++        );
++    });
++
++    it('uses_appropriate_controls_without_regressing_path_fields', function () {
++        const mssqlRoot = renderConnectionForm();
++        const passwordInput = byId(mssqlRoot, 'test-input-password');
++        const portInput = byId(mssqlRoot, 'test-input-port');
++        const connectTimeout = byId(mssqlRoot, 'test-input-connectTimeout');
++
++        expect(passwordInput).to.exist;
++        expect(passwordInput.getAttribute('type')).to.equal('password');
++        expect(portInput).to.exist;
++        expect(portInput.getAttribute('type')).to.equal('number');
++        expect(connectTimeout).to.exist;
++        expect(connectTimeout.getAttribute('type')).to.equal('number');
++
++        const previousNodeEnv = process.env.NODE_ENV;
++        process.env.NODE_ENV = 'production';
++        try {
++            const productionRoot = renderConnectionForm();
++            const productionPassword = byId(productionRoot, 'test-input-password');
++            const productionPort = byId(productionRoot, 'test-input-port');
++
++            expect(productionPassword).to.exist;
++            expect(productionPassword.getAttribute('type')).to.equal('password');
++            expect(productionPort).to.exist;
++            expect(productionPort.getAttribute('type')).to.equal('number');
++        } finally {
++            process.env.NODE_ENV = previousNodeEnv;
++        }
++
++        const sqliteRoot = renderConnectionForm({
++            dialect: DIALECTS.SQLITE,
++            storage: ''
++        });
++
++        const storageInput = byId(sqliteRoot, 'test-input-storage');
++        expect(storageInput).to.exist;
++    });
++});
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,36 @@
++#!/bin/bash
++set -uo pipefail
++cd /testbed
++
++
++dev-switch node 20 2>/dev/null || true
++if [ ! -x /testbed/node_modules/.bin/mocha ]; then
++  npm install --legacy-peer-deps --ignore-scripts 2>&1 | tail -5
++fi
++
++
++case "${1:-}" in
++  base)
++    NODE_ENV=test BABEL_DISABLE_CACHE=1 \
++      /testbed/node_modules/.bin/mocha \
++      --compilers js:babel-register \
++      test/backend/parse.spec.js test/backend/settings.spec.js
++    ;;
++  new)
++    NODE_ENV=test BABEL_DISABLE_CACHE=1 \
++      /testbed/node_modules/.bin/mocha \
++      --compilers js:babel-register \
++      test/backend/Datastores.spec.js \
++      --grep "MSSQL timeout configuration" && \
++    NODE_ENV=test BABEL_DISABLE_CACHE=1 \
++      /testbed/node_modules/.bin/mocha \
++      --compilers js:babel-register \
++      --require ./test/setup.js \
++      test/components/UserConnections.spec.js \
++      --grep "UserConnections MSSQL timeout fields"
++    ;;
++  *)
++    echo "usage: $0 base|new"
++    exit 2
++    ;;
++esac

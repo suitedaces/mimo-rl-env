@@ -1,0 +1,374 @@
+diff --git a/lib/lru/lru_codespec_test.go b/lib/lru/lru_codespec_test.go
+new file mode 100644
+index 0000000..5784f7d
+--- /dev/null
++++ b/lib/lru/lru_codespec_test.go
+@@ -0,0 +1,358 @@
++package lru_test
++
++import (
++	"fmt"
++	"reflect"
++	"strings"
++	"sync"
++	"testing"
++
++	"awesome-golang-algorithm/lib/lru"
++)
++
++type sizedString string
++
++func (s sizedString) Len() int { return len(s) }
++
++type byteCache interface {
++	Bytes() int64
++}
++
++type peekCache interface {
++	Peek(string) (lru.Value, bool)
++}
++
++type removeCache interface {
++	Remove(string) bool
++}
++
++type purgeCache interface {
++	Purge()
++}
++
++type resizeCache interface {
++	Resize(int64) int
++}
++
++type extendedCache interface {
++	byteCache
++	peekCache
++	removeCache
++	purgeCache
++	resizeCache
++}
++
++func requireBytes(t *testing.T, c *lru.Cache) byteCache {
++	t.Helper()
++	api, ok := any(c).(byteCache)
++	if !ok {
++		t.Fatalf("Cache must expose Bytes() int64")
++	}
++	return api
++}
++
++func requirePeek(t *testing.T, c *lru.Cache) peekCache {
++	t.Helper()
++	api, ok := any(c).(peekCache)
++	if !ok {
++		t.Fatalf("Cache must expose Peek(string) (Value, bool)")
++	}
++	return api
++}
++
++func requireRemove(t *testing.T, c *lru.Cache) removeCache {
++	t.Helper()
++	api, ok := any(c).(removeCache)
++	if !ok {
++		t.Fatalf("Cache must expose Remove(string) bool")
++	}
++	return api
++}
++
++func requirePurge(t *testing.T, c *lru.Cache) purgeCache {
++	t.Helper()
++	api, ok := any(c).(purgeCache)
++	if !ok {
++		t.Fatalf("Cache must expose Purge()")
++	}
++	return api
++}
++
++func requireResize(t *testing.T, c *lru.Cache) resizeCache {
++	t.Helper()
++	api, ok := any(c).(resizeCache)
++	if !ok {
++		t.Fatalf("Cache must expose Resize(int64) int")
++	}
++	return api
++}
++
++func requireExtended(t *testing.T, c *lru.Cache) extendedCache {
++	t.Helper()
++	api, ok := any(c).(extendedCache)
++	if !ok {
++		t.Fatalf("Cache must expose the complete lifecycle API")
++	}
++	return api
++}
++
++func assertValue(t *testing.T, value lru.Value, ok bool, want string) {
++	t.Helper()
++	if !ok {
++		t.Fatalf("expected cached value %q, got a miss", want)
++	}
++	got, typeOK := value.(sizedString)
++	if !typeOK || string(got) != want {
++		t.Fatalf("cached value = %#v, want sizedString(%q)", value, want)
++	}
++}
++
++func TestCodespecExtendedAPISurface(t *testing.T) {
++	c := lru.New(0, nil)
++	requireExtended(t, c)
++}
++
++func TestCodespecReplacementAccountingAndRecency(t *testing.T) {
++	var evicted []string
++	c := lru.New(10, func(key string, value lru.Value) {
++		evicted = append(evicted, fmt.Sprintf("%s=%s", key, value.(sizedString)))
++	})
++	bytes := requireBytes(t, c)
++	peek := requirePeek(t, c)
++
++	c.Add("a", sizedString("1111"))
++	c.Add("b", sizedString("2222"))
++	if got := bytes.Bytes(); got != 10 {
++		t.Fatalf("Bytes after two inserts = %d, want 10", got)
++	}
++
++	c.Add("a", sizedString("x"))
++	if got := bytes.Bytes(); got != 7 {
++		t.Fatalf("Bytes after shrinking replacement = %d, want 7", got)
++	}
++	if len(evicted) != 0 {
++		t.Fatalf("replacement unexpectedly invoked OnEvicted for %v", evicted)
++	}
++
++	c.Add("c", sizedString("zz"))
++	if got := bytes.Bytes(); got != 10 || c.Len() != 3 {
++		t.Fatalf("exact-capacity cache has Bytes=%d Len=%d, want 10 and 3", got, c.Len())
++	}
++
++	c.Add("a", sizedString("1234567"))
++	if got := bytes.Bytes(); got != 8 || c.Len() != 1 {
++		t.Fatalf("after growing replacement Bytes=%d Len=%d, want 8 and 1", got, c.Len())
++	}
++	value, ok := peek.Peek("a")
++	assertValue(t, value, ok, "1234567")
++	if !reflect.DeepEqual(evicted, []string{"b=2222", "c=zz"}) {
++		t.Fatalf("replacement eviction records = %v, want [b=2222 c=zz]", evicted)
++	}
++}
++
++func TestCodespecPeekDoesNotPromote(t *testing.T) {
++	c := lru.New(4, nil)
++	peek := requirePeek(t, c)
++	c.Add("a", sizedString("1"))
++	c.Add("b", sizedString("2"))
++
++	value, ok := peek.Peek("a")
++	assertValue(t, value, ok, "1")
++	if value, ok := peek.Peek("missing"); ok || value != nil {
++		t.Fatalf("Peek miss = (%#v, %v), want (nil, false)", value, ok)
++	}
++	c.Add("c", sizedString("3"))
++	if _, ok := peek.Peek("a"); ok {
++		t.Fatal("Peek promoted a; it should have been the capacity eviction")
++	}
++
++	if _, ok := c.Get("b"); !ok {
++		t.Fatal("expected b before checking Get recency")
++	}
++	c.Add("d", sizedString("4"))
++	if _, ok := peek.Peek("c"); ok {
++		t.Fatal("Get did not promote b; c should have been evicted")
++	}
++	value, ok = peek.Peek("b")
++	assertValue(t, value, ok, "2")
++	value, ok = peek.Peek("d")
++	assertValue(t, value, ok, "4")
++}
++
++func TestCodespecRemoveAndMissingKey(t *testing.T) {
++	var evicted []string
++	c := lru.New(0, func(key string, value lru.Value) {
++		evicted = append(evicted, fmt.Sprintf("%s=%s", key, value.(sizedString)))
++	})
++	bytes := requireBytes(t, c)
++	peek := requirePeek(t, c)
++	remove := requireRemove(t, c)
++	c.Add("a", sizedString("12"))
++	c.Add("b", sizedString("345"))
++
++	if !remove.Remove("a") {
++		t.Fatal("Remove returned false for an existing key")
++	}
++	if _, ok := peek.Peek("a"); ok || c.Len() != 1 || bytes.Bytes() != 4 {
++		t.Fatalf("state after Remove: present=%v Len=%d Bytes=%d, want false, 1, 4", ok, c.Len(), bytes.Bytes())
++	}
++	if remove.Remove("absent") {
++		t.Fatal("Remove returned true for a missing key")
++	}
++	if !reflect.DeepEqual(evicted, []string{"a=12"}) {
++		t.Fatalf("Remove callbacks = %v, want [a=12]", evicted)
++	}
++}
++
++func TestCodespecRemoveOldestUsesCurrentRecency(t *testing.T) {
++	var evicted []string
++	c := lru.New(0, func(key string, value lru.Value) {
++		evicted = append(evicted, fmt.Sprintf("%s=%s", key, value.(sizedString)))
++	})
++	bytes := requireBytes(t, c)
++	c.Add("a", sizedString("1"))
++	c.Add("b", sizedString("22"))
++	if _, ok := c.Get("a"); !ok {
++		t.Fatal("expected Get hit for a")
++	}
++	c.RemoveOldest()
++	if _, ok := c.Get("b"); ok || c.Len() != 1 || bytes.Bytes() != 2 {
++		t.Fatalf("RemoveOldest left invalid state: bPresent=%v Len=%d Bytes=%d", ok, c.Len(), bytes.Bytes())
++	}
++	c.RemoveOldest()
++	c.RemoveOldest()
++	if !reflect.DeepEqual(evicted, []string{"b=22", "a=1"}) {
++		t.Fatalf("RemoveOldest callbacks = %v, want [b=22 a=1]", evicted)
++	}
++}
++
++func TestCodespecPurgeClearsExactlyOnce(t *testing.T) {
++	counts := map[string]int{}
++	var badPayload []string
++	c := lru.New(0, func(key string, value lru.Value) {
++		counts[key]++
++		got, ok := value.(sizedString)
++		if !ok || string(got) != key {
++			badPayload = append(badPayload, key)
++		}
++	})
++	api := requireExtended(t, c)
++	for _, key := range []string{"a", "bb", "ccc"} {
++		c.Add(key, sizedString(key))
++	}
++	api.Purge()
++	if len(badPayload) != 0 {
++		t.Fatalf("Purge callbacks carried wrong values for keys %v", badPayload)
++	}
++	if c.Len() != 0 || api.Bytes() != 0 {
++		t.Fatalf("Purge left Len=%d Bytes=%d, want zero", c.Len(), api.Bytes())
++	}
++	for _, key := range []string{"a", "bb", "ccc"} {
++		if _, ok := api.Peek(key); ok {
++			t.Fatalf("key %q remains after Purge", key)
++		}
++		if counts[key] != 1 {
++			t.Fatalf("callback count for %q = %d, want 1", key, counts[key])
++		}
++	}
++	api.Purge()
++	if !reflect.DeepEqual(counts, map[string]int{"a": 1, "bb": 1, "ccc": 1}) {
++		t.Fatalf("second Purge changed callbacks: %v", counts)
++	}
++}
++
++func TestCodespecResizeAndUnlimitedMode(t *testing.T) {
++	var evicted []string
++	c := lru.New(0, func(key string, value lru.Value) {
++		evicted = append(evicted, fmt.Sprintf("%s=%s", key, value.(sizedString)))
++	})
++	api := requireExtended(t, c)
++	c.Add("a", sizedString("12"))
++	c.Add("b", sizedString("345"))
++	c.Add("c", sizedString("6789"))
++	c.Get("a")
++
++	if got := api.Resize(8); got != 1 || api.Bytes() != 8 {
++		t.Fatalf("Resize(8) evicted %d with %d bytes, want 1 and 8", got, api.Bytes())
++	}
++	if got := api.Resize(4); got != 1 || api.Bytes() != 3 {
++		t.Fatalf("Resize(4) evicted %d with %d bytes, want 1 and 3", got, api.Bytes())
++	}
++	if got := api.Resize(20); got != 0 {
++		t.Fatalf("growing Resize evicted %d entries, want 0", got)
++	}
++	if got := api.Resize(0); got != 0 {
++		t.Fatalf("Resize(0) evicted %d entries, want 0", got)
++	}
++	c.Add("large", sizedString(strings.Repeat("x", 100)))
++	if _, ok := api.Peek("large"); !ok || c.Len() != 2 || api.Bytes() != 108 {
++		t.Fatalf("unlimited mode rejected entry: present=%v Len=%d Bytes=%d", ok, c.Len(), api.Bytes())
++	}
++	if !reflect.DeepEqual(evicted, []string{"b=345", "c=6789"}) {
++		t.Fatalf("Resize callbacks = %v, want [b=345 c=6789]", evicted)
++	}
++}
++
++func TestCodespecOversizedEntryEvictsItself(t *testing.T) {
++	var evicted []string
++	c := lru.New(3, func(key string, value lru.Value) {
++		evicted = append(evicted, fmt.Sprintf("%s=%s", key, value.(sizedString)))
++	})
++	bytes := requireBytes(t, c)
++	peek := requirePeek(t, c)
++	c.Add("xx", sizedString("yy"))
++	if _, ok := peek.Peek("xx"); ok || c.Len() != 0 || bytes.Bytes() != 0 {
++		t.Fatalf("oversized entry remains: present=%v Len=%d Bytes=%d", ok, c.Len(), bytes.Bytes())
++	}
++	if !reflect.DeepEqual(evicted, []string{"xx=yy"}) {
++		t.Fatalf("oversized entry callbacks = %v, want [xx=yy]", evicted)
++	}
++}
++
++func TestCodespecConcurrentPublicOperations(t *testing.T) {
++	c := lru.New(96, nil)
++	api := requireExtended(t, c)
++	var wg sync.WaitGroup
++	for worker := 0; worker < 7; worker++ {
++		worker := worker
++		wg.Add(1)
++		go func() {
++			defer wg.Done()
++			for i := 0; i < 300; i++ {
++				key := fmt.Sprintf("w%d-%d", worker, i%11)
++				c.Add(key, sizedString(strings.Repeat("v", i%9+1)))
++				c.Get(key)
++				api.Peek(key)
++				if i%4 == 0 {
++					api.Remove(key)
++				}
++				c.Len()
++				api.Bytes()
++			}
++		}()
++	}
++	wg.Add(1)
++	go func() {
++		defer wg.Done()
++		for i := 0; i < 300; i++ {
++			if i%2 == 0 {
++				api.Resize(0)
++			} else {
++				api.Resize(96)
++			}
++			if i%7 == 0 {
++				c.RemoveOldest()
++			}
++			if i%41 == 0 {
++				api.Purge()
++			}
++		}
++	}()
++	wg.Wait()
++
++	api.Resize(0)
++	api.Purge()
++	if c.Len() != 0 || api.Bytes() != 0 {
++		t.Fatalf("cache invariant after concurrent operations: Len=%d Bytes=%d", c.Len(), api.Bytes())
++	}
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,5 @@
++#!/bin/bash
++set -euo pipefail
++
++
++go test -race -count=1 ./lib/lru

@@ -1,0 +1,224 @@
+diff --git a/core/task-executor/tests/cache_results_contract.test.js b/core/task-executor/tests/cache_results_contract.test.js
+new file mode 100644
+index 000000000..97986792f
+--- /dev/null
++++ b/core/task-executor/tests/cache_results_contract.test.js
+@@ -0,0 +1,208 @@
++'use strict';
++
++const assert = require('assert');
++
++const implementations = [
++    ['task-executor', require('../lib/utils/utils').cacheResults],
++    ['worker', require('../../worker/lib/utils').cacheResults]
++];
++
++const deferred = () => {
++    let resolve;
++    let reject;
++    const promise = new Promise((res, rej) => {
++        resolve = res;
++        reject = rej;
++    });
++    return { promise, resolve, reject };
++};
++
++async function expectRejected(promise, expected) {
++    await assert.rejects(promise, error => error === expected);
++}
++
++async function exercise(name, cacheResults) {
++    let now = 1000;
++    const originalNow = Date.now;
++    Date.now = () => now;
++    try {
++
++        {
++            let calls = 0;
++            const gate = deferred();
++            const cached = cacheResults(() => {
++                calls += 1;
++                return gate.promise;
++            }, 50);
++            const first = cached();
++            const second = cached();
++            assert.strictEqual(calls, 1, `${name}: concurrent callers duplicated the fetch`);
++            gate.resolve({ value: 'fresh' });
++            assert.deepStrictEqual(await Promise.all([first, second]), [{ value: 'fresh' }, { value: 'fresh' }]);
++            assert.strictEqual(calls, 1, `${name}: settled value was not reused`);
++        }
++
++
++        {
++            now = 1000;
++            let calls = 0;
++            const gate = deferred();
++            const cached = cacheResults(() => {
++                calls += 1;
++                return calls === 1 ? 'old' : gate.promise;
++            }, 50);
++            assert.strictEqual(await cached(), 'old');
++            now = 1050;
++            const refresh = cached();
++            const waiter = cached();
++            assert.strictEqual(calls, 2);
++            gate.resolve('new');
++            assert.deepStrictEqual(await Promise.all([refresh, waiter]), ['new', 'new']);
++        }
++
++
++        {
++            let calls = 0;
++            const gate = deferred();
++            const failure = new Error(`${name}: expected failure`);
++            const cached = cacheResults(() => {
++                calls += 1;
++                return calls === 1 ? gate.promise : 'recovered';
++            }, 50);
++            const first = cached();
++            const second = cached();
++            assert.strictEqual(calls, 1);
++            gate.reject(failure);
++            await expectRejected(first, failure);
++            await expectRejected(second, failure);
++            assert.strictEqual(await cached(), 'recovered', `${name}: rejected value was cached`);
++            assert.strictEqual(calls, 2, `${name}: failed fetch was not retried`);
++        }
++
++
++        {
++            let calls = 0;
++            const failure = new Error(`${name}: expected synchronous failure`);
++            const cached = cacheResults(() => {
++                calls += 1;
++                if (calls === 1) {
++                    throw failure;
++                }
++                return 9;
++            }, 50);
++            const first = cached();
++            const second = cached();
++            assert.strictEqual(calls, 1, `${name}: synchronous throw was not coalesced`);
++            await expectRejected(first, failure);
++            await expectRejected(second, failure);
++            assert.strictEqual(await cached(), 9, `${name}: synchronous failure was cached`);
++            assert.strictEqual(calls, 2, `${name}: synchronous failure was not retried`);
++        }
++
++
++
++        {
++            now = 1000;
++            const calls = [];
++            const context = {
++                prefix: 'ctx',
++                fetch(...args) {
++                    calls.push({ receiver: this, args });
++                    return `${this.prefix}:${args.join(',')}`;
++                }
++            };
++            const cached = cacheResults(context.fetch, 50);
++            assert.strictEqual(await cached.call(context, 'one'), 'ctx:one');
++            now = 1049;
++            assert.strictEqual(await cached.call({ prefix: 'wrong' }, 'two'), 'ctx:one');
++            assert.strictEqual(calls.length, 1, `${name}: valid entry ignored its TTL`);
++            now = 1050;
++            assert.strictEqual(await cached.call(context, 'three', 3), 'ctx:three,3');
++            assert.strictEqual(calls.length, 2, `${name}: TTL boundary did not refresh`);
++            assert.strictEqual(calls[1].receiver, context);
++            assert.deepStrictEqual(calls[1].args, ['three', 3]);
++        }
++
++
++        {
++            let calls = 0;
++            const gate = deferred();
++            const cached = cacheResults(() => {
++                calls += 1;
++                return calls === 1 ? gate.promise : calls;
++            }, 50);
++            const first = cached();
++            now = 5000;
++            gate.resolve('settled');
++            assert.strictEqual(await first, 'settled');
++            now = 5049;
++            assert.strictEqual(await cached(), 'settled');
++            now = 5050;
++            assert.strictEqual(await cached(), 2);
++            assert.strictEqual(calls, 2);
++        }
++
++
++        for (const value of [null, false, 0, undefined]) {
++            let calls = 0;
++            const cached = cacheResults(() => {
++                calls += 1;
++                return value;
++            }, 50);
++            assert.strictEqual(await cached(), value);
++            assert.strictEqual(await cached(), value);
++            assert.strictEqual(calls, 1, `${name}: ${String(value)} was not cached`);
++        }
++
++
++        {
++            let calls = 0;
++            const firstGate = deferred();
++            const secondGate = deferred();
++            const cached = cacheResults(() => {
++                calls += 1;
++                return calls === 1 ? firstGate.promise : secondGate.promise;
++            }, 50);
++            const first = cached();
++            cached._clearCache();
++            const second = cached();
++            assert.strictEqual(calls, 2, `${name}: clear did not invalidate an in-flight generation`);
++            secondGate.resolve('second');
++            assert.strictEqual(await second, 'second');
++            firstGate.resolve('first');
++            assert.strictEqual(await first, 'first');
++            assert.strictEqual(await cached(), 'second', `${name}: stale generation repopulated cache`);
++            assert.strictEqual(calls, 2);
++        }
++
++
++        {
++            let calls = 0;
++            const gate = deferred();
++            const cached = cacheResults(() => {
++                calls += 1;
++                return calls === 1 ? gate.promise : calls;
++            }, 0);
++            const first = cached();
++            const second = cached();
++            assert.strictEqual(calls, 1);
++            gate.resolve('first');
++            assert.strictEqual(await first, 'first');
++            assert.strictEqual(await second, 'first');
++            assert.strictEqual(await cached(), 2, `${name}: zero TTL reused a settled value`);
++            assert.strictEqual(calls, 2);
++        }
++    }
++    finally {
++        Date.now = originalNow;
++    }
++}
++
++(async () => {
++    for (const [name, cacheResults] of implementations) {
++        await exercise(name, cacheResults);
++    }
++})().catch(error => {
++    console.error(error.stack || error);
++    process.exitCode = 1;
++});
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,5 @@
++#!/bin/bash
++set -euo pipefail
++
++
++node core/task-executor/tests/cache_results_contract.test.js

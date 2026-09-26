@@ -1,0 +1,258 @@
+diff --git a/tests/session/cmd/test_with_deps_synth.py b/tests/session/cmd/test_with_deps_synth.py
+new file mode 100644
+index 0000000..5cd129a
+--- /dev/null
++++ b/tests/session/cmd/test_with_deps_synth.py
+@@ -0,0 +1,241 @@
++from typing import Dict, List, Optional, Sequence
++
++from tox.execute.request import ExecuteRequest
++from tox.pytest import ToxProject, ToxProjectCreator
++
++
++def make_project(tox_project: ToxProjectCreator, body: str) -> ToxProject:
++    return tox_project(
++        {
++            "tox.ini": f"""
++            [tox]
++            no_package = true
++            {body}
++            """,
++        }
++    )
++
++
++def record_commands(
++    project: ToxProject, failures: Optional[Dict[str, int]] = None
++) -> List[str]:
++    seen: List[str] = []
++    failures = {} if failures is None else failures
++
++    def execute(request: ExecuteRequest) -> Optional[int]:
++        if request.run_id == "commands[0]":
++            name = request.cmd[-1]
++            seen.append(name)
++            return failures.get(name, 0)
++        return None
++
++    project.patch_execute(execute)
++    return seen
++
++
++def assert_before(order: Sequence[str], first: str, second: str) -> None:
++    assert order.index(first) < order.index(second), order
++
++
++def test_with_deps_expands_transitive_shared_closure(tox_project: ToxProjectCreator) -> None:
++    project = make_project(
++        tox_project,
++        """
++        env_list = app, docs, unrelated
++        [testenv]
++        commands = python -c 'pass' {env_name}
++        [testenv:app]
++        depends = unit, lint
++        [testenv:unit]
++        depends = bootstrap
++        [testenv:docs]
++        depends = lint
++        [testenv:unrelated]
++        """,
++    )
++    seen = record_commands(project)
++
++    outcome = project.run("r", "-e", "app,docs", "--with-deps")
++
++    outcome.assert_success()
++    assert len(seen) == len(set(seen))
++    assert set(seen) == {"bootstrap", "unit", "lint", "app", "docs"}
++    assert_before(seen, "bootstrap", "unit")
++    assert_before(seen, "unit", "app")
++    assert_before(seen, "lint", "app")
++    assert_before(seen, "lint", "docs")
++
++
++def test_with_deps_uses_default_selection_only(tox_project: ToxProjectCreator) -> None:
++    project = make_project(
++        tox_project,
++        """
++        env_list = app
++        [testenv]
++        commands = python -c 'pass' {env_name}
++        [testenv:app]
++        depends = prepare
++        [testenv:extra]
++        """,
++    )
++    seen = record_commands(project)
++
++    outcome = project.run("r", "--with-deps")
++
++    outcome.assert_success()
++    assert seen == ["prepare", "app"]
++
++
++def test_without_with_deps_keeps_selection_unchanged(tox_project: ToxProjectCreator) -> None:
++    project = make_project(
++        tox_project,
++        """
++        env_list = app
++        [testenv]
++        commands = python -c 'pass' {env_name}
++        [testenv:app]
++        depends = prepare
++        """,
++    )
++    seen = record_commands(project)
++
++    outcome = project.run("r", "-e", "app")
++
++    outcome.assert_success()
++    assert seen == ["app"]
++
++
++def test_with_deps_honors_materialized_override(tox_project: ToxProjectCreator) -> None:
++    project = make_project(
++        tox_project,
++        """
++        env_list = app
++        [testenv]
++        commands = python -c 'pass' {env_name}
++        [testenv:app]
++        depends = stale
++        """,
++    )
++    seen = record_commands(project)
++
++    outcome = project.run("r", "-e", "app", "--with-deps", "-x", "testenv:app.depends=fresh")
++
++    outcome.assert_success()
++    assert seen == ["fresh", "app"]
++
++
++def test_legacy_with_deps_matches_sequential_run(tox_project: ToxProjectCreator) -> None:
++    project = make_project(
++        tox_project,
++        """
++        env_list = app
++        [testenv]
++        commands = python -c 'pass' {env_name}
++        [testenv:app]
++        depends = prepare
++        """,
++    )
++    seen = record_commands(project)
++
++    outcome = project.run("le", "-e", "app", "--with-deps")
++
++    outcome.assert_success()
++    assert seen == ["prepare", "app"]
++
++
++def test_failed_dependency_blocks_sequential_dependent(tox_project: ToxProjectCreator) -> None:
++    project = make_project(
++        tox_project,
++        """
++        env_list = app
++        [testenv]
++        commands = python -c 'pass' {env_name}
++        [testenv:app]
++        depends = middle
++        [testenv:middle]
++        depends = prepare
++        """,
++    )
++    seen = record_commands(project, {"prepare": 7})
++
++    outcome = project.run("r", "-e", "app", "--with-deps")
++
++    outcome.assert_failed()
++    assert seen == ["prepare"]
++    assert "middle: SKIP" in outcome.out
++    assert "app: SKIP" in outcome.out
++
++
++def test_skipped_dependency_blocks_dependent(tox_project: ToxProjectCreator) -> None:
++    project = make_project(
++        tox_project,
++        """
++        skip_missing_interpreters = true
++        env_list = app
++        [testenv]
++        commands = python -c 'pass' {env_name}
++        [testenv:app]
++        depends = prepare
++        [testenv:prepare]
++        base_python = missing-with-deps-interpreter
++        """,
++    )
++    seen = record_commands(project)
++
++    outcome = project.run("r", "-e", "app", "--with-deps")
++
++    outcome.assert_failed()
++    assert seen == []
++    assert "prepare: SKIP" in outcome.out
++    assert "app: SKIP" in outcome.out
++
++
++def test_failed_dependency_blocks_parallel_transitive_branch_only(tox_project: ToxProjectCreator) -> None:
++    project = make_project(
++        tox_project,
++        """
++        env_list = app, independent
++        [testenv]
++        commands = python -c 'pass' {env_name}
++        [testenv:app]
++        depends = middle
++        [testenv:middle]
++        depends = prepare
++        [testenv:independent]
++        """,
++    )
++    seen = record_commands(project, {"prepare": 9})
++
++    outcome = project.run(
++        "p", "-e", "app,independent", "--with-deps", "-p", "2", "--parallel-no-spinner"
++    )
++
++    outcome.assert_failed()
++    assert set(seen) == {"prepare", "independent"}
++    assert "middle: SKIP" in outcome.out
++    assert "app: SKIP" in outcome.out
++    assert "independent: OK" in outcome.out
++
++
++def test_with_deps_cycle_fails_before_execution(tox_project: ToxProjectCreator) -> None:
++    project = make_project(
++        tox_project,
++        """
++        env_list = cycle_left_olive, independent
++        [testenv]
++        commands = python -c 'pass' {env_name}
++        [testenv:cycle_left_olive]
++        depends = cycle_right_copper
++        [testenv:cycle_right_copper]
++        depends = cycle_left_olive
++        """,
++    )
++    seen = record_commands(project)
++
++    outcome = project.run("r", "-e", "cycle_left_olive,independent", "--with-deps")
++
++    outcome.assert_failed()
++    assert seen == []
++    message = f"{outcome.out}\n{outcome.err}".lower()
++    assert "cycle_left_olive" in message
++    assert "cycle_right_copper" in message
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,6 @@
++#!/bin/bash
++set -euo pipefail
++
++python -m pytest -q \
++  tests/session/cmd/test_with_deps_synth.py \
++  tests/session/cmd/test_depends.py

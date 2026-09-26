@@ -1,0 +1,370 @@
+diff --git a/common/ratereporter_test.go b/common/ratereporter_test.go
+new file mode 100644
+index 0000000..718e708
+--- /dev/null
++++ b/common/ratereporter_test.go
+@@ -0,0 +1,338 @@
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++package common
++
++import (
++	"fmt"
++	"math"
++	"sync"
++	"testing"
++
++	"github.com/stretchr/testify/require"
++	"github.com/stretchr/testify/suite"
++)
++
++const (
++	t0 = int64(1000000000)
++	t1 = int64(3000000000)
++	t2 = int64(7000000000)
++)
++
++type RateReporterSuite struct {
++	*require.Assertions
++	suite.Suite
++}
++
++func TestRateReporterSuite(t *testing.T) {
++	suite.Run(t, new(RateReporterSuite))
++}
++
++func (s *RateReporterSuite) SetupTest() {
++	s.Assertions = require.New(s.T())
++}
++
++
++func (s *RateReporterSuite) TestEmptyCollect() {
++	r := NewRateReporter()
++	s.Empty(r.Collect())
++}
++
++
++func (s *RateReporterSuite) TestFirstReport() {
++	r := NewRateReporter()
++	r.Open("a")
++	r.Update("a", 10, t0)
++
++	out := r.Collect()
++	s.Len(out, 1)
++	rep, ok := out["a"]
++	s.True(ok)
++	s.EqualValues(10, rep.Value)
++	s.EqualValues(t0, rep.Time)
++	s.Equal(0.0, rep.Rate)
++	s.False(rep.Final)
++}
++
++
++func (s *RateReporterSuite) TestRateBetweenReports() {
++	r := NewRateReporter()
++	r.Open("a")
++
++	r.Update("a", 10, t0)
++	first := r.Collect()
++	s.Equal(0.0, first["a"].Rate)
++
++
++	r.Update("a", 30, t1)
++	second := r.Collect()
++	s.Len(second, 1)
++	s.EqualValues(30, second["a"].Value)
++	s.InEpsilon(10.0, second["a"].Rate, 1e-9)
++	s.False(second["a"].Final)
++
++
++	r.Update("a", 70, t2)
++	third := r.Collect()
++	s.InEpsilon(10.0, third["a"].Rate, 1e-9)
++	s.EqualValues(70, third["a"].Value)
++}
++
++
++func (s *RateReporterSuite) TestLastWriteWins() {
++	r := NewRateReporter()
++	r.Open("a")
++	r.Update("a", 5, t0)
++	r.Update("a", 11, t0)
++	r.Update("a", 99, t1)
++
++	out := r.Collect()
++	s.Len(out, 1)
++	s.EqualValues(99, out["a"].Value)
++	s.EqualValues(t1, out["a"].Time)
++}
++
++
++func (s *RateReporterSuite) TestDedupNoChange() {
++	r := NewRateReporter()
++	r.Open("a")
++	r.Update("a", 10, t0)
++
++	s.Len(r.Collect(), 1)
++	s.Empty(r.Collect())
++	s.Empty(r.Collect())
++
++
++	r.Update("a", 20, t1)
++	s.Len(r.Collect(), 1)
++}
++
++
++func (s *RateReporterSuite) TestFinalReportOnClose() {
++	r := NewRateReporter()
++	r.Open("a")
++	r.Update("a", 42, t0)
++	r.Collect()
++
++	r.Close("a")
++	out := r.Collect()
++	s.Len(out, 1)
++	s.True(out["a"].Final)
++	s.EqualValues(42, out["a"].Value)
++
++
++	s.Empty(r.Collect())
++}
++
++
++func (s *RateReporterSuite) TestShortLivedReportedOnce() {
++	r := NewRateReporter()
++
++	r.Open("a")
++	r.Update("a", 7, t0)
++	r.Close("a")
++
++	out := r.Collect()
++	s.Len(out, 1)
++	s.True(out["a"].Final)
++	s.EqualValues(7, out["a"].Value)
++	s.Equal(0.0, out["a"].Rate)
++
++	s.Empty(r.Collect())
++}
++
++
++func (s *RateReporterSuite) TestNestedOpens() {
++	r := NewRateReporter()
++	r.Open("a")
++	r.Open("a")
++	r.Update("a", 10, t0)
++
++	r.Close("a")
++	out := r.Collect()
++	s.Len(out, 1)
++	s.False(out["a"].Final)
++
++	r.Close("a")
++	out = r.Collect()
++	s.Len(out, 1)
++	s.True(out["a"].Final)
++
++	s.Empty(r.Collect())
++}
++
++
++func (s *RateReporterSuite) TestCloseWithoutSample() {
++	r := NewRateReporter()
++	r.Open("a")
++	r.Close("a")
++	s.Empty(r.Collect())
++}
++
++
++func (s *RateReporterSuite) TestCloseUnknownKey() {
++	r := NewRateReporter()
++	r.Close("nope")
++	s.Empty(r.Collect())
++}
++
++
++func (s *RateReporterSuite) TestReuseAfterFinal() {
++	r := NewRateReporter()
++	r.Open("a")
++	r.Update("a", 100, t0)
++	r.Collect()
++	r.Close("a")
++	r.Collect()
++
++	r.Open("a")
++	r.Update("a", 5, t1)
++	out := r.Collect()
++	s.Len(out, 1)
++	s.Equal(0.0, out["a"].Rate)
++	s.EqualValues(5, out["a"].Value)
++	s.False(out["a"].Final)
++}
++
++
++func (s *RateReporterSuite) TestNoInfiniteOrNaNRate() {
++
++	r := NewRateReporter()
++	r.Open("a")
++	r.Update("a", 10, t0)
++	r.Collect()
++	r.Update("a", 50, t0)
++	rep := r.Collect()["a"]
++	s.False(math.IsInf(rep.Rate, 0))
++	s.False(math.IsNaN(rep.Rate))
++	s.Equal(0.0, rep.Rate)
++
++
++	r2 := NewRateReporter()
++	r2.Open("b")
++	r2.Update("b", 10, t1)
++	r2.Collect()
++	r2.Update("b", 20, t0)
++	rep2 := r2.Collect()["b"]
++	s.False(math.IsInf(rep2.Rate, 0))
++	s.False(math.IsNaN(rep2.Rate))
++	s.Equal(0.0, rep2.Rate)
++
++
++	r3 := NewRateReporter()
++	r3.Open("c")
++	r3.Update("c", 10, t0)
++	r3.Collect()
++	r3.Update("c", 20, 0)
++	rep3 := r3.Collect()["c"]
++	s.Equal(0.0, rep3.Rate)
++}
++
++
++func (s *RateReporterSuite) TestNegativeRate() {
++	r := NewRateReporter()
++	r.Open("a")
++	r.Update("a", 100, t0)
++	r.Collect()
++	r.Update("a", 80, t1)
++	out := r.Collect()
++	s.InEpsilon(-10.0, out["a"].Rate, 1e-9)
++}
++
++
++func (s *RateReporterSuite) TestMultipleKeys() {
++	r := NewRateReporter()
++	r.Open("a")
++	r.Open("b")
++	r.Update("a", 10, t0)
++	r.Update("b", 100, t0)
++
++	out := r.Collect()
++	s.Len(out, 2)
++	s.EqualValues(10, out["a"].Value)
++	s.EqualValues(100, out["b"].Value)
++
++
++	r.Update("a", 30, t1)
++	out = r.Collect()
++	s.Len(out, 1)
++	s.Contains(out, "a")
++	s.NotContains(out, "b")
++}
++
++
++func (s *RateReporterSuite) TestConcurrentDistinctKeys() {
++	r := NewRateReporter()
++
++	const n = 200
++	var wg sync.WaitGroup
++	wg.Add(n)
++	for i := 0; i < n; i++ {
++		go func(i int) {
++			defer wg.Done()
++			key := fmt.Sprintf("k-%d", i)
++			r.Open(key)
++			r.Update(key, int64(i), t0)
++			r.Close(key)
++		}(i)
++	}
++	wg.Wait()
++
++
++
++	out := r.Collect()
++	s.Len(out, n)
++	for i := 0; i < n; i++ {
++		rep, ok := out[fmt.Sprintf("k-%d", i)]
++		s.True(ok)
++		s.True(rep.Final)
++		s.EqualValues(int64(i), rep.Value)
++	}
++
++
++	s.Empty(r.Collect())
++}
++
++
++
++func (s *RateReporterSuite) TestConcurrentSameKey() {
++	r := NewRateReporter()
++
++	const n = 200
++	var wg sync.WaitGroup
++	wg.Add(n)
++	for i := 0; i < n; i++ {
++		go func(i int) {
++			defer wg.Done()
++			r.Open("hot")
++			r.Update("hot", int64(i), t0+int64(i))
++			r.Close("hot")
++		}(i)
++	}
++	wg.Wait()
++
++
++
++	out := r.Collect()
++	s.Len(out, 1)
++	s.True(out["hot"].Final)
++
++	s.Empty(r.Collect())
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,21 @@
++#!/usr/bin/env bash
++
++
++
++
++set -euo pipefail
++HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++cd /testbed
++
++
++
++
++
++export GO111MODULE=off
++REPO_PKG="github.com/uber/cherami-server"
++
++
++go test -run 'TestUtilSuite|TestLoadReporterSuite|TestCounterBankSuite' "$REPO_PKG/common"
++
++
++go test -race -run 'TestRateReporterSuite' "$REPO_PKG/common"

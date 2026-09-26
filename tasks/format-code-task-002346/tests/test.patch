@@ -1,0 +1,596 @@
+diff --git a/pkg/abstract_custom_metrics_test.go b/pkg/abstract_custom_metrics_test.go
+new file mode 100644
+index 0000000..b4c9751
+--- /dev/null
++++ b/pkg/abstract_custom_metrics_test.go
+@@ -0,0 +1,330 @@
++package exporter
++
++import (
++	"context"
++	"fmt"
++	"sort"
++	"strings"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/aws/aws-sdk-go/aws"
++	"github.com/aws/aws-sdk-go/aws/request"
++	"github.com/aws/aws-sdk-go/service/apigateway/apigatewayiface"
++	"github.com/aws/aws-sdk-go/service/autoscaling/autoscalingiface"
++	"github.com/aws/aws-sdk-go/service/cloudwatch"
++	"github.com/aws/aws-sdk-go/service/cloudwatch/cloudwatchiface"
++	"github.com/aws/aws-sdk-go/service/databasemigrationservice/databasemigrationserviceiface"
++	"github.com/aws/aws-sdk-go/service/ec2/ec2iface"
++	"github.com/aws/aws-sdk-go/service/resourcegroupstaggingapi/resourcegroupstaggingapiiface"
++	"github.com/aws/aws-sdk-go/service/sts"
++	"github.com/aws/aws-sdk-go/service/sts/stsiface"
++	"github.com/prometheus/client_golang/prometheus"
++	dto "github.com/prometheus/client_model/go"
++)
++
++type customMetricsTestLogger struct{}
++
++func (customMetricsTestLogger) Info(string, ...interface{})         {}
++func (customMetricsTestLogger) Debug(string, ...interface{})        {}
++func (customMetricsTestLogger) Error(error, string, ...interface{}) {}
++func (customMetricsTestLogger) Warn(string, ...interface{})         {}
++func (l customMetricsTestLogger) With(...interface{}) Logger        { return l }
++func (customMetricsTestLogger) IsDebugEnabled() bool                { return false }
++
++type customMetricsFakeCache struct {
++	account          string
++	metricsByName    map[string][]*cloudwatch.Metric
++	datapointsByName map[string][]*cloudwatch.Datapoint
++
++	mu                sync.Mutex
++	statisticsQueries map[string]struct{}
++	listQueries       []string
++}
++
++func newCustomMetricsFakeCache() *customMetricsFakeCache {
++	return &customMetricsFakeCache{
++		account: "123456789012",
++		metricsByName: map[string][]*cloudwatch.Metric{
++			"queue_depth_total": {
++				{
++					MetricName: aws.String("queue_depth_total"),
++					Namespace:  aws.String("Team/AppTelemetry"),
++					Dimensions: []*cloudwatch.Dimension{
++						{Name: aws.String("NodeId"), Value: aws.String("node-17")},
++						{Name: aws.String("MountPath"), Value: aws.String("/var/lib/app")},
++					},
++				},
++			},
++			"request_latency_ms": {
++				{
++					MetricName: aws.String("request_latency_ms"),
++					Namespace:  aws.String("Team/AppTelemetry"),
++					Dimensions: []*cloudwatch.Dimension{
++						{Name: aws.String("WorkerPool"), Value: aws.String("blue-workers")},
++					},
++				},
++			},
++			"empty_signal_count": {
++				{
++					MetricName: aws.String("empty_signal_count"),
++					Namespace:  aws.String("Team/AppTelemetry"),
++					Dimensions: []*cloudwatch.Dimension{
++						{Name: aws.String("NodeId"), Value: aws.String("node-empty")},
++					},
++				},
++			},
++		},
++		datapointsByName: map[string][]*cloudwatch.Datapoint{
++			"queue_depth_total": {
++				{Timestamp: aws.Time(time.Now()), Sum: aws.Float64(41)},
++			},
++			"request_latency_ms": {
++				{Timestamp: aws.Time(time.Now()), Sum: aws.Float64(250)},
++			},
++			"empty_signal_count": nil,
++		},
++		statisticsQueries: map[string]struct{}{},
++	}
++}
++
++func (c *customMetricsFakeCache) GetSTS(Role) stsiface.STSAPI {
++	return customMetricsFakeSTS{account: c.account}
++}
++
++func (c *customMetricsFakeCache) GetCloudwatch(region *string, role Role) cloudwatchiface.CloudWatchAPI {
++	return &customMetricsFakeCloudWatch{cache: c, region: *region, role: role}
++}
++
++func (c *customMetricsFakeCache) GetTagging(*string, Role) resourcegroupstaggingapiiface.ResourceGroupsTaggingAPIAPI {
++	return nil
++}
++
++func (c *customMetricsFakeCache) GetASG(*string, Role) autoscalingiface.AutoScalingAPI {
++	return nil
++}
++
++func (c *customMetricsFakeCache) GetEC2(*string, Role) ec2iface.EC2API {
++	return nil
++}
++
++func (c *customMetricsFakeCache) GetDMS(*string, Role) databasemigrationserviceiface.DatabaseMigrationServiceAPI {
++	return nil
++}
++
++func (c *customMetricsFakeCache) GetAPIGateway(*string, Role) apigatewayiface.APIGatewayAPI {
++	return nil
++}
++
++func (c *customMetricsFakeCache) Refresh() {}
++
++func (c *customMetricsFakeCache) Clear() {}
++
++func (c *customMetricsFakeCache) observedStatisticsQueryKeys() []string {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	keys := make([]string, 0, len(c.statisticsQueries))
++	for key := range c.statisticsQueries {
++		keys = append(keys, key)
++	}
++	sort.Strings(keys)
++	return keys
++}
++
++type customMetricsFakeSTS struct {
++	stsiface.STSAPI
++	account string
++}
++
++func (s customMetricsFakeSTS) GetCallerIdentityWithContext(aws.Context, *sts.GetCallerIdentityInput, ...request.Option) (*sts.GetCallerIdentityOutput, error) {
++	return &sts.GetCallerIdentityOutput{Account: aws.String(s.account)}, nil
++}
++
++type customMetricsFakeCloudWatch struct {
++	cloudwatchiface.CloudWatchAPI
++	cache  *customMetricsFakeCache
++	region string
++	role   Role
++}
++
++func (cw *customMetricsFakeCloudWatch) ListMetricsPagesWithContext(_ aws.Context, input *cloudwatch.ListMetricsInput, fn func(*cloudwatch.ListMetricsOutput, bool) bool, _ ...request.Option) error {
++	namespace := aws.StringValue(input.Namespace)
++	metricName := aws.StringValue(input.MetricName)
++	cw.cache.mu.Lock()
++	cw.cache.listQueries = append(cw.cache.listQueries, namespace+"/"+metricName)
++	cw.cache.mu.Unlock()
++
++	metrics := cw.cache.metricsByName[metricName]
++	filtered := make([]*cloudwatch.Metric, 0, len(metrics))
++	for _, metric := range metrics {
++		if aws.StringValue(metric.Namespace) == namespace {
++			filtered = append(filtered, metric)
++		}
++	}
++	fn(&cloudwatch.ListMetricsOutput{Metrics: filtered}, true)
++	return nil
++}
++
++func (cw *customMetricsFakeCloudWatch) GetMetricStatisticsWithContext(_ aws.Context, input *cloudwatch.GetMetricStatisticsInput, _ ...request.Option) (*cloudwatch.GetMetricStatisticsOutput, error) {
++	metricName := aws.StringValue(input.MetricName)
++	key := fmt.Sprintf("%s|%s|%s|%s", cw.role.RoleArn, cw.role.ExternalID, cw.region, metricName)
++
++	cw.cache.mu.Lock()
++	cw.cache.statisticsQueries[key] = struct{}{}
++	cw.cache.mu.Unlock()
++
++	return &cloudwatch.GetMetricStatisticsOutput{
++		Datapoints: cw.cache.datapointsByName[metricName],
++	}, nil
++}
++
++func customMetricScrapeConfig(metrics ...string) ScrapeConf {
++	customMetrics := make([]*Metric, 0, len(metrics))
++	for _, name := range metrics {
++		customMetrics = append(customMetrics, &Metric{
++			Name:                   name,
++			Statistics:             []string{"Sum"},
++			Period:                 60,
++			Length:                 301,
++			Delay:                  60,
++			NilToZero:              aws.Bool(false),
++			AddCloudwatchTimestamp: aws.Bool(false),
++		})
++	}
++	return ScrapeConf{
++		CustomMetrics: []*CustomMetrics{
++			{
++				Name:      "custom-team-telemetry",
++				Namespace: "Team/AppTelemetry",
++				Regions:   []string{"us-west-2"},
++				Roles:     []Role{{}},
++				Metrics:   customMetrics,
++			},
++		},
++	}
++}
++
++func gatherCustomMetricFamilies(t *testing.T, config ScrapeConf, cache *customMetricsFakeCache) []*dto.MetricFamily {
++	t.Helper()
++	registry := prometheus.NewRegistry()
++	UpdateMetrics(
++		context.Background(),
++		config,
++		registry,
++		500,
++		false,
++		make(chan struct{}, 10),
++		make(chan struct{}, 10),
++		cache,
++		map[string]LabelSet{},
++		customMetricsTestLogger{},
++	)
++	families, err := registry.Gather()
++	if err != nil {
++		t.Fatalf("gather prometheus metrics: %v", err)
++	}
++	return families
++}
++
++func findMetricFamilyByNameParts(families []*dto.MetricFamily, parts ...string) *dto.MetricFamily {
++	for _, family := range families {
++		name := strings.ToLower(family.GetName())
++		matched := true
++		for _, part := range parts {
++			if !strings.Contains(name, strings.ToLower(part)) {
++				matched = false
++				break
++			}
++		}
++		if matched {
++			return family
++		}
++	}
++	return nil
++}
++
++func requireMetricFamilyValue(t *testing.T, family *dto.MetricFamily, want float64) {
++	t.Helper()
++	if family == nil {
++		t.Fatalf("metric family not found")
++	}
++	for _, metric := range family.GetMetric() {
++		if metric.GetGauge().GetValue() == want {
++			return
++		}
++	}
++	t.Fatalf("metric family %q did not contain value %v", family.GetName(), want)
++}
++
++func requireMetricLabelValue(t *testing.T, family *dto.MetricFamily, labelNamePart, wantValue string) {
++	t.Helper()
++	if family == nil {
++		t.Fatalf("metric family not found")
++	}
++	for _, metric := range family.GetMetric() {
++		for _, label := range metric.GetLabel() {
++			if strings.Contains(strings.ToLower(label.GetName()), strings.ToLower(labelNamePart)) && label.GetValue() == wantValue {
++				return
++			}
++		}
++	}
++	t.Fatalf("metric family %q did not contain label matching %q=%q", family.GetName(), labelNamePart, wantValue)
++}
++
++func TestScrapeCustomMetricsExportsConfiguredNamespaceMetrics(t *testing.T) {
++	cache := newCustomMetricsFakeCache()
++	families := gatherCustomMetricFamilies(t, customMetricScrapeConfig("queue_depth_total", "request_latency_ms"), cache)
++
++	queueDepth := findMetricFamilyByNameParts(families, "team_apptelemetry", "queue_depth_total", "sum")
++	requestLatency := findMetricFamilyByNameParts(families, "team_apptelemetry", "request_latency_ms", "sum")
++
++	requireMetricFamilyValue(t, queueDepth, 41)
++	requireMetricFamilyValue(t, requestLatency, 250)
++}
++
++func TestScrapeCustomMetricsPreservesCloudWatchDimensionsAsLabels(t *testing.T) {
++	cache := newCustomMetricsFakeCache()
++	families := gatherCustomMetricFamilies(t, customMetricScrapeConfig("queue_depth_total"), cache)
++	queueDepth := findMetricFamilyByNameParts(families, "team_apptelemetry", "queue_depth_total", "sum")
++
++	requireMetricLabelValue(t, queueDepth, "node", "node-17")
++	requireMetricLabelValue(t, queueDepth, "mount", "/var/lib/app")
++}
++
++func TestScrapeCustomMetricsSkipsMetricsWithNoDatapoints(t *testing.T) {
++	cache := newCustomMetricsFakeCache()
++	families := gatherCustomMetricFamilies(t, customMetricScrapeConfig("queue_depth_total", "empty_signal_count"), cache)
++
++	requireMetricFamilyValue(t, findMetricFamilyByNameParts(families, "team_apptelemetry", "queue_depth_total", "sum"), 41)
++	if got := findMetricFamilyByNameParts(families, "team_apptelemetry", "empty_signal_count"); got != nil {
++		t.Fatalf("metric with no datapoints was exported as %q", got.GetName())
++	}
++}
++
++func TestCustomMetricsUseEachConfiguredRoleRegion(t *testing.T) {
++	cache := newCustomMetricsFakeCache()
++	config := customMetricScrapeConfig("queue_depth_total")
++	config.CustomMetrics[0].Regions = []string{"us-west-2", "eu-central-1"}
++	config.CustomMetrics[0].Roles = []Role{
++		{RoleArn: "arn:aws:iam::111111111111:role/custom-a"},
++		{RoleArn: "arn:aws:iam::222222222222:role/custom-b", ExternalID: "external-b"},
++	}
++
++	gatherCustomMetricFamilies(t, config, cache)
++
++	got := cache.observedStatisticsQueryKeys()
++	want := []string{
++		"arn:aws:iam::111111111111:role/custom-a||eu-central-1|queue_depth_total",
++		"arn:aws:iam::111111111111:role/custom-a||us-west-2|queue_depth_total",
++		"arn:aws:iam::222222222222:role/custom-b|external-b|eu-central-1|queue_depth_total",
++		"arn:aws:iam::222222222222:role/custom-b|external-b|us-west-2|queue_depth_total",
++	}
++	if strings.Join(got, "\n") != strings.Join(want, "\n") {
++		t.Fatalf("custom metric CloudWatch queries:\n got: %v\nwant: %v", got, want)
++	}
++}
++
++var _ SessionCache = (*customMetricsFakeCache)(nil)
++var _ cloudwatchiface.CloudWatchAPI = (*customMetricsFakeCloudWatch)(nil)
++var _ stsiface.STSAPI = customMetricsFakeSTS{}
+diff --git a/pkg/config_custom_metrics_test.go b/pkg/config_custom_metrics_test.go
+new file mode 100644
+index 0000000..fab864c
+--- /dev/null
++++ b/pkg/config_custom_metrics_test.go
+@@ -0,0 +1,189 @@
++package exporter
++
++import (
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++)
++
++func writeCustomMetricsConfigForTest(t *testing.T, body string) string {
++	t.Helper()
++	path := filepath.Join(t.TempDir(), "custom-metrics.yml")
++	if err := os.WriteFile(path, []byte(body), 0600); err != nil {
++		t.Fatalf("write temp config: %v", err)
++	}
++	return path
++}
++
++func requireBoolPtrValue(t *testing.T, got *bool, want bool, field string) {
++	t.Helper()
++	if got == nil {
++		t.Fatalf("%s = nil, want %v", field, want)
++	}
++	if *got != want {
++		t.Fatalf("%s = %v, want %v", field, *got, want)
++	}
++}
++
++func TestCustomMetricsConfigLoadAndDefaults(t *testing.T) {
++	configPath := writeCustomMetricsConfigForTest(t, `
++apiVersion: v1alpha1
++customMetrics:
++  - name: arbitraryCustomJob
++    namespace: Team/AppTelemetry
++    regions:
++      - us-west-2
++      - eu-central-1
++    statistics:
++      - Sum
++      - SampleCount
++    nilToZero: false
++    period: 120
++    length: 600
++    delay: 60
++    addCloudwatchTimestamp: false
++    metrics:
++      - name: queue_depth_total
++      - name: request_latency_ms
++        statistics:
++          - p99
++        period: 240
++`)
++
++	config := ScrapeConf{}
++	if err := config.Load(&configPath); err != nil {
++		t.Fatalf("Load(customMetrics config) returned error: %v", err)
++	}
++
++	if len(config.CustomMetrics) != 1 {
++		t.Fatalf("len(CustomMetrics) = %d, want 1", len(config.CustomMetrics))
++	}
++
++	job := config.CustomMetrics[0]
++	if job.Name != "arbitraryCustomJob" {
++		t.Fatalf("job.Name = %q", job.Name)
++	}
++	if job.Namespace != "Team/AppTelemetry" {
++		t.Fatalf("job.Namespace = %q", job.Namespace)
++	}
++	if strings.Join(job.Regions, ",") != "us-west-2,eu-central-1" {
++		t.Fatalf("job.Regions = %#v", job.Regions)
++	}
++	if len(job.Roles) != 1 || job.Roles[0] != (Role{}) {
++		t.Fatalf("omitted customMetrics roles should default to current identity, got %#v", job.Roles)
++	}
++	if len(job.Metrics) != 2 {
++		t.Fatalf("len(job.Metrics) = %d, want 2", len(job.Metrics))
++	}
++
++	firstMetric := job.Metrics[0]
++	if firstMetric.Name != "queue_depth_total" {
++		t.Fatalf("first metric name = %q", firstMetric.Name)
++	}
++	if strings.Join(firstMetric.Statistics, ",") != "Sum,SampleCount" {
++		t.Fatalf("first metric statistics = %#v", firstMetric.Statistics)
++	}
++	if firstMetric.Period != 120 || firstMetric.Length != 600 || firstMetric.Delay != 60 {
++		t.Fatalf("first metric defaults period/length/delay = %d/%d/%d", firstMetric.Period, firstMetric.Length, firstMetric.Delay)
++	}
++	requireBoolPtrValue(t, firstMetric.NilToZero, false, "firstMetric.NilToZero")
++	requireBoolPtrValue(t, firstMetric.AddCloudwatchTimestamp, false, "firstMetric.AddCloudwatchTimestamp")
++
++	secondMetric := job.Metrics[1]
++	if secondMetric.Name != "request_latency_ms" {
++		t.Fatalf("second metric name = %q", secondMetric.Name)
++	}
++	if strings.Join(secondMetric.Statistics, ",") != "p99" {
++		t.Fatalf("explicit metric statistics should be preserved, got %#v", secondMetric.Statistics)
++	}
++	if secondMetric.Period != 240 {
++		t.Fatalf("explicit metric period should be preserved, got %d", secondMetric.Period)
++	}
++	if secondMetric.Length != 600 || secondMetric.Delay != 60 {
++		t.Fatalf("second metric inherited length/delay = %d/%d, want 600/60", secondMetric.Length, secondMetric.Delay)
++	}
++}
++
++func TestCustomMetricsOnlyConfigIsNonEmpty(t *testing.T) {
++	configPath := writeCustomMetricsConfigForTest(t, `
++apiVersion: v1alpha1
++customMetrics:
++  - name: onlyCustomJob
++    namespace: Example/OnlyCustom
++    regions:
++      - ap-southeast-2
++    metrics:
++      - name: workers_busy
++        statistics:
++          - Sum
++        period: 301
++        length: 301
++`)
++
++	config := ScrapeConf{}
++	if err := config.Load(&configPath); err != nil {
++		t.Fatalf("custom-only config should load and validate: %v", err)
++	}
++	if len(config.CustomMetrics) != 1 {
++		t.Fatalf("len(CustomMetrics) = %d, want 1", len(config.CustomMetrics))
++	}
++	if len(config.CustomMetrics[0].Roles) != 1 || config.CustomMetrics[0].Roles[0] != (Role{}) {
++		t.Fatalf("custom-only config with omitted roles should use current identity, got %#v", config.CustomMetrics[0].Roles)
++	}
++}
++
++func TestCustomMetricsConfigRejectsMissingRequiredFields(t *testing.T) {
++	testCases := []struct {
++		name       string
++		yaml       string
++	}{
++		{
++			name: "missing name",
++			yaml: `
++apiVersion: v1alpha1
++customMetrics:
++  - namespace: Example/MissingName
++    regions: [us-east-2]
++    metrics:
++      - name: packets_seen
++        statistics: [Sum]
++`,
++		},
++		{
++			name: "missing namespace",
++			yaml: `
++apiVersion: v1alpha1
++customMetrics:
++  - name: missingNamespaceJob
++    regions: [us-east-2]
++    metrics:
++      - name: packets_seen
++        statistics: [Sum]
++`,
++		},
++		{
++			name: "missing regions",
++			yaml: `
++apiVersion: v1alpha1
++customMetrics:
++  - name: missingRegionsJob
++    namespace: Example/MissingRegions
++    metrics:
++      - name: packets_seen
++        statistics: [Sum]
++`,
++		},
++	}
++
++	for _, tc := range testCases {
++		t.Run(tc.name, func(t *testing.T) {
++			configPath := writeCustomMetricsConfigForTest(t, tc.yaml)
++			config := ScrapeConf{}
++			err := config.Load(&configPath)
++			if err == nil {
++				t.Fatalf("Load() succeeded, want validation error")
++			}
++		})
++	}
++}
+diff --git a/pkg/docs_custom_metrics_test.go b/pkg/docs_custom_metrics_test.go
+new file mode 100644
+index 0000000..3ee1977
+--- /dev/null
++++ b/pkg/docs_custom_metrics_test.go
+@@ -0,0 +1,34 @@
++package exporter
++
++import (
++	"os"
++	"strings"
++	"testing"
++)
++
++func TestReadmeDocumentsCustomMetricsConfiguration(t *testing.T) {
++	body, err := os.ReadFile("../README.md")
++	if err != nil {
++		t.Fatalf("read README.md: %v", err)
++	}
++	readme := string(body)
++	lowerReadme := strings.ToLower(readme)
++
++	if !strings.Contains(readme, "customMetrics") {
++		t.Fatalf("README.md should mention customMetrics for custom metrics configuration")
++	}
++
++	requiredConcepts := []string{
++		"custom",
++		"namespace",
++		"regions",
++		"roles",
++		"metrics",
++		"dimensions",
++	}
++	for _, want := range requiredConcepts {
++		if !strings.Contains(lowerReadme, want) {
++			t.Fatalf("README.md should document custom metrics concept %q", want)
++		}
++	}
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,20 @@
++#!/bin/bash
++set -uo pipefail
++cd /testbed
++
++
++
++
++
++case "${1:-}" in
++  base)
++    go test ./pkg/ -run "^(TestConfLoad|TestBadConfigs|TestNewSessionCache)$" -v
++    ;;
++  new)
++    go test ./pkg/ -run "^(TestCustomMetricsConfigLoadAndDefaults|TestCustomMetricsOnlyConfigIsNonEmpty|TestCustomMetricsConfigRejectsMissingRequiredFields|TestReadmeDocumentsCustomMetricsConfiguration|TestScrapeCustomMetricsExportsConfiguredNamespaceMetrics|TestScrapeCustomMetricsPreservesCloudWatchDimensionsAsLabels|TestScrapeCustomMetricsSkipsMetricsWithNoDatapoints|TestCustomMetricsUseEachConfiguredRoleRegion)$" -v
++    ;;
++  *)
++    echo "usage: $0 base|new"
++    exit 2
++    ;;
++esac

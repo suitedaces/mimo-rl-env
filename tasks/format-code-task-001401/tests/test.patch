@@ -1,0 +1,388 @@
+diff --git a/usercase-test-coderl/nested_output_rewriters.test.ts b/usercase-test-coderl/nested_output_rewriters.test.ts
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/nested_output_rewriters.test.ts
+@@ -0,0 +1,358 @@
++import {
++  NestFieldOutputsRewriter,
++  RewriteHandler,
++  ScalarFieldToObjectFieldRewriter
++} from '../src';
++import { parse } from 'graphql';
++
++const requestQuery = (result: any): string => (typeof result === 'string' ? result : result.query);
++
++const fieldAtPath = (query: string, path: string[]): any => {
++  const operation = parse(query).definitions.find(
++    (definition: any) => definition.kind === 'OperationDefinition'
++  ) as any;
++  expect(operation).toBeDefined();
++  let selectionSet = operation.selectionSet;
++  let field: any;
++  path.forEach(name => {
++    field = selectionSet.selections.find(
++      (selection: any) => selection.kind === 'Field' && selection.name.value === name
++    );
++    expect(field).toBeDefined();
++    selectionSet = field.selectionSet;
++  });
++  return field;
++};
++
++const selectionNames = (field: any): string[] =>
++  ((field.selectionSet && field.selectionSet.selections) || [])
++    .filter((selection: any) => selection.kind === 'Field')
++    .map((selection: any) => selection.name.value);
++
++const expectFieldSelections = (query: string, path: string[], expected: string[]) => {
++  expect(selectionNames(fieldAtPath(query, path)).sort()).toEqual([...expected].sort());
++};
++
++const expectNoSelectionSet = (query: string, path: string[]) => {
++  expect(fieldAtPath(query, path).selectionSet).toBeUndefined();
++};
++
++describe('nested output schema compatibility exported rewriters', () => {
++  test('constructor contracts are exposed from the package root', () => {
++
++
++    expect(typeof RewriteHandler).toBe('function');
++    expect(typeof ScalarFieldToObjectFieldRewriter).toBe('function');
++    expect(typeof NestFieldOutputsRewriter).toBe('function');
++
++
++    expect(() => new ScalarFieldToObjectFieldRewriter({ objectFieldName: 'text' } as any)).toThrow(
++      Error
++    );
++
++    expect(() =>
++      new NestFieldOutputsRewriter({
++        newOutputName: 'cat',
++        outputsToNest: ['id']
++      } as any)
++    ).toThrow(Error);
++  });
++
++  test('scalar field request and response evolve through one handler session', () => {
++
++
++    const handler = new RewriteHandler([
++      new ScalarFieldToObjectFieldRewriter({
++        fieldName: 'title',
++        rootTypes: ['query'],
++        objectFieldName: 'text'
++      })
++    ]);
++
++    const query = requestQuery(handler.rewriteRequest('query { thing { title color } }'));
++
++    expectFieldSelections(query, ['thing'], ['title', 'color']);
++    expectFieldSelections(query, ['thing', 'title'], ['text']);
++    expectNoSelectionSet(query, ['thing', 'color']);
++    expect(
++      handler.rewriteResponse({
++        thing: { title: { text: 'THING' }, color: 'blue' }
++      })
++    ).toEqual({
++      thing: { title: 'THING', color: 'blue' }
++    });
++  });
++
++  test('scalar object arrays are unwrapped while siblings stay at the same response path', () => {
++
++
++    const handler = new RewriteHandler([
++      new ScalarFieldToObjectFieldRewriter({ fieldName: 'titles', objectFieldName: 'text' })
++    ]);
++
++    const query = requestQuery(handler.rewriteRequest('query { thing { titles other } }'));
++
++    expectFieldSelections(query, ['thing'], ['titles', 'other']);
++    expectFieldSelections(query, ['thing', 'titles'], ['text']);
++    expectNoSelectionSet(query, ['thing', 'other']);
++    expect(
++      handler.rewriteResponse({
++        thing: { titles: [{ text: 'A' }, { text: 'B' }], other: 'kept' }
++      })
++    ).toEqual({
++      thing: { titles: ['A', 'B'], other: 'kept' }
++    });
++  });
++
++  test('scalar fields that already have selections are skipped and record no response path', () => {
++
++
++    const handler = new RewriteHandler([
++      new ScalarFieldToObjectFieldRewriter({ fieldName: 'title', objectFieldName: 'text' })
++    ]);
++
++    const query = requestQuery(handler.rewriteRequest('query { thing { title { text } color } }'));
++
++    expectFieldSelections(query, ['thing'], ['title', 'color']);
++    expectFieldSelections(query, ['thing', 'title'], ['text']);
++    expectNoSelectionSet(query, ['thing', 'color']);
++    expect(
++      handler.rewriteResponse({
++        thing: { title: { text: 'THING' }, color: 'blue' }
++      })
++    ).toEqual({
++      thing: { title: { text: 'THING' }, color: 'blue' }
++    });
++  });
++
++  test('scalar matching can be driven by matchConditions without a fieldName', () => {
++
++
++    const matchHeadline = (nodeAndVars: any) =>
++      nodeAndVars.node.kind === 'Field' && nodeAndVars.node.name.value === 'headline';
++    const handler = new RewriteHandler([
++      new ScalarFieldToObjectFieldRewriter({
++        matchConditions: [matchHeadline],
++        objectFieldName: 'text'
++      } as any)
++    ]);
++
++    const query = requestQuery(handler.rewriteRequest('query { thing { headline other } }'));
++
++    expectFieldSelections(query, ['thing'], ['headline', 'other']);
++    expectFieldSelections(query, ['thing', 'headline'], ['text']);
++    expectNoSelectionSet(query, ['thing', 'other']);
++    expect(
++      handler.rewriteResponse({
++        thing: { headline: { text: 'HEAD' }, other: 'kept' }
++      })
++    ).toEqual({
++      thing: { headline: 'HEAD', other: 'kept' }
++    });
++  });
++
++  test('nest output request and response flatten only configured fields', () => {
++
++
++    const handler = new RewriteHandler([
++      new NestFieldOutputsRewriter({
++        fieldName: 'createCat',
++        rootTypes: ['mutation'],
++        newOutputName: 'cat',
++        outputsToNest: ['id', 'name']
++      })
++    ]);
++
++    const query = requestQuery(handler.rewriteRequest('mutation { createCat { id name executionTime } }'));
++
++    expectFieldSelections(query, ['createCat'], ['executionTime', 'cat']);
++    expectFieldSelections(query, ['createCat', 'cat'], ['id', 'name']);
++    expect(
++      handler.rewriteResponse({
++        createCat: { cat: { id: 1, name: 'jack' }, executionTime: 10 }
++      })
++    ).toEqual({
++      createCat: { executionTime: 10, id: 1, name: 'jack' }
++    });
++  });
++
++  test('nest output transformation flattens arrays of parent results', () => {
++
++
++    const handler = new RewriteHandler([
++      new NestFieldOutputsRewriter({
++        fieldName: 'createCats',
++        newOutputName: 'cat',
++        outputsToNest: ['id', 'name']
++      })
++    ]);
++
++    const query = requestQuery(
++      handler.rewriteRequest('mutation { createCats { id name executionTime } }')
++    );
++
++    expectFieldSelections(query, ['createCats'], ['executionTime', 'cat']);
++    expectFieldSelections(query, ['createCats', 'cat'], ['id', 'name']);
++    expect(
++      handler.rewriteResponse({
++        createCats: [
++          { cat: { id: 1, name: 'jack' }, executionTime: 10 },
++          { cat: { id: 2, name: 'jill' }, executionTime: 11 }
++        ]
++      })
++    ).toEqual({
++      createCats: [
++        { executionTime: 10, id: 1, name: 'jack' },
++        { executionTime: 11, id: 2, name: 'jill' }
++      ]
++    });
++  });
++
++  test('existing nested output selection prevents another nesting pass', () => {
++
++
++    const handler = new RewriteHandler([
++      new NestFieldOutputsRewriter({
++        fieldName: 'createCat',
++        newOutputName: 'cat',
++        outputsToNest: ['id', 'name']
++      })
++    ]);
++
++    const query = requestQuery(
++      handler.rewriteRequest('mutation { createCat { cat { id } id name executionTime } }')
++    );
++
++    expectFieldSelections(query, ['createCat'], ['cat', 'id', 'name', 'executionTime']);
++    expectFieldSelections(query, ['createCat', 'cat'], ['id']);
++    expect(
++      handler.rewriteResponse({
++        createCat: { cat: { id: 1 }, id: 99, name: 'flat', executionTime: 10 }
++      })
++    ).toEqual({
++      createCat: { cat: { id: 1 }, id: 99, name: 'flat', executionTime: 10 }
++    });
++  });
++
++  test('nest response leaves null and non-object branches unchanged but flattens valid siblings', () => {
++
++
++    const handler = new RewriteHandler([
++      new NestFieldOutputsRewriter({
++        fieldName: 'createCats',
++        newOutputName: 'cat',
++        outputsToNest: ['id', 'name']
++      })
++    ]);
++
++    const query = requestQuery(handler.rewriteRequest('mutation { createCats { id name } }'));
++
++    expectFieldSelections(query, ['createCats'], ['cat']);
++    expectFieldSelections(query, ['createCats', 'cat'], ['id', 'name']);
++    expect(
++      handler.rewriteResponse({
++        createCats: [
++          null,
++          'bad',
++          { cat: null, executionTime: 10 },
++          { cat: 'bad', executionTime: 11 },
++          { cat: { id: 3, name: 'ok' }, executionTime: 12 }
++        ]
++      })
++    ).toEqual({
++      createCats: [
++        null,
++        'bad',
++        { cat: null, executionTime: 10 },
++        { cat: 'bad', executionTime: 11 },
++        { executionTime: 12, id: 3, name: 'ok' }
++      ]
++    });
++  });
++
++  test('handler session rewrites request and response through the scalar rewriter', () => {
++
++
++    const handler = new RewriteHandler([
++      new ScalarFieldToObjectFieldRewriter({ fieldName: 'title', objectFieldName: 'text' })
++    ]);
++
++    const query = requestQuery(handler.rewriteRequest('query { thing { title } }'));
++
++    expectFieldSelections(query, ['thing'], ['title']);
++    expectFieldSelections(query, ['thing', 'title'], ['text']);
++    expect(
++      handler.rewriteResponse({
++        thing: { title: { text: 'THING' } }
++      })
++    ).toEqual({
++      thing: { title: 'THING' }
++    });
++  });
++
++  test('two handler instances keep their recorded response paths independent', () => {
++
++
++    const a = new RewriteHandler([
++      new ScalarFieldToObjectFieldRewriter({ fieldName: 'title', objectFieldName: 'text' })
++    ]);
++    const b = new RewriteHandler([
++      new ScalarFieldToObjectFieldRewriter({ fieldName: 'titles', objectFieldName: 'text' })
++    ]);
++
++    const aQuery = requestQuery(a.rewriteRequest('query { thing { title } }'));
++    const bQuery = requestQuery(b.rewriteRequest('query { thing { titles } }'));
++
++    expectFieldSelections(aQuery, ['thing'], ['title']);
++    expectFieldSelections(aQuery, ['thing', 'title'], ['text']);
++    expectFieldSelections(bQuery, ['thing'], ['titles']);
++    expectFieldSelections(bQuery, ['thing', 'titles'], ['text']);
++    expect(
++      a.rewriteResponse({
++        thing: { title: { text: 'ONE' }, titles: [{ text: 'A' }] }
++      })
++    ).toEqual({
++      thing: { title: 'ONE', titles: [{ text: 'A' }] }
++    });
++    expect(
++      b.rewriteResponse({
++        thing: { title: { text: 'ONE' }, titles: [{ text: 'A' }] }
++      })
++    ).toEqual({
++      thing: { title: { text: 'ONE' }, titles: ['A'] }
++    });
++  });
++
++  test('repeated construct request response cycles keep producing the specified transformations', () => {
++
++
++    let completed = 0;
++
++    for (let i = 0; i < 150; i += 1) {
++      const handler = new RewriteHandler([
++        new NestFieldOutputsRewriter({
++          fieldName: 'createCat',
++          newOutputName: 'cat',
++          outputsToNest: ['id', 'name']
++        })
++      ]);
++      const query = requestQuery(
++        handler.rewriteRequest('mutation { createCat { id name executionTime } }')
++      );
++
++      expectFieldSelections(query, ['createCat'], ['executionTime', 'cat']);
++      expectFieldSelections(query, ['createCat', 'cat'], ['id', 'name']);
++      expect(
++        handler.rewriteResponse({
++          createCat: { cat: { id: 1, name: 'jack' }, executionTime: 10 }
++        })
++      ).toEqual({
++        createCat: { executionTime: 10, id: 1, name: 'jack' }
++      });
++      completed += 1;
++    }
++
++
++    expect(completed).toBe(150);
++  });
++});
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,20 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++cd /workspace/repo
++
++if [ ! -x /workspace/repo/node_modules/.bin/jest ]; then
++  echo "Missing /workspace/repo/node_modules/.bin/jest; dependencies must be preinstalled before the offline run." >&2
++  exit 127
++fi
++
++exec /workspace/repo/node_modules/.bin/jest /workspace/repo/usercase-test-coderl/nested_output_rewriters.test.ts --runInBand

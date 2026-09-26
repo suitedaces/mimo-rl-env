@@ -1,0 +1,314 @@
+diff --git a/tests/apps/migrations/auto/test_schema_differ_rename_hints.py b/tests/apps/migrations/auto/test_schema_differ_rename_hints.py
+new file mode 100644
+index 00000000..1a25c9e6
+--- /dev/null
++++ b/tests/apps/migrations/auto/test_schema_differ_rename_hints.py
+@@ -0,0 +1,297 @@
++from __future__ import annotations
++
++import typing as t
++from unittest import TestCase
++from unittest.mock import patch
++
++from piccolo.apps.migrations.auto import DiffableTable, SchemaDiffer
++from piccolo.columns.column_types import Varchar
++
++
++def make_column(name: str, length: int = 255) -> Varchar:
++    column = Varchar(length=length)
++    column._meta.name = name
++    return column
++
++
++def make_table(
++    class_name: str,
++    tablename: str,
++    *columns: Varchar,
++) -> DiffableTable:
++    return DiffableTable(
++        class_name=class_name,
++        tablename=tablename,
++        columns=list(columns),
++    )
++
++
++class TestSchemaDifferRenameHints(TestCase):
++    def make_differ(
++        self,
++        schema: t.List[DiffableTable],
++        schema_snapshot: t.List[DiffableTable],
++        **kwargs: t.Any,
++    ) -> SchemaDiffer:
++        try:
++            return SchemaDiffer(
++                schema=schema,
++                schema_snapshot=schema_snapshot,
++                **kwargs,
++            )
++        except TypeError as exception:
++            self.fail(
++                "SchemaDiffer must accept table_rename_hints and "
++                f"column_rename_hints: {exception}"
++            )
++
++    def test_explicit_table_hints_are_authoritative_and_deterministic(self):
++        schema_snapshot = [
++            make_table("LegacyVenue", "legacy_venue", make_column("capacity")),
++            make_table("LegacyBand", "legacy_band", make_column("code")),
++            make_table("LegacyCrew", "legacy_crew", make_column("name")),
++        ]
++        schema = [
++            make_table(
++                "Hall",
++                "hall",
++                make_column("capacity"),
++                make_column("address"),
++            ),
++            make_table(
++                "Act", "act", make_column("code"), make_column("stage_name")
++            ),
++            make_table("Crew", "crew", make_column("role")),
++        ]
++
++        with patch("builtins.input", side_effect=AssertionError("prompted")):
++            differ = self.make_differ(
++                schema,
++                schema_snapshot,
++                table_rename_hints={
++                    "LegacyVenue": "Hall",
++                    "LegacyBand": "Act",
++                },
++            )
++
++        self.assertEqual(
++            differ.rename_tables.statements,
++            [
++                "manager.rename_table(old_class_name='LegacyBand', "
++                "old_tablename='legacy_band', new_class_name='Act', "
++                "new_tablename='act')",
++                "manager.rename_table(old_class_name='LegacyVenue', "
++                "old_tablename='legacy_venue', new_class_name='Hall', "
++                "new_tablename='hall')",
++            ],
++        )
++        self.assertEqual(
++            differ.create_tables.statements,
++            ["manager.add_table('Crew', tablename='crew')"],
++        )
++        self.assertEqual(
++            differ.drop_tables.statements,
++            [
++                "manager.drop_table(class_name='LegacyCrew', "
++                "tablename='legacy_crew')"
++            ],
++        )
++        self.assertEqual(len(differ.new_table_columns.statements), 1)
++        self.assertIn(
++            "table_class_name='Crew'",
++            differ.new_table_columns.statements[0],
++        )
++        self.assertIn(
++            "column_name='role'", differ.new_table_columns.statements[0]
++        )
++
++    def test_column_hints_are_scoped_and_preserve_other_deltas(self):
++        schema_snapshot = [
++            make_table(
++                "Venue",
++                "venue",
++                make_column("title"),
++            ),
++            make_table(
++                "Band",
++                "band",
++                make_column("title"),
++                make_column("obsolete"),
++            ),
++        ]
++        schema = [
++            make_table("Venue", "venue", make_column("display")),
++            make_table(
++                "Band",
++                "band",
++                make_column("name"),
++                make_column("genre"),
++            ),
++        ]
++
++        differ = self.make_differ(
++            schema,
++            schema_snapshot,
++            auto_input="n",
++            column_rename_hints={
++                "Venue": {"title": "display"},
++                "Band": {"title": "name"},
++            },
++        )
++
++        self.assertEqual(
++            differ.rename_columns.statements,
++            [
++                "manager.rename_column(table_class_name='Band', "
++                "tablename='band', old_column_name='title', "
++                "new_column_name='name')",
++                "manager.rename_column(table_class_name='Venue', "
++                "tablename='venue', old_column_name='title', "
++                "new_column_name='display')",
++            ],
++        )
++        self.assertEqual(len(differ.add_columns.statements), 1)
++        self.assertIn("column_name='genre'", differ.add_columns.statements[0])
++        self.assertEqual(
++            differ.drop_columns.statements,
++            [
++                "manager.drop_column(table_class_name='Band', "
++                "tablename='band', column_name='obsolete')"
++            ],
++        )
++
++    def test_renamed_column_can_also_be_altered_after_table_rename(self):
++        old_column = make_column("title", length=50)
++        new_column = make_column("name", length=120)
++        schema_snapshot = [make_table("LegacyBand", "legacy_band", old_column)]
++        schema = [make_table("Band", "bands", new_column)]
++
++        differ = self.make_differ(
++            schema,
++            schema_snapshot,
++            auto_input="n",
++            table_rename_hints={"LegacyBand": "Band"},
++            column_rename_hints={"Band": {"title": "name"}},
++        )
++
++        self.assertEqual(
++            differ.rename_tables.statements,
++            [
++                "manager.rename_table(old_class_name='LegacyBand', "
++                "old_tablename='legacy_band', new_class_name='Band', "
++                "new_tablename='bands')"
++            ],
++        )
++        self.assertEqual(
++            differ.rename_columns.statements,
++            [
++                "manager.rename_column(table_class_name='Band', "
++                "tablename='bands', old_column_name='title', "
++                "new_column_name='name')"
++            ],
++        )
++        self.assertEqual(differ.add_columns.statements, [])
++        self.assertEqual(differ.drop_columns.statements, [])
++        self.assertEqual(
++            differ.alter_columns.statements,
++            [
++                "manager.alter_column(table_class_name='Band', "
++                "tablename='bands', column_name='name', "
++                "params={'length': 120}, old_params={'length': 50}, "
++                "column_class=Varchar, old_column_class=Varchar)"
++            ],
++        )
++
++    def test_generating_statements_is_repeatable_and_does_not_mutate_inputs(
++        self,
++    ):
++        old_column = make_column("title")
++        new_column = make_column("name")
++        schema_snapshot = [make_table("LegacyBand", "legacy_band", old_column)]
++        schema = [make_table("Band", "band", new_column)]
++
++        differ = self.make_differ(
++            schema,
++            schema_snapshot,
++            auto_input="n",
++            table_rename_hints={"LegacyBand": "Band"},
++            column_rename_hints={"Band": {"title": "name"}},
++        )
++        first = [
++            list(group.statements) for group in differ.get_alter_statements()
++        ]
++        second = [
++            list(group.statements) for group in differ.get_alter_statements()
++        ]
++
++        self.assertEqual(first, second)
++        self.assertEqual(schema_snapshot[0].class_name, "LegacyBand")
++        self.assertEqual(schema_snapshot[0].tablename, "legacy_band")
++        self.assertEqual(old_column._meta.name, "title")
++        self.assertEqual(schema[0].class_name, "Band")
++        self.assertEqual(schema[0].tablename, "band")
++        self.assertEqual(new_column._meta.name, "name")
++
++    def test_invalid_table_hints_are_rejected_at_construction(self):
++        schema_snapshot = [
++            make_table("LegacyBand", "legacy_band", make_column("title")),
++            make_table("LegacyVenue", "legacy_venue", make_column("label")),
++        ]
++        schema = [
++            make_table("Band", "band", make_column("name")),
++            make_table("Venue", "venue", make_column("display")),
++        ]
++        cases = [
++            {"Missing": "Band"},
++            {"LegacyBand": "Missing"},
++            {"LegacyBand": "Band", "LegacyVenue": "Band"},
++        ]
++
++        for hints in cases:
++            with self.subTest(hints=hints):
++                try:
++                    with self.assertRaises(ValueError):
++                        SchemaDiffer(
++                            schema=schema,
++                            schema_snapshot=schema_snapshot,
++                            auto_input="n",
++                            table_rename_hints=hints,
++                        )
++                except TypeError as exception:
++                    self.fail(
++                        "SchemaDiffer must accept table_rename_hints: "
++                        f"{exception}"
++                    )
++
++    def test_invalid_column_hints_are_rejected_at_construction(self):
++        schema_snapshot = [
++            make_table(
++                "Band",
++                "band",
++                make_column("title"),
++                make_column("code"),
++            )
++        ]
++        schema = [make_table("Band", "band", make_column("name"))]
++        cases = [
++            {"Missing": {"title": "name"}},
++            {"Band": {"missing": "name"}},
++            {"Band": {"title": "missing"}},
++            {"Band": {"title": "name", "code": "name"}},
++        ]
++
++        for hints in cases:
++            with self.subTest(hints=hints):
++                try:
++                    with self.assertRaises(ValueError):
++                        SchemaDiffer(
++                            schema=schema,
++                            schema_snapshot=schema_snapshot,
++                            auto_input="n",
++                            column_rename_hints=hints,
++                        )
++                except TypeError as exception:
++                    self.fail(
++                        "SchemaDiffer must accept column_rename_hints: "
++                        f"{exception}"
++                    )
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,6 @@
++#!/bin/bash
++set -euo pipefail
++
++PYTHONPATH=/usr/local/lib/python3.14/dist-packages python3.14 -S -m unittest -v \
++  tests.apps.migrations.auto.test_schema_differ_rename_hints \
++  tests.apps.migrations.auto.test_schema_differ

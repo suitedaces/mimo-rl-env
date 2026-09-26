@@ -1,0 +1,5 @@
+I want `dulwich.pack.apply_delta(src_buf: bytes | list[bytes], delta: bytes | list[bytes]) -> list[bytes]` to apply Git pack delta instructions to a base buffer and return the materialized object content as byte chunks. The function should accept either a single `bytes` value or a list of byte chunks for both `src_buf` and `delta`, treating chunk lists as their concatenation without mutating the input lists.
+
+For `apply_delta(b"", b"\x00\x03\x03abc")`, it should return `[b"abc"]`. For `apply_delta(b"hello world", b"\x0b\x0c\x90\x06\x06there!")`, it should return `[b"hello ", b"there!"]`, so `b"".join(...) == b"hello there!"`.
+
+Malformed deltas should raise `dulwich.errors.ApplyDeltaError`: a truncated size header such as `b"\x80"` should raise it, a declared source size that does not match `len(src_buf)` should raise it, opcode `0` should raise it, and deltas whose copy or insert operations cannot produce the declared destination size should raise it. Calling the function twice with the same inputs should produce equal results, and it should not perform filesystem writes, network access, or hidden global-state changes.

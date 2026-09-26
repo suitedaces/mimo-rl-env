@@ -1,0 +1,429 @@
+diff --git a/usercase-test-coderl/cached_disk_storage_manager_test.go b/usercase-test-coderl/cached_disk_storage_manager_test.go
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/cached_disk_storage_manager_test.go
+@@ -0,0 +1,399 @@
++package usercase_test_coderl
++
++import (
++	"errors"
++	"fmt"
++	"os"
++	"path/filepath"
++	"runtime"
++	"testing"
++
++	"github.com/krotik/eliasdb/storage"
++)
++
++
++
++
++
++
++
++const dbPrefix = "/tmp/eliasdb-usercase-fixture-"
++
++func newCachedManager(t *testing.T, suffix string, maxObjects int, transDisabled bool, lockfileDisabled bool) (*storage.DiskStorageManager, *storage.CachedDiskStorageManager) {
++	t.Helper()
++	base := dbPrefix + suffix
++	cleanupStorageFiles(t, base)
++	t.Cleanup(func() {
++		cleanupStorageFiles(t, base)
++	})
++	dsm := storage.NewDiskStorageManager(base, false, false, transDisabled, lockfileDisabled)
++	return dsm, storage.NewCachedDiskStorageManager(dsm, maxObjects)
++}
++
++func cleanupStorageFiles(t *testing.T, base string) {
++	t.Helper()
++	for _, suffix := range []string{"", ".db", ".dbf", ".ix", ".ixf", ".lck"} {
++		if err := os.Remove(base + suffix); err != nil && !os.IsNotExist(err) {
++			t.Fatalf("remove %s: %v", base+suffix, err)
++		}
++	}
++}
++
++func requireNoError(t *testing.T, err error) {
++	t.Helper()
++	if err != nil {
++		t.Fatalf("unexpected error: %v", err)
++	}
++}
++
++func requireManagerErrorType(t *testing.T, err error, want error) {
++	t.Helper()
++	var managerErr *storage.ManagerError
++	if !errors.As(err, &managerErr) {
++		t.Fatalf("expected *storage.ManagerError, got %T: %v", err, err)
++	}
++	if managerErr.Type != want {
++		t.Fatalf("unexpected ManagerError.Type: got %v want %v", managerErr.Type, want)
++	}
++}
++
++func cachedString(t *testing.T, cdsm *storage.CachedDiskStorageManager, loc uint64) string {
++	t.Helper()
++	obj, err := cdsm.FetchCached(loc)
++	requireNoError(t, err)
++	switch val := obj.(type) {
++	case string:
++		return val
++	case *string:
++		return *val
++	default:
++		t.Fatalf("cached value at %d has type %T", loc, obj)
++		return ""
++	}
++}
++
++func TestCachedWrapperDelegatesNameRootsFlushAndClose(t *testing.T) {
++
++
++	dsm, cdsm := newCachedManager(t, "delegation", 10, true, true)
++
++
++	if got, want := cdsm.Name(), dsm.Name(); got != want {
++		t.Fatalf("Name() = %q, wrapped Name() = %q", got, want)
++	}
++
++	if got, want := cdsm.Root(storage.RootIDVersion), dsm.Root(storage.RootIDVersion); got != want {
++		t.Fatalf("Root(RootIDVersion) = %d, wrapped Root(RootIDVersion) = %d", got, want)
++	}
++
++	if got, want := cdsm.Root(5), dsm.Root(5); got != want {
++		t.Fatalf("Root(5) before SetRoot = %d, wrapped Root(5) before SetRoot = %d", got, want)
++	}
++
++	cdsm.SetRoot(5, 20)
++	if got := cdsm.Root(5); got != 20 {
++		t.Fatalf("Root(5) after SetRoot = %d", got)
++	}
++	if got := dsm.Root(5); got != 20 {
++		t.Fatalf("wrapped Root(5) after SetRoot = %d", got)
++	}
++	requireNoError(t, cdsm.Flush())
++	requireNoError(t, cdsm.Close())
++}
++
++func TestInsertFetchUpdateAndFreeKeepCacheAndDiskInStep(t *testing.T) {
++
++
++	dsm, cdsm := newCachedManager(t, "mutation", 10, true, true)
++	defer cdsm.Close()
++
++	loc, err := cdsm.Insert("test66")
++	requireNoError(t, err)
++
++	if loc == 0 {
++		t.Fatalf("Insert location = %d", loc)
++	}
++	if got := cachedString(t, cdsm, loc); got != "test66" {
++		t.Fatalf("FetchCached after Insert = %q", got)
++	}
++
++	var fetched string
++	requireNoError(t, cdsm.Fetch(loc, &fetched))
++	if fetched != "test66" {
++		t.Fatalf("Fetch after Insert = %q", fetched)
++	}
++	var direct string
++	requireNoError(t, dsm.Fetch(loc, &direct))
++	if direct != "test66" {
++		t.Fatalf("wrapped Fetch after Insert = %q", direct)
++	}
++
++	requireNoError(t, cdsm.Update(loc, "test77"))
++	if got := cachedString(t, cdsm, loc); got != "test77" {
++		t.Fatalf("FetchCached after Update = %q", got)
++	}
++	direct = ""
++	requireNoError(t, dsm.Fetch(loc, &direct))
++	if direct != "test77" {
++		t.Fatalf("wrapped Fetch after Update = %q", direct)
++	}
++
++	requireNoError(t, cdsm.Free(loc))
++	_, err = cdsm.FetchCached(loc)
++	requireManagerErrorType(t, err, storage.ErrNotInCache)
++	direct = ""
++	err = dsm.Fetch(loc, &direct)
++	requireManagerErrorType(t, err, storage.ErrSlotNotFound)
++	if direct != "" {
++		t.Fatalf("wrapped Fetch destination after Free = %q", direct)
++	}
++}
++
++func TestFetchCachedMissUsesSpecificManagerError(t *testing.T) {
++
++
++	_, cdsm := newCachedManager(t, "miss", 3, true, true)
++	defer cdsm.Close()
++
++	obj, err := cdsm.FetchCached(65554)
++	if obj != nil {
++		t.Fatalf("FetchCached fresh object = %#v", obj)
++	}
++	requireManagerErrorType(t, err, storage.ErrNotInCache)
++}
++
++func TestLeastRecentlyUsedEvictionAndFetchTouch(t *testing.T) {
++
++
++	dsm, cdsm := newCachedManager(t, "lru", 3, true, true)
++	defer cdsm.Close()
++
++	loc1, err := dsm.Insert("test1")
++	requireNoError(t, err)
++	loc2, err := dsm.Insert("test2")
++	requireNoError(t, err)
++	loc3, err := dsm.Insert("test3")
++	requireNoError(t, err)
++	loc4, err := dsm.Insert("test4")
++	requireNoError(t, err)
++
++	seenLocations := map[uint64]bool{}
++	for _, loc := range []uint64{loc1, loc2, loc3, loc4} {
++		if loc == 0 || seenLocations[loc] {
++			t.Fatalf("locations = %d, %d, %d, %d", loc1, loc2, loc3, loc4)
++		}
++		seenLocations[loc] = true
++	}
++
++	var one, two, three, four string
++	requireNoError(t, cdsm.Fetch(loc1, &one))
++	if one != "test1" {
++		t.Fatalf("Fetch loc1 = %q", one)
++	}
++	requireNoError(t, cdsm.Fetch(loc2, &two))
++	if two != "test2" {
++		t.Fatalf("Fetch loc2 = %q", two)
++	}
++	requireNoError(t, cdsm.Fetch(loc3, &three))
++	if three != "test3" {
++		t.Fatalf("Fetch loc3 = %q", three)
++	}
++	if got := cachedString(t, cdsm, loc1); got != "test1" {
++		t.Fatalf("FetchCached loc1 at capacity = %q", got)
++	}
++	if got := cachedString(t, cdsm, loc2); got != "test2" {
++		t.Fatalf("FetchCached loc2 at capacity = %q", got)
++	}
++	if got := cachedString(t, cdsm, loc3); got != "test3" {
++		t.Fatalf("FetchCached loc3 at capacity = %q", got)
++	}
++
++	requireNoError(t, cdsm.Fetch(loc4, &four))
++	if four != "test4" {
++		t.Fatalf("Fetch loc4 = %q", four)
++	}
++	_, err = cdsm.FetchCached(loc1)
++	requireManagerErrorType(t, err, storage.ErrNotInCache)
++	if got := cachedString(t, cdsm, loc2); got != "test2" {
++		t.Fatalf("FetchCached loc2 after loc4 = %q", got)
++	}
++	if got := cachedString(t, cdsm, loc3); got != "test3" {
++		t.Fatalf("FetchCached loc3 after loc4 = %q", got)
++	}
++	if got := cachedString(t, cdsm, loc4); got != "test4" {
++		t.Fatalf("FetchCached loc4 after loc4 = %q", got)
++	}
++
++	var touchedTwo, reloadedOne string
++	requireNoError(t, cdsm.Fetch(loc2, &touchedTwo))
++	if touchedTwo != "test2" {
++		t.Fatalf("Fetch touch loc2 = %q", touchedTwo)
++	}
++	requireNoError(t, cdsm.Fetch(loc1, &reloadedOne))
++	if reloadedOne != "test1" {
++		t.Fatalf("Fetch reload loc1 = %q", reloadedOne)
++	}
++	if got := cachedString(t, cdsm, loc1); got != "test1" {
++		t.Fatalf("FetchCached loc1 after reload = %q", got)
++	}
++	if got := cachedString(t, cdsm, loc2); got != "test2" {
++		t.Fatalf("FetchCached loc2 after touch = %q", got)
++	}
++	_, err = cdsm.FetchCached(loc3)
++	requireManagerErrorType(t, err, storage.ErrNotInCache)
++	if got := cachedString(t, cdsm, loc4); got != "test4" {
++		t.Fatalf("FetchCached loc4 after reload = %q", got)
++	}
++}
++
++func TestRollbackClearsCacheAndDelegatesByTransactionMode(t *testing.T) {
++
++
++	_, txCached := newCachedManager(t, "rollback-tx", 3, false, true)
++	defer txCached.Close()
++
++	txLoc, err := txCached.Insert("test1")
++	requireNoError(t, err)
++
++	if txLoc == 0 {
++		t.Fatalf("transactional Insert location = %d", txLoc)
++	}
++	if got := cachedString(t, txCached, txLoc); got != "test1" {
++		t.Fatalf("transactional FetchCached before Rollback = %q", got)
++	}
++	requireNoError(t, txCached.Rollback())
++	_, err = txCached.FetchCached(txLoc)
++	requireManagerErrorType(t, err, storage.ErrNotInCache)
++	var rolledBack string
++	err = txCached.Fetch(txLoc, &rolledBack)
++	requireManagerErrorType(t, err, storage.ErrSlotNotFound)
++	if rolledBack != "" {
++		t.Fatalf("transactional Fetch destination after Rollback = %q", rolledBack)
++	}
++
++	_, noTxCached := newCachedManager(t, "rollback-notx", 3, true, true)
++	defer noTxCached.Close()
++	noTxLoc, err := noTxCached.Insert("test1")
++	requireNoError(t, err)
++
++	if noTxLoc == 0 {
++		t.Fatalf("non-transactional Insert location = %d", noTxLoc)
++	}
++	requireNoError(t, noTxCached.Rollback())
++	if got := cachedString(t, noTxCached, noTxLoc); got != "test1" {
++		t.Fatalf("non-transactional FetchCached after Rollback = %q", got)
++	}
++	var kept string
++	requireNoError(t, noTxCached.Fetch(noTxLoc, &kept))
++	if kept != "test1" {
++		t.Fatalf("non-transactional Fetch after Rollback = %q", kept)
++	}
++}
++
++func TestIndependentManagersDoNotShareCachedState(t *testing.T) {
++
++
++	_, a := newCachedManager(t, "instance-a", 3, true, true)
++	defer a.Close()
++	_, b := newCachedManager(t, "instance-b", 3, true, true)
++	defer b.Close()
++
++	aLoc, err := a.Insert("alpha")
++	requireNoError(t, err)
++	bLoc, err := b.Insert("bravo")
++	requireNoError(t, err)
++
++	if aLoc == 0 {
++		t.Fatalf("a Insert location = %d", aLoc)
++	}
++
++	if bLoc == 0 {
++		t.Fatalf("b Insert location = %d", bLoc)
++	}
++	if got := cachedString(t, a, aLoc); got != "alpha" {
++		t.Fatalf("a FetchCached before update = %q", got)
++	}
++	if got := cachedString(t, b, bLoc); got != "bravo" {
++		t.Fatalf("b FetchCached before a update = %q", got)
++	}
++
++	requireNoError(t, a.Update(aLoc, "omega"))
++	if got := cachedString(t, a, aLoc); got != "omega" {
++		t.Fatalf("a FetchCached after update = %q", got)
++	}
++	if got := cachedString(t, b, bLoc); got != "bravo" {
++		t.Fatalf("b FetchCached after a update = %q", got)
++	}
++}
++
++func TestCloseDelegatesToWrappedDiskManagerLifecycle(t *testing.T) {
++
++
++	_, cdsm := newCachedManager(t, "double-close", 3, true, true)
++
++	requireNoError(t, cdsm.Close())
++	defer func() {
++		recovered := recover()
++		if recovered == nil {
++			t.Fatalf("second Close panic = <nil>")
++		}
++
++	}()
++	_ = cdsm.Close()
++}
++
++func TestCloseReleasesFileDescriptorsAndLockfileGoroutinesAcrossCycles(t *testing.T) {
++
++
++	runtime.GC()
++	beforeFDs := countFDs(t)
++	beforeGoroutines := runtime.NumGoroutine()
++	var keepReachable []*storage.CachedDiskStorageManager
++
++	for i := 0; i < 120; i++ {
++		base := filepath.Join(os.TempDir(), fmt.Sprintf("eliasdb-usercase-fixture-cycle-%03d", i))
++		cleanupStorageFiles(t, base)
++		dsm := storage.NewDiskStorageManager(base, false, false, true, false)
++		cdsm := storage.NewCachedDiskStorageManager(dsm, 3)
++		loc, err := cdsm.Insert("cycle")
++		requireNoError(t, err)
++
++		if loc == 0 {
++			t.Fatalf("cycle %d Insert location = %d", i, loc)
++		}
++		var fetched string
++		requireNoError(t, cdsm.Fetch(loc, &fetched))
++		if fetched != "cycle" {
++			t.Fatalf("cycle %d Fetch = %q", i, fetched)
++		}
++		requireNoError(t, cdsm.Close())
++		keepReachable = append(keepReachable, cdsm)
++		t.Cleanup(func() {
++			cleanupStorageFiles(t, base)
++		})
++	}
++
++	runtime.GC()
++	afterFDs := countFDs(t)
++	afterGoroutines := runtime.NumGoroutine()
++
++	if afterFDs > beforeFDs+64 {
++		t.Fatalf("file descriptors grew from %d to %d", beforeFDs, afterFDs)
++	}
++
++	if afterGoroutines > beforeGoroutines+64 {
++		t.Fatalf("goroutines grew from %d to %d", beforeGoroutines, afterGoroutines)
++	}
++	if len(keepReachable) != 120 {
++		t.Fatalf("kept managers = %d", len(keepReachable))
++	}
++}
++
++func countFDs(t *testing.T) int {
++	t.Helper()
++	entries, err := os.ReadDir("/proc/self/fd")
++	if err != nil {
++		t.Fatalf("read /proc/self/fd: %v", err)
++	}
++	return len(entries)
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,20 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++export GOPROXY=off
++export GOSUMDB=off
++export GOTOOLCHAIN=local
++export GOVCS='*:off'
++export GOFLAGS="${GOFLAGS:-} -mod=readonly"
++set -e
++cd /workspace/repo
++set -euo pipefail
++
++cd /workspace/repo
++exec go test -v -count=1 ./usercase-test-coderl/...

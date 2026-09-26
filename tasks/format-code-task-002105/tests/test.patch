@@ -1,0 +1,542 @@
+diff --git a/usercase-test-coderl/test_custom_model_creation.py b/usercase-test-coderl/test_custom_model_creation.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/test_custom_model_creation.py
+@@ -0,0 +1,503 @@
++import importlib
++import json
++import threading
++from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
++from pathlib import Path
++
++import anyio
++import httpx
++import pytest
++
++import ollama
++from ollama import AsyncClient, Client, Message, Options
++
++EMPTY_SHA256 = 'sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'
++
++
++def _json_body(request: httpx.Request) -> dict:
++  return json.loads(request.content.decode())
++
++
++def _create_json_transport(records, response_status='success', status_code=200):
++  def handler(request: httpx.Request) -> httpx.Response:
++    records.append((request.method, request.url.path, _json_body(request)))
++    return httpx.Response(status_code, json={'status': response_status})
++
++  return httpx.MockTransport(handler)
++
++
++def _stream_transport(records):
++  def handler(request: httpx.Request) -> httpx.Response:
++    records.append((request.method, request.url.path, _json_body(request)))
++    return httpx.Response(
++      200,
++      content=b'{"status":"parsing modelfile"}\n{"status":"creating model layer"}\n{"status":"success"}\n',
++    )
++
++  return httpx.MockTransport(handler)
++
++
++def _blob_transport(records, status_code):
++  def handler(request: httpx.Request) -> httpx.Response:
++    records.append((request.method, request.url.path, request.content))
++    return httpx.Response(status_code)
++
++  return httpx.MockTransport(handler)
++
++
++class _RecordingHandler(BaseHTTPRequestHandler):
++  protocol_version = 'HTTP/1.1'
++
++  def do_POST(self):
++    length = int(self.headers.get('Content-Length', '0'))
++    payload = self.rfile.read(length)
++    self.server.records.append((self.command, self.path, json.loads(payload.decode())))
++
++    body = b'{"status":"success"}'
++    self.send_response(200)
++    self.send_header('Content-Type', 'application/json')
++    self.send_header('Content-Length', str(len(body)))
++    if self.server.close_after_response:
++      self.send_header('Connection', 'close')
++      self.close_connection = True
++    self.end_headers()
++    self.wfile.write(body)
++
++  def log_message(self, format, *args):
++    return None
++
++
++class _RecordingServer:
++  def __init__(self, *, close_after_response=False):
++    self._server = ThreadingHTTPServer(('127.0.0.1', 0), _RecordingHandler)
++    self._server.records = []
++    self._server.close_after_response = close_after_response
++    self.url = f'http://127.0.0.1:{self._server.server_port}'
++    self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
++
++  @property
++  def records(self):
++    return self._server.records
++
++  def __enter__(self):
++    self._thread.start()
++    return self
++
++  def __exit__(self, exc_type, exc, tb):
++    self._server.shutdown()
++    self._server.server_close()
++    self._thread.join(timeout=5)
++
++
++def test_sync_create_from_model_posts_literal_json_and_returns_progress_status():
++
++
++
++
++  records = []
++  client = Client(host='http://testserver', transport=_create_json_transport(records))
++
++  response = client.create('dummy', from_='llama2')
++
++  assert response.status == 'success'
++
++  assert isinstance(response, ollama.ProgressResponse)
++  assert records == [('POST', '/api/create', {'model': 'dummy', 'stream': False, 'from': 'llama2'})]
++  client.close()
++
++
++def test_sync_create_serializes_all_creation_options_with_string_license():
++
++
++
++
++  records = []
++  client = Client(host='http://testserver', transport=_create_json_transport(records))
++
++  response = client.create(
++    'dummy',
++    quantize='q4_k_m',
++    from_='llama2',
++    files={'model.gguf': 'sha256:abc123'},
++    adapters={'adapter.gguf': 'sha256:def456'},
++    template='FROM {{ .Model }}',
++    license='MIT',
++    system='Use short answers.',
++    parameters={'stop': ['</s>']},
++    messages=[{'role': 'user', 'content': 'Hello'}],
++  )
++
++  assert response.status == 'success'
++  assert records == [
++    (
++      'POST',
++      '/api/create',
++      {
++        'model': 'dummy',
++        'stream': False,
++        'quantize': 'q4_k_m',
++        'files': {'model.gguf': 'sha256:abc123'},
++        'adapters': {'adapter.gguf': 'sha256:def456'},
++        'template': 'FROM {{ .Model }}',
++        'license': 'MIT',
++        'system': 'Use short answers.',
++        'parameters': {'stop': ['</s>']},
++        'messages': [{'role': 'user', 'content': 'Hello'}],
++        'from': 'llama2',
++      },
++    ),
++  ]
++  client.close()
++
++
++def test_sync_create_accepts_options_and_message_models():
++
++
++
++
++  records = []
++  client = Client(host='http://testserver', transport=_create_json_transport(records))
++
++  response = client.create('dummy-options', parameters=Options(stop=['</s>']), messages=[Message(role='user', content='Hello from Message')])
++
++  assert response.status == 'success'
++  assert records == [
++    (
++      'POST',
++      '/api/create',
++      {
++        'model': 'dummy-options',
++        'stream': False,
++        'parameters': {'stop': ['</s>']},
++        'messages': [{'role': 'user', 'content': 'Hello from Message'}],
++      },
++    ),
++  ]
++  client.close()
++
++
++def test_sync_create_stream_returns_progress_iterator_chunks():
++
++
++
++
++  records = []
++  client = Client(host='http://testserver', transport=_stream_transport(records))
++
++  chunks = client.create('dummy-stream', from_='llama2', stream=True)
++  statuses = [part.status for part in chunks]
++
++  assert statuses == ['parsing modelfile', 'creating model layer', 'success']
++  assert records == [('POST', '/api/create', {'model': 'dummy-stream', 'stream': True, 'from': 'llama2'})]
++  client.close()
++
++
++def test_sync_create_blob_uploads_empty_file_and_returns_digest_for_created_blob(tmp_path: Path):
++
++
++
++
++  records = []
++  blob = tmp_path / 'empty.gguf'
++  blob.write_bytes(b'')
++  client = Client(host='http://testserver', transport=_blob_transport(records, 201))
++
++  digest = client.create_blob(blob)
++
++  assert digest == EMPTY_SHA256
++  assert records == [('POST', f'/api/blobs/{EMPTY_SHA256}', b'')]
++  client.close()
++
++
++def test_sync_create_blob_returns_digest_for_existing_blob(tmp_path: Path):
++
++
++
++
++  records = []
++  blob = tmp_path / 'empty-existing.gguf'
++  blob.write_bytes(b'')
++  client = Client(host='http://testserver', transport=_blob_transport(records, 200))
++
++  digest = client.create_blob(str(blob))
++
++  assert digest == EMPTY_SHA256
++  assert records == [('POST', f'/api/blobs/{EMPTY_SHA256}', b'')]
++  client.close()
++
++
++def test_sync_create_blob_missing_path_raises_file_not_found_before_upload(tmp_path: Path):
++
++
++
++
++  records = []
++  client = Client(host='http://testserver', transport=_blob_transport(records, 201))
++
++
++  with pytest.raises(FileNotFoundError):
++    client.create_blob(tmp_path / 'missing.gguf')
++
++  assert records == []
++  client.close()
++
++
++def test_sync_create_uses_public_client_api_without_post_close_requirement():
++
++
++
++
++  records = []
++  client = Client(host='http://testserver', transport=_create_json_transport(records))
++
++  response = client.create('dummy', from_='llama2')
++
++
++  assert response.status == 'success'
++  assert records == [('POST', '/api/create', {'model': 'dummy', 'stream': False, 'from': 'llama2'})]
++  client.close()
++
++
++def test_sync_create_omits_none_fields_explicitly_passed():
++
++
++
++
++  records = []
++  client = Client(host='http://testserver', transport=_create_json_transport(records))
++
++  response = client.create('dummy-none', quantize=None, from_='llama2', template=None)
++
++
++  assert response.status == 'success'
++  assert records == [('POST', '/api/create', {'model': 'dummy-none', 'stream': False, 'from': 'llama2'})]
++  client.close()
++
++
++def test_two_sync_clients_keep_independent_request_state():
++
++
++
++
++  records_a = []
++  records_b = []
++  client_a = Client(host='http://a.test', transport=_create_json_transport(records_a, response_status='success-a'))
++  client_b = Client(host='http://b.test', transport=_create_json_transport(records_b, response_status='success-b'))
++
++  response_a = client_a.create('model-a', from_='llama2')
++
++  assert response_a.status == 'success-a'
++  assert records_a == [('POST', '/api/create', {'model': 'model-a', 'stream': False, 'from': 'llama2'})]
++  assert records_b == []
++
++  response_b = client_b.create('model-b', from_='mistral')
++
++  assert response_b.status == 'success-b'
++  assert records_a == [('POST', '/api/create', {'model': 'model-a', 'stream': False, 'from': 'llama2'})]
++  assert records_b == [('POST', '/api/create', {'model': 'model-b', 'stream': False, 'from': 'mistral'})]
++  client_a.close()
++  client_b.close()
++
++
++def test_module_level_create_uses_default_sync_client_public_api(monkeypatch):
++
++
++
++
++  with _RecordingServer(close_after_response=True) as server:
++    with monkeypatch.context() as scoped:
++      scoped.setenv('OLLAMA_HOST', server.url)
++      reloaded = importlib.reload(ollama)
++      response = reloaded.create('dummy', from_='llama2')
++
++    importlib.reload(ollama)
++
++  assert response.status == 'success'
++  assert server.records == [('POST', '/api/create', {'model': 'dummy', 'stream': False, 'from': 'llama2'})]
++
++
++def test_sync_create_repeated_clients_send_create_requests():
++
++
++
++
++  with _RecordingServer() as server:
++    for index in range(3):
++      client = Client(host=server.url)
++      response = client.create(f'leak-check-{index}', from_='llama2')
++      assert response.status == 'success'
++      client.close()
++
++
++  assert len(server.records) == 3
++  assert [record[2]['model'] for record in server.records] == ['leak-check-0', 'leak-check-1', 'leak-check-2']
++
++
++def test_async_create_from_model_posts_literal_json_and_returns_progress_status():
++
++
++
++
++
++  async def run():
++    records = []
++    client = AsyncClient(host='http://testserver', transport=_create_json_transport(records))
++
++    response = await client.create('dummy', from_='llama2')
++
++    assert response.status == 'success'
++
++    assert isinstance(response, ollama.ProgressResponse)
++    assert records == [('POST', '/api/create', {'model': 'dummy', 'stream': False, 'from': 'llama2'})]
++    await client.close()
++
++  anyio.run(run)
++
++
++def test_async_create_serializes_options_with_license_list():
++
++
++
++
++
++  async def run():
++    records = []
++    client = AsyncClient(host='http://testserver', transport=_create_json_transport(records))
++
++    response = await client.create(
++      'dummy',
++      quantize='q4_k_m',
++      from_='llama2',
++      adapters={'adapter.gguf': 'sha256:def456'},
++      template='FROM {{ .Model }}',
++      license=['MIT', 'Apache-2.0'],
++      system='Use short answers.',
++      parameters={'stop': ['</s>']},
++      messages=[{'role': 'user', 'content': 'Hello'}],
++    )
++
++    assert response.status == 'success'
++    assert records == [
++      (
++        'POST',
++        '/api/create',
++        {
++          'model': 'dummy',
++          'stream': False,
++          'quantize': 'q4_k_m',
++          'adapters': {'adapter.gguf': 'sha256:def456'},
++          'template': 'FROM {{ .Model }}',
++          'license': ['MIT', 'Apache-2.0'],
++          'system': 'Use short answers.',
++          'parameters': {'stop': ['</s>']},
++          'messages': [{'role': 'user', 'content': 'Hello'}],
++          'from': 'llama2',
++        },
++      ),
++    ]
++    await client.close()
++
++  anyio.run(run)
++
++
++def test_async_create_stream_returns_progress_async_iterator_chunks():
++
++
++
++
++
++  async def run():
++    records = []
++    client = AsyncClient(host='http://testserver', transport=_stream_transport(records))
++
++    chunks = await client.create('dummy-stream', from_='llama2', stream=True)
++    statuses = []
++    async for part in chunks:
++      statuses.append(part.status)
++
++    assert statuses == ['parsing modelfile', 'creating model layer', 'success']
++    assert records == [('POST', '/api/create', {'model': 'dummy-stream', 'stream': True, 'from': 'llama2'})]
++    await client.close()
++
++  anyio.run(run)
++
++
++def test_async_create_blob_uploads_empty_file_and_returns_digest_for_existing_blob(tmp_path: Path):
++
++
++
++
++
++  async def run():
++    records = []
++    blob = tmp_path / 'async-empty.gguf'
++    blob.write_bytes(b'')
++    client = AsyncClient(host='http://testserver', transport=_blob_transport(records, 200))
++
++    digest = await client.create_blob(blob)
++
++    assert digest == EMPTY_SHA256
++    assert records == [('POST', f'/api/blobs/{EMPTY_SHA256}', b'')]
++    await client.close()
++
++  anyio.run(run)
++
++
++def test_async_create_blob_missing_path_raises_file_not_found_before_upload(tmp_path: Path):
++
++
++
++
++
++  async def run():
++    records = []
++    client = AsyncClient(host='http://testserver', transport=_blob_transport(records, 201))
++
++
++    with pytest.raises(FileNotFoundError):
++      await client.create_blob(tmp_path / 'missing-async.gguf')
++
++    assert records == []
++    await client.close()
++
++  anyio.run(run)
++
++
++def test_async_create_uses_public_client_api_without_post_close_requirement():
++
++
++
++
++
++  async def run():
++    records = []
++    client = AsyncClient(host='http://testserver', transport=_create_json_transport(records))
++
++    response = await client.create('dummy', from_='llama2')
++
++
++    assert response.status == 'success'
++    assert records == [('POST', '/api/create', {'model': 'dummy', 'stream': False, 'from': 'llama2'})]
++    await client.close()
++
++  anyio.run(run)
++
++
++def test_async_create_omits_none_fields_explicitly_passed():
++
++
++
++
++
++  async def run():
++    records = []
++    client = AsyncClient(host='http://testserver', transport=_create_json_transport(records))
++
++    response = await client.create('dummy-none', quantize=None, from_='llama2', template=None)
++
++
++    assert response.status == 'success'
++    assert records == [('POST', '/api/create', {'model': 'dummy-none', 'stream': False, 'from': 'llama2'})]
++    await client.close()
++
++  anyio.run(run)
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,29 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++
++cd /workspace/repo
++
++export PYTHONPATH="/workspace/repo${PYTHONPATH:+:${PYTHONPATH}}"
++export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
++export PIP_NO_INDEX=1
++export PIP_DISABLE_PIP_VERSION_CHECK=1
++
++python - <<'PY'
++import anyio
++import httpx
++import pydantic
++import pytest
++import ollama
++PY
++
++exec python -m pytest /workspace/repo/usercase-test-coderl/test_custom_model_creation.py -v

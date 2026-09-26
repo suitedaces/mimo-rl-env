@@ -1,0 +1,240 @@
+diff --git a/tests/functional/logging/test_meta_logging.py b/tests/functional/logging/test_meta_logging.py
+index 19b107252..85a279e18 100644
+--- a/tests/functional/logging/test_meta_logging.py
++++ b/tests/functional/logging/test_meta_logging.py
+@@ -1,4 +1,5 @@
+ import json
++import os
+ 
+ import pytest
+ 
+@@ -14,9 +15,7 @@ def models():
+     return {"model1.sql": model1, "model2.sql": model2, "model3.sql": model3}
+ 
+ 
+-# This test checks that various events contain node_info,
+-# which is supplied by the log_contextvars context manager
+-def test_meta(project, logs_dir):
++def run_and_capture_node_info_logs(logs_dir):
+     run_dbt(["--log-format=json", "run"])
+ 
+     # get log file
+@@ -35,12 +34,51 @@ def test_meta(project, logs_dir):
+         if "node_info" not in log_dct["data"]:
+             continue
+ 
+-        print(f"--- log_dct: {log_dct}")
+-        node_info = log_dct["data"]["node_info"]
+-        node_path = node_info["node_path"]
+-        if node_path == "model1.sql":
+-            assert node_info["meta"] == {}
+-        elif node_path == "model2.sql":
+-            assert node_info["meta"] == {"owners": ["team1", "team2"]}
+-        elif node_path == "model3.sql":
+-            assert node_info["meta"] == {"key": 1}
++        yield log_dct["data"]["node_info"]
++
++
++def load_manifest(project):
++    manifest_path = os.path.join(project.project_root, "target", "manifest.json")
++    with open(manifest_path) as fp:
++        return json.load(fp)
++
++
++
++
++def test_meta(project, logs_dir):
++    for node_info_log in run_and_capture_node_info_logs(logs_dir):
++        if node_info_log["unique_id"] == "model.test.model1":
++            assert node_info_log["meta"] == {}
++        elif node_info_log["unique_id"] == "model.test.model2":
++            assert node_info_log["meta"] == {"owners": ["team1", "team2"]}
++        elif node_info_log["unique_id"] == "model.test.model3":
++            assert node_info_log["meta"] == {"key": 1}
++
++
++def test_checksum(project, logs_dir):
++    extra_model_path = os.path.join(project.project_root, "models", "checksum_extra_model.sql")
++    with open(extra_model_path, "w") as fp:
++        fp.write("select 42 as answer\n")
++
++    node_info_logs = list(run_and_capture_node_info_logs(logs_dir))
++    manifest = load_manifest(project)
++
++    expected_unique_ids = {
++        "model.test.model1",
++        "model.test.model2",
++        "model.test.model3",
++        "model.test.checksum_extra_model",
++    }
++    node_info_by_unique_id = {unique_id: [] for unique_id in expected_unique_ids}
++    for node_info_log in node_info_logs:
++        unique_id = node_info_log.get("unique_id")
++        if unique_id in expected_unique_ids:
++            node_info_by_unique_id[unique_id].append(node_info_log)
++
++    assert {unique_id for unique_id, logs in node_info_by_unique_id.items() if logs} == expected_unique_ids
++
++    for unique_id, logs in node_info_by_unique_id.items():
++        expected_checksum = manifest["nodes"][unique_id]["checksum"]["checksum"]
++        for node_info_log in logs:
++            assert "node_checksum" in node_info_log
++            assert node_info_log["node_checksum"] == expected_checksum
+diff --git a/tests/unit/contracts/graph/test_node_info_checksum.py b/tests/unit/contracts/graph/test_node_info_checksum.py
+new file mode 100644
+index 000000000..e929a7045
+--- /dev/null
++++ b/tests/unit/contracts/graph/test_node_info_checksum.py
+@@ -0,0 +1,89 @@
++from dbt.artifacts.resources import FileHash
++from dbt.contracts.graph.nodes import ModelNode, SeedNode, SourceDefinition
++from dbt.node_types import NodeType
++
++
++def missing_checksum_model(name):
++    return ModelNode(
++        alias=name,
++        name=name,
++        database="test_db",
++        schema="test_schema",
++        resource_type=NodeType.Model,
++        package_name="test",
++        path=f"models/{name}.sql",
++        original_file_path=f"models/{name}.sql",
++        unique_id=f"model.test.{name}",
++        fqn=["test", name],
++        checksum=None,
++        raw_code="select 1 as id",
++        language="sql",
++        refs=[],
++        sources=[],
++        metrics=[],
++        depends_on={"macros": [], "nodes": []},
++        config={},
++        tags=[],
++        description="",
++        columns={},
++        meta={},
++        group=None,
++        docs={"show": True, "node_color": None},
++        patch_path=None,
++        build_path=None,
++        unrendered_config={},
++        created_at=0.0,
++        relation_name=None,
++    )
++
++
++def test_node_info_includes_null_checksum_when_missing():
++    for node in [
++        missing_checksum_model("missing_checksum_model"),
++        missing_checksum_model("another_missing_checksum_model"),
++    ]:
++        node_info = node.node_info
++        assert "node_checksum" in node_info
++        assert node_info["node_checksum"] is None
++
++
++def test_node_info_exposes_checksum_for_non_model_nodes():
++    node = SeedNode(
++        alias="seed_checksum",
++        name="seed_checksum",
++        database="test_db",
++        schema="test_schema",
++        resource_type=NodeType.Seed,
++        package_name="test",
++        path="seeds/seed_checksum.csv",
++        original_file_path="seeds/seed_checksum.csv",
++        unique_id="seed.test.seed_checksum",
++        fqn=["test", "seed_checksum"],
++        checksum=FileHash(name="sha256", checksum="seed-checksum"),
++    )
++
++    node_info = node.node_info
++    assert "node_checksum" in node_info
++    assert node_info["node_checksum"] == "seed-checksum"
++
++
++def test_node_info_includes_null_checksum_without_checksum_attribute():
++    node = SourceDefinition(
++        database="test_db",
++        schema="test_schema",
++        name="source_table",
++        resource_type=NodeType.Source,
++        package_name="test",
++        path="models/schema.yml",
++        original_file_path="models/schema.yml",
++        unique_id="source.test.raw.source_table",
++        fqn=["test", "raw", "source_table"],
++        source_name="raw",
++        source_description="",
++        loader="seed",
++        identifier="source_table",
++    )
++
++    node_info = node.node_info
++    assert "node_checksum" in node_info
++    assert node_info["node_checksum"] is None
+diff --git a/tests/unit/events/test_types.py b/tests/unit/events/test_types.py
+index 1dd6d00b8..194801849 100644
+--- a/tests/unit/events/test_types.py
++++ b/tests/unit/events/test_types.py
+@@ -129,6 +129,7 @@ def test_node_info_events():
+             "alias": "some_alias",
+             "relation_name": "some.relation.name",
+         },
++        "node_checksum": "some_checksum",
+     }
+     event = LogStartLine(
+         description="some description",
+@@ -151,6 +152,8 @@ def test_node_info_events():
+     assert event.node_info.node_relation.database == ""
+     assert event.node_info.node_relation.relation_name == "some_schema.some_alias"
+ 
++    assert event.node_info.node_checksum == "some_checksum"
++
+ 
+ def test_extra_dict_on_event(monkeypatch):
+ 
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,37 @@
++#!/bin/bash
++set -uo pipefail
++cd /testbed
++
++
++
++pg_isready -q 2>/dev/null || pg_ctlcluster 16 main start 2>/dev/null || true
++
++
++su - postgres -c "psql -c \"SELECT 1 FROM pg_roles WHERE rolname='root'\" | grep -q 1" 2>/dev/null || \
++  su - postgres -c "psql -c \"CREATE USER root WITH PASSWORD 'password' SUPERUSER;\"" 2>/dev/null || true
++su - postgres -c "psql -c \"SELECT 1 FROM pg_database WHERE datname='dbt'\" | grep -q 1" 2>/dev/null || \
++  su - postgres -c "psql -c \"CREATE DATABASE dbt OWNER root;\"" 2>/dev/null || true
++
++
++pip install -e /testbed/core --no-input --no-deps --quiet 2>/dev/null || true
++
++
++case "${1:-}" in
++  base)
++    python3 -m pytest \
++      tests/functional/logging/test_meta_logging.py::test_meta \
++      tests/unit/events/test_types.py::test_extra_dict_on_event \
++      -v
++    ;;
++  new)
++    python3 -m pytest \
++      tests/functional/logging/test_meta_logging.py::test_checksum \
++      tests/unit/events/test_types.py::test_node_info_events \
++      tests/unit/contracts/graph/test_node_info_checksum.py \
++      -v
++    ;;
++  *)
++    echo "usage: $0 base|new"
++    exit 2
++    ;;
++esac

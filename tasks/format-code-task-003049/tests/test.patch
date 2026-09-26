@@ -1,0 +1,175 @@
+diff --git a/pkg/zeaburpack/image_multistage_test.go b/pkg/zeaburpack/image_multistage_test.go
+new file mode 100644
+index 0000000..4eb2558
+--- /dev/null
++++ b/pkg/zeaburpack/image_multistage_test.go
+@@ -0,0 +1,148 @@
++package zeaburpack_test
++
++import (
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++
++	"github.com/stretchr/testify/require"
++	"github.com/zeabur/zbpack/pkg/zeaburpack"
++)
++
++func TestDockerfileProxyRewritePreservesStageAlias(t *testing.T) {
++	lines := captureRewrittenDockerfile(t, "proxy.example.test/cache/", `
++FROM node:20 AS builder
++RUN echo ok
++FROM builder
++RUN echo done
++`)
++
++	fromLines := dockerfileFromLines(lines)
++	require.Len(t, fromLines, 2)
++	require.Equal(t, "FROM proxy.example.test/cache/library/node:20 AS builder", fromLines[0])
++	require.Equal(t, "FROM builder", fromLines[1])
++	require.NotContains(t, fromLines[1], "proxy.example.test/cache/")
++}
++
++func TestDockerfileProxyRewriteHandlesLowercaseAsDeclaration(t *testing.T) {
++	lines := captureRewrittenDockerfile(t, "proxy.example.test/cache/", `
++FROM golang:1.21 as buildstage
++RUN echo ok
++FROM buildstage
++RUN echo done
++`)
++
++	fromLines := dockerfileFromLines(lines)
++	require.Len(t, fromLines, 2)
++	require.True(t, strings.EqualFold("FROM proxy.example.test/cache/library/golang:1.21 AS buildstage", fromLines[0]), fromLines[0])
++	require.Equal(t, "FROM buildstage", fromLines[1])
++	require.NotContains(t, fromLines[1], "proxy.example.test/cache/")
++}
++
++func TestDockerfileProxyRewriteLeavesMultipleStageReferencesUnproxied(t *testing.T) {
++	lines := captureRewrittenDockerfile(t, "proxy.example.test/cache/", `
++FROM alpine:3.19 AS assets
++RUN echo assets
++FROM assets AS runtime-base
++RUN echo runtime
++FROM runtime-base
++RUN echo done
++`)
++
++	fromLines := dockerfileFromLines(lines)
++	require.Len(t, fromLines, 3)
++	require.Equal(t, "FROM proxy.example.test/cache/library/alpine:3.19 AS assets", fromLines[0])
++	require.Equal(t, "FROM assets AS runtime-base", fromLines[1])
++	require.Equal(t, "FROM runtime-base", fromLines[2])
++	require.NotContains(t, fromLines[1], "proxy.example.test/cache/")
++	require.NotContains(t, fromLines[2], "proxy.example.test/cache/")
++}
++
++func TestDockerfileProxyRewritePlainFromStillUsesProxy(t *testing.T) {
++	lines := captureRewrittenDockerfile(t, "proxy.example.test/cache/", `
++FROM ubuntu:22.04
++RUN echo ok
++`)
++
++	fromLines := dockerfileFromLines(lines)
++	require.Len(t, fromLines, 1)
++	require.Equal(t, "FROM proxy.example.test/cache/library/ubuntu:22.04", fromLines[0])
++	require.NotContains(t, fromLines[0], " AS ")
++}
++
++func TestDockerfileProxyRewritePlainFromUsesConfiguredProxy(t *testing.T) {
++	lines := captureRewrittenDockerfile(t, "registry.alt.test/mirror/", `
++FROM ubuntu:22.04
++RUN echo ok
++`)
++
++	fromLines := dockerfileFromLines(lines)
++	require.Len(t, fromLines, 1)
++	require.Equal(t, "FROM registry.alt.test/mirror/library/ubuntu:22.04", fromLines[0])
++	require.NotContains(t, fromLines[0], "proxy.example.test/cache/")
++	require.NotContains(t, fromLines[0], " AS ")
++}
++
++func captureRewrittenDockerfile(t *testing.T, proxyRegistry string, dockerfile string) []string {
++	t.Helper()
++
++	contextDir := t.TempDir()
++	require.NoError(t, os.WriteFile(filepath.Join(contextDir, "Dockerfile"), []byte(strings.TrimSpace(dockerfile)+"\n"), 0o644))
++
++	captureDir := t.TempDir()
++	installDockerCaptureShim(t, captureDir)
++
++	resultImage := "example.test/hidden:latest"
++	proxy := proxyRegistry
++	err := zeaburpack.Build(&zeaburpack.BuildOptions{
++		Path:          &contextDir,
++		ResultImage:   &resultImage,
++		ProxyRegistry: &proxy,
++	})
++	require.NoError(t, err)
++
++	captured, err := os.ReadFile(filepath.Join(captureDir, "Dockerfile.captured"))
++	require.NoError(t, err)
++
++	return strings.Split(strings.TrimSpace(string(captured)), "\n")
++}
++
++func installDockerCaptureShim(t *testing.T, captureDir string) {
++	t.Helper()
++
++	binDir := t.TempDir()
++	shimPath := filepath.Join(binDir, "docker")
++	shim := `#!/bin/sh
++set -eu
++dockerfile=""
++prev=""
++for arg in "$@"; do
++	if [ "$prev" = "-f" ]; then
++		dockerfile="$arg"
++		break
++	fi
++	prev="$arg"
++done
++if [ -z "$dockerfile" ]; then
++	dockerfile="Dockerfile"
++fi
++cp "$dockerfile" "` + filepath.Join(captureDir, "Dockerfile.captured") + `"
++exit 0
++`
++	require.NoError(t, os.WriteFile(shimPath, []byte(shim), 0o755))
++
++	oldPath := os.Getenv("PATH")
++	t.Setenv("PATH", binDir+string(os.PathListSeparator)+oldPath)
++}
++
++func dockerfileFromLines(lines []string) []string {
++	fromLines := make([]string, 0)
++	for _, line := range lines {
++		line = strings.TrimSpace(line)
++		if strings.HasPrefix(strings.ToUpper(line), "FROM ") {
++			fromLines = append(fromLines, line)
++		}
++	}
++	return fromLines
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,16 @@
++#!/bin/bash
++set -uo pipefail
++cd /testbed
++
++case "${1:-}" in
++  base)
++    go test -v -run '^TestReferenceConstructor_Construct$' ./pkg/zeaburpack/
++    ;;
++  new)
++    go test -v -run '^TestDockerfileProxyRewrite(PreservesStageAlias|HandlesLowercaseAsDeclaration|LeavesMultipleStageReferencesUnproxied|PlainFromStillUsesProxy|PlainFromUsesConfiguredProxy)$' ./pkg/zeaburpack/
++    ;;
++  *)
++    echo "usage: $0 base|new"
++    exit 2
++    ;;
++esac

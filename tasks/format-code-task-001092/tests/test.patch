@@ -1,0 +1,237 @@
+diff --git a/tests/test_capacity_temporal_contract.py b/tests/test_capacity_temporal_contract.py
+new file mode 100644
+index 000000000..ac6fc282d
+--- /dev/null
++++ b/tests/test_capacity_temporal_contract.py
+@@ -0,0 +1,216 @@
++from copy import deepcopy
++from datetime import datetime, timezone
++
++import pytest
++
++from electricitymap.contrib.config import capacity as capacity_module
++from electricitymap.contrib.config.capacity import (
++    CapacityData,
++    get_capacity_data,
++    get_capacity_data_with_source,
++)
++
++
++def test_timeline_uses_latest_record_at_or_before_query_and_is_order_independent():
++    config = {
++        "wind": [
++            {"datetime": "2024-01-01", "value": 30, "source": "new"},
++            {"datetime": "2022-01-01", "value": 10, "source": "old"},
++            {
++                "datetime": "2023-06-15T12:00:00",
++                "value": 20,
++                "source": "mid",
++            },
++        ]
++    }
++    original = deepcopy(config)
++
++    assert get_capacity_data(config, datetime(2023, 6, 15, 12, 0)) == {"wind": 20}
++    assert get_capacity_data(config, datetime(2021, 12, 31)) == {"wind": 10}
++    assert get_capacity_data(config, datetime(2025, 1, 1)) == {"wind": 30}
++    assert get_capacity_data_with_source(
++        config, datetime(2023, 6, 15, 12, 0)
++    ) == {"wind": CapacityData(20, "mid")}
++    assert config == original
++
++
++def test_timezone_offsets_are_compared_as_instants():
++    config = {
++        "solar": [
++            {
++                "datetime": "2023-06-01T12:00:00+02:00",
++                "value": 42,
++            },
++            {"datetime": "2023-06-01T11:45:00+01:00", "value": 43},
++        ]
++    }
++
++    query = datetime(2023, 6, 1, 10, 30, tzinfo=timezone.utc)
++    assert get_capacity_data(config, query) == {"solar": 42}
++
++
++def test_empty_timeline_and_scalar_none_are_valid_missing_values():
++    config = {
++        "wind": [],
++        "solar": None,
++        "coal": 0,
++        "gas": [
++            {"datetime": "2023-01-01", "value": None, "source": "survey"}
++        ],
++    }
++
++    assert get_capacity_data(config, datetime(2023, 1, 1)) == {
++        "wind": None,
++        "solar": None,
++        "coal": 0,
++        "gas": None,
++    }
++    assert get_capacity_data_with_source(config, datetime(2023, 1, 1)) == {
++        "wind": CapacityData(None, None),
++        "solar": CapacityData(None, None),
++        "coal": CapacityData(0, None),
++        "gas": CapacityData(None, "survey"),
++    }
++
++
++def test_source_aware_lookup_returns_source_from_selected_record():
++    config = {
++        "hydro": [
++            {"datetime": "2022-01-01", "value": 5, "source": "a"},
++            {"datetime": "2023-01-01", "value": 8, "source": "b"},
++        ]
++    }
++
++    assert get_capacity_data_with_source(config, datetime(2023, 6, 1)) == {
++        "hydro": CapacityData(8, "b")
++    }
++
++
++def test_single_record_mapping_remains_effective_for_every_query_time():
++    config = {
++        "nuclear": {
++            "datetime": "2023-01-01",
++            "value": 7,
++            "source": "operator",
++        }
++    }
++
++    assert get_capacity_data(config, datetime(2020, 1, 1)) == {"nuclear": 7}
++    assert get_capacity_data_with_source(config, datetime(2025, 1, 1)) == {
++        "nuclear": CapacityData(7, "operator")
++    }
++
++
++@pytest.mark.parametrize(
++    "record",
++    [
++        {"value": 3},
++        {"datetime": "not-a-date", "value": 3},
++        {"datetime": "2023-01-01"},
++        {"datetime": "2023-01-01", "value": "3"},
++    ],
++)
++def test_malformed_timeline_records_raise_value_error(record):
++    config = {"wind": [record]}
++    query = datetime(2023, 1, 1, tzinfo=timezone.utc)
++    with pytest.raises(ValueError):
++        get_capacity_data(config, query)
++    with pytest.raises(ValueError):
++        get_capacity_data_with_source(config, query)
++
++
++def test_duplicate_timestamps_are_rejected_in_both_apis():
++    config = {
++        "wind": [
++            {"datetime": "2023-01-01T01:00:00+01:00", "value": 1},
++            {"datetime": "2023-01-01T00:00:00+00:00", "value": 2},
++        ]
++    }
++
++    with pytest.raises(ValueError):
++        get_capacity_data(config, datetime(2023, 1, 1, tzinfo=timezone.utc))
++    with pytest.raises(ValueError):
++        get_capacity_data_with_source(config, datetime(2023, 1, 1, tzinfo=timezone.utc))
++
++
++def test_naive_and_aware_datetimes_cannot_be_mixed():
++    aware_timeline = {
++        "wind": [{"datetime": "2023-01-01T00:00:00+00:00", "value": 1}]
++    }
++    naive_timeline = {"wind": [{"datetime": "2023-01-01", "value": 1}]}
++
++    with pytest.raises(ValueError):
++        get_capacity_data(aware_timeline, datetime(2023, 1, 1))
++    with pytest.raises(ValueError):
++        get_capacity_data_with_source(
++            naive_timeline, datetime(2023, 1, 1, tzinfo=timezone.utc)
++        )
++
++
++def test_capacity_series_emits_initial_state_and_coalesced_changes():
++    get_series = getattr(capacity_module, "get_capacity_data_series", None)
++    assert callable(get_series), "get_capacity_data_series must be public"
++    config = {
++        "wind": [
++            {"datetime": "2022-01-01", "value": 10, "source": "old"},
++            {"datetime": "2023-06-01", "value": 20, "source": "new"},
++        ],
++        "solar": 5,
++        "nuclear": {
++            "datetime": "2023-09-01",
++            "value": 3,
++            "source": "operator",
++        },
++        "gas": [
++            {"datetime": "2022-01-01", "value": 6, "source": "old-survey"},
++            {"datetime": "2023-06-01", "value": 7, "source": "survey"},
++            {"datetime": "2025-01-01", "value": 9, "source": "future"},
++        ],
++    }
++    start = datetime(2023, 1, 1)
++    end = datetime(2024, 1, 1)
++
++    assert get_series(config, start, end) == [
++        (
++            start,
++            {
++                "wind": CapacityData(10, "old"),
++                "solar": CapacityData(5, None),
++                "nuclear": CapacityData(3, "operator"),
++                "gas": CapacityData(6, "old-survey"),
++            },
++        ),
++        (
++            datetime(2023, 6, 1),
++            {
++                "wind": CapacityData(20, "new"),
++                "solar": CapacityData(5, None),
++                "nuclear": CapacityData(3, "operator"),
++                "gas": CapacityData(7, "survey"),
++            },
++        ),
++    ]
++
++
++def test_capacity_series_range_is_inclusive_and_validated():
++    get_series = getattr(capacity_module, "get_capacity_data_series", None)
++    assert callable(get_series), "get_capacity_data_series must be public"
++    config = {
++        "wind": [
++            {"datetime": "2023-01-01", "value": 1},
++            {"datetime": "2023-02-01", "value": 2},
++        ]
++    }
++
++    boundary = datetime(2023, 2, 1)
++    assert get_series(config, boundary, boundary) == [
++        (boundary, {"wind": CapacityData(2, None)})
++    ]
++    with pytest.raises(ValueError):
++        get_series(config, datetime(2023, 3, 1), datetime(2023, 2, 1))
++    with pytest.raises(ValueError):
++        get_series(
++            config,
++            datetime(2023, 1, 1),
++            datetime(2023, 2, 1, tzinfo=timezone.utc),
++        )
++    with pytest.raises(ValueError):
++        get_series(
++            {"wind": [{"datetime": "2023-01-01T00:00:00+00:00", "value": 1}]},
++            datetime(2023, 1, 1),
++            datetime(2023, 2, 1),
++        )
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,4 @@
++#!/bin/bash
++set -euo pipefail
++
++python -m pytest -q tests/test_capacity_temporal_contract.py tests/test_capacity.py

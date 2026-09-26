@@ -1,0 +1,322 @@
+diff --git a/usercase-test-coderl/test_sequence_dist.py b/usercase-test-coderl/test_sequence_dist.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/test_sequence_dist.py
+@@ -0,0 +1,292 @@
++
++
++
++
++
++
++
++from __future__ import annotations
++
++import copy
++import json
++import os
++import socket
++import subprocess
++import sys
++import warnings
++
++import numpy as np
++import pytest
++from scipy.sparse import csr_matrix
++
++from scirpy.ir_dist import metrics, sequence_dist, tcr_dist
++
++
++def assert_csr_dense(actual, expected):
++    assert actual.getformat() == "csr"
++    assert actual.toarray().tolist() == expected
++
++
++def test_identity_square_uppercases_deduplicates_and_expands_duplicates():
++
++
++
++    actual = sequence_dist(["aaa", "ARA", "FFA", "FFA", "AAA"], metric="identity", cutoff=0)
++
++    assert_csr_dense(
++        actual,
++        [
++            [1, 0, 0, 0, 1],
++            [0, 1, 0, 0, 0],
++            [0, 0, 1, 1, 0],
++            [0, 0, 1, 1, 0],
++            [1, 0, 0, 0, 1],
++        ],
++    )
++
++
++def test_identity_rectangular_uppercases_second_array_and_expands_columns():
++
++
++
++    actual = sequence_dist(
++        ["aaa", "ARA", "FFA", "FFA", "AAA"],
++        ["ARA", "CAC", "AAA", "CAC"],
++        metric="identity",
++        cutoff=0,
++    )
++
++    assert actual.shape == (5, 4)
++    assert_csr_dense(
++        actual,
++        [
++            [0, 0, 1, 0],
++            [1, 0, 0, 0],
++            [0, 0, 0, 0],
++            [0, 0, 0, 0],
++            [0, 0, 1, 0],
++        ],
++    )
++
++
++def test_levenshtein_cutoff_offsets_retained_square_distances():
++
++
++
++    actual = sequence_dist(["AAA", "AAT", "ATT", "TTT", "AAA"], metric="levenshtein", cutoff=1, n_jobs=1)
++
++    assert_csr_dense(
++        actual,
++        [
++            [1.0, 2.0, 0.0, 0.0, 1.0],
++            [2.0, 1.0, 2.0, 0.0, 2.0],
++            [0.0, 2.0, 1.0, 2.0, 0.0],
++            [0.0, 0.0, 2.0, 1.0, 0.0],
++            [1.0, 2.0, 0.0, 0.0, 1.0],
++        ],
++    )
++
++
++def test_hamming_rectangular_cutoff_uppercase_and_duplicate_rows():
++
++
++
++    actual = sequence_dist(["aaa", "AAT", "AAC", "aaa"], ["AAA", "AAC", "TTT"], metric="hamming", cutoff=1, n_jobs=1)
++
++    assert_csr_dense(
++        actual,
++        [
++            [1.0, 2.0, 0.0],
++            [2.0, 2.0, 0.0],
++            [2.0, 1.0, 0.0],
++            [1.0, 2.0, 0.0],
++        ],
++    )
++
++
++def test_normalized_hamming_builtin_metric_uses_percentage_distances():
++
++
++
++    actual = sequence_dist(["AAA", "AAT", "TTT"], ["AAA", "AAC"], metric="normalized_hamming", cutoff=34, n_jobs=1)
++
++    assert_csr_dense(
++        actual,
++        [
++            [1.0, 34.0],
++            [34.0, 34.0],
++            [0.0, 0.0],
++        ],
++    )
++
++
++def test_empty_input_returns_empty_square_csr_matrix():
++
++
++
++    actual = sequence_dist([], metric="identity", cutoff=0)
++
++    assert actual.shape == (0, 0)
++    assert_csr_dense(actual, [])
++
++
++def test_custom_distance_calculator_receives_unique_uppercase_sequences_and_is_expanded():
++
++
++
++
++    class LengthSumDistance(metrics.DistanceCalculator):
++        DTYPE = "uint16"
++
++        def __init__(self):
++            super().__init__(255)
++            self.calls = []
++
++        def calc_dist_mat(self, seqs, seqs2=None):
++            self.calls.append(
++                (
++                    [str(seq) for seq in seqs],
++                    None if seqs2 is None else [str(seq) for seq in seqs2],
++                )
++            )
++            if seqs2 is None:
++                seqs2 = seqs
++            rows = []
++            cols = []
++            data = []
++            for row, seq1 in enumerate(seqs):
++                for col, seq2 in enumerate(seqs2):
++                    rows.append(row)
++                    cols.append(col)
++                    data.append(len(seq1) + len(seq2))
++            return csr_matrix((data, (rows, cols)), shape=(len(seqs), len(seqs2)), dtype=self.DTYPE)
++
++    calculator = LengthSumDistance()
++    actual = sequence_dist(["aa", "bbb", "AA"], ["c", "DD", "c"], metric=calculator)
++
++    assert calculator.calls == [(["AA", "BBB"], ["C", "DD"])]
++    assert_csr_dense(actual, [[3, 4, 3], [4, 5, 4], [3, 4, 3]])
++
++
++def test_builtin_metric_constructor_receives_cutoff_n_jobs_and_kwargs(monkeypatch):
++
++
++
++    calls = []
++
++    class RecordingHammingCalculator:
++        def __init__(self, *args, **kwargs):
++            calls.append({"constructor_args": args, "constructor_kwargs": kwargs})
++
++        def calc_dist_mat(self, seqs, seqs2=None):
++            calls.append(
++                {
++                    "seqs": [str(seq) for seq in seqs],
++                    "seqs2": None if seqs2 is None else [str(seq) for seq in seqs2],
++                }
++            )
++            return csr_matrix(np.array([[9, 8], [7, 6]], dtype=np.uint16))
++
++    monkeypatch.setattr(metrics, "HammingDistanceCalculator", RecordingHammingCalculator)
++
++    actual = sequence_dist(
++        ["aa", "bb", "aa"],
++        ["aa", "cc"],
++        metric="hamming",
++        cutoff=7,
++        n_jobs=23,
++        sentinel_weight=5,
++    )
++
++    constructor_call, calc_call = calls
++    constructor_args = constructor_call["constructor_args"]
++    constructor_kwargs = constructor_call["constructor_kwargs"]
++
++    assert constructor_kwargs["sentinel_weight"] == 5
++    assert constructor_kwargs.get("n_jobs", constructor_args[0] if len(constructor_args) >= 1 else None) == 23
++    assert constructor_kwargs.get("cutoff", constructor_args[2] if len(constructor_args) >= 3 else None) == 7
++    assert calc_call == {"seqs": ["AA", "BB"], "seqs2": ["AA", "CC"]}
++    assert_csr_dense(actual, [[9, 8], [7, 6], [9, 8]])
++
++
++def test_non_string_sequence_item_raises_attribute_error():
++
++
++
++
++    with pytest.raises(AttributeError):
++        sequence_dist(["AAA", None], metric="identity", cutoff=0)
++
++
++def test_tcr_dist_alias_returns_same_matrix_as_sequence_dist():
++
++
++
++    args = (["aaa", "ARA", "FFA", "FFA", "AAA"],)
++    kwargs = {"metric": "identity", "cutoff": 0}
++    expected = [
++        [1, 0, 0, 0, 1],
++        [0, 1, 0, 0, 0],
++        [0, 0, 1, 1, 0],
++        [0, 0, 1, 1, 0],
++        [1, 0, 0, 0, 1],
++    ]
++
++    with warnings.catch_warnings():
++        warnings.simplefilter("ignore", FutureWarning)
++        actual = tcr_dist(*args, **kwargs)
++
++    assert_csr_dense(sequence_dist(*args, **kwargs), expected)
++    assert_csr_dense(actual, expected)
++
++
++def test_referential_transparency_same_input_same_value():
++    first = sequence_dist(["AAA", "AAC", "AAA"], metric="identity", cutoff=0).toarray().tolist()
++    second = sequence_dist(["AAA", "AAC", "AAA"], metric="identity", cutoff=0).toarray().tolist()
++
++    assert first == second == [[1, 0, 1], [0, 1, 0], [1, 0, 1]]
++
++
++def test_inputs_are_not_mutated():
++    seqs = ["aaa", "ARA", "FFA", "FFA", "AAA"]
++    seqs2 = ["ara", "CAC", "aaa", "CAC"]
++    original_seqs = copy.deepcopy(seqs)
++    original_seqs2 = copy.deepcopy(seqs2)
++
++    actual = sequence_dist(seqs, seqs2, metric="identity", cutoff=0)
++
++    assert_csr_dense(actual, [[0, 0, 1, 0], [1, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 1, 0]])
++    assert seqs == original_seqs == ["aaa", "ARA", "FFA", "FFA", "AAA"]
++    assert seqs2 == original_seqs2 == ["ara", "CAC", "aaa", "CAC"]
++
++
++def test_no_global_state_fresh_process_repeatability():
++    in_process = sequence_dist(["AAA", "AAC", "AAA"], metric="identity", cutoff=0).toarray().tolist()
++    script = """
++import json
++import sys
++sys.path.insert(0, "/workspace/repo/src")
++from scirpy.ir_dist import sequence_dist
++result = sequence_dist(["AAA", "AAC", "AAA"], metric="identity", cutoff=0).toarray().tolist()
++sys.stdout.write(json.dumps(result))
++"""
++
++    completed = subprocess.run([sys.executable, "-c", script], check=True, capture_output=True, text=True)
++    fresh_process = json.loads(completed.stdout)
++
++    assert in_process == fresh_process == [[1, 0, 1], [0, 1, 0], [1, 0, 1]]
++
++
++def test_no_filesystem_writes_or_network_calls_for_pure_computation(tmp_path, monkeypatch):
++    def raise_on_socket(*args, **kwargs):
++        raise AssertionError("network access is not declared for sequence_dist")
++
++    monkeypatch.setattr(socket, "socket", raise_on_socket)
++    monkeypatch.chdir(tmp_path)
++    before = set(os.listdir(tmp_path))
++
++    actual = sequence_dist(["AAA", "AAC", "AAA"], metric="identity", cutoff=0)
++
++    after = set(os.listdir(tmp_path))
++    assert_csr_dense(actual, [[1, 0, 1], [0, 1, 0], [1, 0, 1]])
++    assert before == after == set()
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,20 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++cd /workspace/repo
++
++
++export PYTHONPATH="/workspace/repo/src${PYTHONPATH:+:${PYTHONPATH}}"
++export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
++export SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0
++export SETUPTOOLS_SCM_PRETEND_VERSION_FOR_SCIRPY=0.0.0
++exec python -m pytest /workspace/repo/usercase-test-coderl/test_sequence_dist.py -v

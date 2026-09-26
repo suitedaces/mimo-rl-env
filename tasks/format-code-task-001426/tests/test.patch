@@ -1,0 +1,454 @@
+diff --git a/batch/test/test_dag.py b/batch/test/test_dag.py
+index 04e2c3659..38f8134bd 100644
+--- a/batch/test/test_dag.py
++++ b/batch/test/test_dag.py
+@@ -370,3 +370,179 @@ def test_input_dependency(client):
+                             parent_ids=[head.id])
+     tail.wait()
+     assert tail.log()['main'] == 'head1\nhead2\n'
++
++
++
++def test_always_run_delete(client):
++    batch = client.create_batch()
++    head = batch.create_job('alpine:3.8', command=['echo', 'head'])
++    left = batch.create_job(
++        'alpine:3.8',
++        command=['/bin/sh', '-c', 'while true; do sleep 86000; done'],
++        parent_ids=[head.id])
++    right = batch.create_job('alpine:3.8', command=['echo', 'right'], parent_ids=[head.id])
++    tail = batch.create_job('alpine:3.8',
++                            command=['echo', 'tail'],
++                            parent_ids=[left.id, right.id],
++                            always_run=True)
++    left.delete()
++    batch.wait()
++    for node in [head, right, tail]:
++        status = node.status()
++        assert status['state'] == 'Complete'
++        assert status['exit_code'] == 0
++
++
++def test_always_run_error(client):
++    batch = client.create_batch()
++    head = batch.create_job('alpine:3.8', command=['/bin/sh', '-c', 'exit 1'])
++    tail = batch.create_job('alpine:3.8',
++                            command=['echo', 'tail after error'],
++                            parent_ids=[head.id],
++                            always_run=True)
++
++    batch.wait()
++
++    for job, ec in [(head, 1), (tail, 0)]:
++        status = job.status()
++        assert status['state'] == 'Complete'
++        assert status['exit_code'] == ec
++
++
++def test_default_child_cancelled_after_parent_error(client):
++    batch = client.create_batch()
++    head = batch.create_job('alpine:3.8', command=['/bin/sh', '-c', 'exit 1'])
++    child = batch.create_job('alpine:3.8',
++                             command=['echo', 'default child should not run'],
++                             parent_ids=[head.id])
++
++    batch.wait()
++    head_status = head.status()
++    child_status = child.status()
++    assert head_status['state'] == 'Complete'
++    assert head_status['exit_code'] == 1
++    assert child_status['state'] == 'Cancelled'
++
++
++def test_always_run_false_child_cancelled_after_parent_error(client):
++    batch = client.create_batch()
++    head = batch.create_job('alpine:3.8', command=['/bin/sh', '-c', 'exit 1'])
++    child = batch.create_job('alpine:3.8',
++                             command=['echo', 'false child should not run'],
++                             parent_ids=[head.id],
++                             always_run=False)
++
++    batch.wait()
++    head_status = head.status()
++    child_status = child.status()
++    assert head_status['state'] == 'Complete'
++    assert head_status['exit_code'] == 1
++    assert child_status['state'] == 'Cancelled'
++
++
++def test_client_create_job_accepts_always_run(client):
++    job = client.create_job(
++        'alpine:3.8',
++        command=['echo', 'client always run option accepted'],
++        always_run=True)
++
++    status = job.wait()
++    assert status['state'] == 'Complete'
++    assert status['exit_code'] == 0
++
++
++def test_api_create_job_sends_always_run_request_body(monkeypatch):
++    from batch.api import API
++
++    seen_requests = []
++
++    class Response:
++        status_code = 200
++        text = ''
++        url = 'http://batch.test/jobs/create'
++
++        @staticmethod
++        def json():
++            return {'id': 1}
++
++    def record_post(url, json, timeout):
++        seen_requests.append((url, json, timeout))
++        return Response()
++
++    monkeypatch.setattr(requests, 'post', record_post)
++
++    API().create_job(
++        'http://batch.test',
++        {
++            'containers': [{
++                'image': 'alpine:3.8',
++                'name': 'main'
++            }],
++            'restartPolicy': 'Never'
++        },
++        attributes=None,
++        batch_id=None,
++        callback=None,
++        parent_ids=[],
++        scratch_folder=None,
++        input_files=None,
++        output_files=None,
++        copy_service_account_name=None,
++        always_run=True)
++
++    assert len(seen_requests) == 1
++    _url, body, _timeout = seen_requests[0]
++    assert body['always_run'] is True
++
++
++def test_always_run_waits_for_all_parents_after_failure(client):
++    marker = '/io/always_run_waits_for_all_parents_after_failure'
++    try:
++        os.remove(marker)
++    except FileNotFoundError:
++        pass
++
++    batch = client.create_batch()
++    failed = batch.create_job('alpine:3.8', command=['/bin/sh', '-c', 'exit 1'])
++    slow = batch.create_job(
++        'alpine:3.8',
++        command=['/bin/sh', '-c', f'sleep 1; echo ready > {marker}'])
++    tail = batch.create_job(
++        'alpine:3.8',
++        command=['/bin/sh', '-c', f'test -f {marker}'],
++        parent_ids=[failed.id, slow.id],
++        always_run=True)
++
++    batch.wait()
++    for job, ec in [(failed, 1), (slow, 0), (tail, 0)]:
++        status = job.status()
++        assert status['state'] == 'Complete'
++        assert status['exit_code'] == ec
++
++
++def test_service_default_omitted_always_run_cancels_child(client):
++    batch = client.create_batch()
++    head = batch.create_job('alpine:3.8', command=['/bin/sh', '-c', 'exit 1'])
++    head.wait()
++
++    response = requests.post(
++        os.environ['BATCH_URL'] + '/jobs/create',
++        json={
++            'spec': {
++                'containers': [{
++                    'image': 'alpine:3.8',
++                    'name': 'main',
++                    'command': ['echo', 'raw default child should not run']
++                }],
++                'restartPolicy': 'Never'
++            },
++            'batch_id': batch.id,
++            'parent_ids': [head.id]
++        },
++        timeout=60)
++    response.raise_for_status()
++    child_id = response.json()['id']
++
++    batch.wait()
++    child_status = client.get_job(child_id).status()
++    assert child_status['state'] == 'Cancelled'
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,265 @@
++#!/bin/bash
++set -uo pipefail
++
++cd /testbed
++
++ensure_build_env() {
++    mkdir -p /testbed/.build_env/fake_bin
++    cat > /testbed/.build_env/mock_k8s_server.py <<'PYMOCK'
++import os
++import subprocess
++import requests
++import sys
++import threading
++import time
++from pathlib import Path
++from types import SimpleNamespace
++
++import kubernetes as kube
++
++
++REPO = Path('/testbed')
++if str(REPO / 'batch') not in sys.path:
++    sys.path.insert(0, str(REPO / 'batch'))
++
++
++os.environ.setdefault('BATCH_USE_KUBE_CONFIG', '1')
++os.environ.setdefault('REFRESH_INTERVAL_IN_SECONDS', '60')
++
++
++class ApiException(Exception):
++    def __init__(self, status=500, reason=None):
++        super().__init__(reason or str(status))
++        self.status = status
++
++
++class FakeWatch:
++    def stream(self, *_args, **_kwargs):
++        while True:
++            time.sleep(3600)
++            yield from ()
++
++
++class FakeCoreV1Api:
++    _lock = threading.RLock()
++    _pods = {}
++    _logs = {}
++    _pod_counter = 0
++    _pvc_counter = 0
++
++    def __init__(self):
++        self.api_client = SimpleNamespace(_ApiClient__deserialize=self._deserialize)
++
++    @staticmethod
++    def _deserialize(data, _klass):
++        containers = []
++        for container in data.get('containers', []):
++            containers.append(
++                SimpleNamespace(
++                    image=container.get('image'),
++                    name=container.get('name'),
++                    command=container.get('command'),
++                    args=container.get('args'),
++                    env=container.get('env'),
++                    volume_mounts=container.get('volumeMounts'),
++                )
++            )
++        return SimpleNamespace(
++            containers=containers,
++            restart_policy=data.get('restartPolicy'),
++            volumes=data.get('volumes'),
++            tolerations=data.get('tolerations'),
++            security_context=data.get('securityContext'),
++            service_account_name=data.get('serviceAccountName'),
++        )
++
++    @classmethod
++    def _next_pod_name(cls, generate_name):
++        with cls._lock:
++            cls._pod_counter += 1
++            return f'{generate_name}{cls._pod_counter}'
++
++    @classmethod
++    def _next_pvc_name(cls, generate_name):
++        with cls._lock:
++            cls._pvc_counter += 1
++            return f'{generate_name}{cls._pvc_counter}'
++
++    def create_namespaced_persistent_volume_claim(self, namespace, body, **_kwargs):
++        name = self._next_pvc_name(body.metadata.generate_name)
++        return SimpleNamespace(metadata=SimpleNamespace(name=name, namespace=namespace))
++
++    def delete_namespaced_persistent_volume_claim(self, name, namespace, *_args, **_kwargs):
++        return SimpleNamespace(metadata=SimpleNamespace(name=name, namespace=namespace))
++
++    def create_namespaced_pod(self, namespace, body, **_kwargs):
++        name = self._next_pod_name(body.metadata.generate_name)
++        metadata = SimpleNamespace(name=name, namespace=namespace, labels=getattr(body.metadata, 'labels', None))
++        pod = SimpleNamespace(metadata=metadata, spec=body.spec, status=SimpleNamespace(container_statuses=None))
++        with self._lock:
++            self._pods[name] = pod
++        threading.Thread(target=self._run_pod, args=(name,), daemon=True).start()
++        return pod
++
++    def _run_pod(self, name):
++        with self._lock:
++            pod = self._pods.get(name)
++        if pod is None:
++            return
++
++        container = pod.spec.containers[0]
++        command = container.command or []
++        args = getattr(container, 'args', None) or []
++        cmd = list(command) + list(args)
++        if not cmd:
++            cmd = ['/bin/sh', '-c', '']
++
++        try:
++            proc = subprocess.run(
++                cmd,
++                cwd='/testbed',
++                stdout=subprocess.PIPE,
++                stderr=subprocess.STDOUT,
++                text=True,
++                timeout=2,
++                env={**os.environ, 'POD_NAME': name, 'POD_IP': '127.0.0.1'},
++            )
++            exit_code = proc.returncode
++            output = proc.stdout
++        except subprocess.TimeoutExpired as exc:
++            exit_code = 124
++            output = exc.stdout if isinstance(exc.stdout, str) else ''
++        except FileNotFoundError as exc:
++            exit_code = 127
++            output = f'{exc}\n'
++
++        terminated = SimpleNamespace(exit_code=exit_code)
++        state = SimpleNamespace(terminated=terminated)
++        status = SimpleNamespace(name=container.name, state=state)
++        with self._lock:
++            pod = self._pods.get(name)
++            if pod is not None:
++                pod.status.container_statuses = [status]
++                self._logs[name] = output
++        try:
++            requests.post('http://127.0.0.1:5000/pod_changed', json={'pod_name': name}, timeout=5)
++        except Exception:
++            pass
++
++    def read_namespaced_pod(self, name, namespace, **_kwargs):
++        with self._lock:
++            pod = self._pods.get(name)
++        if pod is None:
++            raise ApiException(status=404)
++        return pod
++
++    def read_namespaced_pod_log(self, name, namespace, **_kwargs):
++        with self._lock:
++            return self._logs.get(name, '')
++
++    def list_namespaced_pod(self, namespace, **_kwargs):
++        with self._lock:
++            return SimpleNamespace(items=list(self._pods.values()))
++
++    def delete_namespaced_pod(self, name, namespace, *_args, **_kwargs):
++        with self._lock:
++            if name not in self._pods:
++                raise ApiException(status=404)
++            del self._pods[name]
++            self._logs.pop(name, None)
++        return SimpleNamespace()
++
++
++kube.config.load_kube_config = lambda *args, **kwargs: None
++kube.config.load_incluster_config = lambda *args, **kwargs: None
++kube.client.CoreV1Api = FakeCoreV1Api
++kube.client.rest.ApiException = ApiException
++kube.watch.Watch = FakeWatch
++
++
++from batch.server.server import serve  # pylint: disable=wrong-import-position
++
++
++if __name__ == '__main__':
++    serve(5000)
++PYMOCK
++}
++
++run_pytest() {
++    local selection="$1"
++
++    ensure_build_env
++
++
++    mkdir -p /io
++
++
++    if [ -f /testbed/.build_env/server.pid ]; then
++        kill -9 $(cat /testbed/.build_env/server.pid) 2>/dev/null || true
++        rm -f /testbed/.build_env/server.pid
++    fi
++
++
++    fuser -k 5000/tcp 2>/dev/null || true
++
++    cleanup() {
++        set +e
++        if [ -f /testbed/.build_env/server.pid ]; then
++            kill -9 $(cat /testbed/.build_env/server.pid) 2>/dev/null || true
++            rm -f /testbed/.build_env/server.pid
++        fi
++        fuser -k 5000/tcp 2>/dev/null || true
++    }
++    trap cleanup EXIT
++    trap "exit 24" INT TERM
++
++
++    export PATH="/testbed/.build_env/fake_bin:$PATH"
++
++
++    cd /testbed/batch
++    python3 /testbed/.build_env/mock_k8s_server.py &
++    server_pid=$!
++    echo "$server_pid" > /testbed/.build_env/server.pid
++    cd /testbed
++
++
++    echo "Waiting for batch server to start..."
++    for i in $(seq 1 30); do
++        if curl -sf http://127.0.0.1:5000/jobs > /dev/null 2>&1; then
++            echo "Server is ready!"
++            break
++        fi
++        if ! kill -0 $server_pid 2>/dev/null; then
++            echo "Server process died! Check logs."
++            exit 1
++        fi
++        sleep 1
++    done
++
++
++    if ! curl -sf http://127.0.0.1:5000/jobs > /dev/null 2>&1; then
++        echo "Server failed to start within 30 seconds"
++        exit 1
++    fi
++
++
++    export BATCH_URL='http://127.0.0.1:5000'
++    export POD_IP='127.0.0.1'
++
++    cd /testbed/batch
++    python3 -m pytest -v $selection
++}
++
++case "${1:-}" in
++    base)
++        run_pytest "test/test_dag.py::test_simple test/test_dag.py::test_dag test/test_dag.py::test_cancel_left_after_tail test/test_dag.py::test_parent_deleted"
++        ;;
++    new)
++        run_pytest "test/test_dag.py::test_always_run_delete test/test_dag.py::test_always_run_error test/test_dag.py::test_default_child_cancelled_after_parent_error test/test_dag.py::test_always_run_false_child_cancelled_after_parent_error test/test_dag.py::test_client_create_job_accepts_always_run test/test_dag.py::test_api_create_job_sends_always_run_request_body test/test_dag.py::test_always_run_waits_for_all_parents_after_failure test/test_dag.py::test_service_default_omitted_always_run_cancels_child"
++        ;;
++    *)
++        echo "usage: $0 base|new"
++        exit 2
++        ;;
++esac

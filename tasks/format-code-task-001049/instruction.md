@@ -1,0 +1,11 @@
+Nautobot deployments often need to keep shared settings, site-specific overrides, and secrets in separate Python configuration files. Extend the configuration runner used by `nautobot-server` so one invocation can load an ordered stack of configuration overlays while preserving existing single-file behavior.
+
+Each occurrence of `-c` or `--config` contributes one configuration layer, in command-line order; existing forms such as `--config path`, `--config=path`, and `-c path` must remain valid and may be mixed. When no command-line config option is present, interpret the configured environment variable (normally `NAUTOBOT_CONFIG`) as an `os.pathsep`-separated list of layers. Any command-line layer set replaces the environment set completely. If neither source supplies a layer, retain the existing default-config-path behavior.
+
+Resolve relative paths against the process working directory and expose normalized absolute paths. Ignore empty environment-list entries, and remove duplicate normalized paths while preserving the first occurrence. Before executing any selected configuration module, verify that every selected path exists. A missing layer in a CLI invocation must exit with status 2, include that layer's normalized absolute path in the error output, and leave all otherwise-valid layers unexecuted.
+
+Load the selected modules once each, from first to last. An ordinary uppercase setting from a later layer replaces the earlier value. Existing `EXTRA_<SETTING>` behavior remains cumulative at each layer, so for example an overlay's `EXTRA_INSTALLED_APPS` extends the `INSTALLED_APPS` established by a prior layer. Configuration modules can have import-time side effects, so neither validation nor loading may execute a module more than once.
+
+After loading, settings must expose `SETTINGS_PATHS` as the ordered normalized layer collection and retain `SETTINGS_PATH` as the final layer for backwards compatibility. Initializer and `on_configure` callbacks must likewise continue receiving `config_path` as that final path and additionally receive `config_paths` as the full ordered collection.
+
+Keep the public `configure_app()` entry point compatible with a single string `config_path`, and also allow callers to pass an ordered sequence of paths. Both forms must use the same normalization, deduplication, loading, and metadata rules as the CLI.

@@ -1,0 +1,551 @@
+diff --git a/usercase-test-coderl/test_sqla_interface_mutations.py b/usercase-test-coderl/test_sqla_interface_mutations.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/test_sqla_interface_mutations.py
+@@ -0,0 +1,515 @@
++
++
++
++
++
++
++
++
++
++from pathlib import Path
++import tempfile
++
++from flask import Flask
++import pytest
++from sqlalchemy import Column, Integer, String, create_engine
++from sqlalchemy.exc import IntegrityError, InvalidRequestError, OperationalError
++from sqlalchemy.orm import Session as SASession
++from sqlalchemy.orm import sessionmaker
++
++from flask_appbuilder.exceptions import DatabaseException
++from flask_appbuilder.models.mixins import FileColumn, ImageColumn
++from flask_appbuilder.models.sqla import Model
++from flask_appbuilder.models.sqla.interface import SQLAInterface
++
++
++class MutationBook(Model):
++    __tablename__ = "usercase_fixture_mutation_book"
++
++    id = Column(Integer, primary_key=True)
++    title = Column(String(80), unique=True, nullable=False)
++
++
++class ManagedAssetBook(Model):
++    __tablename__ = "usercase_fixture_managed_asset_book"
++
++    id = Column(Integer, primary_key=True)
++    title = Column(String(80), unique=True, nullable=False)
++    file_name = Column(FileColumn)
++    image_name = Column(ImageColumn)
++
++
++class CountingSession(SASession):
++    def __init__(self, *args, **kwargs):
++        super().__init__(*args, **kwargs)
++        self.commit_calls = 0
++        self.rollback_calls = 0
++
++    def commit(self):
++        self.commit_calls += 1
++        return super().commit()
++
++    def rollback(self):
++        self.rollback_calls += 1
++        return super().rollback()
++
++
++class FailingMergeSession(CountingSession):
++    def __init__(self, *args, **kwargs):
++        super().__init__(*args, **kwargs)
++        self.error = OperationalError("UPDATE usercase_fixture_mutation_book", {}, RuntimeError("merge failed"))
++
++    def merge(self, instance, *args, **kwargs):
++        raise self.error
++
++
++class FailingDeleteSession(CountingSession):
++    def __init__(self, *args, **kwargs):
++        super().__init__(*args, **kwargs)
++        self.error = OperationalError("DELETE usercase_fixture_mutation_book", {}, RuntimeError("delete failed"))
++
++    def delete(self, instance):
++        raise self.error
++
++
++class FailingSecondDeleteSession(CountingSession):
++    def __init__(self, *args, **kwargs):
++        super().__init__(*args, **kwargs)
++        self.delete_calls = 0
++        self.error = OperationalError("DELETE usercase_fixture_mutation_book", {}, RuntimeError("bulk delete failed"))
++
++    def delete(self, instance):
++        self.delete_calls += 1
++        if self.delete_calls == 2:
++            raise self.error
++        return super().delete(instance)
++
++
++@pytest.fixture
++def sqla_env():
++    with tempfile.TemporaryDirectory() as tmp:
++        root = Path(tmp)
++        upload_dir = root / "uploads"
++        image_dir = root / "images"
++        upload_dir.mkdir()
++        image_dir.mkdir()
++
++        engine = create_engine(f"sqlite:///{root / 'fixture.sqlite'}")
++        Model.metadata.create_all(
++            engine, tables=[MutationBook.__table__, ManagedAssetBook.__table__]
++        )
++        session_factory = sessionmaker(bind=engine, class_=CountingSession)
++
++        app = Flask("usercase_fixture_sqla")
++        app.config.update(
++            UPLOAD_FOLDER=str(upload_dir),
++            IMG_UPLOAD_FOLDER=str(image_dir),
++            IMG_UPLOAD_URL="/images/",
++        )
++
++        with app.app_context():
++            yield session_factory, upload_dir, image_dir
++
++
++def external_titles(session, model=MutationBook):
++    session.rollback()
++    return [item.title for item in session.query(model).order_by(model.id).all()]
++
++
++def external_count(session, model=MutationBook):
++    session.rollback()
++    return session.query(model).count()
++
++
++def managed_files(upload_dir, image_dir):
++    return sorted(
++        [path.name for path in upload_dir.iterdir()]
++        + [path.name for path in image_dir.iterdir()]
++    )
++
++
++def test_add_commit_true_persists_immediately(sqla_env):
++
++
++
++
++    Session, _upload_dir, _image_dir = sqla_env
++    writer = Session()
++    reader = Session()
++    interface = SQLAInterface(MutationBook, writer)
++
++    book = MutationBook(title="Alpha")
++    result = interface.add(book)
++
++    assert result is None
++    assert writer.commit_calls == 1
++    assert writer.rollback_calls == 0
++
++    assert book.id is not None
++    assert external_count(reader) == 1
++    assert external_titles(reader) == ["Alpha"]
++
++
++def test_add_commit_false_stages_until_manual_commit(sqla_env):
++
++
++
++
++    Session, _upload_dir, _image_dir = sqla_env
++    writer = Session()
++    reader = Session()
++    interface = SQLAInterface(MutationBook, writer)
++
++    book = MutationBook(title="Beta")
++    result = interface.add(book, commit=False)
++
++    assert result is None
++    assert writer.commit_calls == 0
++    assert writer.rollback_calls == 0
++
++    assert book in writer
++    assert external_count(reader) == 0
++    assert external_titles(reader) == []
++
++    writer.commit()
++
++    assert writer.commit_calls == 1
++
++    assert book in writer
++
++    assert book.id is not None
++    assert external_count(reader) == 1
++    assert external_titles(reader) == ["Beta"]
++
++
++def test_edit_commit_modes_merge_state(sqla_env):
++
++
++
++
++    Session, _upload_dir, _image_dir = sqla_env
++    writer = Session()
++    reader = Session()
++    interface = SQLAInterface(MutationBook, writer)
++    interface.add(MutationBook(title="Gamma"))
++    writer.commit_calls = 0
++
++    committed_edit = MutationBook(id=1, title="Gamma committed")
++    result = interface.edit(committed_edit)
++
++    assert result is None
++    assert writer.commit_calls == 1
++    assert writer.rollback_calls == 0
++    assert len(writer.new) == 0
++    assert len(writer.dirty) == 0
++    assert len(writer.deleted) == 0
++    assert external_titles(reader) == ["Gamma committed"]
++
++    uncommitted_edit = MutationBook(id=1, title="Gamma staged")
++    result = interface.edit(uncommitted_edit, commit=False)
++
++    assert result is None
++    assert writer.commit_calls == 1
++    assert writer.rollback_calls == 0
++
++    assert writer.get(MutationBook, 1).title == "Gamma staged"
++    assert external_titles(reader) == ["Gamma committed"]
++
++    writer.commit()
++
++    assert writer.commit_calls == 2
++    assert len(writer.dirty) == 0
++    assert external_titles(reader) == ["Gamma staged"]
++
++
++def test_delete_commit_modes_remove_rows(sqla_env):
++
++
++
++
++    Session, _upload_dir, _image_dir = sqla_env
++    writer = Session()
++    reader = Session()
++    interface = SQLAInterface(MutationBook, writer)
++    first = MutationBook(title="Delta")
++    second = MutationBook(title="Epsilon")
++    interface.add(first)
++    interface.add(second)
++    writer.commit_calls = 0
++
++    result = interface.delete(first)
++
++    assert result is None
++    assert writer.commit_calls == 1
++    assert writer.rollback_calls == 0
++    assert len(writer.deleted) == 0
++    assert external_count(reader) == 1
++    assert external_titles(reader) == ["Epsilon"]
++
++    second_id = second.id
++    result = interface.delete(second, commit=False)
++
++    assert result is None
++    assert writer.commit_calls == 1
++    assert writer.rollback_calls == 0
++
++    writer.flush()
++    assert writer.get(MutationBook, second_id) is None
++    assert external_count(reader) == 1
++    assert external_titles(reader) == ["Epsilon"]
++
++    writer.commit()
++
++    assert writer.commit_calls == 2
++    assert len(writer.deleted) == 0
++    assert external_count(reader) == 0
++    assert external_titles(reader) == []
++
++
++def test_delete_removes_managed_file_and_image(sqla_env):
++
++
++
++
++    Session, upload_dir, image_dir = sqla_env
++    writer = Session()
++    reader = Session()
++    interface = SQLAInterface(ManagedAssetBook, writer)
++    (upload_dir / "doc-one.txt").write_text("one")
++    (image_dir / "cover-one.png").write_text("image")
++    book = ManagedAssetBook(
++        title="Managed One", file_name="doc-one.txt", image_name="cover-one.png"
++    )
++    interface.add(book)
++    writer.commit_calls = 0
++
++    assert managed_files(upload_dir, image_dir) == ["cover-one.png", "doc-one.txt"]
++    assert external_count(reader, ManagedAssetBook) == 1
++
++    result = interface.delete(book)
++
++    assert result is None
++    assert writer.commit_calls == 1
++    assert writer.rollback_calls == 0
++    assert managed_files(upload_dir, image_dir) == []
++    assert external_count(reader, ManagedAssetBook) == 0
++    assert external_titles(reader, ManagedAssetBook) == []
++
++
++def test_delete_all_removes_every_item_file_and_image_and_commits_once(sqla_env):
++
++
++
++
++    Session, upload_dir, image_dir = sqla_env
++    writer = Session()
++    reader = Session()
++    interface = SQLAInterface(ManagedAssetBook, writer)
++    (upload_dir / "doc-two.txt").write_text("two")
++    (image_dir / "cover-two.png").write_text("two")
++    (upload_dir / "doc-three.txt").write_text("three")
++    (image_dir / "cover-three.png").write_text("three")
++    first = ManagedAssetBook(
++        title="Managed Two", file_name="doc-two.txt", image_name="cover-two.png"
++    )
++    second = ManagedAssetBook(
++        title="Managed Three", file_name="doc-three.txt", image_name="cover-three.png"
++    )
++    interface.add(first)
++    interface.add(second)
++    writer.commit_calls = 0
++
++    assert managed_files(upload_dir, image_dir) == [
++        "cover-three.png",
++        "cover-two.png",
++        "doc-three.txt",
++        "doc-two.txt",
++    ]
++    assert external_count(reader, ManagedAssetBook) == 2
++    assert external_titles(reader, ManagedAssetBook) == ["Managed Two", "Managed Three"]
++
++    result = interface.delete_all([first, second])
++
++    assert result is None
++    assert writer.commit_calls == 1
++    assert writer.rollback_calls == 0
++    assert managed_files(upload_dir, image_dir) == []
++    assert external_count(reader, ManagedAssetBook) == 0
++    assert external_titles(reader, ManagedAssetBook) == []
++
++
++def test_out_of_order_delete_transient_model_raises_database_exception(sqla_env):
++
++
++
++
++    Session, _upload_dir, _image_dir = sqla_env
++    writer = Session()
++    interface = SQLAInterface(MutationBook, writer)
++
++    with pytest.raises(DatabaseException) as exc_info:
++        interface.delete(MutationBook(title="Never persisted"))
++
++    assert type(exc_info.value.__cause__) is InvalidRequestError
++    assert writer.rollback_calls == 1
++    assert writer.commit_calls == 0
++
++
++def test_delete_all_empty_cleanup_is_idempotent(sqla_env):
++
++
++
++
++    Session, _upload_dir, _image_dir = sqla_env
++    writer = Session()
++    reader = Session()
++    interface = SQLAInterface(MutationBook, writer)
++
++    assert interface.delete_all([]) is None
++    assert interface.delete_all([]) is None
++
++    assert writer.commit_calls == 2
++    assert writer.rollback_calls == 0
++    assert external_count(reader) == 0
++    assert external_titles(reader) == []
++
++
++def test_two_interfaces_keep_independent_session_state(sqla_env):
++
++
++
++
++    Session, _upload_dir, _image_dir = sqla_env
++    writer_a = Session()
++    writer_b = Session()
++    interface_a = SQLAInterface(MutationBook, writer_a)
++    interface_b = SQLAInterface(MutationBook, writer_b)
++    book_a = MutationBook(title="Only A")
++    book_b = MutationBook(title="Only B")
++
++    assert interface_a.add(book_a, commit=False) is None
++
++
++    assert book_a in writer_a
++    assert book_a not in writer_b
++    assert writer_a.commit_calls == 0
++
++    assert book_b not in writer_b
++    assert writer_b.commit_calls == 0
++
++    assert interface_b.add(book_b, commit=False) is None
++
++
++    assert book_a in writer_a
++    assert book_b in writer_b
++    assert writer_a.commit_calls == 0
++    assert writer_b.commit_calls == 0
++
++
++def test_repeated_add_delete_cycles_keep_rows_and_managed_files_bounded(sqla_env):
++
++
++
++
++    Session, upload_dir, image_dir = sqla_env
++    writer = Session()
++    reader = Session()
++
++    for index in range(125):
++        interface = SQLAInterface(ManagedAssetBook, writer)
++        file_name = f"cycle-{index}.txt"
++        image_name = f"cycle-{index}.png"
++        (upload_dir / file_name).write_text("payload")
++        (image_dir / image_name).write_text("image")
++        item = ManagedAssetBook(
++            title=f"Cycle {index}", file_name=file_name, image_name=image_name
++        )
++
++        assert interface.add(item) is None
++        assert interface.delete(item) is None
++
++    assert external_count(reader, ManagedAssetBook) == 0
++    assert external_titles(reader, ManagedAssetBook) == []
++    assert managed_files(upload_dir, image_dir) == []
++
++
++def test_add_rolls_back_and_reraises_original_sqlalchemy_exception(sqla_env):
++
++
++
++
++    Session, _upload_dir, _image_dir = sqla_env
++    writer = Session()
++    reader = Session()
++    interface = SQLAInterface(MutationBook, writer)
++    interface.add(MutationBook(title="Duplicate"))
++    writer.rollback_calls = 0
++
++    with pytest.raises(IntegrityError):
++        interface.add(MutationBook(title="Duplicate"))
++
++    assert writer.rollback_calls == 1
++    assert external_count(reader) == 1
++    assert external_titles(reader) == ["Duplicate"]
++
++
++def test_edit_rolls_back_and_wraps_sqlalchemy_exception(sqla_env):
++
++
++
++
++    _Session, _upload_dir, _image_dir = sqla_env
++    engine = create_engine("sqlite:///:memory:")
++    Model.metadata.create_all(engine, tables=[MutationBook.__table__])
++    writer = sessionmaker(bind=engine, class_=FailingMergeSession)()
++    interface = SQLAInterface(MutationBook, writer)
++
++    with pytest.raises(DatabaseException) as exc_info:
++        interface.edit(MutationBook(id=1, title="Broken edit"))
++
++    assert type(exc_info.value.__cause__) is OperationalError
++    assert writer.rollback_calls == 1
++    assert writer.commit_calls == 0
++
++
++def test_delete_rolls_back_and_wraps_sqlalchemy_exception(sqla_env):
++
++
++
++
++    _Session, _upload_dir, _image_dir = sqla_env
++    engine = create_engine("sqlite:///:memory:")
++    Model.metadata.create_all(engine, tables=[MutationBook.__table__])
++    writer = sessionmaker(bind=engine, class_=FailingDeleteSession)()
++    interface = SQLAInterface(MutationBook, writer)
++
++    with pytest.raises(DatabaseException) as exc_info:
++        interface.delete(MutationBook(id=1, title="Broken delete"))
++
++    assert type(exc_info.value.__cause__) is OperationalError
++    assert writer.rollback_calls == 1
++    assert writer.commit_calls == 0
++
++
++def test_delete_all_rolls_back_and_wraps_sqlalchemy_exception(sqla_env):
++
++
++
++
++    _Session, _upload_dir, _image_dir = sqla_env
++    engine = create_engine("sqlite:///:memory:")
++    Model.metadata.create_all(engine, tables=[MutationBook.__table__])
++    writer = sessionmaker(bind=engine, class_=FailingSecondDeleteSession)()
++    writer.add_all([MutationBook(title="Bulk One"), MutationBook(title="Bulk Two")])
++    writer.commit()
++    writer.commit_calls = 0
++    items = writer.query(MutationBook).order_by(MutationBook.id).all()
++    interface = SQLAInterface(MutationBook, writer)
++
++    with pytest.raises(DatabaseException) as exc_info:
++        interface.delete_all(items)
++
++    assert type(exc_info.value.__cause__) is OperationalError
++    assert writer.delete_calls == 2
++    assert writer.rollback_calls == 1
++    assert writer.commit_calls == 0
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,26 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++
++cd /workspace/repo
++
++
++
++export PIP_NO_INDEX=1
++export PIP_DISABLE_PIP_VERSION_CHECK=1
++export PIP_NO_INPUT=1
++unset PIP_INDEX_URL PIP_EXTRA_INDEX_URL PIP_FIND_LINKS
++export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
++
++python -m pip install --no-index --disable-pip-version-check --no-input --no-build-isolation --no-deps -e . pytest >/dev/null
++
++exec python -m pytest /workspace/repo/usercase-test-coderl/test_sqla_interface_mutations.py -v

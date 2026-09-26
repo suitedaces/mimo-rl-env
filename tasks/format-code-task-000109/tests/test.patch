@@ -1,0 +1,253 @@
+diff --git a/cmd/skaffold/app/cmd/dev_test.go b/cmd/skaffold/app/cmd/dev_test.go
+index 6ab37b8caa3..ff5d3347bae 100644
+--- a/cmd/skaffold/app/cmd/dev_test.go
++++ b/cmd/skaffold/app/cmd/dev_test.go
+@@ -22,6 +22,7 @@ import (
+ 	"testing"
+ 
+ 	"github.com/GoogleContainerTools/skaffold/pkg/skaffold/config"
++	"github.com/GoogleContainerTools/skaffold/pkg/skaffold/graph"
+ 	"github.com/GoogleContainerTools/skaffold/pkg/skaffold/kubernetes/manifest"
+ 	"github.com/GoogleContainerTools/skaffold/pkg/skaffold/runner"
+ 	runcontext "github.com/GoogleContainerTools/skaffold/pkg/skaffold/runner/runcontext/v2"
+@@ -32,10 +33,11 @@ import (
+ 
+ type mockDevRunner struct {
+ 	runner.Runner
+-	hasBuilt    bool
+-	hasDeployed bool
+-	errDev      error
+-	calls       []string
++	hasBuilt          bool
++	hasDeployed       bool
++	errDev            error
++	calls             []string
++	manifestsByConfig *manifest.ManifestListByConfig
+ }
+ 
+ func (r *mockDevRunner) Dev(context.Context, io.Writer, []*latest.Artifact) error {
+@@ -58,11 +60,16 @@ func (r *mockDevRunner) Prune(context.Context, io.Writer) error {
+ 	return nil
+ }
+ 
+-func (r *mockDevRunner) Cleanup(context.Context, io.Writer, bool, manifest.ManifestList) error {
++func (r *mockDevRunner) Cleanup(context.Context, io.Writer, bool, *manifest.ManifestListByConfig) error {
+ 	r.calls = append(r.calls, "Cleanup")
+ 	return nil
+ }
+ 
++func (r *mockDevRunner) Render(ctx context.Context, out io.Writer, builds []graph.Artifact, offline bool) (*manifest.ManifestListByConfig, error) {
++	r.calls = append(r.calls, "Render")
++	return r.manifestsByConfig, nil
++}
++
+ func TestDoDev(t *testing.T) {
+ 	tests := []struct {
+ 		description   string
+@@ -74,7 +81,7 @@ func TestDoDev(t *testing.T) {
+ 			description:   "cleanup and then prune",
+ 			hasBuilt:      true,
+ 			hasDeployed:   true,
+-			expectedCalls: []string{"Dev", "HasDeployed", "HasBuilt", "Cleanup", "Prune"},
++			expectedCalls: []string{"Dev", "HasDeployed", "HasBuilt", "Render", "Cleanup", "Prune"},
+ 		},
+ 		{
+ 			description:   "hasn't deployed",
+@@ -139,7 +146,11 @@ func (m *mockConfigChangeRunner) Prune(context.Context, io.Writer) error {
+ 	return nil
+ }
+ 
+-func (m *mockConfigChangeRunner) Cleanup(context.Context, io.Writer, bool, manifest.ManifestList) error {
++func (m *mockConfigChangeRunner) Render(ctx context.Context, out io.Writer, builds []graph.Artifact, offline bool) (*manifest.ManifestListByConfig, error) {
++	return nil, nil
++}
++
++func (m *mockConfigChangeRunner) Cleanup(context.Context, io.Writer, bool, *manifest.ManifestListByConfig) error {
+ 	return nil
+ }
+ 
+diff --git a/integration/delete_test.go b/integration/delete_test.go
+new file mode 100644
+index 00000000000..e37004b7b6b
+--- /dev/null
++++ b/integration/delete_test.go
+@@ -0,0 +1,73 @@
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++package integration
++
++import (
++	"testing"
++	"time"
++
++	"github.com/GoogleContainerTools/skaffold/integration/skaffold"
++)
++
++func TestDelete(t *testing.T) {
++	var tests = []struct {
++		description string
++		dir         string
++		args        []string
++		pods        []string
++		deployments []string
++		env         []string
++	}{
++		{
++			description: "getting-started",
++			dir:         "testdata/getting-started",
++			pods:        []string{"getting-started"},
++		},
++		{
++			description: "microservices",
++			dir:         "examples/microservices",
++			args:        []string{"--status-check=false"},
++			deployments: []string{"leeroy-app", "leeroy-web"},
++		},
++		{
++			description: "multi-config-microservices",
++			dir:         "examples/multi-config-microservices",
++			deployments: []string{"leeroy-app", "leeroy-web"},
++		},
++		{
++			description: "multiple deployers",
++			dir:         "testdata/deploy-multiple",
++			pods:        []string{"deploy-kubectl", "deploy-kustomize"},
++		},
++	}
++
++	MarkIntegrationTest(t, CanRunWithoutGcp)
++
++	for _, test := range tests {
++		t.Run(test.description, func(t *testing.T) {
++			ns, client := SetupNamespace(t)
++
++			args := append(test.args, "--cache-artifacts=false")
++			skaffold.Run(args...).InDir(test.dir).InNs(ns.Name).WithEnv(test.env).RunOrFail(t)
++
++			client.WaitForPodsReady(test.pods...)
++			client.waitForDeploymentsToStabilizeWithTimeout(time.Minute*2, test.deployments...)
++
++			skaffold.Delete().InDir(test.dir).InNs(ns.Name).WithEnv(test.env).RunOrFail(t)
++		})
++	}
++}
+diff --git a/pkg/skaffold/deploy/cloudrun/deploy_test.go b/pkg/skaffold/deploy/cloudrun/deploy_test.go
+index c0b55254c8d..382ba52925d 100644
+--- a/pkg/skaffold/deploy/cloudrun/deploy_test.go
++++ b/pkg/skaffold/deploy/cloudrun/deploy_test.go
+@@ -327,9 +327,11 @@ func TestCleanup(tOuter *testing.T) {
+ 			deployer, _ := NewDeployer(&runcontext.RunContext{}, &label.DefaultLabeller{}, &latest.CloudRunDeploy{ProjectID: test.defaultProject, Region: test.region}, configName)
+ 			deployer.clientOptions = append(deployer.clientOptions, option.WithEndpoint(ts.URL), option.WithoutAuthentication())
+ 			deployer.useGcpOptions = false
++			manifestListByConfig := manifest.NewManifestListByConfig()
+ 			manifest, _ := json.Marshal(test.toDelete)
+ 			manifests := [][]byte{manifest}
+-			err := deployer.Cleanup(context.Background(), os.Stderr, false, manifests)
++			manifestListByConfig.Add(configName, manifests)
++			err := deployer.Cleanup(context.Background(), os.Stderr, false, &manifestListByConfig)
+ 			if test.httpErr == 0 && err != nil {
+ 				t.Fatalf("Expected success but got err: %v", err)
+ 			} else if test.httpErr != 0 && err == nil {
+diff --git a/pkg/skaffold/deploy/deploy_mux_test.go b/pkg/skaffold/deploy/deploy_mux_test.go
+index f6a4212f52b..9f9fc67968d 100644
+--- a/pkg/skaffold/deploy/deploy_mux_test.go
++++ b/pkg/skaffold/deploy/deploy_mux_test.go
+@@ -87,7 +87,7 @@ func (m *MockDeployer) Dependencies() ([]string, error) {
+ 	return m.dependencies, m.dependenciesErr
+ }
+ 
+-func (m *MockDeployer) Cleanup(context.Context, io.Writer, bool, manifest.ManifestList) error {
++func (m *MockDeployer) Cleanup(context.Context, io.Writer, bool, *manifest.ManifestListByConfig) error {
+ 	return m.cleanupErr
+ }
+ 
+diff --git a/pkg/skaffold/deploy/kubectl/kubectl_test.go b/pkg/skaffold/deploy/kubectl/kubectl_test.go
+index b8a93544186..a9edb4d4705 100644
+--- a/pkg/skaffold/deploy/kubectl/kubectl_test.go
++++ b/pkg/skaffold/deploy/kubectl/kubectl_test.go
+@@ -337,7 +337,7 @@ func TestKubectlCleanup(t *testing.T) {
+ 				true)
+ 			t.CheckNoError(errR)
+ 
+-			err = k.Cleanup(context.Background(), io.Discard, test.dryRun, m.GetForConfig(configName))
++			err = k.Cleanup(context.Background(), io.Discard, test.dryRun, m)
+ 
+ 			t.CheckError(test.shouldErr, err)
+ 		})
+diff --git a/pkg/skaffold/render/generate/generate_test.go b/pkg/skaffold/render/generate/generate_test.go
+index f15e39b2a9d..d638b6e5d4d 100644
+--- a/pkg/skaffold/render/generate/generate_test.go
++++ b/pkg/skaffold/render/generate/generate_test.go
+@@ -183,7 +183,7 @@ func TestGenerate(t *testing.T) {
+ 
+ func TestGenerateFromURLManifest(t *testing.T) {
+ 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+-		fmt.Fprintln(w, podYaml)
++		fmt.Fprint(w, podYaml)
+ 	}))
+ 
+ 	defer ts.Close()
+diff --git a/pkg/skaffold/runner/timings_test.go b/pkg/skaffold/runner/timings_test.go
+index 7553022e1ce..43ad2e13419 100644
+--- a/pkg/skaffold/runner/timings_test.go
++++ b/pkg/skaffold/runner/timings_test.go
+@@ -100,7 +100,7 @@ func (m *mockDeployer) Deploy(context.Context, io.Writer, []graph.Artifact, *man
+ 	return nil
+ }
+ 
+-func (m *mockDeployer) Cleanup(context.Context, io.Writer, bool, manifest.ManifestList) error {
++func (m *mockDeployer) Cleanup(context.Context, io.Writer, bool, *manifest.ManifestListByConfig) error {
+ 	if m.err {
+ 		return errors.New("Unable to cleanup")
+ 	}
+diff --git a/pkg/skaffold/runner/v2/runner_test.go b/pkg/skaffold/runner/v2/runner_test.go
+index 5c16cc9a4a2..07feabdce96 100644
+--- a/pkg/skaffold/runner/v2/runner_test.go
++++ b/pkg/skaffold/runner/v2/runner_test.go
+@@ -143,7 +143,7 @@ func (t *TestBench) TestDependencies(context.Context, *latest.Artifact) ([]strin
+ 	return nil, nil
+ }
+ func (t *TestBench) Dependencies() ([]string, error) { return nil, nil }
+-func (t *TestBench) Cleanup(ctx context.Context, out io.Writer, dryRun bool, list manifest.ManifestList) error {
++func (t *TestBench) Cleanup(ctx context.Context, out io.Writer, dryRun bool, byConfig *manifest.ManifestListByConfig) error {
+ 	return nil
+ }
+ func (t *TestBench) Prune(ctx context.Context, out io.Writer) error { return nil }
+diff --git a/mimo_build_env.tar.gz.b64 b/mimo_build_env.tar.gz.b64
+new file mode 100644
+--- /dev/null
++++ b/mimo_build_env.tar.gz.b64
+@@ -0,0 +1,8 @@
++H4sIAAAAAAAAA+3Tz2vCMBQH8J77VwR3tr+0etpBlI0xtsPwLrF5xmJMSn64DfbHL3YbrcLmBGXI
++3ufS8Ey+ffTFaO5KwWYgN3FwLok3zPP66e0/63WaZ0k26CXDfhokaTpI0oDkZ+uoxRlLNSGBVsr+
++tO/Q7xcqauZvwdhZodZrKllklqd7x4H5p1mvmf8gz/z8+4M0C0hyuha+98/nXzBSD34OLAwNWNKF
++MLwiT04SKgTx34b7opOlJdttJuSqXpDuhnQL5aS9TkkUF2sWmxVdLJRgMa2qukC62sd0pn77RE1g
++8/a1EmCh0ySZpdL7gaW0wDW1pZI7Oftndw5VK950waAS6jUuhHLMn2+njAVQ6apjYnZ62FZAP7iX
++YxJWbg6FFe2k+4/SMe1okAx0zEGC/zrQTrv9rP0ux0m/u318Wq5Lyc0xpzdZO+ARnm+UHiu5KHk9
++6qkuOQc99hdpTovVSLI7P1Vp/TtCKJaKdEbNFatvF6moMcCiTvjX/wuEEEIIIYQQQgghhBBCCCGE
++EEIIoUvxDiMpN/EAKAAA
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,6 @@
++#!/usr/bin/env bash
++
++set -uo pipefail
++cd /testbed || exit 1
++base64 -d mimo_build_env.tar.gz.b64 | tar -xzf - -C /testbed || exit 1
++exec bash -lc 'cd /testbed && bash -eo pipefail /testbed/.build_env/test_command.sh'

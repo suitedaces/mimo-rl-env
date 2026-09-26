@@ -1,0 +1,212 @@
+diff --git a/@commitlint/travis-cli/src/travis-behavior.test.js b/@commitlint/travis-cli/src/travis-behavior.test.js
+new file mode 100644
+index 00000000..918bfcbb
+--- /dev/null
++++ b/@commitlint/travis-cli/src/travis-behavior.test.js
+@@ -0,0 +1,196 @@
++const fs = require('fs');
++const os = require('os');
++const path = require('path');
++const execa = require('execa');
++
++const cli = require.resolve('../cli.js');
++
++function makeScript(body) {
++	const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'commitlint-travis-'));
++	const file = path.join(dir, 'bin.js');
++	fs.writeFileSync(file, `#!/usr/bin/env node\n${body}\n`);
++	fs.chmodSync(file, 0o755);
++	return {dir, file};
++}
++
++function setup(options = {}) {
++	const log = path.join(
++		fs.mkdtempSync(path.join(os.tmpdir(), 'commitlint-log-')),
++		'calls.log'
++	);
++	fs.writeFileSync(log, '');
++	const git = makeScript(`
++const fs = require('fs');
++const args = process.argv.slice(2);
++fs.appendFileSync(${JSON.stringify(
++		log
++	)}, JSON.stringify({tool: 'git', args}) + '\\n');
++if (args[0] === 'status' && process.env.TEST_DIRTY === '1') process.stdout.write(' M tracked.txt\\n');
++if (process.env.TEST_FAIL_GIT === args[0]) process.exit(23);
++`);
++	const commitlint = makeScript(`
++const fs = require('fs');
++const args = process.argv.slice(2);
++fs.appendFileSync(${JSON.stringify(
++		log
++	)}, JSON.stringify({tool: 'commitlint', args}) + '\\n');
++if (process.env.TEST_FAIL_COMMITLINT === '1') process.exit(19);
++`);
++	const env = {
++		CI: 'true',
++		TRAVIS: 'true',
++		TRAVIS_COMMIT: 'HEAD',
++		TRAVIS_COMMIT_RANGE: 'BASE...HEAD',
++		TRAVIS_EVENT_TYPE: options.event || 'push',
++		TRAVIS_REPO_SLUG: options.baseSlug || 'org/base-repo',
++		TRAVIS_PULL_REQUEST_SLUG: Object.prototype.hasOwnProperty.call(
++			options,
++			'sourceSlug'
++		)
++			? options.sourceSlug
++			: 'contributor/source-repo',
++		TRAVIS_COMMITLINT_GIT_BIN: git.file,
++		TRAVIS_COMMITLINT_BIN: commitlint.file,
++		TEST_DIRTY: options.dirty ? '1' : '0',
++		TEST_FAIL_GIT: options.failGit || '',
++		TEST_FAIL_COMMITLINT: options.failCommitlint ? '1' : '0',
++	};
++	return {env, log};
++}
++
++async function run(options = {}, args = []) {
++	const {env, log} = setup(options);
++	const result = await execa(process.execPath, [cli, ...args], {
++		env,
++		reject: false,
++	});
++	const calls = fs
++		.readFileSync(log, 'utf8')
++		.trim()
++		.split('\n')
++		.filter(Boolean)
++		.map((line) => JSON.parse(line));
++	return {result, calls};
++}
++
++function findCall(calls, tool, args) {
++	return calls.find(
++		(call) =>
++			call.tool === tool && JSON.stringify(call.args) === JSON.stringify(args)
++	);
++}
++
++test('fetches the base remote on a clean non-PR build and does not add a source remote', async () => {
++	const {result, calls} = await run({baseSlug: 'company/push-repo'});
++	expect(result.exitCode).toBe(0);
++	expect(
++		findCall(calls, 'git', [
++			'remote',
++			'add',
++			'base',
++			'https://github.com/company/push-repo.git',
++		])
++	).toBeTruthy();
++	expect(findCall(calls, 'git', ['fetch', 'base', '--quiet'])).toBeTruthy();
++	expect(calls.some((call) => call.args[2] === 'source')).toBe(false);
++	expect(calls.some((call) => call.args[0] === 'stash')).toBe(false);
++	expect(
++		findCall(calls, 'git', ['log', '-n', '1', '--pretty=format:%B', 'HEAD'])
++	).toBeTruthy();
++	expect(calls.find((call) => call.tool === 'commitlint').args).toEqual([]);
++});
++
++test('uses the base repository as the source when a pull request slug is empty', async () => {
++	const {result, calls} = await run({
++		event: 'pull_request',
++		baseSlug: 'company/same-repo',
++		sourceSlug: '',
++	});
++
++	expect(result.exitCode).toBe(0);
++	expect(
++		findCall(calls, 'git', [
++			'remote',
++			'add',
++			'source',
++			'https://github.com/company/same-repo.git',
++		])
++	).toBeTruthy();
++	expect(findCall(calls, 'git', ['fetch', 'source', '--quiet'])).toBeTruthy();
++});
++
++test('fetches both remotes for pull requests before invoking commitlint with the range', async () => {
++	const {result, calls} = await run({event: 'pull_request', dirty: true}, [
++		'--verbose',
++	]);
++
++	expect(result.exitCode).toBe(0);
++	expect(
++		findCall(calls, 'git', [
++			'remote',
++			'add',
++			'base',
++			'https://github.com/org/base-repo.git',
++		])
++	).toBeTruthy();
++	expect(findCall(calls, 'git', ['fetch', 'base', '--quiet'])).toBeTruthy();
++	expect(
++		findCall(calls, 'git', [
++			'remote',
++			'add',
++			'source',
++			'https://github.com/contributor/source-repo.git',
++		])
++	).toBeTruthy();
++	expect(findCall(calls, 'git', ['fetch', 'source', '--quiet'])).toBeTruthy();
++
++	const lintIndex = calls.findIndex((call) => call.tool === 'commitlint');
++	const fetchIndexes = calls
++		.map((call, index) =>
++			call.tool === 'git' && call.args[0] === 'fetch' ? index : -1
++		)
++		.filter((index) => index >= 0);
++	expect(fetchIndexes).toHaveLength(2);
++	expect(lintIndex).toBeGreaterThan(Math.max(...fetchIndexes));
++	expect(calls[1]).toEqual({
++		tool: 'git',
++		args: ['stash', '-k', '-u', '--quiet'],
++	});
++	const popIndex = calls.findIndex(
++		(call) =>
++			call.tool === 'git' && call.args[0] === 'stash' && call.args[1] === 'pop'
++	);
++	expect(popIndex).toBeGreaterThan(lintIndex);
++
++	const lint = calls.find((call) => call.tool === 'commitlint');
++	expect(lint.args).toEqual(['--from', 'BASE', '--to', 'HEAD', '--verbose']);
++});
++
++test('restores a dirty worktree when remote setup fails and keeps the failure status', async () => {
++	const {result, calls} = await run({dirty: true, failGit: 'fetch'});
++
++	expect(result.exitCode).not.toBe(0);
++	const stashIndex = calls.findIndex(
++		(call) => call.tool === 'git' && call.args[0] === 'stash'
++	);
++	const popIndex = calls.findIndex(
++		(call) =>
++			call.tool === 'git' && call.args[0] === 'stash' && call.args[1] === 'pop'
++	);
++	expect(stashIndex).toBeGreaterThanOrEqual(0);
++	expect(popIndex).toBeGreaterThan(stashIndex);
++	expect(calls.some((call) => call.tool === 'commitlint')).toBe(false);
++});
++
++test('restores a dirty worktree before reporting a lint failure', async () => {
++	const {result, calls} = await run({dirty: true, failCommitlint: true});
++
++	expect(result.exitCode).not.toBe(0);
++	const popIndex = calls.findIndex(
++		(call) =>
++			call.tool === 'git' && call.args[0] === 'stash' && call.args[1] === 'pop'
++	);
++	const lintIndex = calls.findIndex((call) => call.tool === 'commitlint');
++	expect(popIndex).toBeGreaterThanOrEqual(0);
++	expect(popIndex).toBeGreaterThan(lintIndex);
++});
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,5 @@
++#!/bin/bash
++set -euo pipefail
++
++./node_modules/.bin/tsc -b ./@commitlint/travis-cli/tsconfig.json --pretty false
++./node_modules/.bin/jest @commitlint/travis-cli/src/travis-behavior.test.js --runInBand

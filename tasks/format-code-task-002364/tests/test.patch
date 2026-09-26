@@ -1,0 +1,151 @@
+diff --git a/spec/unit/puppet/type/postgresql_psql_refreshonly_spec.rb b/spec/unit/puppet/type/postgresql_psql_refreshonly_spec.rb
+new file mode 100644
+index 0000000000..57d7f1a2bc
+--- /dev/null
++++ b/spec/unit/puppet/type/postgresql_psql_refreshonly_spec.rb
+@@ -0,0 +1,115 @@
++require 'spec_helper'
++require 'English'
++require 'etc'
++require 'fileutils'
++require 'shellwords'
++require 'tmpdir'
++
++unless Puppet::Util::SUIDManager.respond_to?(:run_and_capture)
++  module Puppet::Util::SUIDManager
++    def self.run_and_capture(command, _user = nil, _group = nil)
++      output = IO.popen(command, :err => [:child, :out], &:read)
++      [output, $CHILD_STATUS.exitstatus]
++    end
++  end
++end
++
++describe Puppet::Type.type(:postgresql_psql), 'refreshonly behavior' do
++  let(:type) { Puppet::Type.type(:postgresql_psql) }
++  let(:tmpdir) { Dir.mktmpdir('postgresql_psql_refreshonly') }
++  let(:log_path) { File.join(tmpdir, 'psql_invocations.log') }
++  let(:psql_path) { File.join(tmpdir, 'psql') }
++  let(:current_user) { Etc.getpwuid(Process.uid).name }
++  let(:current_group) { Etc.getgrgid(Process.gid).name }
++
++  before do
++    File.open(psql_path, 'w') do |file|
++      file.puts '#!/bin/sh'
++      file.puts "printf '%s\n' \"$*\" >> #{Shellwords.escape(log_path)}"
++    end
++    FileUtils.chmod(0755, psql_path)
++  end
++
++  after do
++    FileUtils.rm_rf(tmpdir)
++  end
++
++  def recorded_invocations(log_path)
++    return [] unless File.exist?(log_path)
++    File.readlines(log_path)
++  end
++
++  def unique_sql(prefix)
++    "CREATE TABLE #{prefix}_#{Process.pid}_#{rand(1_000_000)} (id integer)"
++  end
++
++  def new_psql_resource(type, psql_path, tmpdir, current_user, current_group, command, attributes = {})
++    type.new({
++      :name       => "rspec #{command}",
++      :command    => command,
++      :db         => 'postgres',
++      :psql_path  => psql_path,
++      :psql_user  => current_user,
++      :psql_group => current_group,
++      :cwd        => tmpdir,
++    }.merge(attributes))
++  end
++
++  it 'executes on a normal sync when refreshonly is omitted' do
++    sql = unique_sql('rl_default_refreshonly')
++    resource = new_psql_resource(type, psql_path, tmpdir, current_user, current_group, sql)
++    before_count = recorded_invocations(log_path).length
++
++    resource.property(:command).sync
++
++    invocations = recorded_invocations(log_path)
++    expect(invocations.length).to be > before_count
++    expect(invocations.join).to include(sql)
++  end
++
++  it 'executes on normal sync when refreshonly is explicitly false' do
++    sql = unique_sql('rl_explicit_false_refreshonly')
++    resource = new_psql_resource(type, psql_path, tmpdir, current_user, current_group, sql, :refreshonly => false)
++    before_count = recorded_invocations(log_path).length
++
++    resource.property(:command).sync
++
++    invocations = recorded_invocations(log_path)
++    expect(invocations.length).to be > before_count
++    expect(invocations.join).to include(sql)
++  end
++
++  it 'does not execute on normal sync when refreshonly is explicitly true' do
++    sql = unique_sql('rl_explicit_true_plain')
++    resource = new_psql_resource(type, psql_path, tmpdir, current_user, current_group, sql, :refreshonly => true)
++    before_count = recorded_invocations(log_path).length
++
++    resource.property(:command).sync
++
++    expect(recorded_invocations(log_path).length).to eq(before_count)
++  end
++
++  it 'executes during refresh when refreshonly is explicitly true' do
++    sql = unique_sql('rl_explicit_true_refresh')
++    resource = new_psql_resource(type, psql_path, tmpdir, current_user, current_group, sql, :refreshonly => true)
++    before_count = recorded_invocations(log_path).length
++
++    resource.refresh
++
++    invocations = recorded_invocations(log_path)
++    expect(invocations.length).to be > before_count
++    expect(invocations.join).to include(sql)
++  end
++
++  it 'accepts boolean refreshonly values' do
++    [true, false, :true, :false].each do |value|
++      expect { new_psql_resource(type, psql_path, tmpdir, current_user, current_group, unique_sql('rl_valid_refreshonly'), :refreshonly => value) }.not_to raise_error
++    end
++  end
++
++  it 'rejects non-boolean refreshonly values' do
++    ['sometimes', 'yes', 1].each do |value|
++      expect { new_psql_resource(type, psql_path, tmpdir, current_user, current_group, unique_sql('rl_invalid_refreshonly'), :refreshonly => value) }.to raise_error(Puppet::Error)
++    end
++  end
++end
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,25 @@
++#!/bin/bash
++set -uo pipefail
++
++cd /testbed
++
++
++set +u
++export PATH="$HOME/.rbenv/bin:$HOME/.rbenv/plugins/ruby-build/bin:$PATH"
++eval "$(rbenv init - bash)"
++rbenv global 2.7.8
++set -u
++
++
++case "${1:-}" in
++  base)
++    ruby -e 'puts "No pre-existing postgresql_psql unit specs in base checkout; base regression scope is empty."'
++    ;;
++  new)
++    ruby -S rspec /testbed/spec/unit/puppet/type/postgresql_psql_refreshonly_spec.rb
++    ;;
++  *)
++    echo "usage: $0 base|new"
++    exit 2
++    ;;
++esac

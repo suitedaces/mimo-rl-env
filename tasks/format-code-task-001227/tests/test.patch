@@ -1,0 +1,485 @@
+diff --git a/usercase-test-coderl/sanitize_activation_spec.rb b/usercase-test-coderl/sanitize_activation_spec.rb
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/sanitize_activation_spec.rb
+@@ -0,0 +1,439 @@
++# frozen_string_literal: true
++
++
++
++
++
++
++
++
++require "mail"
++require "sanitize_email"
++
++RSpec.describe "SanitizeEmail stateful activation controls" do
++  def reset_sanitize_email_session
++    SanitizeEmail::Config.config = SanitizeEmail::Config::DEFAULTS.dup
++    SanitizeEmail.force_sanitize = nil
++    SanitizeEmail::Deprecation.deprecate_in_silence = true
++    Mail.defaults { delivery_method :test }
++    Mail::TestMailer.deliveries.clear
++    while Mail.delivery_interceptors.include?(SanitizeEmail::Bleach)
++      Mail.unregister_interceptor(SanitizeEmail::Bleach)
++    end
++    Mail.register_interceptor(SanitizeEmail::Bleach)
++  end
++
++  def configure_sanitize_email(options)
++    SanitizeEmail::Config.configure do |config|
++      options.each { |key, value| config[key] = value }
++    end
++  end
++
++  def deliver_message(to: "real@example.test", subject: "hello", perform_deliveries: true)
++    message = Mail.new do
++      from "sender@example.test"
++      to to
++      subject subject
++      body "body"
++    end
++    message.perform_deliveries = perform_deliveries
++    message.deliver
++    message
++  end
++
++  def original_recipient_header_values(message)
++    message.header.fields.filter_map do |field|
++      name = field.name.to_s.downcase
++      next unless name.include?("sanitize") || name.include?("original")
++
++      field.decoded.to_s
++    end
++  end
++
++  def expect_original_recipient_record(message, expected)
++
++    expect(original_recipient_header_values(message).any? { |value| value.include?(expected) }).to eq(true)
++  end
++
++  def expect_no_original_recipient_record(message)
++
++    expect(original_recipient_header_values(message)).to be_empty
++  end
++
++  def with_rails_env(env)
++    rails_was_defined = Object.const_defined?(:Rails)
++    previous_rails = Object.const_get(:Rails) if rails_was_defined
++    Object.send(:remove_const, :Rails) if rails_was_defined
++
++    rails_module = Module.new
++    rails_module.define_singleton_method(:env) { env }
++    Object.const_set(:Rails, rails_module)
++
++    yield
++  ensure
++    Object.send(:remove_const, :Rails) if Object.const_defined?(:Rails)
++    Object.const_set(:Rails, previous_rails) if rails_was_defined
++  end
++
++  before do
++    reset_sanitize_email_session
++  end
++
++  after do
++    reset_sanitize_email_session
++  end
++
++  it "leaves mail unchanged by default until configured" do
++
++
++    message = deliver_message
++
++    expect(SanitizeEmail.force_sanitize).to eq(nil)
++    expect(SanitizeEmail::Config.config[:engage]).to eq(nil)
++    expect(message.to).to eq(["real@example.test"])
++    expect_no_original_recipient_record(message)
++    expect(Mail::TestMailer.deliveries.length).to eq(1)
++  end
++
++  it "sanitizes a later delivery when engage is true" do
++
++
++    configure_sanitize_email(sanitized_to: "safe@example.test", engage: true)
++
++    message = deliver_message
++
++    expect(SanitizeEmail.force_sanitize).to eq(nil)
++    expect(SanitizeEmail::Config.config[:engage]).to eq(true)
++    expect(message.to).to eq(["safe@example.test"])
++    expect_original_recipient_record(message, "real@example.test")
++    expect(Mail::TestMailer.deliveries.length).to eq(1)
++  end
++
++  it "keeps a later delivery unchanged when engage is false" do
++
++
++    configure_sanitize_email(sanitized_to: "safe@example.test", engage: false)
++
++    message = deliver_message
++
++    expect(SanitizeEmail.force_sanitize).to eq(nil)
++    expect(SanitizeEmail::Config.config[:engage]).to eq(false)
++    expect(message.to).to eq(["real@example.test"])
++    expect_no_original_recipient_record(message)
++    expect(Mail::TestMailer.deliveries.length).to eq(1)
++  end
++
++  it "lets non-nil force_sanitize override configured activation across later deliveries" do
++
++
++    configure_sanitize_email(
++      sanitized_to: "safe@example.test",
++      engage: false,
++      activation_proc: proc { true }
++    )
++
++    SanitizeEmail.force_sanitize = false
++    denied = deliver_message(subject: "force false")
++
++    SanitizeEmail.force_sanitize = true
++    forced = deliver_message(subject: "force true")
++
++    expect(denied.to).to eq(["real@example.test"])
++    expect_no_original_recipient_record(denied)
++    expect(forced.to).to eq(["safe@example.test"])
++    expect_original_recipient_record(forced, "real@example.test")
++    expect(SanitizeEmail.force_sanitize).to eq(true)
++    expect(Mail::TestMailer.deliveries.length).to eq(2)
++  end
++
++  it "falls through nil engage to an activation_proc that receives each Mail message" do
++
++
++    seen_subjects = []
++    configure_sanitize_email(
++      sanitized_to: "safe@example.test",
++      engage: nil,
++      activation_proc: proc { |message|
++        seen_subjects << message.subject
++        message.subject == "allow"
++      }
++    )
++
++    denied = deliver_message(subject: "deny")
++    allowed = deliver_message(subject: "allow")
++
++    expect(seen_subjects).to eq(["deny", "allow"])
++    expect(denied.to).to eq(["real@example.test"])
++    expect_no_original_recipient_record(denied)
++    expect(allowed.to).to eq(["safe@example.test"])
++    expect_original_recipient_record(allowed, "real@example.test")
++    expect(Mail::TestMailer.deliveries.length).to eq(2)
++  end
++
++  it "does not sanitize messages whose perform_deliveries flag is false" do
++
++
++    configure_sanitize_email(sanitized_to: "safe@example.test", engage: true)
++
++    message = deliver_message(perform_deliveries: false)
++
++    expect(message.perform_deliveries).to eq(false)
++    expect(message.to).to eq(["real@example.test"])
++    expect_no_original_recipient_record(message)
++    expect(Mail::TestMailer.deliveries.length).to eq(0)
++  end
++
++  it "sanitary merges options, forces sanitization by default, and restores state afterward" do
++
++
++    configure_sanitize_email(sanitized_to: "global@example.test", engage: false)
++
++    expect(SanitizeEmail.force_sanitize).to eq(nil)
++    expect(SanitizeEmail::Config.config[:sanitized_to]).to eq("global@example.test")
++    expect(SanitizeEmail::Config.config[:engage]).to eq(false)
++
++    SanitizeEmail.sanitary(sanitized_to: "block@example.test") do
++      expect(SanitizeEmail.force_sanitize).to eq(true)
++      expect(SanitizeEmail::Config.config[:sanitized_to]).to eq("block@example.test")
++      expect(SanitizeEmail::Config.config[:engage]).to eq(false)
++
++      message = deliver_message
++
++      expect(message.to).to eq(["block@example.test"])
++      expect_original_recipient_record(message, "real@example.test")
++      expect(Mail::TestMailer.deliveries.length).to eq(1)
++    end
++
++    expect(SanitizeEmail.force_sanitize).to eq(nil)
++    expect(SanitizeEmail::Config.config[:sanitized_to]).to eq("global@example.test")
++    expect(SanitizeEmail::Config.config[:engage]).to eq(false)
++  end
++
++  it "lets sanitary engage option decide activation instead of default force-on behavior" do
++
++
++    configure_sanitize_email(sanitized_to: "global@example.test", engage: true)
++
++    SanitizeEmail.sanitary(engage: false, sanitized_to: "block@example.test") do
++      expect(SanitizeEmail.force_sanitize).to eq(nil)
++      expect(SanitizeEmail::Config.config[:sanitized_to]).to eq("block@example.test")
++      expect(SanitizeEmail::Config.config[:engage]).to eq(false)
++
++      message = deliver_message
++
++      expect(message.to).to eq(["real@example.test"])
++      expect_no_original_recipient_record(message)
++      expect(Mail::TestMailer.deliveries.length).to eq(1)
++    end
++
++    expect(SanitizeEmail.force_sanitize).to eq(nil)
++    expect(SanitizeEmail::Config.config[:sanitized_to]).to eq("global@example.test")
++    expect(SanitizeEmail::Config.config[:engage]).to eq(true)
++  end
++
++  it "lets sanitary activation_proc option decide activation when engage falls through" do
++
++
++    configure_sanitize_email(
++      sanitized_to: "global@example.test",
++      engage: nil,
++      activation_proc: proc { false }
++    )
++
++    SanitizeEmail.sanitary(
++      activation_proc: proc { |message| message.subject == "allow" },
++      sanitized_to: "block@example.test"
++    ) do
++      expect(SanitizeEmail.force_sanitize).to eq(nil)
++      expect(SanitizeEmail::Config.config[:sanitized_to]).to eq("block@example.test")
++      expect(SanitizeEmail::Config.config[:engage]).to eq(nil)
++
++      denied = deliver_message(subject: "deny")
++      allowed = deliver_message(subject: "allow")
++
++      expect(denied.to).to eq(["real@example.test"])
++      expect_no_original_recipient_record(denied)
++      expect(allowed.to).to eq(["block@example.test"])
++      expect_original_recipient_record(allowed, "real@example.test")
++      expect(Mail::TestMailer.deliveries.length).to eq(2)
++    end
++
++    expect(SanitizeEmail.force_sanitize).to eq(nil)
++    expect(SanitizeEmail::Config.config[:sanitized_to]).to eq("global@example.test")
++    expect(SanitizeEmail::Config.config[:engage]).to eq(nil)
++  end
++
++  it "restores sanitary config and force state when the block raises" do
++
++
++    configure_sanitize_email(sanitized_to: "global@example.test", engage: false)
++
++    expect {
++      SanitizeEmail.sanitary(sanitized_to: "raise@example.test") do
++        expect(SanitizeEmail.force_sanitize).to eq(true)
++        expect(SanitizeEmail::Config.config[:sanitized_to]).to eq("raise@example.test")
++        expect(SanitizeEmail::Config.config[:engage]).to eq(false)
++        raise "boom"
++      end
++
++    }.to raise_error(RuntimeError)
++
++    expect(SanitizeEmail.force_sanitize).to eq(nil)
++    expect(SanitizeEmail::Config.config[:sanitized_to]).to eq("global@example.test")
++    expect(SanitizeEmail::Config.config[:engage]).to eq(false)
++  end
++
++  it "unsanitary forces delivery to remain unsanitized and restores force afterward" do
++
++
++    configure_sanitize_email(sanitized_to: "global@example.test", engage: true)
++
++    SanitizeEmail.unsanitary do
++      expect(SanitizeEmail.force_sanitize).to eq(false)
++      expect(SanitizeEmail::Config.config[:sanitized_to]).to eq("global@example.test")
++      expect(SanitizeEmail::Config.config[:engage]).to eq(true)
++
++      message = deliver_message
++
++      expect(message.to).to eq(["real@example.test"])
++      expect_no_original_recipient_record(message)
++      expect(Mail::TestMailer.deliveries.length).to eq(1)
++    end
++
++    expect(SanitizeEmail.force_sanitize).to eq(nil)
++    expect(SanitizeEmail::Config.config[:sanitized_to]).to eq("global@example.test")
++    expect(SanitizeEmail::Config.config[:engage]).to eq(true)
++  end
++
++  it "raises a specific missing block error naming the scoped method" do
++
++
++    expect {
++      SanitizeEmail.sanitary
++
++    }.to raise_error(SanitizeEmail::MissingBlockParameter) { |error|
++      expect(error.message).to include("sanitary")
++    }
++
++    expect {
++      SanitizeEmail.unsanitary
++
++    }.to raise_error(SanitizeEmail::MissingBlockParameter) { |error|
++      expect(error.message).to include("unsanitary")
++    }
++  end
++
++  it "allows repeated scoped cleanup calls without corrupting force state" do
++
++
++    SanitizeEmail.unsanitary do
++      expect(SanitizeEmail.force_sanitize).to eq(false)
++    end
++    expect(SanitizeEmail.force_sanitize).to eq(nil)
++
++    SanitizeEmail.unsanitary do
++      expect(SanitizeEmail.force_sanitize).to eq(false)
++    end
++    expect(SanitizeEmail.force_sanitize).to eq(nil)
++  end
++
++  it "keeps independent Mail message state when activation_proc is message-dependent" do
++
++
++    configure_sanitize_email(
++      sanitized_to: "safe@example.test",
++      engage: nil,
++      activation_proc: proc { |message| message.subject == "first" }
++    )
++
++    first = deliver_message(to: "first-real@example.test", subject: "first")
++    second = Mail.new do
++      from "sender@example.test"
++      to "second-real@example.test"
++      subject "second"
++      body "body"
++    end
++
++    expect(first.to).to eq(["safe@example.test"])
++    expect_original_recipient_record(first, "first-real@example.test")
++    expect(second.to).to eq(["second-real@example.test"])
++    expect_no_original_recipient_record(second)
++
++    second.deliver
++
++    expect(second.to).to eq(["second-real@example.test"])
++    expect_no_original_recipient_record(second)
++    expect(Mail::TestMailer.deliveries.length).to eq(2)
++  end
++
++  it "keeps scoped state bounded across repeated construct-use-cleanup cycles" do
++
++
++    configure_sanitize_email(sanitized_to: "global@example.test", engage: false)
++    config_keys_before_cycles = SanitizeEmail::Config.config.keys
++
++    125.times do
++      SanitizeEmail.sanitary(sanitized_to: "cycle@example.test") do
++        message = deliver_message
++        expect(SanitizeEmail.force_sanitize).to eq(true)
++        expect(message.to).to eq(["cycle@example.test"])
++        expect_original_recipient_record(message, "real@example.test")
++      end
++
++      expect(SanitizeEmail.force_sanitize).to eq(nil)
++      expect(SanitizeEmail::Config.config[:sanitized_to]).to eq("global@example.test")
++
++      expect(SanitizeEmail::Config.config.keys).to match_array(config_keys_before_cycles)
++    end
++
++    expect(Mail::TestMailer.deliveries.length).to eq(125)
++
++    expect(SanitizeEmail::Config.config.keys.length).to eq(config_keys_before_cycles.length)
++  end
++
++  it "maps Rails local_environments to an activation proc using Rails.env" do
++
++
++    with_rails_env("test") do
++      configure_sanitize_email(sanitized_to: "safe@example.test", local_environments: ["test"])
++      matching = deliver_message
++
++
++      expect(SanitizeEmail::Config.config[:activation_proc].call(matching)).to eq(true)
++      expect(matching.to).to eq(["safe@example.test"])
++      expect_original_recipient_record(matching, "real@example.test")
++    end
++
++    reset_sanitize_email_session
++
++    with_rails_env("production") do
++      configure_sanitize_email(sanitized_to: "safe@example.test", local_environments: ["test"])
++      nonmatching = deliver_message
++
++
++      expect(SanitizeEmail::Config.config[:activation_proc].call(nonmatching)).to eq(false)
++      expect(nonmatching.to).to eq(["real@example.test"])
++      expect_no_original_recipient_record(nonmatching)
++    end
++  end
++
++  it "warns for deprecated config force_sanitize and copies it to the public force state" do
++
++
++    SanitizeEmail::Deprecation.deprecate_in_silence = false
++    expect {
++      configure_sanitize_email(
++        sanitized_to: "safe@example.test",
++        activation_proc: proc { true },
++        force_sanitize: false
++      )
++
++    }.to output(a_string_including("force_sanitize")).to_stderr
++
++    expect(SanitizeEmail.force_sanitize).to eq(false)
++    message = deliver_message
++
++    expect(message.to).to eq(["real@example.test"])
++    expect_no_original_recipient_record(message)
++  end
++end
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,36 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++
++cd /workspace/repo
++
++export BUNDLE_FROZEN=true
++export BUNDLE_DISABLE_VERSION_CHECK=true
++export GEM_SPEC_CACHE=/usr/local/bundle/specifications
++export RUBYGEMS_GEMDEPS=""
++
++if ! ruby -I /workspace/repo/lib -e 'require "rspec"; require "mail"; require "sanitize_email"' >/dev/null 2>&1; then
++  echo "Required offline Ruby gems are not installed" >&2
++  exit 127
++fi
++
++RSPEC_EXE="${RSPEC_EXE:-/usr/local/bundle/gems/rspec-core-3.13.6/exe/rspec}"
++if [[ ! -f "${RSPEC_EXE}" ]]; then
++  echo "RSpec executable is missing at ${RSPEC_EXE}" >&2
++  exit 127
++fi
++
++exec ruby "${RSPEC_EXE}" \
++  -O /dev/null \
++  -I /workspace/repo/lib \
++  /workspace/repo/usercase-test-coderl/sanitize_activation_spec.rb \
++  --format documentation

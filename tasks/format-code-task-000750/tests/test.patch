@@ -1,0 +1,423 @@
+diff --git a/usercase-test-coderl/test_to_curl.py b/usercase-test-coderl/test_to_curl.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/test_to_curl.py
+@@ -0,0 +1,396 @@
++
++
++
++
++
++from __future__ import annotations
++
++import json
++import os
++import socket
++import subprocess
++import sys
++from urllib.parse import parse_qsl, urlparse
++
++from posting import (
++    Auth,
++    Cookie,
++    FormItem,
++    Header,
++    Options,
++    QueryParam,
++    RequestBody,
++    RequestModel,
++)
++
++
++def _curl_parts(command: str) -> list[str]:
++    return command.split(" \\\n  ")
++
++
++def _quoted_url_arg(command: str) -> str:
++    candidates = [
++        part[1:-1]
++        for part in _curl_parts(command)
++        if part.startswith("'https://") and part.endswith("'")
++    ]
++    assert len(candidates) == 1
++    return candidates[0]
++
++
++def _assert_ordered(parts: list[str], expected: list[str]) -> None:
++    position = -1
++    for item in expected:
++        next_position = parts.index(item, position + 1)
++        assert next_position > position
++        position = next_position
++
++
++def test_get_request_serializes_to_minimal_multiline_curl():
++
++
++
++    request = RequestModel(method="GET", url="https://example.com/api")
++
++    assert request.to_curl() == "curl \\\n  'https://example.com/api'"
++
++
++def test_post_request_with_json_body_serializes_method_data_then_url():
++
++
++
++    request = RequestModel(
++        method="POST",
++        url="https://example.com/api/users",
++        body=RequestBody(content='{"name": "Ada", "admin": false}'),
++    )
++
++    parts = _curl_parts(request.to_curl())
++
++    assert parts[0] == "curl"
++    assert set(parts) == {
++        "curl",
++        "-X POST",
++        '-d \'{"name": "Ada", "admin": false}\'',
++        "'https://example.com/api/users'",
++    }
++    _assert_ordered(
++        parts,
++        [
++            "-X POST",
++            '-d \'{"name": "Ada", "admin": false}\'',
++            "'https://example.com/api/users'",
++        ],
++    )
++
++
++def test_enabled_headers_are_serialized_and_disabled_headers_are_skipped():
++
++
++
++    request = RequestModel(
++        method="GET",
++        url="https://example.com/api",
++        headers=[
++            Header(name="Accept", value="application/json"),
++            Header(name="X-Trace", value="abc123"),
++            Header(name="X-Skip", value="no", enabled=False),
++        ],
++    )
++
++    parts = _curl_parts(request.to_curl())
++
++    assert parts[0] == "curl"
++    assert "-H 'Accept: application/json'" in parts
++    assert "-H 'X-Trace: abc123'" in parts
++    assert all("X-Skip" not in part for part in parts)
++    assert len(parts) == 4
++    assert _quoted_url_arg(request.to_curl()) == "https://example.com/api"
++
++
++def test_query_parameters_merge_encode_values_and_preserve_fragment():
++
++
++
++    request = RequestModel(
++        method="GET",
++        url="https://example.com/api/search?existing=value#part-2",
++        params=[
++            QueryParam(name="q", value="space value"),
++            QueryParam(name="filter", value="name=John Doe & active"),
++            QueryParam(name="disabled", value="true", enabled=False),
++        ],
++    )
++
++    url = _quoted_url_arg(request.to_curl())
++    parsed = urlparse(url)
++    params = dict(parse_qsl(parsed.query, keep_blank_values=True))
++
++    assert (parsed.scheme, parsed.netloc, parsed.path, parsed.fragment) == (
++        "https",
++        "example.com",
++        "/api/search",
++        "part-2",
++    )
++    assert params == {
++        "existing": "value",
++        "q": "space value",
++        "filter": "name=John Doe & active",
++    }
++    assert " " not in parsed.query
++
++
++def test_enabled_form_data_items_become_data_arguments():
++
++
++
++    request = RequestModel(
++        method="POST",
++        url="https://example.com/api/form",
++        body=RequestBody(
++            form_data=[
++                FormItem(name="name", value="Ada Lovelace"),
++                FormItem(name="role", value="admin"),
++                FormItem(name="skip", value="never", enabled=False),
++            ]
++        ),
++    )
++
++    parts = _curl_parts(request.to_curl())
++
++    assert parts[0] == "curl"
++    assert "-X POST" in parts
++    assert "-d 'name=Ada Lovelace'" in parts
++    assert "-d 'role=admin'" in parts
++    assert all("skip=never" not in part for part in parts)
++    assert len(parts) == 5
++    assert _quoted_url_arg(request.to_curl()) == "https://example.com/api/form"
++
++
++def test_enabled_cookies_become_cookie_arguments():
++
++
++
++    request = RequestModel(
++        method="GET",
++        url="https://example.com/api",
++        cookies=[
++            Cookie(name="session", value="abc123"),
++            Cookie(name="theme", value="dark"),
++            Cookie(name="skip", value="never", enabled=False),
++        ],
++    )
++
++    parts = _curl_parts(request.to_curl())
++
++    assert parts[0] == "curl"
++    assert "--cookie 'session=abc123'" in parts
++    assert "--cookie 'theme=dark'" in parts
++    assert all("skip=never" not in part for part in parts)
++    assert len(parts) == 4
++    assert _quoted_url_arg(request.to_curl()) == "https://example.com/api"
++
++
++def test_basic_auth_serializes_username_and_password():
++
++
++
++    request = RequestModel(
++        method="GET",
++        url="https://example.com/private",
++        auth=Auth.basic_auth("alice", "wonderland"),
++    )
++
++    parts = _curl_parts(request.to_curl())
++
++    assert parts[0] == "curl"
++    assert "-u 'alice:wonderland'" in parts
++    assert len(parts) == 3
++    assert _quoted_url_arg(request.to_curl()) == "https://example.com/private"
++
++
++def test_digest_auth_serializes_digest_flag_and_credentials():
++
++
++
++    request = RequestModel(
++        method="GET",
++        url="https://example.com/private",
++        auth=Auth.digest_auth("bob", "builder"),
++    )
++
++    parts = _curl_parts(request.to_curl())
++
++    assert parts[0] == "curl"
++    assert "--digest -u 'bob:builder'" in parts
++    assert len(parts) == 3
++    assert _quoted_url_arg(request.to_curl()) == "https://example.com/private"
++
++
++def test_request_options_map_to_curl_flags_and_values():
++
++
++
++    request = RequestModel(
++        method="GET",
++        url="https://example.com/api",
++        options=Options(
++            follow_redirects=False,
++            verify_ssl=False,
++            timeout=12.5,
++            proxy_url="http://proxy.example.com:8080",
++        ),
++    )
++
++    parts = _curl_parts(request.to_curl())
++
++    assert parts[0] == "curl"
++    assert "--no-location" in parts
++    assert "--insecure" in parts
++    assert "--max-time 12.5" in parts
++    assert "--proxy 'http://proxy.example.com:8080'" in parts
++    assert len(parts) == 6
++    assert _quoted_url_arg(request.to_curl()) == "https://example.com/api"
++
++
++def test_extra_args_are_inserted_immediately_after_curl():
++
++
++
++    request = RequestModel(method="GET", url="https://example.com/api")
++
++    parts = _curl_parts(request.to_curl("--verbose --compressed"))
++
++    assert parts[:2] == ["curl", "--verbose --compressed"]
++    assert len(parts) == 3
++    assert (
++        _quoted_url_arg(request.to_curl("--verbose --compressed"))
++        == "https://example.com/api"
++    )
++
++
++def test_empty_extra_args_matches_default_call():
++    request = RequestModel(method="GET", url="https://example.com/api")
++
++
++    assert request.to_curl("") == request.to_curl()
++
++
++def test_to_curl_is_referentially_transparent_for_same_model_state():
++    request = RequestModel(
++        method="POST",
++        url="https://example.com/api/users?existing=value#section",
++        headers=[Header(name="Content-Type", value="application/json")],
++        params=[QueryParam(name="page", value="1")],
++        body=RequestBody(content='{"name": "Ada"}'),
++        auth=Auth.basic_auth("alice", "wonderland"),
++        cookies=[Cookie(name="session", value="abc123")],
++        options=Options(verify_ssl=False),
++    )
++
++    assert request.to_curl("--compressed") == request.to_curl("--compressed")
++
++
++def test_to_curl_does_not_mutate_request_model():
++    request = RequestModel(
++        method="POST",
++        url="https://example.com/api/search?existing=value#part-2",
++        headers=[
++            Header(name="Accept", value="application/json"),
++            Header(name="X-Skip", value="no", enabled=False),
++        ],
++        params=[
++            QueryParam(name="q", value="space value"),
++            QueryParam(name="disabled", value="true", enabled=False),
++        ],
++        body=RequestBody(
++            content='{"name": "Ada"}',
++            form_data=[FormItem(name="unused", value="ignored", enabled=False)],
++        ),
++        auth=Auth.digest_auth("bob", "builder"),
++        cookies=[Cookie(name="session", value="abc123")],
++        options=Options(
++            follow_redirects=False,
++            verify_ssl=False,
++            timeout=12.5,
++            proxy_url="http://proxy.example.com:8080",
++        ),
++    )
++    before = (request.model_dump(), [cookie.model_dump() for cookie in request.cookies])
++
++    request.to_curl("--compressed")
++
++    after = (request.model_dump(), [cookie.model_dump() for cookie in request.cookies])
++    assert after == before
++
++
++def test_to_curl_same_state_matches_in_fresh_process():
++    request = RequestModel(
++        method="GET",
++        url="https://example.com/api/search?existing=value#part-2",
++        params=[QueryParam(name="q", value="space value")],
++    )
++    in_process = request.to_curl("--verbose")
++    script = """
++import json
++from posting import QueryParam, RequestModel
++request = RequestModel(
++    method='GET',
++    url='https://example.com/api/search?existing=value#part-2',
++    params=[QueryParam(name='q', value='space value')],
++)
++print(json.dumps(request.to_curl('--verbose')))
++"""
++
++    completed = subprocess.run(
++        [sys.executable, "-c", script],
++        check=True,
++        stdout=subprocess.PIPE,
++        stderr=subprocess.PIPE,
++        text=True,
++    )
++    fresh_process = json.loads(completed.stdout)
++
++    assert fresh_process == in_process
++    parts = _curl_parts(fresh_process)
++    url = _quoted_url_arg(fresh_process)
++    parsed = urlparse(url)
++    params = dict(parse_qsl(parsed.query, keep_blank_values=True))
++
++    assert parts[:2] == ["curl", "--verbose"]
++    assert (parsed.scheme, parsed.netloc, parsed.path, parsed.fragment) == (
++        "https",
++        "example.com",
++        "/api/search",
++        "part-2",
++    )
++    assert params == {"existing": "value", "q": "space value"}
++    assert " " not in parsed.query
++
++
++def test_to_curl_has_no_cwd_file_or_network_side_effects(tmp_path, monkeypatch):
++    def forbidden_socket(*args, **kwargs):
++        raise AssertionError("RequestModel.to_curl must not open network sockets")
++
++    request = RequestModel(
++        method="GET",
++        url="https://example.com/api/search",
++        params=[QueryParam(name="q", value="space value")],
++    )
++    monkeypatch.chdir(tmp_path)
++    monkeypatch.setattr(socket, "socket", forbidden_socket)
++    before = sorted(os.listdir(tmp_path))
++
++    url = _quoted_url_arg(request.to_curl())
++    parsed = urlparse(url)
++    params = dict(parse_qsl(parsed.query, keep_blank_values=True))
++
++    assert (parsed.scheme, parsed.netloc, parsed.path) == (
++        "https",
++        "example.com",
++        "/api/search",
++    )
++    assert params == {"q": "space value"}
++    assert " " not in parsed.query
++
++    assert sorted(os.listdir(tmp_path)) == before
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,17 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++
++cd /workspace/repo
++export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
++export PYTHONNOUSERSITE=1
++exec /workspace/.venv-stage3/bin/python -m pytest /workspace/repo/usercase-test-coderl/test_to_curl.py -v

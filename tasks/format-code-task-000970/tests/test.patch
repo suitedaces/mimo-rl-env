@@ -1,0 +1,183 @@
+diff --git a/pkg/artifactory/resource/user/password_policy_validation_test.go b/pkg/artifactory/resource/user/password_policy_validation_test.go
+new file mode 100644
+index 00000000..72ae3e64
+--- /dev/null
++++ b/pkg/artifactory/resource/user/password_policy_validation_test.go
+@@ -0,0 +1,167 @@
++package user
++
++import (
++	"context"
++	"testing"
++
++	"github.com/hashicorp/terraform-plugin-framework/attr"
++	"github.com/hashicorp/terraform-plugin-framework/resource"
++	"github.com/hashicorp/terraform-plugin-framework/tfsdk"
++	"github.com/hashicorp/terraform-plugin-framework/types"
++)
++
++func passwordPolicyConfig(t *testing.T, password attr.Value, policy attr.Value) tfsdk.Config {
++	t.Helper()
++	ctx := context.Background()
++	r := NewManagedUserResource()
++	var schemaResp resource.SchemaResponse
++	r.Schema(ctx, resource.SchemaRequest{}, &schemaResp)
++	objectType := schemaResp.Schema.Type().(types.ObjectType)
++	attrs := map[string]attr.Value{
++		"id": types.StringNull(), "name": types.StringNull(), "email": types.StringNull(),
++		"password": types.StringNull(), "password_policy": types.ObjectNull(objectType.AttrTypes["password_policy"].(types.ObjectType).AttrTypes),
++		"admin": types.BoolNull(), "profile_updatable": types.BoolNull(), "disable_ui_access": types.BoolNull(),
++		"internal_password_disabled": types.BoolNull(), "groups": types.SetNull(types.StringType),
++	}
++	attrs["name"] = types.StringValue("validator-user")
++	attrs["email"] = types.StringValue("validator@example.com")
++	attrs["password"] = password
++	attrs["password_policy"] = policy
++	obj, diags := types.ObjectValue(objectType.AttrTypes, attrs)
++	if diags.HasError() {
++		t.Fatalf("build object: %v", diags)
++	}
++	raw, err := obj.ToTerraformValue(ctx)
++	if err != nil {
++		t.Fatalf("build config: %v", err)
++	}
++	return tfsdk.Config{Raw: raw, Schema: schemaResp.Schema}
++}
++
++func policyObject(values map[string]attr.Value) attr.Value {
++	typesByName := map[string]attr.Type{
++		"uppercase":    types.Int64Type,
++		"lowercase":    types.Int64Type,
++		"special_char": types.Int64Type,
++		"digit":        types.Int64Type,
++		"length":       types.Int64Type,
++	}
++	for name := range typesByName {
++		if _, ok := values[name]; !ok {
++			values[name] = types.Int64Null()
++		}
++	}
++	return types.ObjectValueMust(typesByName, values)
++}
++
++func validatePasswordConfig(t *testing.T, password attr.Value, policy attr.Value) resource.ValidateConfigResponse {
++	t.Helper()
++	res := NewManagedUserResource()
++	resp := resource.ValidateConfigResponse{}
++	res.(interface {
++		ValidateConfig(context.Context, resource.ValidateConfigRequest, *resource.ValidateConfigResponse)
++	}).ValidateConfig(context.Background(), resource.ValidateConfigRequest{Config: passwordPolicyConfig(t, password, policy)}, &resp)
++	return resp
++}
++
++func validatePasswordConfigSafely(t *testing.T, password attr.Value, policy attr.Value) (resp resource.ValidateConfigResponse, panicked bool) {
++	t.Helper()
++	defer func() {
++		if recover() != nil {
++			panicked = true
++		}
++	}()
++	return validatePasswordConfig(t, password, policy), false
++}
++
++func TestValidateConfigDefersUnknownPassword(t *testing.T) {
++	resp := validatePasswordConfig(t, types.StringUnknown(), types.ObjectNull(map[string]attr.Type{
++		"uppercase": types.Int64Type, "lowercase": types.Int64Type, "special_char": types.Int64Type, "digit": types.Int64Type, "length": types.Int64Type,
++	}))
++	if resp.Diagnostics.HasError() {
++		t.Fatalf("unknown password should defer validation, got %v", resp.Diagnostics)
++	}
++}
++
++func TestValidateConfigStillRejectsKnownInvalidPassword(t *testing.T) {
++	policyTypes := map[string]attr.Type{
++		"uppercase": types.Int64Type, "lowercase": types.Int64Type, "special_char": types.Int64Type, "digit": types.Int64Type, "length": types.Int64Type,
++	}
++	resp := validatePasswordConfig(t, types.StringValue("abcdefgh"), types.ObjectNull(policyTypes))
++	if !resp.Diagnostics.HasError() {
++		t.Fatal("known password that violates default uppercase and digit requirements must be rejected")
++	}
++}
++
++func TestValidateConfigAcceptsPasswordMeetingDefaultPolicy(t *testing.T) {
++	policyTypes := map[string]attr.Type{
++		"uppercase": types.Int64Type, "lowercase": types.Int64Type, "special_char": types.Int64Type, "digit": types.Int64Type, "length": types.Int64Type,
++	}
++	resp := validatePasswordConfig(t, types.StringValue("Abcdef1!"), types.ObjectNull(policyTypes))
++	if resp.Diagnostics.HasError() {
++		t.Fatalf("password meeting the default policy should be accepted: %v", resp.Diagnostics)
++	}
++}
++
++func TestValidateConfigAllowsPasswordMeetingPolicy(t *testing.T) {
++	policy := policyObject(map[string]attr.Value{"length": types.Int64Value(8)})
++	resp := validatePasswordConfig(t, types.StringValue("Abcdef1!"), policy)
++	if resp.Diagnostics.HasError() {
++		t.Fatalf("password meeting policy should be accepted: %v", resp.Diagnostics)
++	}
++}
++
++func TestValidateConfigUsesDefaultsForOmittedPolicyFields(t *testing.T) {
++	policy := policyObject(map[string]attr.Value{"length": types.Int64Value(10)})
++	resp := validatePasswordConfig(t, types.StringValue("abcdefghij"), policy)
++	if !resp.Diagnostics.HasError() {
++		t.Fatal("password missing default uppercase and digit requirements should be rejected")
++	}
++}
++
++func TestValidateConfigDefersUnknownPolicy(t *testing.T) {
++	policyTypes := map[string]attr.Type{
++		"uppercase": types.Int64Type, "lowercase": types.Int64Type, "special_char": types.Int64Type, "digit": types.Int64Type, "length": types.Int64Type,
++	}
++	resp, panicked := validatePasswordConfigSafely(t, types.StringValue("Abcdef1!"), types.ObjectUnknown(policyTypes))
++	if panicked {
++		t.Fatal("unknown password policy must not panic during validation")
++	}
++	if resp.Diagnostics.HasError() {
++		t.Fatalf("unknown password policy should defer validation, got %v", resp.Diagnostics)
++	}
++}
++
++func TestValidateConfigDefersUnknownPolicyField(t *testing.T) {
++	policy := policyObject(map[string]attr.Value{"length": types.Int64Unknown()})
++	resp := validatePasswordConfig(t, types.StringValue("Abcdef1!"), policy)
++	if resp.Diagnostics.HasError() {
++		t.Fatalf("unknown policy fields should defer validation, got %v", resp.Diagnostics)
++	}
++}
++
++func TestValidateConfigHonorsExplicitZeroPolicy(t *testing.T) {
++	policy := policyObject(map[string]attr.Value{
++		"length": types.Int64Value(4), "uppercase": types.Int64Value(0), "lowercase": types.Int64Value(0),
++		"special_char": types.Int64Value(0), "digit": types.Int64Value(0),
++	})
++	resp := validatePasswordConfig(t, types.StringValue("abcd"), policy)
++	if resp.Diagnostics.HasError() {
++		t.Fatalf("explicit zero requirements should be honored: %v", resp.Diagnostics)
++	}
++}
++
++func TestValidateConfigRejectsNegativePolicyWithoutPanic(t *testing.T) {
++	for _, field := range []string{"length", "uppercase", "lowercase", "special_char", "digit"} {
++		t.Run(field, func(t *testing.T) {
++			policy := policyObject(map[string]attr.Value{field: types.Int64Value(-1)})
++			resp, panicked := validatePasswordConfigSafely(t, types.StringValue("Abcd1234"), policy)
++			if panicked {
++				t.Fatal("negative policy values must not panic during validation")
++			}
++			if !resp.Diagnostics.HasError() {
++				t.Fatal("negative policy values must produce a validation diagnostic")
++			}
++		})
++	}
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,5 @@
++#!/bin/bash
++set -euo pipefail
++
++
++go test ./pkg/artifactory/resource/user -run 'TestValidateConfig(DefersUnknownPassword|StillRejectsKnownInvalidPassword|AcceptsPasswordMeetingDefaultPolicy|AllowsPasswordMeetingPolicy|UsesDefaultsForOmittedPolicyFields|DefersUnknownPolicy|DefersUnknownPolicyField|HonorsExplicitZeroPolicy|RejectsNegativePolicyWithoutPanic)$'

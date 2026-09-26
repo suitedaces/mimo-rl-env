@@ -1,0 +1,336 @@
+diff --git a/apis/datadoghq/v2alpha1/datadogagent_update_strategy_schema_test.go b/apis/datadoghq/v2alpha1/datadogagent_update_strategy_schema_test.go
+new file mode 100644
+index 00000000..482aa990
+--- /dev/null
++++ b/apis/datadoghq/v2alpha1/datadogagent_update_strategy_schema_test.go
+@@ -0,0 +1,115 @@
++package v2alpha1
++
++import (
++	"os"
++	"path/filepath"
++	"testing"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++	"sigs.k8s.io/yaml"
++)
++
++func TestDatadogAgentOverrideUpdateStrategyIsExposedInCRDSchema(t *testing.T) {
++
++	crdPath := filepath.Join("..", "..", "..", "config", "crd", "bases", "v1", "datadoghq.com_datadogagents.yaml")
++	raw, err := os.ReadFile(crdPath)
++	require.NoError(t, err)
++
++	var crd map[string]interface{}
++	require.NoError(t, yaml.Unmarshal(raw, &crd))
++
++	var updateStrategySchema map[string]interface{}
++	for _, candidate := range findObjectProperties(crd, "updateStrategy") {
++		candidateProperties := properties(candidate)
++		rollingUpdate, hasRollingUpdate := candidateProperties["rollingUpdate"]
++		rollingProperties := properties(rollingUpdate)
++		if _, hasType := candidateProperties["type"]; hasType && hasRollingUpdate && rollingProperties["maxUnavailable"] != nil && rollingProperties["maxSurge"] != nil {
++			updateStrategySchema = candidate
++			break
++		}
++	}
++	require.NotNil(t, updateStrategySchema, "component override schema should expose updateStrategy with rollingUpdate limits")
++
++	strategyType, ok := properties(updateStrategySchema)["type"]
++	require.True(t, ok, "updateStrategy should expose a strategy type")
++	assert.Equal(t, "string", fieldString(strategyType, "type"))
++
++	rollingUpdate, ok := properties(updateStrategySchema)["rollingUpdate"]
++	require.True(t, ok, "updateStrategy should expose rollingUpdate limits")
++
++	rollingProperties := properties(rollingUpdate)
++	assertIntOrStringSchema(t, rollingProperties["maxUnavailable"], "maxUnavailable")
++	assertIntOrStringSchema(t, rollingProperties["maxSurge"], "maxSurge")
++}
++
++func findObjectProperties(node interface{}, property string) []map[string]interface{} {
++	switch value := node.(type) {
++	case map[string]interface{}:
++		var matches []map[string]interface{}
++		if props := properties(value); props != nil {
++			if found, ok := props[property].(map[string]interface{}); ok {
++				matches = append(matches, found)
++			}
++		}
++		for _, child := range value {
++			matches = append(matches, findObjectProperties(child, property)...)
++		}
++		return matches
++	case []interface{}:
++		var matches []map[string]interface{}
++		for _, child := range value {
++			matches = append(matches, findObjectProperties(child, property)...)
++		}
++		return matches
++	default:
++		return nil
++	}
++}
++
++func properties(schema interface{}) map[string]interface{} {
++	value, ok := schema.(map[string]interface{})
++	if !ok {
++		return nil
++	}
++	props, ok := value["properties"].(map[string]interface{})
++	if !ok {
++		return nil
++	}
++	return props
++}
++
++func assertIntOrStringSchema(t *testing.T, schema interface{}, field string) {
++	t.Helper()
++
++	value := requireMap(t, schema, field)
++
++	assert.Equal(t, true, value["x-kubernetes-int-or-string"], "%s should preserve Kubernetes IntOrString schema semantics", field)
++
++	branches, ok := value["anyOf"].([]interface{})
++	require.True(t, ok, "%s should allow integer and string branches", field)
++
++	seen := map[string]bool{}
++	for _, branch := range branches {
++		seen[fieldString(branch, "type")] = true
++	}
++	assert.True(t, seen["integer"], "%s should allow integer values", field)
++	assert.True(t, seen["string"], "%s should allow string values", field)
++}
++
++func requireMap(t *testing.T, value interface{}, name string) map[string]interface{} {
++	t.Helper()
++
++	result, ok := value.(map[string]interface{})
++	require.True(t, ok, "%s should be an object schema", name)
++	return result
++}
++
++func fieldString(value interface{}, field string) string {
++	object, ok := value.(map[string]interface{})
++	if !ok {
++		return ""
++	}
++	text, _ := object[field].(string)
++	return text
++}
+diff --git a/controllers/datadogagent/override/daemonset_test.go b/controllers/datadogagent/override/daemonset_test.go
+new file mode 100644
+index 00000000..22511049
+--- /dev/null
++++ b/controllers/datadogagent/override/daemonset_test.go
+@@ -0,0 +1,96 @@
++package override
++
++import (
++	"encoding/json"
++	"testing"
++
++	"github.com/DataDog/datadog-operator/apis/datadoghq/v2alpha1"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++	appsv1 "k8s.io/api/apps/v1"
++	"k8s.io/apimachinery/pkg/util/intstr"
++)
++
++func TestDaemonSetAppliesUpdateStrategyFromJSONOverride(t *testing.T) {
++	tests := []struct {
++		name                string
++		overrideJSON        string
++		expectedType        appsv1.DaemonSetUpdateStrategyType
++		expectedUnavailable *intstr.IntOrString
++		expectedSurge       *intstr.IntOrString
++	}{
++		{
++			name: "rolling update keeps percentage limits",
++			overrideJSON: `{
++				"updateStrategy": {
++					"type": "RollingUpdate",
++					"rollingUpdate": {
++						"maxUnavailable": "30%",
++						"maxSurge": "20%"
++					}
++				}
++			}`,
++			expectedType:        appsv1.RollingUpdateDaemonSetStrategyType,
++			expectedUnavailable: intOrStringPtr(intstr.FromString("30%")),
++			expectedSurge:       intOrStringPtr(intstr.FromString("20%")),
++		},
++		{
++			name: "rolling update keeps numeric limits",
++			overrideJSON: `{
++				"updateStrategy": {
++					"type": "RollingUpdate",
++					"rollingUpdate": {
++						"maxUnavailable": 3,
++						"maxSurge": 2
++					}
++				}
++			}`,
++			expectedType:        appsv1.RollingUpdateDaemonSetStrategyType,
++			expectedUnavailable: intOrStringPtr(intstr.FromInt(3)),
++			expectedSurge:       intOrStringPtr(intstr.FromInt(2)),
++		},
++		{
++			name: "non rolling strategy keeps the requested type",
++			overrideJSON: `{
++				"updateStrategy": {
++					"type": "OnDelete"
++				}
++			}`,
++			expectedType: appsv1.OnDeleteDaemonSetStrategyType,
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			daemonSet := appsv1.DaemonSet{}
++			override := componentOverrideFromJSON(t, tt.overrideJSON)
++
++			DaemonSet(&daemonSet, &override)
++
++			assert.Equal(t, tt.expectedType, daemonSet.Spec.UpdateStrategy.Type)
++			if tt.expectedUnavailable != nil || tt.expectedSurge != nil {
++				require.NotNil(t, daemonSet.Spec.UpdateStrategy.RollingUpdate)
++			}
++			if tt.expectedUnavailable != nil {
++				require.NotNil(t, daemonSet.Spec.UpdateStrategy.RollingUpdate.MaxUnavailable)
++				assert.Equal(t, *tt.expectedUnavailable, *daemonSet.Spec.UpdateStrategy.RollingUpdate.MaxUnavailable)
++			}
++			if tt.expectedSurge != nil {
++				require.NotNil(t, daemonSet.Spec.UpdateStrategy.RollingUpdate.MaxSurge)
++				assert.Equal(t, *tt.expectedSurge, *daemonSet.Spec.UpdateStrategy.RollingUpdate.MaxSurge)
++			}
++		})
++	}
++}
++
++func componentOverrideFromJSON(t *testing.T, payload string) v2alpha1.DatadogAgentComponentOverride {
++	t.Helper()
++
++	var override v2alpha1.DatadogAgentComponentOverride
++	require.NoError(t, json.Unmarshal([]byte(payload), &override))
++	return override
++}
++
++func intOrStringPtr(value intstr.IntOrString) *intstr.IntOrString {
++	return &value
++}
+diff --git a/controllers/datadogagent/override/deploymentspec_test.go b/controllers/datadogagent/override/deploymentspec_test.go
+index 2d6a165a..5f4218a3 100644
+--- a/controllers/datadogagent/override/deploymentspec_test.go
++++ b/controllers/datadogagent/override/deploymentspec_test.go
+@@ -11,10 +11,84 @@ import (
+ 	"github.com/DataDog/datadog-operator/apis/datadoghq/v2alpha1"
+ 	apiutils "github.com/DataDog/datadog-operator/apis/utils"
+ 	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
+ 	v1 "k8s.io/api/apps/v1"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/util/intstr"
+ )
+ 
++func TestDeploymentAppliesUpdateStrategyFromJSONOverride(t *testing.T) {
++	tests := []struct {
++		name                string
++		overrideJSON        string
++		expectedType        v1.DeploymentStrategyType
++		expectedUnavailable *intstr.IntOrString
++		expectedSurge       *intstr.IntOrString
++	}{
++		{
++			name: "rolling update keeps percentage limits",
++			overrideJSON: `{
++				"updateStrategy": {
++					"type": "RollingUpdate",
++					"rollingUpdate": {
++						"maxUnavailable": "25%",
++						"maxSurge": "15%"
++					}
++				}
++			}`,
++			expectedType:        v1.RollingUpdateDeploymentStrategyType,
++			expectedUnavailable: intOrStringPtr(intstr.FromString("25%")),
++			expectedSurge:       intOrStringPtr(intstr.FromString("15%")),
++		},
++		{
++			name: "rolling update keeps numeric limits",
++			overrideJSON: `{
++				"updateStrategy": {
++					"type": "RollingUpdate",
++					"rollingUpdate": {
++						"maxUnavailable": 1,
++						"maxSurge": 4
++					}
++				}
++			}`,
++			expectedType:        v1.RollingUpdateDeploymentStrategyType,
++			expectedUnavailable: intOrStringPtr(intstr.FromInt(1)),
++			expectedSurge:       intOrStringPtr(intstr.FromInt(4)),
++		},
++		{
++			name: "non rolling strategy keeps the requested type",
++			overrideJSON: `{
++				"updateStrategy": {
++					"type": "Recreate"
++				}
++			}`,
++			expectedType: v1.RecreateDeploymentStrategyType,
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			deployment := v1.Deployment{}
++			override := componentOverrideFromJSON(t, tt.overrideJSON)
++
++			Deployment(&deployment, &override)
++
++			assert.Equal(t, tt.expectedType, deployment.Spec.Strategy.Type)
++			if tt.expectedUnavailable != nil || tt.expectedSurge != nil {
++				require.NotNil(t, deployment.Spec.Strategy.RollingUpdate)
++			}
++			if tt.expectedUnavailable != nil {
++				require.NotNil(t, deployment.Spec.Strategy.RollingUpdate.MaxUnavailable)
++				assert.Equal(t, *tt.expectedUnavailable, *deployment.Spec.Strategy.RollingUpdate.MaxUnavailable)
++			}
++			if tt.expectedSurge != nil {
++				require.NotNil(t, deployment.Spec.Strategy.RollingUpdate.MaxSurge)
++				assert.Equal(t, *tt.expectedSurge, *deployment.Spec.Strategy.RollingUpdate.MaxSurge)
++			}
++		})
++	}
++}
++
+ func TestDeployment(t *testing.T) {
+ 	deployment := v1.Deployment{
+ 		ObjectMeta: metav1.ObjectMeta{
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,19 @@
++#!/bin/bash
++set -euo pipefail
++cd /testbed
++
++
++
++case "${1:-}" in
++  base)
++    go test ./controllers/datadogagent/override/ -run '^TestDeployment$' -v
++    ;;
++  new)
++    go test ./apis/datadoghq/v2alpha1 -run '^TestDatadogAgentOverrideUpdateStrategyIsExposedInCRDSchema$' -v
++    go test ./controllers/datadogagent/override/ -run '^(TestDaemonSetAppliesUpdateStrategyFromJSONOverride|TestDeploymentAppliesUpdateStrategyFromJSONOverride)$' -v
++    ;;
++  *)
++    echo "usage: $0 base|new"
++    exit 2
++    ;;
++esac

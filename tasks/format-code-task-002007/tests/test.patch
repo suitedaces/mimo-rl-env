@@ -1,0 +1,231 @@
+diff --git a/pilvytis/order_unlock_tracker_test.go b/pilvytis/order_unlock_tracker_test.go
+new file mode 100644
+index 00000000..acc20404
+--- /dev/null
++++ b/pilvytis/order_unlock_tracker_test.go
+@@ -0,0 +1,200 @@
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++package pilvytis
++
++import (
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/mysteriumnetwork/node/eventbus"
++	"github.com/mysteriumnetwork/node/identity"
++	"github.com/stretchr/testify/assert"
++)
++
++
++type unlockMockAPI struct {
++	sync.RWMutex
++	orders map[string][]OrderResponse
++}
++
++func newUnlockMockAPI() *unlockMockAPI {
++	return &unlockMockAPI{orders: map[string][]OrderResponse{}}
++}
++
++func (m *unlockMockAPI) set(addr string, orders []OrderResponse) {
++	m.Lock()
++	defer m.Unlock()
++	m.orders[addr] = orders
++}
++
++func (m *unlockMockAPI) GetPaymentOrders(id identity.Identity) ([]OrderResponse, error) {
++	m.RLock()
++	defer m.RUnlock()
++	return m.orders[id.Address], nil
++}
++
++type unlockIdentityProvider struct{}
++
++func (unlockIdentityProvider) GetIdentities() []identity.Identity { return nil }
++
++
++type recorder struct {
++	sync.Mutex
++	events []AppEventOrderUpdated
++}
++
++func (r *recorder) handle(e AppEventOrderUpdated) {
++	r.Lock()
++	defer r.Unlock()
++	r.events = append(r.events, e)
++}
++
++func (r *recorder) snapshot() []AppEventOrderUpdated {
++	r.Lock()
++	defer r.Unlock()
++	out := make([]AppEventOrderUpdated, len(r.events))
++	copy(out, r.events)
++	return out
++}
++
++func (r *recorder) countFor(id uint64, addr string) int {
++	n := 0
++	for _, e := range r.snapshot() {
++		if e.ID == id && e.IdentityAddress == addr {
++			n++
++		}
++	}
++	return n
++}
++
++func newOrder(id uint64, addr string, status OrderStatus) OrderResponse {
++	return OrderResponse{ID: id, Identity: addr, Status: status}
++}
++
++func publishUnlock(bus eventbus.Publisher, addr string) {
++	bus.Publish(identity.AppTopicIdentityUnlock, identity.AppEventIdentityUnlock{
++		ID: identity.FromAddress(addr),
++	})
++}
++
++func TestUnlockLoadsAlreadyCompletedOrder(t *testing.T) {
++	const addr = "0xalice"
++	api := newUnlockMockAPI()
++	api.set(addr, []OrderResponse{newOrder(1, addr, OrderStatusPaid)})
++
++	bus := eventbus.New()
++	tracker := NewStatusTracker(api, unlockIdentityProvider{}, bus, time.Hour)
++	rec := &recorder{}
++	assert.NoError(t, bus.Subscribe(AppTopicOrderUpdated, rec.handle))
++	assert.NoError(t, tracker.Subscribe(bus))
++
++	publishUnlock(bus, addr)
++
++
++	assert.Eventually(t, func() bool {
++		return rec.countFor(1, addr) == 1
++	}, 2*time.Second, 5*time.Millisecond)
++
++	evt := rec.snapshot()[0]
++	assert.Equal(t, OrderStatusPaid, evt.Status)
++}
++
++func TestUnlockSilentForInProgressOrderThenEmitsOnChange(t *testing.T) {
++	const addr = "0xbob"
++	api := newUnlockMockAPI()
++	api.set(addr, []OrderResponse{newOrder(7, addr, OrderStatusPending)})
++
++	bus := eventbus.New()
++	tracker := NewStatusTracker(api, unlockIdentityProvider{}, bus, time.Hour)
++	rec := &recorder{}
++	assert.NoError(t, bus.Subscribe(AppTopicOrderUpdated, rec.handle))
++	assert.NoError(t, tracker.Subscribe(bus))
++
++	publishUnlock(bus, addr)
++
++
++	assert.Never(t, func() bool {
++		return rec.countFor(7, addr) > 0
++	}, 400*time.Millisecond, 10*time.Millisecond)
++
++
++	api.set(addr, []OrderResponse{newOrder(7, addr, OrderStatusPaid)})
++	publishUnlock(bus, addr)
++
++	assert.Eventually(t, func() bool {
++		return rec.countFor(7, addr) == 1
++	}, 2*time.Second, 5*time.Millisecond)
++	assert.Equal(t, OrderStatusPaid, rec.snapshot()[0].Status)
++}
++
++func TestUnlockReconciliationIsIdempotent(t *testing.T) {
++	const addr = "0xcarol"
++	api := newUnlockMockAPI()
++	api.set(addr, []OrderResponse{newOrder(3, addr, OrderStatusPaid)})
++
++	bus := eventbus.New()
++	tracker := NewStatusTracker(api, unlockIdentityProvider{}, bus, time.Hour)
++	rec := &recorder{}
++	assert.NoError(t, bus.Subscribe(AppTopicOrderUpdated, rec.handle))
++	assert.NoError(t, tracker.Subscribe(bus))
++
++	publishUnlock(bus, addr)
++	assert.Eventually(t, func() bool {
++		return rec.countFor(3, addr) == 1
++	}, 2*time.Second, 5*time.Millisecond)
++
++
++	publishUnlock(bus, addr)
++	assert.Never(t, func() bool {
++		return rec.countFor(3, addr) > 1
++	}, 400*time.Millisecond, 10*time.Millisecond)
++}
++
++func TestUnlockTracksOrdersPerIdentity(t *testing.T) {
++	const a = "0xidentitya"
++	const b = "0xidentityb"
++	api := newUnlockMockAPI()
++
++	api.set(a, []OrderResponse{newOrder(1, a, OrderStatusPaid)})
++	api.set(b, []OrderResponse{newOrder(1, b, OrderStatusPaid)})
++
++	bus := eventbus.New()
++	tracker := NewStatusTracker(api, unlockIdentityProvider{}, bus, time.Hour)
++	rec := &recorder{}
++	assert.NoError(t, bus.Subscribe(AppTopicOrderUpdated, rec.handle))
++	assert.NoError(t, tracker.Subscribe(bus))
++
++
++	publishUnlock(bus, a)
++	assert.Eventually(t, func() bool {
++		return rec.countFor(1, a) == 1
++	}, 2*time.Second, 5*time.Millisecond)
++	assert.Never(t, func() bool {
++		return rec.countFor(1, b) > 0
++	}, 300*time.Millisecond, 10*time.Millisecond)
++
++
++	publishUnlock(bus, b)
++	assert.Eventually(t, func() bool {
++		return rec.countFor(1, b) == 1
++	}, 2*time.Second, 5*time.Millisecond)
++
++
++	assert.Equal(t, 1, rec.countFor(1, a))
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,20 @@
++#!/usr/bin/env bash
++
++
++
++
++set -euo pipefail
++HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++cd /testbed
++
++
++
++
++
++
++
++
++go test ./pilvytis/ -count=1
++
++
++go test ./pilvytis/ -run 'TestUnlockLoadsAlreadyCompletedOrder|TestUnlockSilentForInProgressOrderThenEmitsOnChange|TestUnlockReconciliationIsIdempotent|TestUnlockTracksOrdersPerIdentity' -count=1 -v

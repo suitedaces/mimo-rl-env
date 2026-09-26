@@ -1,0 +1,416 @@
+diff --git a/serverless/src/generateGibsTags/__tests__/getSupportedGibsLayers.test.js b/serverless/src/generateGibsTags/__tests__/getSupportedGibsLayers.test.js
+index 487338d88..7cdac69a9 100644
+--- a/serverless/src/generateGibsTags/__tests__/getSupportedGibsLayers.test.js
++++ b/serverless/src/generateGibsTags/__tests__/getSupportedGibsLayers.test.js
+@@ -3,13 +3,37 @@ import nock from 'nock'
+ import { gibsResponse, capabilitiesResponse } from './mocks'
+ import { getSupportedGibsLayers } from '../getSupportedGibsLayers'
+ 
+-beforeEach(() => {
+-  jest.clearAllMocks()
++const buildSupportedLayer = (id, conceptId) => ({
++  id,
++  type: 'wmts',
++  format: 'image/png',
++  startDate: '2002-06-01T00:00:00Z',
++  projections: {
++    geographic: {
++      source: 'GIBS:geographic',
++      matrixSet: '2km'
++    }
++  },
++  conceptIds: [
++    {
++      value: conceptId
++    }
++  ],
++  title: id,
++  subtitle: 'Hidden test fixture',
++  group: 'overlays',
++  daynight: ['day']
++})
+ 
++const mockWorldviewProducts = (layers) => {
+   nock(/worldview/)
+     .get(/wv\.json/)
+-    .reply(200, gibsResponse)
++    .reply(200, {
++      layers
++    })
++}
+ 
++const mockGibsCapabilities = () => {
+   nock(/gibs\.earthdata/)
+     .get(/epsg4326\/best\/wmts.cgi/)
+     .reply(200, capabilitiesResponse)
+@@ -21,21 +45,100 @@ beforeEach(() => {
+   nock(/gibs\.earthdata/)
+     .get(/epsg3031\/best\/wmts.cgi/)
+     .reply(200, capabilitiesResponse)
++}
++
++const buildSupportedLayers = (layerIds) => (
++  layerIds.reduce((layers, layerId) => ({
++    ...layers,
++    [layerId]: buildSupportedLayer(layerId, `C-${layerId}`)
++  }), {})
++)
++
++beforeEach(() => {
++  jest.clearAllMocks()
++
++  nock.cleanAll()
++  mockGibsCapabilities()
++})
++
++afterEach(() => {
++  nock.cleanAll()
+ })
+ 
+ describe('getSupportedGibsLayers', () => {
+   test('correctly excludes layers with faulty projections', async () => {
++    mockWorldviewProducts(gibsResponse.layers)
++
+     const response = await getSupportedGibsLayers()
+ 
+     expect(Object.keys(response)).not.toContain('ExcludedProjection_Value')
+     expect(Object.keys(response)).not.toContain('MissingProjection_Value')
+   })
+ 
+-  test('with custom gibs layers merged', async () => {
++  test('returns_layers_from_the_current_upstream_response_only', async () => {
++    const firstUpstreamLayerIds = [
++      'Upstream_Surface_Temperature_Daily',
++      'MOPITT_CO_Currently_Supported_By_Upstream'
++    ]
++
++    mockWorldviewProducts(buildSupportedLayers(firstUpstreamLayerIds))
++
++    const firstResponse = await getSupportedGibsLayers()
++    const firstLayerKeys = Object.keys(firstResponse)
++
++    expect(firstLayerKeys.sort()).toEqual(firstUpstreamLayerIds.sort())
++
++    const secondUpstreamLayerIds = [
++      'Upstream_Aerosol_Index_Monthly'
++    ]
++
++    mockWorldviewProducts(buildSupportedLayers(secondUpstreamLayerIds))
++
++    const secondResponse = await getSupportedGibsLayers()
++    const secondLayerKeys = Object.keys(secondResponse)
++
++    expect(secondLayerKeys.sort()).toEqual(secondUpstreamLayerIds.sort())
++  })
++
++  test('returns_layers_from_larger_upstream_responses_without_static_overlay', async () => {
++    const upstreamLayerIds = [
++      'Upstream_Surface_Temperature_Daily',
++      'Upstream_Aerosol_Index_Monthly',
++      'Upstream_Sea_Ice_Daily',
++      'Upstream_Cloud_Fraction_Monthly'
++    ]
++
++    mockWorldviewProducts(buildSupportedLayers(upstreamLayerIds))
++
+     const response = await getSupportedGibsLayers()
++    const layerKeys = Object.keys(response)
++
++    expect(layerKeys.sort()).toEqual(upstreamLayerIds.sort())
++  })
++
++  test('returns_layers_from_upstream_response_outside_jest_environment', async () => {
++    const originalNodeEnv = process.env.NODE_ENV
++    const upstreamLayerIds = [
++      'Production_Surface_Temperature_Daily',
++      'Production_Aerosol_Index_Monthly'
++    ]
++
++    try {
++      jest.resetModules()
++      process.env.NODE_ENV = 'production'
++      nock.cleanAll()
++      mockGibsCapabilities()
++      mockWorldviewProducts(buildSupportedLayers(upstreamLayerIds))
++
++      const { getSupportedGibsLayers: productionGetSupportedGibsLayers } = require('../getSupportedGibsLayers')
++      const response = await productionGetSupportedGibsLayers()
++      const layerKeys = Object.keys(response)
+ 
+-    expect(Object.keys(response)).toContain('AMSRE_Surface_Rain_Rate_Night')
+-    expect(Object.keys(response)).toContain('MOPITT_CO_Monthly_Total_Column_Day')
+-    expect(Object.keys(response).length).toEqual(51)
++      expect(layerKeys.sort()).toEqual(upstreamLayerIds.sort())
++    } finally {
++      process.env.NODE_ENV = originalNodeEnv
++      jest.resetModules()
++      nock.cleanAll()
++    }
+   })
+ })
+diff --git a/serverless/src/generateGibsTags/__tests__/handler.test.js b/serverless/src/generateGibsTags/__tests__/handler.test.js
+index ac87f96e1..85fb63db5 100644
+--- a/serverless/src/generateGibsTags/__tests__/handler.test.js
++++ b/serverless/src/generateGibsTags/__tests__/handler.test.js
+@@ -28,6 +28,37 @@ AWS.SQS = jest.fn()
+     sendMessage: sqsSendMessagePromise
+   }))
+ 
++const parseSqsBodies = () => (
++  sqsSendMessagePromise.mock.calls.map(([message]) => JSON.parse(message.MessageBody))
++)
++
++const addConceptIdsFromMessages = (messages) => (
++  new Set(messages
++    .filter((message) => message.action === 'ADD')
++    .map((message) => message.tagData['concept-id']))
++)
++
++const removeKeepConceptIdsFromMessages = (messages) => {
++  const removeMessage = messages.find((message) => message.action === 'REMOVE')
++  const keepConditions = removeMessage.searchCriteria.condition.and
++    .find((condition) => condition.not)
++    .not
++    .or
++
++  return new Set(keepConditions.map((condition) => condition.concept_id))
++}
++
++const expectSetToEqual = (actualSet, expectedValues) => {
++  expect([...actualSet].sort()).toEqual([...expectedValues].sort())
++}
++
++const supportedConceptIdsFromWorldview = (worldviewResponse) => (
++  new Set(Object.values(worldviewResponse.layers)
++    .flatMap((layer) => (
++      (layer.conceptIds || []).map(({ value }) => value)
++    )))
++)
++
+ beforeEach(() => {
+   jest.clearAllMocks()
+ 
+@@ -53,7 +84,7 @@ afterEach(() => {
+ })
+ 
+ describe('generateGibsTags', () => {
+-  test('correctly generates and queues tag data including custom products', async () => {
++  test('sends_tags_only_for_upstream_supported_concepts', async () => {
+     process.env.tagQueueUrl = 'http://example.com/tagQueue'
+ 
+     nock(/worldview/)
+@@ -62,172 +93,14 @@ describe('generateGibsTags', () => {
+ 
+     await generateGibsTags({}, {})
+ 
+-    // 14 ADD calls for the unique concept ids and 1 DELETE call
+-    expect(sqsSendMessagePromise.mock.calls.length).toEqual(15)
+-
+-    expect(sqsSendMessagePromise.mock.calls[0]).toEqual([{
+-      QueueUrl: 'http://example.com/tagQueue',
+-      MessageBody: JSON.stringify({
+-        tagName: 'edsc.extra.serverless.gibs',
+-        action: 'ADD',
+-        requireGranules: false,
+-        tagData: {
+-          'concept-id': 'C1000000001-EDSC',
+-          data: [
+-            {
+-              match: {
+-                time_start: '>=2002-06-01T00:00:00Z',
+-                time_end: '<=2011-10-04T00:00:00Z',
+-                day_night_flag: 'night'
+-              },
+-              product: 'AMSRE_Surface_Rain_Rate_Night',
+-              group: 'overlays',
+-              title: 'Surface Rain Rate (Night)',
+-              source: 'Aqua / AMSR-E',
+-              format: 'png',
+-              updated_at: '1988-09-03T10:00:00.000Z',
+-              antarctic: false,
+-              antarctic_resolution: null,
+-              arctic: false,
+-              arctic_resolution: null,
+-              geographic: true,
+-              geographic_resolution: '2km'
+-            }
+-          ]
+-        }
+-      })
+-    }])
+-
+-    expect(sqsSendMessagePromise.mock.calls[1]).toEqual([{
+-      QueueUrl: 'http://example.com/tagQueue',
+-      MessageBody: JSON.stringify({
+-        tagName: 'edsc.extra.serverless.gibs',
+-        action: 'ADD',
+-        requireGranules: false,
+-        tagData: {
+-          'concept-id': 'C1000000002-EDSC',
+-          data: [
+-            {
+-              match: {
+-                time_start: '>=2002-08-30T00:00:00Z',
+-                day_night_flag: 'day'
+-              },
+-              product: 'AIRS_L2_Methane_400hPa_Volume_Mixing_Ratio_Day',
+-              group: 'overlays',
+-              title: 'Methane (L2, 400 hPa, Day)',
+-              source: 'Aqua / AIRS',
+-              format: 'png',
+-              updated_at: '1988-09-03T10:00:00.000Z',
+-              antarctic: false,
+-              antarctic_resolution: null,
+-              arctic: false,
+-              arctic_resolution: null,
+-              geographic: true,
+-              geographic_resolution: '2km'
+-            }
+-          ]
+-        }
+-      })
+-    }])
+-
+-    expect(sqsSendMessagePromise.mock.calls[2]).toEqual([{
+-      QueueUrl: 'http://example.com/tagQueue',
+-      MessageBody: JSON.stringify({
+-        tagName: 'edsc.extra.serverless.gibs',
+-        action: 'ADD',
+-        requireGranules: false,
+-        tagData: {
+-          'concept-id': 'C1000000003-EDSC',
+-          data: [
+-            {
+-              match: {
+-                time_start: '>=2002-08-30T00:00:00Z',
+-                day_night_flag: 'day'
+-              },
+-              product: 'AIRS_L2_Methane_400hPa_Volume_Mixing_Ratio_Day',
+-              group: 'overlays',
+-              title: 'Methane (L2, 400 hPa, Day)',
+-              source: 'Aqua / AIRS',
+-              format: 'png',
+-              updated_at: '1988-09-03T10:00:00.000Z',
+-              antarctic: false,
+-              antarctic_resolution: null,
+-              arctic: false,
+-              arctic_resolution: null,
+-              geographic: true,
+-              geographic_resolution: '2km'
+-            }
+-          ]
+-        }
+-      })
+-    }])
++    const messages = parseSqsBodies()
++    const addConceptIds = addConceptIdsFromMessages(messages)
++    const removeKeepConceptIds = removeKeepConceptIdsFromMessages(messages)
++    const upstreamSupportedConceptIds = supportedConceptIdsFromWorldview(gibsResponse)
+ 
+-    expect(sqsSendMessagePromise.mock.calls[14]).toEqual([{
+-      QueueUrl: 'http://example.com/tagQueue',
+-      MessageBody: JSON.stringify({
+-        tagName: 'edsc.extra.serverless.gibs',
+-        action: 'REMOVE',
+-        searchCriteria: {
+-          condition: {
+-            and: [
+-              {
+-                tag: {
+-                  tag_key: 'edsc.extra.serverless.gibs'
+-                }
+-              },
+-              {
+-                not: {
+-                  or: [
+-                    {
+-                      concept_id: 'C1000000001-EDSC'
+-                    },
+-                    {
+-                      concept_id: 'C1000000002-EDSC'
+-                    },
+-                    {
+-                      concept_id: 'C1000000003-EDSC'
+-                    },
+-                    {
+-                      concept_id: 'C191855458-LARC'
+-                    },
+-                    {
+-                      concept_id: 'C43677721-LARC'
+-                    },
+-                    {
+-                      concept_id: 'C43677725-LARC'
+-                    },
+-                    {
+-                      concept_id: 'C191855459-LARC'
+-                    },
+-                    {
+-                      concept_id: 'C7227850-LARC_ASDC'
+-                    },
+-                    {
+-                      concept_id: 'C7085910-LARC_ASDC'
+-                    },
+-                    {
+-                      concept_id: 'C7612165-LARC_ASDC'
+-                    },
+-                    {
+-                      concept_id: 'C6011924-LARC_ASDC'
+-                    },
+-                    {
+-                      concept_id: 'C43677719-LARC'
+-                    },
+-                    {
+-                      concept_id: 'C61095981-LARC'
+-                    },
+-                    {
+-                      concept_id: 'C84942916-LARC'
+-                    }
+-                  ]
+-                }
+-              }
+-            ]
+-          }
+-        }
+-      })
+-    }])
++    expectSetToEqual(addConceptIds, upstreamSupportedConceptIds)
++    expectSetToEqual(removeKeepConceptIds, upstreamSupportedConceptIds)
++    expect(messages.find((message) => message.action === 'REMOVE')).toBeDefined()
+   })
+ 
+   test('correctly generates and queues tag data when no collections are to be tagged', async () => {
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,30 @@
++#!/bin/bash
++set -euo pipefail
++cd /testbed
++
++
++dev-switch node 20 2>/dev/null || true
++if [ ! -x node_modules/.bin/jest ]; then
++  npm ci --legacy-peer-deps 2>&1 | tail -5
++fi
++cp secret.config.json.example secret.config.json
++unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy
++
++case "${1:-}" in
++  base)
++    npx jest --no-cache --runInBand \
++      serverless/src/generateGibsTags/__tests__/getSupportedGibsLayers.test.js \
++      serverless/src/generateGibsTags/__tests__/handler.test.js \
++      --testNamePattern='correctly excludes layers with faulty projections|correctly generates and queues tag data when no collections are to be tagged'
++    ;;
++  new)
++    npx jest --no-cache --runInBand \
++      serverless/src/generateGibsTags/__tests__/getSupportedGibsLayers.test.js \
++      serverless/src/generateGibsTags/__tests__/handler.test.js \
++      --testNamePattern='returns_layers_from_the_current_upstream_response_only|returns_layers_from_larger_upstream_responses_without_static_overlay|returns_layers_from_upstream_response_outside_jest_environment|sends_tags_only_for_upstream_supported_concepts'
++    ;;
++  *)
++    echo "usage: $0 base|new"
++    exit 2
++    ;;
++esac

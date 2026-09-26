@@ -1,0 +1,231 @@
+diff --git a/agent/plugin_manifest_codespec_test.go b/agent/plugin_manifest_codespec_test.go
+new file mode 100644
+index 00000000..1d971b30
+--- /dev/null
++++ b/agent/plugin_manifest_codespec_test.go
+@@ -0,0 +1,204 @@
++package agent
++
++import (
++	"reflect"
++	"testing"
++)
++
++func TestCodespecPluginManifestOrderingAndNullConfiguration(t *testing.T) {
++	plugins, err := CreatePluginsFromJSON(`[
++		"github.com/acme/first-buildkite-plugin#v1",
++		{"github.com/acme/second-buildkite-plugin":{"nested":{"value":"kept"}}},
++		{"github.com/acme/third-buildkite-plugin":null}
++	]`)
++	if err != nil {
++		t.Fatalf("valid manifest returned an error: %v", err)
++	}
++	if len(plugins) != 3 {
++		t.Fatalf("got %d plugins, want 3", len(plugins))
++	}
++	gotLabels := []string{plugins[0].Label(), plugins[1].Label(), plugins[2].Label()}
++	wantLabels := []string{
++		"github.com/acme/first-buildkite-plugin#v1",
++		"github.com/acme/second-buildkite-plugin",
++		"github.com/acme/third-buildkite-plugin",
++	}
++	if !reflect.DeepEqual(gotLabels, wantLabels) {
++		t.Fatalf("plugin order changed: got %#v, want %#v", gotLabels, wantLabels)
++	}
++	if plugins[2].Configuration == nil || len(plugins[2].Configuration) != 0 {
++		t.Fatalf("null plugin configuration should become an empty map, got %#v", plugins[2].Configuration)
++	}
++}
++
++func TestCodespecPluginManifestObjectShapeValidation(t *testing.T) {
++	invalidManifests := []struct {
++		name string
++		json string
++	}{
++		{name: "empty object", json: `[{}]`},
++		{name: "ambiguous object", json: `[{"github.com/acme/one":{},"github.com/acme/two":{}}]`},
++		{name: "scalar configuration", json: `[{"github.com/acme/one":"not-a-map"}]`},
++	}
++	for _, tc := range invalidManifests {
++		t.Run(tc.name, func(t *testing.T) {
++			got, err := CreatePluginsFromJSON(tc.json)
++			if err == nil {
++				t.Fatalf("CreatePluginsFromJSON(%s) succeeded, want an error", tc.json)
++			}
++			if got != nil {
++				t.Fatalf("invalid manifest returned partial plugins: %#v", got)
++			}
++		})
++	}
++}
++
++func TestCodespecPluginManifestRejectsTrailingDataAndPartialResults(t *testing.T) {
++	invalidManifests := []string{
++		`[] ["github.com/acme/extra"]`,
++		`["github.com/acme/valid", 17]`,
++	}
++	for _, manifest := range invalidManifests {
++		got, err := CreatePluginsFromJSON(manifest)
++		if err == nil {
++			t.Fatalf("CreatePluginsFromJSON(%s) succeeded, want an error", manifest)
++		}
++		if got != nil {
++			t.Fatalf("invalid manifest returned partial plugins: %#v", got)
++		}
++	}
++}
++
++func TestCodespecStructuredPluginConfigurationEnvironment(t *testing.T) {
++	plugins, err := CreatePluginsFromJSON(`[{
++		"github.com/buildkite-plugins/docker-compose-buildkite-plugin": {
++			"service settings": {
++				"image-name": "app:v2",
++				"enabled": false,
++				"replicas": 0,
++				"limits": {"cpu/%": 75.5}
++			},
++			"steps": [
++				{"command": "build", "retry": true},
++				{"command": "test", "retry": false}
++			],
++			"matrix": [["linux", "amd64"], ["darwin", "arm64"]],
++			"empty object": {},
++			"empty array": []
++		}
++	}]`)
++	if err != nil || len(plugins) != 1 {
++		t.Fatalf("failed to parse structured plugin: plugins=%d err=%v", len(plugins), err)
++	}
++
++	got, err := plugins[0].ConfigurationToEnvironment()
++	if err != nil {
++		t.Fatalf("structured configuration returned an error: %v", err)
++	}
++	want := []string{
++		"BUILDKITE_PLUGIN_DOCKER_COMPOSE_MATRIX_0_0=linux",
++		"BUILDKITE_PLUGIN_DOCKER_COMPOSE_MATRIX_0_1=amd64",
++		"BUILDKITE_PLUGIN_DOCKER_COMPOSE_MATRIX_1_0=darwin",
++		"BUILDKITE_PLUGIN_DOCKER_COMPOSE_MATRIX_1_1=arm64",
++		"BUILDKITE_PLUGIN_DOCKER_COMPOSE_SERVICE_SETTINGS_ENABLED=false",
++		"BUILDKITE_PLUGIN_DOCKER_COMPOSE_SERVICE_SETTINGS_IMAGE_NAME=app:v2",
++		"BUILDKITE_PLUGIN_DOCKER_COMPOSE_SERVICE_SETTINGS_LIMITS_CPU=75.5",
++		"BUILDKITE_PLUGIN_DOCKER_COMPOSE_SERVICE_SETTINGS_REPLICAS=0",
++		"BUILDKITE_PLUGIN_DOCKER_COMPOSE_STEPS_0_COMMAND=build",
++		"BUILDKITE_PLUGIN_DOCKER_COMPOSE_STEPS_0_RETRY=true",
++		"BUILDKITE_PLUGIN_DOCKER_COMPOSE_STEPS_1_COMMAND=test",
++		"BUILDKITE_PLUGIN_DOCKER_COMPOSE_STEPS_1_RETRY=false",
++	}
++	if !reflect.DeepEqual(got.ToSlice(), want) {
++		t.Fatalf("unexpected structured environment:\n got: %#v\nwant: %#v", got.ToSlice(), want)
++	}
++}
++
++func TestCodespecPluginConfigurationRejectsInvalidLeavesAtomically(t *testing.T) {
++	plugins, err := CreatePluginsFromJSON(`[{"github.com/acme/example-buildkite-plugin":{
++		"valid":"would otherwise export",
++		"credentials":["user", null]
++	}}]`)
++	if err != nil || len(plugins) != 1 {
++		t.Fatalf("failed to parse test plugin: plugins=%d err=%v", len(plugins), err)
++	}
++
++	got, err := plugins[0].ConfigurationToEnvironment()
++	if err == nil {
++		t.Fatal("nested null configuration value succeeded")
++	}
++	if got != nil {
++		t.Fatalf("failed conversion returned a partial environment: %#v", got.ToSlice())
++	}
++
++	plugin := &Plugin{
++		Location: "github.com/acme/example-buildkite-plugin",
++		Configuration: map[string]interface{}{
++			"valid":  "would otherwise export",
++			"broken": make(chan int),
++		},
++	}
++	got, err = plugin.ConfigurationToEnvironment()
++	if err == nil {
++		t.Fatal("unsupported programmatic configuration value succeeded")
++	}
++	if got != nil {
++		t.Fatalf("unsupported value returned a partial environment: %#v", got.ToSlice())
++	}
++}
++
++func TestCodespecPluginConfigurationRejectsNormalizedNameCollisions(t *testing.T) {
++	cases := []map[string]interface{}{
++		{
++			"cache-size": "one",
++			"cache size": "two",
++		},
++		{
++			"cache":      map[string]interface{}{"size": "nested"},
++			"cache_size": "flat",
++		},
++		{
++			"---": "empty normalized segment",
++		},
++	}
++	for i, config := range cases {
++		plugin := &Plugin{
++			Location:      "github.com/acme/example-buildkite-plugin",
++			Configuration: config,
++		}
++		got, err := plugin.ConfigurationToEnvironment()
++		if err == nil {
++			t.Fatalf("case %d succeeded, want an error", i)
++		}
++		if got != nil {
++			t.Fatalf("case %d returned a partial environment: %#v", i, got.ToSlice())
++		}
++	}
++}
++
++func TestCodespecFlatPluginConfigurationRemainsCompatible(t *testing.T) {
++	plugins, err := CreatePluginsFromJSON(`[{"github.com/buildkite-plugins/docker-compose-buildkite-plugin":{
++		"container":"app",
++		"enabled":true,
++		"retries":2,
++		"command":["build", "test"]
++	}}]`)
++	if err != nil || len(plugins) != 1 {
++		t.Fatalf("failed to parse flat plugin: plugins=%d err=%v", len(plugins), err)
++	}
++
++	got, err := plugins[0].ConfigurationToEnvironment()
++	if err != nil {
++		t.Fatalf("flat configuration returned an error: %v", err)
++	}
++	want := []string{
++		"BUILDKITE_PLUGIN_DOCKER_COMPOSE_COMMAND_0=build",
++		"BUILDKITE_PLUGIN_DOCKER_COMPOSE_COMMAND_1=test",
++		"BUILDKITE_PLUGIN_DOCKER_COMPOSE_CONTAINER=app",
++		"BUILDKITE_PLUGIN_DOCKER_COMPOSE_ENABLED=true",
++		"BUILDKITE_PLUGIN_DOCKER_COMPOSE_RETRIES=2",
++	}
++	if !reflect.DeepEqual(got.ToSlice(), want) {
++		t.Fatalf("flat environment changed: got %#v, want %#v", got.ToSlice(), want)
++	}
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,16 @@
++#!/bin/bash
++set -euo pipefail
++
++
++codespec_repo="$(pwd)"
++codespec_gopath="$(mktemp -d)"
++codespec_package="${codespec_gopath}/src/github.com/buildkite/agent"
++mkdir -p "${codespec_package}"
++for codespec_entry in agent api bootstrap clicommand cliconfig env experiments logger mime pool process proctitle retry signalwatcher stdin system utils main.go; do
++  ln -s "${codespec_repo}/${codespec_entry}" "${codespec_package}/${codespec_entry}"
++done
++cp -a "${codespec_repo}/vendor" "${codespec_package}/vendor"
++export GOPATH="${codespec_gopath}"
++export GO111MODULE=off
++cd "${codespec_package}"
++go test ./agent -run '^TestCodespec' -count=1

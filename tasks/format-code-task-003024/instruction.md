@@ -1,0 +1,7 @@
+I want the library's exported validator object to expose a stateful `register(validatorName: string, validationExpression: function, force?: boolean): void` method for adding custom validators at runtime. After I call `V.register('alwaysValid', () => true)`, the same exported object should have a new `V.alwaysValid(...args)` factory, and `V.alwaysValid()('anything')` should return `true`.
+
+The generated factory must forward the value being validated as the first argument to my validation expression and any factory arguments after it. For example, after `V.register('minLength', (value, min, message) => value.length >= min || message || 'too short')`, `V.minLength(3)('abcd')` should return `true`, and `V.minLength(3)('ab')` should return `'too short'`.
+
+Registered validators should work with the same success-or-message convention as built-in validators and should receive a custom message when wrapped with `V.message`. For example, after registering `isFoo` as `(value, message) => value === 'foo' || message || 'not foo'`, `V.message(V.isFoo(), 'custom failure')('bar')` should return `'custom failure'`.
+
+The method must protect existing validators by default. Calling `V.register('email', () => true)` should throw an `Error` whose message starts with `Validator with this name already exists!`. Passing `true` as the third argument should intentionally replace an existing validator name, so after `V.register('customRule', () => true)` and then `V.register('customRule', () => false, true)`, `V.customRule()('x')` should return `false`.

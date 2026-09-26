@@ -1,0 +1,317 @@
+diff --git a/tests/test_async_workflow_context_isolation.py b/tests/test_async_workflow_context_isolation.py
+new file mode 100644
+index 0000000..1e82df5
+--- /dev/null
++++ b/tests/test_async_workflow_context_isolation.py
+@@ -0,0 +1,269 @@
++import asyncio
++import os
++import subprocess
++import sys
++import textwrap
++
++import yaml
++
++from hera.workflows import DAG, Workflow, script
++
++
++@script(image="python:3.9")
++def alpha(message: str):
++    print(message)
++
++
++@script(image="python:3.9")
++def beta(message: str):
++    print(message)
++
++
++@script(image="python:3.10")
++def gamma(message: str):
++    print(message)
++
++
++@script(image="python:3.10")
++def delta(message: str):
++    print(message)
++
++
++def _workflow_doc(yaml_text):
++    return yaml.safe_load(yaml_text)
++
++
++def _template_names(yaml_text):
++    doc = _workflow_doc(yaml_text)
++    return {template["name"] for template in doc["spec"]["templates"]}
++
++
++def _dag_task_names(yaml_text, dag_name):
++    doc = _workflow_doc(yaml_text)
++    for template in doc["spec"]["templates"]:
++        if template["name"] == dag_name:
++            return {task["name"] for task in template["dag"]["tasks"]}
++    raise AssertionError(f"DAG template {dag_name!r} was not rendered")
++
++
++async def _build_interleaved_dag_pair(suffix):
++    left_ready = asyncio.Event()
++    right_inside_dag = asyncio.Event()
++    left_finished = asyncio.Event()
++
++    left_dag = f"left-dag-{suffix}"
++    right_dag = f"right-dag-{suffix}"
++
++    async def build_left():
++        with Workflow(
++            generate_name=f"left-{suffix}-",
++            entrypoint=left_dag,
++        ) as workflow:
++            with DAG(name=left_dag):
++                alpha(arguments={"message": f"left first {suffix}"})
++                left_ready.set()
++                await right_inside_dag.wait()
++                beta(arguments={"message": f"left second {suffix}"})
++                left_finished.set()
++        return workflow.to_yaml()
++
++    async def build_right():
++        await left_ready.wait()
++        with Workflow(
++            generate_name=f"right-{suffix}-",
++            entrypoint=right_dag,
++        ) as workflow:
++            with DAG(name=right_dag):
++                gamma(arguments={"message": f"right first {suffix}"})
++                right_inside_dag.set()
++                await left_finished.wait()
++                delta(arguments={"message": f"right second {suffix}"})
++        return workflow.to_yaml()
++
++    return await asyncio.gather(build_left(), build_right())
++
++
++def _assert_workflow_contains_only_expected_dag_tasks(
++    yaml_text,
++    *,
++    own_dag,
++    own_script_templates,
++    foreign_dag,
++    foreign_script_templates,
++):
++    template_names = _template_names(yaml_text)
++    assert own_dag in template_names
++    assert own_script_templates <= template_names
++    assert foreign_dag not in template_names
++    assert template_names.isdisjoint(foreign_script_templates)
++    assert _dag_task_names(yaml_text, own_dag) == own_script_templates
++
++
++def test_concurrent_dag_workflows_render_only_their_own_tasks():
++    rendered_runs = []
++
++    for index in range(3):
++        suffix = f"case{index}"
++        left_yaml, right_yaml = asyncio.run(_build_interleaved_dag_pair(suffix))
++        rendered_runs.append((_workflow_doc(left_yaml), _workflow_doc(right_yaml)))
++
++        _assert_workflow_contains_only_expected_dag_tasks(
++            left_yaml,
++            own_dag=f"left-dag-{suffix}",
++            own_script_templates={"alpha", "beta"},
++            foreign_dag=f"right-dag-{suffix}",
++            foreign_script_templates={"gamma", "delta"},
++        )
++        _assert_workflow_contains_only_expected_dag_tasks(
++            right_yaml,
++            own_dag=f"right-dag-{suffix}",
++            own_script_templates={"gamma", "delta"},
++            foreign_dag=f"left-dag-{suffix}",
++            foreign_script_templates={"alpha", "beta"},
++        )
++
++    repeated_left_yaml, repeated_right_yaml = asyncio.run(_build_interleaved_dag_pair("case1"))
++    assert _workflow_doc(repeated_left_yaml) == rendered_runs[1][0]
++    assert _workflow_doc(repeated_right_yaml) == rendered_runs[1][1]
++
++
++def test_concurrent_dag_workflows_are_isolated_outside_pytest_context(tmp_path):
++    script = textwrap.dedent(
++        """
++        import asyncio
++
++        import yaml
++
++        from hera.workflows import DAG, Workflow, script
++
++
++        @script(image="python:3.11")
++        def first(message: str):
++            print(message)
++
++
++        @script(image="python:3.11")
++        def second(message: str):
++            print(message)
++
++
++        @script(image="python:3.11")
++        def third(message: str):
++            print(message)
++
++
++        @script(image="python:3.11")
++        def fourth(message: str):
++            print(message)
++
++
++        def workflow_doc(yaml_text):
++            return yaml.safe_load(yaml_text)
++
++
++        def template_names(yaml_text):
++            return {template["name"] for template in workflow_doc(yaml_text)["spec"]["templates"]}
++
++
++        def dag_task_names(yaml_text, dag_name):
++            for template in workflow_doc(yaml_text)["spec"]["templates"]:
++                if template["name"] == dag_name:
++                    return {task["name"] for task in template["dag"]["tasks"]}
++            raise AssertionError(f"missing DAG {dag_name}")
++
++
++        async def build_pair():
++            left_ready = asyncio.Event()
++            right_inside_dag = asyncio.Event()
++            left_finished = asyncio.Event()
++
++            async def build_plain_a():
++                with Workflow(generate_name="plain-a-", entrypoint="plain-a-dag") as workflow:
++                    with DAG(name="plain-a-dag"):
++                        first(arguments={"message": "plain a first"})
++                        left_ready.set()
++                        await right_inside_dag.wait()
++                        second(arguments={"message": "plain a second"})
++                        left_finished.set()
++                return workflow.to_yaml()
++
++            async def build_plain_b():
++                await left_ready.wait()
++                with Workflow(generate_name="plain-b-", entrypoint="plain-b-dag") as workflow:
++                    with DAG(name="plain-b-dag"):
++                        third(arguments={"message": "plain b first"})
++                        right_inside_dag.set()
++                        await left_finished.wait()
++                        fourth(arguments={"message": "plain b second"})
++                return workflow.to_yaml()
++
++            return await asyncio.gather(build_plain_a(), build_plain_b())
++
++
++        left_yaml, right_yaml = asyncio.run(build_pair())
++
++        left_templates = template_names(left_yaml)
++        right_templates = template_names(right_yaml)
++
++        assert "plain-a-dag" in left_templates
++        assert {"first", "second"} <= left_templates
++        assert "plain-b-dag" not in left_templates
++        assert left_templates.isdisjoint({"third", "fourth"})
++        assert dag_task_names(left_yaml, "plain-a-dag") == {"first", "second"}
++
++        assert "plain-b-dag" in right_templates
++        assert {"third", "fourth"} <= right_templates
++        assert "plain-a-dag" not in right_templates
++        assert right_templates.isdisjoint({"first", "second"})
++        assert dag_task_names(right_yaml, "plain-b-dag") == {"third", "fourth"}
++        """
++    )
++    script_file = tmp_path / "outside_pytest_context.py"
++    script_file.write_text(script)
++    env = os.environ.copy()
++    env.pop("PYTEST_CURRENT_TEST", None)
++    result = subprocess.run(
++        [sys.executable, str(script_file)],
++        cwd=os.getcwd(),
++        env=env,
++        text=True,
++        capture_output=True,
++        timeout=15,
++    )
++    assert result.returncode == 0, result.stdout + result.stderr
++
++
++def test_sequential_dag_workflows_do_not_reuse_previous_context():
++    with Workflow(
++        generate_name="sync-left-",
++        entrypoint="sync-left-dag",
++    ) as left_workflow:
++        with DAG(name="sync-left-dag"):
++            alpha(arguments={"message": "sync left first"})
++            beta(arguments={"message": "sync left second"})
++
++    with Workflow(
++        generate_name="sync-right-",
++        entrypoint="sync-right-dag",
++    ) as right_workflow:
++        with DAG(name="sync-right-dag"):
++            gamma(arguments={"message": "sync right first"})
++            delta(arguments={"message": "sync right second"})
++
++    left_yaml = left_workflow.to_yaml()
++    right_yaml = right_workflow.to_yaml()
++
++    _assert_workflow_contains_only_expected_dag_tasks(
++        left_yaml,
++        own_dag="sync-left-dag",
++        own_script_templates={"alpha", "beta"},
++        foreign_dag="sync-right-dag",
++        foreign_script_templates={"gamma", "delta"},
++    )
++    _assert_workflow_contains_only_expected_dag_tasks(
++        right_yaml,
++        own_dag="sync-right-dag",
++        own_script_templates={"gamma", "delta"},
++        foreign_dag="sync-left-dag",
++        foreign_script_templates={"alpha", "beta"},
++    )
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,37 @@
++#!/bin/bash
++set -uo pipefail
++
++cd /testbed
++
++
++if [ ! -x /testbed/.venv/bin/python ]; then
++  python3 -m venv /testbed/.venv
++fi
++
++set +u
++source /testbed/.venv/bin/activate
++set -u
++
++
++if ! python - <<'PY' >/dev/null 2>&1
++import hera
++import pytest
++import yaml
++PY
++then
++  python -m pip install --upgrade pip setuptools wheel
++  python -m pip install -e ".[yaml]" pytest jsonpath-ng
++fi
++
++case "${1:-}" in
++  base)
++    python -m pytest tests/test_hooks.py -q -o "addopts="
++    ;;
++  new)
++    python -m pytest tests/test_async_workflow_context_isolation.py -v -o "addopts="
++    ;;
++  *)
++    echo "usage: $0 base|new"
++    exit 2
++    ;;
++esac

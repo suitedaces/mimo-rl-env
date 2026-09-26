@@ -1,0 +1,141 @@
+diff --git a/scanner/internal/httputil/transport_mux_contract_test.go b/scanner/internal/httputil/transport_mux_contract_test.go
+new file mode 100644
+index 0000000000..7aa3214575
+--- /dev/null
++++ b/scanner/internal/httputil/transport_mux_contract_test.go
+@@ -0,0 +1,125 @@
++package httputil
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"io"
++	"net/http"
++	"net/url"
++	"strings"
++	"testing"
++
++	"github.com/stackrox/rox/pkg/env"
++	roothttputil "github.com/stackrox/rox/pkg/httputil"
++	mtlstestutils "github.com/stackrox/rox/pkg/mtls/testutils"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++)
++
++func TestTransportMux_ServiceDNSFormsAreDenied(t *testing.T) {
++	t.Setenv(env.Namespace.EnvVar(), "rhacs")
++	defaultTransport := roothttputil.RoundTripperFunc(func(req *http.Request) (*http.Response, error) {
++		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader("default"))}, nil
++	})
++
++	tr, err := TransportMux(defaultTransport, WithDenyStackRoxServices(true))
++	require.NoError(t, err)
++	client := &http.Client{Transport: tr}
++
++	for _, tc := range []struct {
++		name string
++		url  string
++	}{
++		{name: "central short", url: "https://central.rhacs/health"},
++		{name: "central service", url: "https://central.rhacs.svc:443/health"},
++		{name: "central fully qualified", url: "https://CENTRAL.RHACS.SVC.CLUSTER.LOCAL./health"},
++		{name: "sensor short", url: "https://sensor.rhacs:8443/health"},
++		{name: "sensor fully qualified", url: "https://sensor.rhacs.svc.cluster.local.:8443/health"},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			assertDenied(t, client, tc.url)
++		})
++	}
++}
++
++func TestTransportMux_ServiceNameBoundariesAndExternalTraffic(t *testing.T) {
++	t.Setenv(env.Namespace.EnvVar(), "rhacs")
++	defaultTransport := roothttputil.RoundTripperFunc(func(req *http.Request) (*http.Response, error) {
++		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(req.URL.Host))}, nil
++	})
++
++	tr, err := TransportMux(defaultTransport, WithDenyStackRoxServices(true))
++	require.NoError(t, err)
++	client := &http.Client{Transport: tr}
++
++	for _, tc := range []struct {
++		name string
++		url  string
++	}{
++		{name: "other service", url: "https://central.rhacs-extra.svc/health"},
++		{name: "other namespace", url: "https://sensor.other.svc/health"},
++		{name: "service prefix", url: "https://central-api.rhacs.svc/health"},
++		{name: "external host", url: "https://quay.io/v2/"},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			resp, err := client.Get(tc.url)
++			require.NoError(t, err)
++			defer resp.Body.Close()
++			body, err := io.ReadAll(resp.Body)
++			require.NoError(t, err)
++			assert.Equal(t, http.StatusOK, resp.StatusCode)
++			parsed, err := url.Parse(tc.url)
++			require.NoError(t, err)
++			assert.Equal(t, parsed.Host, string(body))
++		})
++	}
++}
++
++func TestTransportMux_DenyOptionsRemainIndependent(t *testing.T) {
++	t.Setenv(env.Namespace.EnvVar(), "rhacs")
++	require.NoError(t, mtlstestutils.LoadTestMTLSCerts(t))
++	defaultErr := errors.New("default transport used")
++	defaultTransport := roothttputil.RoundTripperFunc(func(req *http.Request) (*http.Response, error) {
++		return nil, defaultErr
++	})
++
++	for _, tc := range []struct {
++		name       string
++		option     TransportOption
++		deniedURL  string
++		allowedURL string
++	}{
++		{name: "central only", option: WithDenyCentral(true), deniedURL: "https://central.rhacs.svc.cluster.local./health", allowedURL: "https://sensor.rhacs.svc/health"},
++		{name: "sensor only", option: WithDenySensor(true), deniedURL: "https://sensor.rhacs.svc.cluster.local.:8443/health", allowedURL: "https://central.rhacs.svc/health"},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			tr, err := TransportMux(defaultTransport, tc.option)
++			require.NoError(t, err)
++			assertDenied(t, &http.Client{Transport: tr}, tc.deniedURL)
++
++			ctx, cancel := context.WithCancel(context.Background())
++			cancel()
++			req, err := http.NewRequestWithContext(ctx, http.MethodGet, tc.allowedURL, nil)
++			require.NoError(t, err)
++			_, err = tr.RoundTrip(req)
++			assert.ErrorIs(t, err, context.Canceled)
++			assert.NotErrorIs(t, err, defaultErr)
++		})
++	}
++}
++
++func assertDenied(t *testing.T, client *http.Client, url string) {
++	t.Helper()
++	assert.True(t, requestWasDenied(client, url), "service request was not denied: %s", url)
++}
++
++func requestWasDenied(client *http.Client, url string) (denied bool) {
++	defer func() {
++		if recovered := recover(); recovered != nil {
++			denied = strings.Contains(fmt.Sprint(recovered), "HTTP traffic denied")
++		}
++	}()
++	_, err := client.Get(url)
++	return err != nil && strings.Contains(err.Error(), "HTTP traffic denied")
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,5 @@
++#!/bin/bash
++set -euo pipefail
++
++
++go test ./scanner/internal/httputil -run 'TestTransportMux($|_(ServiceDNSFormsAreDenied|ServiceNameBoundariesAndExternalTraffic|DenyOptionsRemainIndependent)$)' -count=1

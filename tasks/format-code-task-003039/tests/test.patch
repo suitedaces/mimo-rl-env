@@ -1,0 +1,647 @@
+diff --git a/server/rpc/server_test.go b/server/rpc/server_test.go
+index 0990b97d9..36de756d4 100644
+--- a/server/rpc/server_test.go
++++ b/server/rpc/server_test.go
+@@ -25,12 +25,14 @@ import (
+ 	"testing"
+ 	"time"
+ 
++	"github.com/gogo/protobuf/types"
+ 	"github.com/stretchr/testify/assert"
+ 	"google.golang.org/grpc"
+ 	"google.golang.org/grpc/codes"
+ 	"google.golang.org/grpc/credentials/insecure"
+ 	"google.golang.org/grpc/status"
+ 
++	"github.com/yorkie-team/yorkie/admin"
+ 	api "github.com/yorkie-team/yorkie/api/yorkie/v1"
+ 	"github.com/yorkie-team/yorkie/client"
+ 	"github.com/yorkie-team/yorkie/server/backend"
+@@ -43,13 +45,18 @@ import (
+ )
+ 
+ var (
++	defaultProjectName = "default"
++	invalidSlugName    = "@#$%^&*()_+"
++
+ 	nilClientID, _     = hex.DecodeString("000000000000000000000000")
+ 	emptyClientID, _   = hex.DecodeString("")
+ 	invalidClientID, _ = hex.DecodeString("invalid")
+ 
+-	testRPCServer *rpc.Server
+-	testRPCAddr   = fmt.Sprintf("localhost:%d", helper.RPCPort)
+-	testClient    api.YorkieServiceClient
++	testRPCServer            *rpc.Server
++	testRPCAddr              = fmt.Sprintf("localhost:%d", helper.RPCPort)
++	testClient               api.YorkieServiceClient
++	testAdminAuthInterceptor *admin.AuthInterceptor
++	testAdminClient          api.AdminServiceClient
+ 
+ 	invalidChangePack = &api.ChangePack{
+ 		DocumentKey: "invalid",
+@@ -69,6 +76,7 @@ func TestMain(m *testing.M) {
+ 		ClientDeactivateThreshold: helper.ClientDeactivateThreshold,
+ 		SnapshotThreshold:         helper.SnapshotThreshold,
+ 		AuthWebhookCacheSize:      helper.AuthWebhookSize,
++		AdminTokenDuration:        helper.AdminTokenDuration,
+ 	}, &mongo.Config{
+ 		ConnectionURI:     helper.MongoConnectionURI,
+ 		YorkieDatabase:    helper.TestDBName(),
+@@ -116,6 +124,19 @@ func TestMain(m *testing.M) {
+ 	}
+ 	testClient = api.NewYorkieServiceClient(conn)
+ 
++	credentials := grpc.WithTransportCredentials(insecure.NewCredentials())
++	dialOptions = []grpc.DialOption{credentials}
++
++	testAdminAuthInterceptor = admin.NewAuthInterceptor("")
++	dialOptions = append(dialOptions, grpc.WithUnaryInterceptor(testAdminAuthInterceptor.Unary()))
++	dialOptions = append(dialOptions, grpc.WithStreamInterceptor(testAdminAuthInterceptor.Stream()))
++
++	adminConn, err := grpc.Dial(testRPCAddr, dialOptions...)
++	if err != nil {
++		log.Fatal(err)
++	}
++	testAdminClient = api.NewAdminServiceClient(adminConn)
++
+ 	code := m.Run()
+ 
+ 	if err := be.Shutdown(); err != nil {
+@@ -125,7 +146,7 @@ func TestMain(m *testing.M) {
+ 	os.Exit(code)
+ }
+ 
+-func TestRPCServerBackend(t *testing.T) {
++func TestSDKRPCServerBackend(t *testing.T) {
+ 	t.Run("activate/deactivate client test", func(t *testing.T) {
+ 		activateResp, err := testClient.ActivateClient(
+ 			context.Background(),
+@@ -671,6 +692,336 @@ func TestRPCServerBackend(t *testing.T) {
+ 	})
+ }
+ 
++func TestAdminRPCServerBackend(t *testing.T) {
++	t.Run("admin signup test", func(t *testing.T) {
++		adminUser := helper.TestSlugName(t)
++		adminPassword := helper.AdminPassword + "123!"
++
++		_, err := testAdminClient.SignUp(
++			context.Background(),
++			&api.SignUpRequest{
++				Username: adminUser,
++				Password: adminPassword,
++			},
++		)
++		assert.NoError(t, err)
++
++
++		_, err = testAdminClient.SignUp(
++			context.Background(),
++			&api.SignUpRequest{
++				Username: adminUser,
++				Password: adminPassword,
++			},
++		)
++		assert.Equal(t, codes.Unknown, status.Convert(err).Code())
++	})
++
++	t.Run("admin login test", func(t *testing.T) {
++		_, err := testAdminClient.LogIn(
++			context.Background(),
++			&api.LogInRequest{
++				Username: helper.AdminUser,
++				Password: helper.AdminPassword,
++			},
++		)
++		assert.NoError(t, err)
++
++
++		_, err = testAdminClient.LogIn(
++			context.Background(),
++			&api.LogInRequest{
++				Username: helper.AdminUser,
++				Password: invalidSlugName,
++			},
++		)
++		assert.Equal(t, codes.Unauthenticated, status.Convert(err).Code())
++	})
++
++	t.Run("admin create project test", func(t *testing.T) {
++		projectName := helper.TestSlugName(t)
++
++		resp, err := testAdminClient.LogIn(
++			context.Background(),
++			&api.LogInRequest{
++				Username: helper.AdminUser,
++				Password: helper.AdminPassword,
++			},
++		)
++		assert.NoError(t, err)
++
++		testAdminAuthInterceptor.SetToken(resp.Token)
++
++		_, err = testAdminClient.CreateProject(
++			context.Background(),
++			&api.CreateProjectRequest{
++				Name: projectName,
++			},
++		)
++		assert.NoError(t, err)
++
++
++		_, err = testAdminClient.CreateProject(
++			context.Background(),
++			&api.CreateProjectRequest{
++				Name: projectName,
++			},
++		)
++		assert.Equal(t, codes.AlreadyExists, status.Convert(err).Code())
++	})
++
++	t.Run("admin list projects test", func(t *testing.T) {
++		resp, err := testAdminClient.LogIn(
++			context.Background(),
++			&api.LogInRequest{
++				Username: helper.AdminUser,
++				Password: helper.AdminPassword,
++			},
++		)
++		assert.NoError(t, err)
++
++		testAdminAuthInterceptor.SetToken(resp.Token)
++
++		_, err = testAdminClient.CreateProject(
++			context.Background(),
++			&api.CreateProjectRequest{
++				Name: helper.TestSlugName(t),
++			},
++		)
++		assert.NoError(t, err)
++
++		_, err = testAdminClient.ListProjects(
++			context.Background(),
++			&api.ListProjectsRequest{},
++		)
++		assert.NoError(t, err)
++	})
++
++	t.Run("admin get project test", func(t *testing.T) {
++		projectName := helper.TestSlugName(t)
++
++		resp, err := testAdminClient.LogIn(
++			context.Background(),
++			&api.LogInRequest{
++				Username: helper.AdminUser,
++				Password: helper.AdminPassword,
++			},
++		)
++		assert.NoError(t, err)
++
++		testAdminAuthInterceptor.SetToken(resp.Token)
++
++		_, err = testAdminClient.CreateProject(
++			context.Background(),
++			&api.CreateProjectRequest{
++				Name: projectName,
++			},
++		)
++		assert.NoError(t, err)
++
++		_, err = testAdminClient.GetProject(
++			context.Background(),
++			&api.GetProjectRequest{
++				Name: projectName,
++			},
++		)
++		assert.NoError(t, err)
++
++
++		_, err = testAdminClient.GetProject(
++			context.Background(),
++			&api.GetProjectRequest{
++				Name: invalidSlugName,
++			},
++		)
++		assert.Equal(t, codes.NotFound, status.Convert(err).Code())
++	})
++
++	t.Run("admin update project test", func(t *testing.T) {
++		projectName := helper.TestSlugName(t)
++
++		resp, err := testAdminClient.LogIn(
++			context.Background(),
++			&api.LogInRequest{
++				Username: helper.AdminUser,
++				Password: helper.AdminPassword,
++			},
++		)
++		assert.NoError(t, err)
++
++		testAdminAuthInterceptor.SetToken(resp.Token)
++
++		createResp, err := testAdminClient.CreateProject(
++			context.Background(),
++			&api.CreateProjectRequest{
++				Name: projectName,
++			},
++		)
++		assert.NoError(t, err)
++
++		_, err = testAdminClient.UpdateProject(
++			context.Background(),
++			&api.UpdateProjectRequest{
++				Id: createResp.Project.Id,
++				Fields: &api.UpdatableProjectFields{
++					Name: &types.StringValue{Value: "updated"},
++				},
++			},
++		)
++		assert.NoError(t, err)
++
++
++		_, err = testAdminClient.UpdateProject(
++			context.Background(),
++			&api.UpdateProjectRequest{
++				Id: projectName,
++				Fields: &api.UpdatableProjectFields{
++					Name: &types.StringValue{Value: invalidSlugName},
++				},
++			},
++		)
++		assert.Equal(t, codes.InvalidArgument, status.Convert(err).Code())
++	})
++
++	t.Run("admin list documents test", func(t *testing.T) {
++		resp, err := testAdminClient.LogIn(
++			context.Background(),
++			&api.LogInRequest{
++				Username: helper.AdminUser,
++				Password: helper.AdminPassword,
++			},
++		)
++		assert.NoError(t, err)
++
++		testAdminAuthInterceptor.SetToken(resp.Token)
++
++		_, err = testAdminClient.ListDocuments(
++			context.Background(),
++			&api.ListDocumentsRequest{
++				ProjectName: defaultProjectName,
++			},
++		)
++		assert.NoError(t, err)
++
++
++		_, err = testAdminClient.ListDocuments(
++			context.Background(),
++			&api.ListDocumentsRequest{
++				ProjectName: invalidSlugName,
++			},
++		)
++		assert.Equal(t, codes.NotFound, status.Convert(err).Code())
++	})
++
++	t.Run("admin get document test", func(t *testing.T) {
++		testDocumentKey := helper.TestDocKey(t).String()
++
++		resp, err := testAdminClient.LogIn(
++			context.Background(),
++			&api.LogInRequest{
++				Username: helper.AdminUser,
++				Password: helper.AdminPassword,
++			},
++		)
++		assert.NoError(t, err)
++
++		testAdminAuthInterceptor.SetToken(resp.Token)
++
++		activateResp, err := testClient.ActivateClient(
++			context.Background(),
++			&api.ActivateClientRequest{ClientKey: t.Name()},
++		)
++		assert.NoError(t, err)
++
++		packWithNoChanges := &api.ChangePack{
++			DocumentKey: testDocumentKey,
++			Checkpoint:  &api.Checkpoint{ServerSeq: 0, ClientSeq: 0},
++		}
++
++		_, err = testClient.AttachDocument(
++			context.Background(),
++			&api.AttachDocumentRequest{
++				ClientId:   activateResp.ClientId,
++				ChangePack: packWithNoChanges,
++			},
++		)
++		assert.NoError(t, err)
++
++		_, err = testAdminClient.GetDocument(
++			context.Background(),
++			&api.GetDocumentRequest{
++				ProjectName: defaultProjectName,
++				DocumentKey: testDocumentKey,
++			},
++		)
++		assert.NoError(t, err)
++
++
++		_, err = testAdminClient.GetDocument(
++			context.Background(),
++			&api.GetDocumentRequest{
++				ProjectName: defaultProjectName,
++				DocumentKey: invalidChangePack.DocumentKey,
++			},
++		)
++		assert.Equal(t, codes.NotFound, status.Convert(err).Code())
++	})
++
++	t.Run("admin list changes test", func(t *testing.T) {
++		testDocumentKey := helper.TestDocKey(t).String()
++
++		resp, err := testAdminClient.LogIn(
++			context.Background(),
++			&api.LogInRequest{
++				Username: helper.AdminUser,
++				Password: helper.AdminPassword,
++			},
++		)
++		assert.NoError(t, err)
++
++		testAdminAuthInterceptor.SetToken(resp.Token)
++
++		activateResp, err := testClient.ActivateClient(
++			context.Background(),
++			&api.ActivateClientRequest{ClientKey: t.Name()},
++		)
++		assert.NoError(t, err)
++
++		packWithNoChanges := &api.ChangePack{
++			DocumentKey: testDocumentKey,
++			Checkpoint:  &api.Checkpoint{ServerSeq: 0, ClientSeq: 0},
++		}
++
++		_, err = testClient.AttachDocument(
++			context.Background(),
++			&api.AttachDocumentRequest{
++				ClientId:   activateResp.ClientId,
++				ChangePack: packWithNoChanges,
++			},
++		)
++		assert.NoError(t, err)
++
++		_, err = testAdminClient.ListChanges(
++			context.Background(),
++			&api.ListChangesRequest{
++				ProjectName: defaultProjectName,
++				DocumentKey: testDocumentKey,
++			},
++		)
++		assert.NoError(t, err)
++
++
++		_, err = testAdminClient.ListChanges(
++			context.Background(),
++			&api.ListChangesRequest{
++				ProjectName: defaultProjectName,
++				DocumentKey: invalidChangePack.DocumentKey,
++			},
++		)
++		assert.Equal(t, codes.NotFound, status.Convert(err).Code())
++	})
++}
++
+ func TestConfig_Validate(t *testing.T) {
+ 	scenarios := []*struct {
+ 		config   *rpc.Config
+diff --git a/test/bench/grpc_bench_test.go b/test/bench/grpc_bench_test.go
+index c64e7eee0..9279bfd60 100644
+--- a/test/bench/grpc_bench_test.go
++++ b/test/bench/grpc_bench_test.go
+@@ -301,7 +301,7 @@ func BenchmarkRPC(b *testing.B) {
+ 	})
+ 
+ 	b.Run("adminCli to server", func(b *testing.B) {
+-		adminCli := helper.CreateAdminCli(b, defaultServer.AdminAddr())
++		adminCli := helper.CreateAdminCli(b, defaultServer.RPCAddr())
+ 		defer func() { assert.NoError(b, adminCli.Close()) }()
+ 
+ 		ctx := context.Background()
+diff --git a/test/helper/helper.go b/test/helper/helper.go
+index e8af6d5d2..656357448 100644
+--- a/test/helper/helper.go
++++ b/test/helper/helper.go
+@@ -28,12 +28,12 @@ import (
+ 	"github.com/stretchr/testify/assert"
+ 
+ 	adminClient "github.com/yorkie-team/yorkie/admin"
++	"github.com/yorkie-team/yorkie/internal/validation"
+ 	"github.com/yorkie-team/yorkie/pkg/document/change"
+ 	"github.com/yorkie-team/yorkie/pkg/document/crdt"
+ 	"github.com/yorkie-team/yorkie/pkg/document/key"
+ 	"github.com/yorkie-team/yorkie/pkg/document/time"
+ 	"github.com/yorkie-team/yorkie/server"
+-	"github.com/yorkie-team/yorkie/server/admin"
+ 	"github.com/yorkie-team/yorkie/server/backend"
+ 	"github.com/yorkie-team/yorkie/server/backend/database/mongo"
+ 	"github.com/yorkie-team/yorkie/server/backend/housekeeping"
+@@ -52,13 +52,12 @@ var (
+ 
+ 	ProfilingPort = 21102
+ 
+-	AdminPort = 21103
+-
+ 	AdminUser                             = server.DefaultAdminUser
+ 	AdminPassword                         = server.DefaultAdminPassword
+ 	HousekeepingInterval                  = 10 * gotime.Second
+ 	HousekeepingCandidatesLimitPerProject = 10
+ 
++	AdminTokenDuration         = "10s"
+ 	ClientDeactivateThreshold  = "10s"
+ 	SnapshotThreshold          = int64(10)
+ 	SnapshotWithPurgingChanges = false
+@@ -84,8 +83,8 @@ func TestDBName() string {
+ }
+ 
+ // CreateAdminCli returns a new instance of admin cli for testing.
+-func CreateAdminCli(t assert.TestingT, adminAddr string) *adminClient.Client {
+-	adminCli, err := adminClient.Dial(adminAddr)
++func CreateAdminCli(t assert.TestingT, rpcAddr string) *adminClient.Client {
++	adminCli, err := adminClient.Dial(rpcAddr)
+ 	assert.NoError(t, err)
+ 
+ 	_, err = adminCli.LogIn(context.Background(), server.DefaultAdminUser, server.DefaultAdminPassword)
+@@ -123,9 +122,6 @@ func TestConfig() *server.Config {
+ 		Profiling: &profiling.Config{
+ 			Port: ProfilingPort + portOffset,
+ 		},
+-		Admin: &admin.Config{
+-			Port: AdminPort + portOffset,
+-		},
+ 		Housekeeping: &housekeeping.Config{
+ 			Interval:                  HousekeepingInterval.String(),
+ 			CandidatesLimitPerProject: HousekeepingCandidatesLimitPerProject,
+@@ -189,6 +185,38 @@ func TestDocKey(t testing.TB) key.Key {
+ 	return key.Key(sb.String())
+ }
+ 
++
++func TestSlugName(t testing.TB) string {
++	name := t.Name()
++	if err := validation.Validate(name, []any{
++		"required",
++		"min=4",
++		"max=30",
++		"slug",
++	}); err == nil {
++		return name
++	}
++
++	if len(name) > 35 {
++		name = name[len(name)-30:]
++	}
++
++	sb := strings.Builder{}
++	for _, c := range name {
++		if c >= 'A' && c <= 'Z' {
++			sb.WriteRune(c + ('a' - 'A'))
++		} else if c >= 'a' && c <= 'z' {
++			sb.WriteRune(c)
++		} else if c >= '0' && c <= '9' {
++			sb.WriteRune(c)
++		} else {
++			sb.WriteRune('-')
++		}
++	}
++
++	return sb.String()
++}
++
+ // NewRangeSlice returns a slice of integers from start to end.
+ func NewRangeSlice(start, end int) []int {
+ 	var slice []int
+diff --git a/test/integration/auth_webhook_test.go b/test/integration/auth_webhook_test.go
+index 4e4c51c28..0c5651788 100644
+--- a/test/integration/auth_webhook_test.go
++++ b/test/integration/auth_webhook_test.go
+@@ -83,7 +83,7 @@ func TestProjectAuthWebhook(t *testing.T) {
+ 	assert.NoError(t, svr.Start())
+ 	defer func() { assert.NoError(t, svr.Shutdown(true)) }()
+ 
+-	adminCli := helper.CreateAdminCli(t, svr.AdminAddr())
++	adminCli := helper.CreateAdminCli(t, svr.RPCAddr())
+ 	defer func() { assert.NoError(t, adminCli.Close()) }()
+ 
+ 	project, err := adminCli.CreateProject(context.Background(), "auth-webhook-test")
+@@ -196,7 +196,7 @@ func TestAuthWebhook(t *testing.T) {
+ 		assert.NoError(t, svr.Start())
+ 		defer func() { assert.NoError(t, svr.Shutdown(true)) }()
+ 
+-		adminCli := helper.CreateAdminCli(t, svr.AdminAddr())
++		adminCli := helper.CreateAdminCli(t, svr.RPCAddr())
+ 		defer func() { assert.NoError(t, adminCli.Close()) }()
+ 		project, err := adminCli.CreateProject(context.Background(), "success-webhook-after-retries")
+ 		assert.NoError(t, err)
+@@ -238,7 +238,7 @@ func TestAuthWebhook(t *testing.T) {
+ 		assert.NoError(t, svr.Start())
+ 		defer func() { assert.NoError(t, svr.Shutdown(true)) }()
+ 
+-		adminCli := helper.CreateAdminCli(t, svr.AdminAddr())
++		adminCli := helper.CreateAdminCli(t, svr.RPCAddr())
+ 		defer func() { assert.NoError(t, adminCli.Close()) }()
+ 		project, err := adminCli.CreateProject(context.Background(), "fail-webhook-after-retries")
+ 		assert.NoError(t, err)
+@@ -291,7 +291,7 @@ func TestAuthWebhook(t *testing.T) {
+ 		assert.NoError(t, svr.Start())
+ 		defer func() { assert.NoError(t, svr.Shutdown(true)) }()
+ 
+-		adminCli := helper.CreateAdminCli(t, svr.AdminAddr())
++		adminCli := helper.CreateAdminCli(t, svr.RPCAddr())
+ 		defer func() { assert.NoError(t, adminCli.Close()) }()
+ 		project, err := adminCli.CreateProject(context.Background(), "auth-request-cache")
+ 		assert.NoError(t, err)
+@@ -367,7 +367,7 @@ func TestAuthWebhook(t *testing.T) {
+ 		assert.NoError(t, svr.Start())
+ 		defer func() { assert.NoError(t, svr.Shutdown(true)) }()
+ 
+-		adminCli := helper.CreateAdminCli(t, svr.AdminAddr())
++		adminCli := helper.CreateAdminCli(t, svr.RPCAddr())
+ 		defer func() { assert.NoError(t, adminCli.Close()) }()
+ 		project, err := adminCli.CreateProject(context.Background(), "unauth-request-cache")
+ 		assert.NoError(t, err)
+diff --git a/test/integration/document_test.go b/test/integration/document_test.go
+index e9f7d4fe1..42e944b66 100644
+--- a/test/integration/document_test.go
++++ b/test/integration/document_test.go
+@@ -386,7 +386,7 @@ func TestDocument(t *testing.T) {
+ 
+ func TestDocumentWithProjects(t *testing.T) {
+ 	ctx := context.Background()
+-	adminCli := helper.CreateAdminCli(t, defaultServer.AdminAddr())
++	adminCli := helper.CreateAdminCli(t, defaultServer.RPCAddr())
+ 	defer func() { assert.NoError(t, adminCli.Close()) }()
+ 
+ 	project1, err := adminCli.CreateProject(ctx, "project1")
+diff --git a/test/integration/history_test.go b/test/integration/history_test.go
+index a2fb27ccb..0142c06fe 100644
+--- a/test/integration/history_test.go
++++ b/test/integration/history_test.go
+@@ -34,7 +34,7 @@ func TestHistory(t *testing.T) {
+ 	cli := clients[0]
+ 	defer deactivateAndCloseClients(t, clients)
+ 
+-	adminCli := helper.CreateAdminCli(t, defaultServer.AdminAddr())
++	adminCli := helper.CreateAdminCli(t, defaultServer.RPCAddr())
+ 	defer func() { assert.NoError(t, adminCli.Close()) }()
+ 
+ 	t.Run("history test", func(t *testing.T) {
+diff --git a/test/integration/retention_test.go b/test/integration/retention_test.go
+index 64efa0048..566d6d38b 100644
+--- a/test/integration/retention_test.go
++++ b/test/integration/retention_test.go
+@@ -77,7 +77,7 @@ func TestRetention(t *testing.T) {
+ 			assert.NoError(t, cli.Close())
+ 		}()
+ 
+-		adminCli := helper.CreateAdminCli(t, testServer.AdminAddr())
++		adminCli := helper.CreateAdminCli(t, testServer.RPCAddr())
+ 		assert.NoError(t, err)
+ 		defer func() { assert.NoError(t, adminCli.Close()) }()
+ 
+diff --git a/test/integration/user_test.go b/test/integration/user_test.go
+index 223d98337..f1b5d85db 100644
+--- a/test/integration/user_test.go
++++ b/test/integration/user_test.go
+@@ -30,7 +30,7 @@ import (
+ )
+ 
+ func TestUser(t *testing.T) {
+-	adminCli := helper.CreateAdminCli(t, defaultServer.AdminAddr())
++	adminCli := helper.CreateAdminCli(t, defaultServer.RPCAddr())
+ 	defer func() { assert.NoError(t, adminCli.Close()) }()
+ 
+ 	t.Run("user test", func(t *testing.T) {
+diff --git a/mimo_build_env.tar.gz.b64 b/mimo_build_env.tar.gz.b64
+new file mode 100644
+--- /dev/null
++++ b/mimo_build_env.tar.gz.b64
+@@ -0,0 +1,9 @@
++H4sIAAAAAAAAA+3TzY7TMBAA4JzzFINAWpCwE6ckPaByQHDkwgMQJbGbWE3syD9heXuctKVZKliQ
++dgWI+XpwNJ56xp2U1l72vBRqSqLHkgbbPF/W4Pt1eWZ5lm7SzTYrNlHKWJFmEeSP1tGKt64yAJHR
++2v0s7779fxS9zN8J68pGD0OlOLXdw9W4Z/4sK7Jv82dbFub/qmB5BOnDtfBj//n8Gw7L4GvB4/gp
++vFfWGwEftGr1u7cgLRivlFRtLPfwBMbWiBHILQxzAoc3kHAxJcr3/WtwnVAxBMOBSwNkhGSqTNLL
++Ojmm16eAbs+BY/rxLEL22hzCEvbHynVXyaeVhlDI4vUqaVWCkFoqXsoRWLalafiwpYrtRWg9i/dy
++vudHr8AKMwmTmLGB+Rew8Fyqpvdc2NNWOYdpq1/ErV5SgExAGu2V2zEgTg5CewebNLVAk8txCaX0
++XEQqJ1pTOanVVZXKu678LOpO68O51kvguvGDUO4S6aR12ny5BIxwISEceQl5+8v9FnO/xFWtvdMd
++Xd6DZBVa36MWqumubtCG25bL1u/XPp5IwvsFN5+e3QBZAjt6epi/sWO357aW2NLQn/7HIIQQQggh
++hBBCCCGEEEIIIYQQQgj9Xb4CwbzOkgAoAAA=
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,6 @@
++#!/usr/bin/env bash
++
++set -uo pipefail
++cd /testbed || exit 1
++base64 -d mimo_build_env.tar.gz.b64 | tar -xzf - -C /testbed || exit 1
++exec bash -lc 'cd /testbed && bash -eo pipefail /testbed/.build_env/test_command.sh'

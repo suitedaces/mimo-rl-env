@@ -1,0 +1,295 @@
+diff --git a/usercase-test-coderl/test_network_estimate_aggregation.py b/usercase-test-coderl/test_network_estimate_aggregation.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/test_network_estimate_aggregation.py
+@@ -0,0 +1,267 @@
++
++
++
++
++
++
++
++from types import SimpleNamespace
++import gc
++
++import networkx as nx
++import pytest
++
++from fpgaconvnet.models.network import Network
++from fpgaconvnet.tools.layer_enum import LAYER_TYPE
++
++
++class BootstrapHW:
++    def __init__(self):
++        self.data_t = SimpleNamespace(width=16)
++        self.input_t = self.data_t
++        self.output_t = self.data_t
++        self.stream_inputs = [False]
++        self.stream_outputs = [False]
++        self.input_compression_ratio = [1]
++        self.output_compression_ratio = [1]
++
++    def update(self):
++        return None
++
++    def streams_in(self):
++        return 1
++
++    def streams_out(self):
++        return 1
++
++    def workload_in(self):
++        return 1
++
++    def workload_out(self):
++        return 1
++
++
++class WorkloadHW:
++    def __init__(self, workload_in, workload_out):
++        self._workload_in = workload_in
++        self._workload_out = workload_out
++
++    def workload_in(self):
++        return self._workload_in
++
++    def workload_out(self):
++        return self._workload_out
++
++
++class ConfiguredPartition:
++    def __init__(
++        self,
++        name,
++        workload_in,
++        workload_out,
++        batch_size,
++        wr_factor,
++        cycle,
++        interval,
++        pipeline_depth,
++    ):
++        self.name = name
++        self.input_nodes = [f"{name}_in"]
++        self.output_nodes = [f"{name}_out"]
++        self.batch_size = batch_size
++        self.wr_factor = wr_factor
++        self._cycle = cycle
++        self._interval = interval
++        self._pipeline_depth = pipeline_depth
++        self.graph = nx.DiGraph()
++        self.graph.add_node(self.input_nodes[0], hw=WorkloadHW(workload_in, 0))
++        self.graph.add_node(self.output_nodes[0], hw=WorkloadHW(0, workload_out))
++        self.graph.add_edge(self.input_nodes[0], self.output_nodes[0])
++
++    def get_cycle(self):
++        return self._cycle
++
++    def get_interval(self):
++        return self._interval
++
++    def get_pipeline_depth(self):
++        return self._pipeline_depth
++
++
++def make_network(batch_size=4):
++    graph = nx.DiGraph()
++    graph.add_node(
++        "bootstrap",
++        type=LAYER_TYPE.NOP,
++        hw=BootstrapHW(),
++        onnx_node=None,
++        onnx_input=[],
++        onnx_output=[],
++    )
++    network = Network("acceptance", model=None, graph=graph, batch_size=batch_size)
++    network.multi_fpga = False
++    return network
++
++
++def configured_network(batch_size=4):
++    network = make_network(batch_size=batch_size)
++    network.partitions = [
++        ConfiguredPartition("p0", 5, 7, 2, 1, 100, 20, 5),
++        ConfiguredPartition("p1", 25, 30, 1, 2, 200, 35, 7),
++        ConfiguredPartition("p2", 4, 9, 3, 1, 50, 12, 11),
++    ]
++    return network
++
++
++def partition_state(network):
++    return [
++        (
++            partition.name,
++            partition.batch_size,
++            partition.wr_factor,
++            partition._cycle,
++            partition._interval,
++            partition._pipeline_depth,
++        )
++        for partition in network.partitions
++    ]
++
++
++def test_memory_usage_uses_max_input_and_weight_reloaded_output_workloads():
++
++
++
++
++    network = configured_network()
++
++    assert network.get_memory_usage_estimate() == 170
++    assert network.batch_size == 4
++    assert partition_state(network) == [
++        ("p0", 2, 1, 100, 20, 5),
++        ("p1", 1, 2, 200, 35, 7),
++        ("p2", 3, 1, 50, 12, 11),
++    ]
++
++
++def test_cycle_aggregation_sequential_and_pipelined_with_selected_partitions():
++
++
++
++
++    network = configured_network()
++
++    assert network.get_cycle(False) == 350
++    assert network.get_cycle(False, partition_list=[0, 2]) == 150
++    assert network.get_cycle(True, partition_list=[0, 1]) == 152
++    assert network.get_cycle(True) == 163
++    assert partition_state(network) == [
++        ("p0", 2, 1, 100, 20, 5),
++        ("p1", 1, 2, 200, 35, 7),
++        ("p2", 3, 1, 50, 12, 11),
++    ]
++
++
++def test_inter_latency_latency_and_throughput_use_current_network_state():
++
++
++
++
++    network = configured_network()
++
++    assert network.get_inter_latency(0.0003, [1]) == 0
++
++    assert network.get_inter_latency(0.0003, [0, 2]) == pytest.approx(0.0006)
++    assert network.get_inter_latency(0.0003) == pytest.approx(0.0009)
++    assert network.get_latency(250, False, 0.0003, [0]) == pytest.approx(4e-07)
++    assert network.get_latency(250, False, 0.0003) == pytest.approx(0.0009014)
++    assert network.get_throughput(250, False, 0.0003, [0]) == pytest.approx(10000000.0)
++    assert network.get_throughput(250, False, 0.0003) == pytest.approx(4437.541601952518)
++    assert network.batch_size == 4
++
++
++def test_get_interval_requires_multi_fpga_and_uses_explicit_partition_indexes():
++
++
++
++
++    network = configured_network()
++
++    with pytest.raises(AssertionError) as exc_info:
++        network.get_interval([0, 1])
++
++    assert "multi" in str(exc_info.value).lower()
++    assert "fpga" in str(exc_info.value).lower()
++
++    network.multi_fpga = True
++    assert network.get_interval([0, 2]) == 20
++    assert network.get_interval([1]) == 35
++
++
++def test_repeated_read_only_estimates_are_idempotent():
++
++
++
++
++    network = configured_network()
++
++    assert network.get_cycle(False) == 350
++
++    assert network.get_latency(250, False, 0.0003) == pytest.approx(0.0009014)
++    assert network.get_memory_usage_estimate() == 170
++    assert network.get_cycle(False) == 350
++    assert network.get_latency(250, False, 0.0003) == pytest.approx(0.0009014)
++    assert network.get_memory_usage_estimate() == 170
++    assert network.batch_size == 4
++    assert partition_state(network) == [
++        ("p0", 2, 1, 100, 20, 5),
++        ("p1", 1, 2, 200, 35, 7),
++        ("p2", 3, 1, 50, 12, 11),
++    ]
++
++
++def test_two_network_instances_keep_independent_partition_state():
++
++
++
++
++    first = make_network(batch_size=2)
++    second = make_network(batch_size=5)
++    first.partitions = [ConfiguredPartition("a0", 2, 3, 1, 1, 40, 8, 4)]
++    second.partitions = [
++        ConfiguredPartition("b0", 6, 5, 2, 3, 70, 9, 6),
++        ConfiguredPartition("b1", 1, 4, 3, 2, 30, 15, 10),
++    ]
++
++    assert first.get_cycle(False) == 40
++    assert second.get_cycle(False) == 100
++
++    first.partitions.append(ConfiguredPartition("a1", 7, 2, 2, 1, 60, 11, 5))
++
++    assert first.get_cycle(False) == 100
++    assert second.get_cycle(False) == 100
++    assert second.get_memory_usage_estimate() == 84
++    assert second.batch_size == 5
++    assert partition_state(second) == [
++        ("b0", 2, 3, 70, 9, 6),
++        ("b1", 3, 2, 30, 15, 10),
++    ]
++
++
++def test_repeated_construct_use_drop_cycles_preserve_partition_state():
++
++
++
++
++    gc.collect()
++
++    for _ in range(150):
++        network = configured_network()
++        before_state = partition_state(network)
++        assert network.get_cycle(False) == 350
++        assert network.get_memory_usage_estimate() == 170
++
++        assert network.batch_size == 4
++        assert partition_state(network) == before_state
++        del network
++
++    gc.collect()
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,18 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++
++cd /workspace/repo
++export PYTHONPATH="/workspace/repo${PYTHONPATH:+:${PYTHONPATH}}"
++export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
++export PIP_DISABLE_PIP_VERSION_CHECK=1
++exec /usr/local/bin/python -m pytest /workspace/repo/usercase-test-coderl/test_network_estimate_aggregation.py -v

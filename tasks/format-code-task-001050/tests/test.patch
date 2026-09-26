@@ -1,0 +1,269 @@
+diff --git a/lib/lru/contract_test.go b/lib/lru/contract_test.go
+new file mode 100644
+index 00000000..ca343590
+--- /dev/null
++++ b/lib/lru/contract_test.go
+@@ -0,0 +1,253 @@
++package lru
++
++import (
++	"reflect"
++	"testing"
++)
++
++type contractValue string
++
++func (v contractValue) Len() int { return len(v) }
++
++type managedCache interface {
++	Bytes() int64
++	Remove(string) bool
++	Purge()
++	Resize(int64) int
++}
++
++func managementAPI(t *testing.T, c *Cache) managedCache {
++	t.Helper()
++	api, ok := interface{}(c).(managedCache)
++	if !ok {
++		t.Fatalf("*Cache must expose Bytes, Remove, Purge, and Resize management methods")
++	}
++	return api
++}
++
++func requireValue(t *testing.T, c *Cache, key, want string) {
++	t.Helper()
++	value, ok := c.Get(key)
++	if !ok || string(value.(contractValue)) != want {
++		t.Fatalf("Get(%q) = (%v, %v), want (%q, true)", key, value, ok, want)
++	}
++}
++
++func requireMissing(t *testing.T, c *Cache, key string) {
++	t.Helper()
++	if value, ok := c.Get(key); ok {
++		t.Fatalf("Get(%q) = (%v, true), want a miss", key, value)
++	}
++}
++
++func TestManagedCacheReplacementAccounting(t *testing.T) {
++	var evicted []string
++	c := New(10, func(key string, value Value) {
++		evicted = append(evicted, key+"="+string(value.(contractValue)))
++	})
++	api := managementAPI(t, c)
++
++	c.Add("a", contractValue("111"))
++	c.Add("b", contractValue("22"))
++	requireValue(t, c, "a", "111")
++	c.Add("a", contractValue("12345678"))
++
++	requireMissing(t, c, "b")
++	requireValue(t, c, "a", "12345678")
++	if api.Bytes() != 9 || c.Len() != 1 {
++		t.Fatalf("after growing replacement: Bytes=%d Len=%d, want 9 and 1", api.Bytes(), c.Len())
++	}
++	if !reflect.DeepEqual(evicted, []string{"b=22"}) {
++		t.Fatalf("replacement callbacks = %v, want [b=22]", evicted)
++	}
++
++	c.Add("a", contractValue("x"))
++	c.Add("c", contractValue("1234567"))
++	if api.Bytes() != 10 || c.Len() != 2 {
++		t.Fatalf("after shrinking replacement: Bytes=%d Len=%d, want 10 and 2", api.Bytes(), c.Len())
++	}
++	if len(evicted) != 1 {
++		t.Fatalf("replacing an existing key must not itself invoke OnEvicted: %v", evicted)
++	}
++}
++
++func TestManagedCacheGetControlsRecency(t *testing.T) {
++	var evicted []string
++	c := New(6, func(key string, _ Value) { evicted = append(evicted, key) })
++	api := managementAPI(t, c)
++	c.Add("a", contractValue("aa"))
++	c.Add("b", contractValue("bb"))
++	requireValue(t, c, "a", "aa")
++	c.Add("c", contractValue("cc"))
++
++	requireMissing(t, c, "b")
++	requireValue(t, c, "a", "aa")
++	requireValue(t, c, "c", "cc")
++	if api.Bytes() != 6 || !reflect.DeepEqual(evicted, []string{"b"}) {
++		t.Fatalf("Bytes=%d callbacks=%v, want 6 and [b]", api.Bytes(), evicted)
++	}
++}
++
++func TestManagedCacheOversizedEntryEviction(t *testing.T) {
++	var evicted []string
++	c := New(5, func(key string, _ Value) { evicted = append(evicted, key) })
++	api := managementAPI(t, c)
++	c.Add("a", contractValue("aa"))
++	c.Add("z", contractValue("123456"))
++
++	if c.Len() != 0 || api.Bytes() != 0 {
++		t.Fatalf("oversized add left Len=%d Bytes=%d, want both zero", c.Len(), api.Bytes())
++	}
++	if !reflect.DeepEqual(evicted, []string{"a", "z"}) {
++		t.Fatalf("oversized eviction order = %v, want [a z]", evicted)
++	}
++}
++
++func TestManagedCacheRemove(t *testing.T) {
++	var evicted []string
++	c := New(0, func(key string, value Value) {
++		evicted = append(evicted, key+"="+string(value.(contractValue)))
++	})
++	api := managementAPI(t, c)
++	c.Add("alpha", contractValue("one"))
++	c.Add("beta", contractValue("xx"))
++
++	if !api.Remove("alpha") {
++		t.Fatal("Remove(alpha) = false, want true")
++	}
++	if api.Remove("alpha") || api.Remove("missing") {
++		t.Fatal("Remove must return false for an absent key")
++	}
++	requireMissing(t, c, "alpha")
++	requireValue(t, c, "beta", "xx")
++	if c.Len() != 1 || api.Bytes() != 6 {
++		t.Fatalf("after Remove: Len=%d Bytes=%d, want 1 and 6", c.Len(), api.Bytes())
++	}
++	if !reflect.DeepEqual(evicted, []string{"alpha=one"}) {
++		t.Fatalf("Remove callbacks = %v, want [alpha=one]", evicted)
++	}
++}
++
++func TestManagedCacheResizeAndUnlimitedMode(t *testing.T) {
++	var evicted []string
++	c := New(0, func(key string, _ Value) { evicted = append(evicted, key) })
++	api := managementAPI(t, c)
++	for _, key := range []string{"a", "b", "c"} {
++		c.Add(key, contractValue("xx"))
++	}
++	requireValue(t, c, "a", "xx")
++
++	if got := api.Resize(6); got != 1 {
++		t.Fatalf("Resize(6) evicted %d entries, want 1", got)
++	}
++	requireMissing(t, c, "b")
++	c.Add("d", contractValue("xx"))
++	requireMissing(t, c, "c")
++	if api.Bytes() != 6 || !reflect.DeepEqual(evicted, []string{"b", "c"}) {
++		t.Fatalf("after bounded adds: Bytes=%d callbacks=%v, want 6 and [b c]", api.Bytes(), evicted)
++	}
++
++	if got := api.Resize(20); got != 0 {
++		t.Fatalf("Resize(20) evicted %d entries, want 0", got)
++	}
++	if c.Len() != 2 || api.Bytes() != 6 || len(evicted) != 2 {
++		t.Fatalf("growing limit changed Len=%d Bytes=%d callbacks=%v", c.Len(), api.Bytes(), evicted)
++	}
++
++	if got := api.Resize(0); got != 0 {
++		t.Fatalf("Resize(0) evicted %d entries, want 0", got)
++	}
++	c.Add("huge", contractValue("12345678901234567890"))
++	if c.Len() != 3 || api.Bytes() != 30 {
++		t.Fatalf("unlimited cache has Len=%d Bytes=%d, want 3 and 30", c.Len(), api.Bytes())
++	}
++}
++
++func TestManagedCachePurgeOrderAndIdempotence(t *testing.T) {
++	var evicted []string
++	c := New(0, func(key string, _ Value) { evicted = append(evicted, key) })
++	api := managementAPI(t, c)
++	for _, key := range []string{"a", "b", "c"} {
++		c.Add(key, contractValue("x"))
++	}
++	requireValue(t, c, "a", "x")
++	api.Purge()
++	api.Purge()
++
++	if c.Len() != 0 || api.Bytes() != 0 {
++		t.Fatalf("Purge left Len=%d Bytes=%d, want both zero", c.Len(), api.Bytes())
++	}
++	if !reflect.DeepEqual(evicted, []string{"b", "c", "a"}) {
++		t.Fatalf("Purge callback order = %v, want [b c a]", evicted)
++	}
++}
++
++func TestManagedCacheCallbackSeesFinalizedState(t *testing.T) {
++	t.Run("Remove", func(t *testing.T) {
++		var c *Cache
++		var observed bool
++		c = New(10, func(key string, _ Value) {
++			api := managementAPI(t, c)
++			_, present := c.Get(key)
++			observed = !present && c.Len() == 0 && api.Bytes() == 0
++		})
++		api := managementAPI(t, c)
++		c.Add("key", contractValue("value"))
++		if !api.Remove("key") || !observed {
++			t.Fatal("Remove callback ran before cache state was finalized")
++		}
++	})
++
++	t.Run("Add eviction", func(t *testing.T) {
++		var c *Cache
++		var observed bool
++		c = New(2, func(key string, _ Value) {
++			api := managementAPI(t, c)
++			_, present := c.Get(key)
++			observed = !present && c.Len() == 1 && api.Bytes() == 2
++		})
++		c.Add("a", contractValue("x"))
++		c.Add("b", contractValue("y"))
++		if !observed {
++			t.Fatal("Add eviction callback ran before cache state was finalized")
++		}
++	})
++
++	t.Run("Resize", func(t *testing.T) {
++		var c *Cache
++		var observed bool
++		c = New(0, func(key string, _ Value) {
++			api := managementAPI(t, c)
++			_, present := c.Get(key)
++			observed = !present && c.Len() == 1 && api.Bytes() == 2
++		})
++		api := managementAPI(t, c)
++		c.Add("a", contractValue("x"))
++		c.Add("b", contractValue("y"))
++		if api.Resize(2) != 1 || !observed {
++			t.Fatal("Resize callback ran before cache state was finalized")
++		}
++	})
++
++	t.Run("Purge", func(t *testing.T) {
++		var c *Cache
++		callback := 0
++		c = New(0, func(key string, _ Value) {
++			api := managementAPI(t, c)
++			_, present := c.Get(key)
++			callback++
++			wantLen := 2 - callback
++			wantBytes := int64(wantLen * 2)
++			if present || c.Len() != wantLen || api.Bytes() != wantBytes {
++				t.Fatalf("Purge callback %d saw present=%v Len=%d Bytes=%d", callback, present, c.Len(), api.Bytes())
++			}
++		})
++		api := managementAPI(t, c)
++		c.Add("a", contractValue("x"))
++		c.Add("b", contractValue("y"))
++		api.Purge()
++		if callback != 2 {
++			t.Fatalf("Purge produced %d callbacks, want 2", callback)
++		}
++	})
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,5 @@
++#!/bin/bash
++set -euo pipefail
++
++
++go test ./lib/lru

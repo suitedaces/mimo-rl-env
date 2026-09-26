@@ -1,0 +1,702 @@
+diff --git a/mongodbatlas/project_api_keys_hidden_test.go b/mongodbatlas/project_api_keys_hidden_test.go
+new file mode 100644
+index 000000000..e97e9d99e
+--- /dev/null
++++ b/mongodbatlas/project_api_keys_hidden_test.go
+@@ -0,0 +1,668 @@
++package mongodbatlas
++
++import (
++	"context"
++	"encoding/json"
++	"fmt"
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"os"
++	"reflect"
++	"regexp"
++	"sort"
++	"strings"
++	"testing"
++
++	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/acctest"
++	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/resource"
++	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
++	"github.com/hashicorp/terraform-plugin-sdk/v2/terraform"
++)
++
++func TestProjectAPIKeysLocalResourceAssignsAllDeclaredKeysAndRoles(t *testing.T) {
++	assignments := map[string][]string{}
++	server := newProjectAPIKeysLocalServer(t, assignments, 0)
++	defer server.Close()
++
++	r := resourceMongoDBAtlasProject()
++	d := schema.TestResourceDataRaw(t, r.Schema, map[string]interface{}{
++		"name":   "project-with-api-keys",
++		"org_id": "org-id",
++		"api_keys": []interface{}{
++			map[string]interface{}{
++				"api_key_id": "key-1",
++				"role_names": []interface{}{"GROUP_READ_ONLY"},
++			},
++			map[string]interface{}{
++				"api_key_id": "key-2",
++				"role_names": []interface{}{"GROUP_DATA_ACCESS_READ_ONLY", "GROUP_CLUSTER_MANAGER"},
++			},
++		},
++	})
++
++	diags := resourceMongoDBAtlasProjectCreate(context.Background(), d, testProjectAPIKeysClient(t, server.URL))
++	if diags.HasError() {
++		t.Fatalf("resource create returned diagnostics: %#v", diags)
++	}
++
++	expected := map[string][]string{
++		"key-1": {"GROUP_READ_ONLY"},
++		"key-2": {"GROUP_DATA_ACCESS_READ_ONLY", "GROUP_CLUSTER_MANAGER"},
++	}
++	assertStringSliceMap(t, expected, assignments)
++}
++
++func TestProjectAPIKeysLocalCreateReportsAssignErrorPrefix(t *testing.T) {
++	server := newProjectAPIKeysLocalServer(t, map[string][]string{}, http.StatusInternalServerError)
++	defer server.Close()
++
++	r := resourceMongoDBAtlasProject()
++	d := schema.TestResourceDataRaw(t, r.Schema, map[string]interface{}{
++		"name":   "project-with-api-key-error",
++		"org_id": "org-id",
++		"api_keys": []interface{}{
++			map[string]interface{}{
++				"api_key_id": "bad-key",
++				"role_names": []interface{}{"GROUP_READ_ONLY"},
++			},
++		},
++	})
++
++	diags := resourceMongoDBAtlasProjectCreate(context.Background(), d, testProjectAPIKeysClient(t, server.URL))
++	if !diags.HasError() {
++		t.Fatalf("expected assignment diagnostic, got none")
++	}
++	if !strings.HasPrefix(diags[0].Summary, "error assigning api keys to the project:") {
++		t.Fatalf("assignment diagnostic prefix mismatch: %q", diags[0].Summary)
++	}
++}
++
++func TestProjectAPIKeysLocalProjectDataSourceReadback(t *testing.T) {
++	server := newProjectAPIKeysLocalServer(t, map[string][]string{}, 0)
++	defer server.Close()
++
++	ds := dataSourceMongoDBAtlasProject()
++	d := schema.TestResourceDataRaw(t, ds.Schema, map[string]interface{}{
++		"project_id": "project-id",
++	})
++
++	diags := dataSourceMongoDBAtlasProjectRead(context.Background(), d, testProjectAPIKeysClient(t, server.URL))
++	if diags.HasError() {
++		t.Fatalf("project data source read returned diagnostics: %#v", diags)
++	}
++
++	expected := map[string][]string{
++		"key-1": {"GROUP_READ_ONLY"},
++		"key-2": {"GROUP_DATA_ACCESS_READ_ONLY", "GROUP_CLUSTER_MANAGER"},
++	}
++	assertStringSliceMap(t, expected, apiKeysFromResourceData(t, d, "api_keys"))
++}
++
++func TestProjectAPIKeysLocalProjectsDataSourceReadback(t *testing.T) {
++	server := newProjectAPIKeysLocalServer(t, map[string][]string{}, 0)
++	defer server.Close()
++
++	ds := dataSourceMongoDBAtlasProjects()
++	d := schema.TestResourceDataRaw(t, ds.Schema, map[string]interface{}{})
++
++	diags := dataSourceMongoDBAtlasProjectsRead(context.Background(), d, testProjectAPIKeysClient(t, server.URL))
++	if diags.HasError() {
++		t.Fatalf("projects data source read returned diagnostics: %#v", diags)
++	}
++
++	results := d.Get("results").([]interface{})
++	if len(results) != 1 {
++		t.Fatalf("expected one project result, got %d: %#v", len(results), results)
++	}
++	project := results[0].(map[string]interface{})
++	if project["name"] != "project-with-api-keys" {
++		t.Fatalf("unexpected project result: %#v", project)
++	}
++
++	expected := map[string][]string{
++		"key-1": {"GROUP_READ_ONLY"},
++		"key-2": {"GROUP_DATA_ACCESS_READ_ONLY", "GROUP_CLUSTER_MANAGER"},
++	}
++	assertStringSliceMap(t, expected, apiKeysFromRawValue(t, project["api_keys"]))
++}
++
++func TestAccResourceMongoDBAtlasProject_apiKeysOnCreate(t *testing.T) {
++	projectName := fmt.Sprintf("test-acc-project-api-keys-%s", acctest.RandString(8))
++	orgID := os.Getenv("MONGODB_ATLAS_ORG_ID")
++	apiKeyIDs := testAccAPIKeyIDs(t, 2)
++
++	expected := map[string][]string{
++		apiKeyIDs[0]: {"GROUP_READ_ONLY"},
++		apiKeyIDs[1]: {"GROUP_DATA_ACCESS_READ_ONLY", "GROUP_CLUSTER_MANAGER"},
++	}
++
++	resource.ParallelTest(t, resource.TestCase{
++		PreCheck:          func() { testAccPreCheck(t) },
++		ProviderFactories: testAccProviderFactories,
++		CheckDestroy:      testAccCheckMongoDBAtlasProjectDestroy,
++		Steps: []resource.TestStep{
++			{
++				Config: testAccProjectAPIKeysConfigWithProjectDS(projectName, orgID, expected, "created", true),
++				Check: resource.ComposeTestCheckFunc(
++					resource.TestCheckResourceAttrSet("mongodbatlas_project.test", "id"),
++					testAccCheckAPIKeysInState("data.mongodbatlas_project.created", expected),
++					testAccCheckNoOrgRoles("data.mongodbatlas_project.created"),
++				),
++			},
++		},
++	})
++}
++
++func TestAccResourceMongoDBAtlasProject_apiKeysAssignError(t *testing.T) {
++	projectName := fmt.Sprintf("test-acc-project-api-key-error-%s", acctest.RandString(8))
++	orgID := os.Getenv("MONGODB_ATLAS_ORG_ID")
++
++	resource.ParallelTest(t, resource.TestCase{
++		PreCheck:          func() { testAccPreCheck(t) },
++		ProviderFactories: testAccProviderFactories,
++		CheckDestroy:      testAccCheckMongoDBAtlasProjectDestroy,
++		Steps: []resource.TestStep{
++			{
++				Config: testAccProjectAPIKeysResourceConfig(projectName, orgID, map[string][]string{
++					"000000000000000000000000": {"GROUP_READ_ONLY"},
++				}),
++
++				ExpectError: regexp.MustCompile(`error assigning api keys to the project:`),
++			},
++		},
++	})
++}
++
++func TestAccDataSourceMongoDBAtlasProject_apiKeysByID(t *testing.T) {
++	projectName := fmt.Sprintf("test-acc-ds-project-api-keys-id-%s", acctest.RandString(8))
++	orgID := os.Getenv("MONGODB_ATLAS_ORG_ID")
++	apiKeyIDs := testAccAPIKeyIDs(t, 2)
++
++	expected := map[string][]string{
++		apiKeyIDs[0]: {"GROUP_READ_ONLY"},
++		apiKeyIDs[1]: {"GROUP_OWNER"},
++	}
++
++	resource.ParallelTest(t, resource.TestCase{
++		PreCheck:          func() { testAccPreCheck(t) },
++		ProviderFactories: testAccProviderFactories,
++		CheckDestroy:      testAccCheckMongoDBAtlasProjectDestroy,
++		Steps: []resource.TestStep{
++			{
++				Config: testAccProjectAPIKeysConfigWithProjectDS(projectName, orgID, expected, "by_id", true),
++				Check: resource.ComposeTestCheckFunc(
++					testAccCheckAPIKeysInState("data.mongodbatlas_project.by_id", expected),
++					testAccCheckNoOrgRoles("data.mongodbatlas_project.by_id"),
++				),
++			},
++		},
++	})
++}
++
++func TestAccDataSourceMongoDBAtlasProject_apiKeysByName(t *testing.T) {
++	projectName := fmt.Sprintf("test-acc-ds-project-api-keys-name-%s", acctest.RandString(8))
++	orgID := os.Getenv("MONGODB_ATLAS_ORG_ID")
++	apiKeyIDs := testAccAPIKeyIDs(t, 2)
++
++	expected := map[string][]string{
++		apiKeyIDs[0]: {"GROUP_DATA_ACCESS_READ_ONLY"},
++		apiKeyIDs[1]: {"GROUP_CLUSTER_MANAGER", "GROUP_READ_ONLY"},
++	}
++
++	resource.ParallelTest(t, resource.TestCase{
++		PreCheck:          func() { testAccPreCheck(t) },
++		ProviderFactories: testAccProviderFactories,
++		CheckDestroy:      testAccCheckMongoDBAtlasProjectDestroy,
++		Steps: []resource.TestStep{
++			{
++				Config: testAccProjectAPIKeysConfigWithProjectDS(projectName, orgID, expected, "by_name", false),
++				Check: resource.ComposeTestCheckFunc(
++					testAccCheckAPIKeysInState("data.mongodbatlas_project.by_name", expected),
++					testAccCheckNoOrgRoles("data.mongodbatlas_project.by_name"),
++				),
++			},
++		},
++	})
++}
++
++func TestAccDataSourceMongoDBAtlasProject_apiKeysFilterOrgRoles(t *testing.T) {
++	projectName := fmt.Sprintf("test-acc-ds-project-api-keys-filter-%s", acctest.RandString(8))
++	orgID := os.Getenv("MONGODB_ATLAS_ORG_ID")
++	apiKeyIDs := testAccAPIKeyIDs(t, 1)
++
++	expected := map[string][]string{
++		apiKeyIDs[0]: {"GROUP_READ_ONLY"},
++	}
++
++	resource.ParallelTest(t, resource.TestCase{
++		PreCheck:          func() { testAccPreCheck(t) },
++		ProviderFactories: testAccProviderFactories,
++		CheckDestroy:      testAccCheckMongoDBAtlasProjectDestroy,
++		Steps: []resource.TestStep{
++			{
++				Config: testAccProjectAPIKeysConfigWithProjectDS(projectName, orgID, expected, "filtered", true),
++				Check: resource.ComposeTestCheckFunc(
++					testAccCheckAPIKeysInState("data.mongodbatlas_project.filtered", expected),
++					testAccCheckNoOrgRoles("data.mongodbatlas_project.filtered"),
++				),
++			},
++		},
++	})
++}
++
++func TestAccDataSourceMongoDBAtlasProjects_apiKeys(t *testing.T) {
++	projectName := fmt.Sprintf("test-acc-ds-projects-api-keys-%s", acctest.RandString(8))
++	orgID := os.Getenv("MONGODB_ATLAS_ORG_ID")
++	apiKeyIDs := testAccAPIKeyIDs(t, 2)
++
++	expected := map[string][]string{
++		apiKeyIDs[0]: {"GROUP_READ_ONLY"},
++		apiKeyIDs[1]: {"GROUP_DATA_ACCESS_READ_ONLY", "GROUP_CLUSTER_MANAGER"},
++	}
++
++	resource.ParallelTest(t, resource.TestCase{
++		PreCheck:          func() { testAccPreCheck(t) },
++		ProviderFactories: testAccProviderFactories,
++		CheckDestroy:      testAccCheckMongoDBAtlasProjectDestroy,
++		Steps: []resource.TestStep{
++			{
++				Config: fmt.Sprintf(`
++%s
++
++data "mongodbatlas_projects" "all" {
++	depends_on = [mongodbatlas_project.test]
++}
++`, testAccProjectAPIKeysResourceConfig(projectName, orgID, expected)),
++				Check: resource.ComposeTestCheckFunc(
++					testAccCheckProjectsResultAPIKeys("data.mongodbatlas_projects.all", projectName, expected),
++				),
++			},
++		},
++	})
++}
++
++func TestReadmeProjectEnvVarsMentionAPIKeyIDs(t *testing.T) {
++	content, err := os.ReadFile("../README.md")
++	if err != nil {
++		t.Fatalf("reading README.md: %s", err)
++	}
++
++	readme := string(content)
++	sectionStart := strings.Index(readme, "For `Project(s)` resource configuration:")
++	if sectionStart < 0 {
++		t.Fatalf("README.md does not contain Project(s) resource configuration section")
++	}
++	section := readme[sectionStart:]
++	if next := strings.Index(section[len("For `Project(s)` resource configuration:"):], "\n- "); next >= 0 {
++		section = section[:len("For `Project(s)` resource configuration:")+next]
++	}
++
++	if !strings.Contains(section, "MONGODB_ATLAS_API_KEYS_IDS=<API_KEYS_IDS>") {
++		t.Fatalf("README Project(s) resource configuration section must mention MONGODB_ATLAS_API_KEYS_IDS=<API_KEYS_IDS>")
++	}
++}
++
++func testAccCheckAPIKeysInState(resourceName string, expected map[string][]string) resource.TestCheckFunc {
++	return func(s *terraform.State) error {
++		rs, ok := s.RootModule().Resources[resourceName]
++		if !ok {
++			return fmt.Errorf("resource %s not found in state", resourceName)
++		}
++
++		actual, err := collectAPIKeysFromAttributes(rs.Primary.Attributes, "api_keys")
++		if err != nil {
++			return fmt.Errorf("%s: %w", resourceName, err)
++		}
++		return compareAPIKeys(expected, actual)
++	}
++}
++
++func testAccCheckProjectsResultAPIKeys(resourceName, projectName string, expected map[string][]string) resource.TestCheckFunc {
++	return func(s *terraform.State) error {
++		rs, ok := s.RootModule().Resources[resourceName]
++		if !ok {
++			return fmt.Errorf("resource %s not found in state", resourceName)
++		}
++
++		count := atoiStateValue(rs.Primary.Attributes["results.#"])
++		for i := 0; i < count; i++ {
++			prefix := fmt.Sprintf("results.%d", i)
++			if rs.Primary.Attributes[prefix+".name"] != projectName {
++				continue
++			}
++			actual, err := collectAPIKeysFromAttributes(rs.Primary.Attributes, prefix+".api_keys")
++			if err != nil {
++				return fmt.Errorf("%s result %q: %w", resourceName, projectName, err)
++			}
++			if err := compareAPIKeys(expected, actual); err != nil {
++				return err
++			}
++			return testAccCheckNoOrgRolesInAttributes(rs.Primary.Attributes, prefix+".api_keys")
++		}
++		return fmt.Errorf("project %q not found in %s results", projectName, resourceName)
++	}
++}
++
++func testAccCheckNoOrgRoles(resourceName string) resource.TestCheckFunc {
++	return func(s *terraform.State) error {
++		rs, ok := s.RootModule().Resources[resourceName]
++		if !ok {
++			return fmt.Errorf("resource %s not found in state", resourceName)
++		}
++		return testAccCheckNoOrgRolesInAttributes(rs.Primary.Attributes, "api_keys")
++	}
++}
++
++func testAccCheckNoOrgRolesInAttributes(attrs map[string]string, apiKeysPrefix string) error {
++	for attr, value := range attrs {
++		if !strings.HasPrefix(attr, apiKeysPrefix+".") || !strings.Contains(attr, ".role_names.") {
++			continue
++		}
++		if strings.HasPrefix(value, "ORG_") {
++			return fmt.Errorf("unexpected org-level role %q in %s", value, attr)
++		}
++	}
++	return nil
++}
++
++func collectAPIKeysFromAttributes(attrs map[string]string, apiKeysPrefix string) (map[string][]string, error) {
++	count := atoiStateValue(attrs[apiKeysPrefix+".#"])
++	if count == 0 {
++		return map[string][]string{}, nil
++	}
++
++	actual := make(map[string][]string)
++	for i := 0; i < count; i++ {
++		prefix := fmt.Sprintf("%s.%d", apiKeysPrefix, i)
++		id := attrs[prefix+".api_key_id"]
++		if id == "" {
++			return nil, fmt.Errorf("missing api_key_id at %s", prefix)
++		}
++		roleCount := atoiStateValue(attrs[prefix+".role_names.#"])
++		roles := make([]string, 0, roleCount)
++		for j := 0; j < roleCount; j++ {
++			if role := attrs[fmt.Sprintf("%s.role_names.%d", prefix, j)]; role != "" {
++				roles = append(roles, role)
++			}
++		}
++		sort.Strings(roles)
++		actual[id] = roles
++	}
++	return actual, nil
++}
++
++func compareAPIKeys(expected, actual map[string][]string) error {
++	if len(actual) != len(expected) {
++		return fmt.Errorf("expected %d api keys, got %d: %#v", len(expected), len(actual), actual)
++	}
++	for id, expectedRoles := range expected {
++		actualRoles, ok := actual[id]
++		if !ok {
++			return fmt.Errorf("expected api key %q not found in %#v", id, actual)
++		}
++		if !sameStringSet(expectedRoles, actualRoles) {
++			return fmt.Errorf("api key %q roles mismatch: expected %#v, got %#v", id, expectedRoles, actualRoles)
++		}
++	}
++	return nil
++}
++
++func sameStringSet(expected, actual []string) bool {
++	expectedCopy := append([]string(nil), expected...)
++	actualCopy := append([]string(nil), actual...)
++	sort.Strings(expectedCopy)
++	sort.Strings(actualCopy)
++	if len(expectedCopy) != len(actualCopy) {
++		return false
++	}
++	for i := range expectedCopy {
++		if expectedCopy[i] != actualCopy[i] {
++			return false
++		}
++	}
++	return true
++}
++
++func testAccAPIKeyIDs(t *testing.T, min int) []string {
++	t.Helper()
++	raw := os.Getenv("MONGODB_ATLAS_API_KEYS_IDS")
++	if raw == "" {
++		t.Skip("MONGODB_ATLAS_API_KEYS_IDS must be set for project API-key acceptance tests")
++	}
++
++	parts := strings.Split(raw, ",")
++	ids := make([]string, 0, len(parts))
++	for _, part := range parts {
++		if trimmed := strings.TrimSpace(part); trimmed != "" {
++			ids = append(ids, trimmed)
++		}
++	}
++	if len(ids) < min {
++		t.Skipf("MONGODB_ATLAS_API_KEYS_IDS must contain at least %d API key IDs", min)
++	}
++	return ids
++}
++
++func testAccProjectAPIKeysResourceConfig(projectName, orgID string, apiKeys map[string][]string) string {
++	var blocks strings.Builder
++	for _, id := range sortedMapKeys(apiKeys) {
++		blocks.WriteString(fmt.Sprintf(`
++	api_keys {
++		api_key_id = %q
++		role_names = %s
++	}
++`, id, hclStringList(apiKeys[id])))
++	}
++
++	return fmt.Sprintf(`
++resource "mongodbatlas_project" "test" {
++	name   = %q
++	org_id = %q
++%s
++}
++`, projectName, orgID, blocks.String())
++}
++
++func testAccProjectAPIKeysConfigWithProjectDS(projectName, orgID string, apiKeys map[string][]string, dsName string, byID bool) string {
++	lookup := `name = mongodbatlas_project.test.name`
++	if byID {
++		lookup = `project_id = mongodbatlas_project.test.id`
++	}
++
++	return fmt.Sprintf(`
++%s
++
++data "mongodbatlas_project" "%s" {
++	%s
++	depends_on = [mongodbatlas_project.test]
++}
++`, testAccProjectAPIKeysResourceConfig(projectName, orgID, apiKeys), dsName, lookup)
++}
++
++func sortedMapKeys(m map[string][]string) []string {
++	keys := make([]string, 0, len(m))
++	for k := range m {
++		keys = append(keys, k)
++	}
++	sort.Strings(keys)
++	return keys
++}
++
++func hclStringList(values []string) string {
++	quoted := make([]string, len(values))
++	for i, value := range values {
++		quoted[i] = fmt.Sprintf("%q", value)
++	}
++	return "[" + strings.Join(quoted, ", ") + "]"
++}
++
++func atoiStateValue(value string) int {
++	var n int
++	_, _ = fmt.Sscanf(value, "%d", &n)
++	return n
++}
++
++func testProjectAPIKeysClient(t *testing.T, baseURL string) *MongoDBClient {
++	t.Helper()
++	cfg := &Config{
++		PublicKey:  "public",
++		PrivateKey: "private",
++		BaseURL:    baseURL + "/",
++	}
++	client, diags := cfg.NewClient(context.Background())
++	if diags.HasError() {
++		t.Fatalf("creating test MongoDB client: %#v", diags)
++	}
++	return client.(*MongoDBClient)
++}
++
++func newProjectAPIKeysLocalServer(t *testing.T, assignments map[string][]string, assignStatus int) *httptest.Server {
++	t.Helper()
++	projectJSON := map[string]interface{}{
++		"id":           "project-id",
++		"orgId":        "org-id",
++		"name":         "project-with-api-keys",
++		"clusterCount": 0,
++		"created":      "2021-01-01T00:00:00Z",
++	}
++	teamsJSON := map[string]interface{}{
++		"links":      []interface{}{},
++		"results":    []interface{}{},
++		"totalCount": 0,
++	}
++	apiKeysJSON := map[string]interface{}{
++		"links": []interface{}{},
++		"results": []interface{}{
++			map[string]interface{}{
++				"id": "key-1",
++				"roles": []interface{}{
++					map[string]interface{}{"roleName": "GROUP_READ_ONLY"},
++					map[string]interface{}{"roleName": "ORG_MEMBER"},
++				},
++			},
++			map[string]interface{}{
++				"id": "key-2",
++				"roles": []interface{}{
++					map[string]interface{}{"roleName": "GROUP_DATA_ACCESS_READ_ONLY"},
++					map[string]interface{}{"roleName": "GROUP_CLUSTER_MANAGER"},
++					map[string]interface{}{"roleName": "ORG_OWNER"},
++				},
++			},
++		},
++		"totalCount": 2,
++	}
++
++	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		w.Header().Set("Content-Type", "application/json")
++		switch {
++		case r.Method == http.MethodPost && r.URL.Path == "/api/atlas/v1.0/groups":
++			writeJSON(t, w, projectJSON)
++		case r.Method == http.MethodGet && r.URL.Path == "/api/atlas/v1.0/groups":
++			writeJSON(t, w, map[string]interface{}{
++				"links":      []interface{}{},
++				"results":    []interface{}{projectJSON},
++				"totalCount": 1,
++			})
++		case r.Method == http.MethodGet && r.URL.Path == "/api/atlas/v1.0/groups/project-id":
++			writeJSON(t, w, projectJSON)
++		case r.Method == http.MethodGet && r.URL.Path == "/api/atlas/v1.0/groups/project-id/teams":
++			writeJSON(t, w, teamsJSON)
++		case r.Method == http.MethodGet && r.URL.Path == "/api/atlas/v1.0/groups/project-id/apiKeys":
++			writeJSON(t, w, apiKeysJSON)
++		case r.Method == http.MethodPatch && strings.HasPrefix(r.URL.Path, "/api/atlas/v1.0/groups/project-id/apiKeys/"):
++			keyID := strings.TrimPrefix(r.URL.Path, "/api/atlas/v1.0/groups/project-id/apiKeys/")
++			var body struct {
++				Roles []string `json:"roles"`
++			}
++			raw, err := io.ReadAll(r.Body)
++			if err != nil {
++				t.Fatalf("reading assign body: %s", err)
++			}
++			if err := json.Unmarshal(raw, &body); err != nil {
++				t.Fatalf("decoding assign body %q: %s", string(raw), err)
++			}
++			assignments[keyID] = append([]string(nil), body.Roles...)
++			if assignStatus != 0 {
++				http.Error(w, `{"error":"assign failed"}`, assignStatus)
++				return
++			}
++			w.WriteHeader(http.StatusOK)
++			_, _ = w.Write([]byte(`{}`))
++		default:
++			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.String())
++		}
++	}))
++}
++
++func writeJSON(t *testing.T, w http.ResponseWriter, value interface{}) {
++	t.Helper()
++	if err := json.NewEncoder(w).Encode(value); err != nil {
++		t.Fatalf("writing JSON response: %s", err)
++	}
++}
++
++func apiKeysFromResourceData(t *testing.T, d *schema.ResourceData, key string) map[string][]string {
++	t.Helper()
++	return apiKeysFromRawValue(t, d.Get(key))
++}
++
++func apiKeysFromRawValue(t *testing.T, raw interface{}) map[string][]string {
++	t.Helper()
++	items, ok := raw.([]interface{})
++	if !ok {
++		t.Fatalf("api_keys has unexpected type %T: %#v", raw, raw)
++	}
++	result := make(map[string][]string, len(items))
++	for _, item := range items {
++		entry, ok := item.(map[string]interface{})
++		if !ok {
++			t.Fatalf("api_keys entry has unexpected type %T: %#v", item, item)
++		}
++		id, ok := entry["api_key_id"].(string)
++		if !ok || id == "" {
++			t.Fatalf("api_key_id missing in %#v", entry)
++		}
++		result[id] = stringSliceFromRaw(t, entry["role_names"])
++	}
++	return result
++}
++
++func stringSliceFromRaw(t *testing.T, raw interface{}) []string {
++	t.Helper()
++	switch v := raw.(type) {
++	case []interface{}:
++		values := make([]string, 0, len(v))
++		for _, item := range v {
++			values = append(values, item.(string))
++		}
++		sort.Strings(values)
++		return values
++	case []string:
++		values := append([]string(nil), v...)
++		sort.Strings(values)
++		return values
++	default:
++		t.Fatalf("role_names has unexpected type %T: %#v", raw, raw)
++		return nil
++	}
++}
++
++func assertStringSliceMap(t *testing.T, expected, actual map[string][]string) {
++	t.Helper()
++	normalizedExpected := normalizeStringSliceMap(expected)
++	normalizedActual := normalizeStringSliceMap(actual)
++	if !reflect.DeepEqual(normalizedExpected, normalizedActual) {
++		t.Fatalf("api key map mismatch:\nexpected: %#v\nactual:   %#v", normalizedExpected, normalizedActual)
++	}
++}
++
++func normalizeStringSliceMap(values map[string][]string) map[string][]string {
++	normalized := make(map[string][]string, len(values))
++	for key, roles := range values {
++		copyRoles := append([]string(nil), roles...)
++		sort.Strings(copyRoles)
++		normalized[key] = copyRoles
++	}
++	return normalized
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,23 @@
++#!/bin/bash
++set -uo pipefail
++cd /testbed
++
++
++
++
++
++BASE_TESTS="TestAccDataSourceMongoDBAtlasProject_byID|TestAccDataSourceMongoDBAtlasProject_byName|TestAccDataSourceMongoDBAtlasProjects_basic|TestAccDataSourceMongoDBAtlasProjects_withPagination|TestAccResourceMongoDBAtlasProject_basic|TestAccResourceMongoDBAtlasProject_CreateWithProjectOwner|TestAccResourceMongoDBAtlasProject_CreateWithFalseDefaultSettings|TestAccResourceMongoDBAtlasProject_withUpdatedRole|TestAccResourceMongoDBAtlasProject_importBasic"
++NEW_TESTS="Test(AccResourceMongoDBAtlasProject_apiKeysOnCreate|AccResourceMongoDBAtlasProject_apiKeysAssignError|AccDataSourceMongoDBAtlasProject_apiKeysByID|AccDataSourceMongoDBAtlasProject_apiKeysByName|AccDataSourceMongoDBAtlasProject_apiKeysFilterOrgRoles|AccDataSourceMongoDBAtlasProjects_apiKeys|ReadmeProjectEnvVarsMentionAPIKeyIDs|ProjectAPIKeysLocalResourceAssignsAllDeclaredKeysAndRoles|ProjectAPIKeysLocalCreateReportsAssignErrorPrefix|ProjectAPIKeysLocalProjectDataSourceReadback|ProjectAPIKeysLocalProjectsDataSourceReadback)$"
++
++case "${1:-}" in
++  base)
++    go test ./mongodbatlas/ -run "$BASE_TESTS" -v -count=1
++    ;;
++  new)
++    go test ./mongodbatlas/ -run "$NEW_TESTS" -v -count=1
++    ;;
++  *)
++    echo "usage: $0 base|new"
++    exit 2
++    ;;
++esac

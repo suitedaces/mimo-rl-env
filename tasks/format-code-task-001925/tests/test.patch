@@ -1,0 +1,148 @@
+diff --git a/tests/test_decorators.py b/tests/test_decorators.py
+index 9b5acf805..275121c2b 100644
+--- a/tests/test_decorators.py
++++ b/tests/test_decorators.py
+@@ -3,6 +3,7 @@
+ 
+ from pymilvus.decorators import retry_on_rpc_failure, error_handler
+ from pymilvus.exceptions import MilvusUnavailableException, MilvusException
++from pymilvus.grpc_gen import common_pb2
+ 
+ 
+ class TestDecorators:
+@@ -11,8 +12,13 @@ def mock_failure(self, code: grpc.StatusCode):
+             raise MockUnavailableError()
+         if code == MockDeadlineExceededError().code():
+             raise MockDeadlineExceededError()
+-        if code == MockResourceExhaustedError().code():
+-            raise MockResourceExhaustedError()
++
++    def mock_milvus_exception(self, code: common_pb2.ErrorCode):
++        if code == common_pb2.ForceDeny:
++            raise MockForceDenyError()
++        if code == common_pb2.RateLimit:
++            raise MockRateLimitError()
++        raise MilvusException(common_pb2.UNEXPECTED_ERROR, str("unexpected error"))
+ 
+     @pytest.mark.parametrize("times", [0, 1, 2, 3])
+     def test_retry_decorators_unavailable(self, times):
+@@ -77,22 +83,55 @@ def test_api(self, code):
+ 
+         assert self.test_retry_decorators_default_retry_times == 7 + 1
+ 
++    def test_retry_decorators_force_deny(self):
++        self.execute_times = 0
++
++        @retry_on_rpc_failure()
++        def test_api(self, code):
++            self.execute_times += 1
++            self.mock_milvus_exception(code)
++
++        with pytest.raises(MilvusException) as e:
++            test_api(self, common_pb2.ForceDeny)
++        print(e)
++        assert "force deny" in e.value.message
++
++
++        assert self.execute_times == 1
++
+     @pytest.mark.parametrize("times", [0, 1, 2, 3])
+-    def test_retry_decorators_resource_exhausted(self, times):
+-        self.count_test_retry_decorators_resource_exhausted = 0
++    def test_retry_decorators_rate_limit_without_retry(self, times):
++        self.count_test_retry_decorators_force_deny = 0
+ 
+         @retry_on_rpc_failure(retry_times=times)
+-        def test_api(self, code):
+-            self.count_test_retry_decorators_resource_exhausted += 1
+-            self.mock_failure(code)
++        def test_api(self, code, retry_on_rate_limit):
++            self.count_test_retry_decorators_force_deny += 1
++            self.mock_milvus_exception(code)
+ 
+         with pytest.raises(MilvusException) as e:
+-            test_api(self, grpc.StatusCode.RESOURCE_EXHAUSTED)
+-            assert "resource exhausted" in e.reason()
+-            print(e)
++            test_api(self, common_pb2.RateLimit, retry_on_rate_limit=False)
++        print(e)
++        assert "rate limit" in e.value.message
++
++
++        assert self.count_test_retry_decorators_force_deny == 1
++
++    @pytest.mark.parametrize("times", [0, 1, 2, 3])
++    def test_retry_decorators_rate_limit_with_retry(self, times):
++        self.count_test_retry_decorators_force_deny = 0
++
++        @retry_on_rpc_failure(retry_times=times)
++        def test_api(self, code, retry_on_rate_limit):
++            self.count_test_retry_decorators_force_deny += 1
++            self.mock_milvus_exception(code)
++
++        with pytest.raises(MilvusException) as e:
++            test_api(self, common_pb2.RateLimit, retry_on_rate_limit=True)
++        print(e)
++        assert "rate limit" in e.value.message
+ 
+         # the first execute + retry times
+-        assert self.count_test_retry_decorators_resource_exhausted == times + 1
++        assert self.count_test_retry_decorators_force_deny == times + 1
+ 
+ 
+ class MockUnavailableError(grpc.RpcError):
+@@ -110,9 +149,30 @@ def code(self):
+     def details(self):
+         return "details of deadline exceeded"
+ 
+-class MockResourceExhaustedError(grpc.RpcError):
++class MockForceDenyError(MilvusException):
++    def __init__(self, code=common_pb2.ForceDeny, message="force deny"):
++        super(MilvusException, self).__init__(message)
++        self._code = code
++        self._message = message
++
++    @property
+     def code(self):
+-        return grpc.StatusCode.RESOURCE_EXHAUSTED
++        return self._code
+ 
+-    def details(self):
+-        return "details of resource exhausted"
++    @property
++    def message(self):
++        return self._message
++
++class MockRateLimitError(MilvusException):
++    def __init__(self, code=common_pb2.RateLimit, message="rate limit"):
++        super(MilvusException, self).__init__(message)
++        self._code = code
++        self._message = message
++
++    @property
++    def code(self):
++        return self._code
++
++    @property
++    def message(self):
++        return self._message
+diff --git a/mimo_build_env.tar.gz.b64 b/mimo_build_env.tar.gz.b64
+new file mode 100644
+--- /dev/null
++++ b/mimo_build_env.tar.gz.b64
+@@ -0,0 +1,4 @@
++H4sIAAAAAAAAA+3S0QrCIBQGYK/3FOcFcnOb2+OEU6FBm6Fu0NtnCyqC6qaI6v8u9IgHVH55N/Vb
++s7bjnLN3KZJWymVObuelFrIUZVWIumpYIYRsG0bybTe6MoWoPBHzzsVHfc/2vxS/5B9tiGvthkGN
++hofN6854lr+o6nP+VZv6RN2IklHxuivc9+f5a0NL8J01WXCT1/a8zvl8/BZdP+ZKx35W0Wa7fdy4
++kVYDpSq10XEIp69jrHZeRecD3+1pNWeffhsAAAAAAAAAAAAAAAAAAAAAwK87AAEHRgEAKAAA
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,6 @@
++#!/usr/bin/env bash
++
++set -uo pipefail
++cd /testbed || exit 1
++base64 -d mimo_build_env.tar.gz.b64 | tar -xzf - -C /testbed || exit 1
++exec bash -lc 'cd /testbed && bash -eo pipefail /testbed/.build_env/test_command.sh'

@@ -1,0 +1,212 @@
+diff --git a/packages/dd-trace/test/opentracing/span.spec.js b/packages/dd-trace/test/opentracing/span.spec.js
+index bbf18bad5..6d91d4a26 100644
+--- a/packages/dd-trace/test/opentracing/span.spec.js
++++ b/packages/dd-trace/test/opentracing/span.spec.js
+@@ -57,7 +57,7 @@ describe('Span', () => {
+     expect(span.context()._trace.started).to.deep.equal([span])
+   })
+ 
+-  it('should use a parent context', () => {
++  it('uses the parent trace object for child spans', () => {
+     const parent = {
+       _traceId: '123',
+       _spanId: '456',
+@@ -74,25 +74,29 @@ describe('Span', () => {
+     expect(span.context()._traceId).to.deep.equal('123')
+     expect(span.context()._parentId).to.deep.equal('456')
+     expect(span.context()._baggageItems).to.deep.equal({ foo: 'bar' })
+-    expect(span.context()._trace.started).to.deep.equal(['span', span])
++    expect(span.context()._trace).to.equal(parent._trace)
++    expect(parent._trace.started).to.include(span)
+     expect(span.context()._trace.origin).to.equal('synthetics')
+   })
+ 
+-  it('should start a new trace if the parent trace is finished', () => {
++  it('uses the parent trace object even after the parent trace has completed', () => {
+     const parent = {
+       _traceId: '123',
+       _spanId: '456',
+       _baggageItems: { foo: 'bar' },
+       _trace: {
+-        started: ['span'],
+-        finished: ['span'],
++        started: [],
++        finished: [],
+         origin: 'synthetics'
+       }
+     }
+ 
+     span = new Span(tracer, recorder, sampler, prioritySampler, { operationName: 'operation', parent })
+ 
+-    expect(span.context()._trace.started).to.deep.equal([span])
++    expect(span.context()._trace).to.equal(parent._trace)
++    expect(parent._trace.started).to.include(span)
++    parent._trace.finished.push(span)
++    expect(span.context()._trace.finished).to.include(span)
+     expect(span.context()._trace.origin).to.equal('synthetics')
+   })
+ 
+diff --git a/packages/dd-trace/test/writer.spec.js b/packages/dd-trace/test/writer.spec.js
+index fcdb62b59..c290e9172 100644
+--- a/packages/dd-trace/test/writer.spec.js
++++ b/packages/dd-trace/test/writer.spec.js
+@@ -17,6 +17,24 @@ describe('Writer', () => {
+   let tracer
+   let scope
+ 
++  function captureFormattedTrace () {
++    let formattedTrace
++
++    format.resetBehavior()
++    format.callsFake(span => ({
++      meta: Object.assign({}, span.context()._tags),
++      metrics: Object.assign({}, span.context()._metrics)
++    }))
++
++    encode.resetBehavior()
++    encode.callsFake(trace => {
++      formattedTrace = trace
++      return Buffer.from('encoded')
++    })
++
++    return () => formattedTrace
++  }
++
+   beforeEach(() => {
+     scope = {
+       _wipe: sinon.stub()
+@@ -37,6 +55,7 @@ describe('Writer', () => {
+         _trace: trace,
+         _sampling: {},
+         _tags: {},
++        _metrics: {},
+         _traceFlags: {}
+       })
+     }
+@@ -131,24 +150,88 @@ describe('Writer', () => {
+       expect(prioritySampler.sample).to.have.been.calledWith(span.context())
+     })
+ 
+-    it('should remove spans from all scopes when the trace is finished', () => {
+-      trace.started = [span, span]
+-      trace.finished = [span, span]
++    it('erases span tags and metrics after a completed trace is flushed', () => {
++      const tagKey = `phase3.tag.${Date.now()}`
++      const metricKey = `phase3.metric.${Date.now()}`
++
++      span.context()._tags[tagKey] = 'tag-value'
++      span.context()._metrics[metricKey] = 42
++      trace.started = [span]
++      trace.finished = [span]
++
++      writer.append(span)
++
++      expect(span.context()._tags).to.not.have.property(tagKey)
++      expect(span.context()._metrics).to.not.have.property(metricKey)
++    })
++
++    it('sends formatted data before erasing span metadata', () => {
++      const getFormattedTrace = captureFormattedTrace()
++      const tagKey = `phase3.sent.tag.${Date.now()}`
++      const metricKey = `phase3.sent.metric.${Date.now()}`
++
++      span.context()._tags[tagKey] = 'sent-tag'
++      span.context()._metrics[metricKey] = 17
++      trace.started = [span]
++      trace.finished = [span]
+ 
+       writer.append(span)
+ 
+-      expect(scope._wipe).to.have.been.calledTwice
+-      expect(scope._wipe).to.have.been.calledWith(span)
++      expect(getFormattedTrace()[0].meta).to.have.property(tagKey, 'sent-tag')
++      expect(getFormattedTrace()[0].metrics).to.have.property(metricKey, 17)
++      expect(span.context()._tags).to.not.have.property(tagKey)
++      expect(span.context()._metrics).to.not.have.property(metricKey)
+     })
+ 
+-    it('should wait for more spans before removing for consumers', () => {
++    it('does not retain flushed spans in trace span collections', () => {
++      const getFormattedTrace = captureFormattedTrace()
++      const first = span
++      const secondContext = {
++        _trace: trace,
++        _sampling: {},
++        _tags: { 'phase3.second': 'yes' },
++        _metrics: { 'phase3.second.metric': 2 },
++        _traceFlags: {}
++      }
++      const second = {
++        tracer: sinon.stub().returns(tracer),
++        context: sinon.stub().returns(secondContext)
++      }
++
++      first.context()._tags['phase3.first'] = 'yes'
++      first.context()._metrics['phase3.first.metric'] = 1
++      trace.started = [first, second]
++      trace.finished = [first, second]
++
++      writer.append(second)
++
++      expect(getFormattedTrace()).to.have.length(2)
++      expect(trace.started).to.not.include(first)
++      expect(trace.started).to.not.include(second)
++      expect(trace.finished).to.not.include(first)
++      expect(trace.finished).to.not.include(second)
++    })
++
++    it('erases metadata for a flushed single consumer span', () => {
++      const getFormattedTrace = captureFormattedTrace()
++      const tagKey = `phase3.consumer.tag.${Date.now()}`
++      const metricKey = `phase3.consumer.metric.${Date.now()}`
++
+       span.context()._tags['span.kind'] = 'consumer'
++      span.context()._tags[tagKey] = 'consumer-value'
++      span.context()._metrics[metricKey] = 99
+       trace.started = [span]
+       trace.finished = [span]
+ 
+       writer.append(span)
+ 
+-      expect(scope._wipe).to.not.have.been.called
++      expect(getFormattedTrace()[0].meta).to.include({
++        'span.kind': 'consumer',
++        [tagKey]: 'consumer-value'
++      })
++      expect(getFormattedTrace()[0].metrics).to.have.property(metricKey, 99)
++      expect(span.context()._tags).to.not.have.property(tagKey)
++      expect(span.context()._metrics).to.not.have.property(metricKey)
+     })
+   })
+ 
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,26 @@
++#!/bin/bash
++set -uo pipefail
++
++cd /testbed
++
++
++if [ ! -x node_modules/.bin/mocha ]; then
++  npm install
++fi
++
++
++NEW_TEST_PATTERN='erases span tags and metrics after a completed trace is flushed|sends formatted data before erasing span metadata|does not retain flushed spans in trace span collections|erases metadata for a flushed single consumer span|uses the parent trace object for child spans|uses the parent trace object even after the parent trace has completed'
++TEST_FILES='packages/dd-trace/test/writer.spec.js packages/dd-trace/test/opentracing/span.spec.js'
++
++case "${1:-}" in
++  base)
++    npx mocha --exit --file packages/dd-trace/test/setup/core.js $TEST_FILES --grep "$NEW_TEST_PATTERN" --invert
++    ;;
++  new)
++    npx mocha --exit --file packages/dd-trace/test/setup/core.js $TEST_FILES --grep "$NEW_TEST_PATTERN"
++    ;;
++  *)
++    echo "usage: $0 base|new"
++    exit 2
++    ;;
++esac

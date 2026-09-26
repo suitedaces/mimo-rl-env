@@ -1,0 +1,202 @@
+diff --git a/tests/test_event_emitting_node.py b/tests/test_event_emitting_node.py
+new file mode 100644
+index 0000000..f79c7fb
+--- /dev/null
++++ b/tests/test_event_emitting_node.py
+@@ -0,0 +1,158 @@
++from concurrent.futures import Future
++import inspect
++import unittest
++
++from opcua import Server, ua
++from opcua.common import event_objects
++from opcua.common.event_objects import BaseEvent
++
++
++class _EventRecorder:
++    def __init__(self):
++        self.future = Future()
++
++    def datachange_notification(self, node, val, data):
++        pass
++
++    def event_notification(self, event):
++        self.future.set_result(event)
++
++
++class TestEventEmitterConstruction(unittest.TestCase):
++    @classmethod
++    def setUpClass(cls):
++        cls.srv = Server()
++        cls.srv.set_endpoint("opc.tcp://127.0.0.1:48570")
++        cls.srv.start()
++
++    @classmethod
++    def tearDownClass(cls):
++        cls.srv.stop()
++
++    def _audit_event_classes(self):
++        classes = []
++        for name in dir(event_objects):
++            if not (name.startswith("Audit") and name.endswith("Event")):
++                continue
++            cls = getattr(event_objects, name)
++            if inspect.isclass(cls) and issubclass(cls, BaseEvent):
++                classes.append(cls)
++        self.assertGreater(len(classes), 10)
++        return classes
++
++    def _new_constructor_option_name(self):
++        legacy_names = {"self", "sourcenode", "message", "severity"}
++        params = inspect.signature(BaseEvent).parameters
++        candidates = [
++            name
++            for name, param in params.items()
++            if name not in legacy_names
++            and param.kind in (param.POSITIONAL_OR_KEYWORD, param.KEYWORD_ONLY)
++        ]
++        self.assertEqual(
++            len(candidates),
++            1,
++            "BaseEvent should expose one new public constructor option for the emitting node",
++        )
++        return candidates[0]
++
++    def _construct_with_distinct_emitter(self, cls, described, emitter, message=None, severity=1):
++        option_name = self._new_constructor_option_name()
++        return cls(
++            sourcenode=described,
++            message=message,
++            severity=severity,
++            **{option_name: emitter}
++        )
++
++    def _objects_node(self):
++        return self.srv.get_objects_node()
++
++    def _new_object(self, name):
++        return self._objects_node().add_object(2, name)
++
++    def _subscribe_and_trigger(self, subscribed_node, event):
++        recorder = _EventRecorder()
++        sub = self.srv.create_subscription(50, recorder)
++        handle = sub.subscribe_events(subscribed_node)
++        try:
++            event.EventId = b"fixtured-event"
++            self.srv.iserver.isession.subscription_service.trigger_event(event)
++            return recorder.future.result(5)
++        finally:
++            sub.unsubscribe(handle)
++            sub.delete()
++
++    def test_base_event_routes_by_default_server_emitter_without_rewriting_source_node(self):
++        described = self._new_object("FixtureDDefaultSource")
++        event = BaseEvent(sourcenode=described.nodeid)
++
++        received = self._subscribe_and_trigger(self.srv.get_server_node(), event)
++
++        self.assertEqual(described.nodeid, received.SourceNode)
++        self.assertNotEqual(self.srv.get_server_node().nodeid, received.SourceNode)
++
++    def test_base_event_routes_by_constructor_emitter_without_rewriting_source_node(self):
++        described = self._new_object("FixtureDBaseSource")
++        emitter = self._new_object("FixtureDBaseEmitter")
++        emitter.set_event_notifier([ua.EventNotifier.SubscribeToEvents])
++        event = self._construct_with_distinct_emitter(
++            BaseEvent,
++            described.nodeid,
++            emitter.nodeid,
++        )
++
++        received = self._subscribe_and_trigger(emitter, event)
++
++        self.assertEqual(described.nodeid, received.SourceNode)
++        self.assertNotEqual(emitter.nodeid, received.SourceNode)
++
++    def test_base_event_backwards_compatible_existing_arguments(self):
++        described = ua.NodeId(5003, 2)
++        message = "legacy message"
++        severity = 42
++
++        event = BaseEvent(described, message, severity)
++
++        self.assertEqual(described, event.SourceNode)
++        self.assertEqual(message, event.Message.Text)
++        self.assertEqual(severity, event.Severity)
++
++    def test_audit_event_classes_accept_the_same_constructor_option(self):
++        described = ua.NodeId(5004, 2)
++        emitter = ua.NodeId(6004, 2)
++        message = "audit compatibility"
++        severity = 43
++
++        for cls in self._audit_event_classes():
++            event = self._construct_with_distinct_emitter(
++                cls,
++                described,
++                emitter,
++                message=message,
++                severity=severity,
++            )
++            self.assertEqual(described, event.SourceNode, cls.__name__)
++            self.assertNotEqual(emitter, event.SourceNode, cls.__name__)
++            self.assertEqual(message, event.Message.Text, cls.__name__)
++            self.assertEqual(severity, event.Severity, cls.__name__)
++
++    def test_audit_create_session_routes_by_emitter_while_source_is_session_node(self):
++        described = self._new_object("FixtureDAuditSource")
++        emitter = self._new_object("FixtureDAuditEmitter")
++        emitter.set_event_notifier([ua.EventNotifier.SubscribeToEvents])
++        event = self._construct_with_distinct_emitter(
++            event_objects.AuditCreateSessionEvent,
++            described.nodeid,
++            emitter.nodeid,
++        )
++
++        received = self._subscribe_and_trigger(emitter, event)
++
++        self.assertEqual(ua.NodeId(ua.ObjectIds.AuditCreateSessionEventType), received.EventType)
++        self.assertEqual(described.nodeid, received.SourceNode)
++        self.assertNotEqual(emitter.nodeid, received.SourceNode)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,33 @@
++#!/bin/bash
++set -uo pipefail
++cd /testbed
++
++
++dev-switch python3 3.12 2>/dev/null || true
++python3 -m pip install --break-system-packages -q -e . 2>/dev/null
++python3 -m pip install --break-system-packages -q pytest 2>/dev/null
++SITECUSTOMIZE=$(python3 -c "import site; print([p for p in site.getsitepackages() if 'dist-packages' in p][0])")/sitecustomize.py
++if ! grep -q "collections.abc" "$SITECUSTOMIZE" 2>/dev/null; then
++    cat >> "$SITECUSTOMIZE" <<'PATCH'
++
++# Monkey-patch for older code that uses collections.Iterable (removed in Python 3.10)
++import collections, collections.abc
++for _name in ('Iterable', 'Mapping', 'MutableMapping', 'MutableSet', 'Callable'):
++    if not hasattr(collections, _name):
++        setattr(collections, _name, getattr(collections.abc, _name))
++PATCH
++fi
++
++
++case "${1:-}" in
++  base)
++    python3 -m pytest tests/tests_server.py tests/tests_subscriptions.py -v -k 'not event'
++    ;;
++  new)
++    python3 -m pytest tests/test_event_emitting_node.py -v
++    ;;
++  *)
++    echo "usage: $0 base|new"
++    exit 2
++    ;;
++esac

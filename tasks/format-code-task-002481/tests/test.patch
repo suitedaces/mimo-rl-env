@@ -1,0 +1,323 @@
+diff --git a/usercase-test-coderl/tag_extractor.test.js b/usercase-test-coderl/tag_extractor.test.js
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/tag_extractor.test.js
+@@ -0,0 +1,299 @@
++
++
++
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import { execFileSync } from 'node:child_process';
++import fs from 'node:fs';
++import os from 'node:os';
++import path from 'node:path';
++import net from 'node:net';
++import http from 'node:http';
++import https from 'node:https';
++import { extractTagContent } from '../src/utils/tagExtractor.js';
++
++function snapshotDirectory(root) {
++  const entries = [];
++
++  function walk(dir, prefix = '') {
++    for (const name of fs.readdirSync(dir).sort()) {
++      const fullPath = path.join(dir, name);
++      const relativePath = prefix ? `${prefix}/${name}` : name;
++      const stat = fs.statSync(fullPath);
++      entries.push(stat.isDirectory() ? `${relativePath}/` : relativePath);
++      if (stat.isDirectory()) {
++        walk(fullPath, relativePath);
++      }
++    }
++  }
++
++  walk(root);
++  return entries;
++}
++
++test('empty rules return original text unchanged', () => {
++
++
++  const actual = extractTagContent('raw <content>Hello</content>', [], []);
++
++  assert.equal(actual, 'raw <content>Hello</content>');
++});
++
++test('missing rules return original text unchanged', () => {
++
++
++  const actual = extractTagContent('plain <content>still raw</content>');
++
++  assert.equal(actual, 'plain <content>still raw</content>');
++});
++
++test('exclude rules remove XML-like blocks before include collection', () => {
++
++
++  const rules = [
++    { type: 'exclude', value: 'thinking', enabled: true },
++    { type: 'include', value: 'content', enabled: true },
++  ];
++  const actual = extractTagContent(
++    'prefix <thinking><content>Hidden</content></thinking> middle <content>Visible</content>',
++    rules,
++    [],
++  );
++
++  assert.equal(actual, 'Visible');
++});
++
++test('include rules collect XML and brace-pipe content, then cleanup and blacklist apply', () => {
++
++
++  const rules = [
++    { type: 'exclude', value: 'thinking', enabled: true },
++    { type: 'include', value: 'content', enabled: true },
++    { type: 'regex_exclude', value: '\\s*\\[draft\\]', enabled: true },
++  ];
++  const actual = extractTagContent(
++    'intro <thinking>hide</thinking> <content>Hello [draft]</content> {content|Second {nested} part} <content>Skip secret</content>',
++    rules,
++    ['secret'],
++  );
++
++  assert.equal(actual, 'Hello\n\nSecond {nested} part');
++});
++
++test('regex include rules collect first capture group from every match', () => {
++
++
++  const rules = [
++    { type: 'regex_include', value: '\\[\\[(.*?)\\]\\]', enabled: true },
++  ];
++  const actual = extractTagContent('A [[keep one]] B [[keep two]]', rules, []);
++
++  assert.equal(actual, 'keep one\n\nkeep two');
++});
++
++test('disabled rules are ignored while enabled include rules still apply', () => {
++
++
++  const rules = [
++    { type: 'exclude', value: 'content', enabled: false },
++    { type: 'include', value: 'noise', enabled: false },
++    { type: 'regex_include', value: '\\[\\[(.*?)\\]\\]', enabled: false },
++    { type: 'include', value: 'content', enabled: true },
++  ];
++  const actual = extractTagContent('<noise>drop?</noise> <content>Used</content> [[ignored]]', rules, []);
++
++  assert.equal(actual, 'Used');
++});
++
++test('malformed enabled patterns are skipped while valid rules still apply', () => {
++
++
++  const rules = [
++    { type: 'regex_include', value: '[[oops', enabled: true },
++    { type: 'include', value: 'content', enabled: true },
++    { type: 'regex_exclude', value: '(', enabled: true },
++    { type: 'regex_exclude', value: '\\s*\\[drop\\]', enabled: true },
++  ];
++  let actual;
++  const originalConsoleError = console.error;
++
++
++  console.error = () => {};
++  try {
++    assert.doesNotThrow(() => {
++      actual = extractTagContent('<content>Alpha [drop]</content> [[Beta]]', rules, []);
++    });
++  } finally {
++    console.error = originalConsoleError;
++  }
++
++  assert.equal(actual, 'Alpha');
++});
++
++test('blacklist drops matching blocks case-insensitively', () => {
++
++
++  const rules = [
++    { type: 'include', value: 'content', enabled: true },
++  ];
++  const actual = extractTagContent(
++    '<content>Public note</content><content>Contains SeCrEt marker</content><content>Another public</content>',
++    rules,
++    ['secret'],
++  );
++
++  assert.equal(actual, 'Public note\n\nAnother public');
++});
++
++test('final output collapses excessive blank lines', () => {
++
++
++  const rules = [
++    { type: 'include', value: 'content', enabled: true },
++  ];
++  const actual = extractTagContent(
++    '<content>First\n\n\n\nSecond\n\n\n</content><content>Third</content>',
++    rules,
++    [],
++  );
++
++  assert.equal(actual, 'First\n\nSecond\n\nThird');
++});
++
++test('regex cleanup applies to collected blocks', () => {
++
++
++  const rules = [
++    { type: 'include', value: 'content', enabled: true },
++    { type: 'regex_exclude', value: '\\s*\\[draft\\]', enabled: true },
++  ];
++
++  const actual = extractTagContent('<content>A [draft]\n\n\nB</content>', rules, []);
++
++  assert.equal(actual, 'A\n\nB');
++});
++
++test('referential transparency returns the same literal for repeated equal calls', () => {
++  const rules = [
++    { type: 'include', value: 'content', enabled: true },
++    { type: 'regex_exclude', value: '\\s*\\(temp\\)', enabled: true },
++  ];
++  const first = extractTagContent('<content>Stable (temp)</content>', rules, []);
++  const second = extractTagContent('<content>Stable (temp)</content>', rules, []);
++
++  assert.equal(first, 'Stable');
++  assert.equal(second, 'Stable');
++  assert.equal(first, second);
++});
++
++test('does not mutate caller-provided inputs', () => {
++  const text = '<content>Keep [draft]</content><content>Skip secret</content>';
++  const rules = [
++    { type: 'include', value: 'content', enabled: true },
++    { type: 'regex_exclude', value: '\\s*\\[draft\\]', enabled: true },
++  ];
++  const blacklist = ['secret'];
++  const originalRules = JSON.parse(JSON.stringify(rules));
++  const originalBlacklist = JSON.parse(JSON.stringify(blacklist));
++
++  const actual = extractTagContent(text, rules, blacklist);
++
++  assert.equal(actual, 'Keep');
++  assert.equal(text, '<content>Keep [draft]</content><content>Skip secret</content>');
++  assert.deepEqual(rules, originalRules);
++  assert.deepEqual(blacklist, originalBlacklist);
++});
++
++test('fresh-process result matches in-process result for the same input', () => {
++  const rules = [
++    { type: 'include', value: 'content', enabled: true },
++  ];
++  const inProcess = extractTagContent('<content>Cache Target</content>', rules, []);
++  const script = `
++    import { extractTagContent } from '/workspace/repo/src/utils/tagExtractor.js';
++    const rules = [{ type: 'include', value: 'content', enabled: true }];
++    process.stdout.write(JSON.stringify(extractTagContent('<content>Cache Target</content>', rules, [])));
++  `;
++  const freshProcess = JSON.parse(execFileSync(
++    process.execPath,
++    ['--experimental-default-type=module', '-e', script],
++    { encoding: 'utf8' },
++  ));
++
++  assert.equal(inProcess, 'Cache Target');
++  assert.equal(freshProcess, 'Cache Target');
++  assert.equal(freshProcess, inProcess);
++});
++
++test('does not perform filesystem or network work during extraction', () => {
++  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tag-extractor-side-effects-'));
++  const originalCwd = process.cwd();
++  const originalFetch = globalThis.fetch;
++  const originalSocketConnect = net.Socket.prototype.connect;
++  const originalHttpRequest = http.request;
++  const originalHttpsRequest = https.request;
++  const originalReadFileSync = fs.readFileSync;
++  const originalWriteFileSync = fs.writeFileSync;
++  const originalAppendFileSync = fs.appendFileSync;
++  const originalOpenSync = fs.openSync;
++  const sideEffectAttempts = [];
++
++  globalThis.fetch = (...args) => {
++    sideEffectAttempts.push(`fetch:${String(args[0])}`);
++    throw new Error('network fetch attempted');
++  };
++  net.Socket.prototype.connect = function blockedConnect(...args) {
++    sideEffectAttempts.push(`socket:${String(args[0])}`);
++    throw new Error('network socket attempted');
++  };
++  http.request = (...args) => {
++    sideEffectAttempts.push(`http:${String(args[0])}`);
++    throw new Error('http request attempted');
++  };
++  https.request = (...args) => {
++    sideEffectAttempts.push(`https:${String(args[0])}`);
++    throw new Error('https request attempted');
++  };
++  fs.readFileSync = (...args) => {
++    sideEffectAttempts.push(`readFileSync:${String(args[0])}`);
++    throw new Error('filesystem read attempted');
++  };
++  fs.writeFileSync = (...args) => {
++    sideEffectAttempts.push(`writeFileSync:${String(args[0])}`);
++    throw new Error('filesystem write attempted');
++  };
++  fs.appendFileSync = (...args) => {
++    sideEffectAttempts.push(`appendFileSync:${String(args[0])}`);
++    throw new Error('filesystem append attempted');
++  };
++  fs.openSync = (...args) => {
++    sideEffectAttempts.push(`openSync:${String(args[0])}`);
++    throw new Error('filesystem open attempted');
++  };
++
++  try {
++    process.chdir(tempDir);
++    const before = snapshotDirectory(tempDir);
++    const actual = extractTagContent(
++      '<content>No side effects</content>',
++      [{ type: 'include', value: 'content', enabled: true }],
++      [],
++    );
++    const after = snapshotDirectory(tempDir);
++
++    assert.equal(actual, 'No side effects');
++    assert.deepEqual(sideEffectAttempts, []);
++    assert.deepEqual(after, before);
++  } finally {
++    process.chdir(originalCwd);
++    globalThis.fetch = originalFetch;
++    net.Socket.prototype.connect = originalSocketConnect;
++    http.request = originalHttpRequest;
++    https.request = originalHttpsRequest;
++    fs.readFileSync = originalReadFileSync;
++    fs.writeFileSync = originalWriteFileSync;
++    fs.appendFileSync = originalAppendFileSync;
++    fs.openSync = originalOpenSync;
++    fs.rmSync(tempDir, { recursive: true, force: true });
++  }
++});
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,14 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++cd /workspace/repo
++exec node --experimental-default-type=module --test /workspace/repo/usercase-test-coderl/tag_extractor.test.js

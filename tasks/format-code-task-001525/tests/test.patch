@@ -1,0 +1,200 @@
+diff --git a/usercase-test-coderl/usecase.sh b/usercase-test-coderl/usecase.sh
+new file mode 100755
+--- /dev/null
++++ b/usercase-test-coderl/usecase.sh
+@@ -0,0 +1,178 @@
++#!/usr/bin/env bash
++
++set -u
++export LANG=C LC_ALL=C TZ=UTC
++
++( cd /workspace/repo && PYTHONDONTWRITEBYTECODE=1 python3 generate-wrapper.py --help >/dev/null ) \
++    || { echo "FAIL: build" >&2; exit 1; }
++BIN=(env PYTHONDONTWRITEBYTECODE=1 python3 /workspace/repo/generate-wrapper.py)
++
++TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
++cd "$TMP" || exit 1
++fail() { echo "FAIL: $*" >&2; exit 1; }
++
++assert_file_text() {
++    local path="$1"
++    local expected="$2"
++    local label="$3"
++    local actual
++    actual=$(cat "$path")
++    [ "$actual" = "$expected" ] || fail "$label: $actual"
++}
++
++assert_cpp_guard_wraps() {
++    local path="$1"
++    local label="$2"
++    shift 2
++    python3 - "$path" "$label" "$@" <<'PY' || exit 1
++import sys
++
++path, label, *decls = sys.argv[1:]
++with open(path, encoding="utf-8") as f:
++    lines = [line.strip() for line in f]
++
++def find_line(value, start=0):
++    for idx in range(start, len(lines)):
++        if lines[idx] == value:
++            return idx
++    return -1
++
++def fail(message):
++    print(f"FAIL: {label}: {message}", file=sys.stderr)
++    sys.exit(1)
++
++final_endif = -1
++for idx in range(len(lines) - 1, -1, -1):
++    if lines[idx]:
++        final_endif = idx
++        break
++if final_endif < 0 or lines[final_endif] != "#endif":
++    fail("missing final include guard #endif")
++
++for open_if in [idx for idx, line in enumerate(lines) if line == "#ifdef __cplusplus"]:
++    extern = find_line('extern "C" {', open_if + 1)
++    if extern < 0:
++        continue
++    open_endif = find_line("#endif", extern + 1)
++    if open_endif < 0:
++        continue
++    close_if = find_line("#ifdef __cplusplus", open_endif + 1)
++    if close_if < 0:
++        continue
++    brace = find_line("}", close_if + 1)
++    if brace < 0:
++        continue
++    close_endif = find_line("#endif", brace + 1)
++    if close_endif < 0 or final_endif <= close_endif:
++        continue
++    if all(any(open_endif < idx < close_if for idx, line in enumerate(lines) if line == decl) for decl in decls):
++        sys.exit(0)
++
++for decl in decls:
++    if not any(line == decl for line in lines):
++        fail(f"missing declaration {decl!r}")
++fail("no #ifdef __cplusplus / extern \"C\" block wraps all required declarations before the final include guard")
++PY
++}
++
++
++
++
++mkdir f1 && cd f1 || exit 1
++printf 'int sample_add(int, int);\n' > sample.h
++"${BIN[@]}" --include sample.h --sys-include '"sample.h"' --soname libsample.so --init-name sample --output-header sample-wrap.h --output-implementation sample-wrap.c >out 2>err; ec=$?
++[ "$ec" -eq 0 ] || fail "F1 exit $ec; want 0"
++
++assert_cpp_guard_wraps sample-wrap.h "F1 guarded declarations" \
++    'extern int (*sample_add_dylibloader_wrapper_sample)(int, int);' \
++    'int initialize_sample(int verbose);'
++cd ..
++
++
++
++
++mkdir f2 && cd f2 || exit 1
++printf 'int sample_add(int, int);\nvoid sample_reset(void);\n' > sample.h
++"${BIN[@]}" --include sample.h --sys-include sample.h --soname libsample.so --init-name sample --output-header sample-wrap.h --output-implementation sample-wrap.c >out 2>err; ec=$?
++[ "$ec" -eq 0 ] || fail "F2 generator exit $ec; want 0"
++
++assert_cpp_guard_wraps sample-wrap.h "F2 guarded declarations" \
++    'extern int (*sample_add_dylibloader_wrapper_sample)(int, int);' \
++    'extern void (*sample_reset_dylibloader_wrapper_sample)(void);' \
++    'int initialize_sample(int verbose);'
++cat > probe.cpp <<'EOF'
++#include "sample-wrap.h"
++int call_init() { return initialize_sample(0); }
++int call_add_ptr() { return sample_add_dylibloader_wrapper_sample(1, 2); }
++void call_reset_ptr() { sample_reset_dylibloader_wrapper_sample(); }
++EOF
++g++ -std=c++11 -I. -c probe.cpp -o probe-cpp.o >cpp.out 2>cpp.err; ec=$?
++[ "$ec" -eq 0 ] || fail "F2 C++ compile exit $ec; stderr: $(cat cpp.err)"
++
++nm -u probe-cpp.o | awk '{print $NF}' | sort >cpp.nm
++EXPECTED_NM='initialize_sample
++sample_add_dylibloader_wrapper_sample
++sample_reset_dylibloader_wrapper_sample'
++assert_file_text cpp.nm "$EXPECTED_NM" "F2 C++ undefined symbols"
++cd ..
++
++
++
++
++mkdir f3 && cd f3 || exit 1
++printf 'int sample_add(int, int);\nvoid sample_reset(void);\n' > sample.h
++"${BIN[@]}" --include sample.h --sys-include sample.h --soname libsample.so --init-name sample --output-header sample-wrap.h --output-implementation sample-wrap.c >out 2>err; ec=$?
++[ "$ec" -eq 0 ] || fail "F3 generator exit $ec; want 0"
++
++cat > probe.c <<'EOF'
++#include "sample-wrap.h"
++int call_init(void) { return initialize_sample(0); }
++int call_add_ptr(void) { return sample_add_dylibloader_wrapper_sample(1, 2); }
++void call_reset_ptr(void) { sample_reset_dylibloader_wrapper_sample(); }
++EOF
++gcc -std=c11 -I. -c probe.c -o probe-c.o >c.out 2>c.err; ec=$?
++[ "$ec" -eq 0 ] || fail "F3 C compile exit $ec; stderr: $(cat c.err)"
++
++nm -u probe-c.o | awk '{print $NF}' | sort >c.nm
++EXPECTED_NM='initialize_sample
++sample_add_dylibloader_wrapper_sample
++sample_reset_dylibloader_wrapper_sample'
++assert_file_text c.nm "$EXPECTED_NM" "F3 C undefined symbols"
++cd ..
++
++
++
++
++mkdir f4 && cd f4 || exit 1
++printf 'typedef int sample_value;\n' > sample.h
++"${BIN[@]}" --include sample.h --sys-include sample.h --soname libsample.so --init-name sample --output-header sample-wrap.h --output-implementation sample-wrap.c >out 2>err; ec=$?
++[ "$ec" -eq 0 ] || fail "F4 generator exit $ec; want 0"
++
++assert_cpp_guard_wraps sample-wrap.h "F4 guarded initializer-only header" \
++    'int initialize_sample(int verbose);'
++cd ..
++
++
++
++
++mkdir f5 && cd f5 || exit 1
++printf 'int sample_add(int, int);\n' > sample.h
++"${BIN[@]}" --include sample.h --sys-include sample.h --soname libsample.so --init-name sample --output-header sample-wrap.h --output-implementation sample-wrap.c >out 2>err; ec=$?
++[ "$ec" -eq 0 ] || fail "F5 generator exit $ec; want 0"
++
++assert_cpp_guard_wraps sample-wrap.h "F5 C++ guard closes before include guard" \
++    'extern int (*sample_add_dylibloader_wrapper_sample)(int, int);' \
++    'int initialize_sample(int verbose);'
++cat > after.cpp <<'EOF'
++#include "sample-wrap.h"
++namespace after_header {
++int value() { return 7; }
++}
++int use_after_header() { return after_header::value(); }
++EOF
++g++ -std=c++11 -I. -c after.cpp -o after-cpp.o >cpp.out 2>cpp.err; ec=$?
++[ "$ec" -eq 0 ] || fail "F5 C++ compile after include exit $ec; stderr: $(cat cpp.err)"
++cd ..
++
++echo "PASS"
++exit 0
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,12 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++exec bash /workspace/repo/usercase-test-coderl/usecase.sh

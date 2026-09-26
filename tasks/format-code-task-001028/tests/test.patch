@@ -1,0 +1,234 @@
+diff --git a/common/src/test/java/org/apache/rocketmq/common/message/MessageDecoderValidationContractTest.java b/common/src/test/java/org/apache/rocketmq/common/message/MessageDecoderValidationContractTest.java
+new file mode 100644
+index 000000000..4758ea833
+--- /dev/null
++++ b/common/src/test/java/org/apache/rocketmq/common/message/MessageDecoderValidationContractTest.java
+@@ -0,0 +1,208 @@
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++package org.apache.rocketmq.common.message;
++
++import java.nio.ByteBuffer;
++import java.util.Arrays;
++import java.util.List;
++import org.junit.Assert;
++import org.junit.Test;
++
++public class MessageDecoderValidationContractTest {
++    @Test
++    public void validFramesDecodeAndCountWithoutChangingTheWireOrder() throws Exception {
++        Message first = new Message("topic", "one".getBytes());
++        first.setFlag(7);
++        first.putUserProperty("kind", "first");
++        Message second = new Message("topic", "two".getBytes());
++        second.setFlag(9);
++        second.putUserProperty("kind", "second");
++
++        byte[] encoded = MessageDecoder.encodeMessages(Arrays.asList(first, second));
++        ByteBuffer decodedBuffer = bufferAtOffset(encoded);
++        List<Message> decoded = MessageDecoder.decodeMessages(decodedBuffer);
++
++        Assert.assertEquals(2, decoded.size());
++        Assert.assertEquals(3 + encoded.length, decodedBuffer.position());
++        Assert.assertEquals(7, decoded.get(0).getFlag());
++        Assert.assertArrayEquals("one".getBytes(), decoded.get(0).getBody());
++        Assert.assertEquals("first", decoded.get(0).getProperty("kind"));
++        Assert.assertEquals(9, decoded.get(1).getFlag());
++        Assert.assertArrayEquals("two".getBytes(), decoded.get(1).getBody());
++        Assert.assertEquals("second", decoded.get(1).getProperty("kind"));
++
++        ByteBuffer countBuffer = bufferAtOffset(encoded);
++        Assert.assertEquals(2, MessageDecoder.countInnerMsgNum(countBuffer));
++        Assert.assertEquals(3 + encoded.length, countBuffer.position());
++    }
++
++    @Test
++    public void singleFrameDecodeStopsAtItsDeclaredBoundary() throws Exception {
++        Message first = new Message("topic", "first".getBytes());
++        Message second = new Message("topic", "second".getBytes());
++        byte[] firstBytes = MessageDecoder.encodeMessage(first);
++        byte[] encoded = MessageDecoder.encodeMessages(Arrays.asList(first, second));
++        ByteBuffer buffer = bufferAtOffset(encoded);
++
++        Message decoded = MessageDecoder.decodeMessage(buffer);
++
++        Assert.assertArrayEquals("first".getBytes(), decoded.getBody());
++        Assert.assertEquals(3 + firstBytes.length, buffer.position());
++        Assert.assertTrue(buffer.hasRemaining());
++    }
++
++    @Test
++    public void emptyBatchOperationsRemainSupported() throws Exception {
++        ByteBuffer decodeBuffer = bufferAtOffset(new byte[0]);
++        Assert.assertTrue(MessageDecoder.decodeMessages(decodeBuffer).isEmpty());
++        Assert.assertEquals(3, decodeBuffer.position());
++
++        ByteBuffer countBuffer = bufferAtOffset(new byte[0]);
++        Assert.assertEquals(0, MessageDecoder.countInnerMsgNum(countBuffer));
++        Assert.assertEquals(3, countBuffer.position());
++    }
++
++    @Test
++    public void singleFrameRejectsTruncatedDataAndPreservesInputPosition() {
++        assertSingleFrameRejected(truncatedHeader());
++        assertSingleFrameRejected(truncatedFrame());
++    }
++
++    @Test
++    public void singleFrameRejectsNegativeComponentLengthsAndPreservesInputPosition() {
++        assertSingleFrameRejected(frameWithLengths(22, -1, 0));
++        assertSingleFrameRejected(frameWithLengths(22, 0, -1));
++    }
++
++    @Test
++    public void singleFrameRejectsInconsistentTotalSizeAndPreservesInputPosition() {
++        assertSingleFrameRejected(frameWithLengths(21, 0, 0));
++        assertSingleFrameRejected(frameWithLengths(30, 0, 0));
++    }
++
++    @Test
++    public void batchDecodeIsAtomicWhenALaterFrameIsMalformed() throws Exception {
++        Message valid = new Message("topic", "ok".getBytes());
++        byte[] validBytes = MessageDecoder.encodeMessage(valid);
++        byte[] malformed = truncatedFrame();
++        byte[] input = new byte[validBytes.length + malformed.length];
++        System.arraycopy(validBytes, 0, input, 0, validBytes.length);
++        System.arraycopy(malformed, 0, input, validBytes.length, malformed.length);
++
++        ByteBuffer buffer = bufferAtOffset(input);
++        Assert.assertThrows(IllegalArgumentException.class, () -> MessageDecoder.decodeMessages(buffer));
++        Assert.assertEquals(3, buffer.position());
++    }
++
++    @Test
++    public void frameCounterRejectsMalformedFramesAndPreservesInputPosition() {
++        ByteBuffer buffer = bufferAtOffset(truncatedHeader());
++
++        Assert.assertThrows(IllegalArgumentException.class, () -> MessageDecoder.countInnerMsgNum(buffer));
++        Assert.assertEquals(3, buffer.position());
++    }
++
++    @Test
++    public void frameCounterValidatesFrameContentsAndIsAtomicAcrossTheBatch() {
++        Message valid = new Message("topic", "ok".getBytes());
++        byte[] validBytes = MessageDecoder.encodeMessage(valid);
++        byte[] malformed = frameWithLengths(22, -1, 0);
++        byte[] input = new byte[validBytes.length + malformed.length];
++        System.arraycopy(validBytes, 0, input, 0, validBytes.length);
++        System.arraycopy(malformed, 0, input, validBytes.length, malformed.length);
++        ByteBuffer buffer = bufferAtOffset(input);
++
++        Assert.assertThrows(IllegalArgumentException.class, () -> MessageDecoder.countInnerMsgNum(buffer));
++        Assert.assertEquals(3, buffer.position());
++    }
++
++    @Test
++    public void encodersRejectUnrepresentableMessagesWithAConsistentException() {
++        Message missingBody = new Message();
++        missingBody.setTopic("topic");
++        Assert.assertThrows(IllegalArgumentException.class, () -> MessageDecoder.encodeMessage(missingBody));
++
++        Message oversizedProperties = new Message("topic", new byte[0]);
++        oversizedProperties.putUserProperty("large", repeat('x', Short.MAX_VALUE));
++        Assert.assertThrows(IllegalArgumentException.class,
++            () -> MessageDecoder.encodeMessage(oversizedProperties));
++
++        Assert.assertThrows(IllegalArgumentException.class,
++            () -> MessageDecoder.encodeMessages(Arrays.asList(new Message("topic", new byte[0]), null)));
++    }
++
++    private static void assertSingleFrameRejected(byte[] bytes) {
++        ByteBuffer buffer = bufferAtOffset(bytes);
++        Assert.assertThrows(IllegalArgumentException.class, () -> MessageDecoder.decodeMessage(buffer));
++        Assert.assertEquals(3, buffer.position());
++    }
++
++    private static byte[] frameWithLengths(int totalSize, int bodyLength, int propertiesLength) {
++        return frameWithLengths(totalSize, bodyLength, propertiesLength, 0);
++    }
++
++    private static byte[] frameWithLengths(int totalSize, int bodyLength, int propertiesLength, int extraBytes) {
++        int actualSize = Math.max(22, totalSize) + Math.max(0, bodyLength) + Math.max(0, propertiesLength)
++            + extraBytes;
++        ByteBuffer buffer = ByteBuffer.allocate(actualSize);
++        buffer.putInt(totalSize);
++        buffer.putInt(0);
++        buffer.putInt(0);
++        buffer.putInt(0);
++        buffer.putInt(bodyLength);
++        if (bodyLength > 0) {
++            buffer.put(new byte[bodyLength]);
++        }
++        buffer.putShort((short) propertiesLength);
++        if (propertiesLength > 0) {
++            buffer.put(new byte[propertiesLength]);
++        }
++        return buffer.array();
++    }
++
++    private static byte[] truncatedFrame() {
++        ByteBuffer buffer = ByteBuffer.allocate(22);
++        buffer.putInt(22);
++        buffer.putInt(0);
++        buffer.putInt(0);
++        buffer.putInt(0);
++        buffer.putInt(1);
++        buffer.put((byte) 1);
++        return buffer.array();
++    }
++
++    private static byte[] truncatedHeader() {
++        ByteBuffer buffer = ByteBuffer.allocate(4);
++        buffer.putInt(10);
++        return buffer.array();
++    }
++
++    private static ByteBuffer bufferAtOffset(byte[] bytes) {
++        ByteBuffer buffer = ByteBuffer.allocate(bytes.length + 3);
++        buffer.put(new byte[] {11, 12, 13});
++        buffer.put(bytes);
++        buffer.flip();
++        buffer.position(3);
++        return buffer;
++    }
++
++    private static String repeat(char value, int count) {
++        char[] chars = new char[count];
++        Arrays.fill(chars, value);
++        return new String(chars);
++    }
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,15 @@
++#!/bin/bash
++set -euo pipefail
++
++
++BUILD_DIR="$(mktemp -d)"
++trap 'rm -rf "${BUILD_DIR}"' EXIT
++find common/src/main/java/org/apache/rocketmq/common/message -name '*.java' -print > "${BUILD_DIR}/main-sources"
++javac -source 8 -target 8 -cp common/target/classes -d "${BUILD_DIR}/classes" @"${BUILD_DIR}/main-sources"
++JUNIT_JAR=/root/.m2/repository/junit/junit/4.13.2/junit-4.13.2.jar
++HAMCREST_JAR=/root/.m2/repository/org/hamcrest/hamcrest-core/1.3/hamcrest-core-1.3.jar
++TEST_CP="${BUILD_DIR}/classes:common/target/classes:${JUNIT_JAR}:${HAMCREST_JAR}"
++javac -source 8 -target 8 -cp "${TEST_CP}" -d "${BUILD_DIR}/test-classes" \
++  common/src/test/java/org/apache/rocketmq/common/message/MessageDecoderValidationContractTest.java
++java -cp "${BUILD_DIR}/test-classes:${TEST_CP}" org.junit.runner.JUnitCore \
++  org.apache.rocketmq.common.message.MessageDecoderValidationContractTest

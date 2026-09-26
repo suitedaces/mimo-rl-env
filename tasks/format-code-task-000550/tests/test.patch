@@ -1,0 +1,468 @@
+diff --git a/usercase-test-coderl/fixtures/aws-config-empty b/usercase-test-coderl/fixtures/aws-config-empty
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/fixtures/aws-config-empty
+@@ -0,0 +1,2 @@
++[default]
++region = us-east-1
+diff --git a/usercase-test-coderl/fixtures/aws-config-three b/usercase-test-coderl/fixtures/aws-config-three
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/fixtures/aws-config-three
+@@ -0,0 +1,11 @@
++[profile alpha]
++sso_start_url = https://alpha.awsapps.com/start
++sso_region = us-east-1
++
++[profile beta]
++sso_start_url = https://beta.awsapps.com/start
++sso_region = us-west-2
++
++[profile gamma]
++sso_start_url = https://gamma.awsapps.com/start
++sso_region = eu-central-1
+diff --git a/usercase-test-coderl/fixtures/sitecustomize.py b/usercase-test-coderl/fixtures/sitecustomize.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/fixtures/sitecustomize.py
+@@ -0,0 +1,60 @@
++import json
++import os
++
++import botocore.exceptions
++
++from aws_sso_lib.exceptions import PendingAuthorizationExpiredError
++import aws_sso_lib.sso as sso
++
++
++class StubFetcher:
++    def __init__(self, region, disable_browser):
++        self.region = region
++        self.disable_browser = disable_browser
++
++    def fetch_token(self, start_url, force_refresh=False):
++        _write_event({
++            "event": "fetch_token",
++            "region": self.region,
++            "start_url": start_url,
++            "force_refresh": force_refresh,
++        })
++
++        mode = os.environ.get("AWS_SSO_UTIL_LOGIN_STUB_MODE", "success")
++        if mode == "pending_expired":
++            raise PendingAuthorizationExpiredError()
++        if mode == "invalid_grant":
++            raise botocore.exceptions.ClientError(
++                {"Error": {"Code": "InvalidGrantException", "Message": "Device code expired"}},
++                "CreateToken",
++            )
++        if mode == "client_error":
++            raise botocore.exceptions.ClientError(
++                {"Error": {"Code": "ThrottlingException", "Message": "Slow down"}},
++                "CreateToken",
++            )
++        if mode == "unexpected":
++            raise RuntimeError("boom")
++
++        return {"accessToken": "stub-token", "expiresAt": "2031-02-03T04:05:06Z"}
++
++
++def _write_event(event):
++    log_path = os.environ.get("AWS_SSO_UTIL_LOGIN_STUB_LOG")
++    if not log_path:
++        return
++    with open(log_path, "a", encoding="utf-8") as f:
++        f.write(json.dumps(event, sort_keys=True) + "\n")
++
++
++def get_token_fetcher(session, sso_region, *, interactive=False, disable_browser=None, **kwargs):
++    _write_event({
++        "event": "get_token_fetcher",
++        "region": sso_region,
++        "interactive": interactive,
++        "disable_browser": disable_browser,
++    })
++    return StubFetcher(sso_region, disable_browser)
++
++
++sso.get_token_fetcher = get_token_fetcher
+diff --git a/usercase-test-coderl/usecase.sh b/usercase-test-coderl/usecase.sh
+new file mode 100755
+--- /dev/null
++++ b/usercase-test-coderl/usecase.sh
+@@ -0,0 +1,358 @@
++#!/usr/bin/env bash
++
++set -u
++export LANG=C.UTF-8 LC_ALL=C.UTF-8 TZ=UTC
++
++REPO=/workspace/repo
++FIXTURES="$REPO/usercase-test-coderl/fixtures"
++
++python - <<'PY' || { echo "FAIL: dependency check" >&2; exit 1; }
++import aws_error_utils
++import boto3
++import botocore
++import click
++import dateutil
++PY
++
++TMP=$(mktemp -d)
++trap 'rm -rf "$TMP"' EXIT
++
++export PYTHONPATH="$FIXTURES:$REPO/cli/src:$REPO/lib"
++export AWS_SHARED_CREDENTIALS_FILE="$TMP/credentials"
++export AWS_EC2_METADATA_DISABLED=true
++export HOME="$TMP/home"
++mkdir -p "$HOME"
++
++BIN="$TMP/aws-sso-util"
++cat > "$BIN" <<'PY'
++#!/usr/bin/env python
++from aws_sso_util.cli import cli
++cli(prog_name="aws-sso-util")
++PY
++chmod +x "$BIN"
++
++fail() { echo "FAIL: $*" >&2; exit 1; }
++
++set_config() {
++    cp "$1" "$TMP/aws-config"
++    export AWS_CONFIG_FILE="$TMP/aws-config"
++}
++
++run_cli() {
++    : > "$TMP/log.jsonl"
++    export AWS_SSO_UTIL_LOGIN_STUB_LOG="$TMP/log.jsonl"
++    unset AWS_SSO_UTIL_LOGIN_STUB_MODE
++    "$@" >out 2>err
++    ec=$?
++}
++
++run_cli_mode() {
++    : > "$TMP/log.jsonl"
++    export AWS_SSO_UTIL_LOGIN_STUB_LOG="$TMP/log.jsonl"
++    AWS_SSO_UTIL_LOGIN_STUB_MODE="$1" "${@:2}" >out 2>err
++    ec=$?
++}
++
++assert_file_eq() {
++    local label=$1
++    local path=$2
++    local expected=$3
++    local actual
++    actual=$(cat "$path")
++    [ "$actual" = "$expected" ] || fail "$label: got [$actual]"
++}
++
++assert_log_eq() {
++    local label=$1
++    local expected=$2
++    local actual
++    actual=$(cat "$TMP/log.jsonl")
++    [ "$actual" = "$expected" ] || fail "$label log: got [$actual]"
++}
++
++assert_success_output() {
++    local label=$1
++    local path=$2
++    local start_url=$3
++
++    python - "$label" "$path" "$start_url" <<'PY' || exit 1
++import sys
++
++label, path, start_url = sys.argv[1:4]
++with open(path, encoding="utf-8") as f:
++    lines = f.read().splitlines()
++expected_prefix = "Login succeeded, valid until "
++if len(lines) != 2:
++    raise SystemExit(f"FAIL: {label} stdout line count: got {lines!r}")
++if lines[0] != f"Logging in {start_url}":
++    raise SystemExit(f"FAIL: {label} missing logging line: got {lines[0]!r}")
++if not lines[1].startswith(expected_prefix):
++    raise SystemExit(f"FAIL: {label} missing success prefix: got {lines[1]!r}")
++timestamp = lines[1][len(expected_prefix):].strip()
++if not timestamp:
++    raise SystemExit(f"FAIL: {label} missing success timestamp")
++if "2031-02-03" not in timestamp or "04:05" not in timestamp:
++    raise SystemExit(f"FAIL: {label} timestamp did not reflect stub token expiration: got {timestamp!r}")
++PY
++}
++
++assert_all_success_output() {
++    local label=$1
++    local path=$2
++
++    python - "$label" "$path" <<'PY' || exit 1
++import sys
++
++label, path = sys.argv[1:3]
++expected_urls = {
++    "https://alpha.awsapps.com/start",
++    "https://beta.awsapps.com/start",
++    "https://gamma.awsapps.com/start",
++}
++with open(path, encoding="utf-8") as f:
++    lines = f.read().splitlines()
++if not lines or lines[0] != "Logging in 3 Identity Center instances":
++    raise SystemExit(f"FAIL: {label} missing multi-instance header: got {lines!r}")
++if len(lines[1:]) != len(expected_urls) * 2:
++    raise SystemExit(f"FAIL: {label} wrong per-instance output count: got {lines!r}")
++seen = set()
++prefix = "Login succeeded, valid until "
++for i in range(1, len(lines), 2):
++    line = lines[i]
++    if not line.startswith("Logging in "):
++        raise SystemExit(f"FAIL: {label} expected logging line: got {line!r}")
++    url = line[len("Logging in "):]
++    seen.add(url)
++    success = lines[i + 1]
++    if not success.startswith(prefix):
++        raise SystemExit(f"FAIL: {label} missing success line after {url}: got {success!r}")
++    timestamp = success[len(prefix):].strip()
++    if "2031-02-03" not in timestamp or "04:05" not in timestamp:
++        raise SystemExit(f"FAIL: {label} timestamp did not reflect stub token expiration: got {timestamp!r}")
++if seen != expected_urls:
++    raise SystemExit(f"FAIL: {label} selected URLs mismatch: got {sorted(seen)!r}")
++PY
++}
++
++assert_fetch_log() {
++    local label=$1
++    local start_url=$2
++    local region=$3
++    local force_refresh=$4
++    local headless=$5
++
++    python - "$label" "$TMP/log.jsonl" "$start_url" "$region" "$force_refresh" "$headless" <<'PY' || exit 1
++import json
++import sys
++
++label, path, start_url, region, force_refresh, headless = sys.argv[1:7]
++want_force = force_refresh == "true"
++with open(path, encoding="utf-8") as f:
++    events = [json.loads(line) for line in f if line.strip()]
++fetches = [e for e in events if e.get("event") == "fetch_token"]
++if not any(e.get("start_url") == start_url and e.get("region") == region and e.get("force_refresh") is want_force for e in fetches):
++    raise SystemExit(f"FAIL: {label} missing fetch_token for {start_url} {region} force={want_force}: got {events!r}")
++fetchers = [e for e in events if e.get("event") == "get_token_fetcher" and e.get("region") == region]
++if not fetchers:
++    raise SystemExit(f"FAIL: {label} missing token fetcher for {region}: got {events!r}")
++if not any(e.get("interactive") is True for e in fetchers):
++    raise SystemExit(f"FAIL: {label} token fetcher did not allow interactive user-code flow: got {events!r}")
++if headless == "true":
++    if not any(e.get("disable_browser") is True for e in fetchers):
++        raise SystemExit(f"FAIL: {label} headless did not disable browser: got {events!r}")
++else:
++    if any(e.get("disable_browser") is True for e in fetchers):
++        raise SystemExit(f"FAIL: {label} browser disabled without --headless: got {events!r}")
++PY
++}
++
++assert_starts_with() {
++    local label=$1
++    local path=$2
++    local prefix=$3
++    local actual
++    actual=$(cat "$path")
++    [[ "$actual" == "$prefix"* ]] || fail "$label: got [$actual]"
++}
++
++assert_nonempty_after_prefix() {
++    local label=$1
++    local path=$2
++    local prefix=$3
++    local actual rest
++    actual=$(cat "$path")
++    [[ "$actual" == "$prefix"* ]] || fail "$label: got [$actual]"
++    rest=${actual#"$prefix"}
++    [ -n "$rest" ] || fail "$label: missing detail after prefix"
++}
++
++cd "$TMP" || exit 1
++
++
++
++
++set_config "$FIXTURES/aws-config-three"
++run_cli "$BIN" --help
++[ "$ec" -eq 0 ] || fail "F1 exit $ec; want 0"
++
++grep -Eq '^[[:space:]]*login([[:space:]]|$)' out || fail "F1 missing login command"
++[ ! -s err ] || fail "F1 unexpected stderr: $(cat err)"
++
++
++
++
++run_cli "$BIN" login --help
++[ "$ec" -eq 0 ] || fail "F2 exit $ec; want 0"
++
++grep -q 'Usage: .*login' out || fail "F2 missing login usage"
++grep -q 'SSO_START_URL' out || fail "F2 missing SSO_START_URL argument"
++grep -q 'SSO_REGION' out || fail "F2 missing SSO_REGION argument"
++grep -q -- '--profile' out || fail "F2 missing profile option"
++grep -q -- '--all' out || fail "F2 missing all option"
++grep -q -- '--force-refresh' out || fail "F2 missing force-refresh option"
++grep -q -- '--headless' out || fail "F2 missing headless option"
++grep -q -- '-v, --verbose\|--verbose, -v' out || fail "F2 missing verbose option"
++grep -qi 'Identity Center' out || fail "F2 missing login-oriented Identity Center text"
++grep -qi 'log in' out || fail "F2 missing login-oriented help text"
++! grep -q -- '--sso-start-url' out || fail "F2 hidden --sso-start-url was listed"
++! grep -q -- '--sso-region' out || fail "F2 hidden --sso-region was listed"
++! grep -Eq '(^|[[:space:]])--force([,[:space:]]|$)' out || fail "F2 hidden --force was listed"
++[ ! -s err ] || fail "F2 unexpected stderr: $(cat err)"
++
++
++
++
++run_cli "$BIN" login https://alpha.awsapps.com/start us-east-1
++[ "$ec" -eq 0 ] || fail "F3 exit $ec; want 0"
++assert_success_output "F3" out "https://alpha.awsapps.com/start"
++[ ! -s err ] || fail "F3 unexpected stderr: $(cat err)"
++assert_fetch_log "F3" "https://alpha.awsapps.com/start" "us-east-1" "false" "false"
++
++
++
++
++run_cli python -m aws_sso_util.login --profile beta --force-refresh --headless
++[ "$ec" -eq 0 ] || fail "F4 exit $ec; want 0"
++assert_success_output "F4" out "https://beta.awsapps.com/start"
++[ ! -s err ] || fail "F4 unexpected stderr: $(cat err)"
++assert_fetch_log "F4" "https://beta.awsapps.com/start" "us-west-2" "true" "true"
++
++
++
++
++run_cli "$BIN" login --sso-start-url https://gamma.awsapps.com/start --sso-region eu-central-1 --force
++[ "$ec" -eq 0 ] || fail "F5 exit $ec; want 0"
++assert_success_output "F5" out "https://gamma.awsapps.com/start"
++[ ! -s err ] || fail "F5 unexpected stderr: $(cat err)"
++assert_fetch_log "F5" "https://gamma.awsapps.com/start" "eu-central-1" "true" "false"
++
++
++
++
++AWS_SSO_LOGIN_DEFAULT_SSO_START_URL=https://beta.awsapps.com/start \
++AWS_SSO_LOGIN_DEFAULT_SSO_REGION=us-west-2 \
++run_cli "$BIN" login
++[ "$ec" -eq 0 ] || fail "F6 exit $ec; want 0"
++assert_success_output "F6" out "https://beta.awsapps.com/start"
++[ ! -s err ] || fail "F6 unexpected stderr: $(cat err)"
++assert_fetch_log "F6" "https://beta.awsapps.com/start" "us-west-2" "false" "false"
++
++
++
++
++set_config "$FIXTURES/aws-config-empty"
++run_cli "$BIN" login
++[ "$ec" -eq 1 ] || fail "F7 exit $ec; want 1"
++[ ! -s out ] || fail "F7 unexpected stdout: $(cat out)"
++assert_file_eq "F7 stderr" err "No Identity Center config found"
++[ ! -s "$TMP/log.jsonl" ] || fail "F7 should not fetch token"
++
++
++
++
++set_config "$FIXTURES/aws-config-three"
++run_cli "$BIN" login nomatch us-east-1
++[ "$ec" -eq 1 ] || fail "F8 exit $ec; want 1"
++[ ! -s out ] || fail "F8 unexpected stdout: $(cat out)"
++
++assert_starts_with "F8 stderr" err "No Identity Center config matched"
++grep -q 'nomatch' err || fail "F8 stderr missing requested start URL matcher"
++grep -q 'us-east-1' err || fail "F8 stderr missing requested region"
++[ ! -s "$TMP/log.jsonl" ] || fail "F8 should not fetch token"
++
++
++
++
++run_cli "$BIN" login
++[ "$ec" -eq 1 ] || fail "F9 exit $ec; want 1"
++[ ! -s out ] || fail "F9 unexpected stdout: $(cat out)"
++
++assert_starts_with "F9 stderr" err "Found 3 Identity Center configs, please specify one or use --all:"
++grep -q 'https://alpha.awsapps.com/start' err || fail "F9 stderr missing alpha URL"
++grep -q 'https://beta.awsapps.com/start' err || fail "F9 stderr missing beta URL"
++grep -q 'https://gamma.awsapps.com/start' err || fail "F9 stderr missing gamma URL"
++[ ! -s "$TMP/log.jsonl" ] || fail "F9 should not fetch token"
++
++
++
++
++run_cli "$BIN" login --all
++[ "$ec" -eq 0 ] || fail "F10 exit $ec; want 0"
++assert_all_success_output "F10" out
++[ ! -s err ] || fail "F10 unexpected stderr: $(cat err)"
++grep -q '"start_url": "https://alpha.awsapps.com/start"' "$TMP/log.jsonl" || fail "F10 missing alpha fetch"
++grep -q '"start_url": "https://beta.awsapps.com/start"' "$TMP/log.jsonl" || fail "F10 missing beta fetch"
++grep -q '"start_url": "https://gamma.awsapps.com/start"' "$TMP/log.jsonl" || fail "F10 missing gamma fetch"
++
++
++
++
++AWS_SSO_LOGIN_ALL=1 run_cli python -m aws_sso_util.login
++[ "$ec" -eq 0 ] || fail "F11 exit $ec; want 0"
++assert_all_success_output "F11" out
++[ ! -s err ] || fail "F11 unexpected stderr: $(cat err)"
++
++
++
++
++AWS_SSO_LOGIN_ALL=true run_cli "$BIN" login
++[ "$ec" -eq 0 ] || fail "F12 exit $ec; want 0"
++assert_all_success_output "F12" out
++[ ! -s err ] || fail "F12 unexpected stderr: $(cat err)"
++
++
++
++
++run_cli_mode pending_expired "$BIN" login https://alpha.awsapps.com/start us-east-1
++[ "$ec" -eq 2 ] || fail "F13 exit $ec; want 2"
++assert_file_eq "F13 stdout" out "Logging in https://alpha.awsapps.com/start"
++assert_file_eq "F13 stderr" err "Login window expired"
++
++
++
++
++run_cli_mode invalid_grant "$BIN" login https://alpha.awsapps.com/start us-east-1
++[ "$ec" -eq 3 ] || fail "F14 exit $ec; want 3"
++assert_file_eq "F14 stdout" out "Logging in https://alpha.awsapps.com/start"
++assert_file_eq "F14 stderr" err "Login failed; the login window may have expired: InvalidGrantException (Device code expired)"
++
++
++
++
++run_cli_mode client_error "$BIN" login https://alpha.awsapps.com/start us-east-1
++[ "$ec" -eq 4 ] || fail "F15 exit $ec; want 4"
++assert_file_eq "F15 stdout" out "Logging in https://alpha.awsapps.com/start"
++
++assert_nonempty_after_prefix "F15 stderr" err "Login failed: "
++
++
++
++
++run_cli_mode unexpected "$BIN" login https://alpha.awsapps.com/start us-east-1
++[ "$ec" -eq 4 ] || fail "F16 exit $ec; want 4"
++assert_file_eq "F16 stdout" out "Logging in https://alpha.awsapps.com/start"
++
++assert_nonempty_after_prefix "F16 stderr" err "Login failed: "
++
++echo "PASS"
++exit 0
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,12 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++exec bash /workspace/repo/usercase-test-coderl/usecase.sh

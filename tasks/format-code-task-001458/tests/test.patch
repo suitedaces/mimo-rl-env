@@ -1,0 +1,533 @@
+diff --git a/usercase-test-coderl/aggregate-count.test.ts b/usercase-test-coderl/aggregate-count.test.ts
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/aggregate-count.test.ts
+@@ -0,0 +1,504 @@
++// @ts-nocheck
++
++jest.mock('ra-data-graphql', () => jest.fn((options) => options));
++
++import { execFileSync } from 'child_process';
++import fs from 'fs';
++import http from 'http';
++import https from 'https';
++import net from 'net';
++import os from 'os';
++import path from 'path';
++import { print } from 'graphql';
++import buildCustomDataProvider, {
++  buildApolloArgs,
++  buildArgs,
++  buildFields,
++  buildGqlQuery,
++  buildMetaArgs,
++  buildQuery,
++  FetchType,
++} from '../src';
++
++const named = (name: string) => ({ kind: 'SCALAR', name, ofType: null });
++const objectType = (name: string) => ({ kind: 'OBJECT', name, ofType: null });
++const nonNull = (type: any) => ({ kind: 'NON_NULL', name: null, ofType: type });
++const list = (type: any) => ({ kind: 'LIST', name: null, ofType: type });
++const arg = (name: string, type: any) => ({
++  name,
++  type,
++  defaultValue: null,
++  description: null,
++});
++const scalarField = (name: string, typeName = 'String') => ({
++  name,
++  type: named(typeName),
++  args: [],
++  isDeprecated: false,
++  deprecationReason: null,
++  description: null,
++});
++
++const queryType = {
++  name: 'person',
++  args: [
++    arg('limit', named('Int')),
++    arg('offset', named('Int')),
++    arg('order_by', list(nonNull(named('person_order_by')))),
++    arg('where', named('person_bool_exp')),
++    arg('distinct_on', list(named('person_select_column'))),
++    arg('ids', list(nonNull(named('Int')))),
++  ],
++  type: list(objectType('person')),
++};
++
++const resource = {
++  type: {
++    kind: 'OBJECT',
++    name: 'person',
++    fields: [
++      scalarField('id', 'Int'),
++      scalarField('name', 'String'),
++      scalarField('age', 'Int'),
++      {
++        name: 'profile',
++        type: objectType('profile'),
++        args: [],
++        isDeprecated: false,
++        deprecationReason: null,
++        description: null,
++      },
++    ],
++  },
++  [FetchType.GET_LIST]: queryType,
++  [FetchType.GET_MANY]: queryType,
++  [FetchType.GET_MANY_REFERENCE]: queryType,
++};
++
++const introspectionResults = {
++  types: [resource.type],
++  queries: [],
++  resources: [resource],
++  schema: {},
++};
++
++const listVariables = {
++  limit: 5,
++  offset: 0,
++  order_by: [{ name: 'asc' }],
++  where: { active: { _eq: true } },
++  distinct_on: undefined,
++  ids: undefined,
++  sortField: 'name',
++  sortOrder: 'ASC',
++};
++
++const manyVariables = {
++  where: { id: { _in: [2, 4, 8] } },
++  ids: [2, 4, 8],
++  limit: undefined,
++  offset: undefined,
++  order_by: undefined,
++};
++
++const referenceVariables = {
++  limit: 25,
++  offset: 50,
++  where: { author_id: { _eq: 7 } },
++  order_by: undefined,
++  distinct_on: undefined,
++};
++
++const makePublicBuilder = (
++  aggregateFieldName = (resourceName: string) => `${resourceName}_aggregate`,
++  metaBuilder = buildMetaArgs
++) =>
++  buildGqlQuery(
++    introspectionResults,
++    buildFields,
++    metaBuilder,
++    buildArgs,
++    buildApolloArgs,
++    aggregateFieldName
++  );
++
++const simplifyArgs = (args: any[]) =>
++  args.map((node) => ({
++    kind: node.kind,
++    name: node.name.value,
++    valueKind: node.value.kind,
++    valueName: node.value.name.value,
++  }));
++
++const sortedArgs = (args: any[]) => simplifyArgs(args).sort((left, right) =>
++  left.name.localeCompare(right.name)
++);
++
++const expectArgsNamed = (args: any[], names: string[]) => {
++  const expected = [...names].sort().map((name) => ({
++    kind: 'Argument',
++    name,
++    valueKind: 'Variable',
++    valueName: name,
++  }));
++  expect(sortedArgs(args)).toEqual(expected);
++};
++
++const operationSelection = (document: any) => {
++  expect(document.kind).toBe('Document');
++  expect(document.definitions).toHaveLength(1);
++  const operation = document.definitions[0];
++  expect(operation.kind).toBe('OperationDefinition');
++  expect(operation.operation).toBe('query');
++  return operation.selectionSet.selections;
++};
++
++const fieldByAlias = (selections: any[], alias: string) =>
++  selections.find((selection) => selection.alias && selection.alias.value === alias);
++
++const fieldNames = (field: any) =>
++  (field.selectionSet ? field.selectionSet.selections : []).map(
++    (selection: any) => selection.name.value
++  );
++
++const expectAggregateCountDocument = (
++  document: any,
++  {
++    aggregateName = 'person_aggregate',
++    itemArgs,
++    totalArgs,
++    expectTotal = true,
++  }: {
++    aggregateName?: string;
++    itemArgs: string[];
++    totalArgs: string[];
++    expectTotal?: boolean;
++  }
++) => {
++  const selections = operationSelection(document);
++  const items = fieldByAlias(selections, 'items');
++  expect(items).toBeDefined();
++  expect(items.name.value).toBe('person');
++  expectArgsNamed(items.arguments || [], itemArgs);
++  expect(fieldNames(items)).toEqual(expect.arrayContaining(['id', 'name']));
++
++  const total = fieldByAlias(selections, 'total');
++  if (!expectTotal) {
++    expect(total).toBeUndefined();
++    return;
++  }
++
++  expect(total).toBeDefined();
++  expect(total.name.value).toBe(aggregateName);
++  expectArgsNamed(total.arguments || [], totalArgs);
++  const aggregate = fieldByAlias(total.selectionSet.selections, 'aggregate') ||
++    total.selectionSet.selections.find((selection: any) => selection.name.value === 'aggregate');
++  expect(aggregate).toBeDefined();
++  expect(fieldNames(aggregate)).toEqual(['count']);
++};
++
++test('buildMetaArgs omits pagination and undefined variables for list counts', () => {
++
++
++  const variables = { ...listVariables };
++  const actual = simplifyArgs(buildMetaArgs(queryType as any, variables, FetchType.GET_LIST));
++
++  expect(actual.sort((left, right) => left.name.localeCompare(right.name))).toEqual([
++    {
++      kind: 'Argument',
++      name: 'order_by',
++      valueKind: 'Variable',
++      valueName: 'order_by',
++    },
++    {
++      kind: 'Argument',
++      name: 'where',
++      valueKind: 'Variable',
++      valueName: 'where',
++    },
++  ]);
++});
++
++test('buildMetaArgs keeps pagination for a non-list fetch type', () => {
++
++
++  const variables = { ...listVariables };
++  const actual = simplifyArgs(buildMetaArgs(queryType as any, variables, FetchType.GET_ONE));
++
++  expect(actual.sort((left, right) => left.name.localeCompare(right.name))).toEqual([
++    {
++      kind: 'Argument',
++      name: 'limit',
++      valueKind: 'Variable',
++      valueName: 'limit',
++    },
++    {
++      kind: 'Argument',
++      name: 'offset',
++      valueKind: 'Variable',
++      valueName: 'offset',
++    },
++    {
++      kind: 'Argument',
++      name: 'order_by',
++      valueKind: 'Variable',
++      valueName: 'order_by',
++    },
++    {
++      kind: 'Argument',
++      name: 'where',
++      valueKind: 'Variable',
++      valueName: 'where',
++    },
++  ]);
++});
++
++test('GET_LIST document includes default aggregate count beside items', () => {
++
++
++  const variables = { ...listVariables };
++  const actual = makePublicBuilder()(resource, FetchType.GET_LIST, queryType as any, variables);
++
++  expectAggregateCountDocument(actual, {
++    itemArgs: ['limit', 'offset', 'order_by', 'where'],
++    totalArgs: ['order_by', 'where'],
++  });
++});
++
++test('GET_MANY document includes count arguments from defined non-pagination variables', () => {
++
++
++  const variables = { ...manyVariables };
++  const actual = makePublicBuilder()(resource, FetchType.GET_MANY, queryType as any, variables);
++
++  expectAggregateCountDocument(actual, {
++    itemArgs: ['where', 'ids'],
++    totalArgs: ['where', 'ids'],
++  });
++});
++
++test('GET_MANY_REFERENCE document omits limit and offset from count arguments', () => {
++
++
++  const variables = { ...referenceVariables };
++  const actual = makePublicBuilder()(
++    resource,
++    FetchType.GET_MANY_REFERENCE,
++    queryType as any,
++    variables
++  );
++
++  expectAggregateCountDocument(actual, {
++    itemArgs: ['limit', 'offset', 'where'],
++    totalArgs: ['where'],
++  });
++});
++
++test('custom aggregateFieldName replaces the default aggregate field', () => {
++
++
++  const variables = { ...listVariables };
++  const actual = makePublicBuilder(() => 'person_stats')(
++    resource,
++    FetchType.GET_LIST,
++    queryType as any,
++    variables
++  );
++
++  expectAggregateCountDocument(actual, {
++    aggregateName: 'person_stats',
++    itemArgs: ['limit', 'offset', 'order_by', 'where'],
++    totalArgs: ['order_by', 'where'],
++  });
++});
++
++test('NO_COUNT sentinel omits the aggregate selection', () => {
++
++
++  const variables = { ...listVariables };
++  const actual = makePublicBuilder(() => 'NO_COUNT')(
++    resource,
++    FetchType.GET_LIST,
++    queryType as any,
++    variables
++  );
++
++  expectAggregateCountDocument(actual, {
++    itemArgs: ['limit', 'offset', 'order_by', 'where'],
++    totalArgs: [],
++    expectTotal: false,
++  });
++});
++
++test('default buildQuery path uses resource aggregate count name', () => {
++
++
++  const params = {
++    pagination: { page: 2, perPage: 5 },
++    sort: { field: 'name', order: 'ASC' },
++    filter: { name: 'Ada' },
++  };
++  const actual = buildQuery(introspectionResults as any)(FetchType.GET_LIST, 'person', params);
++
++  expect(actual.variables).toEqual(
++    expect.objectContaining({
++      limit: expect.any(Number),
++      offset: expect.any(Number),
++      order_by: expect.any(Object),
++      where: expect.any(Object),
++    })
++  );
++
++  expectAggregateCountDocument(actual.query, {
++    itemArgs: ['limit', 'offset', 'order_by', 'where'],
++    totalArgs: ['order_by', 'where'],
++  });
++});
++
++test('custom data provider path honors aggregate field and meta args overrides', () => {
++
++
++  const customBuildVariables = () => () => ({ ...listVariables });
++  const customGetResponseParser = () => () => ({ data }: any) => data;
++  const customMetaArgs = (query: any, variables: any, fetchType: FetchType) =>
++    buildMetaArgs(query, { where: variables.where }, fetchType);
++  const providerOptions = buildCustomDataProvider(
++    {},
++    {
++      aggregateFieldName: () => 'person_stats',
++      buildMetaArgs: customMetaArgs,
++    },
++    customBuildVariables,
++    customGetResponseParser
++  ) as any;
++  const actual = providerOptions.buildQuery(introspectionResults)(
++    FetchType.GET_LIST,
++    'person',
++    {}
++  );
++
++  expectAggregateCountDocument(actual.query, {
++    aggregateName: 'person_stats',
++    itemArgs: ['limit', 'offset', 'order_by', 'where'],
++    totalArgs: ['where'],
++  });
++});
++
++test('unknown resource reports a public buildQuery error', () => {
++
++  expect(() =>
++    buildQuery(introspectionResults as any)(FetchType.GET_LIST, 'robot', {})
++  ).toThrow(Error);
++});
++
++test('buildGqlQuery is referentially transparent for the same inputs', () => {
++  const variables = { ...listVariables };
++  const first = makePublicBuilder()(resource, FetchType.GET_LIST, queryType as any, variables);
++  const second = makePublicBuilder()(resource, FetchType.GET_LIST, queryType as any, variables);
++  expect(second).toEqual(first);
++});
++
++test('buildGqlQuery does not mutate caller-owned variables or schema inputs', () => {
++  const variables = JSON.parse(JSON.stringify({ ...listVariables }));
++  const resourceInput = JSON.parse(JSON.stringify(resource));
++  const queryInput = JSON.parse(JSON.stringify(queryType));
++  const before = {
++    variables: JSON.parse(JSON.stringify(variables)),
++    resource: JSON.parse(JSON.stringify(resourceInput)),
++    queryType: JSON.parse(JSON.stringify(queryInput)),
++  };
++  makePublicBuilder()(resourceInput, FetchType.GET_LIST, queryInput, variables);
++  expect({ variables, resource: resourceInput, queryType: queryInput }).toEqual(before);
++});
++
++test('buildGqlQuery result is stable across a fresh Node process', () => {
++  const inProcess = print(
++    makePublicBuilder()(resource, FetchType.GET_LIST, queryType as any, { ...listVariables })
++  );
++  const script = `
++    const ts = require('typescript');
++    require.extensions['.ts'] = function(module, filename) {
++      const fs = require('fs');
++      const source = fs.readFileSync(filename, 'utf8');
++      const output = ts.transpileModule(source, {
++        compilerOptions: { module: ts.ModuleKind.CommonJS, esModuleInterop: true, target: ts.ScriptTarget.ES2016 }
++      }).outputText;
++      module._compile(output, filename);
++    };
++    const { print } = require('graphql');
++    const api = require('/workspace/repo/src/index.ts');
++    const named = (name) => ({ kind: 'SCALAR', name, ofType: null });
++    const objectType = (name) => ({ kind: 'OBJECT', name, ofType: null });
++    const nonNull = (type) => ({ kind: 'NON_NULL', name: null, ofType: type });
++    const list = (type) => ({ kind: 'LIST', name: null, ofType: type });
++    const arg = (name, type) => ({ name, type, defaultValue: null, description: null });
++    const scalarField = (name, typeName = 'String') => ({ name, type: named(typeName), args: [], isDeprecated: false, deprecationReason: null, description: null });
++    const queryType = { name: 'person', args: [arg('limit', named('Int')), arg('offset', named('Int')), arg('order_by', list(nonNull(named('person_order_by')))), arg('where', named('person_bool_exp')), arg('distinct_on', list(named('person_select_column'))), arg('ids', list(nonNull(named('Int'))))], type: list(objectType('person')) };
++    const resource = { type: { kind: 'OBJECT', name: 'person', fields: [scalarField('id', 'Int'), scalarField('name', 'String'), scalarField('age', 'Int'), { name: 'profile', type: objectType('profile'), args: [], isDeprecated: false, deprecationReason: null, description: null }] }, [api.FetchType.GET_LIST]: queryType };
++    const introspectionResults = { types: [resource.type], queries: [], resources: [resource], schema: {} };
++    const variables = { limit: 5, offset: 0, order_by: [{ name: 'asc' }], where: { active: { _eq: true } }, distinct_on: undefined, ids: undefined, sortField: 'name', sortOrder: 'ASC' };
++    const builder = api.buildGqlQuery(introspectionResults, api.buildFields, api.buildMetaArgs, api.buildArgs, api.buildApolloArgs, (resourceName) => resourceName + '_aggregate');
++    process.stdout.write(print(builder(resource, api.FetchType.GET_LIST, queryType, variables)));
++  `;
++  const freshProcess = execFileSync(process.execPath, ['-e', script], {
++    encoding: 'utf8',
++    cwd: '/workspace/repo',
++  });
++  expect(freshProcess).toBe(inProcess);
++});
++
++test('buildGqlQuery does not write files, use network, or mutate globals', () => {
++  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ra-data-hasura-fixture-'));
++  const previousCwd = process.cwd();
++  const beforeGlobals = Object.keys(globalThis).sort();
++  const original = {
++    writeFileSync: fs.writeFileSync,
++    appendFileSync: fs.appendFileSync,
++    createWriteStream: fs.createWriteStream,
++    netConnect: net.connect,
++    netCreateConnection: net.createConnection,
++    httpRequest: http.request,
++    httpsRequest: https.request,
++    fetch: globalThis.fetch,
++  };
++  const fail = () => {
++    throw new Error('undeclared side effect');
++  };
++
++  process.chdir(tmpDir);
++  try {
++    (fs as any).writeFileSync = fail;
++    (fs as any).appendFileSync = fail;
++    (fs as any).createWriteStream = fail;
++    (net as any).connect = fail;
++    (net as any).createConnection = fail;
++    (http as any).request = fail;
++    (https as any).request = fail;
++    (globalThis as any).fetch = fail;
++
++    const beforeFiles = fs.readdirSync(tmpDir);
++    const actual = makePublicBuilder()(resource, FetchType.GET_LIST, queryType as any, {
++      ...listVariables,
++    });
++    const afterFiles = fs.readdirSync(tmpDir);
++
++
++    expectAggregateCountDocument(actual, {
++      itemArgs: ['limit', 'offset', 'order_by', 'where'],
++      totalArgs: ['order_by', 'where'],
++    });
++    expect(afterFiles).toEqual(beforeFiles);
++    expect(Object.keys(globalThis).sort()).toEqual(beforeGlobals);
++  } finally {
++    (fs as any).writeFileSync = original.writeFileSync;
++    (fs as any).appendFileSync = original.appendFileSync;
++    (fs as any).createWriteStream = original.createWriteStream;
++    (net as any).connect = original.netConnect;
++    (net as any).createConnection = original.netCreateConnection;
++    (http as any).request = original.httpRequest;
++    (https as any).request = original.httpsRequest;
++    (globalThis as any).fetch = original.fetch;
++    process.chdir(previousCwd);
++    fs.rmSync(tmpDir, { recursive: true, force: true });
++  }
++});
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,19 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++cd /workspace/repo
++JEST_BIN=/workspace/repo/node_modules/.bin/jest
++if [ ! -x "$JEST_BIN" ]; then
++  echo "missing local Jest installation: $JEST_BIN" >&2
++  exit 127
++fi
++exec "$JEST_BIN" /workspace/repo/usercase-test-coderl/aggregate-count.test.ts --runInBand

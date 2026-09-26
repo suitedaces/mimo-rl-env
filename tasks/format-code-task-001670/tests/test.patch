@@ -1,0 +1,394 @@
+diff --git a/usercase-test-coderl/fixtures/probe_unaligned.py b/usercase-test-coderl/fixtures/probe_unaligned.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/fixtures/probe_unaligned.py
+@@ -0,0 +1,136 @@
++#!/usr/bin/env python3
++import contextlib
++import io
++import os
++import random
++import sys
++
++import numpy as np
++import torch
++
++REPO_ROOT = "/workspace/repo"
++if REPO_ROOT not in sys.path:
++    sys.path.insert(0, REPO_ROOT)
++
++from data import create_dataset
++from options.test_options import TestOptions
++from options.train_options import TrainOptions
++
++
++def parse_options(kind, args):
++    with contextlib.redirect_stdout(io.StringIO()):
++        if kind == "train":
++            return TrainOptions(" ".join(args)).parse()
++        if kind == "test":
++            opt = TestOptions(" ".join(args)).parse()
++
++            opt.num_threads = 0
++            opt.batch_size = 1
++            opt.serial_batches = True
++            opt.no_flip = True
++            opt.display_id = -1
++            return opt
++    raise SystemExit("usage: probe_unaligned.py <pairs|tensor|epoch> <train|test> ... -- <options>")
++
++
++def make_loader(kind, args):
++    opt = parse_options(kind, args)
++    with contextlib.redirect_stdout(io.StringIO()):
++        loader = create_dataset(opt)
++    return opt, loader
++
++
++def rel(root, path):
++    return os.path.relpath(path, root).replace(os.sep, "/")
++
++
++def fmt(values):
++    return ",".join(f"{float(value):.6f}" for value in values)
++
++
++def summarize_item(dataset, dataroot, index):
++    item = dataset[index]
++    a = item["A"]
++    b = item["B"]
++    print(f"item{index}.A_path={rel(dataroot, item['A_paths'])}")
++    print(f"item{index}.B_path={rel(dataroot, item['B_paths'])}")
++    print(f"item{index}.A_shape={'x'.join(map(str, a.shape))}")
++    print(f"item{index}.B_shape={'x'.join(map(str, b.shape))}")
++    print(f"item{index}.A_first={fmt(a[:, 0, 0])}")
++    print(f"item{index}.B_first={fmt(b[:, 0, 0])}")
++    print(f"item{index}.A_mean={fmt(a.mean(dim=(1, 2)))}")
++    print(f"item{index}.B_mean={fmt(b.mean(dim=(1, 2)))}")
++    print(f"item{index}.A_red_row0={fmt(a[0, 0, :])}")
++
++
++def main():
++    if "--" not in sys.argv:
++        raise SystemExit("missing -- before tool options")
++
++    command = sys.argv[1]
++    kind = sys.argv[2]
++    sep = sys.argv.index("--")
++    probe_args = sys.argv[3:sep]
++    tool_args = sys.argv[sep + 1 :]
++    dataroot = tool_args[tool_args.index("--dataroot") + 1]
++
++    seed = int(os.environ.get("PROBE_SEED", "0"))
++    random.seed(seed)
++    np.random.seed(seed)
++    torch.manual_seed(seed)
++
++    _, loader = make_loader(kind, tool_args)
++    dataset = loader.dataset
++
++    if command == "pairs":
++        print(f"len={len(dataset)}")
++
++        for index in map(int, probe_args):
++            item = dataset[index]
++            print(f"pair{index}={rel(dataroot, item['A_paths'])}|{rel(dataroot, item['B_paths'])}")
++        return
++
++    if command == "tensor":
++        summarize_item(dataset, dataroot, int(probe_args[0]))
++        return
++
++    if command == "flip":
++        index = int(probe_args[0])
++        saw_unflipped = False
++        saw_flipped = False
++        first_item = None
++        for seed in map(int, probe_args[1:]):
++            random.seed(seed)
++            np.random.seed(seed)
++            torch.manual_seed(seed)
++            item = dataset[index]
++            if first_item is None:
++                first_item = item
++            row = fmt(item["A"][0, 0, :])
++            saw_unflipped = saw_unflipped or row == "-1.000000,-0.498039,0.003922,1.000000"
++            saw_flipped = saw_flipped or row == "1.000000,0.003922,-0.498039,-1.000000"
++
++        print(f"item{index}.A_path={rel(dataroot, first_item['A_paths'])}")
++        print(f"item{index}.B_path={rel(dataroot, first_item['B_paths'])}")
++        print(f"item{index}.A_shape={'x'.join(map(str, first_item['A'].shape))}")
++        print(f"item{index}.saw_unflipped={str(saw_unflipped).lower()}")
++        print(f"item{index}.saw_flipped={str(saw_flipped).lower()}")
++        return
++
++    if command == "epoch":
++        index = int(probe_args[0])
++        for epoch in map(int, probe_args[1:]):
++            dataset.current_epoch = epoch
++            random.seed(seed)
++            np.random.seed(seed)
++            torch.manual_seed(seed)
++            item = dataset[index]
++            a = item["A"]
++            print(f"epoch{epoch}.A_shape={'x'.join(map(str, a.shape))}")
++        return
++
++    raise SystemExit(f"unknown command: {command}")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/usercase-test-coderl/usecase.sh b/usercase-test-coderl/usecase.sh
+new file mode 100755
+--- /dev/null
++++ b/usercase-test-coderl/usecase.sh
+@@ -0,0 +1,231 @@
++#!/usr/bin/env bash
++
++set -u
++export LANG=C.UTF-8 LC_ALL=C.UTF-8 TZ=UTC
++export PYTHONDONTWRITEBYTECODE=1
++
++cd /workspace/repo || { echo "FAIL: cd repo" >&2; exit 1; }
++python - <<'PY' >/dev/null 2>&1
++import PIL
++import torch
++import torchvision
++PY
++if [ "$?" -ne 0 ]; then
++    echo "FAIL: python dependencies PIL, torch, and torchvision are required" >&2
++    exit 1
++fi
++
++BIN="python /workspace/repo/usercase-test-coderl/fixtures/probe_unaligned.py"
++TMP=$(mktemp -d)
++trap 'rm -rf "$TMP"' EXIT
++fail() { echo "FAIL: $*" >&2; exit 1; }
++
++python - "$TMP" <<'PY'
++from pathlib import Path
++import sys
++
++import numpy as np
++from PIL import Image
++
++root = Path(sys.argv[1])
++
++
++def ensure(path):
++    path.mkdir(parents=True, exist_ok=True)
++
++
++def rgb(path, color, size=(4, 4)):
++    Image.new("RGB", size, color).save(path)
++
++
++def gray(path, value, size=(4, 4)):
++    Image.new("L", size, value).save(path)
++
++
++def gradient(path, size=(8, 8)):
++    arr = np.zeros((size[1], size[0], 3), dtype=np.uint8)
++    for y in range(size[1]):
++        for x in range(size[0]):
++            arr[y, x] = [(x * 32 + y * 4) % 256, (x * 16 + y * 8) % 256, (x * 8 + y * 16) % 256]
++    Image.fromarray(arr, "RGB").save(path)
++
++
++def row_image(path):
++    arr = np.zeros((4, 4, 3), dtype=np.uint8)
++    vals = [0, 64, 128, 255]
++    for y in range(4):
++        for x, value in enumerate(vals):
++            arr[y, x] = [value, 10 + y, 20]
++    Image.fromarray(arr, "RGB").save(path)
++
++
++for name in [
++    "serial_a_short/trainA", "serial_a_short/trainB",
++    "serial_b_short/trainA", "serial_b_short/trainB",
++    "random/trainA", "random/trainB",
++    "test_direct/testA", "test_direct/testB",
++    "test_fallback/valA", "test_fallback/valB",
++    "tensor/trainA", "tensor/trainB",
++    "flip/trainA", "flip/trainB",
++    "epoch/trainA", "epoch/trainB",
++    "missing_b/trainA", "missing_a/trainB",
++]:
++    ensure(root / name)
++
++for i, color in enumerate([(10, 20, 30), (40, 50, 60)]):
++    rgb(root / f"serial_a_short/trainA/a{i}.png", color)
++for i, color in enumerate([(70, 80, 90), (100, 110, 120), (130, 140, 150)]):
++    rgb(root / f"serial_a_short/trainB/b{i}.png", color)
++
++for i, color in enumerate([(11, 21, 31), (41, 51, 61), (71, 81, 91)]):
++    rgb(root / f"serial_b_short/trainA/a{i}.png", color)
++rgb(root / "serial_b_short/trainB/b0.png", (101, 111, 121))
++
++for i, color in enumerate([(12, 22, 32), (42, 52, 62), (72, 82, 92)]):
++    rgb(root / f"random/trainA/a{i}.png", color)
++for i, color in enumerate([(102, 112, 122), (132, 142, 152), (162, 172, 182)]):
++    rgb(root / f"random/trainB/b{i}.png", color)
++
++rgb(root / "test_direct/testA/a0.png", (1, 2, 3))
++rgb(root / "test_direct/testB/b0.png", (4, 5, 6))
++rgb(root / "test_fallback/valA/va0.png", (7, 8, 9))
++rgb(root / "test_fallback/valB/vb0.png", (10, 11, 12))
++
++gray(root / "tensor/trainA/gray_a.png", 64)
++rgb(root / "tensor/trainB/rgb_b.png", (10, 20, 30))
++row_image(root / "flip/trainA/row_a.png")
++rgb(root / "flip/trainB/b.png", (0, 0, 0))
++gradient(root / "epoch/trainA/grad_a.png")
++rgb(root / "epoch/trainB/b.png", (128, 64, 32), size=(8, 8))
++
++rgb(root / "missing_b/trainA/a.png", (1, 1, 1))
++rgb(root / "missing_a/trainB/b.png", (2, 2, 2))
++PY
++
++cd "$TMP" || fail "cd tmp"
++
++COMMON="--dataset_mode unaligned --gpu_ids -1 --num_threads 0 --batch_size 1 --max_dataset_size 100 --checkpoints_dir $TMP/checkpoints --name acc --preprocess none --no_flip"
++
++
++
++
++$BIN pairs train 0 1 2 -- $COMMON --dataroot "$TMP/serial_a_short" --phase train --serial_batches >out 2>err; ec=$?
++
++EXPECTED='len=3
++pair0=trainA/a0.png|trainB/b0.png
++pair1=trainA/a1.png|trainB/b1.png
++pair2=trainA/a0.png|trainB/b2.png'
++[ "$ec" -eq 0 ] || fail "F1 exit $ec; want 0"
++[ "$(cat out)" = "$EXPECTED" ] || fail "F1 stdout: $(cat out)"
++[ ! -s err ] || fail "F1 unexpected stderr: $(cat err)"
++
++
++
++
++$BIN pairs train 0 1 2 -- $COMMON --dataroot "$TMP/serial_b_short" --phase train --serial_batches >out 2>err; ec=$?
++
++EXPECTED='len=3
++pair0=trainA/a0.png|trainB/b0.png
++pair1=trainA/a1.png|trainB/b0.png
++pair2=trainA/a2.png|trainB/b0.png'
++[ "$ec" -eq 0 ] || fail "F2 exit $ec; want 0"
++[ "$(cat out)" = "$EXPECTED" ] || fail "F2 stdout: $(cat out)"
++[ ! -s err ] || fail "F2 unexpected stderr: $(cat err)"
++
++
++
++
++
++PROBE_SEED=5 $BIN pairs train 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 -- --dataset_mode unaligned --gpu_ids -1 --num_threads 0 --batch_size 1 --max_dataset_size 100 --checkpoints_dir "$TMP/checkpoints" --name acc --preprocess none --no_flip --dataroot "$TMP/random" --phase train >out 2>err; ec=$?
++[ "$ec" -eq 0 ] || fail "F3 exit $ec; want 0"
++grep -qx 'len=3' out || fail "F3 length missing: $(cat out)"
++PAIR_COUNT=$(grep -Ec '^pair1=trainA/a1\.png\|trainB/b[0-2]\.png$' out)
++[ "$PAIR_COUNT" -eq 24 ] || fail "F3 A index or B folder mismatch: $(cat out)"
++UNIQUE_B=$(sed -n 's#^pair1=trainA/a1\.png|trainB/\(b[0-2]\.png\)$#\1#p' out | sort -u | wc -l)
++[ "$UNIQUE_B" -gt 1 ] || fail "F3 B side did not vary across samples: $(cat out)"
++[ ! -s err ] || fail "F3 unexpected stderr: $(cat err)"
++
++
++
++
++$BIN pairs test 0 -- --dataset_mode unaligned --gpu_ids -1 --num_threads 0 --batch_size 1 --max_dataset_size 100 --checkpoints_dir "$TMP/checkpoints" --name acc --preprocess none --no_flip --dataroot "$TMP/test_direct" --phase test >out 2>err; ec=$?
++
++EXPECTED='len=1
++pair0=testA/a0.png|testB/b0.png'
++[ "$ec" -eq 0 ] || fail "F4 exit $ec; want 0"
++[ "$(cat out)" = "$EXPECTED" ] || fail "F4 stdout: $(cat out)"
++[ ! -s err ] || fail "F4 unexpected stderr: $(cat err)"
++
++
++
++
++$BIN pairs test 0 -- --dataset_mode unaligned --gpu_ids -1 --num_threads 0 --batch_size 1 --max_dataset_size 100 --checkpoints_dir "$TMP/checkpoints" --name acc --preprocess none --no_flip --dataroot "$TMP/test_fallback" --phase test >out 2>err; ec=$?
++
++EXPECTED='len=1
++pair0=valA/va0.png|valB/vb0.png'
++[ "$ec" -eq 0 ] || fail "F5 exit $ec; want 0"
++[ "$(cat out)" = "$EXPECTED" ] || fail "F5 stdout: $(cat out)"
++[ ! -s err ] || fail "F5 unexpected stderr: $(cat err)"
++
++
++
++
++$BIN tensor train 0 -- $COMMON --dataroot "$TMP/tensor" --phase train --serial_batches >out 2>err; ec=$?
++EXPECTED='item0.A_path=trainA/gray_a.png
++item0.B_path=trainB/rgb_b.png
++item0.A_shape=3x4x4
++item0.B_shape=3x4x4
++item0.A_first=-0.498039,-0.498039,-0.498039
++item0.B_first=-0.921569,-0.843137,-0.764706
++item0.A_mean=-0.498039,-0.498039,-0.498039
++item0.B_mean=-0.921569,-0.843137,-0.764706
++item0.A_red_row0=-0.498039,-0.498039,-0.498039,-0.498039'
++[ "$ec" -eq 0 ] || fail "F6 exit $ec; want 0"
++[ "$(cat out)" = "$EXPECTED" ] || fail "F6 stdout: $(cat out)"
++[ ! -s err ] || fail "F6 unexpected stderr: $(cat err)"
++
++
++
++
++
++PROBE_SEED=0 $BIN flip train 0 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 -- --dataset_mode unaligned --gpu_ids -1 --num_threads 0 --batch_size 1 --max_dataset_size 100 --checkpoints_dir "$TMP/checkpoints" --name acc --preprocess none --dataroot "$TMP/flip" --phase train --serial_batches >out 2>err; ec=$?
++EXPECTED='item0.A_path=trainA/row_a.png
++item0.B_path=trainB/b.png
++item0.A_shape=3x4x4
++item0.saw_unflipped=true
++item0.saw_flipped=true'
++[ "$ec" -eq 0 ] || fail "F7 exit $ec; want 0"
++[ "$(cat out)" = "$EXPECTED" ] || fail "F7 stdout: $(cat out)"
++[ ! -s err ] || fail "F7 unexpected stderr: $(cat err)"
++
++
++
++
++PROBE_SEED=3 $BIN epoch train 0 1 2 -- --dataset_mode unaligned --gpu_ids -1 --num_threads 0 --batch_size 1 --max_dataset_size 100 --checkpoints_dir "$TMP/checkpoints" --name acc --preprocess scale_width --load_size 8 --crop_size 4 --no_flip --dataroot "$TMP/epoch" --phase train --serial_batches --n_epochs 1 >out 2>err; ec=$?
++
++EXPECTED='epoch1.A_shape=3x8x8
++epoch2.A_shape=3x4x4'
++[ "$ec" -eq 0 ] || fail "F8 exit $ec; want 0"
++[ "$(cat out)" = "$EXPECTED" ] || fail "F8 stdout: $(cat out)"
++[ ! -s err ] || fail "F8 unexpected stderr: $(cat err)"
++
++
++
++
++$BIN pairs train 0 -- $COMMON --dataroot "$TMP/missing_b" --phase train --serial_batches >out 2>err; ec=$?
++[ "$ec" -ne 0 ] || fail "F9 exit $ec; want non-zero"
++[ ! -s out ] || fail "F9 stdout should be empty: $(cat out)"
++
++grep -q 'trainB' err || fail "F9 stderr missing trainB directory context: $(cat err)"
++
++
++
++
++$BIN pairs train 0 -- $COMMON --dataroot "$TMP/missing_a" --phase train --serial_batches >out 2>err; ec=$?
++[ "$ec" -ne 0 ] || fail "F10 exit $ec; want non-zero"
++[ ! -s out ] || fail "F10 stdout should be empty: $(cat out)"
++
++grep -q 'trainA' err || fail "F10 stderr missing trainA directory context: $(cat err)"
++
++echo "PASS"
++exit 0
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,12 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++exec bash /workspace/repo/usercase-test-coderl/usecase.sh

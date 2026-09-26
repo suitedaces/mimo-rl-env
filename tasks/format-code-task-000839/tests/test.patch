@@ -1,0 +1,381 @@
+diff --git a/jobber/log_cli_test.go b/jobber/log_cli_test.go
+new file mode 100644
+index 0000000..046265c
+--- /dev/null
++++ b/jobber/log_cli_test.go
+@@ -0,0 +1,341 @@
++package main
++
++import (
++	"bytes"
++	"fmt"
++	"io/ioutil"
++	"os"
++	"os/exec"
++	"os/user"
++	"path/filepath"
++	"strconv"
++	"strings"
++	"syscall"
++	"testing"
++	"time"
++)
++
++type logCLIFixture struct {
++	t          *testing.T
++	repoRoot   string
++	binDir     string
++	libexecDir string
++	jobberBin  string
++	varDir     string
++	jobfile    string
++	runAs      *syscall.Credential
++	runner     *exec.Cmd
++}
++
++func newLogCLIFixture(t *testing.T) *logCLIFixture {
++	t.Helper()
++	usr, err := user.Current()
++	if err != nil {
++		t.Fatal(err)
++	}
++	return newLogCLIFixtureForUser(t, usr)
++}
++
++func newLogCLIFixtureForUser(t *testing.T, usr *user.User) *logCLIFixture {
++	t.Helper()
++
++	repoRoot, err := filepath.Abs("..")
++	if err != nil {
++		t.Fatal(err)
++	}
++	tmpDir, err := ioutil.TempDir("", "jobber-log-cli-")
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() {
++		os.RemoveAll(tmpDir)
++	})
++	if err := os.Chmod(tmpDir, 0755); err != nil {
++		t.Fatal(err)
++	}
++
++	f := &logCLIFixture{
++		t:          t,
++		repoRoot:   repoRoot,
++		binDir:     filepath.Join(tmpDir, "bin"),
++		libexecDir: filepath.Join(tmpDir, "libexec"),
++		jobfile:    filepath.Join(tmpDir, "jobfile"),
++	}
++	current, err := user.Current()
++	if err != nil {
++		t.Fatal(err)
++	}
++	if usr.Uid != current.Uid {
++		f.runAs = credentialForUser(t, usr)
++	}
++	if err := os.MkdirAll(f.binDir, 0755); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.MkdirAll(f.libexecDir, 0755); err != nil {
++		t.Fatal(err)
++	}
++
++	f.jobberBin = filepath.Join(f.binDir, "jobber")
++	f.buildBinary("github.com/dshearer/jobber/jobber", f.jobberBin)
++	f.buildBinary("github.com/dshearer/jobber/jobberrunner", filepath.Join(f.libexecDir, "jobberrunner"))
++
++	if err := os.MkdirAll("/var/jobber", 0755); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.Chmod("/var/jobber", 0755); err != nil {
++		t.Fatal(err)
++	}
++	f.varDir = filepath.Join("/var/jobber", usr.Uid)
++	if err := os.RemoveAll(f.varDir); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.MkdirAll(f.varDir, 0770); err != nil {
++		t.Fatal(err)
++	}
++	if f.runAs != nil {
++		if err := os.Chown(f.varDir, int(f.runAs.Uid), int(f.runAs.Gid)); err != nil {
++			t.Fatal(err)
++		}
++		if err := os.Chmod(f.varDir, 0770); err != nil {
++			t.Fatal(err)
++		}
++	}
++	t.Cleanup(func() {
++		os.RemoveAll(f.varDir)
++	})
++	return f
++}
++
++func credentialForUser(t *testing.T, usr *user.User) *syscall.Credential {
++	t.Helper()
++	uid, err := strconv.ParseUint(usr.Uid, 10, 32)
++	if err != nil {
++		t.Fatal(err)
++	}
++	gid, err := strconv.ParseUint(usr.Gid, 10, 32)
++	if err != nil {
++		t.Fatal(err)
++	}
++	return &syscall.Credential{Uid: uint32(uid), Gid: uint32(gid)}
++}
++
++func alternateTestUser(t *testing.T) *user.User {
++	t.Helper()
++	current, err := user.Current()
++	if err != nil {
++		t.Fatal(err)
++	}
++	for _, name := range []string{"ubuntu", "nobody", "daemon"} {
++		usr, err := user.Lookup(name)
++		if err == nil && usr.Uid != current.Uid {
++			return usr
++		}
++	}
++	t.Fatal("could not find an alternate local user for CLI log coverage")
++	return nil
++}
++
++func (f *logCLIFixture) setCommandUser(cmd *exec.Cmd) {
++	if f.runAs != nil {
++		cmd.SysProcAttr = &syscall.SysProcAttr{Credential: f.runAs}
++	}
++}
++
++func (f *logCLIFixture) buildBinary(pkg, out string) {
++	f.t.Helper()
++	cmd := exec.Command("go", "build", "-o", out, pkg)
++	cmd.Dir = f.repoRoot
++	cmd.Env = append(os.Environ(), "GOPATH=/go", "GO111MODULE=off")
++	var output bytes.Buffer
++	cmd.Stdout = &output
++	cmd.Stderr = &output
++	if err := cmd.Run(); err != nil {
++		f.t.Fatalf("failed to build %s: %v\n%s", pkg, err, output.String())
++	}
++}
++
++func (f *logCLIFixture) startRunner(jobfileContents string) {
++	f.t.Helper()
++	if err := ioutil.WriteFile(f.jobfile, []byte(jobfileContents), 0600); err != nil {
++		f.t.Fatal(err)
++	}
++	if f.runAs != nil {
++		if err := os.Chown(f.jobfile, int(f.runAs.Uid), int(f.runAs.Gid)); err != nil {
++			f.t.Fatal(err)
++		}
++	}
++
++	cmd := exec.Command(filepath.Join(f.libexecDir, "jobberrunner"), f.jobfile)
++	cmd.Env = append(os.Environ(), "PATH="+f.libexecDir+":"+f.binDir+":"+os.Getenv("PATH"))
++	f.setCommandUser(cmd)
++	var output bytes.Buffer
++	cmd.Stdout = &output
++	cmd.Stderr = &output
++	if err := cmd.Start(); err != nil {
++		f.t.Fatalf("failed to start jobberrunner: %v\n%s", err, output.String())
++	}
++	f.runner = cmd
++	f.t.Cleanup(func() {
++		if f.runner != nil && f.runner.Process != nil {
++			_ = f.runner.Process.Signal(syscall.SIGTERM)
++			done := make(chan error, 1)
++			go func() { done <- f.runner.Wait() }()
++			select {
++			case <-done:
++			case <-time.After(2 * time.Second):
++				_ = f.runner.Process.Kill()
++				<-done
++			}
++		}
++	})
++
++	socketPath := filepath.Join(f.varDir, "cmd.sock")
++	deadline := time.Now().Add(5 * time.Second)
++	for {
++		if _, err := os.Stat(socketPath); err == nil {
++			return
++		}
++		if err := cmd.Process.Signal(syscall.Signal(0)); err != nil {
++			f.t.Fatalf("jobberrunner exited before creating command socket: %v\n%s", err, output.String())
++		}
++		if time.Now().After(deadline) {
++			f.t.Fatalf("timed out waiting for command socket %s\n%s", socketPath, output.String())
++		}
++		time.Sleep(50 * time.Millisecond)
++	}
++}
++
++func (f *logCLIFixture) jobber(args ...string) string {
++	f.t.Helper()
++	cmd := exec.Command(f.jobberBin, args...)
++	cmd.Env = append(os.Environ(), "PATH="+f.libexecDir+":"+f.binDir+":"+os.Getenv("PATH"))
++	f.setCommandUser(cmd)
++	var stdout, stderr bytes.Buffer
++	cmd.Stdout = &stdout
++	cmd.Stderr = &stderr
++	if err := cmd.Run(); err != nil {
++		f.t.Fatalf("jobber %s failed: %v\nstdout:\n%s\nstderr:\n%s",
++			strings.Join(args, " "), err, stdout.String(), stderr.String())
++	}
++	return stdout.String()
++}
++
++func assertEmptyRunLogOutput(t *testing.T, output string) {
++	t.Helper()
++	trimmed := strings.TrimSpace(output)
++
++	if trimmed != "No run logs." {
++		t.Fatalf("expected empty run log output to be %q, got %q", "No run logs.", trimmed)
++	}
++	for _, token := range []string{"TIME", "JOB", "SUCCEEDED", "RESULT", "USER"} {
++		if strings.Contains(output, token) {
++			t.Fatalf("empty run log output should not contain header token %q: %q", token, output)
++		}
++	}
++}
++
++func assertTabularLogOutputForJob(t *testing.T, output, jobName string, allUsers bool) {
++	t.Helper()
++	assertTabularLogOutputForJobs(t, output, []string{jobName}, allUsers)
++}
++
++func assertTabularLogOutputForJobs(t *testing.T, output string, jobNames []string, allUsers bool) {
++	t.Helper()
++	if strings.TrimSpace(output) == "No run logs." {
++		t.Fatalf("expected non-empty log table, got empty-state message")
++	}
++	var lines []string
++	for _, line := range strings.Split(output, "\n") {
++		if strings.TrimSpace(line) != "" {
++			lines = append(lines, line)
++		}
++	}
++	if len(lines) < 2 {
++		t.Fatalf("expected log output to include a header and at least one row; got %q", output)
++	}
++	header := lines[0]
++	for _, token := range []string{"TIME", "JOB", "SUCCEEDED", "RESULT"} {
++		if !strings.Contains(header, token) {
++			t.Fatalf("expected header token %q in first line %q", token, header)
++		}
++	}
++	if allUsers && !strings.Contains(header, "USER") {
++		t.Fatalf("expected USER column in all-users log header %q", header)
++	}
++	for _, jobName := range jobNames {
++		if !strings.Contains(output, jobName) {
++			t.Fatalf("expected job name %q in log output %q", jobName, output)
++		}
++	}
++}
++
++func oneSecondFromNowSpec() string {
++	next := time.Now().Add(time.Second)
++	return fmt.Sprintf("%d %d %d %d %d *",
++		next.Second(),
++		next.Minute(),
++		next.Hour(),
++		next.Day(),
++		int(next.Month()))
++}
++
++func (f *logCLIFixture) waitForLogEntry(jobName string) string {
++	f.t.Helper()
++	return f.waitForLogEntries(jobName)
++}
++
++func (f *logCLIFixture) waitForLogEntries(jobNames ...string) string {
++	f.t.Helper()
++	deadline := time.Now().Add(5 * time.Second)
++	for time.Now().Before(deadline) {
++		output := f.jobber("log")
++		foundAll := true
++		for _, jobName := range jobNames {
++			if !strings.Contains(output, jobName) {
++				foundAll = false
++				break
++			}
++		}
++		if foundAll {
++			return output
++		}
++		time.Sleep(100 * time.Millisecond)
++	}
++	return f.jobber("log")
++}
++
++func TestLogCommandEmptyState(t *testing.T) {
++	fixture := newLogCLIFixture(t)
++	fixture.startRunner("[prefs]\nrunLog:\n    type: memory\n\n[jobs]\n")
++	otherFixture := newLogCLIFixtureForUser(t, alternateTestUser(t))
++	otherFixture.startRunner("[prefs]\nrunLog:\n    type: memory\n\n[jobs]\n")
++
++	assertEmptyRunLogOutput(t, fixture.jobber("log"))
++	assertEmptyRunLogOutput(t, otherFixture.jobber("log"))
++	assertEmptyRunLogOutput(t, fixture.jobber("log", "-a"))
++}
++
++func TestLogCommandNonEmptyStillTabular(t *testing.T) {
++	fixture := newLogCLIFixture(t)
++	const firstJobName = "TestJobAlpha"
++	const secondJobName = "TestJobBeta"
++	runTime := oneSecondFromNowSpec()
++	fixture.startRunner(fmt.Sprintf(`[prefs]
++runLog:
++    type: memory
++
++[jobs]
++- name: %s
++  cmd: exit 0
++  time: '%s'
++- name: %s
++  cmd: exit 0
++  time: '%s'
++`, firstJobName, runTime, secondJobName, runTime))
++
++	jobNames := []string{firstJobName, secondJobName}
++	logOutput := fixture.waitForLogEntries(jobNames...)
++
++	assertTabularLogOutputForJobs(t, logOutput, jobNames, false)
++	assertTabularLogOutputForJobs(t, fixture.jobber("log", "-a"), jobNames, true)
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,29 @@
++#!/bin/bash
++set -euo pipefail
++
++cd /testbed
++
++
++
++mkdir -p /go/src/github.com/dshearer
++if [ ! -e /go/src/github.com/dshearer/jobber ]; then
++    ln -s /testbed /go/src/github.com/dshearer/jobber
++fi
++cd /go/src/github.com/dshearer/jobber
++
++
++case "${1:-}" in
++  base)
++    GOPATH=/go GO111MODULE=off go test -vet=off -v \
++      ./common ./jobber ./jobbermaster ./jobberrunner \
++      -run "TestLoadPrefs|TestShouldIncludeUser|TestParseDefaultPrefs|TestParseDefaultPrefsAfterUncommenting|TestParseDefaultJobfile|TestParseDefaultJobfileAfterUncommenting|TestNextRunTime"
++    ;;
++  new)
++    GOPATH=/go GO111MODULE=off go test -vet=off -count=1 -v \
++      ./jobber -run "TestLogCommand"
++    ;;
++  *)
++    echo "usage: $0 base|new"
++    exit 2
++    ;;
++esac

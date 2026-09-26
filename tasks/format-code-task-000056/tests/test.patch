@@ -1,0 +1,288 @@
+diff --git a/pkg/serverless/logs/logs_test.go b/pkg/serverless/logs/logs_test.go
+index 938393f354..19a88406ae 100644
+--- a/pkg/serverless/logs/logs_test.go
++++ b/pkg/serverless/logs/logs_test.go
+@@ -12,6 +12,7 @@ import (
+ 	"net/http"
+ 	"net/http/httptest"
+ 	"os"
++	"strings"
+ 	"testing"
+ 	"time"
+ 
+@@ -392,7 +393,74 @@ func TestProcessMessageShouldNotProcessLogsDropped(t *testing.T) {
+ 	assert.Len(t, timed, 0)
+ }
+ 
+-func TestProcessMessageShouldProcessLogTypeFunction(t *testing.T) {
++func countMetricsByName(samples []metrics.MetricSample, name string) int {
++	count := 0
++	for _, sample := range samples {
++		if sample.Name == name {
++			count++
++		}
++	}
++	return count
++}
++
++func platformReportJSON(requestID, status string, memoryUsed, memorySize float64) []byte {
++	return []byte(fmt.Sprintf(`{
++		"time": %q,
++		"type": "platform.report",
++		"record": {
++			"requestId": %q,
++			"status": %q,
++			"metrics": {
++				"maxMemoryUsedMB": %.1f,
++				"memorySizeMB": %.1f
++			}
++		}
++	}`, time.Unix(0, 0).UTC().Format(logMessageTimeLayout), requestID, status, memoryUsed, memorySize))
++}
++
++func unmarshalPlatformReport(t *testing.T, raw []byte) *LambdaLogAPIMessage {
++	t.Helper()
++	message := &LambdaLogAPIMessage{}
++	require.NoError(t, json.Unmarshal(raw, message))
++	return message
++}
++
++func newOOMTestCollector(t *testing.T, demux aggregator.Demultiplexer, requestID string) *LambdaLogsCollector {
++	t.Helper()
++
++	executionContext := &executioncontext.ExecutionContext{}
++	return newOOMTestCollectorWithExecutionContext(t, demux, requestID, executionContext)
++}
++
++func newOOMTestCollectorWithExecutionContext(t *testing.T, demux aggregator.Demultiplexer, requestID string, executionContext *executioncontext.ExecutionContext) *LambdaLogsCollector {
++	t.Helper()
++
++	arn := "arn:aws:lambda:us-east-1:123456789012:function:test-function"
++	metricTags := []string{"functionname:test-function"}
++	tags := Tags{Tags: metricTags}
++	executionContext.SetFromInvocation(arn, requestID)
++
++	lc := NewLambdaLogCollector(
++		make(chan<- *config.ChannelMessage),
++		demux,
++		&tags,
++		true,
++		true,
++		executionContext,
++		func() {},
++		make(chan<- float64),
++	)
++	lc.lastRequestID = requestID
++	return lc
++}
++
++func processAndWaitForSamples(lc *LambdaLogsCollector, message LambdaLogAPIMessage, expectedSamples int) ([]metrics.MetricSample, []metrics.MetricSample) {
++	lc.Start()
++	lc.In <- []LambdaLogAPIMessage{message}
++	return lc.demux.(*aggregator.TestAgentDemultiplexer).WaitForNumberOfSamples(expectedSamples, 0, 100*time.Millisecond)
++}
++
++func TestProcessMessageShouldProcessLogTypeFunctionOutOfMemory(t *testing.T) {
+ 	demux := aggregator.InitTestAgentDemultiplexerWithFlushInterval(time.Hour)
+ 	defer demux.Stop(false)
+ 	message := &LambdaLogAPIMessage{
+@@ -413,14 +481,170 @@ func TestProcessMessageShouldProcessLogTypeFunction(t *testing.T) {
+ 	mockExecutionContext.SetFromInvocation(arn, lastRequestID)
+ 
+ 	lc := NewLambdaLogCollector(make(chan<- *config.ChannelMessage), demux, &tags, true, computeEnhancedMetrics, mockExecutionContext, func() {}, make(chan<- float64))
++	lc.lastRequestID = lastRequestID
+ 
+-	go lc.processMessage(message)
++	received, timed := processAndWaitForSamples(lc, *message, 2)
+ 
+-	received, timed := demux.WaitForNumberOfSamples(2, 0, 100*time.Millisecond)
+ 	assert.Len(t, received, 2)
+ 	assert.Len(t, timed, 0)
+-	assert.Equal(t, serverlessMetrics.OutOfMemoryMetric, received[0].Name)
+-	assert.Equal(t, serverlessMetrics.ErrorsMetric, received[1].Name)
++	assert.Equal(t, 1, countMetricsByName(received, serverlessMetrics.OutOfMemoryMetric))
++	assert.Equal(t, 1, countMetricsByName(received, serverlessMetrics.ErrorsMetric))
++}
++
++func TestProcessPlatformReportOOMEmitsEnhancedMetricsFromJSON(t *testing.T) {
++	demux := aggregator.InitTestAgentDemultiplexerWithFlushInterval(time.Hour)
++	defer demux.Stop(false)
++
++	requestID := "8286a188-ba32-4475-8077-530cd35c09a9"
++	message := unmarshalPlatformReport(t, platformReportJSON(requestID, "error", 512, 512))
++	lc := newOOMTestCollector(t, demux, requestID)
++
++	received, timed := processAndWaitForSamples(lc, *message, 8)
++	assert.Len(t, timed, 0)
++	assert.Equal(t, 1, countMetricsByName(received, serverlessMetrics.OutOfMemoryMetric))
++	assert.Equal(t, 1, countMetricsByName(received, serverlessMetrics.ErrorsMetric))
++}
++
++func TestProcessPlatformReportOOMAlsoEmitsWhenMemoryExceedsLimit(t *testing.T) {
++	demux := aggregator.InitTestAgentDemultiplexerWithFlushInterval(time.Hour)
++	defer demux.Stop(false)
++
++	requestID := "5d607cb8-d752-43e7-8f99-f5b5f6a17452"
++	message := unmarshalPlatformReport(t, platformReportJSON(requestID, "error", 768, 512))
++	lc := newOOMTestCollector(t, demux, requestID)
++
++	received, timed := processAndWaitForSamples(lc, *message, 8)
++	assert.Len(t, timed, 0)
++	assert.Equal(t, 1, countMetricsByName(received, serverlessMetrics.OutOfMemoryMetric))
++	assert.Equal(t, 1, countMetricsByName(received, serverlessMetrics.ErrorsMetric))
++}
++
++func TestProcessPlatformReportOOMRequiresQualifyingReport(t *testing.T) {
++	testCases := []struct {
++		name       string
++		status     string
++		memoryUsed float64
++		memorySize float64
++	}{
++		{
++			name:       "non-error status at memory limit",
++			status:     "success",
++			memoryUsed: 256,
++			memorySize: 256,
++		},
++		{
++			name:       "error status below memory limit",
++			status:     "error",
++			memoryUsed: 255,
++			memorySize: 256,
++		},
++		{
++			name:       "error status with zero memory used",
++			status:     "error",
++			memoryUsed: 0,
++			memorySize: 256,
++		},
++	}
++
++	for _, tc := range testCases {
++		t.Run(tc.name, func(t *testing.T) {
++			demux := aggregator.InitTestAgentDemultiplexerWithFlushInterval(time.Hour)
++			defer demux.Stop(false)
++
++			requestID := "negative-" + strings.ReplaceAll(tc.name, " ", "-")
++			message := unmarshalPlatformReport(t, platformReportJSON(requestID, tc.status, tc.memoryUsed, tc.memorySize))
++			lc := newOOMTestCollector(t, demux, requestID)
++
++			received, timed := processAndWaitForSamples(lc, *message, 6)
++			assert.Len(t, timed, 0)
++			assert.Equal(t, 0, countMetricsByName(received, serverlessMetrics.OutOfMemoryMetric))
++		})
++	}
++}
++
++func TestOutOfMemoryEnhancedMetricsAreDedupedPerRequest(t *testing.T) {
++	demux := aggregator.InitTestAgentDemultiplexerWithFlushInterval(time.Hour)
++	defer demux.Stop(false)
++
++	requestID := "fa7d55f7-4054-412f-9567-8f607c8376db"
++	lc := newOOMTestCollector(t, demux, requestID)
++	functionOOM := &LambdaLogAPIMessage{
++		logType:      logTypeFunction,
++		time:         time.Now(),
++		stringRecord: "JavaScript heap out of memory",
++	}
++	reportOOM := unmarshalPlatformReport(t, platformReportJSON(requestID, "error", 1024, 1024))
++
++	lc.Start()
++	lc.In <- []LambdaLogAPIMessage{*functionOOM, *reportOOM}
++
++	received, timed := demux.WaitForNumberOfSamples(8, 0, 100*time.Millisecond)
++	assert.Len(t, timed, 0)
++	assert.Equal(t, 1, countMetricsByName(received, serverlessMetrics.OutOfMemoryMetric))
++}
++
++func TestPersistedOOMDeduplicationPreventsDuplicateAfterRestore(t *testing.T) {
++	demux := aggregator.InitTestAgentDemultiplexerWithFlushInterval(time.Hour)
++	defer demux.Stop(false)
++
++	const stateFile = "/tmp/dd-lambda-extension-cache.json"
++	require.NoError(t, os.RemoveAll(stateFile))
++	t.Cleanup(func() {
++		_ = os.Remove(stateFile)
++	})
++
++	requestID := "72946812-35dd-4382-b180-92f51cb7168c"
++	lc := newOOMTestCollector(t, demux, requestID)
++	firstReport := unmarshalPlatformReport(t, platformReportJSON(requestID, "error", 384, 256))
++
++	received, timed := processAndWaitForSamples(lc, *firstReport, 8)
++	require.Len(t, timed, 0)
++	require.Equal(t, 1, countMetricsByName(received, serverlessMetrics.OutOfMemoryMetric))
++
++	require.NoError(t, lc.executionContext.SaveCurrentExecutionContext())
++
++	restoredCollector := newOOMTestCollector(t, demux, requestID)
++	require.NoError(t, restoredCollector.executionContext.RestoreCurrentStateFromFile())
++	replayedReport := unmarshalPlatformReport(t, platformReportJSON(requestID, "error", 384, 256))
++
++	restoredCollector.Start()
++	restoredCollector.In <- []LambdaLogAPIMessage{*replayedReport}
++
++	replayed, replayedTimed := demux.WaitForNumberOfSamples(14, 0, 100*time.Millisecond)
++	assert.Len(t, replayedTimed, 0)
++	assert.Equal(t, 1, countMetricsByName(replayed, serverlessMetrics.OutOfMemoryMetric))
++}
++
++func TestPersistedOOMDeduplicationPreventsDuplicateForArbitraryRequest(t *testing.T) {
++	demux := aggregator.InitTestAgentDemultiplexerWithFlushInterval(time.Hour)
++	defer demux.Stop(false)
++
++	const stateFile = "/tmp/dd-lambda-extension-cache.json"
++	require.NoError(t, os.RemoveAll(stateFile))
++	t.Cleanup(func() {
++		_ = os.Remove(stateFile)
++	})
++
++	requestID := "2b11979d-d2f0-4e1a-8840-5357f2c20b42"
++	lc := newOOMTestCollector(t, demux, requestID)
++	firstReport := unmarshalPlatformReport(t, platformReportJSON(requestID, "error", 640, 512))
++
++	received, timed := processAndWaitForSamples(lc, *firstReport, 8)
++	require.Len(t, timed, 0)
++	require.Equal(t, 1, countMetricsByName(received, serverlessMetrics.OutOfMemoryMetric))
++
++	require.NoError(t, lc.executionContext.SaveCurrentExecutionContext())
++
++	restoredCollector := newOOMTestCollector(t, demux, requestID)
++	require.NoError(t, restoredCollector.executionContext.RestoreCurrentStateFromFile())
++	replayedReport := unmarshalPlatformReport(t, platformReportJSON(requestID, "error", 640, 512))
++
++	restoredCollector.Start()
++	restoredCollector.In <- []LambdaLogAPIMessage{*replayedReport}
++
++	replayed, replayedTimed := demux.WaitForNumberOfSamples(14, 0, 100*time.Millisecond)
++	assert.Len(t, replayedTimed, 0)
++	assert.Equal(t, 1, countMetricsByName(replayed, serverlessMetrics.OutOfMemoryMetric))
+ }
+ 
+ func TestProcessLogMessageLogsEnabled(t *testing.T) {
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,20 @@
++#!/bin/bash
++set -uo pipefail
++cd /testbed
++
++
++cd /testbed
++
++
++case "${1:-}" in
++  base)
++    go test -v -count=1 ./pkg/serverless/executioncontext/... ./pkg/serverless/logs/...
++    ;;
++  new)
++    go test -v -count=1 ./pkg/serverless/logs/... -run '^(TestProcessMessageShouldProcessLogTypeFunctionOutOfMemory|TestProcessPlatformReportOOMEmitsEnhancedMetricsFromJSON|TestProcessPlatformReportOOMAlsoEmitsWhenMemoryExceedsLimit|TestProcessPlatformReportOOMRequiresQualifyingReport|TestOutOfMemoryEnhancedMetricsAreDedupedPerRequest|TestPersistedOOMDeduplicationPreventsDuplicateAfterRestore|TestPersistedOOMDeduplicationPreventsDuplicateForArbitraryRequest)$'
++    ;;
++  *)
++    echo "usage: $0 base|new"
++    exit 2
++    ;;
++esac

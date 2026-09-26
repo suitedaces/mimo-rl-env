@@ -1,0 +1,315 @@
+diff --git a/guillotina/tests/test_api.py b/guillotina/tests/test_api.py
+index 0b506a34..31a74d02 100644
+--- a/guillotina/tests/test_api.py
++++ b/guillotina/tests/test_api.py
+@@ -9,10 +9,12 @@ from guillotina.interfaces import IFile
+ from guillotina.interfaces import IResource
+ from guillotina.test_package import ITestBehavior
+ from guillotina.tests import utils
++from guillotina.tests.dbusers.settings import DEFAULT_SETTINGS as DBUSERS_DEFAULT_SETTINGS
+ from guillotina.transactions import transaction
+ from guillotina.utils import get_behavior
+ from zope.interface import Interface
+ 
++import base64
+ import json
+ import pytest
+ 
+@@ -612,6 +614,196 @@ async def test_duplicate_content(container_requester):
+         assert "foobar2" in response
+ 
+ 
++def _basic_token(username, password):
++    return base64.b64encode("{}:{}".format(username, password).encode("utf-8")).decode("ascii")
++
++
++async def _create_db_user(requester, user_id, password):
++    _, status = await requester(
++        "POST",
++        "/db/guillotina/users",
++        data=json.dumps(
++            {
++                "@type": "User",
++                "name": user_id.title(),
++                "id": user_id,
++                "username": user_id,
++                "email": "{}@example.com".format(user_id),
++                "password": password,
++            }
++        ),
++    )
++    assert status in (200, 201)
++
++
++async def _assert_missing(requester, path, token):
++    _, status = await requester(
++        "GET",
++        path,
++        auth_type="Basic",
++        token=token,
++    )
++    assert status in (401, 403, 404)
++
++
++async def _assert_exists(requester, path, token):
++    _, status = await requester(
++        "GET",
++        path,
++        auth_type="Basic",
++        token=token,
++    )
++    assert status == 200
++
++
++@pytest.mark.app_settings(DBUSERS_DEFAULT_SETTINGS)
++async def test_duplicate_rejects_check_permission_false_without_destination_add_permission(dbusers_requester):
++    async with dbusers_requester as requester:
++        await _create_db_user(requester, "bob", "bob")
++        await _create_db_user(requester, "alice", "alice")
++
++        bob_token = _basic_token("bob", "bob")
++        alice_token = _basic_token("alice", "alice")
++
++        _, status = await requester(
++            "POST",
++            "/db/guillotina/users/bob/",
++            data=json.dumps({"@type": "Item", "id": "source-for-duplicate"}),
++            auth_type="Basic",
++            token=bob_token,
++        )
++        assert status in (200, 201)
++
++        _, status = await requester(
++            "POST",
++            "/db/guillotina/users/bob/source-for-duplicate/@sharing",
++            data=json.dumps(
++                {"prinrole": [{"principal": "alice", "role": "guillotina.Owner", "setting": "Allow"}]}
++            ),
++            auth_type="Basic",
++            token=bob_token,
++        )
++        assert status == 200
++
++        _, status = await requester(
++            "POST",
++            "/db/guillotina/users/bob/",
++            data=json.dumps({"@type": "Folder", "id": "duplicate-target"}),
++            auth_type="Basic",
++            token=bob_token,
++        )
++        assert status in (200, 201)
++
++        _, status = await requester(
++            "POST",
++            "/db/guillotina/users/bob/source-for-duplicate/@duplicate",
++            data=json.dumps(
++                {
++                    "new_id": "copy-denied-by-permission",
++                    "destination": "/users/bob/duplicate-target",
++                    "check_permission": False,
++                }
++            ),
++            auth_type="Basic",
++            token=alice_token,
++        )
++        assert status in (401, 403, 412)
++
++        await _assert_missing(
++            requester,
++            "/db/guillotina/users/bob/duplicate-target/copy-denied-by-permission",
++            bob_token,
++        )
++
++
++@pytest.mark.app_settings(DBUSERS_DEFAULT_SETTINGS)
++async def test_move_rejects_check_permission_false_without_destination_add_permission(dbusers_requester):
++    async with dbusers_requester as requester:
++        await _create_db_user(requester, "carol", "carol")
++        await _create_db_user(requester, "dave", "dave")
++
++        carol_token = _basic_token("carol", "carol")
++        dave_token = _basic_token("dave", "dave")
++
++        _, status = await requester(
++            "POST",
++            "/db/guillotina/users/carol/",
++            data=json.dumps({"@type": "Item", "id": "source-for-move"}),
++            auth_type="Basic",
++            token=carol_token,
++        )
++        assert status in (200, 201)
++
++        _, status = await requester(
++            "POST",
++            "/db/guillotina/users/carol/source-for-move/@sharing",
++            data=json.dumps(
++                {"prinrole": [{"principal": "dave", "role": "guillotina.Owner", "setting": "Allow"}]}
++            ),
++            auth_type="Basic",
++            token=carol_token,
++        )
++        assert status == 200
++
++        _, status = await requester(
++            "POST",
++            "/db/guillotina/users/carol/",
++            data=json.dumps({"@type": "Folder", "id": "move-target"}),
++            auth_type="Basic",
++            token=carol_token,
++        )
++        assert status in (200, 201)
++
++        _, status = await requester(
++            "POST",
++            "/db/guillotina/users/carol/source-for-move/@move",
++            data=json.dumps(
++                {
++                    "new_id": "move-denied-by-permission",
++                    "destination": "/users/carol/move-target",
++                    "check_permission": False,
++                }
++            ),
++            auth_type="Basic",
++            token=dave_token,
++        )
++        assert status in (401, 403, 412)
++
++        await _assert_missing(
++            requester,
++            "/db/guillotina/users/carol/move-target/move-denied-by-permission",
++            carol_token,
++        )
++        await _assert_exists(
++            requester,
++            "/db/guillotina/users/carol/source-for-move",
++            carol_token,
++        )
++
++
++@pytest.mark.app_settings(DBUSERS_DEFAULT_SETTINGS)
++async def test_user_info_requires_access_content(dbusers_requester):
++    async with dbusers_requester as requester:
++        await _create_db_user(requester, "frank", "frank")
++
++        frank_token = _basic_token("frank", "frank")
++
++        _, status = await requester(
++            "GET",
++            "/db/guillotina/@user_info",
++            auth_type="Basic",
++            token=frank_token,
++        )
++        assert status in (401, 403, 412)
++
++        response, status = await requester(
++            "GET",
++            "/db/guillotina/@user_info",
++        )
++        assert status == 200
++        assert isinstance(response, dict)
++
++
+ async def test_create_content_fields(container_requester):
+     async with container_requester as requester:
+         response, status = await requester(
+diff --git a/guillotina/tests/test_content.py b/guillotina/tests/test_content.py
+index 5dc9bcff..ae06db7e 100644
+--- a/guillotina/tests/test_content.py
++++ b/guillotina/tests/test_content.py
+@@ -1,3 +1,5 @@
++from guillotina import content
++from guillotina.auth.users import GuillotinaUser
+ from guillotina import configure
+ from guillotina.behaviors.dublincore import IDublinCore
+ from guillotina.component import get_utility
+@@ -25,6 +27,57 @@ import pickle
+ import pytest
+ 
+ 
++async def test_duplicate_api_check_permission_controls_add_security(container_requester):
++    async with container_requester as requester:
++        _, status = await requester(
++            "POST",
++            "/db/guillotina/",
++            data=json.dumps({"@type": "Item", "id": "api-duplicate-source"}),
++        )
++        assert status in (200, 201)
++        _, status = await requester(
++            "POST",
++            "/db/guillotina/",
++            data=json.dumps({"@type": "Folder", "id": "api-duplicate-target"}),
++        )
++        assert status in (200, 201)
++
++        async with transaction(db=requester.db) as txn:
++            root = await txn.manager.get_root()
++            container = await root.async_get("guillotina")
++            source = await container.async_get("api-duplicate-source")
++            target = await container.async_get("api-duplicate-target")
++
++            utils.login(user=GuillotinaUser("api-limited-user"))
++            with pytest.raises(Exception):
++                await content.duplicate(
++                    source,
++                    destination=target,
++                    new_id="api-copy-denied",
++                    check_permission=True,
++                )
++            assert not await target.async_contains("api-copy-denied")
++
++            copied = await content.duplicate(
++                source,
++                destination=target,
++                new_id="api-copy-allowed-by-explicit-flag",
++                check_permission=False,
++            )
++            assert copied.__name__ == "api-copy-allowed-by-explicit-flag"
++
++        _, status = await requester(
++            "GET",
++            "/db/guillotina/api-duplicate-target/api-copy-denied",
++        )
++        assert status in (401, 403, 404)
++        _, status = await requester(
++            "GET",
++            "/db/guillotina/api-duplicate-target/api-copy-allowed-by-explicit-flag",
++        )
++        assert status == 200
++
++
+ class ICustomContentType(IItem):
+ 
+     images = Dict(key_type=TextLine(), value_type=TextLine(), required=False, defaultFactory=dict)
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,28 @@
++#!/bin/bash
++set -uo pipefail
++cd /testbed
++
++
++set +u
++source /opt/venv/bin/activate
++set -u
++
++python setup.py develop 2>/dev/null
++
++case "${1:-}" in
++  base)
++    DATABASE=DUMMY python -m pytest guillotina/tests/test_api.py -v -k "test_duplicate_content or test_not_allowed_move_to_same_parent or test_not_allowed_move_to_self"
++    ;;
++  new)
++    DATABASE=DUMMY python -m pytest \
++      guillotina/tests/test_api.py::test_duplicate_rejects_check_permission_false_without_destination_add_permission \
++      guillotina/tests/test_api.py::test_move_rejects_check_permission_false_without_destination_add_permission \
++      guillotina/tests/test_api.py::test_user_info_requires_access_content \
++      guillotina/tests/test_content.py::test_duplicate_api_check_permission_controls_add_security \
++      -v
++    ;;
++  *)
++    echo "usage: $0 base|new"
++    exit 2
++    ;;
++esac

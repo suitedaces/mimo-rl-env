@@ -1,0 +1,244 @@
+diff --git a/services/server/test/unit/utils/custom-api-contract-creation.spec.ts b/services/server/test/unit/utils/custom-api-contract-creation.spec.ts
+new file mode 100644
+index 00000000..bc1f1081
+--- /dev/null
++++ b/services/server/test/unit/utils/custom-api-contract-creation.spec.ts
+@@ -0,0 +1,201 @@
++import chai from "chai";
++import nock from "nock";
++import { SourcifyChain } from "@ethereum-sourcify/lib-sourcify";
++import { getCreatorTx } from "../../../src/server/services/utils/contract-creation-util";
++
++const ADDRESS = "0x00000000000000000000000000000000000000a1";
++const FIRST_TX =
++  "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
++const SECOND_TX =
++  "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
++
++function makeChain(fetchContractCreationTxUsing: Record<string, unknown>) {
++  return new SourcifyChain({
++    name: "Custom creator API test",
++    chainId: 42262,
++    supported: true,
++    rpc: ["http://localhost:8545"],
++    fetchContractCreationTxUsing: fetchContractCreationTxUsing as any,
++  });
++}
++
++describe("custom contract creation APIs", function () {
++  afterEach(() => {
++    nock.cleanAll();
++    delete process.env.CUSTOM_CREATOR_TOKEN;
++  });
++
++  it("expands URL placeholders, sends configured headers, and resolves nested array paths", async function () {
++    process.env.CUSTOM_CREATOR_TOKEN = "verifier-secret";
++    const chain = makeChain({
++      customApi: [
++        {
++          url: "https://custom.example/v1/chains/${CHAIN_ID}/accounts/${ADDRESS}",
++          responsePath: "data.deployments.0.transaction.hash",
++          headers: [
++            {
++              headerName: "X-Creator-Token",
++              headerEnvName: "CUSTOM_CREATOR_TOKEN",
++            },
++          ],
++        },
++      ],
++    });
++    const scope = nock("https://custom.example", {
++      reqheaders: { "X-Creator-Token": "verifier-secret" },
++    })
++      .get(`/v1/chains/42262/accounts/${ADDRESS}`)
++      .reply(200, {
++        data: { deployments: [{ transaction: { hash: FIRST_TX } }] },
++      });
++
++    chai.expect(await getCreatorTx(chain, ADDRESS)).to.equal(FIRST_TX);
++    chai.expect(scope.isDone()).to.equal(true);
++  });
++
++  it("omits a configured header when its environment variable is unset", async function () {
++    const chain = makeChain({
++      customApi: [
++        {
++          url: "https://no-secret.example/account/${ADDRESS}",
++          responsePath: "hash",
++          headers: [
++            {
++              headerName: "X-Creator-Token",
++              headerEnvName: "CUSTOM_CREATOR_TOKEN",
++            },
++          ],
++        },
++      ],
++    });
++    const scope = nock("https://no-secret.example")
++      .matchHeader("X-Creator-Token", (value) => value === undefined)
++      .get(`/account/${ADDRESS}`)
++      .reply(200, { hash: FIRST_TX });
++
++    chai.expect(await getCreatorTx(chain, ADDRESS)).to.equal(FIRST_TX);
++    chai.expect(scope.isDone()).to.equal(true);
++  });
++
++  it("tries custom APIs in declaration order until one returns a valid hash", async function () {
++    const chain = makeChain({
++      customApi: [
++        {
++          url: "https://first.example/account/${ADDRESS}",
++          responsePath: "result.txHash",
++        },
++        {
++          url: "https://second.example/account/${ADDRESS}",
++          responsePath: "result.txHash",
++        },
++      ],
++    });
++    const firstScope = nock("https://first.example")
++      .get(`/account/${ADDRESS}`)
++      .reply(200, { result: { txHash: "not-a-transaction-hash" } });
++    const secondScope = nock("https://second.example")
++      .get(`/account/${ADDRESS}`)
++      .reply(200, { result: { txHash: SECOND_TX } });
++
++    chai.expect(await getCreatorTx(chain, ADDRESS)).to.equal(SECOND_TX);
++    chai.expect(firstScope.isDone()).to.equal(true);
++    chai.expect(secondScope.isDone()).to.equal(true);
++  });
++
++  it("falls through to an existing provider after custom API failures", async function () {
++    const chain = makeChain({
++      customApi: [
++        {
++          url: "https://missing.example/account/${ADDRESS}",
++          responsePath: "result.txHash",
++        },
++        {
++          url: "https://unavailable.example/account/${ADDRESS}",
++          responsePath: "result.txHash",
++        },
++      ],
++      blockscoutApi: { url: "https://fallback.example" },
++    });
++    const missingScope = nock("https://missing.example")
++      .get(`/account/${ADDRESS}`)
++      .reply(200, { result: {} });
++    const unavailableScope = nock("https://unavailable.example")
++      .get(`/account/${ADDRESS}`)
++      .reply(503, { error: "temporarily unavailable" });
++    const fallbackScope = nock("https://fallback.example")
++      .get(`/api/v2/addresses/${ADDRESS}`)
++      .reply(200, { creation_tx_hash: FIRST_TX });
++
++    chai.expect(await getCreatorTx(chain, ADDRESS)).to.equal(FIRST_TX);
++    chai.expect(missingScope.isDone()).to.equal(true);
++    chai.expect(unavailableScope.isDone()).to.equal(true);
++    chai.expect(fallbackScope.isDone()).to.equal(true);
++  });
++
++  it("stops after the first successful custom API", async function () {
++    const chain = makeChain({
++      customApi: [
++        {
++          url: "https://winner.example/account/${ADDRESS}",
++          responsePath: "hash",
++        },
++        {
++          url: "https://unused.example/account/${ADDRESS}",
++          responsePath: "hash",
++        },
++      ],
++      blockscoutApi: { url: "https://unused-fallback.example" },
++    });
++    const winnerScope = nock("https://winner.example")
++      .get(`/account/${ADDRESS}`)
++      .reply(200, { hash: FIRST_TX });
++    const unusedCustom = nock("https://unused.example")
++      .get(`/account/${ADDRESS}`)
++      .reply(200, { hash: SECOND_TX });
++    const unusedFallback = nock("https://unused-fallback.example")
++      .get(`/api/v2/addresses/${ADDRESS}`)
++      .reply(200, { creation_tx_hash: SECOND_TX });
++
++    chai.expect(await getCreatorTx(chain, ADDRESS)).to.equal(FIRST_TX);
++    chai.expect(winnerScope.isDone()).to.equal(true);
++    chai.expect(unusedCustom.isDone()).to.equal(false);
++    chai.expect(unusedFallback.isDone()).to.equal(false);
++  });
++
++  it("returns null when custom APIs produce no valid transaction hash", async function () {
++    const chain = makeChain({
++      customApi: [
++        {
++          url: "https://empty.example/account/${ADDRESS}",
++          responsePath: "hash",
++        },
++        {
++          url: "https://wrong-type.example/account/${ADDRESS}",
++          responsePath: "hash",
++        },
++      ],
++    });
++    const emptyScope = nock("https://empty.example")
++      .get(`/account/${ADDRESS}`)
++      .reply(200, { hash: "" });
++    const wrongTypeScope = nock("https://wrong-type.example")
++      .get(`/account/${ADDRESS}`)
++      .reply(200, { hash: 123 });
++
++    chai.expect(await getCreatorTx(chain, ADDRESS)).to.equal(null);
++    chai.expect(emptyScope.isDone()).to.equal(true);
++    chai.expect(wrongTypeScope.isDone()).to.equal(true);
++  });
++
++  it("keeps legacy-only creator lookup behavior unchanged", async function () {
++    const chain = makeChain({
++      blockscoutApi: { url: "https://legacy.example" },
++    });
++    const scope = nock("https://legacy.example")
++      .get(`/api/v2/addresses/${ADDRESS}`)
++      .reply(200, { creation_tx_hash: SECOND_TX });
++
++    chai.expect(await getCreatorTx(chain, ADDRESS)).to.equal(SECOND_TX);
++    chai.expect(scope.isDone()).to.equal(true);
++  });
++});
+diff --git a/services/server/test/verifier-types/custom-api-config.ts b/services/server/test/verifier-types/custom-api-config.ts
+new file mode 100644
+index 00000000..438436ee
+--- /dev/null
++++ b/services/server/test/verifier-types/custom-api-config.ts
+@@ -0,0 +1,18 @@
++import { FetchContractCreationTxMethods } from "@ethereum-sourcify/lib-sourcify";
++
++const customCreatorConfig: FetchContractCreationTxMethods = {
++  customApi: [
++    {
++      url: "https://creator.example/chains/${CHAIN_ID}/accounts/${ADDRESS}",
++      responsePath: "data.deployments.0.hash",
++      headers: [
++        {
++          headerName: "X-API-Key",
++          headerEnvName: "CREATOR_API_KEY",
++        },
++      ],
++    },
++  ],
++};
++
++void customCreatorConfig;
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,8 @@
++#!/bin/bash
++set -euo pipefail
++
++
++npm run build --workspace @ethereum-sourcify/lib-sourcify
++cd services/server
++npm run test:unit -- --grep 'custom contract creation APIs'
++../../node_modules/.bin/tsc --noEmit --strict --esModuleInterop --skipLibCheck --module commonjs --target es2017 test/verifier-types/custom-api-config.ts

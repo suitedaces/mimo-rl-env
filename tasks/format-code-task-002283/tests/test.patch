@@ -1,0 +1,114 @@
+diff --git a/smart_open/tests/test_s3.py b/smart_open/tests/test_s3.py
+index 4e5ca5b..9406e0a 100644
+--- a/smart_open/tests/test_s3.py
++++ b/smart_open/tests/test_s3.py
+@@ -877,6 +877,87 @@ class DownloadKeyTest(unittest.TestCase):
+                               KEY_NAME, bucket_name=BUCKET_NAME)
+ 
+ 
++def _make_404_client_error():
++    return botocore.client.ClientError(
++        error_response={'Error': {'Code': '404', 'Message': 'Not Found'}},
++        operation_name='HeadObject',
++    )
++
++
++def _make_500_client_error():
++    return botocore.client.ClientError(
++        error_response={'Error': {'Code': '500', 'Message': 'Internal Server Error'}},
++        operation_name='HeadObject',
++    )
++
++
++@moto.mock_s3
++class IterBucketRaceConditionTest(unittest.TestCase):
++    """Tests that iter_bucket survives keys that vanish between list and download."""
++
++    def setUp(self):
++        self.old_flag_multi = smart_open.concurrency._MULTIPROCESSING
++        self.old_flag_concurrent = smart_open.concurrency._CONCURRENT_FUTURES
++        smart_open.concurrency._MULTIPROCESSING = False
++        smart_open.concurrency._CONCURRENT_FUTURES = False
++        ignore_resource_warnings()
++        _resource('s3').create_bucket(Bucket=BUCKET_NAME).wait_until_exists()
++        populate_bucket(num_keys=5)
++
++    def tearDown(self):
++        smart_open.concurrency._MULTIPROCESSING = self.old_flag_multi
++        smart_open.concurrency._CONCURRENT_FUTURES = self.old_flag_concurrent
++
++    def test_iter_bucket_skips_404(self):
++        """A single key 404 during download must be silently skipped, others yielded."""
++        missing = 'key_2'
++
++        def fake_download(bucket, key_name):
++            if key_name == missing:
++                raise _make_404_client_error()
++            return b'content-' + key_name.encode('ascii')
++
++        with mock.patch('smart_open.s3._download_fileobj', side_effect=fake_download):
++            results = list(smart_open.s3.iter_bucket(BUCKET_NAME, retries=0))
++
++        returned_keys = [k for k, _ in results]
++        self.assertNotIn(missing, returned_keys)
++        self.assertEqual(sorted(returned_keys),
++                         sorted(['key_0', 'key_1', 'key_3', 'key_4']))
++
++    def test_iter_bucket_skips_multiple_404s(self):
++        """Multiple 404s must all be skipped; remaining keys still yielded."""
++        missing = {'key_0', 'key_3'}
++
++        def fake_download(bucket, key_name):
++            if key_name in missing:
++                raise _make_404_client_error()
++            return b'content-' + key_name.encode('ascii')
++
++        with mock.patch('smart_open.s3._download_fileobj', side_effect=fake_download):
++            results = list(smart_open.s3.iter_bucket(BUCKET_NAME, retries=0))
++
++        returned_keys = [k for k, _ in results]
++        for m in missing:
++            self.assertNotIn(m, returned_keys)
++        self.assertEqual(sorted(returned_keys), sorted(['key_1', 'key_2', 'key_4']))
++
++    def test_iter_bucket_propagates_non_404_clienterror(self):
++        """Non-404 ClientErrors must still propagate to the caller."""
++        def fake_download(bucket, key_name):
++            raise _make_500_client_error()
++
++        with mock.patch('smart_open.s3._download_fileobj', side_effect=fake_download):
++            with self.assertRaises(botocore.client.ClientError):
++                list(smart_open.s3.iter_bucket(BUCKET_NAME, retries=0))
++
++    def test_iter_bucket_no_errors_preservation(self):
++        """With no errors, iter_bucket still yields every key (preservation)."""
++        results = list(smart_open.s3.iter_bucket(BUCKET_NAME))
++        returned_keys = sorted(k for k, _ in results)
++        self.assertEqual(returned_keys, ['key_0', 'key_1', 'key_2', 'key_3', 'key_4'])
++
++
+ @moto.mock_s3
+ class OpenTest(unittest.TestCase):
+     def setUp(self):
+diff --git a/test_commands.json b/test_commands.json
+new file mode 100644
+index 0000000..c779a37
+--- /dev/null
++++ b/test_commands.json
+@@ -0,0 +1,3 @@
++{
++  "test_commands": ["python -m pytest smart_open/tests/test_s3.py::IterBucketRaceConditionTest -v"]
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,8 @@
++#!/usr/bin/env bash
++
++set -uo pipefail
++cd /testbed
++rc=0
++python -m pytest -v -rA smart_open/tests/test_s3.py::IterBucketRaceConditionTest::test_iter_bucket_skips_404 smart_open/tests/test_s3.py::IterBucketRaceConditionTest::test_iter_bucket_skips_multiple_404s smart_open/tests/test_s3.py::IterBucketRaceConditionTest::test_iter_bucket_propagates_non_404_clienterror smart_open/tests/test_s3.py::IterBucketRaceConditionTest::test_iter_bucket_no_errors_preservation
++rc=$(( rc | $? ))
++exit $rc

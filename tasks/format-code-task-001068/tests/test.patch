@@ -1,0 +1,255 @@
+diff --git a/openduty/tests/synth_test_settings.py b/openduty/tests/synth_test_settings.py
+new file mode 100644
+index 0000000..a6cde5d
+--- /dev/null
++++ b/openduty/tests/synth_test_settings.py
+@@ -0,0 +1,4 @@
++from openduty.settings_dev import *
++
++DATABASES['default']['NAME'] = ':memory:'
++SOUTH_TESTS_MIGRATE = False
+diff --git a/openduty/tests/test_escalation_planning_contract.py b/openduty/tests/test_escalation_planning_contract.py
+new file mode 100644
+index 0000000..73df6ff
+--- /dev/null
++++ b/openduty/tests/test_escalation_planning_contract.py
+@@ -0,0 +1,226 @@
++from datetime import datetime, timedelta
++
++from django.contrib.auth.models import User
++from django.test import TestCase
++from django.utils import timezone
++from schedule.models import Calendar, Event
++
++from notification.helper import NotificationHelper
++from notification.models import UserNotificationMethod
++from openduty.escalation_helper import get_escalation_for_service
++from openduty.models import Incident, SchedulePolicy, SchedulePolicyRule, Service
++
++
++def aware(year, month, day, hour=0, minute=0):
++    value = datetime(year, month, day, hour, minute)
++    return timezone.make_aware(value, timezone.get_current_timezone())
++
++
++def lookup_at(service, instant):
++    try:
++        return get_escalation_for_service(service, instant)
++    except TypeError:
++        raise AssertionError(
++            'get_escalation_for_service must accept an evaluation timestamp')
++
++
++class EscalationRecipientContractTests(TestCase):
++    def setUp(self):
++        self.alpha = User.objects.create_user('plan-alpha')
++        self.beta = User.objects.create_user('plan-beta')
++        self.gamma = User.objects.create_user('plan-gamma')
++        self.policy = SchedulePolicy.objects.create(
++            name='recipient-contract', repeat_times=1)
++        self.service = Service.objects.create(
++            name='recipient-service', policy=self.policy, retry=5,
++            escalate_after=10)
++
++    def add_rule(self, position, user=None, calendar=None):
++        return SchedulePolicyRule.objects.create(
++            schedule_policy=self.policy, position=position, user_id=user,
++            schedule=calendar, escalate_after=0)
++
++    def add_event(self, calendar, title, start, end):
++        return Event.objects.create(
++            calendar=calendar, creator=self.alpha, title=title,
++            description='coverage', start=start, end=end)
++
++    def test_rules_and_calendar_names_follow_policy_order(self):
++        instant = aware(2020, 1, 15, 12)
++        calendar = Calendar.objects.create(
++            name='ordered calendar', slug='ordered-calendar')
++        self.add_event(
++            calendar, 'plan-alpha, plan-beta',
++            instant - timedelta(hours=1), instant + timedelta(hours=1))
++
++
++        self.add_rule(30, user=self.gamma)
++        self.add_rule(10, calendar=calendar)
++        self.add_rule(20, user=self.beta)
++
++        recipients = lookup_at(self.service, instant)
++        self.assertEqual(
++            [user.username for user in recipients],
++            ['plan-alpha', 'plan-beta', 'plan-gamma'])
++
++    def test_duplicate_blank_and_unknown_calendar_names_are_ignored(self):
++        instant = aware(2020, 2, 10, 9)
++        calendar = Calendar.objects.create(
++            name='messy calendar', slug='messy-calendar')
++        self.add_event(
++            calendar,
++            ' plan-alpha, , user-that-does-not-exist, plan-alpha ',
++            instant - timedelta(minutes=30), instant + timedelta(minutes=30))
++        self.add_rule(10, calendar=calendar)
++        self.add_rule(20, user=self.alpha)
++        self.add_rule(30, user=self.beta)
++
++        recipients = lookup_at(self.service, instant)
++        self.assertEqual(
++            sorted(user.username for user in recipients),
++            ['plan-alpha', 'plan-beta'])
++
++    def test_event_interval_is_inclusive_and_excludes_neighbours(self):
++        instant = aware(2020, 3, 20, 17)
++        calendar = Calendar.objects.create(
++            name='boundary calendar', slug='boundary-calendar')
++        self.add_event(
++            calendar, 'plan-alpha', instant - timedelta(hours=1), instant)
++        self.add_event(
++            calendar, 'plan-beta', instant, instant + timedelta(hours=1))
++        self.add_event(
++            calendar, 'plan-gamma',
++            instant - timedelta(hours=2), instant - timedelta(seconds=1))
++        self.add_event(
++            calendar, 'plan-gamma',
++            instant + timedelta(seconds=1), instant + timedelta(hours=2))
++        self.add_rule(10, calendar=calendar)
++
++        recipients = lookup_at(self.service, instant)
++        self.assertEqual(
++            [user.username for user in recipients],
++            ['plan-alpha', 'plan-beta'])
++
++    def test_service_without_policy_has_no_recipients(self):
++        service = Service.objects.create(
++            name='no-policy-service', policy=None, retry=5,
++            escalate_after=10)
++        self.assertEqual(lookup_at(service, aware(2020, 4, 1)), [])
++
++    def test_existing_one_argument_lookup_uses_the_current_shift(self):
++        calendar = Calendar.objects.create(
++            name='current calendar', slug='current-calendar')
++        self.add_event(
++            calendar, 'plan-beta', aware(2000, 1, 1), aware(2100, 1, 1))
++        self.add_rule(10, calendar=calendar)
++
++        recipients = get_escalation_for_service(self.service)
++        self.assertEqual(
++            [user.username for user in recipients], ['plan-beta'])
++
++
++class NotificationPlanContractTests(TestCase):
++    def setUp(self):
++        self.alpha = User.objects.create_user('notify-alpha')
++        self.beta = User.objects.create_user('notify-beta')
++
++    def make_service(self, repeat_times=1, retry=5, escalate_after=10):
++        policy = SchedulePolicy.objects.create(
++            name='notification-policy-%s-%s-%s' % (
++                repeat_times, retry, escalate_after),
++            repeat_times=repeat_times)
++        service = Service.objects.create(
++            name='notification-service-%s-%s-%s' % (
++                repeat_times, retry, escalate_after),
++            policy=policy, retry=retry, escalate_after=escalate_after)
++        return policy, service
++
++    def add_rule(self, policy, position, user=None, calendar=None):
++        return SchedulePolicyRule.objects.create(
++            schedule_policy=policy, position=position, user_id=user,
++            schedule=calendar, escalate_after=0)
++
++    def add_method(self, user, position, method):
++        return UserNotificationMethod.objects.create(
++            user=user, position=position, method=method)
++
++    def make_incident(self, service, occurred_at, key='planning-incident'):
++        return Incident.objects.create(
++            service_key=service, incident_key=key,
++            event_type=Incident.TRIGGER, description='database unavailable',
++            details='connection refused', occurred_at=occurred_at)
++
++    def test_plan_orders_methods_targets_and_complete_repetitions(self):
++        anchor = aware(2021, 5, 6, 7, 30)
++        policy, service = self.make_service(repeat_times=2)
++        self.add_rule(policy, 20, user=self.beta)
++        self.add_rule(policy, 10, user=self.alpha)
++        self.add_method(self.alpha, 30, UserNotificationMethod.METHOD_XMPP)
++        self.add_method(self.alpha, 10, UserNotificationMethod.METHOD_TWILIO_SMS)
++        self.add_method(self.alpha, 20, UserNotificationMethod.METHOD_EMAIL)
++        self.add_method(self.beta, 10, UserNotificationMethod.METHOD_SLACK)
++        incident = self.make_incident(service, anchor)
++
++        plan = NotificationHelper.generate_notifications_for_incident(incident)
++        observed = [
++            (item.user_to_notify.username, item.notifier, item.send_at)
++            for item in plan
++        ]
++        self.assertEqual(observed, [
++            ('notify-alpha', UserNotificationMethod.METHOD_TWILIO_SMS, anchor),
++            ('notify-alpha', UserNotificationMethod.METHOD_EMAIL,
++             anchor + timedelta(minutes=5)),
++            ('notify-beta', UserNotificationMethod.METHOD_SLACK,
++             anchor + timedelta(minutes=10)),
++            ('notify-alpha', UserNotificationMethod.METHOD_TWILIO_SMS,
++             anchor + timedelta(minutes=20)),
++            ('notify-alpha', UserNotificationMethod.METHOD_EMAIL,
++             anchor + timedelta(minutes=25)),
++            ('notify-beta', UserNotificationMethod.METHOD_SLACK,
++             anchor + timedelta(minutes=30)),
++        ])
++
++    def test_recipient_snapshot_uses_incident_occurrence_time(self):
++        anchor = aware(2019, 6, 1, 12)
++        policy, service = self.make_service()
++        calendar = Calendar.objects.create(
++            name='historical coverage', slug='historical-coverage')
++        Event.objects.create(
++            calendar=calendar, creator=self.alpha, title='notify-alpha',
++            description='historical shift',
++            start=anchor - timedelta(hours=1),
++            end=anchor + timedelta(hours=1))
++        self.add_rule(policy, 10, calendar=calendar)
++        self.add_method(
++            self.alpha, 10, UserNotificationMethod.METHOD_PUSHOVER)
++        incident = self.make_incident(service, anchor, 'historical-incident')
++
++        plan = NotificationHelper.generate_notifications_for_incident(incident)
++        self.assertEqual(len(plan), 1)
++        self.assertEqual(plan[0].user_to_notify, self.alpha)
++        self.assertEqual(plan[0].send_at, anchor)
++
++    def test_zero_retry_keeps_all_methods_at_window_start(self):
++        anchor = aware(2022, 7, 8, 9)
++        policy, service = self.make_service(retry=0)
++        self.add_rule(policy, 10, user=self.alpha)
++        self.add_method(self.alpha, 20, UserNotificationMethod.METHOD_EMAIL)
++        self.add_method(
++            self.alpha, 10, UserNotificationMethod.METHOD_TWILIO_CALL)
++        incident = self.make_incident(service, anchor, 'zero-retry')
++
++        plan = NotificationHelper.generate_notifications_for_incident(incident)
++        self.assertEqual(
++            [(item.notifier, item.send_at) for item in plan],
++            [(UserNotificationMethod.METHOD_TWILIO_CALL, anchor),
++             (UserNotificationMethod.METHOD_EMAIL, anchor)])
++
++    def test_zero_repetitions_produces_an_empty_plan(self):
++        anchor = aware(2023, 8, 9, 10)
++        policy, service = self.make_service(repeat_times=0)
++        self.add_rule(policy, 10, user=self.alpha)
++        self.add_method(self.alpha, 10, UserNotificationMethod.METHOD_EMAIL)
++        incident = self.make_incident(service, anchor, 'zero-repetitions')
++
++        self.assertEqual(
++            NotificationHelper.generate_notifications_for_incident(incident), [])
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,8 @@
++#!/bin/bash
++set -euo pipefail
++
++
++DJANGO_SETTINGS_MODULE=openduty.tests.synth_test_settings \
++  python manage.py test \
++  openduty.tests.test_escalation_planning_contract \
++  -v 1 --noinput

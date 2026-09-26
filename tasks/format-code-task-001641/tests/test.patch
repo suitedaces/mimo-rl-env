@@ -1,0 +1,400 @@
+diff --git a/usercase-test-coderl/test_render_table_tag.py b/usercase-test-coderl/test_render_table_tag.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/test_render_table_tag.py
+@@ -0,0 +1,375 @@
++import copy
++import json
++import subprocess
++import sys
++from io import StringIO
++
++import pytest
++from django.conf import settings
++
++
++TEMPLATE_SOURCES = {
++    "acceptance/default.html": (
++        "DEFAULT|path={{ request.path }}|"
++        "columns={% for column in table.columns %}{{ column.name }}:{{ column.header }};{% endfor %}|"
++        "rows={% for row in table.rows %}[{% for column, cell in row.items %}{{ column.name }}={{ cell }};{% endfor %}]{% endfor %}|"
++        "hook={{ table.hook_seen }}"
++    ),
++    "acceptance/override.html": (
++        "OVERRIDE|rows={% for row in table.rows %}{{ row.record.name }}={{ row.record.score }};{% endfor %}|"
++        "hook={{ table.hook_seen }}"
++    ),
++    "acceptance/fallback.html": (
++        "FALLBACK|{{ table.attrs.class }}|{% for row in table.rows %}{{ row.record.name }};{% endfor %}"
++    ),
++    "acceptance/context.html": (
++        "CTX|{% for row in table.rows %}{% for column, cell in row.items %}"
++        "{{ column.name }}={{ cell }};{% endfor %}{% endfor %}|outside={{ outside }}|"
++        "hook={{ table.hook_seen }}"
++    ),
++    "acceptance/queryset.html": (
++        "QS|columns={% for column in table.columns %}{{ column.name }}:{{ column.header }};{% endfor %}|"
++        "rows={% for row in table.rows %}[{% for column, cell in row.items %}{{ column.name }}={{ cell }};{% endfor %}]{% endfor %}"
++    ),
++}
++
++
++if not settings.configured:
++    settings.configure(
++        SECRET_KEY="usercase-render-table",
++        INSTALLED_APPS=["django.contrib.contenttypes", "django_tables2"],
++        DATABASES={"default": {"ENGINE": "django.db.backends.sqlite3", "NAME": ":memory:"}},
++        DEFAULT_AUTO_FIELD="django.db.models.AutoField",
++        ROOT_URLCONF=__name__,
++        TEMPLATES=[
++            {
++                "BACKEND": "django.template.backends.django.DjangoTemplates",
++                "APP_DIRS": False,
++                "OPTIONS": {
++                    "loaders": [("django.template.loaders.locmem.Loader", TEMPLATE_SOURCES)],
++                    "context_processors": ["django.template.context_processors.request"],
++                },
++            }
++        ],
++        USE_TZ=True,
++    )
++
++import django
++
++django.setup()
++
++from django.core.handlers.wsgi import WSGIRequest
++from django.db import connection, models
++from django.template import Context, Template
++from django.test.client import FakePayload
++
++import django_tables2 as tables
++
++
++def build_request(uri="/"):
++    path, _, querystring = uri.partition("?")
++    return WSGIRequest(
++        {
++            "CONTENT_TYPE": "text/html; charset=utf-8",
++            "PATH_INFO": path,
++            "QUERY_STRING": querystring,
++            "REMOTE_ADDR": "127.0.0.1",
++            "REQUEST_METHOD": "GET",
++            "SCRIPT_NAME": "",
++            "SERVER_NAME": "testserver",
++            "SERVER_PORT": "80",
++            "SERVER_PROTOCOL": "HTTP/1.1",
++            "wsgi.version": (1, 0),
++            "wsgi.url_scheme": "http",
++            "wsgi.input": FakePayload(b""),
++            "wsgi.errors": StringIO(),
++            "wsgi.multiprocess": True,
++            "wsgi.multithread": False,
++            "wsgi.run_once": False,
++        }
++    )
++
++
++class HookedScoreTable(tables.Table):
++    name = tables.Column()
++    score = tables.Column()
++
++    class Meta:
++        template_name = "acceptance/default.html"
++        attrs = {"class": "score-grid"}
++
++    def before_render(self, request):
++        self.hook_seen = f"{request.method}:{request.path}"
++
++
++class ContextColumnTable(tables.Table):
++    name = tables.TemplateColumn("{{ record.name }}+{{ outside }}+{{ request.path }}")
++
++    class Meta:
++        template_name = "acceptance/context.html"
++
++    def before_render(self, request):
++        self.hook_seen = request.path
++
++
++class StableItem(models.Model):
++    id = models.IntegerField(primary_key=True)
++    name = models.CharField(max_length=20)
++    age = models.IntegerField()
++
++    class Meta:
++        app_label = "usercase_test_coderl"
++        ordering = ["id"]
++
++
++def render_template(source, context):
++    return Template(source).render(context)
++
++
++def test_render_table_resolves_context_table_and_uses_configured_template_with_request_and_hook():
++
++
++
++
++    table = HookedScoreTable([{"name": "Ada", "score": 7}, {"name": "Bo", "score": 11}])
++    request = build_request("/scores/?page=2")
++
++    actual = render_template(
++        "{% load django_tables2 %}{% render_table table %}",
++        Context({"request": request, "table": table}),
++    )
++
++    assert (
++        actual
++        == "DEFAULT|path=/scores/|columns=name:Name;score:Score;|rows=[name=Ada;score=7;][name=Bo;score=11;]|hook=GET:/scores/"
++    )
++
++
++def test_render_table_explicit_string_template_overrides_table_default():
++
++
++
++
++    table = HookedScoreTable([{"name": "Cy", "score": 5}])
++
++    actual = render_template(
++        '{% load django_tables2 %}{% render_table table "acceptance/override.html" %}',
++        Context({"request": build_request("/override/"), "table": table}),
++    )
++
++    assert actual == "OVERRIDE|rows=Cy=5;|hook=GET:/override/"
++
++
++def test_render_table_template_argument_resolves_tuple_with_first_existing_template():
++
++
++
++
++    table = HookedScoreTable([{"name": "Di", "score": 13}, {"name": "Eve", "score": 17}])
++
++    actual = render_template(
++        "{% load django_tables2 %}{% render_table table choices %}",
++        Context(
++            {
++                "request": build_request("/pick/"),
++                "table": table,
++                "choices": ("missing.html", "acceptance/fallback.html"),
++            }
++        ),
++    )
++
++    assert actual == "FALLBACK|score-grid|Di;Eve;"
++
++
++def test_render_table_template_column_can_use_surrounding_context():
++
++
++
++
++    table = ContextColumnTable([{"name": "Nova"}])
++
++    actual = render_template(
++        "{% load django_tables2 %}{% render_table table %}",
++        Context({"request": build_request("/ctx/"), "table": table, "outside": "SURROUND"}),
++    )
++
++
++
++    assert actual.startswith("CTX|")
++    assert "name=Nova+SURROUND+" in actual
++    assert actual.endswith("|hook=/ctx/")
++
++
++def test_render_table_queryset_builds_model_table_and_renders_rows():
++
++
++
++
++    with connection.schema_editor() as schema:
++        schema.create_model(StableItem)
++    StableItem.objects.bulk_create(
++        [StableItem(id=101, name="Mira", age=31), StableItem(id=202, name="Oren", age=42)]
++    )
++
++    actual = render_template(
++        '{% load django_tables2 %}{% render_table qs "acceptance/queryset.html" %}',
++        Context({"request": build_request("/people/"), "qs": StableItem.objects.all()}),
++    )
++
++    assert (
++        actual
++        == "QS|columns=id:Id;name:Name;age:Age;|rows=[id=101;name=Mira;age=31;][id=202;name=Oren;age=42;]"
++    )
++
++
++def test_render_table_invalid_value_raises_specific_value_error():
++
++
++
++
++
++
++    with pytest.raises(ValueError) as exc_info:
++        render_template(
++            "{% load django_tables2 %}{% render_table table %}",
++            Context({"request": build_request("/bad/"), "table": {"not": "valid"}}),
++        )
++    message = str(exc_info.value).lower()
++    assert "table" in message
++    assert "queryset" in message
++    assert "dict" in message
++
++
++def test_render_table_does_not_replace_caller_context_variable():
++
++
++
++
++    table = HookedScoreTable([{"name": "Ivy", "score": 19}])
++    source = (
++        '{% load django_tables2 %}{% with "outer" as table %}'
++        "{{ table }}|{% render_table mytable %}|{{ table }}{% endwith %}"
++    )
++    context = Context({"request": build_request("/preserve/"), "mytable": table})
++
++    first = render_template(source, context)
++    second = render_template(source, context)
++
++    expected = (
++        "outer|DEFAULT|path=/preserve/|columns=name:Name;score:Score;|"
++        "rows=[name=Ivy;score=19;]|hook=GET:/preserve/|outer"
++    )
++    assert first == expected
++    assert second == expected
++
++
++def test_referential_transparency_same_input_same_output():
++    table = HookedScoreTable([{"name": "Ada", "score": 7}, {"name": "Bo", "score": 11}])
++    request = build_request("/scores/?page=2")
++    source = "{% load django_tables2 %}{% render_table table %}"
++    context = Context({"request": request, "table": table})
++
++    assert render_template(source, context) == render_template(source, context)
++
++
++def test_no_mutation_of_caller_owned_data_or_context_binding():
++    rows = [{"name": "Ada", "score": 7}, {"name": "Bo", "score": 11}]
++    rows_before = copy.deepcopy(rows)
++    table = HookedScoreTable(rows)
++    context_payload = {"request": build_request("/stable/"), "table": table, "marker": {"keep": [1, 2]}}
++    marker_before = copy.deepcopy(context_payload["marker"])
++
++    actual = render_template(
++        "{% load django_tables2 %}{% render_table table %}",
++        Context(context_payload),
++    )
++
++    assert actual == (
++        "DEFAULT|path=/stable/|columns=name:Name;score:Score;|"
++        "rows=[name=Ada;score=7;][name=Bo;score=11;]|hook=GET:/stable/"
++    )
++    assert rows == rows_before
++    assert context_payload["marker"] == marker_before
++
++
++    assert context_payload["table"] is table
++    assert context_payload["request"].path == "/stable/"
++
++
++def test_no_global_state_strict_fresh_python_process():
++    table = HookedScoreTable([{"name": "Ada", "score": 7}, {"name": "Bo", "score": 11}])
++    source = "{% load django_tables2 %}{% render_table table %}"
++    in_process = render_template(
++        source,
++        Context({"request": build_request("/scores/?page=2"), "table": table}),
++    )
++    script = r'''
++import json
++from django.conf import settings
++TEMPLATE_SOURCES = {
++    "acceptance/default.html": "DEFAULT|path={{ request.path }}|columns={% for column in table.columns %}{{ column.name }}:{{ column.header }};{% endfor %}|rows={% for row in table.rows %}[{% for column, cell in row.items %}{{ column.name }}={{ cell }};{% endfor %}]{% endfor %}|hook={{ table.hook_seen }}"
++}
++settings.configure(
++    SECRET_KEY="usercase-render-table",
++    INSTALLED_APPS=["django.contrib.contenttypes", "django_tables2"],
++    DATABASES={"default": {"ENGINE": "django.db.backends.sqlite3", "NAME": ":memory:"}},
++    DEFAULT_AUTO_FIELD="django.db.models.AutoField",
++    ROOT_URLCONF=__name__,
++    TEMPLATES=[{"BACKEND": "django.template.backends.django.DjangoTemplates", "APP_DIRS": False, "OPTIONS": {"loaders": [("django.template.loaders.locmem.Loader", TEMPLATE_SOURCES)], "context_processors": ["django.template.context_processors.request"]}}],
++    USE_TZ=True,
++)
++import django
++django.setup()
++from io import StringIO
++from django.core.handlers.wsgi import WSGIRequest
++from django.template import Context, Template
++from django.test.client import FakePayload
++import django_tables2 as tables
++def build_request(uri="/"):
++    path, _, querystring = uri.partition("?")
++    return WSGIRequest({"CONTENT_TYPE": "text/html; charset=utf-8", "PATH_INFO": path, "QUERY_STRING": querystring, "REMOTE_ADDR": "127.0.0.1", "REQUEST_METHOD": "GET", "SCRIPT_NAME": "", "SERVER_NAME": "testserver", "SERVER_PORT": "80", "SERVER_PROTOCOL": "HTTP/1.1", "wsgi.version": (1, 0), "wsgi.url_scheme": "http", "wsgi.input": FakePayload(b""), "wsgi.errors": StringIO(), "wsgi.multiprocess": True, "wsgi.multithread": False, "wsgi.run_once": False})
++class HookedScoreTable(tables.Table):
++    name = tables.Column()
++    score = tables.Column()
++    class Meta:
++        template_name = "acceptance/default.html"
++        attrs = {"class": "score-grid"}
++    def before_render(self, request):
++        self.hook_seen = f"{request.method}:{request.path}"
++table = HookedScoreTable([{"name": "Ada", "score": 7}, {"name": "Bo", "score": 11}])
++out = Template("{% load django_tables2 %}{% render_table table %}").render(Context({"request": build_request("/scores/?page=2"), "table": table}))
++sys_stdout = json.dumps(out)
++print(sys_stdout)
++'''
++    fresh_process = subprocess.run(
++        [sys.executable, "-c", script],
++        check=True,
++        text=True,
++        stdout=subprocess.PIPE,
++        stderr=subprocess.PIPE,
++    )
++
++    assert json.loads(fresh_process.stdout) == in_process
++    assert (
++        in_process
++        == "DEFAULT|path=/scores/|columns=name:Name;score:Score;|rows=[name=Ada;score=7;][name=Bo;score=11;]|hook=GET:/scores/"
++    )
++
++
++def test_render_table_preserves_behavior_under_changed_cwd(tmp_path, monkeypatch):
++    monkeypatch.chdir(tmp_path)
++
++    table = HookedScoreTable([{"name": "Ada", "score": 7}])
++    request = build_request("/side-effects/")
++    actual = render_template(
++        "{% load django_tables2 %}{% render_table table %}",
++        Context({"request": request, "table": table}),
++    )
++
++
++
++    assert actual == (
++        "DEFAULT|path=/side-effects/|columns=name:Name;score:Score;|"
++        "rows=[name=Ada;score=7;]|hook=GET:/side-effects/"
++    )
++    assert request.path == "/side-effects/"
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,15 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++cd /workspace/repo
++export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
++exec /opt/coderl-stage4a-venv/bin/python -m pytest /workspace/repo/usercase-test-coderl/test_render_table_tag.py -v

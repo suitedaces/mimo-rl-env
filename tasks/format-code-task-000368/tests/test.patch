@@ -1,0 +1,316 @@
+diff --git a/usercase-test-coderl/unleash-client-provider.test.ts b/usercase-test-coderl/unleash-client-provider.test.ts
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/unleash-client-provider.test.ts
+@@ -0,0 +1,267 @@
++import { Logger } from '@nestjs/common';
++import type { Context, UnleashConfig } from 'unleash-client';
++
++import { UnleashClientProvider } from '@alpha018/nestjs-unleash-client';
++
++
++
++
++
++
++
++
++type MockUnleashClient = {
++  clientId: string;
++  config: unknown;
++  destroyed: boolean;
++  destroy: jest.Mock;
++  getFeatureToggleDefinition: jest.Mock;
++  isEnabled: jest.Mock;
++  listeners: {
++    error?: (err: { message: string; stack?: string }) => void;
++    warn?: (msg: string) => void;
++  };
++  on: jest.Mock;
++};
++
++const mockClients: MockUnleashClient[] = [];
++let mockActiveClientCount = 0;
++let mockPeakActiveClientCount = 0;
++let mockNextClientId = 1;
++
++jest.mock('unleash-client', () => {
++  const actual = jest.requireActual('unleash-client');
++
++  return {
++    ...actual,
++    Unleash: jest.fn().mockImplementation((config: unknown) => {
++      const client: MockUnleashClient = {
++        clientId: `mock-client-${mockNextClientId}`,
++        config,
++        destroyed: false,
++        destroy: jest.fn(),
++        getFeatureToggleDefinition: jest.fn(),
++        isEnabled: jest.fn(),
++        listeners: {},
++        on: jest.fn(),
++      };
++
++      mockNextClientId += 1;
++      mockActiveClientCount += 1;
++      mockPeakActiveClientCount = Math.max(mockPeakActiveClientCount, mockActiveClientCount);
++
++      client.on.mockImplementation((event: 'error' | 'warn', callback: never) => {
++        client.listeners[event] = callback;
++        return client;
++      });
++
++      client.destroy.mockImplementation(() => {
++        if (!client.destroyed) {
++          client.destroyed = true;
++          mockActiveClientCount -= 1;
++        }
++      });
++
++      mockClients.push(client);
++      return client;
++    }),
++  };
++});
++
++const sampleConfig: UnleashConfig = {
++  url: 'http://localhost:4242/api',
++  instanceId: 'test-instance',
++  appName: 'test-app',
++};
++
++const checkoutDefinition = {
++  name: 'checkout',
++  enabled: true,
++  strategies: [{ name: 'default', parameters: {} }],
++};
++
++describe('UnleashClientProvider public stateful facade', () => {
++  let loggerErrorSpy: jest.SpyInstance;
++  let loggerWarnSpy: jest.SpyInstance;
++
++  beforeEach(() => {
++    mockClients.splice(0, mockClients.length);
++    mockActiveClientCount = 0;
++    mockPeakActiveClientCount = 0;
++    mockNextClientId = 1;
++    jest.clearAllMocks();
++    loggerErrorSpy = jest.spyOn(Logger.prototype, 'error').mockImplementation();
++    loggerWarnSpy = jest.spyOn(Logger.prototype, 'warn').mockImplementation();
++  });
++
++  afterEach(() => {
++    jest.restoreAllMocks();
++  });
++
++  test('initializes one SDK client, exposes it, and wires SDK event listeners', () => {
++
++
++    const provider = new UnleashClientProvider(sampleConfig);
++
++    provider.onModuleInit();
++
++    expect(mockClients.length).toBe(1);
++    expect(mockClients[0].config).toEqual({
++      url: 'http://localhost:4242/api',
++      instanceId: 'test-instance',
++      appName: 'test-app',
++    });
++
++    expect(provider.unleashClient).toBe(mockClients[0]);
++
++    const registeredEvents = mockClients[0].on.mock.calls.map((call) => call[0]);
++    expect(registeredEvents).toEqual(expect.arrayContaining(['error', 'warn']));
++    expect(typeof mockClients[0].listeners.error).toBe('function');
++    expect(typeof mockClients[0].listeners.warn).toBe('function');
++    expect(mockActiveClientCount).toBe(1);
++
++    provider.onModuleDestroy();
++  });
++
++  test('logs SDK error and warning events through the Nest logger', () => {
++
++
++    const provider = new UnleashClientProvider(sampleConfig);
++    provider.onModuleInit();
++
++    mockClients[0].listeners.error?.({
++      message: 'sdk exploded',
++      stack: 'Error: sdk exploded\n    at acceptance-test',
++    });
++    mockClients[0].listeners.warn?.('sdk warming up');
++
++
++    expect(
++      loggerErrorSpy.mock.calls.some(
++        (call) => call[0] === 'sdk exploded' && call[1] === 'Error: sdk exploded\n    at acceptance-test',
++      ),
++    ).toBe(true);
++
++    expect(loggerWarnSpy.mock.calls.some((call) => call[0] === 'sdk warming up')).toBe(true);
++
++    provider.onModuleDestroy();
++  });
++
++  test('delegates enabled checks to the retained SDK client and returns true then false', () => {
++
++
++    const provider = new UnleashClientProvider(sampleConfig);
++    provider.onModuleInit();
++    mockClients[0].isEnabled.mockReturnValueOnce(true).mockReturnValueOnce(false);
++
++    expect(provider.isEnabled('checkout', { userId: '42' })).toBe(true);
++    expect(provider.isEnabled('checkout', { userId: '84' })).toBe(false);
++    expect(mockClients[0].isEnabled.mock.calls).toEqual([
++      ['checkout', { userId: '42' }],
++      ['checkout', { userId: '84' }],
++    ]);
++
++    provider.onModuleDestroy();
++  });
++
++  test('delegates feature definition lookups and preserves found and missing results', () => {
++
++
++    const provider = new UnleashClientProvider(sampleConfig);
++    provider.onModuleInit();
++    mockClients[0].getFeatureToggleDefinition
++      .mockReturnValueOnce(checkoutDefinition)
++      .mockReturnValueOnce(undefined);
++
++
++    expect(provider.getFeatureToggleDefinition('checkout')).toBe(checkoutDefinition);
++    expect(provider.getFeatureToggleDefinition('missing')).toBeUndefined();
++    expect(mockClients[0].getFeatureToggleDefinition.mock.calls).toEqual([['checkout'], ['missing']]);
++
++    provider.onModuleDestroy();
++  });
++
++  test('does not create the SDK client before module initialization', () => {
++
++
++    const provider = new UnleashClientProvider(sampleConfig);
++
++    expect(mockClients.length).toBe(0);
++  });
++
++  test('keeps two provider instances backed by their own SDK clients', () => {
++
++
++    const configA: UnleashConfig = {
++      url: 'http://localhost:4242/api',
++      instanceId: 'test-instance-a',
++      appName: 'test-app-a',
++    };
++    const configB: UnleashConfig = {
++      url: 'http://localhost:4242/api',
++      instanceId: 'test-instance-b',
++      appName: 'test-app-b',
++    };
++    const a = new UnleashClientProvider(configA);
++    const b = new UnleashClientProvider(configB);
++
++    a.onModuleInit();
++    b.onModuleInit();
++    mockClients[0].isEnabled.mockReturnValue(true);
++    mockClients[1].isEnabled.mockReturnValue(false);
++
++
++    expect(a.unleashClient).toBe(mockClients[0]);
++    expect(b.unleashClient).toBe(mockClients[1]);
++    expect(a.unleashClient).not.toBe(b.unleashClient);
++    expect(mockClients.map((client) => client.config)).toEqual([
++      {
++        url: 'http://localhost:4242/api',
++        instanceId: 'test-instance-a',
++        appName: 'test-app-a',
++      },
++      {
++        url: 'http://localhost:4242/api',
++        instanceId: 'test-instance-b',
++        appName: 'test-app-b',
++      },
++    ]);
++    expect(a.isEnabled('checkout', { userId: '42' })).toBe(true);
++    expect(b.isEnabled('checkout', { userId: '42' })).toBe(false);
++    expect(mockActiveClientCount).toBe(2);
++
++    a.onModuleDestroy();
++    b.onModuleDestroy();
++  });
++
++  test('destroys the retained SDK client', () => {
++
++
++    const provider = new UnleashClientProvider(sampleConfig);
++    provider.onModuleInit();
++
++    expect(mockActiveClientCount).toBe(1);
++    provider.onModuleDestroy();
++    expect(mockClients[0].destroy.mock.calls.length).toBe(1);
++    expect(mockActiveClientCount).toBe(0);
++
++  });
++
++  test('keeps the SDK client resource counter bounded across many init-use-destroy cycles', () => {
++
++
++    for (let i = 0; i < 125; i += 1) {
++      const provider = new UnleashClientProvider(sampleConfig);
++      provider.onModuleInit();
++      mockClients[i].isEnabled.mockReturnValue(true);
++
++      expect(provider.isEnabled('checkout', { userId: '42' })).toBe(true);
++      provider.onModuleDestroy();
++      expect(mockActiveClientCount).toBe(0);
++    }
++
++    expect(mockClients.length).toBe(125);
++    expect(mockPeakActiveClientCount).toBe(1);
++    expect(mockActiveClientCount).toBe(0);
++  });
++});
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,39 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++
++cd /workspace/repo
++
++if [ ! -x /workspace/repo/node_modules/.bin/jest ]; then
++  echo "Missing local Jest installation at /workspace/repo/node_modules/.bin/jest" >&2
++  exit 127
++fi
++
++exec /workspace/repo/node_modules/.bin/jest /workspace/repo/usercase-test-coderl/unleash-client-provider.test.ts --runInBand --config '{
++  "rootDir": "/workspace/repo",
++  "moduleFileExtensions": ["js", "json", "ts"],
++  "moduleNameMapper": {
++    "^@alpha018/nestjs-unleash-client$": "<rootDir>/src/index.ts"
++  },
++  "transform": {
++    "^.+\\.(t|j)s$": ["ts-jest", {
++      "tsconfig": {
++        "baseUrl": "/workspace/repo",
++        "paths": {
++          "@alpha018/nestjs-unleash-client": ["src/index.ts"]
++        }
++      }
++    }]
++  },
++  "testEnvironment": "node",
++  "testRegex": ".*\\.test\\.ts$"
++}'

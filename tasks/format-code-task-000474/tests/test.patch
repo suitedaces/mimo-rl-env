@@ -1,0 +1,345 @@
+diff --git a/usercase-test-coderl/test_palace_graph_analyzer.py b/usercase-test-coderl/test_palace_graph_analyzer.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/test_palace_graph_analyzer.py
+@@ -0,0 +1,316 @@
++
++
++from __future__ import annotations
++
++import gc
++import tempfile
++
++import pytest
++
++from memory_palace.graph_analyzer import PalaceGraphAnalyzer
++from memory_palace.knowledge_graph import KnowledgeGraph
++
++
++def _sample_graph() -> KnowledgeGraph:
++    graph = KnowledgeGraph(":memory:")
++    for entity_id in ("a", "b", "c", "d", "e"):
++        graph.upsert_entity(entity_id, "concept", f"Entity {entity_id.upper()}")
++
++    graph.create_synapse("a", "b", strength=0.8)
++    graph.create_synapse("b", "c", strength=0.6)
++    graph.create_synapse("c", "d", strength=0.4)
++    graph.create_synapse("a", "c", strength=0.3)
++    graph.create_synapse("d", "e", strength=0.2)
++    return graph
++
++
++def _normalized_link_predictions(
++    predictions: list[tuple[str, str, float]],
++) -> list[tuple[tuple[str, str], float]]:
++    return [
++        (tuple(sorted((source, target))), score)
++        for source, target, score in predictions
++    ]
++
++
++def _component_set(components: list[set[str]]) -> set[frozenset[str]]:
++    return {frozenset(component) for component in components}
++
++
++def test_build_graph_loads_sample_entities_synapses_and_weights() -> None:
++
++
++
++    graph = _sample_graph()
++    try:
++        nx_graph = PalaceGraphAnalyzer(graph).build_graph()
++
++        assert type(nx_graph).__name__ == "DiGraph"
++        assert len(nx_graph.nodes) == 5
++        assert len(nx_graph.edges) == 5
++
++        assert set(nx_graph.nodes) == {"a", "b", "c", "d", "e"}
++        assert set(nx_graph.edges) == {
++            ("a", "b"),
++            ("a", "c"),
++            ("b", "c"),
++            ("c", "d"),
++            ("d", "e"),
++        }
++        assert nx_graph["a"]["b"]["weight"] == 0.8
++    finally:
++        graph.close()
++
++
++def test_sample_rank_and_centrality_scores_are_state_derived() -> None:
++
++
++
++    graph = _sample_graph()
++    try:
++        analyzer = PalaceGraphAnalyzer(graph)
++
++        page_rank = analyzer.pagerank()
++        assert set(page_rank) == {"a", "b", "c", "d", "e"}
++        assert all(0.0 <= score <= 1.0 for score in page_rank.values())
++        assert page_rank["a"] < page_rank["d"]
++
++        centrality = analyzer.betweenness_centrality()
++        assert set(centrality) == {"a", "b", "c", "d", "e"}
++
++        assert centrality["b"] > centrality["e"] or centrality["c"] > centrality["e"]
++    finally:
++        graph.close()
++
++
++def test_sample_undirected_structure_outputs_are_exact() -> None:
++
++
++
++    graph = _sample_graph()
++    try:
++        analyzer = PalaceGraphAnalyzer(graph)
++
++        communities = analyzer.detect_communities()
++        assert all(isinstance(community_id, int) for community_id in communities)
++        assert all(
++            isinstance(members, set) and members for members in communities.values()
++        )
++        assert set().union(*communities.values()) == {"a", "b", "c", "d", "e"}
++        assert sum(len(members) for members in communities.values()) == 5
++
++
++        assert {tuple(sorted(edge)) for edge in analyzer.find_bridges()} == {
++            ("c", "d"),
++            ("d", "e"),
++        }
++
++        assert set(analyzer.find_keystones()) == {"c", "d"}
++        assert analyzer.connected_components() == [{"a", "b", "c", "d", "e"}]
++    finally:
++        graph.close()
++
++
++def test_shortest_path_prefers_stronger_synapses_and_missing_endpoints_return_none() -> None:
++
++
++
++    graph = _sample_graph()
++    try:
++        analyzer = PalaceGraphAnalyzer(graph)
++
++        assert analyzer.shortest_path("a", "e") == ["a", "b", "c", "d", "e"]
++        assert analyzer.shortest_path("missing", "e") is None
++        assert analyzer.shortest_path("a", "missing") is None
++    finally:
++        graph.close()
++
++
++def test_disconnected_graph_components_and_no_path_are_exact() -> None:
++
++
++
++    graph = KnowledgeGraph(":memory:")
++    try:
++        for entity_id in ("a", "b", "z"):
++            graph.upsert_entity(entity_id, "concept", entity_id)
++        graph.create_synapse("a", "b", strength=0.5)
++
++        analyzer = PalaceGraphAnalyzer(graph)
++
++
++        assert _component_set(analyzer.connected_components()) == {
++            frozenset({"a", "b"}),
++            frozenset({"z"}),
++        }
++        assert analyzer.shortest_path("a", "z") is None
++        assert analyzer.predict_links() == []
++    finally:
++        graph.close()
++
++
++def test_empty_graph_algorithm_results_are_empty_literals() -> None:
++
++
++
++    graph = KnowledgeGraph(":memory:")
++    try:
++        analyzer = PalaceGraphAnalyzer(graph)
++        nx_graph = analyzer.build_graph()
++
++        assert len(nx_graph.nodes) == 0
++        assert len(nx_graph.edges) == 0
++        assert analyzer.pagerank() == {}
++        assert analyzer.betweenness_centrality() == {}
++        assert analyzer.detect_communities() == {}
++        assert analyzer.find_bridges() == []
++        assert analyzer.find_keystones() == []
++        assert analyzer.connected_components() == []
++        assert analyzer.predict_links() == []
++    finally:
++        graph.close()
++
++
++def test_predict_links_uses_adamic_adar_ordering_and_top_n() -> None:
++
++
++
++    graph = _sample_graph()
++    try:
++        analyzer = PalaceGraphAnalyzer(graph)
++
++        top_ten = _normalized_link_predictions(analyzer.predict_links(top_n=10))
++        assert top_ten[0][0] == ("c", "e")
++        assert set(pair for pair, _score in top_ten[1:]) == {("a", "d"), ("b", "d")}
++
++        assert all(score > 0.0 for _pair, score in top_ten)
++        assert [score for _pair, score in top_ten] == sorted(
++            (score for _pair, score in top_ten), reverse=True
++        )
++        assert top_ten[0][1] > top_ten[1][1]
++        assert top_ten[1][1] == pytest.approx(top_ten[2][1])
++
++        top_two = _normalized_link_predictions(analyzer.predict_links(top_n=2))
++        assert len(top_two) == 2
++        assert top_two[0][0] == ("c", "e")
++        assert top_two[1][0] in {("a", "d"), ("b", "d")}
++        assert top_two[0][1] > top_two[1][1] > 0.0
++        assert analyzer.predict_links(top_n=0) == []
++    finally:
++        graph.close()
++
++
++def test_predict_links_empty_for_too_few_nodes_and_complete_two_node_graph() -> None:
++
++
++
++    one_node = KnowledgeGraph(":memory:")
++    two_node_complete = KnowledgeGraph(":memory:")
++    try:
++        one_node.upsert_entity("solo", "concept", "Solo")
++        assert PalaceGraphAnalyzer(one_node).predict_links() == []
++
++        two_node_complete.upsert_entity("x", "concept", "X")
++        two_node_complete.upsert_entity("y", "concept", "Y")
++        two_node_complete.create_synapse("x", "y", strength=0.9)
++        assert PalaceGraphAnalyzer(two_node_complete).predict_links() == []
++    finally:
++        one_node.close()
++        two_node_complete.close()
++
++
++def test_analyzer_reads_entities_and_synapses_from_live_knowledge_graph() -> None:
++
++
++
++    graph = _sample_graph()
++    try:
++        analyzer = PalaceGraphAnalyzer(graph)
++
++        nx_graph = analyzer.build_graph()
++        assert set(nx_graph.nodes) == {"a", "b", "c", "d", "e"}
++
++        assert set(analyzer.pagerank()) == {"a", "b", "c", "d", "e"}
++    finally:
++        graph.close()
++
++
++def test_analyzer_build_graph_is_repeatable_before_cleanup() -> None:
++
++
++
++    graph = _sample_graph()
++    try:
++        analyzer = PalaceGraphAnalyzer(graph)
++        nx_graph = analyzer.build_graph()
++
++
++        assert set(nx_graph.nodes) == {"a", "b", "c", "d", "e"}
++        assert len(nx_graph.edges) == 5
++    finally:
++        graph.close()
++
++
++def test_two_analyzers_reflect_independent_knowledge_graph_state() -> None:
++
++
++
++    graph_a = KnowledgeGraph(":memory:")
++    graph_b = KnowledgeGraph(":memory:")
++    try:
++        for entity_id in ("a", "b", "c"):
++            graph_a.upsert_entity(entity_id, "concept", entity_id)
++        graph_a.create_synapse("a", "b", strength=0.8)
++        graph_a.create_synapse("b", "c", strength=0.6)
++
++        for entity_id in ("x", "y"):
++            graph_b.upsert_entity(entity_id, "concept", entity_id)
++        graph_b.create_synapse("x", "y", strength=0.9)
++
++        nx_a = PalaceGraphAnalyzer(graph_a).build_graph()
++        nx_b = PalaceGraphAnalyzer(graph_b).build_graph()
++
++        assert sorted(nx_a.nodes) == ["a", "b", "c"]
++        assert sorted(nx_a.edges) == [("a", "b"), ("b", "c")]
++        assert sorted(nx_b.nodes) == ["x", "y"]
++        assert sorted(nx_b.edges) == [("x", "y")]
++
++        assert set(PalaceGraphAnalyzer(graph_a).pagerank()) == {"a", "b", "c"}
++        assert set(PalaceGraphAnalyzer(graph_b).pagerank()) == {"x", "y"}
++    finally:
++        graph_a.close()
++        graph_b.close()
++
++
++def test_repeated_construct_use_cycles_load_weighted_graphs() -> None:
++
++
++
++    gc.collect()
++    retained_sessions: list[tuple[KnowledgeGraph, PalaceGraphAnalyzer]] = []
++    snapshots: list[tuple[int, int, float]] = []
++
++    with tempfile.TemporaryDirectory() as temp_dir:
++        for index in range(120):
++            graph = KnowledgeGraph(f"{temp_dir}/graph_{index}.sqlite")
++            graph.upsert_entity("a", "concept", "Entity A")
++            graph.upsert_entity("b", "concept", "Entity B")
++            graph.create_synapse("a", "b", strength=0.8)
++            analyzer = PalaceGraphAnalyzer(graph)
++
++            nx_graph = analyzer.build_graph()
++            assert len(nx_graph.nodes) == 2
++            assert len(nx_graph.edges) == 1
++            assert nx_graph["a"]["b"]["weight"] == 0.8
++            snapshots.append(
++                (len(nx_graph.nodes), len(nx_graph.edges), nx_graph["a"]["b"]["weight"])
++            )
++
++            graph.close()
++            retained_sessions.append((graph, analyzer))
++
++        gc.collect()
++
++
++    assert len(retained_sessions) == 120
++    assert snapshots == [(2, 1, 0.8)] * 120
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,19 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++
++cd /workspace/repo
++
++export PYTHONPATH="/workspace/repo/plugins/memory-palace/src:/workspace/repo/plugins/leyline/src:${PYTHONPATH:-}"
++export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
++
++exec python -m pytest /workspace/repo/usercase-test-coderl/test_palace_graph_analyzer.py -v

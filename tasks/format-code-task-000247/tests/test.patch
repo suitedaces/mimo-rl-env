@@ -1,0 +1,298 @@
+diff --git a/toxic_api_test.go b/toxic_api_test.go
+new file mode 100644
+index 0000000..70dc22b
+--- /dev/null
++++ b/toxic_api_test.go
+@@ -0,0 +1,258 @@
++package main
++
++import (
++	"bytes"
++	"encoding/json"
++	"io"
++	"net"
++	"net/http"
++	"strings"
++	"testing"
++	"time"
++)
++
++
++
++func createNamedProxy(t *testing.T, addr, name, listen, upstream string) *http.Response {
++	body := `{"Name":"` + name + `","Listen":"` + listen + `","Upstream":"` + upstream + `"}`
++	resp, err := http.Post(addr+"/proxies", "application/json", strings.NewReader(body))
++	if err != nil {
++		t.Fatal("Failed to create proxy", err)
++	}
++	return resp
++}
++
++
++func getToxics(t *testing.T, addr, proxy, direction string) map[string]interface{} {
++	resp, err := http.Get(addr + "/proxies/" + proxy + "/" + direction + "/toxics")
++	if err != nil {
++		t.Fatal("Failed to get toxics", err)
++	}
++	defer resp.Body.Close()
++	if resp.StatusCode != http.StatusOK {
++		t.Fatalf("Expected 200 listing toxics, got %d", resp.StatusCode)
++	}
++	out := make(map[string]interface{})
++	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
++		t.Fatal("Failed to decode toxic list", err)
++	}
++	return out
++}
++
++
++
++func setToxic(t *testing.T, addr, proxy, direction, name, body string) (*http.Response, map[string]interface{}) {
++	resp, err := http.Post(addr+"/proxies/"+proxy+"/"+direction+"/toxics/"+name, "application/json", strings.NewReader(body))
++	if err != nil {
++		t.Fatal("Failed to set toxic", err)
++	}
++	defer resp.Body.Close()
++	out := make(map[string]interface{})
++	json.NewDecoder(resp.Body).Decode(&out)
++	return resp, out
++}
++
++func asObject(t *testing.T, v interface{}) map[string]interface{} {
++	m, ok := v.(map[string]interface{})
++	if !ok {
++		t.Fatalf("Expected toxic to be a JSON object, got %T", v)
++	}
++	return m
++}
++
++func TestNewProxyListsDisabledLatencyToxicBothDirections(t *testing.T) {
++	WithServer(t, func(addr string) {
++		if resp := createNamedProxy(t, addr, "mysql_master", "localhost:3310", "localhost:20001"); resp.StatusCode != http.StatusCreated {
++			t.Fatal("Unable to create proxy")
++		}
++
++		for _, dir := range []string{"upstream", "downstream"} {
++			toxics := getToxics(t, addr, "mysql_master", dir)
++			raw, ok := toxics["latency"]
++			if !ok {
++				t.Fatalf("Expected a latency toxic in %s list", dir)
++			}
++			latency := asObject(t, raw)
++			if latency["enabled"] != false {
++				t.Fatalf("Expected %s latency toxic to start disabled", dir)
++			}
++			if latency["latency"] != 0.0 || latency["jitter"] != 0.0 {
++				t.Fatalf("Expected %s latency toxic to default latency/jitter to 0, got %v", dir, latency)
++			}
++		}
++	})
++}
++
++func TestSetToxicPersistsAndEchoesState(t *testing.T) {
++	WithServer(t, func(addr string) {
++		if resp := createNamedProxy(t, addr, "mysql_master", "localhost:3310", "localhost:20001"); resp.StatusCode != http.StatusCreated {
++			t.Fatal("Unable to create proxy")
++		}
++
++		resp, out := setToxic(t, addr, "mysql_master", "downstream", "latency", `{"enabled":true,"latency":100,"jitter":10}`)
++		if resp.StatusCode != http.StatusOK {
++			t.Fatalf("Expected 200 setting toxic, got %d", resp.StatusCode)
++		}
++		if out["enabled"] != true || out["latency"] != 100.0 || out["jitter"] != 10.0 {
++			t.Fatalf("POST response did not reflect the new state: %v", out)
++		}
++
++		toxics := getToxics(t, addr, "mysql_master", "downstream")
++		latency := asObject(t, toxics["latency"])
++		if latency["enabled"] != true || latency["latency"] != 100.0 || latency["jitter"] != 10.0 {
++			t.Fatalf("GET did not reflect the persisted state: %v", latency)
++		}
++	})
++}
++
++func TestSetToxicIsPerDirection(t *testing.T) {
++	WithServer(t, func(addr string) {
++		if resp := createNamedProxy(t, addr, "mysql_master", "localhost:3310", "localhost:20001"); resp.StatusCode != http.StatusCreated {
++			t.Fatal("Unable to create proxy")
++		}
++
++		setToxic(t, addr, "mysql_master", "downstream", "latency", `{"enabled":true,"latency":100,"jitter":10}`)
++
++		up := asObject(t, getToxics(t, addr, "mysql_master", "upstream")["latency"])
++		if up["enabled"] != false {
++			t.Fatal("Setting downstream toxic must not enable the upstream toxic")
++		}
++	})
++}
++
++func TestSetToxicResetsOmittedFields(t *testing.T) {
++	WithServer(t, func(addr string) {
++		if resp := createNamedProxy(t, addr, "mysql_master", "localhost:3310", "localhost:20001"); resp.StatusCode != http.StatusCreated {
++			t.Fatal("Unable to create proxy")
++		}
++
++		setToxic(t, addr, "mysql_master", "downstream", "latency", `{"enabled":true,"latency":600,"jitter":40}`)
++
++
++		_, out := setToxic(t, addr, "mysql_master", "downstream", "latency", `{"enabled":false}`)
++		if out["enabled"] != false || out["latency"] != 0.0 || out["jitter"] != 0.0 {
++			t.Fatalf("Omitted fields should reset to zero, got %v", out)
++		}
++
++		latency := asObject(t, getToxics(t, addr, "mysql_master", "downstream")["latency"])
++		if latency["enabled"] != false || latency["latency"] != 0.0 || latency["jitter"] != 0.0 {
++			t.Fatalf("Reset state did not persist, got %v", latency)
++		}
++	})
++}
++
++func TestToxicsForUnknownProxyReturn404(t *testing.T) {
++	WithServer(t, func(addr string) {
++		resp, err := http.Get(addr + "/proxies/does_not_exist/upstream/toxics")
++		if err != nil {
++			t.Fatal(err)
++		}
++		resp.Body.Close()
++		if resp.StatusCode != http.StatusNotFound {
++			t.Fatalf("Expected 404 for unknown proxy, got %d", resp.StatusCode)
++		}
++
++		resp2, _ := setToxic(t, addr, "does_not_exist", "upstream", "latency", `{"enabled":true}`)
++		if resp2.StatusCode != http.StatusNotFound {
++			t.Fatalf("Expected 404 for unknown proxy on POST, got %d", resp2.StatusCode)
++		}
++	})
++}
++
++func TestSetUnknownToxicReturns404(t *testing.T) {
++	WithServer(t, func(addr string) {
++		if resp := createNamedProxy(t, addr, "mysql_master", "localhost:3310", "localhost:20001"); resp.StatusCode != http.StatusCreated {
++			t.Fatal("Unable to create proxy")
++		}
++		resp, _ := setToxic(t, addr, "mysql_master", "upstream", "nonexistent_toxic", `{"enabled":true}`)
++		if resp.StatusCode != http.StatusNotFound {
++			t.Fatalf("Expected 404 for unknown toxic, got %d", resp.StatusCode)
++		}
++	})
++}
++
++
++func echoServer(t *testing.T, listen string) (stop func()) {
++	ln, err := net.Listen("tcp", listen)
++	if err != nil {
++		t.Fatal("Failed to start echo server", err)
++	}
++	done := make(chan struct{})
++	go func() {
++		for {
++			conn, err := ln.Accept()
++			if err != nil {
++				select {
++				case <-done:
++				default:
++				}
++				return
++			}
++			go io.Copy(conn, conn)
++		}
++	}()
++	return func() {
++		close(done)
++		ln.Close()
++	}
++}
++
++
++
++func roundTrip(t *testing.T, proxyAddr string, msg []byte) time.Duration {
++	conn, err := net.Dial("tcp", proxyAddr)
++	if err != nil {
++		t.Fatal("Failed to dial proxy", err)
++	}
++	defer conn.Close()
++
++	start := time.Now()
++	if _, err := conn.Write(msg); err != nil {
++		t.Fatal("Failed to write to proxy", err)
++	}
++	buf := make([]byte, len(msg))
++	if _, err := io.ReadFull(conn, buf); err != nil {
++		t.Fatal("Failed to read echo from proxy", err)
++	}
++	elapsed := time.Since(start)
++	if !bytes.Equal(buf, msg) {
++		t.Fatalf("Echo mismatch: got %q want %q", buf, msg)
++	}
++	return elapsed
++}
++
++func TestLatencyToxicDelaysTraffic(t *testing.T) {
++	WithServer(t, func(addr string) {
++		stop := echoServer(t, "localhost:20102")
++		defer stop()
++
++		if resp := createNamedProxy(t, addr, "lat_on", "localhost:20101", "localhost:20102"); resp.StatusCode != http.StatusCreated {
++			t.Fatal("Unable to create proxy")
++		}
++
++		setToxic(t, addr, "lat_on", "downstream", "latency", `{"enabled":true,"latency":600,"jitter":0}`)
++
++		msg := []byte("hello world")
++		elapsed := roundTrip(t, "localhost:20101", msg)
++		if elapsed < 450*time.Millisecond {
++			t.Fatalf("Expected enabled latency toxic to delay traffic by ~600ms, took %v", elapsed)
++		}
++	})
++}
++
++func TestNoLatencyToxicDoesNotDelayTraffic(t *testing.T) {
++	WithServer(t, func(addr string) {
++		stop := echoServer(t, "localhost:20104")
++		defer stop()
++
++		if resp := createNamedProxy(t, addr, "lat_off", "localhost:20103", "localhost:20104"); resp.StatusCode != http.StatusCreated {
++			t.Fatal("Unable to create proxy")
++		}
++
++		msg := []byte("hello world")
++		elapsed := roundTrip(t, "localhost:20103", msg)
++		if elapsed > 300*time.Millisecond {
++			t.Fatalf("Expected no added latency, but round trip took %v", elapsed)
++		}
++	})
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,29 @@
++#!/usr/bin/env bash
++
++
++
++set -euo pipefail
++HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++cd /testbed
++
++
++
++
++export GO111MODULE=off
++export GOPATH="/root/go:/testbed/Godeps/_workspace"
++PKG_DIR="/root/go/src/github.com/Shopify/toxiproxy"
++mkdir -p "$(dirname "$PKG_DIR")"
++ln -sfn /testbed "$PKG_DIR"
++cd "$PKG_DIR"
++
++
++
++
++
++TEST_BIN="$(mktemp -d)/toxiproxy.test"
++go test -c -o "$TEST_BIN"
++
++
++
++
++"$TEST_BIN"

@@ -1,0 +1,452 @@
+diff --git a/usercase-test-coderl/runner_lifecycle_test.go b/usercase-test-coderl/runner_lifecycle_test.go
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/runner_lifecycle_test.go
+@@ -0,0 +1,418 @@
++package usercase_test_coderl
++
++import (
++	"context"
++	stderrors "errors"
++	"fmt"
++	"math/big"
++	"net/http"
++	"os"
++	"runtime"
++	"strings"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/grailbio/reflow"
++	rerrors "github.com/grailbio/reflow/errors"
++	"github.com/grailbio/reflow/flow"
++	"github.com/grailbio/reflow/log"
++	"github.com/grailbio/reflow/runner"
++	"github.com/grailbio/reflow/sched"
++	"github.com/grailbio/reflow/taskdb"
++	"github.com/grailbio/reflow/test/testutil"
++	"github.com/grailbio/reflow/trace"
++	"github.com/grailbio/reflow/types"
++	"github.com/grailbio/reflow/values"
++)
++
++
++
++
++
++
++
++
++const renderedAlphaFileset = "obj<alpha=<id: sha256:8ed3f6ad685b959ead7022518e1af76cd816f8e8ec7ccdda1ed4018e8f2223f8, size: 5>>"
++
++type snapshotter struct{}
++
++func (snapshotter) Snapshot(ctx context.Context, url string) (reflow.Fileset, error) {
++	return reflow.Fileset{}, fmt.Errorf("unexpected snapshot %s", url)
++}
++
++type countingTracer struct {
++	mu      sync.Mutex
++	starts  int
++	ends    int
++	flushes int
++	active  int
++	maxLive int
++}
++
++func (c *countingTracer) Flush() {
++	c.mu.Lock()
++	c.flushes++
++	c.mu.Unlock()
++}
++
++func (c *countingTracer) Emit(ctx context.Context, e trace.Event) (context.Context, error) {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	switch e.Kind {
++	case trace.StartEvent:
++		c.starts++
++		c.active++
++		if c.active > c.maxLive {
++			c.maxLive = c.active
++		}
++	case trace.EndEvent:
++		c.ends++
++		c.active--
++	case trace.NoteEvent:
++	}
++	return ctx, nil
++}
++
++func (*countingTracer) WriteHTTPContext(context.Context, *http.Header) {}
++
++func (*countingTracer) ReadHTTPContext(ctx context.Context, _ http.Header) context.Context {
++	return ctx
++}
++
++func (*countingTracer) CopyTraceContext(_, dst context.Context) context.Context {
++	return dst
++}
++
++func (*countingTracer) URL(context.Context) string {
++	return "counting://trace"
++}
++
++func quietLogger() *log.Logger {
++	return log.New(nil, log.OffLevel)
++}
++
++func filesetFlow(files ...string) *flow.Flow {
++	fs := testutil.Files(files...)
++	return &flow.Flow{
++		Op:         flow.Val,
++		Value:      values.T(fs),
++		State:      flow.Done,
++		FlowDigest: values.Digest(fs, types.Fileset),
++	}
++}
++
++func intFlow(n int64) *flow.Flow {
++	v := big.NewInt(n)
++	return &flow.Flow{
++		Op:         flow.Val,
++		Value:      values.T(v),
++		State:      flow.Done,
++		FlowDigest: values.Digest(v, types.Int),
++	}
++}
++
++func errorFlow(err error) *flow.Flow {
++	return &flow.Flow{
++		Op:         flow.Val,
++		Err:        rerrors.Recover(err),
++		State:      flow.Done,
++		FlowDigest: reflow.Digester.FromString("usercase-error-flow"),
++	}
++}
++
++func newRunner(f *flow.Flow, typ *types.T) *runner.Runner {
++	runID := taskdb.NewRunID()
++	return &runner.Runner{
++		State: runner.State{
++			ID:    runID,
++			Phase: runner.Init,
++		},
++		EvalConfig: flow.EvalConfig{
++			Scheduler:   &sched.Scheduler{},
++			Snapshotter: snapshotter{},
++			Repository:  testutil.NewInmemoryRepository("usercase"),
++			Assoc:       testutil.NewInmemoryAssoc(),
++			Log:         quietLogger(),
++			Trace:       quietLogger(),
++			RunID:       runID,
++		},
++		Flow:    f,
++		Type:    typ,
++		Cmdline: "reflow run usercase.rf -param alpha=1",
++	}
++}
++
++type stateWant struct {
++	phase          runner.Phase
++	result         string
++	errNil         bool
++	attempt        int
++	createdZero    *bool
++	lastTryZero    bool
++	completionZero bool
++}
++
++func assertState(t *testing.T, r *runner.Runner, want stateWant) {
++	t.Helper()
++
++	if got := r.Phase; got != want.phase {
++		t.Fatalf("phase: got %v, want %v", got, want.phase)
++	}
++	if got := r.Result; got != want.result {
++		t.Fatalf("result: got %q, want %q", got, want.result)
++	}
++	if got := r.Err == nil; got != want.errNil {
++		t.Fatalf("err nil: got %v, want %v", got, want.errNil)
++	}
++	if got := r.AttemptNumber; got != want.attempt {
++		t.Fatalf("attempt: got %d, want %d", got, want.attempt)
++	}
++	if want.createdZero != nil {
++		if got := r.Created.IsZero(); got != *want.createdZero {
++			t.Fatalf("created zero: got %v, want %v", got, *want.createdZero)
++		}
++	}
++	if got := r.LastTry.IsZero(); got != want.lastTryZero {
++		t.Fatalf("last try zero: got %v, want %v", got, want.lastTryZero)
++	}
++	if got := r.Completion.IsZero(); got != want.completionZero {
++		t.Fatalf("completion zero: got %v, want %v", got, want.completionZero)
++	}
++}
++
++func boolPtr(v bool) *bool {
++	return &v
++}
++
++func assertErrorContains(t *testing.T, err error, want string) {
++	t.Helper()
++
++	if err == nil {
++		t.Fatalf("error: got nil, want message containing %q", want)
++	}
++	if got := err.Error(); !strings.Contains(got, want) {
++		t.Fatalf("error: got %q, want message containing %q", got, want)
++	}
++}
++
++func assertReflowKind(t *testing.T, err error, want rerrors.Kind) {
++	t.Helper()
++	var re *rerrors.Error
++	if !stderrors.As(err, &re) {
++		t.Fatalf("error type: got %T, want *errors.Error", err)
++	}
++	if got := re.Kind; got != want {
++		t.Fatalf("error kind: got %d %s, want %d %s", int(got), got, int(want), want)
++	}
++}
++
++func countFDs() (int, bool) {
++	entries, err := os.ReadDir("/proc/self/fd")
++	if err != nil {
++		return 0, false
++	}
++	return len(entries), true
++}
++
++
++
++func TestDoFreshInitThenEvalSuccessLifecycle(t *testing.T) {
++	r := newRunner(filesetFlow("alpha"), nil)
++	assertState(t, r, stateWant{phase: runner.Init, result: "", errNil: true, attempt: 0, createdZero: boolPtr(true), lastTryZero: true, completionZero: true})
++
++	if got := r.Do(context.Background()); got != true {
++		t.Fatalf("first Do return: got %v, want true", got)
++	}
++	assertState(t, r, stateWant{phase: runner.Eval, result: "", errNil: true, attempt: 0, createdZero: boolPtr(false), lastTryZero: true, completionZero: true})
++
++	if got := r.Do(context.Background()); got != false {
++		t.Fatalf("second Do return: got %v, want false", got)
++	}
++	assertState(t, r, stateWant{phase: runner.Done, result: renderedAlphaFileset, errNil: true, attempt: 0, createdZero: boolPtr(false), lastTryZero: false, completionZero: false})
++}
++
++
++
++func TestEvalRendersTypedValueAndFlushesTrace(t *testing.T) {
++	tracer := &countingTracer{}
++	ctx := trace.WithTracer(context.Background(), tracer)
++
++	got, err := newRunner(intFlow(42), types.Int).Eval(ctx)
++	if err != nil {
++		t.Fatalf("Eval returned error: %v", err)
++	}
++	if got != "42" {
++		t.Fatalf("Eval result: got %q, want %q", got, "42")
++	}
++	if tracer.starts != 1 {
++		t.Fatalf("trace starts: got %d, want 1", tracer.starts)
++	}
++	if tracer.ends != 1 {
++		t.Fatalf("trace ends: got %d, want 1", tracer.ends)
++	}
++	if tracer.flushes != 1 {
++		t.Fatalf("trace flushes: got %d, want 1", tracer.flushes)
++	}
++	if tracer.active != 0 {
++		t.Fatalf("trace active spans: got %d, want 0", tracer.active)
++	}
++}
++
++
++
++func TestEvalWrapsGenericFlowErrorAsEvaluationError(t *testing.T) {
++	got, err := newRunner(errorFlow(fmt.Errorf("plain boom")), nil).Eval(context.Background())
++	if got != "" {
++		t.Fatalf("Eval result: got %q, want empty string", got)
++	}
++	assertReflowKind(t, err, rerrors.Eval)
++}
++
++
++
++func TestDoRestartableErrorMovesToRetryThenReinitializes(t *testing.T) {
++	r := newRunner(errorFlow(rerrors.E(rerrors.Temporary, "temporary boom")), nil)
++
++	if got := r.Do(context.Background()); got != true {
++		t.Fatalf("first Do return: got %v, want true", got)
++	}
++	assertState(t, r, stateWant{phase: runner.Eval, result: "", errNil: true, attempt: 0, createdZero: boolPtr(false), lastTryZero: true, completionZero: true})
++
++	if got := r.Do(context.Background()); got != true {
++		t.Fatalf("second Do return: got %v, want true", got)
++	}
++	assertState(t, r, stateWant{phase: runner.Retry, result: "", errNil: false, attempt: 0, createdZero: boolPtr(false), lastTryZero: false, completionZero: true})
++
++	if got := r.Err.Kind; got != rerrors.Temporary {
++		t.Fatalf("retry error kind: got %s, want %s", got, rerrors.Temporary)
++	}
++	assertErrorContains(t, r.Err, "temporary boom")
++
++	r.LastTry = time.Now().Add(-2 * time.Minute)
++	if got := r.Do(context.Background()); got != true {
++		t.Fatalf("retry Do return: got %v, want true", got)
++	}
++	assertState(t, r, stateWant{phase: runner.Init, result: "", errNil: true, attempt: 1, createdZero: boolPtr(false), lastTryZero: false, completionZero: true})
++}
++
++
++
++func TestDoExhaustsAfterThreeRetryAttempts(t *testing.T) {
++	r := newRunner(errorFlow(rerrors.E(rerrors.Temporary, "temporary boom")), nil)
++	r.Phase = runner.Retry
++	r.AttemptNumber = 2
++	r.Err = rerrors.Recover(rerrors.E(rerrors.Temporary, "temporary boom"))
++	r.LastTry = time.Now().Add(-2 * time.Minute)
++	r.Created = time.Now().Add(-3 * time.Minute)
++
++	if got := r.Do(context.Background()); got != false {
++		t.Fatalf("retry exhaustion return: got %v, want false", got)
++	}
++	assertState(t, r, stateWant{phase: runner.Done, result: "", errNil: false, attempt: 3, createdZero: boolPtr(false), lastTryZero: false, completionZero: false})
++
++	if got := r.Err.Kind; got != rerrors.Temporary {
++		t.Fatalf("exhaustion error kind: got %s, want %s", got, rerrors.Temporary)
++	}
++}
++
++
++
++func TestDoNonRestartableErrorFinishesDone(t *testing.T) {
++	r := newRunner(errorFlow(rerrors.E(rerrors.Fatal, "fatal boom")), nil)
++
++	if got := r.Do(context.Background()); got != true {
++		t.Fatalf("first Do return: got %v, want true", got)
++	}
++	assertState(t, r, stateWant{phase: runner.Eval, result: "", errNil: true, attempt: 0, createdZero: boolPtr(false), lastTryZero: true, completionZero: true})
++
++	if got := r.Do(context.Background()); got != false {
++		t.Fatalf("second Do return: got %v, want false", got)
++	}
++	assertState(t, r, stateWant{phase: runner.Done, result: "", errNil: false, attempt: 0, createdZero: boolPtr(false), lastTryZero: false, completionZero: false})
++
++	if got := r.Err.Kind; got != rerrors.Fatal {
++		t.Fatalf("fatal error kind: got %s, want %s", got, rerrors.Fatal)
++	}
++	assertErrorContains(t, r.Err, "fatal boom")
++}
++
++
++
++func TestDoWithoutSchedulerReturnsFalseAndDoesNotAdvance(t *testing.T) {
++	r := newRunner(filesetFlow("alpha"), nil)
++	r.Scheduler = nil
++
++	if got := r.Do(context.Background()); got != false {
++		t.Fatalf("Do return without scheduler: got %v, want false", got)
++	}
++
++	assertState(t, r, stateWant{phase: runner.Init, result: "", errNil: true, attempt: 0, lastTryZero: true, completionZero: true})
++}
++
++
++
++func TestRunnerInstancesKeepIndependentState(t *testing.T) {
++	a := newRunner(filesetFlow("alpha"), nil)
++	b := newRunner(filesetFlow("alpha"), nil)
++
++	if got := a.Do(context.Background()); got != true {
++		t.Fatalf("a first Do return: got %v, want true", got)
++	}
++	assertState(t, a, stateWant{phase: runner.Eval, result: "", errNil: true, attempt: 0, createdZero: boolPtr(false), lastTryZero: true, completionZero: true})
++	assertState(t, b, stateWant{phase: runner.Init, result: "", errNil: true, attempt: 0, createdZero: boolPtr(true), lastTryZero: true, completionZero: true})
++
++	if got := b.Do(context.Background()); got != true {
++		t.Fatalf("b first Do return: got %v, want true", got)
++	}
++	if got := b.Do(context.Background()); got != false {
++		t.Fatalf("b second Do return: got %v, want false", got)
++	}
++	assertState(t, b, stateWant{phase: runner.Done, result: renderedAlphaFileset, errNil: true, attempt: 0, createdZero: boolPtr(false), lastTryZero: false, completionZero: false})
++	assertState(t, a, stateWant{phase: runner.Eval, result: "", errNil: true, attempt: 0, createdZero: boolPtr(false), lastTryZero: true, completionZero: true})
++}
++
++
++
++func TestEvalTraceLifecycleStaysBoundedAcrossCycles(t *testing.T) {
++	runtime.GC()
++	startGoroutines := runtime.NumGoroutine()
++	startFDs, haveFDs := countFDs()
++
++	tracer := &countingTracer{}
++	ctx := trace.WithTracer(context.Background(), tracer)
++	for i := 0; i < 100; i++ {
++		got, err := newRunner(filesetFlow("alpha"), nil).Eval(ctx)
++		if err != nil {
++			t.Fatalf("Eval cycle %d returned error: %v", i, err)
++		}
++		if got != renderedAlphaFileset {
++			t.Fatalf("Eval cycle %d result: got %q, want %q", i, got, renderedAlphaFileset)
++		}
++	}
++	runtime.GC()
++
++	if tracer.starts != 100 {
++		t.Fatalf("trace starts: got %d, want 100", tracer.starts)
++	}
++	if tracer.ends != 100 {
++		t.Fatalf("trace ends: got %d, want 100", tracer.ends)
++	}
++	if tracer.flushes != 100 {
++		t.Fatalf("trace flushes: got %d, want 100", tracer.flushes)
++	}
++	if tracer.active != 0 {
++		t.Fatalf("trace active spans: got %d, want 0", tracer.active)
++	}
++	if tracer.maxLive != 1 {
++		t.Fatalf("trace max live spans: got %d, want 1", tracer.maxLive)
++	}
++	if got := runtime.NumGoroutine(); got > startGoroutines+10 {
++		t.Fatalf("goroutines after cycles: got %d, want <= %d", got, startGoroutines+10)
++	}
++	if haveFDs {
++		if got, ok := countFDs(); ok && got > startFDs+4 {
++			t.Fatalf("fd count after cycles: got %d, want <= %d", got, startFDs+4)
++		}
++	}
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,24 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++
++
++set -euo pipefail
++
++cd /workspace/repo
++
++
++
++export GOPROXY=off
++export GOSUMDB=off
++export GOTOOLCHAIN=local
++export GOFLAGS="-modfile=/opt/stage4a_reflow/reflow.mod -mod=readonly"
++exec go test -v -count=1 ./usercase-test-coderl/...

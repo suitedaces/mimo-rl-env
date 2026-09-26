@@ -1,0 +1,224 @@
+diff --git a/dask/tests/test_tokenize.py b/dask/tests/test_tokenize.py
+index a7f6060bd..241f2c01b 100644
+--- a/dask/tests/test_tokenize.py
++++ b/dask/tests/test_tokenize.py
+@@ -3,6 +3,7 @@ from __future__ import annotations
+ import dataclasses
+ import datetime
+ import decimal
++import os
+ import operator
+ import pathlib
+ import pickle
+@@ -10,6 +11,7 @@ import random
+ import subprocess
+ import sys
+ import textwrap
++import uuid
+ from enum import Enum, Flag, IntEnum, IntFlag
+ from typing import Union
+ 
+@@ -229,8 +231,7 @@ def test_tokenize_numpy_memmap():
+         z = check_tokenize(np.load(fn, mmap_mode="r"))
+ 
+     assert check_tokenize(x1) == check_tokenize(x2)
+-    # Memory maps should behave similar to ordinary arrays
+-    assert y == z
++    assert y != z
+ 
+     with tmpfile(".npy") as fn:
+         x = np.random.normal(size=(10, 10))
+@@ -246,6 +247,139 @@ def test_tokenize_numpy_memmap():
+         assert check_tokenize(mm[1, :]) == check_tokenize(mm2[1, :])
+ 
+ 
++class GuardedMemmap(np.memmap):
++    def __array__(self, dtype=None, copy=None):
++        raise AssertionError("tokenization attempted to materialize the memmap")
++
++    def __reduce__(self):
++        raise AssertionError("tokenization attempted to pickle the memmap")
++
++    def __reduce_ex__(self, protocol):
++        raise AssertionError("tokenization attempted to pickle the memmap")
++
++    def tobytes(self, *args, **kwargs):
++        raise AssertionError("tokenization attempted to read the full memmap")
++
++    def __iter__(self):
++        raise AssertionError("tokenization attempted to iterate over the memmap")
++
++
++def test_tokenize_memmap_does_not_hash_contents(tmp_path):
++    from dask.base import tokenize
++
++    path = tmp_path / "large.dat"
++    data = np.arange(4096, dtype=np.int64)
++    data.tofile(os.fspath(path))
++    mm = np.memmap(path, dtype=data.dtype, mode="r", shape=data.shape)
++
++    token = tokenize(mm)
++
++    assert token == tokenize(mm)
++
++
++def test_tokenize_writable_memmap_does_not_use_object_fallback(tmp_path):
++    from dask.base import tokenize
++
++    path = tmp_path / "writable.dat"
++    data = np.arange(32, dtype=np.int64)
++    data.tofile(os.fspath(path))
++    mm = np.memmap(path, dtype=data.dtype, mode="r+", shape=data.shape).view(
++        GuardedMemmap
++    )
++
++    token = tokenize(mm)
++
++    assert token == tokenize(mm)
++
++
++def test_tokenize_larger_memmap_does_not_use_object_fallback(tmp_path):
++    from dask.base import tokenize
++
++    path = tmp_path / "larger.dat"
++    data = np.arange(8192, dtype=np.int64)
++    data.tofile(os.fspath(path))
++    mm = np.memmap(path, dtype=data.dtype, mode="r", shape=data.shape)
++
++    token = tokenize(mm)
++
++    assert token == tokenize(mm)
++
++
++def test_tokenize_non_tmp_memmap_does_not_use_object_fallback(tmp_path):
++    from dask.base import tokenize
++
++    path = tmp_path / f"{uuid.uuid4().hex}.dat"
++    np.arange(64, dtype=np.int64).tofile(os.fspath(path))
++    mm = np.memmap(path, dtype=np.int64, mode="r", shape=(64,)).view(GuardedMemmap)
++
++    token = tokenize(mm)
++
++    assert token == tokenize(mm)
++
++
++def test_from_array_memmap_graph_build_does_not_materialize_contents(
++    tmp_path
++):
++    import dask.array as da
++
++    path = tmp_path / "array.dat"
++    data = np.arange(4096, dtype=np.int64).reshape(512, 8)
++    data.tofile(os.fspath(path))
++    mm = np.memmap(path, dtype=data.dtype, mode="r", shape=data.shape)
++
++    arr = da.from_array(mm, chunks=(128, 8))
++
++    assert arr.shape == mm.shape
++    assert arr.chunks == ((128, 128, 128, 128), (8,))
++
++
++def test_memmap_token_uses_backing_metadata_and_is_stable(tmp_path):
++    from dask.base import tokenize
++
++    path = tmp_path / "stable.npy"
++    data = np.arange(32, dtype=np.int64)
++    np.save(path, data)
++
++    first = np.load(path, mmap_mode="r")
++    second = np.load(path, mmap_mode="r")
++
++    assert tokenize(first) == tokenize(second)
++
++    before = tokenize(first)
++    os.utime(path, (2_000_000_000, 2_000_000_000))
++    after = tokenize(np.load(path, mmap_mode="r"))
++
++    assert before != after
++
++
++def test_memmap_token_distinguishes_views_or_offsets(tmp_path):
++    from dask.base import tokenize
++
++    path = tmp_path / "offsets.dat"
++    np.zeros(32, dtype=np.uint8).tofile(os.fspath(path))
++
++    first = np.memmap(path, dtype=np.uint8, mode="r", offset=0, shape=(8,))
++    same_first = np.memmap(path, dtype=np.uint8, mode="r", offset=0, shape=(8,))
++    shifted = np.memmap(path, dtype=np.uint8, mode="r", offset=8, shape=(8,))
++
++    assert tokenize(first) == tokenize(same_first)
++    assert tokenize(first) != tokenize(shifted)
++
++
++def test_memmap_token_distinguishes_dtype_metadata(tmp_path):
++    from dask.base import tokenize
++
++    path = tmp_path / "dtype.dat"
++    np.zeros(16, dtype=np.uint8).tofile(os.fspath(path))
++
++    unsigned = np.memmap(path, dtype=np.uint8, mode="r", shape=(8,))
++    signed = np.memmap(path, dtype=np.int8, mode="r", shape=(8,))
++
++    assert unsigned.shape == signed.shape
++    assert unsigned.strides == signed.strides
++    assert tokenize(unsigned) != tokenize(signed)
++
++
+ @pytest.mark.skipif("not np")
+ def test_tokenize_numpy_memmap_no_filename():
+     # GH 1562:
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,49 @@
++#!/bin/bash
++set -uo pipefail
++cd /testbed
++
++if [ ! -x /testbed/.build_env/.venv/bin/python ]; then
++  rm -rf /testbed/.build_env/.venv
++  python3 -m venv /testbed/.build_env/.venv
++fi
++
++set +u
++source /testbed/.build_env/.venv/bin/activate
++set -u
++
++python -m pip install -U pip setuptools wheel
++python -m pip install \
++  "numpy<2.0" \
++  "pandas<2.3" \
++  "dask-expr==1.1.2" \
++  "pyarrow>=14" \
++  pytest \
++  pytest-cov \
++  pytest-rerunfailures \
++  pytest-timeout \
++  pytest-xdist
++python -m pip install -e ".[array]"
++
++case "${1:-}" in
++  base)
++    python -m pytest -q \
++      dask/tests/test_tokenize.py::test_tokenize_numpy_array_consistent_on_values \
++      dask/tests/test_tokenize.py::test_tokenize_numpy_memmap_offset
++    ;;
++  new)
++    python -m pytest -q \
++      dask/tests/test_tokenize.py::test_tokenize_numpy_memmap \
++      dask/tests/test_tokenize.py::test_tokenize_memmap_does_not_hash_contents \
++      dask/tests/test_tokenize.py::test_tokenize_writable_memmap_does_not_use_object_fallback \
++      dask/tests/test_tokenize.py::test_tokenize_larger_memmap_does_not_use_object_fallback \
++      dask/tests/test_tokenize.py::test_tokenize_non_tmp_memmap_does_not_use_object_fallback \
++      dask/tests/test_tokenize.py::test_from_array_memmap_graph_build_does_not_materialize_contents \
++      dask/tests/test_tokenize.py::test_memmap_token_uses_backing_metadata_and_is_stable \
++      dask/tests/test_tokenize.py::test_memmap_token_distinguishes_views_or_offsets \
++      dask/tests/test_tokenize.py::test_memmap_token_distinguishes_dtype_metadata
++    ;;
++  *)
++    echo "usage: $0 base|new"
++    exit 2
++    ;;
++esac

@@ -1,0 +1,381 @@
+diff --git a/environment_values_template_test.go b/environment_values_template_test.go
+new file mode 100644
+index 0000000..aca9b01
+--- /dev/null
++++ b/environment_values_template_test.go
+@@ -0,0 +1,345 @@
++package main
++
++import (
++	"fmt"
++	"io/ioutil"
++	"os"
++	"path/filepath"
++	"reflect"
++	"sort"
++	"strings"
++	"testing"
++
++	"github.com/roboll/helmfile/helmexec"
++	"github.com/roboll/helmfile/state"
++)
++
++func writeTestFile(t *testing.T, filename string, content string) {
++	t.Helper()
++	if err := os.MkdirAll(filepath.Dir(filename), 0755); err != nil {
++		t.Fatalf("failed to create parent directory for %s: %v", filename, err)
++	}
++	if err := ioutil.WriteFile(filename, []byte(content), 0644); err != nil {
++		t.Fatalf("failed to write %s: %v", filename, err)
++	}
++}
++
++func loadRenderedState(t *testing.T, filename string, env string) (*state.HelmState, error) {
++	t.Helper()
++
++	a := &app{
++		logger:            helmexec.NewLogger(os.Stderr, "debug"),
++		readFile:          ioutil.ReadFile,
++		glob:              filepath.Glob,
++		abs:               filepath.Abs,
++		fileExistsAt:      fileExistsAt,
++		directoryExistsAt: directoryExistsAt,
++	}
++
++	var rendered *state.HelmState
++	err := a.FindAndIterateOverDesiredStates(
++		filename,
++		func(st *state.HelmState, _ helmexec.Interface) []error {
++			rendered = st
++			return nil
++		},
++		"",
++		nil,
++		env,
++	)
++	if err != nil {
++		return nil, err
++	}
++	if rendered == nil {
++		return nil, fmt.Errorf("helmfile %s was not loaded", filename)
++	}
++	return rendered, nil
++}
++
++func releaseNames(st *state.HelmState) []string {
++	names := make([]string, 0, len(st.Releases))
++	for _, r := range st.Releases {
++		names = append(names, r.Name)
++	}
++	sort.Strings(names)
++	return names
++}
++
++func firstReleaseValueStrings(st *state.HelmState) []string {
++	if len(st.Releases) == 0 {
++		return nil
++	}
++
++	values := make([]string, 0, len(st.Releases[0].Values))
++	for _, v := range st.Releases[0].Values {
++		values = append(values, fmt.Sprint(v))
++	}
++	sort.Strings(values)
++	return values
++}
++
++func TestEnvironmentValuesAvailableInReleaseNameConditionalAndValuesPath(t *testing.T) {
++	dir, err := ioutil.TempDir("", "helmfile-env-values-")
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer os.RemoveAll(dir)
++
++	writeTestFile(t, filepath.Join(dir, "env", "default.yaml"), `
++releaseName: alpha42
++enableExtra: "yes"
++valuesFile: blue
++`)
++	writeTestFile(t, filepath.Join(dir, "values", "blue.yaml"), "color: blue\n")
++	helmfile := filepath.Join(dir, "helmfile.yaml")
++	writeTestFile(t, helmfile, `
++environments:
++  default:
++    values:
++    - env/default.yaml
++
++releases:
++- name: svc-{{ .Environment.Values.releaseName }}
++  chart: stable/example
++  values:
++  - values/{{ .Environment.Values.valuesFile }}.yaml
++{{ if eq .Environment.Values.enableExtra "yes" }}
++- name: extra-{{ .Environment.Values.releaseName }}
++  chart: stable/example
++{{ end }}
++`)
++
++	st, err := loadRenderedState(t, helmfile, "default")
++	if err != nil {
++		t.Fatalf("unexpected error loading helmfile: %v", err)
++	}
++
++	if got, want := releaseNames(st), []string{"extra-alpha42", "svc-alpha42"}; !reflect.DeepEqual(got, want) {
++		t.Fatalf("unexpected release names: got=%v want=%v", got, want)
++	}
++
++	if got, want := firstReleaseValueStrings(st), []string{"values/blue.yaml"}; !reflect.DeepEqual(got, want) {
++		t.Fatalf("unexpected rendered values paths for first release: got=%v want=%v", got, want)
++	}
++}
++
++func TestEnvironmentSelectionChangesRenderedReleasesAndValuesPath(t *testing.T) {
++	dir, err := ioutil.TempDir("", "helmfile-env-switch-")
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer os.RemoveAll(dir)
++
++	writeTestFile(t, filepath.Join(dir, "env", "default.yaml"), `
++releaseName: local17
++tier: sandbox
++valuesFile: red
++`)
++	writeTestFile(t, filepath.Join(dir, "env", "production.yaml"), `
++releaseName: release99
++tier: live
++valuesFile: green
++`)
++	writeTestFile(t, filepath.Join(dir, "values", "red.yaml"), "color: red\n")
++	writeTestFile(t, filepath.Join(dir, "values", "green.yaml"), "color: green\n")
++
++	helmfile := filepath.Join(dir, "helmfile.yaml")
++	writeTestFile(t, helmfile, `
++environments:
++  default:
++    values:
++    - env/default.yaml
++  production:
++    values:
++    - env/production.yaml
++
++releases:
++- name: app-{{ .Environment.Values.releaseName }}
++  chart: stable/example
++  values:
++  - values/{{ .Environment.Values.valuesFile }}.yaml
++{{ if eq .Environment.Values.tier "live" }}
++- name: prod-only-release
++  chart: stable/example
++{{ end }}
++`)
++
++	defaultState, err := loadRenderedState(t, helmfile, "default")
++	if err != nil {
++		t.Fatalf("unexpected error loading default environment: %v", err)
++	}
++	productionState, err := loadRenderedState(t, helmfile, "production")
++	if err != nil {
++		t.Fatalf("unexpected error loading production environment: %v", err)
++	}
++
++	if got, want := releaseNames(defaultState), []string{"app-local17"}; !reflect.DeepEqual(got, want) {
++		t.Fatalf("unexpected default release names: got=%v want=%v", got, want)
++	}
++	if got, want := firstReleaseValueStrings(defaultState), []string{"values/red.yaml"}; !reflect.DeepEqual(got, want) {
++		t.Fatalf("unexpected default values paths: got=%v want=%v", got, want)
++	}
++
++	if got, want := releaseNames(productionState), []string{"app-release99", "prod-only-release"}; !reflect.DeepEqual(got, want) {
++		t.Fatalf("unexpected production release names: got=%v want=%v", got, want)
++	}
++	if got, want := firstReleaseValueStrings(productionState), []string{"values/green.yaml"}; !reflect.DeepEqual(got, want) {
++		t.Fatalf("unexpected production values paths: got=%v want=%v", got, want)
++	}
++}
++
++func TestRenderingDefersErrorsUntilEnvironmentValuesAreAvailable(t *testing.T) {
++	dir, err := ioutil.TempDir("", "helmfile-env-deferred-")
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer os.RemoveAll(dir)
++
++	writeTestFile(t, filepath.Join(dir, "env", "default.yaml"), `
++suffix: omega9
++includeGate: "true"
++`)
++	helmfile := filepath.Join(dir, "helmfile.yaml")
++	writeTestFile(t, helmfile, `
++environments:
++  default:
++    values:
++    - env/default.yaml
++
++releases:
++{{ if eq .Environment.Values.includeGate "true" }}
++- name: gated-{{ .Environment.Values.suffix }}
++  chart: stable/example
++{{ end }}
++`)
++
++	st, err := loadRenderedState(t, helmfile, "default")
++	if err != nil {
++		t.Fatalf("helmfile should render after environment values are available: %v", err)
++	}
++
++	if got, want := releaseNames(st), []string{"gated-omega9"}; !reflect.DeepEqual(got, want) {
++		t.Fatalf("unexpected release names after deferred rendering: got=%v want=%v", got, want)
++	}
++}
++
++func TestProductionEnvironmentUsesArbitraryConfiguredValues(t *testing.T) {
++	dir, err := ioutil.TempDir("", "helmfile-env-arbitrary-prod-")
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer os.RemoveAll(dir)
++
++	writeTestFile(t, filepath.Join(dir, "env", "default.yaml"), `
++releaseName: local31
++tier: sandbox
++valuesFile: silver
++`)
++	writeTestFile(t, filepath.Join(dir, "env", "production.yaml"), `
++releaseName: release123
++tier: live
++valuesFile: violet
++`)
++	writeTestFile(t, filepath.Join(dir, "values", "silver.yaml"), "color: silver\n")
++	writeTestFile(t, filepath.Join(dir, "values", "violet.yaml"), "color: violet\n")
++
++	helmfile := filepath.Join(dir, "helmfile.yaml")
++	writeTestFile(t, helmfile, `
++environments:
++  default:
++    values:
++    - env/default.yaml
++  production:
++    values:
++    - env/production.yaml
++
++releases:
++- name: arbitrary-{{ .Environment.Values.releaseName }}
++  chart: stable/example
++  values:
++  - values/{{ .Environment.Values.valuesFile }}.yaml
++{{ if eq .Environment.Values.tier "live" }}
++- name: arbitrary-prod-gate-{{ .Environment.Values.releaseName }}
++  chart: stable/example
++{{ end }}
++`)
++
++	productionState, err := loadRenderedState(t, helmfile, "production")
++	if err != nil {
++		t.Fatalf("unexpected error loading production environment: %v", err)
++	}
++
++	if got, want := releaseNames(productionState), []string{"arbitrary-prod-gate-release123", "arbitrary-release123"}; !reflect.DeepEqual(got, want) {
++		t.Fatalf("unexpected arbitrary production release names: got=%v want=%v", got, want)
++	}
++	if got, want := firstReleaseValueStrings(productionState), []string{"values/violet.yaml"}; !reflect.DeepEqual(got, want) {
++		t.Fatalf("unexpected arbitrary production values paths: got=%v want=%v", got, want)
++	}
++}
++
++func TestFirstPassCanRecoverEnvironmentAfterLaterUnresolvedTemplate(t *testing.T) {
++	dir, err := ioutil.TempDir("", "helmfile-env-partial-")
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer os.RemoveAll(dir)
++
++	writeTestFile(t, filepath.Join(dir, "env", "default.yaml"), `
++suffix: theta77
++includeGate: "true"
++`)
++	helmfile := filepath.Join(dir, "helmfile.yaml")
++	writeTestFile(t, helmfile, `
++environments:
++  default:
++    values:
++    - env/default.yaml
++
++{{ if eq .Environment.Values.includeGate "true" }}
++releases:
++- name: partial-{{ .Environment.Values.suffix }}
++  chart: stable/example
++  labels:
++    recovered: {{ .Environment.Values.suffix }}
++{{ end }}
++`)
++
++	st, err := loadRenderedState(t, helmfile, "default")
++	if err != nil {
++		t.Fatalf("helmfile should render after recovering environment from partial first pass: %v", err)
++	}
++	if got, want := releaseNames(st), []string{"partial-theta77"}; !reflect.DeepEqual(got, want) {
++		t.Fatalf("unexpected release names after partial first pass recovery: got=%v want=%v", got, want)
++	}
++}
++
++func TestFinalTemplateErrorIncludesHelmfileNameAndUnderlyingError(t *testing.T) {
++	dir, err := ioutil.TempDir("", "helmfile-env-error-")
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer os.RemoveAll(dir)
++
++	helmfile := filepath.Join(dir, "helmfile.yaml")
++	writeTestFile(t, helmfile, `
++environments:
++  default:
++    values: []
++
++releases:
++- name: broken-{{ .Environment.Values.definitelyMissingKey }}
++  chart: stable/example
++`)
++
++	_, err = loadRenderedState(t, helmfile, "default")
++	if err == nil {
++		t.Fatal("expected template rendering to fail")
++	}
++
++	msg := err.Error()
++	for _, want := range []string{helmfile, "definitelyMissingKey"} {
++		if !strings.Contains(msg, want) {
++			t.Fatalf("expected error %q to contain %q", msg, want)
++		}
++	}
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,25 @@
++#!/bin/bash
++set -uo pipefail
++cd /testbed
++
++
++
++mkdir -p /root/go/src/github.com/roboll
++ln -sf /testbed /root/go/src/github.com/roboll/helmfile
++
++
++export GO111MODULE=off
++
++
++case "${1:-}" in
++  base)
++    go test -v -count=1 github.com/roboll/helmfile -skip 'TestEnvironmentValuesAvailableInReleaseNameConditionalAndValuesPath|TestEnvironmentSelectionChangesRenderedReleasesAndValuesPath|TestRenderingDefersErrorsUntilEnvironmentValuesAreAvailable|TestProductionEnvironmentUsesArbitraryConfiguredValues|TestFirstPassCanRecoverEnvironmentAfterLaterUnresolvedTemplate|TestFinalTemplateErrorIncludesHelmfileNameAndUnderlyingError'
++    ;;
++  new)
++    go test -v -count=1 github.com/roboll/helmfile -run 'TestEnvironmentValuesAvailableInReleaseNameConditionalAndValuesPath|TestEnvironmentSelectionChangesRenderedReleasesAndValuesPath|TestRenderingDefersErrorsUntilEnvironmentValuesAreAvailable|TestProductionEnvironmentUsesArbitraryConfiguredValues|TestFirstPassCanRecoverEnvironmentAfterLaterUnresolvedTemplate|TestFinalTemplateErrorIncludesHelmfileNameAndUnderlyingError'
++    ;;
++  *)
++    echo "usage: $0 base|new"
++    exit 2
++    ;;
++esac

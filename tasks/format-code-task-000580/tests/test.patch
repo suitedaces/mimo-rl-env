@@ -1,0 +1,523 @@
+diff --git a/usercase-test-coderl/test_dynamodb_high_level_resource.py b/usercase-test-coderl/test_dynamodb_high_level_resource.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/test_dynamodb_high_level_resource.py
+@@ -0,0 +1,486 @@
++import gc
++import json
++import os
++import tempfile
++from decimal import Decimal
++
++import boto3
++import pytest
++from boto3.docs.service import ServiceDocumenter
++from boto3.dynamodb.conditions import Attr, Key
++from boto3.exceptions import DynamoDBNeedsKeyConditionError
++from botocore.stub import Stubber
++
++
++os.environ.setdefault("AWS_ACCESS_KEY_ID", "fixture-test")
++os.environ.setdefault("AWS_SECRET_ACCESS_KEY", "fixture-test")
++os.environ.setdefault("AWS_EC2_METADATA_DISABLED", "true")
++
++
++class LateRequestRecorder:
++    def __init__(self, client):
++        self.bodies = []
++        client.meta.events.register_first("before-call.*.*", self.record)
++
++    def record(self, event_name, params, **kwargs):
++        body = params.get("body", b"")
++        if isinstance(body, bytes):
++            body = body.decode("utf-8")
++        self.bodies.append(json.loads(body) if body else {})
++
++
++def make_table(name="Users"):
++    session = boto3.Session(region_name="us-east-1")
++    dynamodb = session.resource("dynamodb")
++    return dynamodb.Table(name)
++
++
++def placeholders_for(mapping, expected_value):
++    return {key for key, value in mapping.items() if value == expected_value}
++
++
++def assert_placeholder_expression(
++    body,
++    *,
++    table_name,
++    key_attr,
++    key_wire_value,
++    filter_attr=None,
++    filter_wire_value=None,
++    caller_names=None,
++    caller_values=None,
++):
++
++
++
++    assert body["TableName"] == table_name
++    names = body["ExpressionAttributeNames"]
++    values = body["ExpressionAttributeValues"]
++    caller_names = caller_names or {}
++    caller_values = caller_values or {}
++
++    for placeholder, name in caller_names.items():
++        assert names[placeholder] == name
++    for placeholder, value in caller_values.items():
++        assert values[placeholder] == value
++
++    key_expression = body["KeyConditionExpression"]
++    assert isinstance(key_expression, str)
++    assert "=" in key_expression
++    key_name_placeholders = placeholders_for(names, key_attr)
++    key_value_placeholders = placeholders_for(values, key_wire_value)
++    assert key_name_placeholders
++    assert key_value_placeholders
++    assert any(placeholder in key_expression for placeholder in key_name_placeholders)
++    assert any(placeholder in key_expression for placeholder in key_value_placeholders)
++
++    if filter_attr is not None:
++        filter_expression = body["FilterExpression"]
++        assert isinstance(filter_expression, str)
++        assert ">=" in filter_expression
++        filter_name_placeholders = placeholders_for(names, filter_attr)
++        filter_value_placeholders = placeholders_for(values, filter_wire_value)
++        assert filter_name_placeholders
++        assert filter_value_placeholders
++        assert any(
++            placeholder in filter_expression
++            for placeholder in filter_name_placeholders
++        )
++        assert any(
++            placeholder in filter_expression
++            for placeholder in filter_value_placeholders
++        )
++
++
++def assert_doc_section_mentions(content, section_name, required_text):
++    indexes = [
++        index
++        for index in range(len(content))
++        if content.startswith(section_name, index)
++    ]
++    assert indexes
++    assert any(required_text in content[index : index + 1200] for index in indexes)
++
++
++def test_put_item_serializes_python_values_and_preserves_input():
++
++
++
++
++    table = make_table()
++    recorder = LateRequestRecorder(table.meta.client)
++    item = {
++        "pk": "u#1",
++        "age": 42,
++        "active": True,
++        "tags": {"admin"},
++        "profile": {"name": "Ada"},
++        "scores": [1, 2],
++        "empty": None,
++    }
++
++    with Stubber(table.meta.client) as stubber:
++        stubber.add_response(
++            "put_item",
++            {},
++            expected_params={"TableName": "Users", "Item": item},
++        )
++        response = table.put_item(Item=item)
++
++    assert response == {}
++    assert recorder.bodies == [
++        {
++            "TableName": "Users",
++            "Item": {
++                "pk": {"S": "u#1"},
++                "age": {"N": "42"},
++                "active": {"BOOL": True},
++                "tags": {"SS": ["admin"]},
++                "profile": {"M": {"name": {"S": "Ada"}}},
++                "scores": {"L": [{"N": "1"}, {"N": "2"}]},
++                "empty": {"NULL": True},
++            },
++        }
++    ]
++    assert item == {
++        "pk": "u#1",
++        "age": 42,
++        "active": True,
++        "tags": {"admin"},
++        "profile": {"name": "Ada"},
++        "scores": [1, 2],
++        "empty": None,
++    }
++
++
++def test_get_item_deserializes_attribute_value_response():
++
++
++
++
++    table = make_table()
++
++    with Stubber(table.meta.client) as stubber:
++        stubber.add_response(
++            "get_item",
++            {
++                "Item": {
++                    "pk": {"S": "u#1"},
++                    "age": {"N": "42"},
++                    "active": {"BOOL": True},
++                    "empty": {"NULL": True},
++                }
++            },
++            expected_params={"TableName": "Users", "Key": {"pk": "u#1"}},
++        )
++        response = table.get_item(Key={"pk": "u#1"})
++
++    assert response == {
++        "Item": {
++            "pk": "u#1",
++            "age": Decimal("42"),
++            "active": True,
++            "empty": None,
++        }
++    }
++
++
++def test_query_accepts_condition_objects_and_merges_placeholders():
++
++
++
++
++    table = make_table()
++    recorder = LateRequestRecorder(table.meta.client)
++
++    with Stubber(table.meta.client) as stubber:
++        stubber.add_response(
++            "query",
++            {
++                "Items": [{"pk": {"S": "u#1"}, "age": {"N": "42"}}],
++                "Count": 1,
++                "ScannedCount": 1,
++            },
++            expected_params={
++                "TableName": "Users",
++                "KeyConditionExpression": Key("pk").eq("u#1"),
++                "FilterExpression": Attr("age").gte(21),
++                "ExpressionAttributeNames": {"#caller": "caller_supplied"},
++                "ExpressionAttributeValues": {":caller": "kept"},
++            },
++        )
++        response = table.query(
++            KeyConditionExpression=Key("pk").eq("u#1"),
++            FilterExpression=Attr("age").gte(21),
++            ExpressionAttributeNames={"#caller": "caller_supplied"},
++            ExpressionAttributeValues={":caller": "kept"},
++        )
++
++    assert response == {
++        "Items": [{"pk": "u#1", "age": Decimal("42")}],
++        "Count": 1,
++        "ScannedCount": 1,
++    }
++    assert len(recorder.bodies) == 1
++    assert_placeholder_expression(
++        recorder.bodies[0],
++        table_name="Users",
++        key_attr="pk",
++        key_wire_value={"S": "u#1"},
++        filter_attr="age",
++        filter_wire_value={"N": "21"},
++        caller_names={"#caller": "caller_supplied"},
++        caller_values={":caller": {"S": "kept"}},
++    )
++
++
++def test_attr_in_key_condition_raises_specific_validation_error():
++
++
++
++
++    table = make_table()
++
++    with Stubber(table.meta.client) as stubber:
++        stubber.add_response("query", {"Items": []})
++        with pytest.raises(DynamoDBNeedsKeyConditionError) as excinfo:
++            table.query(KeyConditionExpression=Attr("pk").eq("u#1"))
++
++
++
++    assert isinstance(excinfo.value, DynamoDBNeedsKeyConditionError)
++
++
++def test_repeated_item_object_is_copied_before_serialization():
++
++
++
++
++    table = make_table()
++    recorder = LateRequestRecorder(table.meta.client)
++    used_twice = {"pk": "u#2", "profile": {"name": "Grace"}}
++
++    with Stubber(table.meta.client) as stubber:
++        stubber.add_response(
++            "batch_write_item",
++            {"UnprocessedItems": {}},
++            expected_params={
++                "RequestItems": {
++                    "Users": [
++                        {"PutRequest": {"Item": used_twice}},
++                        {"PutRequest": {"Item": used_twice}},
++                    ]
++                }
++            },
++        )
++        batch = table.batch_writer()
++        batch.put_item(Item=used_twice)
++        batch.put_item(Item=used_twice)
++        batch._flush()
++
++    assert recorder.bodies == [
++        {
++            "RequestItems": {
++                "Users": [
++                    {
++                        "PutRequest": {
++                            "Item": {
++                                "pk": {"S": "u#2"},
++                                "profile": {
++                                    "M": {"name": {"S": "Grace"}}
++                                },
++                            }
++                        }
++                    },
++                    {
++                        "PutRequest": {
++                            "Item": {
++                                "pk": {"S": "u#2"},
++                                "profile": {
++                                    "M": {"name": {"S": "Grace"}}
++                                },
++                            }
++                        }
++                    },
++                ]
++            }
++        }
++    ]
++    assert used_twice == {"pk": "u#2", "profile": {"name": "Grace"}}
++
++
++def test_no_output_shape_operation_completes_without_response_conversion():
++
++
++
++
++    table = make_table()
++    arn = "arn:aws:dynamodb:us-east-1:123456789012:table/Users"
++
++    with Stubber(table.meta.client) as stubber:
++        stubber.add_response("tag_resource", {})
++        response = table.meta.client.tag_resource(
++            ResourceArn=arn, Tags=[{"Key": "project", "Value": "val"}]
++        )
++
++    assert response == {}
++
++
++def test_generated_documentation_describes_python_values_and_conditions():
++
++
++
++
++    with tempfile.TemporaryDirectory() as docs_root:
++        root_services_path = os.path.join(docs_root, "reference", "services")
++        ServiceDocumenter(
++            "dynamodb",
++            session=boto3.Session(region_name="us-east-1"),
++            root_docs_path=root_services_path,
++        ).document_service()
++
++        with open(
++            os.path.join(root_services_path, "dynamodb", "table", "put_item.rst"),
++            encoding="utf-8",
++        ) as f:
++            put_item_content = f.read()
++        with open(
++            os.path.join(root_services_path, "dynamodb", "table", "query.rst"),
++            encoding="utf-8",
++        ) as f:
++            query_content = f.read()
++
++
++
++
++    put_item_lower = put_item_content.lower()
++    assert "valid dynamodb type" in put_item_lower
++    assert "true" in put_item_lower
++    assert "none" in put_item_lower
++    assert "set([" in put_item_content
++    assert_doc_section_mentions(query_content, "FilterExpression", "Attr(")
++    assert_doc_section_mentions(query_content, "KeyConditionExpression", "Key(")
++
++
++def test_two_resource_instances_keep_condition_builder_state_independent():
++
++
++
++
++    table_a = make_table("UsersA")
++    table_b = make_table("UsersB")
++    recorder_a = LateRequestRecorder(table_a.meta.client)
++    recorder_b = LateRequestRecorder(table_b.meta.client)
++
++    with Stubber(table_a.meta.client) as stubber_a:
++        stubber_a.add_response(
++            "query",
++            {"Items": [], "Count": 0, "ScannedCount": 0},
++            expected_params={
++                "TableName": "UsersA",
++                "KeyConditionExpression": Key("pk").eq("a#1"),
++                "FilterExpression": Attr("age").gte(30),
++            },
++        )
++        response_a = table_a.query(
++            KeyConditionExpression=Key("pk").eq("a#1"),
++            FilterExpression=Attr("age").gte(30),
++        )
++
++    with Stubber(table_b.meta.client) as stubber_b:
++        stubber_b.add_response(
++            "query",
++            {"Items": [], "Count": 0, "ScannedCount": 0},
++            expected_params={
++                "TableName": "UsersB",
++                "KeyConditionExpression": Key("pk").eq("b#1"),
++                "FilterExpression": Attr("age").gte(40),
++            },
++        )
++        response_b = table_b.query(
++            KeyConditionExpression=Key("pk").eq("b#1"),
++            FilterExpression=Attr("age").gte(40),
++        )
++
++    assert response_a == {"Items": [], "Count": 0, "ScannedCount": 0}
++    assert response_b == {"Items": [], "Count": 0, "ScannedCount": 0}
++    assert len(recorder_a.bodies) == 1
++    assert len(recorder_b.bodies) == 1
++    assert_placeholder_expression(
++        recorder_a.bodies[0],
++        table_name="UsersA",
++        key_attr="pk",
++        key_wire_value={"S": "a#1"},
++        filter_attr="age",
++        filter_wire_value={"N": "30"},
++    )
++    assert_placeholder_expression(
++        recorder_b.bodies[0],
++        table_name="UsersB",
++        key_attr="pk",
++        key_wire_value={"S": "b#1"},
++        filter_attr="age",
++        filter_wire_value={"N": "40"},
++    )
++
++
++def test_resource_session_has_high_level_interface_for_generated_table_method():
++
++
++
++
++    table = make_table()
++    recorder = LateRequestRecorder(table.meta.client)
++
++    with Stubber(table.meta.client) as stubber:
++        stubber.add_response(
++            "put_item",
++            {},
++            expected_params={"TableName": "Users", "Item": {"pk": "u#close"}},
++        )
++        response = table.put_item(Item={"pk": "u#close"})
++
++
++
++    assert response == {}
++    assert recorder.bodies == [
++        {"TableName": "Users", "Item": {"pk": {"S": "u#close"}}}
++    ]
++
++
++def test_repeated_resource_cycles_apply_high_level_interface_each_time():
++
++
++
++
++
++    def cycle(index):
++        table = make_table(f"LeakUsers{index}")
++        recorder = LateRequestRecorder(table.meta.client)
++        with Stubber(table.meta.client) as stubber:
++            stubber.add_response(
++                "put_item",
++                {},
++                expected_params={
++                    "TableName": f"LeakUsers{index}",
++                    "Item": {"pk": f"u#{index}"},
++                },
++            )
++            response = table.put_item(Item={"pk": f"u#{index}"})
++        assert response == {}
++        assert recorder.bodies == [
++            {
++                "TableName": f"LeakUsers{index}",
++                "Item": {"pk": {"S": f"u#{index}"}},
++            }
++        ]
++
++    for warmup_index in range(5):
++        cycle(warmup_index)
++
++
++
++    for index in range(10):
++        cycle(index)
++        if index % 10 == 0:
++            gc.collect()
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,27 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++
++cd /workspace/repo
++
++
++
++
++export PIP_NO_INDEX=1
++export PIP_DISABLE_PIP_VERSION_CHECK=1
++export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
++
++export AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-fixture-test}"
++export AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-fixture-test}"
++export AWS_EC2_METADATA_DISABLED="${AWS_EC2_METADATA_DISABLED:-true}"
++
++exec python -m pytest /workspace/repo/usercase-test-coderl/test_dynamodb_high_level_resource.py -v

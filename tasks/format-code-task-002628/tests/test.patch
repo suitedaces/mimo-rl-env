@@ -1,0 +1,441 @@
+diff --git a/usercase-test-coderl/test_embedding_rerankers.py b/usercase-test-coderl/test_embedding_rerankers.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/test_embedding_rerankers.py
+@@ -0,0 +1,412 @@
++
++
++
++
++
++
++
++
++from __future__ import annotations
++
++import json
++import threading
++import warnings
++from contextlib import contextmanager
++from http.server import BaseHTTPRequestHandler, HTTPServer
++
++import pytest
++import requests
++import torch
++
++from opendeepsearch.ranking_models.base_reranker import BaseSemanticSearcher
++from opendeepsearch.ranking_models.infinity_rerank import InfinitySemanticSearcher
++from opendeepsearch.ranking_models.jina_reranker import JinaReranker
++
++
++class DeterministicSemanticSearcher(BaseSemanticSearcher):
++    def __init__(self, embeddings: dict[str, list[float]] | None = None):
++        self.embeddings = embeddings or {
++            "sky": [1.0, 0.0],
++            "engine": [0.0, 1.0],
++            "blue sky": [0.9, 0.1],
++            " blue sky ": [0.9, 0.1],
++            "car engine": [0.0, 1.0],
++            "cloud color": [0.7, 0.3],
++        }
++
++    def _get_embeddings(self, texts: list[str]) -> torch.Tensor:
++        return torch.tensor([self.embeddings[text] for text in texts], dtype=torch.float32)
++
++
++def assert_tensor(actual: torch.Tensor, expected: list[list[float]]) -> None:
++    torch.testing.assert_close(
++        actual,
++        torch.tensor(expected, dtype=torch.float32),
++        rtol=1e-6,
++        atol=1e-6,
++    )
++
++
++def header_value(headers: dict[str, str], name: str) -> str | None:
++    for key, value in headers.items():
++        if key.lower() == name.lower():
++            return value
++    return None
++
++
++@contextmanager
++def recording_embedding_server(prefix: str = ""):
++    calls: list[dict[str, object]] = []
++
++    class Handler(BaseHTTPRequestHandler):
++        def do_POST(self) -> None:
++            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
++            calls.append(body)
++            vectors = {
++                "sky": [1.0, 0.0],
++                "engine": [0.0, 1.0],
++                "blue sky": [0.9, 0.1],
++                "car engine": [0.0, 1.0],
++            }
++            embeddings = []
++            for text in body["input"]:
++                key = text[len(prefix) :] if prefix and text.startswith(prefix) else text
++                embeddings.append(vectors.get(key, [1.0, 0.0]))
++            payload = json.dumps(
++                {"data": [{"embedding": embedding} for embedding in embeddings]}
++            ).encode("utf-8")
++            self.send_response(200)
++            self.send_header("Content-Type", "application/json")
++            self.send_header("Content-Length", str(len(payload)))
++            self.end_headers()
++            self.wfile.write(payload)
++
++        def log_message(self, *_args: object) -> None:
++            return
++
++    server = HTTPServer(("127.0.0.1", 0), Handler)
++    thread = threading.Thread(target=server.serve_forever, daemon=True)
++    thread.start()
++    try:
++        yield f"http://127.0.0.1:{server.server_port}/embeddings", calls
++    finally:
++        server.shutdown()
++        server.server_close()
++        thread.join(timeout=2)
++
++
++def test_calculate_scores_normalization_modes_are_exact_dot_products():
++
++
++
++
++    searcher = DeterministicSemanticSearcher()
++    documents = ["blue sky", "car engine", "cloud color"]
++
++    assert_tensor(
++        searcher.calculate_scores(["sky", "engine"], documents, normalize="none"),
++        [
++            [0.8999999761581421, 0.0, 0.699999988079071],
++            [0.10000000149011612, 1.0, 0.30000001192092896],
++        ],
++    )
++    assert_tensor(
++        searcher.calculate_scores(["sky", "engine"], documents, normalize="scale"),
++        [
++            [90.0, 0.0, 70.0],
++            [10.0, 100.0, 30.000001907348633],
++        ],
++    )
++    assert_tensor(
++        searcher.calculate_scores(["sky", "engine"], documents, normalize="softmax"),
++        [
++            [0.44937750697135925, 0.18270325660705566, 0.3679192066192627],
++            [0.21362929046154022, 0.5254432559013367, 0.2609274089336395],
++        ],
++    )
++
++
++def test_rerank_single_and_multiple_queries_return_ranked_score_records():
++
++
++
++
++    searcher = DeterministicSemanticSearcher()
++    documents = ["blue sky", "car engine", "cloud color"]
++
++    single = searcher.rerank("sky", documents, top_k=2, normalize="none")
++    assert single == [
++        {"document": "blue sky", "score": pytest.approx(0.8999999761581421)},
++        {"document": "cloud color", "score": pytest.approx(0.699999988079071)},
++    ]
++
++    multiple = searcher.rerank(["sky", "engine"], documents, top_k=1, normalize="none")
++    assert multiple == [
++        [{"document": "blue sky", "score": pytest.approx(0.8999999761581421)}],
++        [{"document": "car engine", "score": pytest.approx(1.0)}],
++    ]
++
++
++def test_get_reranked_documents_strips_the_top_passage_text():
++
++
++
++
++    searcher = DeterministicSemanticSearcher()
++
++    assert (
++        searcher.get_reranked_documents(
++            "sky", [" blue sky ", "car engine"], top_k=1, normalize="none"
++        )
++        == "blue sky"
++    )
++
++
++def test_unknown_normalization_raises_specific_value_error():
++
++
++
++
++    searcher = DeterministicSemanticSearcher()
++
++    with pytest.raises(ValueError) as excinfo:
++        searcher.calculate_scores(["sky"], ["blue sky"], normalize="zscore")
++
++    assert "zscore" in str(excinfo.value)
++
++
++def test_infinity_posts_configured_payload_and_parses_embeddings():
++
++
++
++
++    prefix = "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery: "
++    with recording_embedding_server(prefix=prefix) as (endpoint, calls):
++        searcher = InfinitySemanticSearcher(
++            embedding_endpoint=endpoint,
++            model_name="model-a",
++            instruction_prefix=prefix,
++        )
++
++        scores = searcher.calculate_scores(
++            ["sky"], ["blue sky", "car engine"], normalize="none"
++        )
++
++    assert_tensor(scores, [[0.8999999761581421, 0.0]])
++
++    assert calls
++    assert all(call["model"] == "model-a" for call in calls)
++    observed_inputs = [text for call in calls for text in call["input"]]
++    assert sorted(observed_inputs) == sorted(
++        [prefix + "sky", prefix + "blue sky", prefix + "car engine"]
++    )
++
++
++def test_infinity_warns_and_truncates_embedding_batches_above_2048():
++
++
++
++
++    with recording_embedding_server(prefix="P:") as (endpoint, calls):
++        searcher = InfinitySemanticSearcher(
++            embedding_endpoint=endpoint,
++            model_name="model-a",
++            instruction_prefix="P:",
++        )
++        with warnings.catch_warnings(record=True) as caught:
++            warnings.simplefilter("always")
++            scores = searcher.calculate_scores(
++                ["sky"], [f"doc-{idx}" for idx in range(2050)], normalize="none"
++            )
++
++    assert tuple(scores.shape) == (1, 2048)
++
++    assert calls
++    assert max(len(call["input"]) for call in calls) == 2048
++    assert all(len(call["input"]) <= 2048 for call in calls)
++    assert any(isinstance(item.message, Warning) for item in caught)
++
++
++def test_infinity_instances_keep_independent_endpoint_and_model_state():
++
++
++
++
++    with recording_embedding_server(prefix="A:") as (endpoint_a, calls_a):
++        with recording_embedding_server(prefix="B:") as (endpoint_b, calls_b):
++            searcher_a = InfinitySemanticSearcher(
++                embedding_endpoint=endpoint_a,
++                model_name="model-a",
++                instruction_prefix="A:",
++            )
++            searcher_b = InfinitySemanticSearcher(
++                embedding_endpoint=endpoint_b,
++                model_name="model-b",
++                instruction_prefix="B:",
++            )
++
++            assert_tensor(
++                searcher_a.calculate_scores(["sky"], ["blue sky"], normalize="none"),
++                [[0.8999999761581421]],
++            )
++            assert_tensor(
++                searcher_b.calculate_scores(["engine"], ["car engine"], normalize="none"),
++                [[1.0]],
++            )
++
++
++    assert calls_a
++    assert all(call["model"] == "model-a" for call in calls_a)
++    assert sorted(text for call in calls_a for text in call["input"]) == [
++        "A:blue sky",
++        "A:sky",
++    ]
++    assert calls_b
++    assert all(call["model"] == "model-b" for call in calls_b)
++    assert sorted(text for call in calls_b for text in call["input"]) == [
++        "B:car engine",
++        "B:engine",
++    ]
++
++
++def test_jina_constructor_uses_env_api_key_and_rejects_missing_key(monkeypatch, tmp_path):
++
++
++
++
++    monkeypatch.setenv("JINA_API_KEY", "env-token")
++
++    calls = []
++
++    class Response:
++        def raise_for_status(self) -> None:
++            return
++
++        def json(self) -> dict[str, list[dict[str, list[float]]]]:
++            vectors = {
++                "sky": [1.0, 0.0],
++                "blue sky": [0.9, 0.1],
++            }
++            return {
++                "data": [
++                    {"embedding": vectors[text]} for text in calls[-1]["json"]["input"]
++                ]
++            }
++
++    def fake_post(
++        url: str,
++        headers: dict[str, str],
++        json: dict[str, object],
++        **_kwargs: object,
++    ) -> Response:
++        calls.append({"url": url, "headers": headers, "json": json})
++        return Response()
++
++    monkeypatch.setattr(requests, "post", fake_post)
++    from_env = JinaReranker()
++    scores = from_env.calculate_scores(["sky"], ["blue sky"], normalize="none")
++    assert_tensor(scores, [[0.8999999761581421]])
++
++    assert calls
++    assert all(call["url"] == "https://api.jina.ai/v1/embeddings" for call in calls)
++    assert all(header_value(call["headers"], "Authorization") == "Bearer env-token" for call in calls)
++    assert all(call["json"]["model"] == "jina-embeddings-v3" for call in calls)
++
++    monkeypatch.delenv("JINA_API_KEY", raising=False)
++    monkeypatch.chdir(tmp_path)
++
++    with pytest.raises(ValueError):
++        JinaReranker()
++
++
++def test_jina_posts_required_payload_and_returns_similarity_scores(monkeypatch):
++
++
++
++
++    calls = []
++
++    class Response:
++        def raise_for_status(self) -> None:
++            return
++
++        def json(self) -> dict[str, list[dict[str, list[float]]]]:
++            vectors = {
++                "sky": [1.0, 0.0],
++                "blue sky": [0.9, 0.1],
++                "car engine": [0.0, 1.0],
++            }
++            return {
++                "data": [
++                    {"embedding": vectors[text]} for text in calls[-1]["json"]["input"]
++                ]
++            }
++
++    def fake_post(
++        url: str,
++        headers: dict[str, str],
++        json: dict[str, object],
++        **_kwargs: object,
++    ) -> Response:
++        calls.append({"url": url, "headers": headers, "json": json})
++        return Response()
++
++    monkeypatch.setattr(requests, "post", fake_post)
++    searcher = JinaReranker(api_key="token-123", model="model-b")
++
++    scores = searcher.calculate_scores(["sky"], ["blue sky", "car engine"], normalize="none")
++
++    assert_tensor(scores, [[0.8999999761581421, 0.0]])
++
++    assert calls
++    observed_inputs = []
++    for call in calls:
++        assert call["url"] == "https://api.jina.ai/v1/embeddings"
++        assert header_value(call["headers"], "Authorization") == "Bearer token-123"
++        payload = call["json"]
++        assert payload["model"] == "model-b"
++        assert payload["task"] == "text-matching"
++        assert payload["late_chunking"] is False
++        assert payload["dimensions"] == 1024
++        assert payload["embedding_type"] == "float"
++        observed_inputs.extend(payload["input"])
++    assert sorted(observed_inputs) == ["blue sky", "car engine", "sky"]
++
++
++def test_jina_request_failure_surfaces_specific_runtime_error(monkeypatch):
++
++
++
++
++    searcher = JinaReranker(api_key="token-123")
++
++    def failing_post(*_args: object, **_kwargs: object) -> object:
++        raise requests.exceptions.ConnectionError("socket boom")
++
++    monkeypatch.setattr(requests, "post", failing_post)
++
++    with pytest.raises(RuntimeError) as excinfo:
++        searcher.calculate_scores(["sky"], ["blue sky"], normalize="none")
++
++    assert "socket boom" in str(excinfo.value)
++
++
++def test_repeated_construct_use_cycles_keep_python_heap_bounded(monkeypatch):
++
++
++
++
++    class Response:
++        def raise_for_status(self) -> None:
++            return
++
++        def json(self) -> dict[str, list[dict[str, list[float]]]]:
++            return {"data": [{"embedding": [1.0, 0.0]}]}
++
++    monkeypatch.setattr(requests, "post", lambda *_args, **_kwargs: Response())
++
++    for _ in range(100):
++        searcher = JinaReranker(api_key="token-123")
++        scores = searcher.calculate_scores(["sky"], ["blue sky"], normalize="none")
++        assert tuple(scores.shape) == (1, 1)
++        assert float(scores[0, 0]) == pytest.approx(1.0)
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,19 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++cd /workspace/repo
++
++export PIP_NO_INDEX=1
++export PIP_DISABLE_PIP_VERSION_CHECK=1
++export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
++export PYTHONPATH="/workspace/repo/src${PYTHONPATH:+:$PYTHONPATH}"
++exec python -m pytest /workspace/repo/usercase-test-coderl/test_embedding_rerankers.py -v

@@ -1,0 +1,281 @@
+diff --git a/checks/codespec_workflow_dependencies_test.go b/checks/codespec_workflow_dependencies_test.go
+new file mode 100644
+index 0000000..b9f8501
+--- /dev/null
++++ b/checks/codespec_workflow_dependencies_test.go
+@@ -0,0 +1,265 @@
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++package checks_test
++
++import (
++	"context"
++	"fmt"
++	"sort"
++	"strings"
++	"testing"
++
++	"github.com/ossf/scorecard/v2/checker"
++	"github.com/ossf/scorecard/v2/checks"
++	"github.com/ossf/scorecard/v2/clients"
++)
++
++const codespecWorkflowPath = ".github/workflows/codespec-dependencies.yml"
++
++type codespecMemoryRepo struct {
++	clients.RepoClient
++	files map[string][]byte
++}
++
++func (r *codespecMemoryRepo) ListFiles(predicate func(string) (bool, error)) ([]string, error) {
++	paths := make([]string, 0, len(r.files))
++	for path := range r.files {
++		match, err := predicate(path)
++		if err != nil {
++			return nil, err
++		}
++		if match {
++			paths = append(paths, path)
++		}
++	}
++	sort.Strings(paths)
++	return paths, nil
++}
++
++func (r *codespecMemoryRepo) GetFileContent(filename string) ([]byte, error) {
++	content, ok := r.files[filename]
++	if !ok {
++		return nil, fmt.Errorf("missing fixture %q", filename)
++	}
++	return content, nil
++}
++
++type codespecDetailLogger struct {
++	details []checker.CheckDetail
++}
++
++func (l *codespecDetailLogger) append(detailType checker.DetailType, msg checker.LogMessage) {
++	l.details = append(l.details, checker.CheckDetail{Type: detailType, Msg: msg})
++}
++
++func (l *codespecDetailLogger) Info(format string, args ...interface{}) {
++	l.append(checker.DetailInfo, checker.LogMessage{Text: fmt.Sprintf(format, args...)})
++}
++
++func (l *codespecDetailLogger) Warn(format string, args ...interface{}) {
++	l.append(checker.DetailWarn, checker.LogMessage{Text: fmt.Sprintf(format, args...)})
++}
++
++func (l *codespecDetailLogger) Debug(format string, args ...interface{}) {
++	l.append(checker.DetailDebug, checker.LogMessage{Text: fmt.Sprintf(format, args...)})
++}
++
++func (l *codespecDetailLogger) Info3(msg *checker.LogMessage) {
++	l.append(checker.DetailInfo, *msg)
++}
++
++func (l *codespecDetailLogger) Warn3(msg *checker.LogMessage) {
++	l.append(checker.DetailWarn, *msg)
++}
++
++func (l *codespecDetailLogger) Debug3(msg *checker.LogMessage) {
++	l.append(checker.DetailDebug, *msg)
++}
++
++func codespecRunPinnedDependencies(workflow string) (checker.CheckResult, []checker.CheckDetail) {
++	repo := &codespecMemoryRepo{files: map[string][]byte{
++		"go.sum":             []byte("fixture checksum file\n"),
++		codespecWorkflowPath: []byte(workflow),
++	}}
++	logger := &codespecDetailLogger{}
++	result := checks.PinnedDependencies(&checker.CheckRequest{
++		Ctx:        context.Background(),
++		RepoClient: repo,
++		Dlogger:    logger,
++		Owner:      "codespec",
++		Repo:       "fixture",
++	})
++	return result, logger.details
++}
++
++func codespecWarnings(details []checker.CheckDetail) []checker.CheckDetail {
++	warnings := make([]checker.CheckDetail, 0)
++	for _, detail := range details {
++		if detail.Type == checker.DetailWarn {
++			warnings = append(warnings, detail)
++		}
++	}
++	return warnings
++}
++
++func TestCodespecWorkflowDependenciesAcceptImmutableAndLocalForms(t *testing.T) {
++	t.Parallel()
++	sha := "0123456789abcdef0123456789abcdef01234567"
++	digest := "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
++	workflow := fmt.Sprintf(`name: immutable dependencies
++jobs:
++  local-reusable:
++    uses: ./.github/workflows/reusable.yml
++  remote-reusable:
++    uses: octo-org/automation/.github/workflows/reusable.yml@%s
++  mapped-container:
++    container:
++      image: cgr.dev/octo-org/tooling@sha256:%s
++  build:
++    container: ghcr.io/octo-org/builder@sha256:%s
++    services:
++      cache:
++        image: redis@sha256:%s
++      database:
++        image: postgres@sha256:%s
++    steps:
++      - uses: ./custom-action
++      - uses: actions/checkout@%s
++      - uses: docker://alpine@sha256:%s
++`, sha, digest, digest, digest, digest, strings.ToUpper(sha), strings.ToUpper(digest))
++
++	result, details := codespecRunPinnedDependencies(workflow)
++	if result.Error2 != nil || result.Score != checker.MaxResultScore {
++		t.Fatalf("fully immutable workflow: score=%d error=%v reason=%q", result.Score, result.Error2, result.Reason)
++	}
++	if warnings := codespecWarnings(details); len(warnings) != 0 {
++		t.Fatalf("fully immutable and local dependencies produced warnings: %+v", warnings)
++	}
++}
++
++func TestCodespecWorkflowDependenciesReportEveryMutableForm(t *testing.T) {
++	t.Parallel()
++	workflow := `name: mutable dependencies
++jobs:
++  called:
++    uses: octo-org/automation/.github/workflows/reusable.yml@main
++  build:
++    container:
++      image: ghcr.io/octo-org/builder:latest
++    services:
++      cache:
++        image: redis:7
++    steps:
++      - uses: actions/checkout@v3
++      - uses: docker://alpine:3.18
++      - uses: ./local-action
++`
++
++	result, details := codespecRunPinnedDependencies(workflow)
++	if result.Error2 != nil {
++		t.Fatalf("valid workflow returned a runtime error: %v", result.Error2)
++	}
++	if result.Score >= checker.MaxResultScore {
++		t.Fatalf("mutable dependencies did not reduce the score: %+v", result)
++	}
++	warnings := codespecWarnings(details)
++	wants := []string{
++		"octo-org/automation/.github/workflows/reusable.yml@main",
++		"ghcr.io/octo-org/builder:latest",
++		"redis:7",
++		"actions/checkout@v3",
++		"docker://alpine:3.18",
++	}
++	if len(warnings) != len(wants) {
++		t.Fatalf("got %d warnings, want one per mutable declaration (%d): %+v", len(warnings), len(wants), warnings)
++	}
++	for _, want := range wants {
++		matches := 0
++		for _, warning := range warnings {
++			if warning.Msg.Path != codespecWorkflowPath {
++				t.Errorf("warning for %q has path %q, want %q", warning.Msg.Text, warning.Msg.Path, codespecWorkflowPath)
++			}
++			if warning.Msg.Type != checker.FileTypeSource {
++				t.Errorf("warning for %q has file type %v, want source", warning.Msg.Text, warning.Msg.Type)
++			}
++			if strings.Contains(warning.Msg.Text, want) {
++				matches++
++			}
++		}
++		if matches != 1 {
++			t.Errorf("dependency %q appeared in %d warnings, want exactly one; warnings=%+v", want, matches, warnings)
++		}
++	}
++	for _, warning := range warnings {
++		if strings.Contains(warning.Msg.Text, "./local-action") {
++			t.Errorf("repository-local action must not be reported: %+v", warning)
++		}
++	}
++}
++
++func TestCodespecWorkflowDependencyReferenceBoundaries(t *testing.T) {
++	t.Parallel()
++	workflow := `name: reference boundaries
++jobs:
++  reusable-missing:
++    uses: octo-org/automation/.github/workflows/reusable.yml
++  reusable-expression:
++    uses: ${{ inputs.workflow }}@0123456789abcdef0123456789abcdef01234567
++  build:
++    steps:
++      - uses: actions/upload-artifact
++      - uses: actions/checkout@0123456789abcdef0123456789abcdef0123456
++      - uses: actions/setup-go@0123456789abcdef0123456789abcdef012345678
++      - uses: ${{ matrix.action }}@0123456789abcdef0123456789abcdef01234567
++      - uses: actions/cache@ABCDEF0123456789ABCDEF0123456789ABCDEF01
++      - uses: docker://busybox@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcde
++      - uses: docker://ubuntu@sha512:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
++`
++
++	result, details := codespecRunPinnedDependencies(workflow)
++	if result.Error2 != nil || result.Score >= checker.MaxResultScore {
++		t.Fatalf("boundary workflow: score=%d error=%v", result.Score, result.Error2)
++	}
++	warnings := codespecWarnings(details)
++	if len(warnings) != 8 {
++		t.Fatalf("got %d warnings, want eight invalid refs while uppercase full SHA remains accepted: %+v", len(warnings), warnings)
++	}
++	for _, warning := range warnings {
++		if strings.Contains(warning.Msg.Text, "actions/cache@") {
++			t.Errorf("uppercase 40-hex action SHA was rejected: %+v", warning)
++		}
++	}
++}
++
++func TestCodespecWorkflowDependencySchemaErrorsAreInconclusive(t *testing.T) {
++	t.Parallel()
++	workflow := `name: malformed dependency
++jobs:
++  build:
++    container:
++      - ubuntu
++      - latest
++    steps:
++      - run: echo hello
++`
++
++	result, _ := codespecRunPinnedDependencies(workflow)
++	if result.Error2 == nil {
++		t.Fatalf("malformed container declaration was silently accepted: %+v", result)
++	}
++	if result.Score != checker.InconclusiveResultScore {
++		t.Fatalf("malformed dependency score=%d, want inconclusive %d", result.Score, checker.InconclusiveResultScore)
++	}
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,5 @@
++#!/bin/bash
++set -euo pipefail
++
++
++go test -vet=off ./checks -run '^(TestCodespecWorkflowDependenc|TestGithubWorkflowPinning)' -count=1

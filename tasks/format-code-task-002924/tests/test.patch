@@ -1,0 +1,308 @@
+diff --git a/usercase-test-coderl/test_collection_creation_session.py b/usercase-test-coderl/test_collection_creation_session.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/test_collection_creation_session.py
+@@ -0,0 +1,280 @@
++
++
++from __future__ import annotations
++
++import json
++import time
++
++import httpx
++import pytest
++
++from pyzotero import ConflictError, ParamNotPassedError, Zotero
++
++
++COLLECTIONS_URL = "https://api.zotero.org/users/myuserID/collections"
++
++
++class RecordingEndpoint:
++    def __init__(
++        self,
++        responses: list[tuple[int, bytes, dict[str, str]]] | None = None,
++        events: list[tuple[str, object]] | None = None,
++    ) -> None:
++        self.requests: list[httpx.Request] = []
++        self.events = events if events is not None else []
++        self.responses = responses or [
++            (200, b'{"success":{"0":"ABC123"}}', {"content-type": "application/json"})
++        ]
++
++    def handler(self, request: httpx.Request) -> httpx.Response:
++        self.requests.append(request)
++        self.events.append(("post", str(request.url)))
++        status, body, headers = self.responses[min(len(self.requests) - 1, len(self.responses) - 1)]
++        return httpx.Response(status, headers=headers, content=body, request=request)
++
++    def client(self) -> httpx.Client:
++        return httpx.Client(
++            transport=httpx.MockTransport(self.handler),
++            follow_redirects=True,
++        )
++
++
++def request_json(request: httpx.Request) -> object:
++    return json.loads(request.content.decode("utf-8"))
++
++
++def test_create_collections_posts_default_parent_and_stores_response() -> None:
++
++
++
++    endpoint = RecordingEndpoint()
++    zot = Zotero("myuserID", "user", "myuserkey", client=endpoint.client())
++    payload = [{"name": "foo", "key": "ABC123"}]
++
++
++    assert callable(zot.create_collections)
++
++    response = zot.create_collections(payload)
++
++    assert response == {"success": {"0": "ABC123"}}
++    assert len(endpoint.requests) == 1
++    request = endpoint.requests[0]
++
++    assert request_json(request) == [
++        {"name": "foo", "key": "ABC123", "parentCollection": ""}
++    ]
++    assert request.method == "POST"
++    assert str(request.url) == COLLECTIONS_URL
++    assert ("if-unmodified-since-version" in request.headers) is False
++    assert ("zotero-write-token" in request.headers) is True
++
++    assert request.headers["zotero-write-token"] != ""
++
++    assert request.headers["content-type"].lower().split(";", 1)[0] == "application/json"
++    assert zot.request.status_code == 200
++    assert str(zot.request.url) == COLLECTIONS_URL
++    assert zot.request.json() == {"success": {"0": "ABC123"}}
++
++
++def test_create_collections_uses_last_modified_and_updates_session_request() -> None:
++
++
++
++    endpoint = RecordingEndpoint(
++        responses=[
++            (200, b'{"success":{"0":"ABC123"}}', {"content-type": "application/json"}),
++            (200, b'{"success":{"0":"DEF456"}}', {"content-type": "application/json"}),
++        ]
++    )
++    zot = Zotero("myuserID", "user", "myuserkey", client=endpoint.client())
++
++    first = zot.create_collections([{"name": "foo", "key": "ABC123"}])
++    second = zot.create_collections(
++        [{"name": "bar", "key": "DEF456", "parentCollection": "ABC123"}],
++        last_modified=5,
++    )
++
++    assert first == {"success": {"0": "ABC123"}}
++    assert second == {"success": {"0": "DEF456"}}
++    assert len(endpoint.requests) == 2
++    assert endpoint.requests[0].headers.get("if-unmodified-since-version") is None
++    assert endpoint.requests[1].headers["if-unmodified-since-version"] == "5"
++    assert request_json(endpoint.requests[1]) == [
++        {"name": "bar", "key": "DEF456", "parentCollection": "ABC123"}
++    ]
++    assert zot.request.status_code == 200
++    assert zot.request.json() == {"success": {"0": "DEF456"}}
++
++
++def test_create_collection_alias_preserves_payload_and_last_modified() -> None:
++
++
++
++    endpoint = RecordingEndpoint(
++        responses=[
++            (200, b'{"success":{"0":"XYZ789"}}', {"content-type": "application/json"})
++        ]
++    )
++    zot = Zotero("myuserID", "user", "myuserkey", client=endpoint.client())
++    payload = [{"name": "bar", "key": "XYZ789", "parentCollection": "PARENT1"}]
++
++    response = zot.create_collection(payload, last_modified=5)
++
++    assert response == {"success": {"0": "XYZ789"}}
++    assert len(endpoint.requests) == 1
++
++    assert request_json(endpoint.requests[0]) == [
++        {"name": "bar", "key": "XYZ789", "parentCollection": "PARENT1"}
++    ]
++    assert str(endpoint.requests[0].url) == COLLECTIONS_URL
++    assert endpoint.requests[0].headers["if-unmodified-since-version"] == "5"
++
++
++def test_missing_name_raises_specific_error_before_post() -> None:
++
++
++
++    endpoint = RecordingEndpoint()
++    zot = Zotero("myuserID", "user", "myuserkey", client=endpoint.client())
++
++    with pytest.raises(ParamNotPassedError) as excinfo:
++        zot.create_collections([{"key": "NO_NAME"}])
++
++    assert str(excinfo.value) == "The dict you pass must include a 'name' key"
++    assert len(endpoint.requests) == 0
++    assert zot.request is None
++
++
++def test_failed_response_uses_zotero_http_error_handling_and_stores_request() -> None:
++
++
++
++    endpoint = RecordingEndpoint(
++        responses=[(409, b"library locked", {"content-type": "text/plain"})]
++    )
++    zot = Zotero("myuserID", "user", "myuserkey", client=endpoint.client())
++
++    with pytest.raises(ConflictError) as excinfo:
++        zot.create_collections([{"name": "foo", "key": "ABC123"}])
++
++
++    assert isinstance(excinfo.value, ConflictError)
++    assert len(endpoint.requests) == 1
++    assert zot.request.status_code == 409
++    assert zot.request.text == "library locked"
++
++
++def test_create_collections_waits_for_active_write_backoff_before_post(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++
++
++
++    events: list[tuple[str, object]] = []
++    endpoint = RecordingEndpoint(events=events)
++    zot = Zotero("myuserID", "user", "myuserkey", client=endpoint.client())
++
++    def fake_sleep(duration: float) -> None:
++        events.append(("sleep", duration))
++
++    monkeypatch.setattr(time, "time", lambda: 100.0)
++    monkeypatch.setattr(time, "sleep", fake_sleep)
++    zot.backoff_until = 105.0
++
++    response = zot.create_collections([{"name": "foo", "key": "ABC123"}])
++
++    assert response == {"success": {"0": "ABC123"}}
++    assert events == [
++        ("sleep", 5.0),
++        ("post", "https://api.zotero.org/users/myuserID/collections"),
++    ]
++    assert len(endpoint.requests) == 1
++
++
++def test_two_zotero_instances_keep_collection_write_state_independent() -> None:
++
++
++
++    endpoint_a = RecordingEndpoint(
++        responses=[
++            (200, b'{"success":{"0":"AAA111"}}', {"content-type": "application/json"})
++        ]
++    )
++    endpoint_b = RecordingEndpoint(
++        responses=[
++            (200, b'{"success":{"0":"BBB222"}}', {"content-type": "application/json"})
++        ]
++    )
++    zot_a = Zotero("alpha", "user", "keyA", client=endpoint_a.client())
++    zot_b = Zotero("beta", "group", "keyB", client=endpoint_b.client())
++
++    response_a = zot_a.create_collections([{"name": "alpha", "key": "AAA111"}])
++
++    assert response_a == {"success": {"0": "AAA111"}}
++    assert str(endpoint_a.requests[0].url) == "https://api.zotero.org/users/alpha/collections"
++    assert zot_a.request.status_code == 200
++    assert zot_a.request.json() == {"success": {"0": "AAA111"}}
++    assert zot_b.request is None
++    assert len(endpoint_b.requests) == 0
++
++    response_b = zot_b.create_collections(
++        [{"name": "beta", "key": "BBB222"}],
++        last_modified=7,
++    )
++
++    assert response_b == {"success": {"0": "BBB222"}}
++    assert str(endpoint_b.requests[0].url) == "https://api.zotero.org/groups/beta/collections"
++    assert endpoint_b.requests[0].headers["if-unmodified-since-version"] == "7"
++    assert zot_b.request.status_code == 200
++    assert zot_b.request.json() == {"success": {"0": "BBB222"}}
++
++
++def test_configured_client_is_used_for_collection_creation() -> None:
++
++
++
++    endpoint = RecordingEndpoint()
++    client = endpoint.client()
++    zot = Zotero("myuserID", "user", "myuserkey", client=client)
++
++    response = zot.create_collections([{"name": "configured", "key": "CFG001"}])
++
++
++    assert response == {"success": {"0": "ABC123"}}
++    assert len(endpoint.requests) == 1
++    assert str(endpoint.requests[0].url) == COLLECTIONS_URL
++
++
++def test_repeated_construct_use_cycles_use_each_configured_client() -> None:
++
++
++
++    clients: list[httpx.Client] = []
++    posted_urls: list[str] = []
++
++    for index in range(100):
++        endpoint = RecordingEndpoint(
++            responses=[
++                (
++                    200,
++                    b'{"success":{"0":"LEAK00"}}',
++                    {"content-type": "application/json"},
++                )
++            ]
++        )
++        client = endpoint.client()
++        zot = Zotero(str(index), "user", "myuserkey", client=client)
++
++        assert zot.create_collections([{"name": "leak", "key": "LEAK00"}]) == {
++            "success": {"0": "LEAK00"}
++        }
++        assert len(endpoint.requests) == 1
++        posted_urls.append(str(endpoint.requests[0].url))
++        clients.append(client)
++        del zot
++
++
++    assert posted_urls == [
++        f"https://api.zotero.org/users/{index}/collections" for index in range(100)
++    ]
++    assert len(clients) == 100
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,18 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++cd /workspace/repo
++
++export PYTHONNOUSERSITE=1
++export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
++export PYTHONPATH="/workspace/repo/src${PYTHONPATH:+:${PYTHONPATH}}"
++exec /workspace/repo/.venv/bin/python -m pytest -o addopts='' /workspace/repo/usercase-test-coderl/test_collection_creation_session.py -v

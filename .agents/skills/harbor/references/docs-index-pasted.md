@@ -1,0 +1,81 @@
+# Harbor
+
+- [Quick start](https://docs.harborframework.com/getting-started/quick-start.md): Run your first job.
+- [Installation](https://docs.harborframework.com/getting-started/installation.md): Install Harbor.
+- [Core concepts](https://docs.harborframework.com/core-concepts/index.md): Core concepts for understanding Harbor.
+- [Overview](https://docs.harborframework.com/core-concepts/tasks/overview.md): A Harbor task is an instruction, environment, and test script.
+- [Instruction](https://docs.harborframework.com/core-concepts/tasks/instruction.md): Defining the objective of the task for the agent.
+- [Configuration](https://docs.harborframework.com/core-concepts/tasks/configuration.md): Task configuration, metadata, and schema reference.
+- [Environment](https://docs.harborframework.com/core-concepts/tasks/environment.md): The environment for a task.
+- [Skills](https://docs.harborframework.com/core-concepts/tasks/skills.md): Bundle reusable agent instructions with a task.
+- [Solution](https://docs.harborframework.com/core-concepts/tasks/solution.md): Task solutions.
+- [Verifier](https://docs.harborframework.com/core-concepts/tasks/verifier.md): Task verification.
+- [Artifacts](https://docs.harborframework.com/core-concepts/tasks/artifacts.md): Declare task outputs to preserve and pass to the verifier.
+- [Resources](https://docs.harborframework.com/core-concepts/tasks/resources.md): Managing environment resources.
+- [Multi-container](https://docs.harborframework.com/core-concepts/tasks/multi-container.md): Multi-container documentation for Harbor.
+- [Network policies](https://docs.harborframework.com/core-concepts/tasks/network-policies.md): Network policies documentation for Harbor.
+- [Multi-step](https://docs.harborframework.com/core-concepts/tasks/multi-step.md): Evaluate agent performance across multiple milestones.
+- [Separate verifier](https://docs.harborframework.com/core-concepts/tasks/separate-verifier.md): Run verification in a separate environment.
+- [Datasets](https://docs.harborframework.com/core-concepts/datasets/datasets.md): Collections of tasks for evaluation and training.
+- [Create a Dataset](https://docs.harborframework.com/core-concepts/datasets/create-a-dataset.md): Create a dataset of Harbor tasks
+- [Git repos](https://docs.harborframework.com/core-concepts/datasets/git-repos.md): Run a dataset from a Git repo.
+- [Registries](https://docs.harborframework.com/core-concepts/datasets/registries.md): Create custom registries of datasets.
+- [Metrics](https://docs.harborframework.com/core-concepts/datasets/metrics.md): Custom dataset metrics.
+- [Run a job](https://docs.harborframework.com/core-concepts/jobs/run-a-job.md): Run a job in Harbor.
+- [Configs](https://docs.harborframework.com/core-concepts/jobs/configs.md): Complete schema for configuring Harbor jobs.
+- [Environment variables](https://docs.harborframework.com/core-concepts/jobs/environment-variables.md): Control which environment variables reach Harbor, sandboxes, agents, and verifiers.
+- [Skills](https://docs.harborframework.com/core-concepts/jobs/skills.md): Inject reusable instructions from local directories or git repositories
+- [Loading trajectories](https://docs.harborframework.com/core-concepts/jobs/loading-trajectories.md): Load a previous trajectory into an agent session.
+- [Handoff](https://docs.harborframework.com/core-concepts/jobs/handoff.md): Resume a completed trial in your local agent CLI.
+- [Regrade](https://docs.harborframework.com/core-concepts/jobs/regrade.md): Run an updated verifier against recorded outputs without rerunning the agent.
+- [Simulate a user](https://docs.harborframework.com/core-concepts/jobs/simulate-a-user.md): Evaluate an agent through a multi-turn conversation with a simulated user.
+- [Custom verifiers](https://docs.harborframework.com/core-concepts/jobs/custom-verifiers.md): Customize the job verification process.
+- [Artifact collection](https://docs.harborframework.com/core-concepts/jobs/artifact-collection.md): Preserve files produced during a trial.
+- [Stream](https://docs.harborframework.com/core-concepts/jobs/stream.md): Follow agent actions and explore sandbox files while a job runs.
+- [Pre-integrated agents](https://docs.harborframework.com/core-concepts/agents/pre-integrated-agents.md): Run agents supported by Harbor.
+- [ACP](https://docs.harborframework.com/core-concepts/agents/acp.md): Run agents from the Agent Client Protocol registry.
+- [Custom agents](https://docs.harborframework.com/core-concepts/agents/custom-agents.md): Integrate and run your own agent with Harbor.
+- [ATIF](https://docs.harborframework.com/core-concepts/agents/atif.md): Record and exchange agent trajectories in a standard JSON format.
+- [Pre-integrated sandboxes](https://docs.harborframework.com/core-concepts/sandboxes/pre-integrated-sandboxes.md): Run tasks with local or remote environments supported by Harbor.
+- [ASP](https://docs.harborframework.com/core-concepts/sandboxes/asp.md): Agent Sandbox Protocol: run any agent harness's tools in a remote sandbox over SSH.
+- [Custom sandboxes](https://docs.harborframework.com/core-concepts/sandboxes/custom-sandboxes.md): Integrate and run your own sandbox with Harbor.
+- [Existing plugins](https://docs.harborframework.com/core-concepts/plugins/existing-plugins.md): Connect Harbor jobs to observability platforms.
+- [Custom plugins](https://docs.harborframework.com/core-concepts/plugins/custom-plugins.md): Run custom logic around Harbor jobs and trials.
+- [View job results](https://docs.harborframework.com/core-concepts/results/view-job-results.md): Browse jobs, inspect trials, and compare results locally.
+- [Handoff](https://docs.harborframework.com/core-concepts/results/handoff.md): Interview an agent after a completed trial.
+- [Publish](https://docs.harborframework.com/core-concepts/harbor-hub/publish.md): Publish datasets and tasks to the Hub.
+- [Upload](https://docs.harborframework.com/core-concepts/harbor-hub/upload.md): Upload job results to the Hub.
+- [Download](https://docs.harborframework.com/core-concepts/harbor-hub/download.md): Download datasets, tasks, jobs, trials, and trajectories.
+- [Hosted jobs](https://docs.harborframework.com/core-concepts/harbor-hub/hosted-jobs.md): Submit hosted jobs and check their status.
+- [Leaderboards](https://docs.harborframework.com/core-concepts/harbor-hub/leaderboards.md): Create, rank, and share evaluation results on Harbor Hub.
+- [Sharing](https://docs.harborframework.com/core-concepts/harbor-hub/sharing.md): Sharing tasks, datasets, and jobs.
+- [Hosted Harbor](https://docs.harborframework.com/core-concepts/hosted-harbor/index.md): Launching Jobs On The Hub
+- [Harbor Hub API key](https://docs.harborframework.com/core-concepts/hosted-harbor/api-key.md): Create a Harbor Hub API key
+- [Web UI](https://docs.harborframework.com/core-concepts/hosted-harbor/web-ui.md): Add secrets and launch a remote rollout from Harbor Hub
+- [CLI](https://docs.harborframework.com/core-concepts/hosted-harbor/cli.md): Launch remote rollouts and browse jobs, trials, and secrets from the harbor CLI
+- [API overview](https://docs.harborframework.com/core-concepts/hosted-harbor/api.md): Base URL, authentication, and error shapes for the remote rollout API
+- [Submitting jobs](https://docs.harborframework.com/core-concepts/hosted-harbor/submitting-jobs.md): Launch a remote rollout with POST /job-submit and check its status
+- [Custom agents](https://docs.harborframework.com/core-concepts/hosted-harbor/custom-agents.md): Run an ACP agent from a GitHub repository
+- [Managing secrets](https://docs.harborframework.com/core-concepts/hosted-harbor/secrets.md): Store, list, revoke, and preflight hosted secrets over the API
+- [Registry credentials](https://docs.harborframework.com/core-concepts/hosted-harbor/registry-credentials.md): Store credentials for pulling private task images
+- [Quick start](https://docs.harborframework.com/core-concepts/rewardkit/quick-start.md): Define and run verifiers that produce reward scores.
+- [Judge criteria](https://docs.harborframework.com/core-concepts/rewardkit/judge-criteria.md): Grade tasks with LLM or agent judges configured in TOML.
+- [Built-in criteria](https://docs.harborframework.com/core-concepts/rewardkit/built-in-criteria.md): Reference for all built-in criterion functions.
+- [Motivation & design](https://docs.harborframework.com/core-concepts/rewardkit/motivation-and-design.md): Why Rewardkit exists and the principles behind its design.
+- [Create a task](https://docs.harborframework.com/tutorials/create-a-task.md): Create a task documentation for Harbor.
+- [Create a verifier with Rewardkit](https://docs.harborframework.com/tutorials/create-a-verifier-with-rewardkit.md): Build a task whose verifier combines programmatic criteria, weights, and an optional LLM judge.
+- [Contributing](https://docs.harborframework.com/contributing/contributing.md): Contributing documentation for Harbor.
+- [Release policy](https://docs.harborframework.com/contributing/release-policy.md): Harbor's stable and nightly release policy.
+- [Usage stats](https://docs.harborframework.com/telemetry/telemetry.md): What Harbor collects and how to opt out.
+- [News](https://docs.harborframework.com/news.md)
+- [Stop zipping your job results](https://docs.harborframework.com/news/job-result-sharing.md): Upload and share Harbor job results on Harbor Hub instead of zipping and sending them manually.
+- [Verify Harbor tasks in a separate sandbox](https://docs.harborframework.com/news/separate-verifier-sandboxes.md): Run task verification in a sandbox separate from the agent, with explicit artifact handoff between the two environments.
+- [Multi-step tasks](https://docs.harborframework.com/news/multi-step-tasks.md): The first major addition to the Harbor task format: tasks split into sequential steps, each with its own instruction and verifier.
+- [Explore the Harbor cookbook](https://docs.harborframework.com/news/harbor-cookbook.md): Introducing the Harbor cookbook: recipes for building Harbor tasks and optimization loops
+- [The Harbor registry is getting an upgrade](https://docs.harborframework.com/news/harbor-registry.md): Introducing a new way to package and distribute Harbor tasks and datasets.
+- [Changelog](https://docs.harborframework.com/changelog.md): Release notes and product updates for Harbor.
+
+## Optional
+
+- [Harbor Hub](https://hub.harborframework.com)
+- [Discord](https://discord.gg/QVvyhRw5UQ)

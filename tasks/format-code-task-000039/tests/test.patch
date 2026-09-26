@@ -1,0 +1,354 @@
+diff --git a/backend/aopp_approval_external_test.go b/backend/aopp_approval_external_test.go
+new file mode 100644
+index 000000000..58d8dce33
+--- /dev/null
++++ b/backend/aopp_approval_external_test.go
+@@ -0,0 +1,236 @@
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++package backend_test
++
++import (
++	"fmt"
++	"net/http"
++	"net/http/httptest"
++	"net/url"
++	"testing"
++
++	"github.com/digitalbitbox/bitbox-wallet-app/backend"
++	"github.com/digitalbitbox/bitbox-wallet-app/backend/arguments"
++	"github.com/digitalbitbox/bitbox-wallet-app/backend/coins/btc"
++	"github.com/digitalbitbox/bitbox-wallet-app/backend/coins/btc/types"
++	coinpkg "github.com/digitalbitbox/bitbox-wallet-app/backend/coins/coin"
++	"github.com/digitalbitbox/bitbox-wallet-app/backend/devices/device"
++	deviceevent "github.com/digitalbitbox/bitbox-wallet-app/backend/devices/device/event"
++	"github.com/digitalbitbox/bitbox-wallet-app/backend/devices/usb"
++	"github.com/digitalbitbox/bitbox-wallet-app/backend/handlers"
++	"github.com/digitalbitbox/bitbox-wallet-app/backend/keystore"
++	keystoremock "github.com/digitalbitbox/bitbox-wallet-app/backend/keystore/mocks"
++	"github.com/digitalbitbox/bitbox-wallet-app/backend/keystore/software"
++	"github.com/digitalbitbox/bitbox-wallet-app/backend/signing"
++	"github.com/digitalbitbox/bitbox-wallet-app/util/observable"
++	"github.com/digitalbitbox/bitbox-wallet-app/util/test"
++	"github.com/stretchr/testify/require"
++)
++
++type aoppTestEnv struct{}
++
++func (aoppTestEnv) NotifyUser(string)             {}
++func (aoppTestEnv) DeviceInfos() []usb.DeviceInfo { return nil }
++func (aoppTestEnv) SystemOpen(string) error       { return nil }
++func (aoppTestEnv) UsingMobileData() bool         { return false }
++func (aoppTestEnv) NativeLocale() string          { return "en" }
++
++type aoppTestDevice struct {
++	observable.Implementation
++	keystore keystore.Keystore
++	onEvent  func(deviceevent.Event, interface{})
++}
++
++func (d *aoppTestDevice) Init(bool) error {
++	d.onEvent(deviceevent.EventKeystoreAvailable, nil)
++	return nil
++}
++
++func (d *aoppTestDevice) ProductName() string { return "test-device" }
++func (d *aoppTestDevice) Identifier() string  { return "aopp-test-device" }
++func (d *aoppTestDevice) Keystore() keystore.Keystore {
++	return d.keystore
++}
++func (d *aoppTestDevice) SetOnEvent(f func(deviceevent.Event, interface{})) { d.onEvent = f }
++func (d *aoppTestDevice) Close()                                            {}
++
++func newAOPPTestBackend(t *testing.T) *backend.Backend {
++	t.Helper()
++	b, err := backend.NewBackend(
++		arguments.NewArguments(
++			test.TstTempDir("aopp-approval"),
++			false, false,
++			false, false,
++			&types.GapLimits{Receive: 20, Change: 6}),
++		aoppTestEnv{},
++	)
++	require.NoError(t, err)
++	b.RatesUpdater().SetCoingeckoURL("unused")
++	b.OnDeviceInit(func(device.Interface) {})
++	b.OnDeviceUninit(func(string) {})
++	return b
++}
++
++func registerAOPPSigningKeystore(t *testing.T, b *backend.Backend) {
++	t.Helper()
++	keystoreHelper := software.NewKeystoreFromPIN("0000")
++	ks := &keystoremock.KeystoreMock{
++		RootFingerprintFunc: func() ([]byte, error) {
++			return []byte{0x55, 0x55, 0x55, 0x55}, nil
++		},
++		SupportsAccountFunc: func(coin coinpkg.Coin, meta interface{}) bool {
++			switch coin.(type) {
++			case *btc.Coin:
++				scriptType := meta.(signing.ScriptType)
++				return scriptType != signing.ScriptTypeP2PKH
++			default:
++				return true
++			}
++		},
++		SupportsUnifiedAccountsFunc: func() bool {
++			return true
++		},
++		SupportsMultipleAccountsFunc: func() bool {
++			return true
++		},
++		CanSignMessageFunc: func(coinpkg.Code) bool {
++			return true
++		},
++		ExtendedPublicKeyFunc: keystoreHelper.ExtendedPublicKey,
++	}
++	require.NoError(t, b.Register(&aoppTestDevice{keystore: ks}))
++}
++
++func defaultAOPPParams() url.Values {
++	params := url.Values{}
++	params.Set("v", "0")
++	params.Set("msg", "message to be signed")
++	params.Set("format", "any")
++	params.Set("asset", "btc")
++	params.Set("callback", "http://localhost/aopp/")
++	return params
++}
++
++func postAOPPRoute(t *testing.T, b *backend.Backend, path string) {
++	t.Helper()
++	h := handlers.NewHandlers(b, handlers.NewConnectionData(0, ""))
++	request := httptest.NewRequest(http.MethodPost, path, nil)
++	response := httptest.NewRecorder()
++	h.Router.ServeHTTP(response, request)
++	require.Equal(t, http.StatusOK, response.Code)
++}
++
++func currentAOPPState(b *backend.Backend) string {
++	return fmt.Sprint(b.AOPP().State)
++}
++
++func currentAOPPErrorCode(b *backend.Backend) string {
++	return fmt.Sprint(b.AOPP().ErrorCode)
++}
++
++func TestAOPPSuccess(t *testing.T) {
++	t.Run("user-approval-before-account-selection", func(t *testing.T) {
++		b := newAOPPTestBackend(t)
++		defer b.Close()
++
++		params := defaultAOPPParams()
++		params.Set("callback", "https://approval-gate.example.org/callback")
++		registerAOPPSigningKeystore(t, b)
++		b.HandleURI("aopp:?" + params.Encode())
++
++		require.Equal(t, "user-approval", currentAOPPState(b))
++		require.NotEqual(t, "choosing-account", currentAOPPState(b))
++		require.Equal(t, "approval-gate.example.org", b.AOPP().CallbackHost)
++	})
++
++	t.Run("approve-continues-flow", func(t *testing.T) {
++		b := newAOPPTestBackend(t)
++		defer b.Close()
++
++		params := defaultAOPPParams()
++		params.Set("callback", "https://approval-continues.example.org/callback")
++		registerAOPPSigningKeystore(t, b)
++		b.HandleURI("aopp:?" + params.Encode())
++		require.Equal(t, "user-approval", currentAOPPState(b))
++
++		postAOPPRoute(t, b, "/api/aopp/approve")
++
++		require.Equal(t, "choosing-account", currentAOPPState(b))
++		require.NotEmpty(t, b.AOPP().Accounts)
++	})
++
++	t.Run("approve-noops-outside-approval", func(t *testing.T) {
++		b := newAOPPTestBackend(t)
++		defer b.Close()
++		require.Equal(t, "inactive", currentAOPPState(b))
++
++		postAOPPRoute(t, b, "/api/aopp/approve")
++
++		require.Equal(t, "inactive", currentAOPPState(b))
++	})
++
++	t.Run("approval-keystore-disconnect", func(t *testing.T) {
++		b := newAOPPTestBackend(t)
++		defer b.Close()
++
++		params := defaultAOPPParams()
++		params.Set("callback", "https://approval-disconnect.example.org/callback")
++		registerAOPPSigningKeystore(t, b)
++		b.HandleURI("aopp:?" + params.Encode())
++		require.Equal(t, "user-approval", currentAOPPState(b))
++		b.DeregisterKeystore()
++
++		postAOPPRoute(t, b, "/api/aopp/approve")
++
++		require.Equal(t, "awaiting-keystore", currentAOPPState(b))
++		require.NotEqual(t, "choosing-account", currentAOPPState(b))
++	})
++
++	t.Run("cancel-from-approval-stops-before-account-selection", func(t *testing.T) {
++		b := newAOPPTestBackend(t)
++		defer b.Close()
++
++		params := defaultAOPPParams()
++		params.Set("callback", "https://approval-cancel.example.org/callback")
++		registerAOPPSigningKeystore(t, b)
++		b.HandleURI("aopp:?" + params.Encode())
++		require.Equal(t, "user-approval", currentAOPPState(b))
++
++		postAOPPRoute(t, b, "/api/aopp/cancel")
++
++		require.Equal(t, "inactive", currentAOPPState(b))
++		require.NotEqual(t, "choosing-account", currentAOPPState(b))
++	})
++}
++
++func TestAOPPFailures(t *testing.T) {
++	t.Run("no_accounts", func(t *testing.T) {
++		b := newAOPPTestBackend(t)
++		defer b.Close()
++
++		registerAOPPSigningKeystore(t, b)
++		for _, acct := range b.Accounts() {
++			require.NoError(t, b.SetAccountActive(acct.Config().Code, false))
++		}
++		params := defaultAOPPParams()
++		b.HandleURI("aopp:?" + params.Encode())
++		require.Equal(t, "user-approval", currentAOPPState(b))
++
++		postAOPPRoute(t, b, "/api/aopp/approve")
++
++		require.Equal(t, "error", currentAOPPState(b))
++		require.Equal(t, "aoppNoAccounts", currentAOPPErrorCode(b))
++	})
++}
+diff --git a/backend/aopp_test.go b/backend/aopp_test.go
+index 9f85738e6..93116adc0 100644
+--- a/backend/aopp_test.go
++++ b/backend/aopp_test.go
+@@ -307,7 +307,9 @@ func TestAOPPFailures(t *testing.T) {
+ 		params := defaultParams()
+ 		b.registerKeystore(&ks)
+ 		require.NoError(t, b.SetAccountActive("v0-55555555-btc-0", false))
++		b.DeregisterKeystore()
+ 		b.HandleURI("aopp:?" + params.Encode())
++		b.registerKeystore(&ks)
+ 		require.Equal(t, aoppStateError, b.AOPP().State)
+ 		require.Equal(t, errAOPPNoAccounts, b.AOPP().ErrorCode)
+ 	})
+diff --git a/backend/handlers/aopp_approve_route_test.go b/backend/handlers/aopp_approve_route_test.go
+new file mode 100644
+index 000000000..1563eda47
+--- /dev/null
++++ b/backend/handlers/aopp_approve_route_test.go
+@@ -0,0 +1,70 @@
++package handlers_test
++
++import (
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++
++	"github.com/stretchr/testify/require"
++)
++
++func TestAOPPFrontendApprovalSurface(t *testing.T) {
++	apiSource, err := os.ReadFile(filepath.Join("..", "..", "frontends", "web", "src", "api", "aopp.ts"))
++	require.NoError(t, err)
++	componentSource, err := os.ReadFile(filepath.Join("..", "..", "frontends", "web", "src", "components", "aopp", "aopp.tsx"))
++	require.NoError(t, err)
++
++	api := string(apiSource)
++	component := string(componentSource)
++	require.Contains(t, api, "'user-approval'")
++	require.Contains(t, api, "approve = (): Promise<null>")
++	require.Contains(t, api, "apiPost('aopp/approve')")
++
++	approvalIndex := strings.Index(component, "case 'user-approval':")
++	require.NotEqual(t, -1, approvalIndex)
++	approvalCase := component[approvalIndex:]
++	if nextCase := strings.Index(approvalCase[len("case 'user-approval':"):], "case '"); nextCase >= 0 {
++		approvalCase = approvalCase[:len("case 'user-approval':")+nextCase]
++	}
++	approvalSource := approvalCase
++	if !strings.Contains(approvalSource, "aoppAPI.approve") && !strings.Contains(approvalSource, "aoppAPI.cancel") {
++		if methodName := calledComponentMethod(approvalCase); methodName != "" {
++			approvalSource += componentMethodSource(component, methodName)
++		}
++	}
++	require.Contains(t, approvalSource, "callbackHost")
++	require.Contains(t, approvalSource, "aoppAPI.cancel")
++	require.Contains(t, approvalSource, "aoppAPI.approve")
++}
++
++func calledComponentMethod(source string) string {
++	const receiver = "this."
++	idx := strings.Index(source, receiver)
++	if idx < 0 {
++		return ""
++	}
++	rest := source[idx+len(receiver):]
++	end := 0
++	for end < len(rest) {
++		c := rest[end]
++		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' {
++			end++
++			continue
++		}
++		break
++	}
++	return rest[:end]
++}
++
++func componentMethodSource(component, methodName string) string {
++	idx := strings.Index(component, methodName)
++	if idx < 0 {
++		return ""
++	}
++	end := idx + 800
++	if end > len(component) {
++		end = len(component)
++	}
++	return component[idx:end]
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,17 @@
++#!/bin/bash
++set -euo pipefail
++cd /testbed
++
++case "${1:-}" in
++  base)
++    go test -v -count=1 -run 'TestAOPPFailures/(wrong_version|missing_callback|invalid_callback|missing_msg|unsupported_asset)$' ./backend/
++    ;;
++  new)
++    go test -v -count=1 -run 'TestAOPPSuccess/(user-approval-before-account-selection|approve-continues-flow|approve-noops-outside-approval|approval-keystore-disconnect|cancel-from-approval-stops-before-account-selection)$|TestAOPPFailures/no_accounts$' ./backend/
++    go test -v -count=1 -run 'TestAOPP(ApproveRouteCallsBackend|FrontendApprovalSurface)$' ./backend/handlers/
++    ;;
++  *)
++    echo "usage: $0 base|new"
++    exit 2
++    ;;
++esac

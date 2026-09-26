@@ -1,0 +1,560 @@
+diff --git a/plugins/defaultplugins/aclplugin/acl_config_modify_test.go b/plugins/defaultplugins/aclplugin/acl_config_modify_test.go
+new file mode 100644
+index 000000000..a90f7408b
+--- /dev/null
++++ b/plugins/defaultplugins/aclplugin/acl_config_modify_test.go
+@@ -0,0 +1,518 @@
++package aclplugin
++
++import (
++	"bytes"
++	"fmt"
++	"sync"
++	"testing"
++
++	govppmock "git.fd.io/govpp.git/adapter/mock"
++	govppapi "git.fd.io/govpp.git/api"
++	"git.fd.io/govpp.git/core"
++	"github.com/ligato/cn-infra/logging"
++	"github.com/ligato/cn-infra/logging/logrus"
++	"github.com/ligato/cn-infra/logging/measure"
++	"github.com/ligato/vpp-agent/idxvpp/nametoidx"
++	"github.com/ligato/vpp-agent/plugins/defaultplugins/aclplugin/aclidx"
++	aclapi "github.com/ligato/vpp-agent/plugins/defaultplugins/common/bin_api/acl"
++	"github.com/ligato/vpp-agent/plugins/defaultplugins/common/model/acl"
++	"github.com/ligato/vpp-agent/plugins/defaultplugins/ifplugin/ifaceidx"
++	"github.com/lunixbochs/struc"
++
++	. "github.com/onsi/gomega"
++)
++
++const modifyACLTestVPPACLIndex uint32 = 99
++
++type aclSetRequest struct {
++	swIfIndex uint32
++	nInput    uint8
++	acls      []uint32
++}
++
++type aclBindingRecorder struct {
++	lock        sync.Mutex
++	current     map[uint32]*aclapi.ACLInterfaceListDetails
++	setRequests []aclSetRequest
++	errors      []error
++}
++
++type recordingLogger struct {
++	logging.Logger
++	lock                         sync.Mutex
++	emptyInterfaceListDebugCalls int
++}
++
++func (l *recordingLogger) Debugf(format string, args ...interface{}) {
++	l.lock.Lock()
++	for _, arg := range args {
++		if interfaces, ok := arg.([]uint32); ok && len(interfaces) == 0 {
++			l.emptyInterfaceListDebugCalls++
++		}
++	}
++	l.lock.Unlock()
++	l.Logger.Debugf(format, args...)
++}
++
++func (l *recordingLogger) emptyInterfaceListCalls() int {
++	l.lock.Lock()
++	defer l.lock.Unlock()
++	return l.emptyInterfaceListDebugCalls
++}
++
++func newACLBindingRecorder(initial map[uint32]*aclapi.ACLInterfaceListDetails) *aclBindingRecorder {
++	current := make(map[uint32]*aclapi.ACLInterfaceListDetails, len(initial))
++	for swIfIndex, details := range initial {
++		current[swIfIndex] = cloneACLInterfaceDetails(details)
++	}
++	return &aclBindingRecorder{current: current}
++}
++
++func (r *aclBindingRecorder) replyHandler(adapter *govppmock.VppAdapter) govppmock.ReplyHandler {
++	return func(request govppmock.MessageDTO) (reply []byte, msgID uint16, ok bool) {
++		switch request.MsgName {
++		case (&aclapi.ACLAddReplace{}).GetMessageName():
++			reply, msgID, ok = r.replyBytes(adapter, request, &aclapi.ACLAddReplaceReply{ACLIndex: modifyACLTestVPPACLIndex})
++		case (&aclapi.ACLInterfaceListDump{}).GetMessageName():
++			dump := &aclapi.ACLInterfaceListDump{}
++			if err := decodeVPPRequest(request.Data, dump); err != nil {
++				r.recordError(err)
++				reply, msgID, ok = r.replyBytes(adapter, request, &aclapi.ACLInterfaceListDetails{})
++				break
++			}
++			reply, msgID, ok = r.replyBytes(adapter, request, r.currentDetails(dump.SwIfIndex))
++		case (&aclapi.ACLInterfaceSetACLList{}).GetMessageName():
++			set := &aclapi.ACLInterfaceSetACLList{}
++			if err := decodeVPPRequest(request.Data, set); err != nil {
++				r.recordError(err)
++				reply, msgID, ok = r.replyBytes(adapter, request, &aclapi.ACLInterfaceSetACLListReply{})
++				break
++			}
++			r.recordSetRequest(set)
++			reply, msgID, ok = r.replyBytes(adapter, request, &aclapi.ACLInterfaceSetACLListReply{})
++		default:
++			return nil, 0, false
++		}
++		return reply, msgID, ok
++	}
++}
++
++func (r *aclBindingRecorder) replyBytes(adapter *govppmock.VppAdapter, request govppmock.MessageDTO, msg govppapi.Message) ([]byte, uint16, bool) {
++	reply, err := adapter.ReplyBytes(request, msg)
++	if err != nil {
++		r.recordError(err)
++		return nil, 0, false
++	}
++	msgID, err := adapter.GetMsgID(msg.GetMessageName(), msg.GetCrcString())
++	if err != nil {
++		r.recordError(err)
++		return nil, 0, false
++	}
++	return reply, msgID, true
++}
++
++func (r *aclBindingRecorder) currentDetails(swIfIndex uint32) *aclapi.ACLInterfaceListDetails {
++	r.lock.Lock()
++	defer r.lock.Unlock()
++
++	if details, ok := r.current[swIfIndex]; ok {
++		return cloneACLInterfaceDetails(details)
++	}
++	return &aclapi.ACLInterfaceListDetails{SwIfIndex: swIfIndex}
++}
++
++func (r *aclBindingRecorder) recordSetRequest(set *aclapi.ACLInterfaceSetACLList) {
++	r.lock.Lock()
++	defer r.lock.Unlock()
++
++	acls := append([]uint32(nil), set.Acls...)
++	r.setRequests = append(r.setRequests, aclSetRequest{
++		swIfIndex: set.SwIfIndex,
++		nInput:    set.NInput,
++		acls:      acls,
++	})
++	r.current[set.SwIfIndex] = &aclapi.ACLInterfaceListDetails{
++		SwIfIndex: set.SwIfIndex,
++		NInput:    set.NInput,
++		Acls:      acls,
++	}
++}
++
++func (r *aclBindingRecorder) recordedSetRequests() []aclSetRequest {
++	r.lock.Lock()
++	defer r.lock.Unlock()
++
++	out := make([]aclSetRequest, 0, len(r.setRequests))
++	for _, req := range r.setRequests {
++		out = append(out, aclSetRequest{
++			swIfIndex: req.swIfIndex,
++			nInput:    req.nInput,
++			acls:      append([]uint32(nil), req.acls...),
++		})
++	}
++	return out
++}
++
++func (r *aclBindingRecorder) recordError(err error) {
++	r.lock.Lock()
++	defer r.lock.Unlock()
++	r.errors = append(r.errors, err)
++}
++
++func (r *aclBindingRecorder) recordedErrors() []error {
++	r.lock.Lock()
++	defer r.lock.Unlock()
++	return append([]error(nil), r.errors...)
++}
++
++func decodeVPPRequest(data []byte, msg interface{}) error {
++	buf := bytes.NewReader(data)
++	header := &core.VppRequestHeader{}
++	if err := struc.Unpack(buf, header); err != nil {
++		return fmt.Errorf("decode VPP request header: %v", err)
++	}
++	if err := struc.Unpack(buf, msg); err != nil {
++		return fmt.Errorf("decode VPP request body: %v", err)
++	}
++	return nil
++}
++
++func cloneACLInterfaceDetails(details *aclapi.ACLInterfaceListDetails) *aclapi.ACLInterfaceListDetails {
++	if details == nil {
++		return nil
++	}
++	return &aclapi.ACLInterfaceListDetails{
++		SwIfIndex: details.SwIfIndex,
++		NInput:    details.NInput,
++		Acls:      append([]uint32(nil), details.Acls...),
++	}
++}
++
++type testGovPPMux struct {
++	conn *core.Connection
++}
++
++func (m *testGovPPMux) NewAPIChannel() (*govppapi.Channel, error) {
++	return m.conn.NewAPIChannel()
++}
++
++func (m *testGovPPMux) NewAPIChannelBuffered(reqChanBufSize, replyChanBufSize int) (*govppapi.Channel, error) {
++	return m.conn.NewAPIChannelBuffered(reqChanBufSize, replyChanBufSize)
++}
++
++func newModifyACLTestPlugin(t *testing.T, names map[string]uint32, initial map[uint32]*aclapi.ACLInterfaceListDetails) (*ACLConfigurator, *aclBindingRecorder, func()) {
++	t.Helper()
++	g := NewGomegaWithT(t)
++
++	adapter := &govppmock.VppAdapter{}
++	conn, err := core.Connect(adapter)
++	g.Expect(err).To(Succeed())
++
++	rec := newACLBindingRecorder(initial)
++	adapter.MockReplyHandler(rec.replyHandler(adapter))
++	baseLogger := logrus.NewLogger("acl-modify-test")
++	baseLogger.SetLevel(logging.DebugLevel)
++	logRecorder := &recordingLogger{Logger: baseLogger}
++
++	nameIndex := nametoidx.NewNameToIdx(logRecorder, "test", "test-sw_if_indexes", ifaceidx.IndexMetadata)
++	swIfIndexes := ifaceidx.NewSwIfIndex(nameIndex)
++	for name, index := range names {
++		swIfIndexes.RegisterName(name, index, nil)
++	}
++
++	aclNameIndex := nametoidx.NewNameToIdx(logRecorder, "test", "test-acl_indexes", nil)
++	aclIndexes := aclidx.NewAclIndex(aclNameIndex)
++	aclIndexes.RegisterName("acl-under-test", modifyACLTestVPPACLIndex+1, nil)
++
++	plugin := &ACLConfigurator{
++		Log:            logRecorder,
++		GoVppmux:       &testGovPPMux{conn: conn},
++		ACLL3L4Indexes: aclIndexes,
++		ACLL2Indexes:   aclidx.NewAclIndex(nametoidx.NewNameToIdx(logRecorder, "test", "test-l2_acl_indexes", nil)),
++		SwIfIndexes:    swIfIndexes,
++		Stopwatch:      measure.NewStopwatch("acl-modify-test", logRecorder),
++	}
++	g.Expect(plugin.Init()).To(Succeed())
++
++	return plugin, rec, func() {
++		g.Expect(plugin.Close()).To(Succeed())
++		conn.Disconnect()
++	}
++}
++
++func testACL(ingress []string, egress []string) *acl.AccessLists_Acl {
++	return &acl.AccessLists_Acl{
++		AclName: "acl-under-test",
++		Rules: []*acl.AccessLists_Acl_Rule{
++			{
++				AclAction: acl.AclAction_PERMIT,
++				Match: &acl.AccessLists_Acl_Rule_Match{
++					IpRule: &acl.AccessLists_Acl_Rule_Match_IpRule{
++						Ip: &acl.AccessLists_Acl_Rule_Match_IpRule_Ip{
++							SourceNetwork:      "192.0.2.0/24",
++							DestinationNetwork: "198.51.100.0/24",
++						},
++					},
++				},
++			},
++		},
++		Interfaces: &acl.AccessLists_Acl_Interfaces{
++			Ingress: ingress,
++			Egress:  egress,
++		},
++	}
++}
++
++func ingressACLDetails(swIfIndex uint32) *aclapi.ACLInterfaceListDetails {
++	return &aclapi.ACLInterfaceListDetails{
++		SwIfIndex: swIfIndex,
++		NInput:    1,
++		Acls:      []uint32{modifyACLTestVPPACLIndex},
++	}
++}
++
++func egressACLDetails(swIfIndex uint32) *aclapi.ACLInterfaceListDetails {
++	return &aclapi.ACLInterfaceListDetails{
++		SwIfIndex: swIfIndex,
++		NInput:    0,
++		Acls:      []uint32{modifyACLTestVPPACLIndex},
++	}
++}
++
++func expectedIngressSet(swIfIndex uint32) aclSetRequest {
++	return aclSetRequest{swIfIndex: swIfIndex, nInput: 1, acls: []uint32{modifyACLTestVPPACLIndex}}
++}
++
++func expectedEgressSet(swIfIndex uint32) aclSetRequest {
++	return aclSetRequest{swIfIndex: swIfIndex, nInput: 0, acls: []uint32{modifyACLTestVPPACLIndex}}
++}
++
++func expectedUnset(swIfIndex uint32) aclSetRequest {
++	return aclSetRequest{swIfIndex: swIfIndex, nInput: 0, acls: nil}
++}
++
++func expectACLSetRequests(t *testing.T, actual []aclSetRequest, expected map[uint32]aclSetRequest) {
++	t.Helper()
++	g := NewGomegaWithT(t)
++
++	g.Expect(actual).To(HaveLen(len(expected)))
++
++	seen := map[uint32]aclSetRequest{}
++	for _, req := range actual {
++		if _, exists := seen[req.swIfIndex]; exists {
++			t.Fatalf("interface %d received more than one binding operation", req.swIfIndex)
++		}
++		seen[req.swIfIndex] = req
++	}
++
++	for swIfIndex, expectedReq := range expected {
++		req, ok := seen[swIfIndex]
++		g.Expect(ok).To(BeTrue())
++		g.Expect(req.nInput).To(Equal(expectedReq.nInput))
++		g.Expect(req.acls).To(ConsistOf(uint32SliceToInterfaces(expectedReq.acls)...))
++	}
++}
++
++func expectNoEmptyInterfaceBindingWrapperCalls(t *testing.T, plugin *ACLConfigurator) {
++	t.Helper()
++	g := NewGomegaWithT(t)
++	logger, ok := plugin.Log.(*recordingLogger)
++	g.Expect(ok).To(BeTrue())
++	g.Expect(logger.emptyInterfaceListCalls()).To(Equal(0))
++}
++
++func uint32SliceToInterfaces(values []uint32) []interface{} {
++	out := make([]interface{}, 0, len(values))
++	for _, value := range values {
++		out = append(out, value)
++	}
++	return out
++}
++
++func TestModifyACLUpdatesOnlyChangedIngressBindings(t *testing.T) {
++	plugin, rec, cleanup := newModifyACLTestPlugin(t, map[string]uint32{
++		"ifA": 101,
++		"ifB": 102,
++		"ifC": 103,
++		"ifD": 104,
++	}, map[uint32]*aclapi.ACLInterfaceListDetails{
++		101: ingressACLDetails(101),
++		102: ingressACLDetails(102),
++		103: ingressACLDetails(103),
++	})
++	defer cleanup()
++
++	err := plugin.ModifyACL(
++		testACL([]string{"ifA", "ifB", "ifC"}, nil),
++		testACL([]string{"ifB", "ifC", "ifD"}, nil),
++	)
++
++	g := NewGomegaWithT(t)
++	g.Expect(err).To(Succeed())
++	g.Expect(rec.recordedErrors()).To(BeEmpty())
++	expectACLSetRequests(t, rec.recordedSetRequests(), map[uint32]aclSetRequest{
++		101: expectedUnset(101),
++		104: expectedIngressSet(104),
++	})
++}
++
++func TestModifyACLUpdatesOnlyChangedEgressBindings(t *testing.T) {
++	plugin, rec, cleanup := newModifyACLTestPlugin(t, map[string]uint32{
++		"ifA": 201,
++		"ifB": 202,
++		"ifE": 205,
++	}, map[uint32]*aclapi.ACLInterfaceListDetails{
++		201: egressACLDetails(201),
++		202: egressACLDetails(202),
++	})
++	defer cleanup()
++
++	err := plugin.ModifyACL(
++		testACL(nil, []string{"ifA", "ifB"}),
++		testACL(nil, []string{"ifB", "ifE"}),
++	)
++
++	g := NewGomegaWithT(t)
++	g.Expect(err).To(Succeed())
++	g.Expect(rec.recordedErrors()).To(BeEmpty())
++	expectACLSetRequests(t, rec.recordedSetRequests(), map[uint32]aclSetRequest{
++		201: expectedUnset(201),
++		205: expectedEgressSet(205),
++	})
++}
++
++func TestModifyACLMixedIngressEgressDiff(t *testing.T) {
++	plugin, rec, cleanup := newModifyACLTestPlugin(t, map[string]uint32{
++		"if1": 301,
++		"if2": 302,
++		"if3": 303,
++		"if4": 304,
++		"if5": 305,
++		"if6": 306,
++	}, map[uint32]*aclapi.ACLInterfaceListDetails{
++		301: ingressACLDetails(301),
++		302: ingressACLDetails(302),
++		304: egressACLDetails(304),
++		305: egressACLDetails(305),
++	})
++	defer cleanup()
++
++	err := plugin.ModifyACL(
++		testACL([]string{"if1", "if2"}, []string{"if4", "if5"}),
++		testACL([]string{"if2", "if3"}, []string{"if5", "if6"}),
++	)
++
++	g := NewGomegaWithT(t)
++	g.Expect(err).To(Succeed())
++	g.Expect(rec.recordedErrors()).To(BeEmpty())
++	expectACLSetRequests(t, rec.recordedSetRequests(), map[uint32]aclSetRequest{
++		301: expectedUnset(301),
++		303: expectedIngressSet(303),
++		304: expectedUnset(304),
++		306: expectedEgressSet(306),
++	})
++}
++
++func TestModifyACLSameBindingsSkipsInterfaceVPPCalls(t *testing.T) {
++	plugin, rec, cleanup := newModifyACLTestPlugin(t, map[string]uint32{
++		"if10": 410,
++		"if11": 411,
++		"if12": 412,
++		"if13": 413,
++	}, map[uint32]*aclapi.ACLInterfaceListDetails{
++		410: ingressACLDetails(410),
++		411: ingressACLDetails(411),
++		412: egressACLDetails(412),
++		413: egressACLDetails(413),
++	})
++	defer cleanup()
++
++	err := plugin.ModifyACL(
++		testACL([]string{"if10", "if11"}, []string{"if12", "if13"}),
++		testACL([]string{"if10", "if11"}, []string{"if12", "if13"}),
++	)
++
++	g := NewGomegaWithT(t)
++	g.Expect(err).To(Succeed())
++	g.Expect(rec.recordedErrors()).To(BeEmpty())
++	expectACLSetRequests(t, rec.recordedSetRequests(), map[uint32]aclSetRequest{})
++	expectNoEmptyInterfaceBindingWrapperCalls(t, plugin)
++}
++
++func TestModifyACLSameBindingSetDifferentOrderSkipsInterfaceVPPCalls(t *testing.T) {
++	plugin, rec, cleanup := newModifyACLTestPlugin(t, map[string]uint32{
++		"if20": 420,
++		"if21": 421,
++		"if22": 422,
++		"if23": 423,
++	}, map[uint32]*aclapi.ACLInterfaceListDetails{
++		420: ingressACLDetails(420),
++		421: ingressACLDetails(421),
++		422: egressACLDetails(422),
++		423: egressACLDetails(423),
++	})
++	defer cleanup()
++
++	err := plugin.ModifyACL(
++		testACL([]string{"if20", "if21"}, []string{"if22", "if23"}),
++		testACL([]string{"if21", "if20"}, []string{"if23", "if22"}),
++	)
++
++	g := NewGomegaWithT(t)
++	g.Expect(err).To(Succeed())
++	g.Expect(rec.recordedErrors()).To(BeEmpty())
++	expectACLSetRequests(t, rec.recordedSetRequests(), map[uint32]aclSetRequest{})
++	expectNoEmptyInterfaceBindingWrapperCalls(t, plugin)
++}
++
++func TestModifyACLNoEmptyBindingOperationsForOneSidedDiff(t *testing.T) {
++	tests := []struct {
++		name     string
++		names    map[string]uint32
++		initial  map[uint32]*aclapi.ACLInterfaceListDetails
++		oldACL   *acl.AccessLists_Acl
++		newACL   *acl.AccessLists_Acl
++		expected map[uint32]aclSetRequest
++	}{
++		{
++			name:  "ingress add without empty remove",
++			names: map[string]uint32{"if1": 501, "if2": 502},
++			initial: map[uint32]*aclapi.ACLInterfaceListDetails{
++				501: ingressACLDetails(501),
++			},
++			oldACL: testACL([]string{"if1"}, nil),
++			newACL: testACL([]string{"if1", "if2"}, nil),
++			expected: map[uint32]aclSetRequest{
++				502: expectedIngressSet(502),
++			},
++		},
++		{
++			name:  "egress remove without empty add",
++			names: map[string]uint32{"if3": 503, "if4": 504},
++			initial: map[uint32]*aclapi.ACLInterfaceListDetails{
++				503: egressACLDetails(503),
++				504: egressACLDetails(504),
++			},
++			oldACL: testACL(nil, []string{"if3", "if4"}),
++			newACL: testACL(nil, []string{"if4"}),
++			expected: map[uint32]aclSetRequest{
++				503: expectedUnset(503),
++			},
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			plugin, rec, cleanup := newModifyACLTestPlugin(t, tt.names, tt.initial)
++			defer cleanup()
++
++			err := plugin.ModifyACL(tt.oldACL, tt.newACL)
++
++			g := NewGomegaWithT(t)
++			g.Expect(err).To(Succeed())
++			g.Expect(rec.recordedErrors()).To(BeEmpty())
++			expectACLSetRequests(t, rec.recordedSetRequests(), tt.expected)
++			expectNoEmptyInterfaceBindingWrapperCalls(t, plugin)
++		})
++	}
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,31 @@
++#!/bin/bash
++set -uo pipefail
++
++cd /testbed
++
++
++set +u
++dev-switch go 1.23
++
++mkdir -p /root/go/src/github.com/ligato
++ln -sfn /testbed /root/go/src/github.com/ligato/vpp-agent
++
++export GOPATH=/root/go
++export GO111MODULE=off
++
++cd /root/go/src/github.com/ligato/vpp-agent
++set -u
++
++
++case "${1:-}" in
++	base)
++		go test -tags=mockvpp -count=1 ./plugins/defaultplugins/aclplugin/ -run '^$'
++		;;
++	new)
++		go test -tags=mockvpp -count=1 ./plugins/defaultplugins/aclplugin/ -run 'TestModifyACL(UpdatesOnlyChangedIngressBindings|UpdatesOnlyChangedEgressBindings|MixedIngressEgressDiff|SameBindingsSkipsInterfaceVPPCalls|SameBindingSetDifferentOrderSkipsInterfaceVPPCalls|NoEmptyBindingOperationsForOneSidedDiff)$'
++		;;
++	*)
++		echo "usage: $0 base|new"
++		exit 2
++		;;
++esac

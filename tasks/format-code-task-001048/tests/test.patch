@@ -1,0 +1,219 @@
+diff --git a/common/dynamicconfig/precedence_test.go b/common/dynamicconfig/precedence_test.go
+new file mode 100644
+index 000000000..08c5dbff5
+--- /dev/null
++++ b/common/dynamicconfig/precedence_test.go
+@@ -0,0 +1,203 @@
++package dynamicconfig_test
++
++import (
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/require"
++	enumspb "go.temporal.io/api/enums/v1"
++
++	dconf "go.temporal.io/server/common/dynamicconfig"
++	"go.temporal.io/server/common/log"
++)
++
++func TestClientSelectsMostSpecificMatchingConstraint(t *testing.T) {
++	client := dconf.NewMutableEphemeralClient()
++	key := dconf.MatchingGetTasksBatchSize
++
++	client.Add(key, 10)
++	client.Add(key, 20, dconf.ForNamespace("payments"))
++	client.Add(key, 30, dconf.ForNamespace("payments"), dconf.ForTaskQueueName("critical"))
++	client.Add(key, 40,
++		dconf.ForNamespace("payments"),
++		dconf.ForTaskQueueName("critical"),
++		workflowTaskTypeConstraint,
++	)
++
++	tests := []struct {
++		name    string
++		filters map[dconf.Filter]interface{}
++		want    int
++	}{
++		{
++			name: "all filters use most specific rule",
++			filters: map[dconf.Filter]interface{}{
++				dconf.Namespace:     "payments",
++				dconf.TaskQueueName: "critical",
++				dconf.TaskType:      enumspb.TASK_QUEUE_TYPE_WORKFLOW.String(),
++			},
++			want: 40,
++		},
++		{
++			name: "extra filter still allows subset rule",
++			filters: map[dconf.Filter]interface{}{
++				dconf.Namespace:     "payments",
++				dconf.TaskQueueName: "critical",
++				dconf.TaskType:      enumspb.TASK_QUEUE_TYPE_ACTIVITY.String(),
++			},
++			want: 30,
++		},
++		{
++			name: "namespace rule beats global default",
++			filters: map[dconf.Filter]interface{}{
++				dconf.Namespace:     "payments",
++				dconf.TaskQueueName: "other",
++			},
++			want: 20,
++		},
++		{
++			name: "global default handles another namespace",
++			filters: map[dconf.Filter]interface{}{
++				dconf.Namespace: "shipping",
++			},
++			want: 10,
++		},
++		{
++			name: "unknown extra filter is ignored",
++			filters: map[dconf.Filter]interface{}{
++				dconf.Namespace:   "payments",
++				dconf.Filter(999): "diagnostic-only",
++			},
++			want: 20,
++		},
++	}
++
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			got, err := client.GetIntValue(key, tc.filters, 99)
++			require.NoError(t, err)
++			require.Equal(t, tc.want, got)
++		})
++	}
++}
++
++func TestClientPreservesDeclarationOrderForEqualSpecificity(t *testing.T) {
++	client := dconf.NewMutableEphemeralClient()
++	key := dconf.MatchingMaxTaskBatchSize
++	client.Add(key, 111, dconf.ForNamespace("payments"))
++	client.Add(key, 222, dconf.ForNamespace("payments"))
++
++	got, err := client.GetIntValue(key, map[dconf.Filter]interface{}{
++		dconf.Namespace:     "payments",
++		dconf.TaskQueueName: "critical",
++	}, 99)
++	require.NoError(t, err)
++	require.Equal(t, 111, got)
++}
++
++func TestCollectionTaskQueuePrecedence(t *testing.T) {
++	client := dconf.NewMutableEphemeralClient()
++	client.Add(dconf.MatchingGetTasksBatchSize, 10)
++	client.Add(dconf.MatchingGetTasksBatchSize, 20, dconf.ForNamespace("payments"))
++	client.Add(dconf.MatchingGetTasksBatchSize, 30,
++		dconf.ForNamespace("payments"), dconf.ForTaskQueueName("critical"))
++	client.Add(dconf.MatchingGetTasksBatchSize, 40,
++		dconf.ForNamespace("payments"), dconf.ForTaskQueueName("critical"),
++		workflowTaskTypeConstraint)
++	collection := dconf.NewCollection(client, log.NewNoopLogger())
++	value := collection.GetIntPropertyFilteredByTaskQueueInfo(dconf.MatchingGetTasksBatchSize, 99)
++
++	tests := []struct {
++		name      string
++		namespace string
++		taskQueue string
++		taskType  enumspb.TaskQueueType
++		want      int
++	}{
++		{"task type override", "payments", "critical", enumspb.TASK_QUEUE_TYPE_WORKFLOW, 40},
++		{"task queue fallback", "payments", "critical", enumspb.TASK_QUEUE_TYPE_ACTIVITY, 30},
++		{"namespace fallback", "payments", "other", enumspb.TASK_QUEUE_TYPE_WORKFLOW, 20},
++		{"global fallback", "shipping", "other", enumspb.TASK_QUEUE_TYPE_WORKFLOW, 10},
++	}
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			require.Equal(t, tc.want, value(tc.namespace, tc.taskQueue, tc.taskType))
++		})
++	}
++}
++
++func TestCollectionIntPropertyPreservesExplicitZero(t *testing.T) {
++	client := dconf.NewMutableEphemeralClient()
++	collection := dconf.NewCollection(client, log.NewNoopLogger())
++
++	client.Add(dconf.MatchingGetTasksBatchSize, 7)
++	client.Add(dconf.MatchingGetTasksBatchSize, 5,
++		dconf.ForNamespace("payments"), dconf.ForTaskQueueName("critical"))
++	client.Add(dconf.MatchingGetTasksBatchSize, 0,
++		dconf.ForNamespace("payments"), dconf.ForTaskQueueName("critical"),
++		workflowTaskTypeConstraint)
++	intValue := collection.GetIntPropertyFilteredByTaskQueueInfo(dconf.MatchingGetTasksBatchSize, 0)
++	require.Equal(t, 0, intValue("payments", "critical", enumspb.TASK_QUEUE_TYPE_WORKFLOW))
++}
++
++func TestCollectionDurationPropertyPreservesExplicitZero(t *testing.T) {
++	client := dconf.NewMutableEphemeralClient()
++	collection := dconf.NewCollection(client, log.NewNoopLogger())
++	client.Add(dconf.MatchingSyncMatchWaitDuration, 9*time.Second)
++	client.Add(dconf.MatchingSyncMatchWaitDuration, 2*time.Second,
++		dconf.ForNamespace("payments"), dconf.ForTaskQueueName("critical"))
++	client.Add(dconf.MatchingSyncMatchWaitDuration, 0,
++		dconf.ForNamespace("payments"), dconf.ForTaskQueueName("critical"),
++		workflowTaskTypeConstraint)
++	durationValue := collection.GetDurationPropertyFilteredByTaskQueueInfo(dconf.MatchingSyncMatchWaitDuration, 0)
++	require.Equal(t, time.Duration(0), durationValue("payments", "critical", enumspb.TASK_QUEUE_TYPE_WORKFLOW))
++}
++
++func TestCollectionBoolPropertyPreservesExplicitFalse(t *testing.T) {
++	client := dconf.NewMutableEphemeralClient()
++	collection := dconf.NewCollection(client, log.NewNoopLogger())
++	client.Add(dconf.EnableStickyQuery, true)
++	client.Add(dconf.EnableStickyQuery, true,
++		dconf.ForNamespace("payments"), dconf.ForTaskQueueName("critical"))
++	client.Add(dconf.EnableStickyQuery, false,
++		dconf.ForNamespace("payments"), dconf.ForTaskQueueName("critical"),
++		workflowTaskTypeConstraint)
++	boolValue := collection.GetBoolPropertyFilteredByTaskQueueInfo(dconf.EnableStickyQuery, false)
++	require.False(t, boolValue("payments", "critical", enumspb.TASK_QUEUE_TYPE_WORKFLOW))
++}
++
++func TestCollectionFloatPropertyPreservesExplicitZero(t *testing.T) {
++	client := dconf.NewMutableEphemeralClient()
++	collection := dconf.NewCollection(client, log.NewNoopLogger())
++	client.Add(dconf.AdminMatchingNamespaceTaskqueueToPartitionDispatchRate, 9.0)
++	client.Add(dconf.AdminMatchingNamespaceTaskqueueToPartitionDispatchRate, 2.0,
++		dconf.ForNamespace("payments"), dconf.ForTaskQueueName("critical"))
++	client.Add(dconf.AdminMatchingNamespaceTaskqueueToPartitionDispatchRate, 0.0,
++		dconf.ForNamespace("payments"), dconf.ForTaskQueueName("critical"),
++		workflowTaskTypeConstraint)
++	floatValue := collection.GetFloatPropertyFilteredByTaskQueueInfo(dconf.AdminMatchingNamespaceTaskqueueToPartitionDispatchRate, 0)
++	require.Equal(t, 0.0, floatValue("payments", "critical", enumspb.TASK_QUEUE_TYPE_WORKFLOW))
++}
++
++func TestForTaskTypeInteroperatesWithTaskQueuePropertyGetter(t *testing.T) {
++	client := dconf.NewMutableEphemeralClient()
++	client.Add(dconf.MatchingGetTasksBatchSize, 44,
++		dconf.ForNamespace("payments"), dconf.ForTaskQueueName("critical"),
++		dconf.ForTaskType(int(enumspb.TASK_QUEUE_TYPE_WORKFLOW)))
++	collection := dconf.NewCollection(client, log.NewNoopLogger())
++	value := collection.GetIntPropertyFilteredByTaskQueueInfo(dconf.MatchingGetTasksBatchSize, 99)
++	require.Equal(t, 44, value("payments", "critical", enumspb.TASK_QUEUE_TYPE_WORKFLOW))
++}
++
++func TestClientReportsMissingKeyWhileReturningCallerDefault(t *testing.T) {
++	client := dconf.NewMutableEphemeralClient()
++	got, err := client.GetIntValue(dconf.MatchingMaxTaskBatchSize, map[dconf.Filter]interface{}{
++		dconf.Namespace: "payments",
++	}, 123)
++	require.Error(t, err)
++	require.Equal(t, 123, got)
++}
++
++func workflowTaskTypeConstraint(constraints map[string]interface{}) {
++	constraints[dconf.TaskType.String()] = enumspb.TASK_QUEUE_TYPE_WORKFLOW.String()
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,5 @@
++#!/bin/bash
++set -euo pipefail
++
++
++go test ./common/dynamicconfig

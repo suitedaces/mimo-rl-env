@@ -1,0 +1,524 @@
+diff --git a/usercase-test-coderl/test_base_discovery.py b/usercase-test-coderl/test_base_discovery.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/test_base_discovery.py
+@@ -0,0 +1,490 @@
++import random
++
++import pytest
++
++from singularity.code import data, difficulty, g
++from singularity.code import player as player_mod
++from singularity.code.base import Base
++from singularity.code.dirs import create_directories
++from singularity.code.logmessage import LogBaseLostMaintenance
++from singularity.code.player import Player
++
++
++class MockMapScreen(object):
++    def __init__(self):
++        self.needs_rebuild = False
++        self.messages = []
++        self.story_sections = []
++        self.find_speed_button_calls = 0
++
++    def find_speed_button(self):
++        self.find_speed_button_calls += 1
++
++    def show_message(self, message, color="text"):
++        self.messages.append((message, color))
++
++    def show_story_section(self, name):
++        self.story_sections.append(name)
++
++
++def setup_module():
++    g.no_gui()
++    create_directories(True)
++    data.reload_all()
++
++
++@pytest.fixture(autouse=True)
++def isolated_world(monkeypatch):
++    random.seed(8675309)
++    g.curr_speed = 3
++    g.map_screen = MockMapScreen()
++    monkeypatch.setattr(g, "events", {})
++
++
++def make_player(cash=0):
++    pl = Player(cash=cash, difficulty=difficulty.difficulties["normal"])
++    g.pl = pl
++    pl.initialize()
++    return pl
++
++
++def add_completed_base(pl, name, location_id="N AMERICA", base_type_id="Stolen Computer Time"):
++    base = Base(name, g.base_type[base_type_id], built=True)
++    pl.locations[location_id].add_base(base)
++    pl.recalc_cpu()
++    return base
++
++
++def leave_global_grace(pl, *bases):
++    pl.raw_sec = 23 * g.seconds_per_day
++    pl.update_times()
++    pl.had_grace = False
++    for base in bases:
++        base.grace_over = True
++
++
++def suspicion_snapshot(pl):
++    return {group_id: group.suspicion for group_id, group in pl.groups.items()}
++
++
++def expected_detection_rolls(base, seconds):
++    return sorted((chance / 10000.0, seconds) for chance in base.get_detect_chance().values())
++
++
++def assert_rolls_use_base_detection_chances(roll_calls, expected_rolls):
++
++    expected = set(expected_rolls)
++    assert roll_calls
++    assert all(call in expected for call in roll_calls)
++
++
++def assert_only_suspicion_changed(pl, before, group_id, discoveries=1):
++
++    expected = before.copy()
++    expected[group_id] += pl.groups[group_id].discover_suspicion * discoveries
++    assert suspicion_snapshot(pl) == expected
++
++
++def entry_text(entry):
++    parts = [
++        getattr(entry, "log_line", ""),
++        getattr(entry, "full_message", ""),
++    ]
++    if hasattr(entry, "serialize_obj"):
++        parts.extend(str(value) for value in entry.serialize_obj().values())
++    return " ".join(parts)
++
++
++def assert_contains_any_identifier(text, *identifiers):
++    text = text.lower()
++    assert any(str(identifier).lower() in text for identifier in identifiers if identifier)
++
++
++def discovery_log_identifies(entry, base_name, base_type, location, group):
++    text = entry_text(entry)
++    return all(
++        any(str(identifier).lower() in text.lower() for identifier in identifiers if identifier)
++        for identifiers in (
++            (base_name,),
++            (base_type.name, base_type.id),
++            (location.name, location.id),
++            (group.name, group.id),
++        )
++    )
++
++
++def assert_discovery_log_identifies(entry, base_name, base_type, location, group):
++
++    text = entry_text(entry)
++    assert_contains_any_identifier(text, base_name)
++    assert_contains_any_identifier(text, base_type.name, base_type.id)
++    assert_contains_any_identifier(text, location.name, location.id)
++    assert_contains_any_identifier(text, group.name, group.id)
++
++
++def assert_red_message_mentions_base(message, base_name):
++
++    text, color = message
++    assert color == "red"
++    assert base_name in text
++
++
++def test_successful_discovery_removes_base_logs_red_message_and_updates_state(monkeypatch):
++
++
++
++
++    pl = make_player()
++    base = add_completed_base(pl, "Alpha Node")
++    assert pl.raw_sec == 0
++    assert pl.raw_day == 0
++    assert len(pl.locations["N AMERICA"].bases) == 1
++    assert len(list(g.all_bases())) == 1
++    assert pl.available_cpus == [1, 0, 0, 0, 0]
++    assert pl.effective_cpu_pool() == 1
++    assert len(pl.log) == 0
++    assert pl.last_discovery is None
++    assert pl.prev_discovery is None
++    assert all(suspicion == 0 for suspicion in suspicion_snapshot(pl).values())
++    winning_group = "covert"
++    winning_chance = base.get_detect_chance()[winning_group] / 10000.0
++    expected_rolls = expected_detection_rolls(base, 60)
++    before_suspicion = suspicion_snapshot(pl)
++    base_type = base.spec
++    location = base.location
++    group = pl.groups[winning_group]
++
++    leave_global_grace(pl, base)
++    roll_calls = []
++
++    def selected_group_roll_wins(chance_per_day, seconds=g.seconds_per_day):
++        roll_calls.append((chance_per_day, seconds))
++        return chance_per_day == winning_chance
++
++    monkeypatch.setattr(player_mod.chance, "roll_interval", selected_group_roll_wins)
++
++    assert pl.give_time(60, midnight_stop=True) == 1
++    assert_rolls_use_base_detection_chances(roll_calls, expected_rolls)
++    assert (winning_chance, 60) in roll_calls
++    assert pl.raw_sec == 1987260
++    assert pl.raw_day == 23
++    assert len(pl.locations["N AMERICA"].bases) == 0
++    assert len(list(g.all_bases())) == 0
++    assert pl.available_cpus == [0, 0, 0, 0, 0]
++    assert pl.effective_cpu_pool() == 0
++    assert g.curr_speed == 0
++    assert g.map_screen.needs_rebuild is True
++    assert g.map_screen.find_speed_button_calls == 1
++    assert pl.last_discovery.id == "N AMERICA"
++    assert pl.prev_discovery is None
++    assert_only_suspicion_changed(pl, before_suspicion, winning_group)
++    assert len(pl.log) == 1
++    assert_discovery_log_identifies(pl.log[0], "Alpha Node", base_type, location, group)
++    assert len(g.map_screen.messages) == 1
++    assert_red_message_mentions_base(g.map_screen.messages[0], "Alpha Node")
++
++
++def test_no_discovery_rolls_each_group_and_preserves_state(monkeypatch):
++
++
++
++
++    pl = make_player()
++    base = add_completed_base(pl, "Quiet Node")
++    leave_global_grace(pl, base)
++    before_suspicion = suspicion_snapshot(pl)
++    roll_calls = []
++
++    def no_roll_wins(chance_per_day, seconds=g.seconds_per_day):
++        roll_calls.append((chance_per_day, seconds))
++        return False
++
++    monkeypatch.setattr(player_mod.chance, "roll_interval", no_roll_wins)
++
++    assert pl.give_time(60, midnight_stop=True) == 1
++
++    assert sorted(roll_calls) == expected_detection_rolls(base, 60)
++    assert pl.raw_sec == 1987260
++    assert pl.raw_day == 23
++    assert len(pl.locations["N AMERICA"].bases) == 1
++    assert len(list(g.all_bases())) == 1
++    assert pl.available_cpus == [1, 0, 0, 0, 0]
++    assert pl.effective_cpu_pool() == 1
++    assert g.curr_speed == 3
++    assert g.map_screen.needs_rebuild is False
++    assert g.map_screen.find_speed_button_calls == 0
++    assert len(pl.log) == 0
++    assert g.map_screen.messages == []
++    assert pl.last_discovery is None
++    assert pl.prev_discovery is None
++    assert suspicion_snapshot(pl) == before_suspicion
++
++
++def test_global_grace_blocks_discovery_rolls(monkeypatch):
++
++
++
++
++    pl = make_player()
++    base = add_completed_base(pl, "Protected Node")
++    base.grace_over = True
++    roll_calls = []
++
++    def no_roll_wins(chance_per_day, seconds=g.seconds_per_day):
++        roll_calls.append((chance_per_day, seconds))
++        return False
++
++    monkeypatch.setattr(player_mod.chance, "roll_interval", no_roll_wins)
++
++    assert pl.give_time(60, midnight_stop=True) == 1
++    assert roll_calls == []
++    assert pl.raw_sec == 60
++    assert pl.raw_day == 0
++    assert len(pl.locations["N AMERICA"].bases) == 1
++    assert len(list(g.all_bases())) == 1
++    assert pl.available_cpus == [1, 0, 0, 0, 0]
++    assert pl.effective_cpu_pool() == 1
++    assert len(pl.log) == 0
++    assert pl.last_discovery is None
++    assert pl.prev_discovery is None
++    assert all(suspicion == 0 for suspicion in suspicion_snapshot(pl).values())
++
++
++def test_base_construction_grace_blocks_discovery_rolls(monkeypatch):
++
++
++
++
++    pl = make_player(cash=100000)
++    base = add_completed_base(pl, "Young Storage", base_type_id="Storage Unit")
++    pl.raw_sec = 23 * g.seconds_per_day
++    pl.update_times()
++    pl.had_grace = False
++    base.grace_over = False
++    base.started_at = pl.raw_min
++    roll_calls = []
++
++    def no_roll_wins(chance_per_day, seconds=g.seconds_per_day):
++        roll_calls.append((chance_per_day, seconds))
++        return False
++
++    monkeypatch.setattr(player_mod.chance, "roll_interval", no_roll_wins)
++
++    assert pl.give_time(60, midnight_stop=True) == 1
++    assert roll_calls == []
++    assert base.grace_over is False
++    assert pl.raw_sec == 1987260
++    assert pl.raw_day == 23
++    assert len(pl.locations["N AMERICA"].bases) == 1
++    assert len(list(g.all_bases())) == 1
++    assert pl.available_cpus == [0, 0, 0, 0, 0]
++    assert pl.effective_cpu_pool() == 0
++    assert len(pl.log) == 0
++    assert pl.last_discovery is None
++    assert pl.prev_discovery is None
++    assert all(suspicion == 0 for suspicion in suspicion_snapshot(pl).values())
++
++
++def test_multiple_discoveries_track_most_recent_and_previous_locations(monkeypatch):
++
++
++
++
++    pl = make_player()
++    base_a = add_completed_base(pl, "Alpha Node", "N AMERICA")
++    base_b = add_completed_base(pl, "Beta Node", "EUROPE")
++    winning_group = "covert"
++    winning_chance = base_a.get_detect_chance()[winning_group] / 10000.0
++    before_suspicion = suspicion_snapshot(pl)
++    expected_logs = [
++        ("Alpha Node", base_a.spec, base_a.location, pl.groups[winning_group]),
++        ("Beta Node", base_b.spec, base_b.location, pl.groups[winning_group]),
++    ]
++    leave_global_grace(pl, base_a, base_b)
++    roll_calls = []
++
++    def selected_group_roll_wins(chance_per_day, seconds=g.seconds_per_day):
++        roll_calls.append((chance_per_day, seconds))
++        return chance_per_day == winning_chance
++
++    monkeypatch.setattr(player_mod.chance, "roll_interval", selected_group_roll_wins)
++    monkeypatch.setattr(player_mod.random, "shuffle", lambda values: None)
++
++    assert pl.give_time(60, midnight_stop=True) == 1
++    assert roll_calls.count((winning_chance, 60)) == 2
++    assert all(seconds == 60 for _, seconds in roll_calls)
++    assert len(pl.locations["N AMERICA"].bases) == 0
++    assert len(pl.locations["EUROPE"].bases) == 0
++    assert len(list(g.all_bases())) == 0
++    assert pl.available_cpus == [0, 0, 0, 0, 0]
++    assert pl.effective_cpu_pool() == 0
++    assert g.curr_speed == 0
++    assert g.map_screen.needs_rebuild is True
++    assert g.map_screen.find_speed_button_calls == 2
++
++    assert pl.last_discovery is not None
++    assert pl.prev_discovery is not None
++    assert {pl.last_discovery.id, pl.prev_discovery.id} == {"N AMERICA", "EUROPE"}
++    assert pl.last_discovery.id != pl.prev_discovery.id
++    assert_only_suspicion_changed(pl, before_suspicion, winning_group, discoveries=2)
++    assert len(pl.log) == 2
++    for expected in expected_logs:
++        assert any(
++            discovery_log_identifies(entry, *expected)
++            for entry in pl.log
++        )
++    assert len(g.map_screen.messages) == 2
++    for base_name in ("Alpha Node", "Beta Node"):
++        assert any(
++            color == "red" and base_name in message
++            for message, color in g.map_screen.messages
++        )
++
++
++def test_maintenance_destruction_prevents_same_tick_discovery(monkeypatch):
++
++
++
++
++    pl = make_player()
++    base = add_completed_base(pl, "Starved Storage", base_type_id="Storage Unit")
++    leave_global_grace(pl, base)
++    detection_rolls = set(expected_detection_rolls(base, g.seconds_per_day))
++    roll_calls = []
++
++    def maintenance_roll_wins(chance_per_day, seconds=g.seconds_per_day):
++        roll_calls.append((chance_per_day, seconds))
++        return True
++
++    monkeypatch.setattr(player_mod.chance, "roll_interval", maintenance_roll_wins)
++
++    assert pl.give_time(g.seconds_per_day, midnight_stop=True) == 1440
++
++    assert roll_calls
++    assert not any(call in detection_rolls for call in roll_calls)
++    assert pl.raw_sec == 2073600
++    assert pl.raw_day == 24
++    assert len(pl.locations["N AMERICA"].bases) == 0
++    assert len(list(g.all_bases())) == 0
++    assert pl.available_cpus == [0, 0, 0, 0, 0]
++    assert pl.effective_cpu_pool() == 0
++    assert g.curr_speed == 0
++    assert g.map_screen.needs_rebuild is True
++    assert g.map_screen.find_speed_button_calls == 1
++    assert pl.last_discovery is None
++    assert pl.prev_discovery is None
++    assert all(suspicion == 0 for suspicion in suspicion_snapshot(pl).values())
++    assert len(pl.log) == 1
++    assert isinstance(pl.log[0], LogBaseLostMaintenance)
++    assert "discover" not in entry_text(pl.log[0]).lower()
++    assert len(g.map_screen.messages) == 1
++    assert g.map_screen.messages[0][1] == "red"
++    assert "discover" not in g.map_screen.messages[0][0].lower()
++
++
++def test_zero_elapsed_time_does_not_trigger_discovery_rolls(monkeypatch):
++
++
++
++
++
++    pl = make_player()
++    base = add_completed_base(pl, "Still Node")
++    leave_global_grace(pl, base)
++    before_suspicion = suspicion_snapshot(pl)
++    roll_calls = []
++
++    def no_roll_wins(chance_per_day, seconds=g.seconds_per_day):
++        roll_calls.append((chance_per_day, seconds))
++        return True
++
++    monkeypatch.setattr(player_mod.chance, "roll_interval", no_roll_wins)
++
++    assert pl.give_time(0, midnight_stop=True) == 0
++    assert roll_calls == []
++    assert len(pl.locations["N AMERICA"].bases) == 1
++    assert len(list(g.all_bases())) == 1
++    assert pl.last_discovery is None
++    assert pl.prev_discovery is None
++    assert len(pl.log) == 0
++    assert g.map_screen.messages == []
++    assert suspicion_snapshot(pl) == before_suspicion
++
++
++def test_repeated_non_discovery_ticks_preserve_base_and_do_not_accumulate_suspicion(monkeypatch):
++
++
++
++
++
++    pl = make_player()
++    base = add_completed_base(pl, "Persistent Node")
++    leave_global_grace(pl, base)
++    before_suspicion = suspicion_snapshot(pl)
++    roll_calls = []
++
++    def no_roll_wins(chance_per_day, seconds=g.seconds_per_day):
++        roll_calls.append((chance_per_day, seconds))
++        return False
++
++    monkeypatch.setattr(player_mod.chance, "roll_interval", no_roll_wins)
++
++    assert pl.give_time(60, midnight_stop=True) == 1
++    assert pl.give_time(60, midnight_stop=True) == 1
++
++    assert sorted(roll_calls) == sorted(expected_detection_rolls(base, 60) * 2)
++    assert len(pl.locations["N AMERICA"].bases) == 1
++    assert len(list(g.all_bases())) == 1
++    assert len(pl.log) == 0
++    assert g.map_screen.messages == []
++    assert pl.last_discovery is None
++    assert pl.prev_discovery is None
++    assert suspicion_snapshot(pl) == before_suspicion
++
++
++def test_two_player_instances_keep_discovery_state_independent(monkeypatch):
++
++
++
++
++    player_a = make_player()
++    base_a = add_completed_base(player_a, "Alpha Node")
++    winning_group = "covert"
++    winning_chance = base_a.get_detect_chance()[winning_group] / 10000.0
++    expected_rolls = expected_detection_rolls(base_a, 60)
++    before_a_suspicion = suspicion_snapshot(player_a)
++    leave_global_grace(player_a, base_a)
++
++    player_b = make_player()
++    assert len(player_b.locations["N AMERICA"].bases) == 0
++    assert player_b.last_discovery is None
++    assert player_b.prev_discovery is None
++    assert all(suspicion == 0 for suspicion in suspicion_snapshot(player_b).values())
++
++    g.pl = player_a
++    roll_calls = []
++
++    def selected_group_roll_wins(chance_per_day, seconds=g.seconds_per_day):
++        roll_calls.append((chance_per_day, seconds))
++        return chance_per_day == winning_chance
++
++    monkeypatch.setattr(player_mod.chance, "roll_interval", selected_group_roll_wins)
++    assert player_a.give_time(60, midnight_stop=True) == 1
++    assert_rolls_use_base_detection_chances(roll_calls, expected_rolls)
++    assert (winning_chance, 60) in roll_calls
++    assert len(player_a.locations["N AMERICA"].bases) == 0
++    assert player_a.last_discovery.id == "N AMERICA"
++    assert player_a.prev_discovery is None
++    assert_only_suspicion_changed(player_a, before_a_suspicion, winning_group)
++
++    g.pl = player_b
++    assert player_b.raw_sec == 0
++    assert player_b.raw_day == 0
++    assert len(player_b.locations["N AMERICA"].bases) == 0
++    assert len(list(g.all_bases())) == 0
++    assert player_b.available_cpus == [0, 0, 0, 0, 0]
++    assert player_b.effective_cpu_pool() == 0
++    assert len(player_b.log) == 0
++    assert player_b.last_discovery is None
++    assert player_b.prev_discovery is None
++    assert all(suspicion == 0 for suspicion in suspicion_snapshot(player_b).values())
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,24 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++cd /workspace/repo
++
++
++
++
++export PYTHONPATH="/workspace/repo${PYTHONPATH:+:${PYTHONPATH}}"
++export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
++export PIP_NO_INDEX=1
++export PIP_DISABLE_PIP_VERSION_CHECK=1
++export PYGAME_HIDE_SUPPORT_PROMPT=1
++
++exec python3 -m pytest /workspace/repo/usercase-test-coderl/test_base_discovery.py -v

@@ -1,0 +1,409 @@
+diff --git a/internal/controller/postgrescluster/databaseinitsql_test.go b/internal/controller/postgrescluster/databaseinitsql_test.go
+new file mode 100644
+index 000000000..5a0c1cb8e
+--- /dev/null
++++ b/internal/controller/postgrescluster/databaseinitsql_test.go
+@@ -0,0 +1,278 @@
++// +build envtest
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++package postgrescluster
++
++import (
++	"context"
++	"io"
++	"strings"
++	"testing"
++
++	"gotest.tools/v3/assert"
++	appsv1 "k8s.io/api/apps/v1"
++	corev1 "k8s.io/api/core/v1"
++	apierrors "k8s.io/apimachinery/pkg/api/errors"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/labels"
++
++	"github.com/crunchydata/postgres-operator/internal/naming"
++	"github.com/crunchydata/postgres-operator/pkg/apis/postgres-operator.crunchydata.com/v1beta1"
++)
++
++
++
++
++func writableObservedInstance(namespace string) *observedInstances {
++	return &observedInstances{forCluster: []*Instance{
++		{
++			Name: "instance",
++			Pods: []*corev1.Pod{{
++				ObjectMeta: metav1.ObjectMeta{
++					Namespace: namespace,
++					Name:      "pod",
++					Annotations: map[string]string{
++						"status": `{"role":"master"}`,
++					},
++				},
++				Status: corev1.PodStatus{
++					ContainerStatuses: []corev1.ContainerStatus{{
++						Name: naming.ContainerDatabase,
++						State: corev1.ContainerState{
++							Running: new(corev1.ContainerStateRunning),
++						},
++					}},
++				},
++			}},
++			Runner: &appsv1.StatefulSet{},
++		},
++	}}
++}
++
++func TestReconcileDatabaseInitSQLStatusHandling(t *testing.T) {
++	ctx := context.Background()
++	var called bool
++
++	env, tClient, _ := setupTestEnv(t, ControllerName)
++	t.Cleanup(func() { teardownTestEnv(t, env) })
++
++	r := &Reconciler{
++		Client: tClient,
++		PodExec: func(namespace, pod, container string, stdin io.Reader, stdout,
++			stderr io.Writer, command ...string) error {
++			called = true
++			return nil
++		},
++	}
++
++	ns := &corev1.Namespace{}
++	ns.GenerateName = "postgres-operator-test-"
++	ns.Labels = labels.Set{"postgres-operator-test": ""}
++	assert.NilError(t, tClient.Create(ctx, ns))
++	t.Cleanup(func() { assert.Check(t, tClient.Delete(ctx, ns)) })
++
++	observed := writableObservedInstance(ns.Name)
++
++
++	path := "init.sql"
++	cm := corev1.ConfigMap{
++		ObjectMeta: metav1.ObjectMeta{
++			Name:      "test-cm",
++			Namespace: ns.Name,
++		},
++		Data: map[string]string{path: "SELECT 1;"},
++	}
++	assert.NilError(t, tClient.Create(ctx, cm.DeepCopy()))
++
++	base := testCluster()
++	base.Namespace = ns.Name
++	base.Spec.DatabaseInitSQL = &v1beta1.DatabaseInitSQL{
++		Name: cm.Name,
++		Key:  path,
++	}
++
++	applied := "already-applied"
++
++	t.Run("spec absent clears status", func(t *testing.T) {
++		called = false
++		cluster := base.DeepCopy()
++		cluster.Spec.DatabaseInitSQL = nil
++		cluster.Status.DatabaseInitSQL = &applied
++
++		assert.NilError(t, r.reconcileDatabaseInitSQL(ctx, cluster, observed))
++		assert.Assert(t, !called, "SQL must not be executed when spec is absent")
++		assert.Assert(t, cluster.Status.DatabaseInitSQL == nil,
++			"status must be cleared when spec is absent")
++	})
++
++	t.Run("spec absent and status already nil", func(t *testing.T) {
++		called = false
++		cluster := base.DeepCopy()
++		cluster.Spec.DatabaseInitSQL = nil
++
++		assert.NilError(t, r.reconcileDatabaseInitSQL(ctx, cluster, observed))
++		assert.Assert(t, !called)
++		assert.Assert(t, cluster.Status.DatabaseInitSQL == nil)
++	})
++
++	t.Run("already applied is a no-op", func(t *testing.T) {
++		called = false
++		cluster := base.DeepCopy()
++		cluster.Status.DatabaseInitSQL = &applied
++
++		assert.NilError(t, r.reconcileDatabaseInitSQL(ctx, cluster, observed))
++		assert.Assert(t, !called, "SQL must not run again once status is set")
++		assert.Assert(t, cluster.Status.DatabaseInitSQL != nil)
++		assert.Equal(t, *cluster.Status.DatabaseInitSQL, applied,
++			"status must be left unchanged when already applied")
++	})
++
++	t.Run("no writable instance", func(t *testing.T) {
++		called = false
++		cluster := base.DeepCopy()
++
++
++
++		replica := &observedInstances{forCluster: []*Instance{
++			{
++				Name: "replica",
++				Pods: []*corev1.Pod{{
++					ObjectMeta: metav1.ObjectMeta{
++						Namespace: ns.Name,
++						Name:      "replica-pod",
++						Annotations: map[string]string{
++							"status": `{"role":"replica"}`,
++						},
++					},
++					Status: corev1.PodStatus{
++						ContainerStatuses: []corev1.ContainerStatus{{
++							Name: naming.ContainerDatabase,
++							State: corev1.ContainerState{
++								Running: new(corev1.ContainerStateRunning),
++							},
++						}},
++					},
++				}},
++				Runner: &appsv1.StatefulSet{},
++			},
++		}}
++
++		assert.NilError(t, r.reconcileDatabaseInitSQL(ctx, cluster, replica))
++		assert.Assert(t, !called, "SQL cannot run without a writable instance")
++		assert.Assert(t, cluster.Status.DatabaseInitSQL == nil,
++			"status must stay unset so it is retried later")
++	})
++
++	t.Run("applies and records status on success", func(t *testing.T) {
++		called = false
++		cluster := base.DeepCopy()
++
++		assert.NilError(t, r.reconcileDatabaseInitSQL(ctx, cluster, observed))
++		assert.Assert(t, called, "SQL must be executed against the writable pod")
++		assert.Assert(t, cluster.Status.DatabaseInitSQL != nil,
++			"status must be recorded after a successful run")
++	})
++}
++
++func TestReconcileDatabaseInitSQLConfigMapErrors(t *testing.T) {
++	ctx := context.Background()
++	var called bool
++
++	env, tClient, _ := setupTestEnv(t, ControllerName)
++	t.Cleanup(func() { teardownTestEnv(t, env) })
++
++	r := &Reconciler{
++		Client: tClient,
++		PodExec: func(namespace, pod, container string, stdin io.Reader, stdout,
++			stderr io.Writer, command ...string) error {
++			called = true
++			return nil
++		},
++	}
++
++	ns := &corev1.Namespace{}
++	ns.GenerateName = "postgres-operator-test-"
++	ns.Labels = labels.Set{"postgres-operator-test": ""}
++	assert.NilError(t, tClient.Create(ctx, ns))
++	t.Cleanup(func() { assert.Check(t, tClient.Delete(ctx, ns)) })
++
++	observed := writableObservedInstance(ns.Name)
++
++	base := testCluster()
++	base.Namespace = ns.Name
++
++	t.Run("configmap not found", func(t *testing.T) {
++		called = false
++		cluster := base.DeepCopy()
++		cluster.Spec.DatabaseInitSQL = &v1beta1.DatabaseInitSQL{
++			Name: "does-not-exist",
++			Key:  "init.sql",
++		}
++
++		err := r.reconcileDatabaseInitSQL(ctx, cluster, observed)
++		assert.Assert(t, apierrors.IsNotFound(err), "expected a not-found error, got: %v", err)
++		assert.Assert(t, !called)
++		assert.Assert(t, cluster.Status.DatabaseInitSQL == nil)
++	})
++
++	t.Run("missing key", func(t *testing.T) {
++		called = false
++		cm := &corev1.ConfigMap{
++			ObjectMeta: metav1.ObjectMeta{
++				Name:      "no-key",
++				Namespace: ns.Name,
++			},
++		}
++		assert.NilError(t, tClient.Create(ctx, cm))
++
++		cluster := base.DeepCopy()
++		cluster.Spec.DatabaseInitSQL = &v1beta1.DatabaseInitSQL{
++			Name: cm.Name,
++			Key:  "missing-key",
++		}
++
++		err := r.reconcileDatabaseInitSQL(ctx, cluster, observed)
++		assert.Assert(t, err != nil, "expected an error for the missing key")
++		assert.Assert(t, strings.Contains(err.Error(), "missing-key"),
++			"error must identify the missing key, got: %v", err)
++		assert.Assert(t, !called)
++		assert.Assert(t, cluster.Status.DatabaseInitSQL == nil)
++	})
++
++	t.Run("found with data", func(t *testing.T) {
++		called = false
++		path := "init.sql"
++		cm := &corev1.ConfigMap{
++			ObjectMeta: metav1.ObjectMeta{
++				Name:      "with-data",
++				Namespace: ns.Name,
++			},
++			Data: map[string]string{path: "SELECT 1;"},
++		}
++		assert.NilError(t, tClient.Create(ctx, cm))
++
++		cluster := base.DeepCopy()
++		cluster.Spec.DatabaseInitSQL = &v1beta1.DatabaseInitSQL{
++			Name: cm.Name,
++			Key:  path,
++		}
++
++		assert.NilError(t, r.reconcileDatabaseInitSQL(ctx, cluster, observed))
++		assert.Assert(t, called)
++		assert.Assert(t, cluster.Status.DatabaseInitSQL != nil)
++	})
++}
+diff --git a/pkg/apis/postgres-operator.crunchydata.com/v1beta1/databaseinitsql_test.go b/pkg/apis/postgres-operator.crunchydata.com/v1beta1/databaseinitsql_test.go
+new file mode 100644
+index 000000000..add135ced
+--- /dev/null
++++ b/pkg/apis/postgres-operator.crunchydata.com/v1beta1/databaseinitsql_test.go
+@@ -0,0 +1,88 @@
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++package v1beta1
++
++import (
++	"strings"
++	"testing"
++
++	"gotest.tools/v3/assert"
++	"sigs.k8s.io/yaml"
++)
++
++
++
++
++func TestDatabaseInitSQLSpecField(t *testing.T) {
++	var cluster PostgresCluster
++	cluster.Spec.DatabaseInitSQL = &DatabaseInitSQL{
++		Name: "my-config-map",
++		Key:  "init.sql",
++	}
++
++	b, err := yaml.Marshal(cluster.Spec.DatabaseInitSQL)
++	assert.NilError(t, err)
++	assert.DeepEqual(t, string(b), "key: init.sql\nname: my-config-map\n")
++
++
++	specYAML, err := yaml.Marshal(cluster.Spec)
++	assert.NilError(t, err)
++	assert.Assert(t, strings.Contains(string(specYAML), "databaseInitSQL:"))
++}
++
++
++
++func TestDatabaseInitSQLStatusField(t *testing.T) {
++	var cluster PostgresCluster
++
++
++	statusYAML, err := yaml.Marshal(cluster.Status)
++	assert.NilError(t, err)
++	assert.Assert(t, !strings.Contains(string(statusYAML), "databaseInitSQL"))
++
++
++	applied := "my-config-map"
++	cluster.Status.DatabaseInitSQL = &applied
++	statusYAML, err = yaml.Marshal(cluster.Status)
++	assert.NilError(t, err)
++	assert.Assert(t, strings.Contains(string(statusYAML), "databaseInitSQL: my-config-map"))
++}
++
++
++
++func TestDatabaseInitSQLDeepCopy(t *testing.T) {
++	cluster := &PostgresCluster{}
++	cluster.Spec.DatabaseInitSQL = &DatabaseInitSQL{
++		Name: "original-name",
++		Key:  "original-key",
++	}
++	applied := "original-status"
++	cluster.Status.DatabaseInitSQL = &applied
++
++	out := cluster.DeepCopy()
++
++
++	assert.Assert(t, out.Spec.DatabaseInitSQL != cluster.Spec.DatabaseInitSQL)
++	assert.Equal(t, *out.Spec.DatabaseInitSQL, *cluster.Spec.DatabaseInitSQL)
++	assert.Assert(t, out.Status.DatabaseInitSQL != cluster.Status.DatabaseInitSQL)
++	assert.Equal(t, *out.Status.DatabaseInitSQL, *cluster.Status.DatabaseInitSQL)
++
++
++	cluster.Spec.DatabaseInitSQL.Name = "changed"
++	*cluster.Status.DatabaseInitSQL = "changed"
++	assert.Equal(t, out.Spec.DatabaseInitSQL.Name, "original-name")
++	assert.Equal(t, *out.Status.DatabaseInitSQL, "original-status")
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,26 @@
++#!/usr/bin/env bash
++
++
++
++set -euo pipefail
++HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++cd /testbed
++
++
++
++
++export KUBEBUILDER_ASSETS="${KUBEBUILDER_ASSETS:-/usr/local/kubebuilder/bin}"
++
++
++go test -tags=envtest -count=1 \
++    -run 'TestReconcilePostgresVolumes|TestGeneratePostgresUserSecret|TestReconcilePGMonitor' \
++    ./internal/controller/postgrescluster/
++go test -count=1 ./pkg/apis/postgres-operator.crunchydata.com/v1beta1/
++
++
++go test -tags=envtest -count=1 \
++    -run 'TestReconcileDatabaseInitSQLStatusHandling|TestReconcileDatabaseInitSQLConfigMapErrors' \
++    ./internal/controller/postgrescluster/
++go test -count=1 \
++    -run 'TestDatabaseInitSQLSpecField|TestDatabaseInitSQLStatusField|TestDatabaseInitSQLDeepCopy' \
++    ./pkg/apis/postgres-operator.crunchydata.com/v1beta1/

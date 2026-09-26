@@ -1,0 +1,346 @@
+diff --git a/.codespec/inheritance.test.js b/.codespec/inheritance.test.js
+new file mode 100644
+index 0000000..962cb8a
+--- /dev/null
++++ b/.codespec/inheritance.test.js
+@@ -0,0 +1,326 @@
++const childProcess = require("child_process");
++const fs = require("fs");
++const os = require("os");
++const path = require("path");
++const yaml = require("js-yaml");
++
++const REPO_ROOT = path.resolve(__dirname, "..");
++const CLI = path.join(REPO_ROOT, "bin.js");
++
++function createWorkspace() {
++  const root = fs.mkdtempSync(path.join(os.tmpdir(), "rnuc-inheritance-"));
++  const projectRoot = path.join(root, "project");
++  const libRoot = path.join(root, "lib");
++  fs.mkdirSync(path.join(projectRoot, "ios"), { recursive: true });
++  fs.mkdirSync(path.join(libRoot, "ios"), { recursive: true });
++  fs.mkdirSync(path.join(libRoot, "android"), { recursive: true });
++  return { root, projectRoot, libRoot };
++}
++
++function write(root, relativePath, contents) {
++  const target = path.join(root, relativePath);
++  fs.mkdirSync(path.dirname(target), { recursive: true });
++  fs.writeFileSync(target, contents);
++  return target;
++}
++
++function runCli(configPath, workspace) {
++  return childProcess.spawnSync(
++    process.execPath,
++    [
++      CLI,
++      configPath,
++      "--projectRoot",
++      workspace.projectRoot,
++      "--libRoot",
++      workspace.libRoot,
++    ],
++    { cwd: workspace.root, encoding: "utf8" }
++  );
++}
++
++function generatedPaths(workspace) {
++  return [
++    path.join(workspace.projectRoot, "ios", "rnuc.xcconfig"),
++    path.join(workspace.libRoot, "ios", "ConfigValues.h"),
++    path.join(workspace.libRoot, "android", "rnuc.yaml"),
++    path.join(workspace.libRoot, "index.d.ts"),
++  ];
++}
++
++function processOutput(result) {
++  return `${result.stdout || ""}\n${result.stderr || ""}`;
++}
++
++describe("CLI YAML inheritance contract", () => {
++  let workspaces = [];
++
++  afterEach(() => {
++    for (const workspace of workspaces) {
++      fs.rmSync(workspace.root, { recursive: true, force: true });
++    }
++    workspaces = [];
++  });
++
++  test("merges recursive mixed-format parents into every generated platform artifact", () => {
++    const workspace = createWorkspace();
++    workspaces.push(workspace);
++
++    write(
++      workspace.root,
++      "configs/base.env",
++      "BASE_ONLY=from-dotenv\nSHARED_SETTING=dotenv-value\n"
++    );
++    write(
++      workspace.root,
++      "configs/shared.yaml",
++      [
++        "extends: base.env",
++        "DIAMOND_VALUE: from-shared",
++        "SHARED_SETTING: shared-value",
++        "",
++      ].join("\n")
++    );
++    write(
++      workspace.root,
++      "configs/parents/first.yaml",
++      [
++        "extends: ../shared.yaml",
++        "DIAMOND_VALUE: from-first",
++        "PARENT_ORDER: first",
++        "FIRST_ONLY: retained",
++        "PLATFORM_VALUE:",
++        "  ios: first-ios",
++        "  android: first-android",
++        "REPLACED_BY_SCALAR:",
++        "  ios: old-ios",
++        "  android: old-android",
++        "REPLACED_BY_MAP: old-scalar",
++        "",
++      ].join("\n")
++    );
++    write(
++      workspace.root,
++      "configs/parents/second.yaml",
++      [
++        "extends: ../shared.yaml",
++        "PARENT_ORDER: second",
++        "SECOND_ONLY: retained",
++        "PLATFORM_VALUE:",
++        "  android: second-android",
++        "REPLACED_BY_SCALAR: second-scalar",
++        "REPLACED_BY_MAP:",
++        "  ios: map-ios",
++        "  android: map-android",
++        "",
++      ].join("\n")
++    );
++    const rootConfig = write(
++      workspace.root,
++      "configs/app.yaml",
++      [
++        "extends:",
++        "  - parents/first.yaml",
++        "  - parents/second.yaml",
++        "SHARED_SETTING: child-value",
++        "PLATFORM_VALUE:",
++        "  ios: child-ios",
++        "ROOT_FLAG: false",
++        "ROOT_COUNT: 0",
++        "",
++      ].join("\n")
++    );
++
++    const result = runCli(rootConfig, workspace);
++    expect(result.status).toBe(0);
++
++    const androidPath = path.join(workspace.libRoot, "android", "rnuc.yaml");
++    const android = yaml.safeLoad(fs.readFileSync(androidPath, "utf8"));
++    expect(android).toEqual({
++      BASE_ONLY: "from-dotenv",
++      SHARED_SETTING: "child-value",
++      DIAMOND_VALUE: "from-shared",
++      PARENT_ORDER: "second",
++      FIRST_ONLY: "retained",
++      PLATFORM_VALUE: "second-android",
++      REPLACED_BY_SCALAR: "second-scalar",
++      REPLACED_BY_MAP: "map-android",
++      SECOND_ONLY: "retained",
++      ROOT_FLAG: false,
++      ROOT_COUNT: 0,
++    });
++
++    const header = fs.readFileSync(
++      path.join(workspace.libRoot, "ios", "ConfigValues.h"),
++      "utf8"
++    );
++    expect(header).toContain('#define PLATFORM_VALUE @"child-ios"');
++    expect(header).toContain('#define REPLACED_BY_SCALAR @"second-scalar"');
++    expect(header).toContain('#define REPLACED_BY_MAP @"map-ios"');
++    expect(header).toContain('#define BASE_ONLY @"from-dotenv"');
++    expect(header).toContain("#define ROOT_FLAG @(NO)");
++
++    const xcconfig = fs.readFileSync(
++      path.join(workspace.projectRoot, "ios", "rnuc.xcconfig"),
++      "utf8"
++    );
++    expect(xcconfig).toContain("PLATFORM_VALUE=child-ios");
++    expect(xcconfig).toContain("PARENT_ORDER=second");
++
++    const typings = fs.readFileSync(
++      path.join(workspace.libRoot, "index.d.ts"),
++      "utf8"
++    );
++    expect(typings).toContain("PLATFORM_VALUE: string;");
++    expect(typings).toContain("ROOT_FLAG: boolean;");
++    expect(typings).toContain("ROOT_COUNT: number;");
++
++    for (const outputPath of generatedPaths(workspace)) {
++      expect(fs.readFileSync(outputPath, "utf8")).not.toMatch(/\bextends\b/);
++    }
++  });
++
++  test("accepts the single-parent string form", () => {
++    const inherited = createWorkspace();
++    workspaces.push(inherited);
++
++    write(inherited.root, "parent.yaml", "FROM_PARENT: yes\nVALUE: parent\n");
++    const child = write(
++      inherited.root,
++      "child.yaml",
++      "extends: parent.yaml\nVALUE: child\n"
++    );
++    const inheritedResult = runCli(child, inherited);
++    expect(inheritedResult.status).toBe(0);
++    expect(
++      yaml.safeLoad(
++        fs.readFileSync(path.join(inherited.libRoot, "android", "rnuc.yaml"), "utf8")
++      )
++    ).toEqual({ FROM_PARENT: "yes", VALUE: "child" });
++  });
++
++  test("preserves configs without inheritance, including explicit false and zero", () => {
++    const standalone = createWorkspace();
++    workspaces.push(standalone);
++
++    const plain = write(
++      standalone.root,
++      "plain.yaml",
++      "PLAIN_STRING: unchanged\nPLAIN_FALSE: false\nPLAIN_ZERO: 0\n"
++    );
++    const standaloneResult = runCli(plain, standalone);
++    expect(standaloneResult.status).toBe(0);
++    expect(
++      yaml.safeLoad(
++        fs.readFileSync(path.join(standalone.libRoot, "android", "rnuc.yaml"), "utf8")
++      )
++    ).toEqual({ PLAIN_STRING: "unchanged", PLAIN_FALSE: false, PLAIN_ZERO: 0 });
++  });
++
++  test("reports a cycle with its files and leaves every generated file untouched", () => {
++    const workspace = createWorkspace();
++    workspaces.push(workspace);
++    const a = write(workspace.root, "cycle/a.yaml", "extends: b.yaml\nA: value\n");
++    write(workspace.root, "cycle/b.yaml", "extends: a.yaml\nB: value\n");
++    for (const outputPath of generatedPaths(workspace)) {
++      fs.writeFileSync(outputPath, `sentinel:${path.basename(outputPath)}`);
++    }
++
++    const result = runCli(a, workspace);
++    const output = processOutput(result);
++    expect(result.status).not.toBe(0);
++    expect(output).toMatch(/cycle/i);
++    expect(output).toContain("a.yaml");
++    expect(output).toContain("b.yaml");
++    for (const outputPath of generatedPaths(workspace)) {
++      expect(fs.readFileSync(outputPath, "utf8")).toBe(
++        `sentinel:${path.basename(outputPath)}`
++      );
++    }
++  });
++
++  test.each([
++    [
++      "a non-string/non-array value at the root",
++      "extends: 42\nVALUE: ignored\n",
++      [],
++      /invalid-root\.yaml/,
++    ],
++    [
++      "a non-string array entry in a parent",
++      "extends: invalid-parent.yaml\nVALUE: ignored\n",
++      [
++        [
++          "invalid-parent.yaml",
++          "extends:\n  - valid-parent.yaml\n  - 42\nPARENT: ignored\n",
++        ],
++      ],
++      /invalid-parent\.yaml/,
++    ],
++  ])("rejects %s in extends metadata", (_name, rootText, extraFiles, sourcePattern) => {
++    const workspace = createWorkspace();
++    workspaces.push(workspace);
++    write(workspace.root, "valid-parent.yaml", "PARENT: value\n");
++    for (const [relativePath, contents] of extraFiles) {
++      write(workspace.root, relativePath, contents);
++    }
++    const rootConfig = write(workspace.root, "invalid-root.yaml", rootText);
++    for (const outputPath of generatedPaths(workspace)) {
++      fs.writeFileSync(outputPath, `original:${path.basename(outputPath)}`);
++    }
++
++    const result = runCli(rootConfig, workspace);
++    const output = processOutput(result);
++    expect(result.status).not.toBe(0);
++    expect(output).toMatch(sourcePattern);
++    expect(output).toMatch(/extends/i);
++    for (const outputPath of generatedPaths(workspace)) {
++      expect(fs.readFileSync(outputPath, "utf8")).toBe(
++        `original:${path.basename(outputPath)}`
++      );
++    }
++  });
++
++  test("reports both sides of a missing-parent reference without creating outputs", () => {
++    const workspace = createWorkspace();
++    workspaces.push(workspace);
++    const rootConfig = write(
++      workspace.root,
++      "missing-root.yaml",
++      "extends: nested/missing-parent.yaml\nVALUE: ignored\n"
++    );
++
++    const result = runCli(rootConfig, workspace);
++    const output = processOutput(result);
++    expect(result.status).not.toBe(0);
++    expect(output).toMatch(/missing-root\.yaml/);
++    expect(output).toMatch(/missing-parent\.yaml/);
++    for (const outputPath of generatedPaths(workspace)) {
++      expect(fs.existsSync(outputPath)).toBe(false);
++    }
++  });
++
++  test("identifies malformed parent YAML and keeps generated files unchanged", () => {
++    const workspace = createWorkspace();
++    workspaces.push(workspace);
++    const rootConfig = write(
++      workspace.root,
++      "parse-root.yaml",
++      "extends: bad-parent.yaml\nVALUE: ignored\n"
++    );
++    write(workspace.root, "bad-parent.yaml", "BROKEN: [unterminated\n");
++    for (const outputPath of generatedPaths(workspace)) {
++      fs.writeFileSync(outputPath, `original:${path.basename(outputPath)}`);
++    }
++
++    const result = runCli(rootConfig, workspace);
++    const output = processOutput(result);
++    expect(result.status).not.toBe(0);
++    expect(output).toMatch(/bad-parent\.yaml/);
++    for (const outputPath of generatedPaths(workspace)) {
++      expect(fs.readFileSync(outputPath, "utf8")).toBe(
++        `original:${path.basename(outputPath)}`
++      );
++    }
++  });
++});
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,9 @@
++#!/bin/bash
++set -euo pipefail
++
++
++./node_modules/.bin/jest --runInBand \
++  .codespec/inheritance.test.js \
++  src/__tests__/load-env.js \
++  src/__tests__/render-env.js \
++  src/__tests__/main.js

@@ -1,0 +1,527 @@
+diff --git a/src/Kunstmaan/GeneratorBundle/Tests/Generator/DefaultSiteGeneratorTest.php b/src/Kunstmaan/GeneratorBundle/Tests/Generator/DefaultSiteGeneratorTest.php
+new file mode 100644
+index 000000000..c132bc0ff
+--- /dev/null
++++ b/src/Kunstmaan/GeneratorBundle/Tests/Generator/DefaultSiteGeneratorTest.php
+@@ -0,0 +1,488 @@
++<?php
++
++namespace Kunstmaan\GeneratorBundle\Tests\Generator;
++
++use Kunstmaan\GeneratorBundle\Generator\DefaultSiteGenerator;
++use Kunstmaan\GeneratorBundle\Helper\CommandAssistant;
++use Symfony\Component\Filesystem\Filesystem;
++
++class DefaultSiteGeneratorTest extends \PHPUnit_Framework_TestCase
++{
++    private $filesystem;
++    private $tmpDirs = array();
++
++    protected function setUp()
++    {
++        $this->filesystem = new Filesystem();
++    }
++
++    protected function tearDown()
++    {
++        foreach ($this->tmpDirs as $dir) {
++            $this->filesystem->remove($dir);
++        }
++    }
++
++    public function testGeneratedDefaultSiteExposesNodeTranslationTwigFunctionWithoutDemosite()
++    {
++        $sitePath = $this->generateSite(false, $this->createRootDirWithConfig($this->configWithoutPagerfanta()));
++        $this->assertSame('OK', $this->runTwigRenderProbe($sitePath));
++    }
++
++    public function testGeneratedDemositeExposesNodeTranslationTwigFunction()
++    {
++        $sitePath = $this->generateSite(true, $this->createRootDirWithConfig($this->configWithoutPagerfanta()));
++        $this->assertSame('OK', $this->runTwigRenderProbe($sitePath));
++    }
++
++    public function testNodeTranslationTwigFunctionReturnsMatchingAvailableTranslationAndNullForMissing()
++    {
++        $sitePath = $this->generateSite(false, $this->createRootDirWithConfig($this->configWithoutPagerfanta()));
++        $this->assertSame('en-match|nl-match|null|null', $this->runTwigCallableProbe($sitePath));
++    }
++
++    public function testGeneratorDoesNotDuplicateExistingPagerfantaConfig()
++    {
++        $rootDir = $this->createRootDirWithConfig($this->configWithPagerfanta());
++        $this->generateSite(false, $rootDir);
++
++        $config = file_get_contents($rootDir.'/app/config/config.yml');
++
++        $this->assertSame(1, $this->countTopLevelPagerfantaBlocks($config));
++        $this->assertContains('framework:', $config);
++        $this->assertContains('kunstmaan_translator:', $config);
++    }
++
++    public function testGeneratorAppendsPagerfantaConfigWhenMissing()
++    {
++        $rootDir = $this->createRootDirWithConfig($this->configWithoutPagerfanta());
++        $this->generateSite(false, $rootDir);
++
++        $config = file_get_contents($rootDir.'/app/config/config.yml');
++
++        $this->assertSame(1, $this->countTopLevelPagerfantaBlocks($config));
++        $this->assertContains('default_view: twitter_bootstrap', $config);
++        $this->assertContains('framework:', $config);
++    }
++
++    private function generateSite($demosite, $rootDir)
++    {
++        $sitePath = $this->newTempDir();
++        $bundle = $this->getBundle($sitePath);
++
++        $generator = new InspectableDefaultSiteGenerator(
++            $this->filesystem,
++            $this->getRegistry(),
++            '/defaultsite',
++            $this->getAssistant()
++        );
++        $generator->generate($bundle, '', $rootDir, $demosite);
++
++        return $sitePath;
++    }
++
++    private function runTwigRenderProbe($sitePath)
++    {
++        $script = $this->buildTwigRenderProbeScript($sitePath);
++        $output = array();
++        $exitCode = 0;
++        exec(escapeshellcmd(PHP_BINARY).' '.escapeshellarg($script).' 2>&1', $output, $exitCode);
++
++        if (0 !== $exitCode) {
++            $this->fail("Twig render probe failed: ".implode("\n", $output));
++        }
++
++        return implode("\n", $output);
++    }
++
++    private function runTwigCallableProbe($sitePath)
++    {
++        $script = $this->buildTwigCallableProbeScript($sitePath);
++        $output = array();
++        $exitCode = 0;
++        exec(escapeshellcmd(PHP_BINARY).' '.escapeshellarg($script).' 2>&1', $output, $exitCode);
++
++        if (0 !== $exitCode) {
++            $this->fail("Twig callable probe failed: ".implode("\n", $output));
++        }
++
++        return implode("\n", $output);
++    }
++
++    private function buildTwigRenderProbeScript($sitePath)
++    {
++        $script = $this->newTempDir().'/twig_render_probe.php';
++        $code = $this->twigProbePrelude($sitePath).<<<'PHP'
++
++$files = glob($sitePath . '/Twig/*.php');
++if (!$files) {
++    fwrite(STDERR, 'no generated twig extension files');
++    exit(1);
++}
++foreach ($files as $file) {
++    require_once $file;
++}
++$loader = new Twig_Loader_Array(array('inline' => '{{ get_node_trans_by_node_id(1, "en") ? "OK" : "FAIL" }}'));
++$twig = new Twig_Environment($loader);
++foreach (get_declared_classes() as $class) {
++    if (0 !== strpos($class, 'Kunstmaan\\TestBundle\\Twig\\')) {
++        continue;
++    }
++    $ref = new ReflectionClass($class);
++    if (!$ref->isInstantiable()) {
++        continue;
++    }
++    $ctor = $ref->getConstructor();
++    $ext = $ctor && 1 === $ctor->getNumberOfRequiredParameters() ? $ref->newInstance(new ProbeEntityManager()) : $ref->newInstance();
++    if ($ext instanceof Twig_Extension || $ext instanceof Twig\Extension\ExtensionInterface) {
++        $twig->addExtension($ext);
++    }
++    foreach ($ext->getFunctions() as $name => $function) {
++        if ($name === 'get_node_trans_by_node_id' && method_exists($function, 'getCallable')) {
++            $twig->addFunction(new Twig\TwigFunction($name, $function->getCallable()));
++        }
++    }
++}
++echo $twig->render('inline');
++PHP;
++        file_put_contents($script, $code);
++        return $script;
++    }
++
++    private function buildTwigCallableProbeScript($sitePath)
++    {
++        $script = $this->newTempDir().'/twig_callable_probe.php';
++        $code = $this->twigProbePrelude($sitePath).<<<'PHP'
++
++$files = glob($sitePath . '/Twig/*.php');
++if (!$files) {
++    fwrite(STDERR, 'no generated twig extension files');
++    exit(1);
++}
++foreach ($files as $file) {
++    require_once $file;
++}
++$callable = null;
++foreach (get_declared_classes() as $class) {
++    if (0 !== strpos($class, 'Kunstmaan\\TestBundle\\Twig\\')) {
++        continue;
++    }
++    $ref = new ReflectionClass($class);
++    if (!$ref->isInstantiable()) {
++        continue;
++    }
++    $ctor = $ref->getConstructor();
++    $ext = $ctor && 1 === $ctor->getNumberOfRequiredParameters() ? $ref->newInstance(new ProbeEntityManager()) : $ref->newInstance();
++    foreach ($ext->getFunctions() as $name => $function) {
++        if ($name === 'get_node_trans_by_node_id' && method_exists($function, 'getCallable')) {
++            $callable = $function->getCallable();
++        }
++    }
++}
++if (null === $callable) {
++    fwrite(STDERR, 'missing callable');
++    exit(1);
++}
++$a = call_user_func($callable, 42, 'en');
++$b = call_user_func($callable, 84, 'nl');
++$c = call_user_func($callable, 42, 'nl');
++$d = call_user_func($callable, 404, 'en');
++$map = array(
++    is_object($a) && isset($a->marker) ? $a->marker : 'null',
++    is_object($b) && isset($b->marker) ? $b->marker : 'null',
++    null === $c ? 'null' : 'bad',
++    null === $d ? 'null' : 'bad',
++);
++echo implode('|', $map);
++PHP;
++        file_put_contents($script, $code);
++        return $script;
++    }
++
++    private function twigProbePrelude($sitePath)
++    {
++        return sprintf(<<<PHP
++<?php
++require 'autoload.php.dist';
++
++if (!class_exists('Twig_Function_Method') && class_exists('Twig\\TwigFunction')) {
++    class Twig_Function_Method extends Twig\\TwigFunction {
++        public function __construct(\$extension, \$method) {
++            parent::__construct(\$method, array(\$extension, \$method));
++        }
++    }
++}
++
++\$sitePath = %s;
++
++class ProbeEntityManager extends Doctrine\ORM\EntityManager {
++    public function __construct() {}
++    public function getRepository(\$entityName) { return new ProbeNodeTranslationRepository(); }
++}
++
++class ProbeNodeTranslationRepository {
++    public function createQueryBuilder(\$alias) { return new ProbeNodeTranslationQueryBuilder(); }
++}
++
++class ProbeNodeTranslationQueryBuilder {
++    private \$params = array();
++    public function select(\$select) { return \$this; }
++    public function innerJoin(\$join, \$alias, \$conditionType = null, \$condition = null) { return \$this; }
++    public function where(\$where) { return \$this; }
++    public function andWhere(\$where) { return \$this; }
++    public function setParameter(\$name, \$value) { \$this->params[\$name] = \$value; return \$this; }
++    public function setFirstResult(\$firstResult) { return \$this; }
++    public function setMaxResults(\$maxResults) { return \$this; }
++    public function getQuery() { return new ProbeNodeTranslationQuery(\$this->params); }
++}
++
++class ProbeNodeTranslationQuery {
++    private \$params;
++    public function __construct(array \$params) { \$this->params = \$params; }
++    public function getOneOrNullResult() {
++        \$key = (isset(\$this->params['node_id']) ? \$this->params['node_id'] : null) . ':' . (isset(\$this->params['lang']) ? \$this->params['lang'] : null);
++        \$translations = array(
++            '1:en' => (object) array('marker' => 'render-match'),
++            '42:en' => (object) array('marker' => 'en-match'),
++            '84:nl' => (object) array('marker' => 'nl-match'),
++        );
++        return array_key_exists(\$key, \$translations) ? \$translations[\$key] : null;
++    }
++}
++
++PHP
++        , var_export($sitePath, true));
++    }
++
++    private function countTopLevelPagerfantaBlocks($config)
++    {
++        preg_match_all('/^white_october_pagerfanta\s*:/m', $config, $matches);
++
++        return count($matches[0]);
++    }
++
++    private function getBundle($path)
++    {
++        $bundle = $this->getMock('Symfony\Component\HttpKernel\Bundle\BundleInterface');
++        $bundle->expects($this->any())->method('getNamespace')->will($this->returnValue('Kunstmaan\TestBundle'));
++        $bundle->expects($this->any())->method('getName')->will($this->returnValue('KunstmaanTestBundle'));
++        $bundle->expects($this->any())->method('getPath')->will($this->returnValue($path));
++
++        return $bundle;
++    }
++
++    private function getRegistry()
++    {
++        return $this->getMock('Symfony\Bridge\Doctrine\RegistryInterface');
++    }
++
++    private function getAssistant()
++    {
++        $output = $this->getMock('Symfony\Component\Console\Output\OutputInterface');
++
++        $commandAssistant = new CommandAssistant();
++        $commandAssistant->setOutput($output);
++
++        return $commandAssistant;
++    }
++
++    private function createRootDirWithConfig($config)
++    {
++        $rootDir = $this->newTempDir();
++        $this->filesystem->mkdir($rootDir.'/app/config');
++        file_put_contents($rootDir.'/app/config/config.yml', $config);
++        file_put_contents($rootDir.'/app/config/routing.yml', '');
++
++        return $rootDir;
++    }
++
++    private function newTempDir()
++    {
++        $dir = sys_get_temp_dir().'/kunstmaan_generator_'.str_replace('.', '', uniqid('', true));
++        $this->filesystem->remove($dir);
++        $this->filesystem->mkdir($dir);
++        $this->tmpDirs[] = $dir;
++
++        return $dir;
++    }
++
++    private function configWithPagerfanta()
++    {
++        return <<<YAML
++framework:
++    secret: test
++    router:
++        resource: "%kernel.root_dir%/config/routing.yml"
++    templating:
++        engines: ['twig']
++
++kunstmaan_translator:
++    managed_locales: ['nl', 'en']
++
++white_october_pagerfanta:
++    default_view: twitter_bootstrap
++
++YAML;
++    }
++
++    private function configWithoutPagerfanta()
++    {
++        return <<<YAML
++framework:
++    secret: another-test
++    router:
++        resource: "%kernel.root_dir%/config/routing.yml"
++    templating:
++        engines: ['twig']
++
++kunstmaan_translator:
++    managed_locales: ['en', 'fr']
++
++doctrine:
++    dbal:
++        driver: pdo_sqlite
++
++YAML;
++    }
++}
++
++class TwigFunctionMethodCompat extends \Twig\TwigFunction
++{
++    public function __construct($extension, $method)
++    {
++        parent::__construct($method, array($extension, $method));
++    }
++}
++
++class InspectableDefaultSiteGenerator extends DefaultSiteGenerator
++{
++    public function generate($bundle, $prefix, $rootDir, $demosite = false)
++    {
++        $this->setParentProperty('bundle', $bundle);
++        $this->setParentProperty('prefix', null === $prefix || '' === $prefix ? null : strtolower(trim($prefix, '_')).'_');
++        $this->setParentProperty('rootDir', $rootDir);
++        $this->setParentProperty('demosite', $demosite);
++
++        $parameters = array(
++            'namespace' => $bundle->getNamespace(),
++            'bundle' => $bundle,
++            'bundle_name' => $bundle->getName(),
++            'prefix' => null === $prefix || '' === $prefix ? null : strtolower(trim($prefix, '_')).'_',
++            'demosite' => $demosite,
++            'multilanguage' => false,
++        );
++
++        $this->generateTwigExtensions($parameters);
++        $this->generateConfig();
++    }
++
++    public function generateTwigExtensions($parameters)
++    {
++        $method = new \ReflectionMethod('Kunstmaan\GeneratorBundle\Generator\DefaultSiteGenerator', 'generateTwigExtensions');
++        $method->setAccessible(true);
++        $method->invoke($this, $parameters);
++    }
++
++    public function generateConfig()
++    {
++        $method = new \ReflectionMethod('Kunstmaan\GeneratorBundle\Generator\DefaultSiteGenerator', 'generateConfig');
++        $method->setAccessible(true);
++        $method->invoke($this);
++    }
++
++    private function setParentProperty($name, $value)
++    {
++        $property = new \ReflectionProperty('Kunstmaan\GeneratorBundle\Generator\DefaultSiteGenerator', $name);
++        $property->setAccessible(true);
++        $property->setValue($this, $value);
++    }
++}
++
++class FakeNodeTranslationRepository
++{
++    private $translations;
++
++    public function __construct(array $translations)
++    {
++        $this->translations = $translations;
++    }
++
++    public function createQueryBuilder($alias)
++    {
++        return new FakeNodeTranslationQueryBuilder($this->translations);
++    }
++}
++
++class FakeNodeTranslationQueryBuilder
++{
++    private $translations;
++    private $parameters = array();
++
++    public function __construct(array $translations)
++    {
++        $this->translations = $translations;
++    }
++
++    public function select($select)
++    {
++        return $this;
++    }
++
++    public function innerJoin($join, $alias, $conditionType = null, $condition = null)
++    {
++        return $this;
++    }
++
++    public function where($where)
++    {
++        return $this;
++    }
++
++    public function andWhere($where)
++    {
++        return $this;
++    }
++
++    public function setParameter($name, $value)
++    {
++        $this->parameters[$name] = $value;
++
++        return $this;
++    }
++
++    public function setFirstResult($firstResult)
++    {
++        return $this;
++    }
++
++    public function setMaxResults($maxResults)
++    {
++        return $this;
++    }
++
++    public function getQuery()
++    {
++        return new FakeNodeTranslationQuery($this->translations, $this->parameters);
++    }
++}
++
++class FakeNodeTranslationQuery
++{
++    private $translations;
++    private $parameters;
++
++    public function __construct(array $translations, array $parameters)
++    {
++        $this->translations = $translations;
++        $this->parameters = $parameters;
++    }
++
++    public function getOneOrNullResult()
++    {
++        $nodeId = isset($this->parameters['node_id']) ? $this->parameters['node_id'] : null;
++        $lang = isset($this->parameters['lang']) ? $this->parameters['lang'] : null;
++        $key = $nodeId.':'.$lang;
++
++        return array_key_exists($key, $this->translations) ? $this->translations[$key] : null;
++    }
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,28 @@
++#!/bin/bash
++set -uo pipefail
++cd /testbed
++
++
++
++update-alternatives --set php /usr/bin/php7.4 2>/dev/null
++
++
++if [ ! -d /testbed/vendor ]; then
++    composer install --ignore-platform-reqs --no-interaction
++fi
++
++
++case "$1" in
++  base)
++    ./vendor/bin/phpunit --no-configuration --bootstrap ./autoload.php.dist \
++      src/Kunstmaan/GeneratorBundle/Tests/Helper/GeneratorUtilsTest.php
++    ;;
++  new)
++    ./vendor/bin/phpunit --no-configuration --bootstrap ./autoload.php.dist \
++      src/Kunstmaan/GeneratorBundle/Tests/Generator/DefaultSiteGeneratorTest.php
++    ;;
++  *)
++    echo "usage: $0 base|new"
++    exit 2
++    ;;
++esac

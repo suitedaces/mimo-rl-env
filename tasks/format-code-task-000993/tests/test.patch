@@ -1,0 +1,283 @@
+diff --git a/helper/flag-kv/flag_json_include_codespec_test.go b/helper/flag-kv/flag_json_include_codespec_test.go
+new file mode 100644
+index 0000000..75c7f04
+--- /dev/null
++++ b/helper/flag-kv/flag_json_include_codespec_test.go
+@@ -0,0 +1,267 @@
++package kvflag
++
++import (
++	"fmt"
++	"os"
++	"path/filepath"
++	"reflect"
++	"strings"
++	"testing"
++)
++
++func writeCodespecVarFile(t *testing.T, root, name, contents string) string {
++	t.Helper()
++	path := filepath.Join(root, filepath.FromSlash(name))
++	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
++		t.Fatalf("create fixture directory: %s", err)
++	}
++	if err := os.WriteFile(path, []byte(contents), 0644); err != nil {
++		t.Fatalf("write fixture %s: %s", name, err)
++	}
++	return path
++}
++
++func TestCodespecFlagJSONRecursiveIncludesAndPrecedence(t *testing.T) {
++	dir := t.TempDir()
++	writeCodespecVarFile(t, dir, "shared.json", `{
++		"from_shared": "yes",
++		"include_winner": "shared",
++		"nested_winner": "shared",
++		"winner": "shared"
++	}`)
++	writeCodespecVarFile(t, dir, "layers/base.json", `{
++		"_packer_include": "../shared.json",
++		"from_base": "yes",
++		"include_winner": "base",
++		"nested_winner": "base",
++		"winner": "base"
++	}`)
++	writeCodespecVarFile(t, dir, "environment.json", `{
++		"from_environment": "yes",
++		"include_winner": "environment",
++		"winner": "environment"
++	}`)
++	root := writeCodespecVarFile(t, dir, "root.json", `{
++		"_packer_include": ["layers/base.json", "environment.json"],
++		"from_root": "yes",
++		"winner": "root"
++	}`)
++
++	var got FlagJSON
++	if err := got.Set(root); err != nil {
++		t.Fatalf("Set returned an error: %s", err)
++	}
++
++	want := map[string]string{
++		"from_shared":      "yes",
++		"from_base":        "yes",
++		"from_environment": "yes",
++		"from_root":        "yes",
++		"include_winner":   "environment",
++		"nested_winner":    "base",
++		"winner":           "root",
++	}
++	if !reflect.DeepEqual(map[string]string(got), want) {
++		t.Fatalf("wrong composed variables\n got: %#v\nwant: %#v", got, want)
++	}
++	if _, exists := got["_packer_include"]; exists {
++		t.Fatal("_packer_include metadata leaked into variables")
++	}
++}
++
++func TestCodespecFlagJSONRepeatedSetKeepsCommandLineOrdering(t *testing.T) {
++	dir := t.TempDir()
++	first := writeCodespecVarFile(t, dir, "first.json", `{
++		"first": "loaded",
++		"winner": "first-file"
++	}`)
++	second := writeCodespecVarFile(t, dir, "second.json", `{
++		"second": "loaded",
++		"winner": "second-file"
++	}`)
++
++	got := FlagJSON{"preexisting": "kept", "winner": "preexisting"}
++	if err := got.Set(first); err != nil {
++		t.Fatalf("first Set returned an error: %s", err)
++	}
++	if err := got.Set(second); err != nil {
++		t.Fatalf("second Set returned an error: %s", err)
++	}
++
++	want := map[string]string{
++		"preexisting": "kept",
++		"first":       "loaded",
++		"second":      "loaded",
++		"winner":      "second-file",
++	}
++	if !reflect.DeepEqual(map[string]string(got), want) {
++		t.Fatalf("wrong variables after repeated Set\n got: %#v\nwant: %#v", got, want)
++	}
++}
++
++func TestCodespecFlagJSONSharedIncludeIsNotACycle(t *testing.T) {
++	dir := t.TempDir()
++	writeCodespecVarFile(t, dir, "shared.json", `{"shared": "loaded"}`)
++	writeCodespecVarFile(t, dir, "left.json", `{
++		"_packer_include": "shared.json",
++		"left": "loaded"
++	}`)
++	writeCodespecVarFile(t, dir, "right.json", `{
++		"_packer_include": "shared.json",
++		"right": "loaded"
++	}`)
++	root := writeCodespecVarFile(t, dir, "diamond.json", `{
++		"_packer_include": ["left.json", "right.json"],
++		"root": "loaded"
++	}`)
++
++	var got FlagJSON
++	if err := got.Set(root); err != nil {
++		t.Fatalf("a shared non-recursive include was rejected: %s", err)
++	}
++	for _, key := range []string{"shared", "left", "right", "root"} {
++		if got[key] != "loaded" {
++			t.Errorf("variable %q was not loaded: %#v", key, got)
++		}
++	}
++}
++
++func TestCodespecFlagJSONRejectsCanonicalCycleAtomically(t *testing.T) {
++	dir := t.TempDir()
++	if err := os.Mkdir(filepath.Join(dir, "nested"), 0755); err != nil {
++		t.Fatalf("create alias directory: %s", err)
++	}
++	cycle := writeCodespecVarFile(t, dir, "loop.json", `{
++		"_packer_include": "nested/../loop.json",
++		"new": "must-not-commit"
++	}`)
++
++	got := FlagJSON{"existing": "unchanged"}
++	want := map[string]string{"existing": "unchanged"}
++	err := got.Set(cycle)
++	if err == nil {
++		t.Fatal("expected an include-cycle error")
++	}
++	if !strings.Contains(err.Error(), "loop.json") {
++		t.Fatalf("cycle error does not identify the file: %s", err)
++	}
++	if !strings.Contains(strings.ToLower(err.Error()), "cycle") {
++		t.Fatalf("cycle error does not describe an include cycle: %s", err)
++	}
++	if !reflect.DeepEqual(map[string]string(got), want) {
++		t.Fatalf("cycle failure changed receiver\n got: %#v\nwant: %#v", got, want)
++	}
++}
++
++func TestCodespecFlagJSONRejectsInvalidValueShapes(t *testing.T) {
++	cases := []struct {
++		name string
++		json string
++	}{
++		{"numeric variable", `{"count": 3}`},
++		{"boolean variable", `{"enabled": true}`},
++		{"null variable", `{"name": null}`},
++		{"array variable", `{"names": ["one", "two"]}`},
++		{"object variable", `{"name": {"nested": "value"}}`},
++		{"numeric include", `{"_packer_include": 3}`},
++		{"mixed include list", `{"_packer_include": ["good.json", 3]}`},
++	}
++
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			dir := t.TempDir()
++			writeCodespecVarFile(t, dir, "good.json", `{"from_good": "must-not-commit"}`)
++			path := writeCodespecVarFile(t, dir, "invalid-values.json", tc.json)
++			got := FlagJSON{"existing": "unchanged"}
++			want := map[string]string{"existing": "unchanged"}
++
++			err := got.Set(path)
++			if err == nil {
++				t.Fatal("expected invalid value shape to fail")
++			}
++			if !strings.Contains(err.Error(), "invalid-values.json") {
++				t.Fatalf("error does not identify invalid-values.json: %s", err)
++			}
++			if !reflect.DeepEqual(map[string]string(got), want) {
++				t.Fatalf("invalid value changed receiver\n got: %#v\nwant: %#v", got, want)
++			}
++		})
++	}
++}
++
++func TestCodespecFlagJSONRejectsInvalidDocuments(t *testing.T) {
++	cases := []struct {
++		name string
++		json string
++	}{
++		{"top-level array", `["not", "an", "object"]`},
++		{"top-level string", `"not-an-object"`},
++		{"top-level number", `42`},
++		{"top-level boolean", `true`},
++		{"top-level null", `null`},
++		{"trailing document", `{"first": "value"} {"second": "value"}`},
++		{"duplicate variable", `{"same": "first", "same": "second"}`},
++		{"duplicate include", `{"_packer_include": "a.json", "_packer_include": "b.json"}`},
++	}
++
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			dir := t.TempDir()
++			path := writeCodespecVarFile(t, dir, "invalid-document.json", tc.json)
++			got := FlagJSON{"existing": "unchanged"}
++			want := map[string]string{"existing": "unchanged"}
++
++			err := got.Set(path)
++			if err == nil {
++				t.Fatal("expected invalid JSON document to fail")
++			}
++			if !strings.Contains(err.Error(), "invalid-document.json") {
++				t.Fatalf("error does not identify invalid-document.json: %s", err)
++			}
++			if !reflect.DeepEqual(map[string]string(got), want) {
++				t.Fatalf("invalid document changed receiver\n got: %#v\nwant: %#v", got, want)
++			}
++		})
++	}
++}
++
++func TestCodespecFlagJSONNestedFailuresAreContextualAndAtomic(t *testing.T) {
++	cases := []struct {
++		name       string
++		brokenName string
++		writeFile  bool
++		contents   string
++	}{
++		{"missing include", "missing.json", false, ""},
++		{"malformed include", "broken.json", true, `{"broken":`},
++		{"duplicate key in include", "duplicate.json", true, `{"same":"first","same":"second"}`},
++		{"trailing data in include", "trailing.json", true, `{"first":"value"} {"second":"value"}`},
++	}
++
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			dir := t.TempDir()
++			writeCodespecVarFile(t, dir, "valid.json", `{"loaded_first": "must-not-commit"}`)
++			if tc.writeFile {
++				writeCodespecVarFile(t, dir, tc.brokenName, tc.contents)
++			}
++			root := writeCodespecVarFile(t, dir, "root.json", fmt.Sprintf(`{
++				"_packer_include": ["valid.json", %q],
++				"root": "must-not-commit"
++			}`, tc.brokenName))
++
++			got := FlagJSON{"existing": "unchanged"}
++			want := map[string]string{"existing": "unchanged"}
++			err := got.Set(root)
++			if err == nil {
++				t.Fatal("expected nested include failure")
++			}
++			if !strings.Contains(err.Error(), tc.brokenName) {
++				t.Fatalf("error does not identify %s: %s", tc.brokenName, err)
++			}
++			if !reflect.DeepEqual(map[string]string(got), want) {
++				t.Fatalf("nested failure changed receiver\n got: %#v\nwant: %#v", got, want)
++			}
++		})
++	}
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,5 @@
++#!/bin/bash
++set -euo pipefail
++
++
++GO111MODULE=off go test ./helper/flag-kv

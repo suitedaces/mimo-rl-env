@@ -1,0 +1,288 @@
+diff --git a/usercase-test-coderl/fixtures/fake_es.py b/usercase-test-coderl/fixtures/fake_es.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/fixtures/fake_es.py
+@@ -0,0 +1,45 @@
++#!/usr/bin/env python3
++import json
++import os
++from http.server import BaseHTTPRequestHandler, HTTPServer
++
++
++PORT = int(os.environ["FAKE_ES_PORT"])
++MODE = os.environ.get("FAKE_ES_MODE", "ok")
++LOG = os.environ["FAKE_ES_LOG"]
++
++
++class Handler(BaseHTTPRequestHandler):
++    def log_message(self, fmt, *args):
++        return
++
++    def send_json(self, code, body):
++        data = json.dumps(body, sort_keys=True).encode("utf-8")
++        self.send_response(code)
++        self.send_header("Content-Type", "application/json")
++        self.send_header("Content-Length", str(len(data)))
++        self.end_headers()
++        self.wfile.write(data)
++
++    def do_GET(self):
++        self.send_json(200, {"version": {"number": "7.0.0"}, "tagline": "You Know, for Search"})
++
++    def log_write(self):
++        length = int(self.headers.get("Content-Length", "0") or "0")
++        body = self.rfile.read(length).decode("utf-8")
++        with open(LOG, "a", encoding="utf-8") as handle:
++
++            handle.write(json.dumps({"method": self.command, "path": self.path, "body": body}, sort_keys=True) + "\n")
++        if MODE == "fail":
++            self.send_json(500, {"error": {"type": "fixture_failure", "reason": "write rejected"}, "status": 500})
++        else:
++            self.send_json(201, {"_index": "elastalert_status_silence", "_type": "_doc", "_id": "abc123", "result": "created"})
++
++    def do_POST(self):
++        self.log_write()
++
++    def do_PUT(self):
++        self.log_write()
++
++
++HTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
+diff --git a/usercase-test-coderl/usecase.sh b/usercase-test-coderl/usecase.sh
+new file mode 100755
+--- /dev/null
++++ b/usercase-test-coderl/usecase.sh
+@@ -0,0 +1,216 @@
++#!/usr/bin/env bash
++
++set -u
++export LANG=C.UTF-8 LC_ALL=C.UTF-8 TZ=UTC
++VENVDIR=/opt/coderl-elastalert-venv
++if [ ! -x "$VENVDIR/bin/elastalert" ] || [ ! -x "$VENVDIR/bin/python" ]; then
++    echo "FAIL: missing offline ElastAlert test venv at $VENVDIR" >&2
++    exit 1
++fi
++
++export PATH="$VENVDIR/bin:$PATH"
++export PYTHONPATH="/workspace/repo${PYTHONPATH:+:$PYTHONPATH}"
++export AWS_EC2_METADATA_DISABLED=true
++unset AWS_DEFAULT_REGION AWS_REGION AWS_PROFILE AWS_DEFAULT_PROFILE
++BIN="$VENVDIR/bin/elastalert"
++
++TMP=$(mktemp -d); trap 'cleanup' EXIT
++fail() { echo "FAIL: $*" >&2; exit 1; }
++
++server_pid=""
++cleanup() {
++    if [ -n "${server_pid}" ]; then
++        kill "${server_pid}" 2>/dev/null || true
++        wait "${server_pid}" 2>/dev/null || true
++    fi
++    rm -rf "$TMP"
++}
++
++write_case_files() {
++    local dir="$1"
++    local port="$2"
++    mkdir -p "$dir/rules"
++    cat >"$dir/config.yaml" <<EOF
++rules_folder: $dir/rules
++run_every:
++  minutes: 1
++buffer_time:
++  minutes: 15
++es_host: 127.0.0.1
++es_port: $port
++writeback_index: elastalert_status
++logging:
++  version: 1
++  disable_existing_loggers: false
++  formatters:
++    simple:
++      format: '%(levelname)s:%(name)s:%(message)s'
++  handlers:
++    console:
++      class: logging.StreamHandler
++      stream: ext://sys.stderr
++      formatter: simple
++  root:
++    level: INFO
++    handlers: [console]
++  loggers:
++    elastalert:
++      level: INFO
++      propagate: true
++EOF
++    cat >"$dir/rules/noisy_rule.yaml" <<'EOF'
++name: Fixture Noisy Rule
++index: logstash-*
++type: any
++alert:
++  - debug
++filter: []
++EOF
++}
++
++start_fake_es() {
++    local port="$1"
++    local mode="$2"
++    local log="$3"
++    rm -f "$log"
++    FAKE_ES_PORT="$port" FAKE_ES_MODE="$mode" FAKE_ES_LOG="$log" \
++        python3 /workspace/repo/usercase-test-coderl/fixtures/fake_es.py \
++        >"$TMP/fake_es_${port}.out" 2>"$TMP/fake_es_${port}.err" &
++    server_pid=$!
++    sleep 0.4
++}
++
++stop_fake_es() {
++    if [ -n "${server_pid}" ]; then
++        kill "${server_pid}" 2>/dev/null || true
++        wait "${server_pid}" 2>/dev/null || true
++        server_pid=""
++    fi
++}
++
++assert_no_scheduler_start() {
++    local fixture="$1"
++    local dir="$2"
++    ! grep -q 'Starting up' "$dir/err" || fail "$fixture started normal scheduler loop"
++    ! grep -q 'Disabled rules are:' "$dir/err" || fail "$fixture entered scheduler polling loop"
++}
++
++
++
++
++case_dir="$TMP/F1"; write_case_files "$case_dir" 19301; start_fake_es 19301 ok "$case_dir/es.log"
++start_epoch=$(date +%s)
++( cd "$case_dir" && timeout 8s "$BIN" --config config.yaml --rule noisy_rule.yaml --silence hours=4 >out 2>err ); ec=$?
++end_epoch=$(date +%s)
++[ "$ec" -eq 0 ] || fail "F1 exit $ec; want 0"
++
++
++grep -Eq 'Success\. Fixture Noisy Rule\._silence will be silenced until .+' "$case_dir/err" \
++    || fail "F1 missing success message: $(cat "$case_dir/err")"
++assert_no_scheduler_start F1 "$case_dir"
++python3 - "$case_dir/es.log" "$start_epoch" "$end_epoch" <<'PY'
++import datetime
++import json
++import sys
++
++lines = open(sys.argv[1], encoding="utf-8").read().splitlines()
++if len(lines) != 1:
++    raise SystemExit("FAIL: F1 expected one ES write, got %d" % len(lines))
++event = json.loads(lines[0])
++
++if event.get("method") not in {"POST", "PUT"}:
++    raise SystemExit("FAIL: F1 ES method %r" % event.get("method"))
++body = json.loads(event["body"])
++if body.get("rule_name") != "Fixture Noisy Rule._silence":
++    raise SystemExit("FAIL: F1 rule_name %r" % body.get("rule_name"))
++until_value = body.get("until")
++if not until_value:
++    raise SystemExit("FAIL: F1 missing until timestamp")
++
++def parse_dt(value):
++    value = value.replace("Z", "+00:00")
++    parsed = datetime.datetime.fromisoformat(value)
++    if parsed.tzinfo is None:
++        parsed = parsed.replace(tzinfo=datetime.timezone.utc)
++    return parsed.astimezone(datetime.timezone.utc)
++
++until = parse_dt(until_value)
++
++earliest = datetime.datetime.fromtimestamp(int(sys.argv[2]), datetime.timezone.utc) + datetime.timedelta(hours=3, minutes=59)
++latest = datetime.datetime.fromtimestamp(int(sys.argv[3]), datetime.timezone.utc) + datetime.timedelta(hours=4, minutes=1)
++if not earliest <= until <= latest:
++    raise SystemExit("FAIL: F1 until %s outside expected four-hour window" % until)
++PY
++stop_fake_es
++
++
++
++
++case_dir="$TMP/F2"; write_case_files "$case_dir" 19302; start_fake_es 19302 ok "$case_dir/es.log"
++( cd "$case_dir" && timeout 8s "$BIN" --config config.yaml --silence hours=4 >out 2>err ); ec=$?
++[ "$ec" -eq 1 ] || fail "F2 exit $ec; want 1"
++
++
++grep -Fq -- '--silence must be used with --rule' "$case_dir/err" || fail "F2 stderr: $(cat "$case_dir/err")"
++[ ! -s "$case_dir/es.log" ] || fail "F2 should not write silence to ES"
++assert_no_scheduler_start F2 "$case_dir"
++stop_fake_es
++
++
++
++
++case_dir="$TMP/F3"; write_case_files "$case_dir" 19303; start_fake_es 19303 ok "$case_dir/es.log"
++( cd "$case_dir" && timeout 8s "$BIN" --config config.yaml --rule noisy_rule.yaml --debug --silence hours=4 >out 2>err ); ec=$?
++[ "$ec" -eq 1 ] || fail "F3 exit $ec; want 1"
++
++
++grep -Fq -- '--silence not compatible with --debug' "$case_dir/err" || fail "F3 stderr: $(cat "$case_dir/err")"
++[ ! -s "$case_dir/es.log" ] || fail "F3 should not write silence to ES"
++assert_no_scheduler_start F3 "$case_dir"
++stop_fake_es
++
++
++
++
++case_dir="$TMP/F4"; write_case_files "$case_dir" 19304; start_fake_es 19304 ok "$case_dir/es.log"
++( cd "$case_dir" && timeout 8s "$BIN" --config config.yaml --rule noisy_rule.yaml --silence bananas >out 2>err ); ec=$?
++[ "$ec" -eq 1 ] || fail "F4 exit $ec; want 1"
++
++
++grep -Fq 'bananas is not a valid time period' "$case_dir/err" || fail "F4 stderr: $(cat "$case_dir/err")"
++[ ! -s "$case_dir/es.log" ] || fail "F4 should not write silence to ES"
++assert_no_scheduler_start F4 "$case_dir"
++stop_fake_es
++
++
++
++
++case_dir="$TMP/F5"; write_case_files "$case_dir" 19305; start_fake_es 19305 fail "$case_dir/es.log"
++( cd "$case_dir" && timeout 8s "$BIN" --config config.yaml --rule noisy_rule.yaml --silence hours=4 >out 2>err ); ec=$?
++[ "$ec" -eq 1 ] || fail "F5 exit $ec; want 1"
++
++
++grep -Fq 'Failed to save silence command to Elasticsearch' "$case_dir/err" || fail "F5 stderr: $(cat "$case_dir/err")"
++
++! grep -Fq 'Success. Fixture Noisy Rule._silence will be silenced until' "$case_dir/err" \
++    || fail "F5 reported success after write failure: $(cat "$case_dir/err")"
++python3 - "$case_dir/es.log" <<'PY'
++import json
++import sys
++
++lines = open(sys.argv[1], encoding="utf-8").read().splitlines()
++if len(lines) != 1:
++    raise SystemExit("FAIL: F5 expected one ES write, got %d" % len(lines))
++event = json.loads(lines[0])
++body = json.loads(event["body"])
++
++if event.get("method") not in {"POST", "PUT"}:
++    raise SystemExit("FAIL: F5 ES method %r" % event.get("method"))
++if body.get("rule_name") != "Fixture Noisy Rule._silence":
++    raise SystemExit("FAIL: F5 rule_name %r" % body.get("rule_name"))
++PY
++assert_no_scheduler_start F5 "$case_dir"
++stop_fake_es
++
++echo "PASS"
++exit 0
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,12 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++exec bash /workspace/repo/usercase-test-coderl/usecase.sh

@@ -1,0 +1,306 @@
+diff --git a/usercase-test-coderl/fixtures/fake_sonic.py b/usercase-test-coderl/fixtures/fake_sonic.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/fixtures/fake_sonic.py
+@@ -0,0 +1,71 @@
++#!/usr/bin/env python3
++import argparse
++import socket
++import threading
++
++
++def append_line(path, line):
++    with open(path, "a", encoding="utf-8") as handle:
++        handle.write(line + "\n")
++        handle.flush()
++
++
++def handle_client(conn, log_path, mode):
++    with conn:
++        conn.sendall(b"CONNECTED mock-sonic\r\n")
++        stream = conn.makefile("rwb", buffering=0)
++        while True:
++            raw = stream.readline()
++            if not raw:
++                return
++            line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
++            append_line(log_path, line)
++
++            if line.startswith("START "):
++                stream.write(b"STARTED ingest protocol(1) buffer(20000)\r\n")
++            elif line.startswith("FLUSHO "):
++                stream.write(b"OK\r\n")
++            elif line.startswith("PUSH "):
++                if mode == "push_error":
++                    stream.write(b"ERR rejected by fake sonic\r\n")
++                else:
++                    stream.write(b"OK\r\n")
++            elif line == "QUIT":
++                stream.write(b"ENDED\r\n")
++                return
++            elif line == "PING":
++                stream.write(b"PONG\r\n")
++            else:
++                stream.write(b"OK\r\n")
++
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--host", default="127.0.0.1")
++    parser.add_argument("--port", type=int, default=1491)
++    parser.add_argument("--log", required=True)
++    parser.add_argument("--ready", required=True)
++    parser.add_argument("--mode", choices=["ok", "push_error"], default="ok")
++    args = parser.parse_args()
++
++    open(args.log, "w", encoding="utf-8").close()
++    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
++    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
++    server.bind((args.host, args.port))
++    server.listen(32)
++    with open(args.ready, "w", encoding="utf-8") as handle:
++        handle.write("ready\n")
++
++    try:
++        while True:
++            conn, _ = server.accept()
++            thread = threading.Thread(
++                target=handle_client, args=(conn, args.log, args.mode), daemon=True
++            )
++            thread.start()
++    finally:
++        server.close()
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/usercase-test-coderl/usecase.sh b/usercase-test-coderl/usecase.sh
+new file mode 100755
+--- /dev/null
++++ b/usercase-test-coderl/usecase.sh
+@@ -0,0 +1,205 @@
++#!/usr/bin/env bash
++
++set -u
++export LANG=C.UTF-8 LC_ALL=C.UTF-8 TZ=UTC
++
++BIN=/tmp/search_index_coderl_acceptance
++( cd /workspace/repo/searchIndex && go build -o "$BIN" . ) \
++    || { echo "FAIL: build" >&2; exit 1; }
++
++TMP=$(mktemp -d)
++SONIC_PID=""
++trap 'stop_sonic 2>/dev/null || true; rm -rf "$TMP"' EXIT
++cd "$TMP" || exit 1
++
++fail() { echo "FAIL: $*" >&2; exit 1; }
++
++assert_contains() {
++    local needle=$1 file=$2 label=$3
++    grep -Fq "$needle" "$file" || fail "$label: missing [$needle]"
++}
++
++assert_not_contains() {
++    local needle=$1 file=$2 label=$3
++    if grep -Fq "$needle" "$file"; then
++        fail "$label: unexpected [$needle]"
++    fi
++}
++
++assert_log_contains() {
++    local needle=$1 label=$2
++
++    grep -Fq "$needle" out || grep -Fq "$needle" err || fail "$label: missing log [$needle]"
++}
++
++assert_log_not_contains() {
++    local needle=$1 label=$2
++
++    if grep -Fq "$needle" out || grep -Fq "$needle" err; then
++        fail "$label: unexpected log [$needle]"
++    fi
++}
++
++write_conf() {
++    local path=$1 root=$2 posts=$3 collection=$4 bucket=$5
++    cat > "$path" <<EOF
++sonic_host: 127.0.0.1
++sonic_password: SecretPassword
++sonic_collection: $collection
++sonic_bucket: $bucket
++root_path: $root
++post_path: $posts
++index_all_init: true
++EOF
++}
++
++start_sonic() {
++    local mode=$1 log=$2 ready=$3
++    rm -f "$log" "$ready"
++    python3 /workspace/repo/usercase-test-coderl/fixtures/fake_sonic.py \
++        --host 127.0.0.1 --port 1491 --log "$log" --ready "$ready" --mode "$mode" &
++    SONIC_PID=$!
++    for _ in $(seq 1 100); do
++        [ -f "$ready" ] && return 0
++        sleep 0.05
++    done
++    fail "fake Sonic did not start"
++}
++
++stop_sonic() {
++    if [ -n "${SONIC_PID:-}" ]; then
++        kill "$SONIC_PID" 2>/dev/null || true
++        wait "$SONIC_PID" 2>/dev/null || true
++        SONIC_PID=""
++    fi
++}
++
++
++
++
++mkdir -p f1/site/content/post f1/site/content/other
++cat > f1/site/content/post/hello.md <<'EOF'
++---
++title: "Hello"
++description: "First post"
++draft: false
++author: ""
++---
++body ignored
++EOF
++cat > f1/site/content/other/outside.md <<'EOF'
++---
++title: "Outside"
++description: "Not selected"
++draft: false
++author: ""
++---
++EOF
++write_conf f1/conf.yaml "$TMP/f1/site/content" "$TMP/f1/site/content/post" demo bucket1
++start_sonic ok f1/sonic.log f1/ready
++"$BIN" -c f1/conf.yaml >out 2>err; ec=$?
++stop_sonic
++OBJ_HELLO='nGNAi5jkKBEtM4M4c3KFyQ0JNDWq0fBi'
++[ "$ec" -eq 0 ] || fail "F1 exit $ec; want 0"
++assert_log_contains '开始连接Sonic服务' F1
++assert_log_contains '新增索引数据：1' F1
++assert_log_contains '开始写入索引数据' F1
++assert_log_contains '成功写入索引：1' F1
++assert_contains 'START ingest SecretPassword' f1/sonic.log F1
++assert_contains "FLUSHO demo bucket1 $OBJ_HELLO" f1/sonic.log F1
++assert_contains "PUSH demo bucket1 $OBJ_HELLO \"Hello First post\"" f1/sonic.log F1
++assert_not_contains 'Outside Not selected' f1/sonic.log F1
++flush_line=$(grep -nF "FLUSHO demo bucket1 $OBJ_HELLO" f1/sonic.log | head -1 | cut -d: -f1)
++push_line=$(grep -nF "PUSH demo bucket1 $OBJ_HELLO \"Hello First post\"" f1/sonic.log | head -1 | cut -d: -f1)
++[ "$flush_line" -lt "$push_line" ] || fail "F1: flush should precede push"
++
++
++
++
++mkdir -p f2/site/content/post
++cat > f2/site/content/post/draft.md <<'EOF'
++---
++title: "Drafty"
++description: "Hidden post"
++draft: true
++author: ""
++---
++EOF
++write_conf f2/conf.yaml "$TMP/f2/site/content" "$TMP/f2/site/content/post" demo bucket1
++start_sonic ok f2/sonic.log f2/ready
++"$BIN" -c f2/conf.yaml >out 2>err; ec=$?
++stop_sonic
++OBJ_DRAFT='n3EElr5/Y6THzL+441WOA5GP7Lm4tdh0'
++[ "$ec" -eq 0 ] || fail "F2 exit $ec; want 0"
++assert_log_contains '删除索引数据：1' F2
++assert_contains "FLUSHO demo bucket1 $OBJ_DRAFT" f2/sonic.log F2
++assert_not_contains 'PUSH ' f2/sonic.log F2
++
++
++
++
++mkdir -p f3/site/content/post
++cat > f3/site/content/post/no_desc.md <<'EOF'
++---
++title: "Only title"
++draft: false
++author: ""
++EOF
++cat > f3/site/content/post/no_title.md <<'EOF'
++---
++description: "Only description"
++draft: false
++author: ""
++EOF
++cat > f3/site/content/post/after_author.md <<'EOF'
++---
++draft: false
++author: ""
++title: "Too Late"
++description: "After author"
++EOF
++write_conf f3/conf.yaml "$TMP/f3/site/content" "$TMP/f3/site/content/post" demo bucket1
++start_sonic ok f3/sonic.log f3/ready
++"$BIN" -c f3/conf.yaml >out 2>err; ec=$?
++stop_sonic
++[ "$ec" -eq 0 ] || fail "F3 exit $ec; want 0"
++assert_log_contains '没有索引数据需要更新' F3
++assert_log_not_contains '开始连接Sonic服务' F3
++[ ! -s f3/sonic.log ] || fail "F3: Sonic should not be contacted; got $(cat f3/sonic.log)"
++
++
++
++
++mkdir -p f4/site/content/post
++ln -s "$TMP/f4/site/content/post/missing-target.md" f4/site/content/post/broken.md
++write_conf f4/conf.yaml "$TMP/f4/site/content" "$TMP/f4/site/content/post" demo bucket1
++"$BIN" -c f4/conf.yaml >out 2>err; ec=$?
++[ "$ec" -ne 0 ] || fail "F4 exit $ec; want non-zero"
++assert_log_contains 'open ' F4
++
++assert_log_contains 'broken.md' F4
++
++
++
++
++mkdir -p f5/site/content/post
++cat > f5/site/content/post/broken-push.md <<'EOF'
++---
++title: "Broken Push"
++description: "Server rejects"
++draft: false
++author: ""
++EOF
++write_conf f5/conf.yaml "$TMP/f5/site/content" "$TMP/f5/site/content/post" demo bucket1
++start_sonic push_error f5/sonic.log f5/ready
++"$BIN" -c f5/conf.yaml >out 2>err; ec=$?
++stop_sonic
++OBJ_BROKEN_PUSH='FJnSA21rfDvKJoNUw1aaUkn61mMmqOpvZW8NrcfCzxAJXamACgvnHA=='
++[ "$ec" -eq 0 ] || fail "F5 exit $ec; want 0"
++assert_log_contains '写入索引有异常' F5
++assert_log_contains "Object: $OBJ_BROKEN_PUSH - Error: rejected by fake sonic" F5
++assert_contains "FLUSHO demo bucket1 $OBJ_BROKEN_PUSH" f5/sonic.log F5
++assert_contains "PUSH demo bucket1 $OBJ_BROKEN_PUSH \"Broken Push Server rejects\"" f5/sonic.log F5
++
++echo "PASS"
++exit 0
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,15 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++
++export GOPROXY=off
++export GOSUMDB=off
++set -e
++cd /workspace/repo
++exec bash /workspace/repo/usercase-test-coderl/usecase.sh

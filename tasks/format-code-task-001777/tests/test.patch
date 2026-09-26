@@ -1,0 +1,209 @@
+diff --git a/test_commands.json b/test_commands.json
+new file mode 100644
+index 000000000..6cbb084f4
+--- /dev/null
++++ b/test_commands.json
+@@ -0,0 +1,3 @@
++{
++  "test_commands": ["go test -run 'TestDirectoryPOSTAsGET|TestNoncePOSTAsGET|TestDirectoryPOSTGarbageBody|TestNoncePOSTGarbageBody|TestDirectoryGETPreserved|TestNonceGETPreserved|TestDirectoryPOSTAsGETNonEmptyPayload|TestNoncePOSTAsGETNonEmptyPayload' ./wfe2/"]
++}
+diff --git a/wfe2/wfe_test.go b/wfe2/wfe_test.go
+index 965abe45e..cf785860b 100644
+--- a/wfe2/wfe_test.go
++++ b/wfe2/wfe_test.go
+@@ -3088,3 +3088,182 @@ func TestPrepAccountForDisplay(t *testing.T) {
+ 	// The ID field should now be zeroed
+ 	test.AssertEquals(t, acct.ID, int64(0))
+ }
++
++
++
++func signedPostAsGet(t *testing.T, wfe *WebFrontEndImpl, path string) *http.Request {
++	signedURL := fmt.Sprintf("http://localhost%s", path)
++	_, _, body := signRequestKeyID(t, 1, nil, signedURL, "", wfe.nonceService)
++	return makePostRequestWithPath(path, body)
++}
++
++
++
++func signedPostAsGetWithBody(t *testing.T, wfe *WebFrontEndImpl, path string, body string) *http.Request {
++	signedURL := fmt.Sprintf("http://localhost%s", path)
++	_, _, jwsBody := signRequestKeyID(t, 1, nil, signedURL, body, wfe.nonceService)
++	return makePostRequestWithPath(path, jwsBody)
++}
++
++
++
++func TestDirectoryPOSTAsGET(t *testing.T) {
++	wfe, _ := setupWFE(t)
++	mux := wfe.Handler()
++	core.RandReader = fakeRand{}
++	defer func() { core.RandReader = rand.Reader }()
++
++	expectedJSON := `{
++  "keyChange": "http://localhost/acme/key-change",
++  "meta": {
++    "termsOfService": "http://example.invalid/terms"
++  },
++  "newNonce": "http://localhost/acme/new-nonce",
++  "newAccount": "http://localhost/acme/new-acct",
++  "newOrder": "http://localhost/acme/new-order",
++  "revokeCert": "http://localhost/acme/revoke-cert",
++  "AAAAAAAAAAA": "https://community.letsencrypt.org/t/adding-random-entries-to-the-directory/33417"
++}`
++
++	req := signedPostAsGet(t, &wfe, directoryPath)
++	responseWriter := httptest.NewRecorder()
++	mux.ServeHTTP(responseWriter, req)
++
++
++	test.AssertEquals(t, responseWriter.Code, http.StatusOK)
++	test.AssertEquals(t, responseWriter.Header().Get("Content-Type"), "application/json")
++	test.AssertUnmarshaledEquals(t, responseWriter.Body.String(), expectedJSON)
++}
++
++
++
++func TestNoncePOSTAsGET(t *testing.T) {
++	wfe, _ := setupWFE(t)
++	mux := wfe.Handler()
++
++	req := signedPostAsGet(t, &wfe, newNoncePath)
++	responseWriter := httptest.NewRecorder()
++	mux.ServeHTTP(responseWriter, req)
++
++
++
++
++	test.AssertEquals(t, responseWriter.Code, http.StatusNoContent)
++	nonce := responseWriter.Header().Get("Replay-Nonce")
++	test.AssertNotEquals(t, nonce, "")
++	test.AssertEquals(t, wfe.nonceService.Valid(nonce), true)
++}
++
++
++
++func TestDirectoryPOSTAsGETNonEmptyPayload(t *testing.T) {
++	wfe, _ := setupWFE(t)
++	mux := wfe.Handler()
++
++	req := signedPostAsGetWithBody(t, &wfe, directoryPath, `{"foo":"bar"}`)
++	responseWriter := httptest.NewRecorder()
++	mux.ServeHTTP(responseWriter, req)
++
++
++	test.AssertEquals(t, responseWriter.Header().Get("Content-Type"), "application/problem+json")
++	var prob probs.ProblemDetails
++	err := json.Unmarshal(responseWriter.Body.Bytes(), &prob)
++	test.AssertNotError(t, err, "Failed to unmarshal problem")
++	test.AssertEquals(t, prob.Type, probs.V2ErrorNS+probs.MalformedProblem)
++	test.AssertEquals(t, prob.HTTPStatus, http.StatusBadRequest)
++
++	test.Assert(t,
++		!strings.Contains(responseWriter.Body.String(), `"newAccount"`),
++		"Directory JSON was returned despite invalid POST-as-GET payload")
++}
++
++
++
++func TestNoncePOSTAsGETNonEmptyPayload(t *testing.T) {
++	wfe, _ := setupWFE(t)
++	mux := wfe.Handler()
++
++	req := signedPostAsGetWithBody(t, &wfe, newNoncePath, `{"hello":"world"}`)
++	responseWriter := httptest.NewRecorder()
++	mux.ServeHTTP(responseWriter, req)
++
++	test.AssertEquals(t, responseWriter.Header().Get("Content-Type"), "application/problem+json")
++	var prob probs.ProblemDetails
++	err := json.Unmarshal(responseWriter.Body.Bytes(), &prob)
++	test.AssertNotError(t, err, "Failed to unmarshal problem")
++	test.AssertEquals(t, prob.Type, probs.V2ErrorNS+probs.MalformedProblem)
++	test.AssertEquals(t, prob.HTTPStatus, http.StatusBadRequest)
++}
++
++
++
++func TestDirectoryPOSTGarbageBody(t *testing.T) {
++	wfe, _ := setupWFE(t)
++	mux := wfe.Handler()
++
++	req := makePostRequestWithPath(directoryPath, "this is not a JWS")
++	responseWriter := httptest.NewRecorder()
++	mux.ServeHTTP(responseWriter, req)
++
++
++	test.AssertNotEquals(t, responseWriter.Code, http.StatusOK)
++	test.AssertEquals(t, responseWriter.Header().Get("Content-Type"), "application/problem+json")
++
++	test.Assert(t,
++		!strings.Contains(responseWriter.Body.String(), `"newAccount"`),
++		"Directory JSON was returned despite invalid JWS body")
++}
++
++
++
++func TestNoncePOSTGarbageBody(t *testing.T) {
++	wfe, _ := setupWFE(t)
++	mux := wfe.Handler()
++
++	req := makePostRequestWithPath(newNoncePath, "this is not a JWS")
++	responseWriter := httptest.NewRecorder()
++	mux.ServeHTTP(responseWriter, req)
++
++
++
++	test.AssertEquals(t, responseWriter.Code, http.StatusBadRequest)
++	test.AssertEquals(t, responseWriter.Header().Get("Content-Type"), "application/problem+json")
++}
++
++
++
++func TestDirectoryGETPreserved(t *testing.T) {
++	wfe, _ := setupWFE(t)
++	mux := wfe.Handler()
++	core.RandReader = fakeRand{}
++	defer func() { core.RandReader = rand.Reader }()
++
++	req := &http.Request{
++		Method: "GET",
++		URL:    mustParseURL(directoryPath),
++		Host:   "localhost",
++	}
++	responseWriter := httptest.NewRecorder()
++	mux.ServeHTTP(responseWriter, req)
++	test.AssertEquals(t, responseWriter.Code, http.StatusOK)
++	test.AssertEquals(t, responseWriter.Header().Get("Content-Type"), "application/json")
++	test.Assert(t, strings.Contains(responseWriter.Body.String(), `"newAccount"`),
++		"GET /directory should still return directory JSON")
++}
++
++
++
++func TestNonceGETPreserved(t *testing.T) {
++	wfe, _ := setupWFE(t)
++	mux := wfe.Handler()
++
++	responseWriter := httptest.NewRecorder()
++	mux.ServeHTTP(responseWriter, &http.Request{
++		Method: "GET",
++		URL:    mustParseURL(newNoncePath),
++	})
++	test.AssertEquals(t, responseWriter.Code, http.StatusNoContent)
++	nonce := responseWriter.Header().Get("Replay-Nonce")
++	test.AssertEquals(t, wfe.nonceService.Valid(nonce), true)
++}
++
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,8 @@
++#!/usr/bin/env bash
++
++set -uo pipefail
++cd /testbed
++rc=0
++go test -run 'TestDirectoryPOSTAsGET|TestNoncePOSTAsGET|TestDirectoryPOSTGarbageBody|TestNoncePOSTGarbageBody|TestDirectoryGETPreserved|TestNonceGETPreserved|TestDirectoryPOSTAsGETNonEmptyPayload|TestNoncePOSTAsGETNonEmptyPayload' ./wfe2/
++rc=$(( rc | $? ))
++exit $rc

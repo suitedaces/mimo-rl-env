@@ -1,0 +1,150 @@
+diff --git a/parser/parser_test.go b/parser/parser_test.go
+index f2b4410a49..1d81ef2dc2 100644
+--- a/parser/parser_test.go
++++ b/parser/parser_test.go
+@@ -518,6 +518,7 @@ func (s *testParserSuite) TestBuiltin(c *C) {
+ 		{"SELECT LOG10(10);", true},
+ 		{"SELECT CONV(10+'10'+'10'+X'0a',10,10);", true},
+ 		{"SELECT CRC32('MySQL');", true},
++		{"SELECT SIGN(0);", true},
+ 
+ 		{"SELECT SUBSTR('Quadratically',5);", true},
+ 		{"SELECT SUBSTR('Quadratically',5, 3);", true},
+diff --git a/plan/typeinferer_test.go b/plan/typeinferer_test.go
+index bdcc8f2c56..0a8cec5093 100644
+--- a/plan/typeinferer_test.go
++++ b/plan/typeinferer_test.go
+@@ -167,6 +167,9 @@ func (ts *testTypeInferrerSuite) TestInferType(c *C) {
+ 		{"character_length('TiDB')", mysql.TypeLonglong, charset.CharsetBin},
+ 		{"crc32('TiDB')", mysql.TypeLonglong, charset.CharsetBin},
+ 		{"timestampdiff(MINUTE,'2003-02-01','2003-05-01 12:05:55')", mysql.TypeLonglong, charset.CharsetBin},
++		{"sign(0)", mysql.TypeLonglong, charset.CharsetBin},
++		{"sign(null)", mysql.TypeLonglong, charset.CharsetBin},
++		{"sign(1.2)", mysql.TypeLonglong, charset.CharsetBin},
+ 		{"unix_timestamp()", mysql.TypeLonglong, charset.CharsetBin},
+ 		{"unix_timestamp('2015-11-13 10:20:19')", mysql.TypeLonglong, charset.CharsetBin},
+ 		{"find_in_set('foo', 'foo,bar')", mysql.TypeLonglong, charset.CharsetBin},
+diff --git a/session_test.go b/session_test.go
+index 0b8c6decc3..bcb68d21a6 100644
+--- a/session_test.go
++++ b/session_test.go
+@@ -1313,6 +1313,58 @@ func (s *testSessionSuite) TestTimeFunc(c *C) {
+ 	c.Assert(err, IsNil)
+ }
+ 
++func (s *testSessionSuite) TestSign(c *C) {
++	defer testleak.AfterTest(c)()
++	store := newStore(c, s.dbName)
++	se := newSession(c, store, s.dbName)
++
++	for _, t := range []struct {
++		expr   string
++		ret    int64
++		isNull bool
++	}{
++		{"SIGN(123)", 1, false},
++		{"SIGN(2)", 1, false},
++		{"SIGN(0.5)", 1, false},
++		{"SIGN('7')", 1, false},
++		{"SIGN('9')", 1, false},
++		{"SIGN(0)", 0, false},
++		{"SIGN(0.0)", 0, false},
++		{"SIGN('0')", 0, false},
++		{"SIGN(-123)", -1, false},
++		{"SIGN(-2)", -1, false},
++		{"SIGN(-0.5)", -1, false},
++		{"SIGN('-7')", -1, false},
++		{"SIGN('-9')", -1, false},
++		{"SIGN(NULL)", 0, true},
++		{"SIGN(NULLIF(1, 1))", 0, true},
++	} {
++		r := mustExecSQL(c, se, "select "+t.expr)
++		row, err := r.Next()
++		c.Assert(err, IsNil, Commentf("expr %s", t.expr))
++		c.Assert(row.Data, HasLen, 1, Commentf("expr %s", t.expr))
++		if t.isNull {
++			c.Assert(row.Data[0].IsNull(), IsTrue, Commentf("expr %s", t.expr))
++			continue
++		}
++		c.Assert(row.Data[0].GetInt64(), Equals, t.ret, Commentf("expr %s", t.expr))
++	}
++
++	mustExecSQL(c, se, "drop table if exists sign_probe")
++	mustExecSQL(c, se, "create table sign_probe (v double)")
++	mustExecSQL(c, se, "insert into sign_probe values (0.5), (0), (-0.5)")
++	r := mustExecSQL(c, se, "select sign(v) from sign_probe order by v")
++	rows, err := GetRows(r)
++	c.Assert(err, IsNil)
++	c.Assert(rows, HasLen, 3)
++	c.Assert(rows[0][0].GetInt64(), Equals, int64(-1))
++	c.Assert(rows[1][0].GetInt64(), Equals, int64(0))
++	c.Assert(rows[2][0].GetInt64(), Equals, int64(1))
++
++	err = store.Close()
++	c.Assert(err, IsNil)
++}
++
+ func (s *testSessionSuite) TestBit(c *C) {
+ 	defer testleak.AfterTest(c)()
+ 	store := newStore(c, s.dbName)
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,56 @@
++#!/bin/bash
++set -euo pipefail
++
++cd /testbed
++
++
++dev-switch go 1.23
++
++mkdir -p /root/go/src/github.com/pingcap
++ln -sf /testbed /root/go/src/github.com/pingcap/tidb
++
++GO111MODULE=off GOPATH=/testbed/_vendor:/root/go GO15VENDOREXPERIMENT="1" go build -o bin/goyacc parser/goyacc/main.go
++bin/goyacc -o /dev/null -xegen temp_parser_file parser/parser.y
++bin/goyacc -o parser/parser.go -xe temp_parser_file parser/parser.y
++rm -f temp_parser_file y.output
++sed -i -e 's|//line.*||' -e 's/yyEofCode/yyEOFCode/' parser/parser.go
++python3 -c "
++import sys
++with open('parser/parser.go', 'rb') as f:
++    data = f.read()
++last_bad = -1
++for i in range(len(data)-1, -1, -1):
++    if data[i] > 127:
++        last_bad = i
++        break
++if last_bad >= 0:
++    while last_bad > 0 and data[last_bad-1] > 127:
++        last_bad -= 1
++    data = data[:last_bad]
++    if not data.endswith(b'\n'):
++        data += b'\n'
++    with open('parser/parser.go', 'wb') as f:
++        f.write(data)
++" 2>/dev/null
++
++
++export GO111MODULE=off
++export GOPATH=/testbed/_vendor:/root/go
++export GO15VENDOREXPERIMENT=1
++
++case "${1:-}" in
++  base)
++    go test -vet=off -run TestT ./expression/ -check.f 'TestAbs|TestConv'
++    go test -vet=off -run TestT ./parser/ -check.f 'TestSimple'
++    go test -vet=off -run TestT ./plan/ -check.f 'TestColumnInfoModified'
++    ;;
++  new)
++    go test -vet=off -run TestT . -check.f 'TestSign'
++    go test -vet=off -run TestT ./parser/ -check.f 'TestBuiltin'
++    go test -vet=off -run TestT ./plan/ -check.f 'TestInferType'
++    ;;
++  *)
++    echo "usage: $0 base|new"
++    exit 2
++    ;;
++esac

@@ -1,0 +1,229 @@
+diff --git ab/balance_strategy_roundrobin_global_test.go b/balance_strategy_roundrobin_global_test.go
+new file mode 100644
+index 0000000..98dd53a
+--- /dev/null
++++ b/balance_strategy_roundrobin_global_test.go
+@@ -0,0 +1,123 @@
++package sarama
++
++import (
++	"reflect"
++	"sort"
++	"testing"
++)
++
++func roundRobinTestMetadata(memberTopics map[string][]string) map[string]ConsumerGroupMemberMetadata {
++	members := make(map[string]ConsumerGroupMemberMetadata, len(memberTopics))
++	for memberID, topics := range memberTopics {
++		members[memberID] = ConsumerGroupMemberMetadata{Topics: topics}
++	}
++	return members
++}
++
++func assertRoundRobinPlan(t *testing.T, plan BalanceStrategyPlan, err error, expected BalanceStrategyPlan) {
++	t.Helper()
++	if err != nil {
++		t.Fatalf("BalanceStrategyRoundRobin.Plan returned error: %v", err)
++	}
++	normalizedPlan := normalizeRoundRobinPlan(plan)
++	normalizedExpected := normalizeRoundRobinPlan(expected)
++	if !reflect.DeepEqual(normalizedPlan, normalizedExpected) {
++		t.Fatalf("unexpected round-robin plan\nexpected: %#v\nactual:   %#v", normalizedExpected, normalizedPlan)
++	}
++}
++
++func normalizeRoundRobinPlan(plan BalanceStrategyPlan) BalanceStrategyPlan {
++	normalized := make(BalanceStrategyPlan, len(plan))
++	for memberID, topics := range plan {
++		topicCopy := make(map[string][]int32, len(topics))
++		for topic, partitions := range topics {
++			if len(partitions) == 0 {
++				continue
++			}
++			partitionsCopy := append([]int32(nil), partitions...)
++			sort.Slice(partitionsCopy, func(i, j int) bool {
++				return partitionsCopy[i] < partitionsCopy[j]
++			})
++			topicCopy[topic] = partitionsCopy
++		}
++		if len(topicCopy) > 0 {
++			normalized[memberID] = topicCopy
++		}
++	}
++	return normalized
++}
++
++func TestBalanceStrategyRoundRobinGlobalAcrossSinglePartitionTopics(t *testing.T) {
++	members := roundRobinTestMetadata(map[string][]string{
++		"M1": {"T1", "T2", "T3"},
++		"M2": {"T1", "T2", "T3"},
++		"M3": {"T1", "T2", "T3"},
++	})
++	topics := map[string][]int32{
++		"T1": {0},
++		"T2": {0},
++		"T3": {0},
++	}
++
++	plan, err := BalanceStrategyRoundRobin.Plan(members, topics)
++	assertRoundRobinPlan(t, plan, err, BalanceStrategyPlan{
++		"M1": map[string][]int32{"T1": {0}},
++		"M2": map[string][]int32{"T2": {0}},
++		"M3": map[string][]int32{"T3": {0}},
++	})
++}
++
++func TestBalanceStrategyRoundRobinGlobalAcrossMixedPartitionCounts(t *testing.T) {
++	members := roundRobinTestMetadata(map[string][]string{
++		"M1": {"T1", "T2", "T3"},
++		"M2": {"T1", "T2", "T3"},
++	})
++	topics := map[string][]int32{
++		"T1": {0},
++		"T2": {0, 1},
++		"T3": {0, 1, 2, 3},
++	}
++
++	plan, err := BalanceStrategyRoundRobin.Plan(members, topics)
++	assertRoundRobinPlan(t, plan, err, BalanceStrategyPlan{
++		"M1": map[string][]int32{"T1": {0}, "T2": {1}, "T3": {1, 3}},
++		"M2": map[string][]int32{"T2": {0}, "T3": {0, 2}},
++	})
++}
++
++func TestBalanceStrategyRoundRobinSkipsUnsubscribedMembersWithoutResettingProgress(t *testing.T) {
++	members := roundRobinTestMetadata(map[string][]string{
++		"M1": {"T1", "T2", "T3"},
++		"M2": {"T1", "T3"},
++	})
++	topics := map[string][]int32{
++		"T1": {0},
++		"T2": {0},
++		"T3": {0},
++	}
++
++	plan, err := BalanceStrategyRoundRobin.Plan(members, topics)
++	assertRoundRobinPlan(t, plan, err, BalanceStrategyPlan{
++		"M1": map[string][]int32{"T1": {0}, "T2": {0}},
++		"M2": map[string][]int32{"T3": {0}},
++	})
++}
++
++func TestBalanceStrategyRoundRobinSkipsMultipleIneligibleMembers(t *testing.T) {
++	members := roundRobinTestMetadata(map[string][]string{
++		"A": {"T1", "T2", "T3"},
++		"B": {"T1"},
++		"C": {"T1", "T3"},
++	})
++	topics := map[string][]int32{
++		"T1": {0},
++		"T2": {0},
++		"T3": {0, 1},
++	}
++
++	plan, err := BalanceStrategyRoundRobin.Plan(members, topics)
++	assertRoundRobinPlan(t, plan, err, BalanceStrategyPlan{
++		"A": map[string][]int32{"T1": {0}, "T2": {0}, "T3": {1}},
++		"C": map[string][]int32{"T3": {0}},
++	})
++}
+diff --git a/balance_strategy_test.go b/balance_strategy_test.go
+index 25a51adaa..66af3d1c9 100644
+--- a/balance_strategy_test.go
++++ b/balance_strategy_test.go
+@@ -90,26 +90,64 @@ func TestBalanceStrategyRoundRobin(t *testing.T) {
+ 		expected BalanceStrategyPlan
+ 	}{
+ 		{
+-			members: map[string][]string{"M1": {"T1", "T2"}, "M2": {"T1", "T2"}},
+-			topics:  map[string][]int32{"T1": {0, 1, 2, 3}, "T2": {0, 1, 2, 3}},
++			members: map[string][]string{"M1": {"T1", "T2", "T3"}, "M2": {"T1", "T2", "T3"}},
++			topics:  map[string][]int32{"T1": {0}, "T2": {0}, "T3": {0}},
+ 			expected: BalanceStrategyPlan{
+-				"M1": map[string][]int32{"T1": {0, 2}, "T2": {1, 3}},
+-				"M2": map[string][]int32{"T1": {1, 3}, "T2": {0, 2}},
++				"M1": map[string][]int32{"T1": {0}, "T3": {0}},
++				"M2": map[string][]int32{"T2": {0}},
+ 			},
+ 		},
+ 		{
+-			members: map[string][]string{"M1": {"T1", "T2"}, "M2": {"T1", "T2"}},
+-			topics:  map[string][]int32{"T1": {0, 1, 2}, "T2": {0, 1, 2}},
++			members: map[string][]string{"M1": {"T1", "T2", "T3"}, "M2": {"T1", "T2", "T3"}},
++			topics:  map[string][]int32{"T1": {0}, "T2": {0, 1}, "T3": {0, 1, 2, 3}},
++			expected: BalanceStrategyPlan{
++				"M1": map[string][]int32{"T1": {0}, "T2": {1}, "T3": {1, 3}},
++				"M2": map[string][]int32{"T2": {0}, "T3": {0, 2}},
++			},
++		},
++		{
++			members: map[string][]string{"M1": {"T1"}, "M2": {"T1"}},
++			topics:  map[string][]int32{"T1": {0}},
++			expected: BalanceStrategyPlan{
++				"M1": map[string][]int32{"T1": {0}},
++			},
++		},
++		{
++			members: map[string][]string{"M1": {"T1", "T2", "T3"}},
++			topics:  map[string][]int32{"T1": {0}, "T2": {0}, "T3": {0, 1, 2}},
+ 			expected: BalanceStrategyPlan{
+-				"M1": map[string][]int32{"T1": {0, 2}, "T2": {1}},
+-				"M2": map[string][]int32{"T1": {1}, "T2": {0, 2}},
++				"M1": map[string][]int32{"T1": {0}, "T2": {0}, "T3": {0, 1, 2}},
++			},
++		},
++		{
++			members: map[string][]string{"M1": {"T1", "T2", "T3"}, "M2": {"T1"}},
++			topics:  map[string][]int32{"T1": {0}, "T2": {0}, "T3": {0}},
++			expected: BalanceStrategyPlan{
++				"M1": map[string][]int32{"T1": {0}, "T2": {0}, "T3": {0}},
++			},
++		},
++		{
++			members: map[string][]string{"M1": {"T1", "T2", "T3"}, "M2": {"T1", "T3"}},
++			topics:  map[string][]int32{"T1": {0}, "T2": {0}, "T3": {0}},
++			expected: BalanceStrategyPlan{
++				"M1": map[string][]int32{"T1": {0}, "T2": {0}},
++				"M2": map[string][]int32{"T3": {0}},
++			},
++		},
++		{
++			members: map[string][]string{"M": {"T1", "T2", "TT2"}, "M2": {"T1", "T2", "TT2"}, "M3": {"T1", "T2", "TT2"}},
++			topics:  map[string][]int32{"T1": {0}, "T2": {0}, "TT2": {0}},
++			expected: BalanceStrategyPlan{
++				"M":  map[string][]int32{"T1": {0}},
++				"M2": map[string][]int32{"T2": {0}},
++				"M3": map[string][]int32{"TT2": {0}},
+ 			},
+ 		},
+ 	}
+ 
+ 	strategy := BalanceStrategyRoundRobin
+ 	if strategy.Name() != "roundrobin" {
+-		t.Errorf("Unexpected stategy name\nexpected: range\nactual: %v", strategy.Name())
++		t.Errorf("Unexpected strategy name\nexpected: roundrobin\nactual: %v", strategy.Name())
+ 	}
+ 
+ 	for _, test := range tests {
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,17 @@
++#!/usr/bin/env bash
++set -uo pipefail
++
++cd /testbed
++
++case "${1:-}" in
++  base)
++    go test -v -run '^TestBalanceStrategyRoundRobin$' -count=1 .
++    ;;
++  new)
++    go test -v -run '^(TestBalanceStrategyRoundRobin|TestBalanceStrategyRoundRobinGlobalAcrossSinglePartitionTopics|TestBalanceStrategyRoundRobinGlobalAcrossMixedPartitionCounts|TestBalanceStrategyRoundRobinSkipsUnsubscribedMembersWithoutResettingProgress|TestBalanceStrategyRoundRobinSkipsMultipleIneligibleMembers)$' -count=1 .
++    ;;
++  *)
++    echo "usage: $0 base|new"
++    exit 2
++    ;;
++esac

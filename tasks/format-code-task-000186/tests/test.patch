@@ -1,0 +1,268 @@
+diff --git a/cmd/validator/accounts/import_fixture_test.go b/cmd/validator/accounts/import_fixture_test.go
+new file mode 100644
+index 0000000000..6fc0b3c23a
+--- /dev/null
++++ b/cmd/validator/accounts/import_fixture_test.go
+@@ -0,0 +1,239 @@
++package accounts
++
++import (
++	"flag"
++	"io"
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++
++	"github.com/ethereum/go-ethereum/common/hexutil"
++	"github.com/prysmaticlabs/prysm/v4/cmd/validator/flags"
++	"github.com/prysmaticlabs/prysm/v4/config/params"
++	"github.com/prysmaticlabs/prysm/v4/testing/assert"
++	"github.com/prysmaticlabs/prysm/v4/testing/require"
++	validatorAccounts "github.com/prysmaticlabs/prysm/v4/validator/accounts"
++	"github.com/prysmaticlabs/prysm/v4/validator/accounts/iface"
++	validatorWallet "github.com/prysmaticlabs/prysm/v4/validator/accounts/wallet"
++	"github.com/prysmaticlabs/prysm/v4/validator/keymanager"
++	"github.com/prysmaticlabs/prysm/v4/validator/keymanager/local"
++	"github.com/sirupsen/logrus"
++	logTest "github.com/sirupsen/logrus/hooks/test"
++	"github.com/urfave/cli/v2"
++)
++
++func TestFixtureAccountsImportPromptsWalletDirectoryOnceWhenCreatingWallet(t *testing.T) {
++	local.ResetCaches()
++	keysDir := t.TempDir()
++	firstWalletDir := filepath.Join(t.TempDir(), "wallet-entered-first")
++	secondSentinelDir := filepath.Join(t.TempDir(), "wallet-second-sentinel")
++	defaultWalletDir := filepath.Join(t.TempDir(), "default-wallet")
++	_, _, passwordFilePath := setupWalletAndPasswordsDir(t)
++	keystore, _ := createKeystore(t, keysDir)
++
++	cliCtx := setupPromptedImportCtx(t, defaultWalletDir, keysDir, passwordFilePath)
++	output, err := runWithStdinAndCapturedStdout(
++		t,
++		strings.Join([]string{firstWalletDir, secondSentinelDir}, "\n")+"\n",
++		func() error {
++			return accountsImport(cliCtx)
++		},
++	)
++	require.NoError(t, err)
++	assert.Equal(t, 1, strings.Count(output, "Enter a wallet directory"))
++
++	firstExists, err := validatorWallet.Exists(firstWalletDir)
++	require.NoError(t, err)
++	assert.Equal(t, true, firstExists)
++	secondExists, err := validatorWallet.Exists(secondSentinelDir)
++	require.NoError(t, err)
++	assert.Equal(t, false, secondExists)
++
++	importedKeys := fetchWalletPublicKeys(t, cliCtx, firstWalletDir)
++	assert.Equal(t, true, publicKeyHexSet(importedKeys)[keystore.Pubkey])
++}
++
++func TestFixtureAccountsImportDiscoversTopLevelAndNestedKeystores(t *testing.T) {
++	keysDir := t.TempDir()
++	topKey := writeImportKeystore(t, keysDir, "validator-root-alpha.json")
++
++	depthOneDir := filepath.Join(keysDir, "batch-alpha", "validators-a")
++	depthOneKey := writeImportKeystore(t, depthOneDir, "account-beta-01.json")
++
++	depthTwoDir := filepath.Join(keysDir, "group-gamma", "segment-delta")
++	depthTwoKey := writeImportKeystore(t, depthTwoDir, "deposit-gamma-02.json")
++
++	importedKeys := importKeystoresFromDir(t, keysDir)
++	importedSet := publicKeyHexSet(importedKeys)
++	assert.Equal(t, true, importedSet[topKey.Pubkey])
++	assert.Equal(t, true, importedSet[depthOneKey.Pubkey])
++	assert.Equal(t, true, importedSet[depthTwoKey.Pubkey])
++	assert.Equal(t, 3, len(importedSet))
++}
++
++func TestFixtureAccountsImportStopsAtMaxKeystoreDirectoryDepth(t *testing.T) {
++	hook := logTest.NewGlobal()
++	keysDir := t.TempDir()
++	supportedDir := filepath.Join(keysDir, "outer-supported", "inner-supported")
++	supportedKey := writeImportKeystore(t, supportedDir, "validator-supported-depth.json")
++
++	tooDeepDir := filepath.Join(keysDir, "outer-too-deep", "inner-too-deep", "beyond-limit")
++	tooDeepKey := writeImportKeystore(t, tooDeepDir, "validator-too-deep-omega.json")
++
++	infoLogsBeforeImport := countLogEntriesAtLevel(hook, logrus.InfoLevel)
++	importedKeys := importKeystoresFromDir(t, keysDir)
++	importedSet := publicKeyHexSet(importedKeys)
++	assert.Equal(t, true, importedSet[supportedKey.Pubkey])
++	assert.Equal(t, false, importedSet[tooDeepKey.Pubkey])
++	assert.Equal(t, true, countLogEntriesAtLevel(hook, logrus.InfoLevel) > infoLogsBeforeImport)
++}
++
++func TestFixtureAccountsImportLogsStartOfKeystoreImport(t *testing.T) {
++	hook := logTest.NewGlobal()
++	keysDir := t.TempDir()
++	writeImportKeystore(t, keysDir, "validator-start-log.json")
++
++	infoLogsBeforeImport := countLogEntriesAtLevel(hook, logrus.InfoLevel)
++	_ = importKeystoresFromDir(t, keysDir)
++	assert.Equal(t, true, countLogEntriesAtLevel(hook, logrus.InfoLevel) > infoLogsBeforeImport)
++}
++
++func TestFixtureAccountsImportDirectoryProcessingFailureReportsImportDirectoryError(t *testing.T) {
++	local.ResetCaches()
++	walletDir, passwordsDir, passwordFilePath := setupWalletAndPasswordsDir(t)
++	missingKeysDir := filepath.Join(t.TempDir(), "missing-keys-dir")
++	cliCtx := setupWalletCtx(t, &testWalletConfig{
++		walletDir:           walletDir,
++		passwordsDir:        passwordsDir,
++		keysDir:             missingKeysDir,
++		keymanagerKind:      keymanager.Local,
++		walletPasswordFile:  passwordFilePath,
++		accountPasswordFile: passwordFilePath,
++	})
++	acc, err := validatorAccounts.NewCLIManager(
++		validatorAccounts.WithWalletDir(walletDir),
++		validatorAccounts.WithKeymanagerType(keymanager.Local),
++		validatorAccounts.WithWalletPassword(password),
++	)
++	require.NoError(t, err)
++	_, err = acc.WalletCreate(cliCtx.Context)
++	require.NoError(t, err)
++
++	err = accountsImport(cliCtx)
++	if err == nil {
++		t.Fatal("expected missing keys directory to fail")
++	}
++}
++
++func importKeystoresFromDir(t *testing.T, keysDir string) [][48]byte {
++	t.Helper()
++	local.ResetCaches()
++	walletDir, passwordsDir, passwordFilePath := setupWalletAndPasswordsDir(t)
++	cliCtx := setupWalletCtx(t, &testWalletConfig{
++		walletDir:           walletDir,
++		passwordsDir:        passwordsDir,
++		keysDir:             keysDir,
++		keymanagerKind:      keymanager.Local,
++		walletPasswordFile:  passwordFilePath,
++		accountPasswordFile: passwordFilePath,
++	})
++	acc, err := validatorAccounts.NewCLIManager(
++		validatorAccounts.WithWalletDir(walletDir),
++		validatorAccounts.WithKeymanagerType(keymanager.Local),
++		validatorAccounts.WithWalletPassword(password),
++	)
++	require.NoError(t, err)
++	_, err = acc.WalletCreate(cliCtx.Context)
++	require.NoError(t, err)
++	require.NoError(t, accountsImport(cliCtx))
++	return fetchWalletPublicKeys(t, cliCtx, walletDir)
++}
++
++func fetchWalletPublicKeys(t *testing.T, cliCtx *cli.Context, walletDir string) [][48]byte {
++	t.Helper()
++	w, err := validatorWallet.OpenWallet(cliCtx.Context, &validatorWallet.Config{
++		WalletDir:      walletDir,
++		WalletPassword: password,
++	})
++	require.NoError(t, err)
++	km, err := w.InitializeKeymanager(cliCtx.Context, iface.InitKeymanagerConfig{ListenForChanges: false})
++	require.NoError(t, err)
++	keys, err := km.FetchValidatingPublicKeys(cliCtx.Context)
++	require.NoError(t, err)
++	return keys
++}
++
++func setupPromptedImportCtx(t testing.TB, defaultWalletDir, keysDir, passwordFilePath string) *cli.Context {
++	t.Helper()
++	app := cli.App{}
++	set := flag.NewFlagSet("fixture-import", 0)
++	set.String(flags.WalletDirFlag.Name, defaultWalletDir, "")
++	set.String(flags.KeysDirFlag.Name, "", "")
++	set.String(flags.WalletPasswordFileFlag.Name, "", "")
++	set.String(flags.AccountPasswordFileFlag.Name, "", "")
++	set.String(flags.KeymanagerKindFlag.Name, keymanager.Local.String(), "")
++	set.String(flags.GrpcHeadersFlag.Name, "", "")
++
++	assert.NoError(t, set.Set(flags.KeysDirFlag.Name, keysDir))
++	assert.NoError(t, set.Set(flags.WalletPasswordFileFlag.Name, passwordFilePath))
++	assert.NoError(t, set.Set(flags.AccountPasswordFileFlag.Name, passwordFilePath))
++	return cli.NewContext(&app, set, nil)
++}
++
++func writeImportKeystore(t *testing.T, dir, name string) *keymanager.Keystore {
++	t.Helper()
++	require.NoError(t, os.MkdirAll(dir, params.BeaconIoConfig().ReadWriteExecutePermissions))
++	keystore, path := createKeystore(t, dir)
++	newPath := filepath.Join(dir, name)
++	require.NoError(t, os.Rename(path, newPath))
++	return keystore
++}
++
++func publicKeyHexSet(keys [][48]byte) map[string]bool {
++	out := make(map[string]bool, len(keys))
++	for _, key := range keys {
++		out[hexutil.Encode(key[:])[2:]] = true
++	}
++	return out
++}
++
++func countLogEntriesAtLevel(hook *logTest.Hook, level logrus.Level) int {
++	count := 0
++	for _, entry := range hook.AllEntries() {
++		if entry.Level == level {
++			count++
++		}
++	}
++	return count
++}
++
++func runWithStdinAndCapturedStdout(t testing.TB, input string, fn func() error) (string, error) {
++	t.Helper()
++	stdinFile, err := os.CreateTemp(t.TempDir(), "stdin")
++	require.NoError(t, err)
++	_, err = stdinFile.WriteString(input)
++	require.NoError(t, err)
++	_, err = stdinFile.Seek(0, 0)
++	require.NoError(t, err)
++
++	oldStdin := os.Stdin
++	oldStdout := os.Stdout
++	stdoutReader, stdoutWriter, err := os.Pipe()
++	require.NoError(t, err)
++	outCh := make(chan string, 1)
++	go func() {
++		out, _ := io.ReadAll(stdoutReader)
++		outCh <- string(out)
++	}()
++
++	os.Stdin = stdinFile
++	os.Stdout = stdoutWriter
++	runErr := fn()
++	require.NoError(t, stdoutWriter.Close())
++	os.Stdout = oldStdout
++	os.Stdin = oldStdin
++	require.NoError(t, stdinFile.Close())
++	require.NoError(t, stdoutReader.Close())
++	return <-outCh, runErr
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,18 @@
++#!/bin/bash
++set -uo pipefail
++cd /testbed
++
++
++
++case "${1:-}" in
++  base)
++    go test ./cmd/validator/accounts -run '^TestImport_Noninteractive$' -v -count=1 -timeout 120s
++    ;;
++  new)
++    go test ./cmd/validator/accounts -run '^TestFixtureAccountsImport' -v -count=1 -timeout 120s
++    ;;
++  *)
++    echo "usage: $0 base|new"
++    exit 2
++    ;;
++esac

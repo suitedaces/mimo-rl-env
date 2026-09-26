@@ -1,0 +1,301 @@
+diff --git a/starfish/test/image/test_apply.py b/starfish/test/image/test_apply.py
+index ebbc75a7..7388bda1 100644
+--- a/starfish/test/image/test_apply.py
++++ b/starfish/test/image/test_apply.py
+@@ -3,6 +3,7 @@ import copy
+ import numpy as np
+ 
+ from starfish.imagestack.imagestack import ImageStack
++from starfish.types import Indices
+ from starfish.util.synthesize import SyntheticData
+ 
+ 
+@@ -10,6 +11,33 @@ def divide(array, value):
+     return array / value
+ 
+ 
++def _small_distinct_stack():
++    data = np.linspace(0, 1, num=2 * 3 * 2 * 4 * 5, dtype=np.float32).reshape(2, 3, 2, 4, 5)
++    return ImageStack.from_numpy_array(data), data.copy()
++
++
++def _axis_size(stack, axis):
++    return stack.xarray.sizes[axis.value]
++
++
++def add_block_size(array):
++    return array + array.size
++
++
++def test_apply_accepts_axis_subset_for_2d_planes():
++    stack, original = _small_distinct_stack()
++
++    output = stack.apply(
++        add_block_size,
++        split_by={Indices.Y.value, Indices.X.value},
++        n_processes=1,
++    )
++
++    expected_size = _axis_size(stack, Indices.Y) * _axis_size(stack, Indices.X)
++    np.testing.assert_array_equal(output.xarray.values, original + expected_size)
++    np.testing.assert_array_equal(stack.xarray.values, original)
++
++
+ def test_apply():
+     """test that apply correctly applies a simple function across 2d tiles of a Stack"""
+     stack = ImageStack.synthetic_stack()
+@@ -20,10 +48,31 @@ def test_apply():
+ 
+ def test_apply_3d():
+     """test that apply correctly applies a simple function across 3d volumes of a Stack"""
+-    stack = ImageStack.synthetic_stack()
+-    assert np.all(stack.xarray == 1)
+-    output = stack.apply(divide, value=4, is_volume=True)
+-    assert (output.xarray == 0.25).all()
++    stack, original = _small_distinct_stack()
++
++    output = stack.apply(
++        add_block_size,
++        split_by={Indices.Z.value, Indices.Y.value, Indices.X.value},
++        n_processes=1,
++    )
++
++    expected_size = (
++        _axis_size(stack, Indices.Z)
++        * _axis_size(stack, Indices.Y)
++        * _axis_size(stack, Indices.X)
++    )
++    np.testing.assert_array_equal(output.xarray.values, original + expected_size)
++    np.testing.assert_array_equal(stack.xarray.values, original)
++
++
++def test_apply_accepts_non_tile_axis_subset():
++    stack, original = _small_distinct_stack()
++
++    output = stack.apply(add_block_size, split_by={Indices.CH.value}, n_processes=1)
++
++    expected_size = _axis_size(stack, Indices.CH)
++    np.testing.assert_array_equal(output.xarray.values, original + expected_size)
++    np.testing.assert_array_equal(stack.xarray.values, original)
+ 
+ 
+ def test_apply_labeled_dataset():
+diff --git a/starfish/test/image/test_apply_split_by_filter_compat.py b/starfish/test/image/test_apply_split_by_filter_compat.py
+new file mode 100644
+index 00000000..fb45c5b1
+--- /dev/null
++++ b/starfish/test/image/test_apply_split_by_filter_compat.py
+@@ -0,0 +1,151 @@
++import numpy as np
++import pytest
++
++from starfish.image._filter.bandpass import Bandpass
++from starfish.image._filter.clip import Clip
++from starfish.image._filter.gaussian_high_pass import GaussianHighPass
++from starfish.image._filter.gaussian_low_pass import GaussianLowPass
++from starfish.image._filter.mean_high_pass import MeanHighPass
++from starfish.image._filter.richardson_lucy_deconvolution import DeconvolvePSF
++from starfish.image._filter.scale_by_percentile import ScaleByPercentile
++from starfish.image._filter.white_tophat import WhiteTophat
++from starfish.imagestack.imagestack import ImageStack
++from starfish.types import Indices
++
++
++def _new_distinct_stack():
++    data = np.linspace(0, 1, num=2 * 2 * 2 * 8 * 8, dtype=np.float32).reshape(2, 2, 2, 8, 8)
++    return ImageStack.from_numpy_array(data), data.copy()
++
++
++def _new_percentile_stack():
++    shape = (2, 2, 2, 5, 5)
++    data = np.zeros(shape, dtype=np.float32)
++    stack = ImageStack.from_numpy_array(data.copy())
++
++    r_axis = stack.xarray.get_axis_num(Indices.ROUND.value)
++    c_axis = stack.xarray.get_axis_num(Indices.CH.value)
++    z_axis = stack.xarray.get_axis_num(Indices.Z.value)
++    y_axis = stack.xarray.get_axis_num(Indices.Y.value)
++    x_axis = stack.xarray.get_axis_num(Indices.X.value)
++
++    for index in np.ndindex(shape):
++        r = index[r_axis]
++        c = index[c_axis]
++        z = index[z_axis]
++        y = index[y_axis]
++        x = index[x_axis]
++
++
++        data[index] = 1000 * r + 100 * c + 40 * z + 3 * y + x
++
++    stack.xarray.values[...] = data
++    return stack, data
++
++
++def _clip_plane_wise_reference(data, stack, p_min, p_max):
++    result = np.empty_like(data)
++    r_axis = stack.xarray.get_axis_num(Indices.ROUND.value)
++    c_axis = stack.xarray.get_axis_num(Indices.CH.value)
++    z_axis = stack.xarray.get_axis_num(Indices.Z.value)
++
++    for r in range(stack.xarray.sizes[Indices.ROUND.value]):
++        for c in range(stack.xarray.sizes[Indices.CH.value]):
++            for z in range(stack.xarray.sizes[Indices.Z.value]):
++                selector = [slice(None)] * data.ndim
++                selector[r_axis] = r
++                selector[c_axis] = c
++                selector[z_axis] = z
++                plane = data[tuple(selector)]
++                low, high = np.percentile(plane, [p_min, p_max])
++                result[tuple(selector)] = np.clip(plane, low, high)
++    return result
++
++
++def _clip_volume_wise_reference(data, stack, p_min, p_max):
++    result = np.empty_like(data)
++    r_axis = stack.xarray.get_axis_num(Indices.ROUND.value)
++    c_axis = stack.xarray.get_axis_num(Indices.CH.value)
++
++    for r in range(stack.xarray.sizes[Indices.ROUND.value]):
++        for c in range(stack.xarray.sizes[Indices.CH.value]):
++            selector = [slice(None)] * data.ndim
++            selector[r_axis] = r
++            selector[c_axis] = c
++            volume = data[tuple(selector)]
++            low, high = np.percentile(volume, [p_min, p_max])
++            result[tuple(selector)] = np.clip(volume, low, high)
++    return result
++
++
++def _assert_same_logical_dimensions(before, after):
++    assert after.xarray.dims == before.xarray.dims
++    assert after.xarray.shape == before.xarray.shape
++
++
++def test_clip_is_volume_false_matches_plane_wise_percentile_clipping():
++    stack, data = _new_percentile_stack()
++    p_min, p_max = 20, 80
++    expected = _clip_plane_wise_reference(data, stack, p_min, p_max)
++
++    result = Clip(p_min=p_min, p_max=p_max, is_volume=False).run(stack, n_processes=1)
++
++    _assert_same_logical_dimensions(stack, result)
++    np.testing.assert_allclose(result.xarray.values, expected, rtol=1e-6, atol=1e-6)
++
++
++def test_clip_is_volume_true_matches_volume_wise_percentile_clipping():
++    stack, data = _new_percentile_stack()
++    p_min, p_max = 20, 80
++    expected_volume = _clip_volume_wise_reference(data, stack, p_min, p_max)
++    expected_plane = _clip_plane_wise_reference(data, stack, p_min, p_max)
++
++    result = Clip(p_min=p_min, p_max=p_max, is_volume=True).run(stack, n_processes=1)
++
++    assert not np.allclose(expected_volume, expected_plane)
++    _assert_same_logical_dimensions(stack, result)
++    np.testing.assert_allclose(result.xarray.values, expected_volume, rtol=1e-6, atol=1e-6)
++
++
++FILTER_FACTORIES = [
++    lambda is_volume: Clip(p_min=10, p_max=90, is_volume=is_volume),
++    lambda is_volume: GaussianLowPass(sigma=1, is_volume=is_volume),
++    lambda is_volume: GaussianHighPass(sigma=1, is_volume=is_volume),
++    lambda is_volume: MeanHighPass(size=3, is_volume=is_volume),
++    lambda is_volume: ScaleByPercentile(p=95, is_volume=is_volume),
++    lambda is_volume: WhiteTophat(masking_radius=1, is_volume=is_volume),
++    lambda is_volume: Bandpass(lshort=1, llong=3, threshold=0.0, is_volume=is_volume),
++]
++
++
++@pytest.mark.parametrize("is_volume", [False, True])
++@pytest.mark.parametrize("filter_factory", FILTER_FACTORIES)
++def test_modified_filters_accept_both_is_volume_modes(filter_factory, is_volume):
++    stack, _ = _new_distinct_stack()
++    filter_instance = filter_factory(is_volume)
++
++    result = filter_instance.run(stack, n_processes=1)
++
++    _assert_same_logical_dimensions(stack, result)
++    assert np.isfinite(result.xarray.values).all()
++
++
++def test_richardson_lucy_deconvolution_accepts_multiz_stack_with_2d_kernel():
++    stack, data = _new_distinct_stack()
++    z_axis = stack.xarray.get_axis_num(Indices.Z.value)
++
++
++
++
++    result = DeconvolvePSF(
++        num_iter=2,
++        sigma=1,
++    ).run(stack, n_processes=1)
++
++    _assert_same_logical_dimensions(stack, result)
++    assert np.isfinite(result.xarray.values).all()
++    assert not np.allclose(result.xarray.values, data)
++
++    moved = np.moveaxis(result.xarray.values, z_axis, 0)
++    if moved.shape[0] > 1:
++        assert any(not np.allclose(moved[0], moved[z]) for z in range(1, moved.shape[0]))
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,57 @@
++#!/bin/bash
++set -uo pipefail
++cd /testbed
++
++
++
++export PYTHONPATH=/testbed:${PYTHONPATH:-}
++
++
++
++
++
++case "${1:-}" in
++  base)
++    python3 -c "
++import skimage.feature
++import skimage.registration
++import numpy as np
++if not hasattr(np, 'float'):
++    np.float = float
++if not hasattr(skimage.feature, 'register_translation'):
++    skimage.feature.register_translation = skimage.registration.phase_cross_correlation
++import pytest
++import sys
++sys.exit(pytest.main([
++    '-q',
++    'starfish/test/image/test_apply.py::test_apply',
++    'starfish/test/image/test_apply.py::test_apply_labeled_dataset',
++    'starfish/test/image/test_apply.py::test_apply_in_place',
++]))
++"
++    ;;
++  new)
++    python3 -c "
++import skimage.feature
++import skimage.registration
++import numpy as np
++if not hasattr(np, 'float'):
++    np.float = float
++if not hasattr(skimage.feature, 'register_translation'):
++    skimage.feature.register_translation = skimage.registration.phase_cross_correlation
++import pytest
++import sys
++sys.exit(pytest.main([
++    '-q',
++    'starfish/test/image/test_apply.py::test_apply_accepts_axis_subset_for_2d_planes',
++    'starfish/test/image/test_apply.py::test_apply_3d',
++    'starfish/test/image/test_apply.py::test_apply_accepts_non_tile_axis_subset',
++    'starfish/test/image/test_apply_split_by_filter_compat.py',
++]))
++"
++    ;;
++  *)
++    echo "usage: $0 base|new"
++    exit 2
++    ;;
++esac

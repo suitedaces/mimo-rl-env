@@ -1,0 +1,282 @@
+diff --git a/packages/opencensus-exporter-zpages/test/test-zpages-json.ts b/packages/opencensus-exporter-zpages/test/test-zpages-json.ts
+new file mode 100644
+index 0000000..7025c65
+--- /dev/null
++++ b/packages/opencensus-exporter-zpages/test/test-zpages-json.ts
+@@ -0,0 +1,191 @@
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++import {types} from '@opencensus/opencensus-core';
++import * as assert from 'assert';
++import * as http from 'http';
++
++import {ZpagesExporter, ZpagesExporterOptions} from '../src/zpages';
++
++const tracing = require('@opencensus/nodejs');
++
++
++const options = {
++  port: 8083,
++  spanNames: ['predefined/span1'],
++  startServer: false
++} as ZpagesExporterOptions;
++
++const serverUrl = 'http://localhost:' + options.port;
++
++const LATENCY_BUCKETS = [
++  'ZERO_MICROSx10', 'MICROSx10_MICROSx100', 'MICROSx100_MILLIx1',
++  'MILLIx1_MILLIx10', 'MILLIx10_MILLIx100', 'MILLIx100_SECONDx1',
++  'SECONDx1_SECONDx10', 'SECONDx10_SECONDx100', 'SECONDx100_MAX'
++];
++
++
++function get(path: string): Promise<{statusCode: number, body: string}> {
++  return new Promise((resolve, reject) => {
++    http.get(serverUrl + path, (res) => {
++          let body = '';
++          res.on('data', (chunk) => body += chunk);
++          res.on('end', () => resolve({statusCode: res.statusCode, body}));
++        })
++        .on('error', reject);
++  });
++}
++
++describe('Zpages JSON endpoints', () => {
++  let zpages: ZpagesExporter;
++  let runningTraceId: string;
++  let runningId: string;
++
++  before((done) => {
++    zpages = new ZpagesExporter(options);
++    tracing.start({samplingRate: 1});
++    tracing.registerExporter(zpages);
++
++
++    tracing.tracer.startRootSpan(
++        {name: 'rootJsonTest'}, (root: types.RootSpan) => {
++          const child = tracing.tracer.startChildSpan('childJsonTest', 'type');
++          child.end();
++          root.end();
++        });
++
++
++    tracing.tracer.startRootSpan(
++        {name: 'runningJsonTest'}, (running: types.RootSpan) => {
++          runningTraceId = running.traceId;
++          runningId = running.id;
++        });
++
++    zpages.startServer(done);
++  });
++
++  after(() => {
++    zpages.stopServer();
++  });
++
++  describe('/tracez?json=1', () => {
++    it('responds with valid JSON', async () => {
++      const res = await get('/tracez?json=1');
++      assert.strictEqual(res.statusCode, 200);
++      assert.doesNotThrow(() => JSON.parse(res.body));
++    });
++
++    it('reports a spanCell per span name, ordered ascending by name',
++       async () => {
++         const data = JSON.parse((await get('/tracez?json=1')).body);
++         assert.ok(Array.isArray(data.spanCells));
++         const names = data.spanCells.map((c: {name: string}) => c.name);
++
++         for (const expected
++                  of ['predefined/span1', 'rootJsonTest', 'childJsonTest',
++                      'runningJsonTest']) {
++           assert.ok(
++               names.indexOf(expected) !== -1,
++               `expected spanCell for "${expected}"`);
++         }
++
++         const sorted = names.slice().sort();
++         assert.deepStrictEqual(names, sorted);
++       });
++
++    it('exposes RUNNING/ERRORS/latencies counters per cell', async () => {
++      const data = JSON.parse((await get('/tracez?json=1')).body);
++      const byName: {[k: string]: any} = {};
++      for (const cell of data.spanCells) byName[cell.name] = cell;
++
++
++      for (const cell of data.spanCells) {
++        assert.strictEqual(typeof cell.RUNNING, 'number');
++        assert.strictEqual(typeof cell.ERRORS, 'number');
++        for (const bucket of LATENCY_BUCKETS) {
++          assert.strictEqual(
++              typeof cell.latencies[bucket], 'number',
++              `cell "${cell.name}" missing latency bucket "${bucket}"`);
++        }
++      }
++
++
++      const child = byName['childJsonTest'];
++      const latencySum = LATENCY_BUCKETS.reduce(
++          (acc, b) => acc + child.latencies[b], 0);
++      assert.strictEqual(latencySum, 1);
++      assert.strictEqual(child.RUNNING, 0);
++      assert.strictEqual(child.ERRORS, 0);
++
++
++      const running = byName['runningJsonTest'];
++      assert.ok(running.RUNNING >= 1);
++      const runningLatencySum = LATENCY_BUCKETS.reduce(
++          (acc, b) => acc + running.latencies[b], 0);
++      assert.strictEqual(runningLatencySum, 0);
++    });
++
++    it('returns null selectedTraces when no tracename is given', async () => {
++      const data = JSON.parse((await get('/tracez?json=1')).body);
++      assert.strictEqual(data.selectedTraces, null);
++    });
++
++    it('serializes selected traces without circular-reference errors',
++       async () => {
++         const res = await get(
++             '/tracez?json=1&tracename=runningJsonTest&type=RUNNING');
++         assert.strictEqual(res.statusCode, 200);
++         const data = JSON.parse(res.body);
++         assert.ok(data.selectedTraces);
++         assert.strictEqual(data.selectedTraces.name, 'runningJsonTest');
++         assert.ok(Array.isArray(data.selectedTraces.traces));
++         assert.ok(data.selectedTraces.traces.length >= 1);
++         const trace = data.selectedTraces.traces[0];
++         assert.strictEqual(trace.traceId, runningTraceId);
++         assert.strictEqual(trace.id, runningId);
++       });
++  });
++
++  describe('/tracez (HTML)', () => {
++    it('still renders HTML when json=1 is absent', async () => {
++      const res = await get('/tracez');
++      assert.strictEqual(res.statusCode, 200);
++      assert.ok(
++          res.body.indexOf('<html') !== -1,
++          'expected an HTML document, got: ' + res.body.slice(0, 40));
++    });
++  });
++
++  describe('/traceconfigz?json=1', () => {
++    it('responds with the sampling configuration as JSON', async () => {
++      const res = await get('/traceconfigz?json=1');
++      assert.strictEqual(res.statusCode, 200);
++      const data = JSON.parse(res.body);
++      assert.strictEqual(data.samplingProbability, 1);
++      assert.strictEqual(typeof data.defaultConfig.samplingRate, 'number');
++    });
++  });
++
++  describe('/traceconfigz (HTML)', () => {
++    it('still renders HTML when json=1 is absent', async () => {
++      const res = await get('/traceconfigz');
++      assert.strictEqual(res.statusCode, 200);
++      assert.ok(
++          res.body.indexOf('<html') !== -1,
++          'expected an HTML document, got: ' + res.body.slice(0, 40));
++    });
++  });
++});
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,80 @@
++#!/usr/bin/env bash
++
++
++
++set -euo pipefail
++HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++cd /testbed
++
++
++
++PKG=packages/opencensus-exporter-zpages
++
++
++
++
++
++
++
++BUILDER="$(mktemp /tmp/zpages-build.XXXXXX.js)"
++cat > "$BUILDER" <<'EOF'
++const fs = require('fs');
++const path = require('path');
++const pkgRoot = path.resolve(process.argv[2]);
++function loadTs() {
++  for (const base of [pkgRoot, '/testbed']) {
++    const p = path.join(base, 'node_modules', 'typescript');
++    if (fs.existsSync(p)) return require(p);
++  }
++  return require('typescript');
++}
++const ts = loadTs();
++function walk(dir, out) {
++  for (const e of fs.readdirSync(dir, {withFileTypes: true})) {
++    const p = path.join(dir, e.name);
++    if (e.isDirectory()) {
++      if (e.name === 'node_modules' || e.name === 'build') continue;
++      walk(p, out);
++    } else {
++      out.push(p);
++    }
++  }
++  return out;
++}
++const srcDirs = ['src', 'test'].map(d => path.join(pkgRoot, d))
++                    .filter(d => fs.existsSync(d));
++const files = [];
++for (const d of srcDirs) walk(d, files);
++const options = {
++  module: ts.ModuleKind.CommonJS,
++  target: ts.ScriptTarget.ES2017,
++  esModuleInterop: false,
++  inlineSourceMap: false,
++};
++for (const f of files) {
++  const outPath = path.join(pkgRoot, 'build', path.relative(pkgRoot, f));
++  if (f.endsWith('.d.ts')) continue;
++  fs.mkdirSync(path.dirname(outPath), {recursive: true});
++  if (f.endsWith('.ts')) {
++    const source = fs.readFileSync(f, 'utf8');
++    const result = ts.transpileModule(source, {compilerOptions: options, fileName: f});
++    fs.writeFileSync(outPath.replace(/\.ts$/, '.js'), result.outputText);
++  } else {
++    fs.copyFileSync(f, outPath);
++  }
++}
++EOF
++
++
++
++for p in packages/*/; do
++  node "$BUILDER" "$p" || true
++done
++
++MOCHA="$PKG/node_modules/.bin/mocha"
++
++
++"$MOCHA" "$PKG/build/test/test-zpages.js"
++
++
++"$MOCHA" "$PKG/build/test/test-zpages-json.js"

@@ -1,0 +1,9 @@
+I want the Dnote CLI to provide a local note search command invoked as `dnote find <keywords>` with alias `dnote f`. It should require exactly one keyword phrase argument: running it without a phrase or with extra positional arguments should fail with exit code 1 and print `Incorrect number of argument` through the CLI error path.
+
+When I run `dnote find rpoplpush`, it should search my local notes for that keyword and print one line per match to stdout. Each result line should be indented the same way as other plain Dnote CLI output and contain the book label in parentheses, the local note row id in parentheses, and a snippet from the note body, for example `  (redis) (12) use RPOPLPUSH for reliable queues`. Newlines inside snippets should be flattened into spaces.
+
+The command should also handle multiple search terms supplied as one quoted phrase, such as `dnote find "building a heap"`, by searching for each term as a literal full-text token. Matching terms inside the snippet should be highlighted with the CLI's yellow terminal styling. If there are no matching notes, the command should exit 0 and print nothing.
+
+I also want a book filter flag: `dnote find "merge sort" --book algorithm` and `dnote find "merge sort" -b algorithm` should only return matches from the `algorithm` book. If the local database query or result scanning fails, the command should exit non-zero and report an error message that includes the operation that failed, such as `querying notes`, `scanning a row`, or `formatting a body`.
+
+`dnote find --help` should exit 0 and show the command as `find`, describe it as finding notes by keywords, list the alias `f`, include examples for a single keyword, a quoted multi-keyword phrase, and the `-b` book-constrained form, and document the `--book, -b` flag as the book name to search within.

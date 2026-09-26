@@ -1,0 +1,9 @@
+I want `CarbonStore` to support semantic long-term memory recall with a public method `recall(query: str | vector, *, top_k: int = 5, session_id: str | None = None, actor: str | None = None, namespace: str | None = None, min_salience: float | None = None, include_expired: bool = False, model: str | None = None, embedder: Embedder | None = None, metric: "cosine" | "dot" | "l2" = "cosine") -> list[MemoryHit]`.
+
+In a session where memories have already been recorded with embeddings, `store.recall("vim editor", top_k=3, embedder=emb)` should return ranked `MemoryHit` objects sorted from best score to worst; if the stored memories are "loves vim", "prefers emacs", and "likes nano" with vectors closest to the query in that order, the first hit's `memory.content` should be "loves vim". Each `MemoryHit` should expose the recalled `MemoryItem` as `.memory` and the numeric similarity as `.score`.
+
+Filters should compose with AND. For example, after recording one embedded memory in session `s1` and one in session `s2`, `store.recall("a", session_id="s1", top_k=5, embedder=emb)` should return only memories whose `memory.session_id == "s1"`; similarly `actor`, `namespace`, and `min_salience` should restrict results to the matching actor, namespace, and salience threshold. Recall should only return entities recorded as memories, not ordinary document entities that also have chunks and embeddings.
+
+Expired memories should be hidden by default: if "old" has an `expires_at` timestamp in the past and "fresh" has no expiry, `store.recall("old", embedder=emb)` should return only "fresh". Passing `include_expired=True` should include both expired and unexpired matching memories.
+
+If no memories match, recall should return an empty list. A string query should require an embedder so it can be encoded; a vector query should work with `model=` and no embedder. The `metric` argument should choose cosine, dot, or negative L2 scoring for ranking.

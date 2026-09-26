@@ -1,0 +1,7 @@
+I want the ReNative CLI to provide hook-management commands for project build hooks: `rnv hooks run`, `rnv hooks list`, and `rnv hooks pipes`.
+
+`rnv hooks run -x <hookName>` and `rnv hooks run --exe-method <hookName>` should configure the project when a project config exists, load the project build hooks with a forced rebuild, and execute the named hook with the current ReNative context. If `rnv hooks run` is called without a hook name, or the requested hook name is not available, it should show an interactive list prompt with the message `Pick an available hook:` and run the selected hook. If the project has zero hooks, `rnv hooks run` should exit successfully without running anything. If hooks cannot be loaded after compilation, it should fail with the message `Build hooks have not been compiled properly!` and a non-zero exit code.
+
+`rnv hooks list` should configure the project first, force-load the build hooks, and write a summary that starts with a `Hooks:` section containing the available hook names. When pipes are available too, the same summary should also include a `Pipes:` section containing the available pipe names. If no build-hooks object is available, `rnv hooks list` should fail with `Your buildHooks object is empty!` and a non-zero exit code.
+
+`rnv hooks pipes` should configure the project first, load the build hooks, and print `Pipes:` followed by the available pipe names. Successful hook run/list/pipes commands should complete with exit code 0.

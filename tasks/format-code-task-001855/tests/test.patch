@@ -1,0 +1,590 @@
+diff --git a/usercase-test-coderl/gothic_flow_test.go b/usercase-test-coderl/gothic_flow_test.go
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/gothic_flow_test.go
+@@ -0,0 +1,554 @@
++package usercase_test_coderl
++
++import (
++	"compress/gzip"
++	"context"
++	"fmt"
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"net/url"
++	"reflect"
++	"strings"
++	"sync"
++	"testing"
++
++	"github.com/go-chi/chi/v5"
++	"github.com/gorilla/mux"
++	"github.com/gorilla/sessions"
++	"github.com/markbates/goth"
++	"github.com/markbates/goth/gothic"
++	"github.com/markbates/goth/providers/faux"
++)
++
++
++
++
++
++
++
++
++const (
++	sessionCookieName   = "coderl_gothic_sid"
++	storedAuthSession   = `{"ID":"id","Name":"","Email":"","AuthURL":"http://example.com/auth?client_id=\u0026response_type=code\u0026state=state_REAL","AccessToken":""}`
++	existingUserSession = `{"ID":"","Name":"Homer Simpson","Email":"homer@example.com","AuthURL":"","AccessToken":"token_EXISTING"}`
++	needsAuthSession    = `{"ID":"","Name":"Homer Simpson","Email":"homer@example.com","AuthURL":"","AccessToken":""}`
++	authorizedSession   = `{"ID":"","Name":"Homer Simpson","Email":"homer@example.com","AuthURL":"","AccessToken":"access"}`
++)
++
++var (
++	initialStoreType     = reflect.TypeOf(gothic.Store).String()
++	initialStoreHTTPOnly = gothic.Store.(*sessions.CookieStore).Options.HttpOnly
++)
++
++type recordedSave struct {
++	sessionName string
++	maxAge      int
++	values      map[interface{}]interface{}
++}
++
++type recordingStore struct {
++	mu          sync.Mutex
++	nextID      int
++	byRequest   map[*http.Request]string
++	sessions    map[string]*sessions.Session
++	saveHistory []recordedSave
++}
++
++func newRecordingStore() *recordingStore {
++	return &recordingStore{
++		byRequest: make(map[*http.Request]string),
++		sessions:  make(map[string]*sessions.Session),
++	}
++}
++
++func (s *recordingStore) Get(r *http.Request, name string) (*sessions.Session, error) {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++
++	id := s.idForRequestLocked(r)
++	key := id + "\x00" + name
++	if existing := s.sessions[key]; existing != nil {
++		return cloneSession(s, existing), nil
++	}
++	return s.newSessionLocked(r, name, id), nil
++}
++
++func (s *recordingStore) New(r *http.Request, name string) (*sessions.Session, error) {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++
++	return s.newSessionLocked(r, name, s.idForRequestLocked(r)), nil
++}
++
++func (s *recordingStore) Save(r *http.Request, w http.ResponseWriter, session *sessions.Session) error {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++
++	id := s.idForRequestLocked(r)
++	http.SetCookie(w, &http.Cookie{Name: sessionCookieName, Value: id, Path: "/"})
++	stored := cloneSession(s, session)
++	s.sessions[id+"\x00"+session.Name()] = stored
++	s.saveHistory = append(s.saveHistory, recordedSave{
++		sessionName: session.Name(),
++		maxAge:      session.Options.MaxAge,
++		values:      cloneValues(session.Values),
++	})
++	return nil
++}
++
++func (s *recordingStore) idForRequestLocked(r *http.Request) string {
++	if cookie, err := r.Cookie(sessionCookieName); err == nil && cookie.Value != "" {
++		s.byRequest[r] = cookie.Value
++		return cookie.Value
++	}
++	if id := s.byRequest[r]; id != "" {
++		return id
++	}
++	s.nextID++
++	id := fmt.Sprintf("sid-%03d", s.nextID)
++	s.byRequest[r] = id
++	return id
++}
++
++func (s *recordingStore) newSessionLocked(r *http.Request, name, id string) *sessions.Session {
++	session := sessions.NewSession(s, name)
++	session.Options = &sessions.Options{Path: "/", MaxAge: 2592000, HttpOnly: true}
++	s.byRequest[r] = id
++	return session
++}
++
++func (s *recordingStore) activeValueSessions() int {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++
++	count := 0
++	for _, session := range s.sessions {
++		if len(session.Values) > 0 {
++			count++
++		}
++	}
++	return count
++}
++
++func (s *recordingStore) savedValues(index int) map[interface{}]interface{} {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	return cloneValues(s.saveHistory[index].values)
++}
++
++func (s *recordingStore) savedMaxAge(index int) int {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	return s.saveHistory[index].maxAge
++}
++
++func (s *recordingStore) saveCount() int {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	return len(s.saveHistory)
++}
++
++func cloneSession(store sessions.Store, session *sessions.Session) *sessions.Session {
++	cloned := sessions.NewSession(store, session.Name())
++	cloned.IsNew = session.IsNew
++	cloned.Values = cloneValues(session.Values)
++	if session.Options != nil {
++		options := *session.Options
++		cloned.Options = &options
++	}
++	return cloned
++}
++
++func cloneValues(values map[interface{}]interface{}) map[interface{}]interface{} {
++	cloned := make(map[interface{}]interface{}, len(values))
++	for key, value := range values {
++		cloned[key] = value
++	}
++	return cloned
++}
++
++func installFaux(t *testing.T) *recordingStore {
++	t.Helper()
++	store := newRecordingStore()
++	gothic.Store = store
++	goth.ClearProviders()
++	goth.UseProviders(&faux.Provider{})
++	return store
++}
++
++func carryCookies(req *http.Request, res *httptest.ResponseRecorder) {
++	for _, cookie := range res.Result().Cookies() {
++		req.AddCookie(cookie)
++	}
++}
++
++func seedGothicSession(t *testing.T, store *recordingStore, req *http.Request, value string) {
++	t.Helper()
++	session, err := store.Get(req, gothic.SessionName)
++	if err != nil {
++		t.Fatalf("seed store get: %v", err)
++	}
++	session.Values["faux"] = gzipString(t, value)
++	if err := session.Save(req, httptest.NewRecorder()); err != nil {
++		t.Fatalf("seed store save: %v", err)
++	}
++}
++
++func gzipString(t *testing.T, value string) string {
++	t.Helper()
++	var b strings.Builder
++	gz := gzip.NewWriter(&b)
++	if _, err := gz.Write([]byte(value)); err != nil {
++		t.Fatalf("gzip write: %v", err)
++	}
++	if err := gz.Close(); err != nil {
++		t.Fatalf("gzip close: %v", err)
++	}
++	return b.String()
++}
++
++func gunzipString(t *testing.T, value string) string {
++	t.Helper()
++	reader, err := gzip.NewReader(strings.NewReader(value))
++	if err != nil {
++		t.Fatalf("gzip reader: %v", err)
++	}
++	raw, err := io.ReadAll(reader)
++	if err != nil {
++		t.Fatalf("gzip read: %v", err)
++	}
++	return string(raw)
++}
++
++func assertString(t *testing.T, got, want string) {
++	t.Helper()
++	if got != want {
++		t.Fatalf("got %q, want %q", got, want)
++	}
++}
++
++func assertInt(t *testing.T, got, want int) {
++	t.Helper()
++	if got != want {
++		t.Fatalf("got %d, want %d", got, want)
++	}
++}
++
++func TestDefaultExportsAndCookieStoreShape(t *testing.T) {
++
++
++	assertString(t, gothic.SessionName, "_gothic_session")
++	assertString(t, initialStoreType, "*sessions.CookieStore")
++	assertString(t, fmt.Sprint(initialStoreHTTPOnly), "true")
++}
++
++func TestGetAuthURLUsesProviderStateAndStoresMarshaledSession(t *testing.T) {
++
++
++	store := installFaux(t)
++	res := httptest.NewRecorder()
++	req := httptest.NewRequest(http.MethodGet, "/auth?provider=faux&state=state_REAL", nil)
++
++	authURL, err := gothic.GetAuthURL(res, req)
++	if err != nil {
++		t.Fatalf("GetAuthURL: %v", err)
++	}
++
++	assertString(t, authURL, "http://example.com/auth?client_id=&response_type=code&state=state_REAL")
++	stored, err := gothic.GetFromSession("faux", req)
++	if err != nil {
++		t.Fatalf("GetFromSession faux: %v", err)
++	}
++	assertString(t, stored, storedAuthSession)
++
++	if store.saveCount() == 0 {
++		t.Fatal("GetAuthURL did not save through gothic.Store")
++	}
++}
++
++func TestGeneratedStateIsURLSafeAndDifferentAcrossAuthRequests(t *testing.T) {
++
++
++	installFaux(t)
++	firstURL, err := gothic.GetAuthURL(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/auth?provider=faux", nil))
++	if err != nil {
++		t.Fatalf("first GetAuthURL: %v", err)
++	}
++	secondURL, err := gothic.GetAuthURL(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/auth?provider=faux", nil))
++	if err != nil {
++		t.Fatalf("second GetAuthURL: %v", err)
++	}
++
++	firstState := mustQuery(t, firstURL, "state")
++	secondState := mustQuery(t, secondURL, "state")
++
++	assertURLSafeState(t, firstState)
++	assertURLSafeState(t, secondState)
++	if firstState == secondState {
++		t.Fatalf("got identical generated states %q", firstState)
++	}
++}
++
++func TestBeginAuthHandlerRedirectsOrWritesProviderError(t *testing.T) {
++
++
++	installFaux(t)
++	successRes := httptest.NewRecorder()
++	gothic.BeginAuthHandler(successRes, httptest.NewRequest(http.MethodGet, "/auth?provider=faux&state=state_REAL", nil))
++	assertInt(t, successRes.Code, 307)
++	assertString(t, successRes.Header().Get("Location"), "http://example.com/auth?client_id=&response_type=code&state=state_REAL")
++
++	errorRes := httptest.NewRecorder()
++	gothic.BeginAuthHandler(errorRes, httptest.NewRequest(http.MethodGet, "/auth", nil))
++	assertInt(t, errorRes.Code, 400)
++
++	assertString(t, strings.TrimSpace(errorRes.Body.String()), "you must select a provider")
++}
++
++func TestGetProviderNameAllPublicSourcesAndNoProviderError(t *testing.T) {
++
++
++	store := installFaux(t)
++
++	cases := []struct {
++		name string
++		req  *http.Request
++	}{
++		{"provider query", httptest.NewRequest(http.MethodGet, "/auth?provider=faux", nil)},
++		{":provider query", httptest.NewRequest(http.MethodGet, "/auth?:provider=faux", nil)},
++		{"mux vars", mux.SetURLVars(httptest.NewRequest(http.MethodGet, "/auth", nil), map[string]string{"provider": "faux"})},
++		{"context string", httptest.NewRequest(http.MethodGet, "/auth", nil).WithContext(context.WithValue(context.Background(), "provider", "faux"))},
++		{"path value", pathValueRequest()},
++		{"GetContextWithProvider", gothic.GetContextWithProvider(httptest.NewRequest(http.MethodGet, "/auth", nil), "faux")},
++	}
++
++	for _, tc := range cases {
++		got, err := gothic.GetProviderName(tc.req)
++		if err != nil {
++			t.Fatalf("%s GetProviderName: %v", tc.name, err)
++		}
++		assertString(t, got, "faux")
++	}
++
++	chiReq := httptest.NewRequest(http.MethodGet, "/auth/faux", nil)
++	routeCtx := chi.NewRouteContext()
++	routeCtx.URLParams.Add("provider", "faux")
++	chiReq = chiReq.WithContext(context.WithValue(chiReq.Context(), chi.RouteCtxKey, routeCtx))
++	got, err := gothic.GetProviderName(chiReq)
++	if err != nil {
++		t.Fatalf("chi GetProviderName: %v", err)
++	}
++	assertString(t, got, "faux")
++
++	fallbackReq := httptest.NewRequest(http.MethodGet, "/auth/callback", nil)
++	seedGothicSession(t, store, fallbackReq, existingUserSession)
++	got, err = gothic.GetProviderName(fallbackReq)
++	if err != nil {
++		t.Fatalf("session fallback GetProviderName: %v", err)
++	}
++	assertString(t, got, "faux")
++
++	_, err = gothic.GetProviderName(httptest.NewRequest(http.MethodGet, "/auth", nil))
++	if err == nil {
++		t.Fatal("missing provider returned nil error")
++	}
++	assertString(t, err.Error(), "you must select a provider")
++}
++
++func pathValueRequest() *http.Request {
++	req := httptest.NewRequest(http.MethodGet, "/auth/faux", nil)
++	req.SetPathValue("provider", "faux")
++	return req
++}
++
++func TestCompleteUserAuthReturnsExistingUserAndClearsSession(t *testing.T) {
++
++
++	store := installFaux(t)
++	res := httptest.NewRecorder()
++	req := httptest.NewRequest(http.MethodGet, "/auth/callback?provider=faux", nil)
++	seedGothicSession(t, store, req, existingUserSession)
++
++	user, err := gothic.CompleteUserAuth(res, req)
++	if err != nil {
++		t.Fatalf("CompleteUserAuth: %v", err)
++	}
++
++	assertString(t, user.Name, "Homer Simpson")
++	assertString(t, user.Email, "homer@example.com")
++	assertString(t, user.Provider, "faux")
++	assertString(t, user.AccessToken, "token_EXISTING")
++
++	if got := store.savedValues(store.saveCount() - 1); len(got) != 0 {
++		t.Fatalf("cleanup saved values = %#v, want empty map", got)
++	}
++	assertInt(t, store.activeValueSessions(), 0)
++}
++
++func TestCompleteUserAuthAuthorizesFromPostFormAndPersistsBeforeCleanup(t *testing.T) {
++
++
++	store := installFaux(t)
++	res := httptest.NewRecorder()
++	form := url.Values{"code": {"code_REAL"}, "state": {"state_REAL"}}
++
++	req := gothic.GetContextWithProvider(httptest.NewRequest(http.MethodPost, "/auth/callback", strings.NewReader(form.Encode())), "faux")
++	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
++	seedGothicSession(t, store, req, needsAuthSession)
++
++	user, err := gothic.CompleteUserAuth(res, req)
++	if err != nil {
++		t.Fatalf("CompleteUserAuth POST: %v", err)
++	}
++
++	assertString(t, user.Name, "Homer Simpson")
++	assertString(t, user.Email, "homer@example.com")
++	assertString(t, user.AccessToken, "access")
++	assertString(t, gunzipString(t, store.savedValues(store.saveCount() - 2)["faux"].(string)), authorizedSession)
++
++	if got := store.savedValues(store.saveCount() - 1); len(got) != 0 {
++		t.Fatalf("cleanup saved values = %#v, want empty map", got)
++	}
++}
++
++func TestCompleteUserAuthStateMismatchAndOutOfOrderSessionError(t *testing.T) {
++
++
++	installFaux(t)
++	beginRes := httptest.NewRecorder()
++	beginReq := httptest.NewRequest(http.MethodGet, "/auth?provider=faux&state=state_REAL", nil)
++	if _, err := gothic.GetAuthURL(beginRes, beginReq); err != nil {
++		t.Fatalf("GetAuthURL: %v", err)
++	}
++	callbackReq := httptest.NewRequest(http.MethodGet, "/auth/callback?provider=faux&state=state_FAKE", nil)
++	carryCookies(callbackReq, beginRes)
++	_, err := gothic.CompleteUserAuth(httptest.NewRecorder(), callbackReq)
++	if err == nil {
++		t.Fatal("state mismatch returned nil error")
++	}
++	assertString(t, err.Error(), "state token mismatch")
++
++	_, err = gothic.CompleteUserAuth(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/auth/callback?provider=faux", nil))
++	if err == nil {
++		t.Fatal("out-of-order callback returned nil error")
++	}
++	assertString(t, err.Error(), "could not find a matching session for this request")
++}
++
++func TestSessionHelpersRoundTripCompressMissingAndSeparateBrowserSessions(t *testing.T) {
++
++
++	store := installFaux(t)
++	reqA := httptest.NewRequest(http.MethodGet, "/auth", nil)
++	reqB := httptest.NewRequest(http.MethodGet, "/auth", nil)
++
++	if err := gothic.StoreInSession("alpha", "value-A", reqA, httptest.NewRecorder()); err != nil {
++		t.Fatalf("StoreInSession alpha: %v", err)
++	}
++	if err := gothic.StoreInSession("alpha", "value-B", reqB, httptest.NewRecorder()); err != nil {
++		t.Fatalf("StoreInSession beta: %v", err)
++	}
++
++	valueA, err := gothic.GetFromSession("alpha", reqA)
++	if err != nil {
++		t.Fatalf("GetFromSession alpha A: %v", err)
++	}
++	valueB, err := gothic.GetFromSession("alpha", reqB)
++	if err != nil {
++		t.Fatalf("GetFromSession alpha B: %v", err)
++	}
++	assertString(t, valueA, "value-A")
++	assertString(t, valueB, "value-B")
++
++	raw := store.savedValues(0)["alpha"].(string)
++
++	if raw == "value-A" {
++		t.Fatal("stored session value was not compressed")
++	}
++	assertString(t, gunzipString(t, raw), "value-A")
++
++	_, err = gothic.GetFromSession("missing", reqA)
++	if err == nil {
++		t.Fatal("missing GetFromSession returned nil error")
++	}
++	assertString(t, err.Error(), "could not find a matching session for this request")
++}
++
++func TestLogoutIsIdempotentAndClearsStoredValues(t *testing.T) {
++
++
++	store := installFaux(t)
++	req := httptest.NewRequest(http.MethodGet, "/auth/callback?provider=faux", nil)
++	seedGothicSession(t, store, req, existingUserSession)
++
++	if err := gothic.Logout(httptest.NewRecorder(), req); err != nil {
++		t.Fatalf("first Logout: %v", err)
++	}
++	if err := gothic.Logout(httptest.NewRecorder(), req); err != nil {
++		t.Fatalf("second Logout: %v", err)
++	}
++	assertInt(t, store.savedMaxAge(store.saveCount()-1), -1)
++	if got := store.savedValues(store.saveCount() - 1); len(got) != 0 {
++		t.Fatalf("logout saved values = %#v, want empty map", got)
++	}
++	assertInt(t, store.activeValueSessions(), 0)
++}
++
++func TestRepeatedAuthAndLogoutCyclesLeaveNoActiveSessionValues(t *testing.T) {
++
++
++	store := installFaux(t)
++	for i := 0; i < 120; i++ {
++		req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/auth?provider=faux&state=state_%03d", i), nil)
++		res := httptest.NewRecorder()
++		if _, err := gothic.GetAuthURL(res, req); err != nil {
++			t.Fatalf("cycle %d GetAuthURL: %v", i, err)
++		}
++		if err := gothic.Logout(httptest.NewRecorder(), req); err != nil {
++			t.Fatalf("cycle %d Logout: %v", i, err)
++		}
++	}
++	assertInt(t, store.activeValueSessions(), 0)
++}
++
++func mustQuery(t *testing.T, rawURL, key string) string {
++	t.Helper()
++	parsed, err := url.Parse(rawURL)
++	if err != nil {
++		t.Fatalf("parse URL %q: %v", rawURL, err)
++	}
++	return parsed.Query().Get(key)
++}
++
++func assertURLSafeState(t *testing.T, state string) {
++	t.Helper()
++	if state == "" {
++		t.Fatal("generated state is empty")
++	}
++	seenPadding := false
++	for _, r := range state {
++		switch {
++		case r >= 'A' && r <= 'Z':
++			if seenPadding {
++				t.Fatalf("generated state %q has data after padding", state)
++			}
++		case r >= 'a' && r <= 'z':
++			if seenPadding {
++				t.Fatalf("generated state %q has data after padding", state)
++			}
++		case r >= '0' && r <= '9':
++			if seenPadding {
++				t.Fatalf("generated state %q has data after padding", state)
++			}
++		case r == '-' || r == '_':
++			if seenPadding {
++				t.Fatalf("generated state %q has data after padding", state)
++			}
++		case r == '=':
++			seenPadding = true
++		default:
++			t.Fatalf("generated state %q contains non URL-safe character %q", state, r)
++		}
++	}
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,26 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++
++
++set -euo pipefail
++cd /workspace/repo
++
++export GOPROXY=off
++export GOSUMDB=off
++export GOTOOLCHAIN=local
++
++GO_BIN="/root/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/bin/go"
++if [[ ! -x "$GO_BIN" ]]; then
++  GO_BIN="$(command -v go)"
++fi
++
++"$GO_BIN" test -mod=readonly -v -count=1 ./usercase-test-coderl/...

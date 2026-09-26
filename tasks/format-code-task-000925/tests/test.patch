@@ -1,0 +1,206 @@
+diff --git a/usercase-test-coderl/fixtures/streaming_eval_probe.py b/usercase-test-coderl/fixtures/streaming_eval_probe.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/fixtures/streaming_eval_probe.py
+@@ -0,0 +1,101 @@
++#!/usr/bin/env python3
++import json
++import pathlib
++import sys
++import types
++
++
++REPO = pathlib.Path("/workspace/repo")
++sys.path.insert(0, str(REPO / "src"))
++
++
++
++
++
++simuleval = types.ModuleType("simuleval")
++simuleval_cli = types.ModuleType("simuleval.cli")
++
++
++def evaluate(agent_class, config, parser):
++    for name in ("--data-file", "--audio-root-dir", "--output", "--tgt-lang"):
++        parser.add_argument(name, required=True)
++    args, rest = parser.parse_known_args()
++    print(
++        json.dumps(
++            {
++                "agent": f"{agent_class.__module__}.{agent_class.__name__}",
++                "task": args.task,
++                "expressive": getattr(args, "expressive", None),
++                "data_file": args.data_file,
++                "audio_root_dir": args.audio_root_dir,
++                "output": args.output,
++                "tgt_lang": args.tgt_lang,
++                "config": {key: config[key] for key in sorted(config)},
++                "unknown": rest,
++            },
++            sort_keys=True,
++        )
++    )
++
++
++simuleval_cli.evaluate = evaluate
++sys.modules["simuleval"] = simuleval
++sys.modules["simuleval.cli"] = simuleval_cli
++
++fairseq2 = types.ModuleType("fairseq2")
++fairseq2_assets = types.ModuleType("fairseq2.assets")
++
++
++class FileAssetMetadataProvider:
++    def __init__(self, *args, **kwargs):
++        pass
++
++
++class AssetStore:
++    def __init__(self):
++        self.metadata_providers = []
++
++    def retrieve_card(self, name):
++        raise RuntimeError("asset_store should not be used for s2st")
++
++
++fairseq2_assets.FileAssetMetadataProvider = FileAssetMetadataProvider
++fairseq2_assets.asset_store = AssetStore()
++fairseq2_assets.download_manager = object()
++sys.modules["fairseq2"] = fairseq2
++sys.modules["fairseq2.assets"] = fairseq2_assets
++
++scorer = types.ModuleType(
++    "seamless_communication.cli.streaming.scorers.seamless_quality_scorer"
++)
++
++
++class SeamlessQualityScorer:
++    pass
++
++
++scorer.SeamlessQualityScorer = SeamlessQualityScorer
++sys.modules[
++    "seamless_communication.cli.streaming.scorers.seamless_quality_scorer"
++] = scorer
++
++for module_name, class_name in [
++    ("seamless_communication.streaming.agents.seamless_s2st", "SeamlessS2STAgent"),
++    (
++        "seamless_communication.streaming.agents.seamless_streaming_s2st",
++        "SeamlessStreamingS2STAgent",
++    ),
++    (
++        "seamless_communication.streaming.agents.seamless_streaming_s2t",
++        "SeamlessStreamingS2TAgent",
++    ),
++]:
++    mod = types.ModuleType(module_name)
++    cls = type(class_name, (), {"__module__": module_name})
++    setattr(mod, class_name, cls)
++    sys.modules[module_name] = mod
++
++from seamless_communication.cli.streaming.evaluate import main
++
++
++main()
+diff --git a/usercase-test-coderl/usecase.sh b/usercase-test-coderl/usecase.sh
+new file mode 100755
+--- /dev/null
++++ b/usercase-test-coderl/usecase.sh
+@@ -0,0 +1,78 @@
++#!/usr/bin/env bash
++
++set -u
++export LANG=C.UTF-8 LC_ALL=C.UTF-8 TZ=UTC
++export PYTHONDONTWRITEBYTECODE=1
++
++( cd /workspace/repo && python - <<'PY'
++from pathlib import Path
++path = Path("src/seamless_communication/cli/streaming/evaluate.py")
++compile(path.read_text(), str(path), "exec")
++PY
++) \
++    || { echo "FAIL: build" >&2; exit 1; }
++
++BIN="python /workspace/repo/usercase-test-coderl/fixtures/streaming_eval_probe.py"
++TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
++cd "$TMP" || exit 1
++fail() { echo "FAIL: $*" >&2; exit 1; }
++
++check_s2st_probe() {
++    local label="$1"
++    local expected_agent="$2"
++    local expected_expressive="$3"
++    python - "$label" "$expected_agent" "$expected_expressive" out <<'PY' \
++        || fail "$label stdout: $(cat out)"
++import json
++import sys
++from pathlib import Path
++
++label, expected_agent, expected_expressive, path = sys.argv[1:5]
++payload = json.loads(Path(path).read_text())
++
++assert payload["agent"] == expected_agent, payload
++assert payload["task"] == "s2st", payload
++assert payload["expressive"] is (expected_expressive == "true"), payload
++assert payload["data_file"] == "data.tsv", payload
++assert payload["audio_root_dir"] == "audio", payload
++assert payload["output"] == "out", payload
++assert payload["tgt_lang"] == "fra", payload
++
++config = payload["config"]
++assert config["min_unit_chunk_size"] == 50, payload
++assert config["latency_metrics"] == "StartOffset EndOffset", payload
++PY
++}
++
++
++
++
++$BIN --task s2st --data-file data.tsv --audio-root-dir audio --output out --tgt-lang fra >out 2>err; ec=$?
++[ "$ec" -eq 0 ] || fail "F1 exit $ec; want 0"
++
++check_s2st_probe F1 "seamless_communication.streaming.agents.seamless_streaming_s2st.SeamlessStreamingS2STAgent" false
++
++! grep -qi "invalid choice" err || fail "F1 parser error stderr: $(cat err)"
++
++
++
++
++$BIN --task s2st --expressive --data-file data.tsv --audio-root-dir audio --output out --tgt-lang fra >out 2>err; ec=$?
++[ "$ec" -eq 0 ] || fail "F2 exit $ec; want 0"
++
++check_s2st_probe F2 "seamless_communication.streaming.agents.seamless_s2st.SeamlessS2STAgent" true
++
++! grep -qi "invalid choice" err || fail "F2 parser error stderr: $(cat err)"
++
++
++
++
++$BIN --task text --data-file data.tsv --audio-root-dir audio --output out --tgt-lang fra >out 2>err; ec=$?
++[ "$ec" -ne 0 ] || fail "F3 exit $ec; want non-zero parser error"
++[ ! -s out ] || fail "F3 unexpected stdout: $(cat out)"
++
++grep -qi "error:" err || fail "F3 stderr is not an argparse parser error: $(cat err)"
++grep -q "text" err || fail "F3 stderr does not mention rejected task: $(cat err)"
++
++echo "PASS"
++exit 0
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,12 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++exec bash /workspace/repo/usercase-test-coderl/usecase.sh

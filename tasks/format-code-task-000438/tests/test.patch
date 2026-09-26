@@ -1,0 +1,460 @@
+diff --git a/usercase-test-coderl/test_generate_autoregressive.py b/usercase-test-coderl/test_generate_autoregressive.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/test_generate_autoregressive.py
+@@ -0,0 +1,431 @@
++
++
++
++
++
++
++import copy
++import json
++import os
++import socket
++import subprocess
++import sys
++
++import pytest
++import torch
++from torch import nn
++
++from attention_simulator.autoregressive_language_model import generate
++
++
++class ExactTokenizer:
++    def __init__(self, encodings, decodings=None, alphabet="ABCDEFGHIJKLMNOPQRSTUVWXYZ"):
++        self.encodings = copy.deepcopy(encodings)
++        self.decodings = {tuple(k): v for k, v in (decodings or {}).items()}
++        self.alphabet = alphabet
++        self.decode_calls = []
++
++    def encode(self, text, return_tensors="pt"):
++        assert return_tensors == "pt"
++        return torch.tensor([self.encodings[text]], dtype=torch.long)
++
++    def decode(self, ids, clean_up_tokenization_spaces=True):
++        if isinstance(ids, int):
++            token_ids = [ids]
++        else:
++            token_ids = list(ids)
++        self.decode_calls.append((token_ids, clean_up_tokenization_spaces))
++        return self.decodings.get(tuple(token_ids), "".join(self.alphabet[i] for i in token_ids))
++
++
++class PlainTokenizer:
++    def __init__(self, encodings, alphabet="ABCDEFGHIJKLMNOPQRSTUVWXYZ"):
++        self.encodings = copy.deepcopy(encodings)
++        self.alphabet = alphabet
++
++    def encode(self, text, return_tensors="pt"):
++        assert return_tensors == "pt"
++        return torch.tensor([self.encodings[text]], dtype=torch.long)
++
++    def decode(self, ids, clean_up_tokenization_spaces=True):
++        if isinstance(ids, int):
++            ids = [ids]
++        return "".join(self.alphabet[i] for i in ids)
++
++
++class SequenceLogitModel(nn.Module):
++    def __init__(self, rows, record=True):
++        super().__init__()
++        self.rows = [torch.tensor(row, dtype=torch.float32) for row in rows]
++        self.record = record
++        self.calls = []
++
++    def forward(self, input_ids, mask=None):
++        call_index = len(self.calls)
++        if self.record:
++            self.calls.append(
++                {
++                    "ids": input_ids.detach().cpu().tolist(),
++                    "mask": None if mask is None else mask.detach().cpu().clone(),
++                    "grad_enabled": torch.is_grad_enabled(),
++                    "autocast_cpu": torch.is_autocast_enabled("cpu"),
++                }
++            )
++        row = self.rows[min(call_index, len(self.rows) - 1)].to(input_ids.device)
++        logits = row.reshape(1, 1, -1).repeat(input_ids.shape[0], input_ids.shape[1], 1)
++        return {"output_representation": logits}
++
++
++class ParameterizedModel(nn.Module):
++    def __init__(self):
++        super().__init__()
++        self.logits = nn.Parameter(torch.tensor([[0.0, 7.0]], dtype=torch.float32))
++
++    def forward(self, input_ids, mask=None):
++        row = self.logits[0].to(input_ids.device)
++        logits = row.reshape(1, 1, -1).repeat(input_ids.shape[0], input_ids.shape[1], 1)
++        return {"output_representation": logits}
++
++
++def run_with_recorded_multinomial(model, tokenizer, **kwargs):
++    seen_probs = []
++
++    def fake_multinomial(probs, num_samples):
++        assert num_samples == 1
++        seen_probs.append(probs.detach().cpu().tolist())
++        token = int(torch.argmax(probs, dim=-1).item())
++        return torch.tensor([[token]], dtype=torch.long, device=probs.device)
++
++    original = torch.multinomial
++    torch.multinomial = fake_multinomial
++    try:
++        output = generate(model, tokenizer, **kwargs)
++    finally:
++        torch.multinomial = original
++
++    return output, seen_probs
++
++
++def assert_nested_approx(actual, expected):
++    torch.testing.assert_close(
++        torch.tensor(actual, dtype=torch.float32),
++        torch.tensor(expected, dtype=torch.float32),
++        rtol=1e-6,
++        atol=1e-6,
++    )
++
++
++def assert_causal_mask(mask, seq_len):
++    assert mask is not None
++    mask_tensor = torch.as_tensor(mask).detach().cpu()
++    assert mask_tensor.shape[-2:] == (seq_len, seq_len)
++    if mask_tensor.ndim > 2:
++        assert all(dim == 1 for dim in mask_tensor.shape[:-2])
++    masks = mask_tensor.reshape(-1, seq_len, seq_len)
++    allowed = torch.tril(torch.ones(seq_len, seq_len, dtype=torch.bool))
++
++    if mask_tensor.dtype == torch.bool:
++        expected = allowed.expand_as(masks)
++        torch.testing.assert_close(masks, expected)
++        return
++
++    numeric_masks = masks.to(torch.float32)
++    multiplicative = (
++        (numeric_masks[..., allowed] > 0.0).all()
++        and torch.allclose(numeric_masks[..., ~allowed], torch.zeros_like(numeric_masks[..., ~allowed]))
++    )
++    additive = (
++        torch.allclose(numeric_masks[..., allowed], torch.zeros_like(numeric_masks[..., allowed]))
++        and ((numeric_masks[..., ~allowed] < -1e4) | torch.isneginf(numeric_masks[..., ~allowed])).all()
++    )
++    assert multiplicative or additive
++
++
++def assert_model_call(call, expected_ids, expected_grad_enabled, expected_autocast_cpu):
++    assert call["ids"] == expected_ids
++
++    assert_causal_mask(call["mask"], seq_len=len(expected_ids[0]))
++    assert call["grad_enabled"] is expected_grad_enabled
++    assert call["autocast_cpu"] is expected_autocast_cpu
++
++
++def test_zero_max_length_decodes_prompt_without_model_call():
++
++
++
++    tokenizer = ExactTokenizer({ "hi": [10, 11] }, decodings={ (10, 11): "hi" })
++    model = SequenceLogitModel([[0.0, 1.0, 2.0]])
++
++    result = generate(model, tokenizer, "hi", max_length=0, device=torch.device("cpu"))
++
++    assert result == "hi"
++    assert model.calls == []
++    assert tokenizer.decode_calls == [([10, 11], True)]
++
++
++def test_top_k_one_appends_exactly_two_tokens_with_causal_masks():
++
++
++
++    tokenizer = ExactTokenizer({ "A": [0] })
++    model = SequenceLogitModel([[0.0, 9.0, 1.0], [0.0, 8.0, 2.0]])
++
++    result, seen_probs = run_with_recorded_multinomial(
++        model,
++        tokenizer,
++        input_text="A",
++        max_length=2,
++        top_p=1.0,
++        top_k=1,
++        device=torch.device("cpu"),
++    )
++
++    assert result == "ABB"
++    assert seen_probs == [[[0.0, 1.0, 0.0]], [[0.0, 1.0, 0.0]]]
++    assert len(model.calls) == 2
++    assert_model_call(model.calls[0], expected_ids=[[0]], expected_grad_enabled=False, expected_autocast_cpu=False)
++    assert_model_call(model.calls[1], expected_ids=[[0, 1]], expected_grad_enabled=False, expected_autocast_cpu=False)
++
++
++def test_top_k_caps_k_at_vocabulary_size_and_renormalizes_all_tokens():
++
++
++
++    tokenizer = ExactTokenizer({ "B": [1] })
++    model = SequenceLogitModel([[0.0, 1.0, 2.0]])
++
++    result, seen_probs = run_with_recorded_multinomial(
++        model,
++        tokenizer,
++        input_text="B",
++        max_length=1,
++        temperature=1.0,
++        top_p=1.0,
++        top_k=99,
++        device=torch.device("cpu"),
++    )
++
++    assert result == "BC"
++    assert_nested_approx(seen_probs[0], [[0.09003057330846786, 0.2447284758090973, 0.6652409434318542]])
++
++
++def test_top_p_keeps_smallest_prefix_reaching_threshold():
++
++
++
++    tokenizer = ExactTokenizer({ "A": [0] })
++    model = SequenceLogitModel([[0.9162907319, 0.4054651081, 0.0]])
++
++    result, seen_probs = run_with_recorded_multinomial(
++        model,
++        tokenizer,
++        input_text="A",
++        max_length=1,
++        temperature=1.0,
++        top_p=0.6,
++        top_k=0,
++        device=torch.device("cpu"),
++    )
++
++    assert result == "AA"
++    assert_nested_approx(seen_probs[0], [[0.625, 0.375, 0.0]])
++
++
++def test_top_p_zero_disables_nucleus_filtering():
++
++
++
++    tokenizer = ExactTokenizer({ "A": [0] })
++    model = SequenceLogitModel([[0.0, 2.0]])
++
++    result, seen_probs = run_with_recorded_multinomial(
++        model,
++        tokenizer,
++        input_text="A",
++        max_length=1,
++        temperature=1.0,
++        top_p=0.0,
++        top_k=0,
++        device=torch.device("cpu"),
++    )
++
++    assert result == "AB"
++    assert_nested_approx(seen_probs[0], [[0.11920291185379028, 0.8807970285415649]])
++
++
++def test_nucleus_filtering_runs_before_top_k_filtering():
++
++
++
++    tokenizer = ExactTokenizer({ "C": [2] }, alphabet="ABCD")
++    model = SequenceLogitModel([[-0.9162907319, -1.3862943611, -1.6094379124, -1.8971199849]])
++
++    result, seen_probs = run_with_recorded_multinomial(
++        model,
++        tokenizer,
++        input_text="C",
++        max_length=1,
++        temperature=1.0,
++        top_p=0.8,
++        top_k=2,
++        device=torch.device("cpu"),
++    )
++
++    assert result == "CA"
++    assert_nested_approx(seen_probs[0], [[0.6153846383094788, 0.38461539149284363, 0.0, 0.0]])
++
++
++def test_temperature_divides_logits_before_softmax():
++
++
++
++    tokenizer = ExactTokenizer({ "A": [0] })
++    model = SequenceLogitModel([[0.0, 2.0]])
++
++    result, seen_probs = run_with_recorded_multinomial(
++        model,
++        tokenizer,
++        input_text="A",
++        max_length=1,
++        temperature=2.0,
++        top_p=1.0,
++        top_k=0,
++        device=torch.device("cpu"),
++    )
++
++    assert result == "AB"
++    assert_nested_approx(seen_probs[0], [[0.2689414322376251, 0.7310585975646973]])
++
++
++def test_scaler_state_enables_autocast_and_generation_stays_under_no_grad():
++
++
++
++    tokenizer = ExactTokenizer({ "A": [0] })
++    model = SequenceLogitModel([[0.0, 5.0]])
++
++    result, seen_probs = run_with_recorded_multinomial(
++        model,
++        tokenizer,
++        input_text="A",
++        max_length=1,
++        top_p=1.0,
++        top_k=1,
++        scaler_state={"precision": torch.bfloat16},
++        device=torch.device("cpu"),
++    )
++
++    assert result == "AB"
++    assert seen_probs == [[[0.0, 1.0]]]
++    assert len(model.calls) == 1
++    assert_model_call(model.calls[0], expected_ids=[[0]], expected_grad_enabled=False, expected_autocast_cpu=True)
++
++
++def test_missing_output_representation_raises_key_error():
++
++
++
++
++    class BadModel(nn.Module):
++        def forward(self, input_ids, mask=None):
++            return {}
++
++    tokenizer = ExactTokenizer({ "A": [0] })
++
++    with pytest.raises(KeyError, match="output_representation"):
++        generate(BadModel(), tokenizer, "A", max_length=1, top_p=1.0, device=torch.device("cpu"))
++
++
++def test_referential_transparency_for_same_arguments():
++    tokenizer = PlainTokenizer({ "A": [0] })
++    model = SequenceLogitModel([[0.0, 4.0], [0.0, 4.0]], record=False)
++
++    first = generate(model, tokenizer, "A", max_length=2, top_p=1.0, top_k=1, device=torch.device("cpu"))
++    second = generate(model, tokenizer, "A", max_length=2, top_p=1.0, top_k=1, device=torch.device("cpu"))
++
++    assert first == second
++    assert first == "ABB"
++
++
++def test_generate_does_not_mutate_caller_inputs():
++    tokenizer = PlainTokenizer({ "A": [0] })
++    model = ParameterizedModel()
++    scaler_state = {"precision": torch.bfloat16, "tag": ["stable"]}
++    model_before = {name: value.detach().clone() for name, value in model.state_dict().items()}
++
++    result = generate(
++        model,
++        tokenizer,
++        "A",
++        max_length=1,
++        top_p=1.0,
++        top_k=1,
++        scaler_state=scaler_state,
++        device=torch.device("cpu"),
++    )
++
++    assert result == "AB"
++
++    assert {name: value.detach().cpu().tolist() for name, value in model.state_dict().items()} == {
++        name: value.detach().cpu().tolist() for name, value in model_before.items()
++    }
++
++
++def test_no_global_state_matches_fresh_python_process():
++    tokenizer = PlainTokenizer({ "A": [0] })
++    model = SequenceLogitModel([[0.0, 9.0], [0.0, 9.0]], record=False)
++    in_process = generate(model, tokenizer, "A", max_length=2, top_p=1.0, top_k=1, device=torch.device("cpu"))
++
++    script = r'''
++import json
++import torch
++from torch import nn
++from attention_simulator.autoregressive_language_model import generate
++
++class Tokenizer:
++    def encode(self, text, return_tensors="pt"):
++        return torch.tensor([[0]], dtype=torch.long)
++    def decode(self, ids, clean_up_tokenization_spaces=True):
++        if isinstance(ids, int):
++            ids = [ids]
++        return "".join("ABCDEFGHIJKLMNOPQRSTUVWXYZ"[i] for i in ids)
++
++class Model(nn.Module):
++    def forward(self, input_ids, mask=None):
++        row = torch.tensor([0.0, 9.0], dtype=torch.float32, device=input_ids.device)
++        return {"output_representation": row.reshape(1, 1, 2).repeat(input_ids.shape[0], input_ids.shape[1], 1)}
++
++sys_stdout = generate(Model(), Tokenizer(), "A", max_length=2, top_p=1.0, top_k=1, device=torch.device("cpu"))
++print("\n__TST_RESULT__=" + json.dumps(sys_stdout))
++'''
++    completed = subprocess.run(
++        [sys.executable, "-c", script],
++        cwd="/workspace/repo",
++        text=True,
++        stdout=subprocess.PIPE,
++        stderr=subprocess.PIPE,
++        check=True,
++    )
++
++    assert in_process == "ABB"
++
++    assert "__TST_RESULT__=" in completed.stdout
++    assert json.loads(completed.stdout.rsplit("__TST_RESULT__=", 1)[1].splitlines()[0]) == "ABB"
++
++
++def test_no_undeclared_relative_file_writes_or_network_calls(tmp_path, monkeypatch):
++    def blocked_socket(*args, **kwargs):
++        raise AssertionError("network access is not declared for generate")
++
++    monkeypatch.chdir(tmp_path)
++    monkeypatch.setattr(socket, "socket", blocked_socket)
++    tokenizer = PlainTokenizer({ "A": [0] })
++    model = SequenceLogitModel([[0.0, 6.0]], record=False)
++
++    before = sorted(os.listdir(tmp_path))
++    result = generate(model, tokenizer, "A", max_length=1, top_p=1.0, top_k=1, device=torch.device("cpu"))
++    after = sorted(os.listdir(tmp_path))
++
++    assert before == []
++    assert result == "AB"
++    assert after == []
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,19 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++cd /workspace/repo
++export PYTHONPATH="/workspace/repo/attention_simulator/src:/workspace/repo/optorch/src${PYTHONPATH:+:$PYTHONPATH}"
++export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
++export PIP_NO_INDEX=1
++export HF_DATASETS_OFFLINE=1
++export TRANSFORMERS_OFFLINE=1
++exec python -m pytest /workspace/repo/usercase-test-coderl/test_generate_autoregressive.py -v

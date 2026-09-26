@@ -1,0 +1,5 @@
+I want Celery canvas to support chunked task execution through a `chunks(task, it, n, **options)` signature and the convenience method `Task.chunks(it, n)`. A user should be able to write `sig = add.chunks(zip(range(4), range(4)), 2)`, then call `sig.group()` and get a group made from two `starmap`-style task signatures: one for `[(0, 0), (1, 1)]` and one for `[(2, 2), (3, 3)]`.
+
+The chunked signature should also be executable: `add.chunks(zip(range(4), range(4)), 2)()` should apply the generated group immediately and return the group result, while `.apply_async(countdown=10)` should publish the generated group with the supplied execution options and route it using the underlying task name. Serialized chunk signatures should round-trip with `chunks.from_dict(...)` using the stored task, iterable, chunk size, and options.
+
+Workers also need a built-in `celery.chunks` task that accepts `(task, it, n)`, creates the same chunked signature in the current app, executes it, and returns its result. The top-level `from celery import chunks` API and the interactive `celery shell` locals should expose this primitive alongside `group`, `chain`, `xmap`, and `xstarmap`.

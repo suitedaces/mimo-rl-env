@@ -1,0 +1,572 @@
+diff --git a/usercase-test-coderl/scheduler_stateful_test.go b/usercase-test-coderl/scheduler_stateful_test.go
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/scheduler_stateful_test.go
+@@ -0,0 +1,542 @@
++package usercase_test_coderl
++
++import (
++	"errors"
++	"fmt"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/mcuadros/ofelia/core"
++)
++
++type testLogger struct{}
++
++func (testLogger) Debug(string, ...any)   {}
++func (testLogger) Error(string, ...any)   {}
++func (testLogger) Info(string, ...any)    {}
++func (testLogger) Warning(string, ...any) {}
++
++type eventLog struct {
++	mu     sync.Mutex
++	events []string
++	after  []middlewareAfter
++}
++
++func (l *eventLog) appendEvent(v string) {
++	l.mu.Lock()
++	defer l.mu.Unlock()
++	l.events = append(l.events, v)
++}
++
++func (l *eventLog) appendAfter(v middlewareAfter) {
++	l.mu.Lock()
++	defer l.mu.Unlock()
++	l.after = append(l.after, v)
++}
++
++func (l *eventLog) snapshot() ([]string, []middlewareAfter) {
++	l.mu.Lock()
++	defer l.mu.Unlock()
++	events := append([]string(nil), l.events...)
++	after := append([]middlewareAfter(nil), l.after...)
++	return events, after
++}
++
++type jobRunRecord struct {
++	Call                 int
++	StdoutBefore         int
++	StderrBefore         int
++	RunningAtRun         int32
++	ExecutionStarted     bool
++	ExecutionRunning     bool
++	ExecutionFailedAtRun bool
++	ExecutionSkippedRun  bool
++	StdoutAfter          string
++	StderrAfter          string
++}
++
++type recordingJob struct {
++	core.BareJob
++
++	mu        sync.Mutex
++	runErr    error
++	block     chan struct{}
++	started   chan struct{}
++	startOnce sync.Once
++	log       *eventLog
++	records   []jobRunRecord
++}
++
++func (j *recordingJob) Run(ctx *core.Context) error {
++	j.mu.Lock()
++	call := len(j.records) + 1
++	if j.log != nil {
++		j.log.appendEvent("job:run")
++	}
++	record := jobRunRecord{
++		Call:                 call,
++		StdoutBefore:         int(ctx.Execution.OutputStream.TotalWritten()),
++		StderrBefore:         int(ctx.Execution.ErrorStream.TotalWritten()),
++		RunningAtRun:         j.Running(),
++		ExecutionStarted:     !ctx.Execution.Date.IsZero(),
++		ExecutionRunning:     ctx.Execution.IsRunning,
++		ExecutionFailedAtRun: ctx.Execution.Failed,
++		ExecutionSkippedRun:  ctx.Execution.Skipped,
++	}
++	_, _ = ctx.Execution.OutputStream.Write([]byte(fmt.Sprintf("stdout-%d", call)))
++	_, _ = ctx.Execution.ErrorStream.Write([]byte(fmt.Sprintf("stderr-%d", call)))
++	record.StdoutAfter = ctx.Execution.OutputStream.String()
++	record.StderrAfter = ctx.Execution.ErrorStream.String()
++	j.records = append(j.records, record)
++	block := j.block
++	j.mu.Unlock()
++
++	if j.started != nil {
++		j.startOnce.Do(func() { close(j.started) })
++	}
++	if block != nil {
++		<-block
++	}
++
++	return j.runErr
++}
++
++func (j *recordingJob) recordsSnapshot() []jobRunRecord {
++	j.mu.Lock()
++	defer j.mu.Unlock()
++	return append([]jobRunRecord(nil), j.records...)
++}
++
++type middlewareAfter struct {
++	NextErrNil       bool
++	ExecutionRunning bool
++	Failed           bool
++	Skipped          bool
++	ErrorText        string
++	DurationRecorded bool
++	Stdout           string
++	Stderr           string
++	JobRunning       int32
++}
++
++type recordingMiddleware struct {
++	name string
++	log  *eventLog
++	done chan struct{}
++}
++
++func (m *recordingMiddleware) ContinueOnStop() bool {
++	return false
++}
++
++func (m *recordingMiddleware) Run(ctx *core.Context) error {
++	m.log.appendEvent(m.name + ":before")
++	err := ctx.Next()
++
++	errorText := "<nil>"
++	if ctx.Execution.Error != nil {
++		errorText = ctx.Execution.Error.Error()
++	}
++	m.log.appendAfter(middlewareAfter{
++		NextErrNil:       err == nil,
++		ExecutionRunning: ctx.Execution.IsRunning,
++		Failed:           ctx.Execution.Failed,
++		Skipped:          ctx.Execution.Skipped,
++		ErrorText:        errorText,
++		DurationRecorded: ctx.Execution.Duration != 0,
++		Stdout:           ctx.Execution.OutputStream.String(),
++		Stderr:           ctx.Execution.ErrorStream.String(),
++		JobRunning:       ctx.Job.Running(),
++	})
++	m.log.appendEvent(m.name + ":after")
++
++	if m.done != nil {
++		close(m.done)
++	}
++	return err
++}
++
++func newJob(name, schedule string) *recordingJob {
++	return &recordingJob{
++		BareJob: core.BareJob{
++			Name:     name,
++			Schedule: schedule,
++			Command:  "echo test",
++		},
++	}
++}
++
++func waitClosed(t *testing.T, ch <-chan struct{}, timeout time.Duration) {
++	t.Helper()
++	select {
++	case <-ch:
++	case <-time.After(timeout):
++		t.Fatalf("timed out after %s waiting for scheduled job", timeout)
++	}
++}
++
++func requireAssignedCronID(t *testing.T, scheduler *core.Scheduler, job core.Job, context string) {
++	t.Helper()
++	entries := scheduler.CronJobs()
++	if len(entries) != 1 {
++		t.Fatalf("len(CronJobs()) %s = %d, want 1", context, len(entries))
++	}
++
++	if got := job.GetCronJobID(); got == 0 {
++		t.Fatalf("GetCronJobID() %s = %d, want a non-zero registered cron ID", context, got)
++	}
++	if got, want := job.GetCronJobID(), int(entries[0].ID); got != want {
++		t.Fatalf("GetCronJobID() %s = %d, want registered entry ID %d", context, got, want)
++	}
++}
++
++func TestAddJobRegistersSupportedSchedulesAndAssignsCronID(t *testing.T) {
++
++
++	for _, tc := range []struct {
++		schedule string
++	}{
++		{"@every 1s"},
++		{"@hourly"},
++		{"* * * * *"},
++		{"* * * * * *"},
++	} {
++		scheduler := core.NewScheduler(testLogger{})
++		job := newJob("valid", tc.schedule)
++
++		if err := scheduler.AddJob(job); err != nil {
++			t.Fatalf("AddJob(%q) returned %v", tc.schedule, err)
++		}
++
++		requireAssignedCronID(t, scheduler, job, fmt.Sprintf("for %q", tc.schedule))
++		if got := scheduler.IsRunning(); got != false {
++			t.Fatalf("IsRunning() before Start for %q = %v, want false", tc.schedule, got)
++		}
++
++	}
++}
++
++func TestAddJobRejectsEmptyAndInvalidSchedules(t *testing.T) {
++
++
++	emptyScheduler := core.NewScheduler(testLogger{})
++	emptyJob := newJob("empty", "")
++	emptyErr := emptyScheduler.AddJob(emptyJob)
++
++	if got := errors.Is(emptyErr, core.ErrEmptySchedule); got != true {
++		t.Fatalf("errors.Is(emptyErr, core.ErrEmptySchedule) = %v, want true", got)
++	}
++
++	if got := len(emptyScheduler.CronJobs()); got != 0 {
++		t.Fatalf("len(CronJobs()) after empty schedule = %d, want 0", got)
++	}
++	if got := emptyJob.GetCronJobID(); got != 0 {
++		t.Fatalf("empty GetCronJobID() = %d, want 0", got)
++	}
++
++	invalidScheduler := core.NewScheduler(testLogger{})
++	invalidJob := newJob("invalid", "* * * * * * *")
++	invalidErr := invalidScheduler.AddJob(invalidJob)
++
++
++	if invalidErr == nil {
++		t.Fatal("AddJob() with invalid seven-field schedule returned nil, want cron parser error")
++	}
++	if errors.Is(invalidErr, core.ErrEmptySchedule) {
++		t.Fatalf("AddJob() with invalid seven-field schedule returned ErrEmptySchedule, want cron parser error: %v", invalidErr)
++	}
++	if got := len(invalidScheduler.CronJobs()); got != 0 {
++		t.Fatalf("len(CronJobs()) after invalid schedule = %d, want 0", got)
++	}
++	if got := invalidJob.GetCronJobID(); got != 0 {
++		t.Fatalf("invalid GetCronJobID() = %d, want 0", got)
++	}
++}
++
++func TestScheduledRunUsesMiddlewareContextAndCapturesExecutionState(t *testing.T) {
++
++
++	events := &eventLog{}
++	done := make(chan struct{})
++	job := newJob("run", "@every 1s")
++	job.runErr = errors.New("job failure")
++	job.log = events
++
++	scheduler := core.NewScheduler(testLogger{})
++	scheduler.Use(&recordingMiddleware{name: "scheduler-middleware", log: events, done: done})
++
++
++	if err := scheduler.AddJob(job); err != nil {
++		t.Fatalf("AddJob() returned %v", err)
++	}
++	if got := len(scheduler.CronJobs()); got != 1 {
++		t.Fatalf("len(CronJobs()) after AddJob = %d, want 1", got)
++	}
++	requireAssignedCronID(t, scheduler, job, "after AddJob")
++
++
++	if err := scheduler.Start(); err != nil {
++		t.Fatalf("Start() returned %v", err)
++	}
++	if got := scheduler.IsRunning(); got != true {
++		t.Fatalf("IsRunning() after Start = %v, want true", got)
++	}
++
++	waitClosed(t, done, 2200*time.Millisecond)
++	if err := scheduler.Stop(); err != nil {
++		t.Fatalf("Stop() returned %v", err)
++	}
++	if got := scheduler.IsRunning(); got != false {
++		t.Fatalf("IsRunning() after Stop = %v, want false", got)
++	}
++
++
++	records := job.recordsSnapshot()
++
++	if got := len(records); got < 1 {
++		t.Fatalf("job run count = %d, want at least 1", got)
++	}
++	firstRecord := records[0]
++	if firstRecord.Call != 1 {
++		t.Fatalf("first job call number = %d, want 1", firstRecord.Call)
++	}
++	if firstRecord.StdoutBefore != 0 || firstRecord.StderrBefore != 0 {
++		t.Fatalf("execution streams before first run = stdout %d stderr %d, want both empty", firstRecord.StdoutBefore, firstRecord.StderrBefore)
++	}
++	if firstRecord.RunningAtRun <= 0 {
++		t.Fatalf("job.Running() during first run = %d, want positive", firstRecord.RunningAtRun)
++	}
++	if !firstRecord.ExecutionStarted || !firstRecord.ExecutionRunning {
++		t.Fatalf("execution state during first run = started %v running %v, want true true", firstRecord.ExecutionStarted, firstRecord.ExecutionRunning)
++	}
++	if firstRecord.ExecutionFailedAtRun || firstRecord.ExecutionSkippedRun {
++		t.Fatalf("fresh execution during first run = failed %v skipped %v, want false false", firstRecord.ExecutionFailedAtRun, firstRecord.ExecutionSkippedRun)
++	}
++	if firstRecord.StdoutAfter != "stdout-1" || firstRecord.StderrAfter != "stderr-1" {
++		t.Fatalf("execution streams after first run = stdout %q stderr %q, want captured output", firstRecord.StdoutAfter, firstRecord.StderrAfter)
++	}
++
++	gotEvents, gotAfter := events.snapshot()
++
++	wantEvents := []string{"scheduler-middleware:before", "job:run", "scheduler-middleware:after"}
++	if len(gotEvents) < len(wantEvents) {
++		t.Fatalf("events = %v, want at least %v", gotEvents, wantEvents)
++	}
++	for i, want := range wantEvents {
++		if gotEvents[i] != want {
++			t.Fatalf("events[%d] = %q, want %q in middleware/job execution order; all events = %v", i, gotEvents[i], want, gotEvents)
++		}
++	}
++
++	if got := len(gotAfter); got < 1 {
++		t.Fatalf("middleware after record count = %d, want at least 1", got)
++	}
++	firstAfter := gotAfter[0]
++	if firstAfter.ExecutionRunning {
++		t.Fatalf("middleware after ExecutionRunning = %v, want false after context stop", firstAfter.ExecutionRunning)
++	}
++	if !firstAfter.Failed || firstAfter.Skipped {
++		t.Fatalf("middleware after failed/skipped = %v/%v, want true/false", firstAfter.Failed, firstAfter.Skipped)
++	}
++	if firstAfter.ErrorText != "job failure" {
++		t.Fatalf("middleware after error text = %q, want captured job error", firstAfter.ErrorText)
++	}
++	if !firstAfter.DurationRecorded {
++		t.Fatal("middleware after duration was not recorded")
++	}
++	if firstAfter.Stdout != "stdout-1" || firstAfter.Stderr != "stderr-1" {
++		t.Fatalf("middleware after streams = stdout %q stderr %q, want captured output", firstAfter.Stdout, firstAfter.Stderr)
++	}
++	if firstAfter.JobRunning != 0 {
++		t.Fatalf("middleware after job.Running() = %d, want 0 after context stop", firstAfter.JobRunning)
++	}
++	if got := job.Running(); got != 0 {
++		t.Fatalf("job.Running() after fired run = %d, want 0", got)
++	}
++}
++
++func TestRemoveJobDeregistersCronEntryAndPreventsFutureRuns(t *testing.T) {
++
++
++	job := newJob("remove", "@every 1s")
++	job.started = make(chan struct{})
++	scheduler := core.NewScheduler(testLogger{})
++
++	if err := scheduler.AddJob(job); err != nil {
++		t.Fatalf("AddJob() returned %v", err)
++	}
++	if got := len(scheduler.CronJobs()); got != 1 {
++		t.Fatalf("len(CronJobs()) before RemoveJob = %d, want 1", got)
++	}
++	requireAssignedCronID(t, scheduler, job, "before RemoveJob")
++
++	if err := scheduler.Start(); err != nil {
++		t.Fatalf("Start() returned %v", err)
++	}
++	if got := scheduler.IsRunning(); got != true {
++		t.Fatalf("IsRunning() after Start before RemoveJob = %v, want true", got)
++	}
++	if err := scheduler.RemoveJob(job); err != nil {
++		t.Fatalf("RemoveJob() returned %v", err)
++	}
++	if got := len(scheduler.CronJobs()); got != 0 {
++		t.Fatalf("len(CronJobs()) after RemoveJob = %d, want 0", got)
++	}
++
++	select {
++	case <-job.started:
++		t.Fatal("removed job fired, want no run")
++	case <-time.After(1200 * time.Millisecond):
++	}
++	if got := len(job.recordsSnapshot()); got != 0 {
++		t.Fatalf("removed job run count = %d, want 0", got)
++	}
++	if err := scheduler.Stop(); err != nil {
++		t.Fatalf("Stop() returned %v", err)
++	}
++	if got := scheduler.IsRunning(); got != false {
++		t.Fatalf("IsRunning() after Stop = %v, want false", got)
++	}
++}
++
++func TestStopWaitsForInFlightScheduledJob(t *testing.T) {
++
++
++	started := make(chan struct{})
++	unblock := make(chan struct{})
++	job := newJob("blocking", "@every 1s")
++	job.started = started
++	job.block = unblock
++	scheduler := core.NewScheduler(testLogger{})
++
++	if err := scheduler.AddJob(job); err != nil {
++		t.Fatalf("AddJob() returned %v", err)
++	}
++	if err := scheduler.Start(); err != nil {
++		t.Fatalf("Start() returned %v", err)
++	}
++	if got := scheduler.IsRunning(); got != true {
++		t.Fatalf("IsRunning() after Start = %v, want true", got)
++	}
++	waitClosed(t, started, 2200*time.Millisecond)
++
++	stopDone := make(chan struct{})
++	go func() {
++		_ = scheduler.Stop()
++		close(stopDone)
++	}()
++
++	stopReturnedWhileBlocked := false
++	select {
++	case <-stopDone:
++		stopReturnedWhileBlocked = true
++	case <-time.After(150 * time.Millisecond):
++	}
++	if got := stopReturnedWhileBlocked; got != false {
++		t.Fatalf("Stop returned while job body was blocked = %v, want false", got)
++	}
++
++	close(unblock)
++	waitClosed(t, stopDone, 2200*time.Millisecond)
++	if got := scheduler.IsRunning(); got != false {
++		t.Fatalf("IsRunning() after Stop waited for job = %v, want false", got)
++	}
++	if got := len(job.recordsSnapshot()); got != 1 {
++		t.Fatalf("blocking job run count = %d, want 1", got)
++	}
++}
++
++func TestStopIsIdempotent(t *testing.T) {
++
++
++	scheduler := core.NewScheduler(testLogger{})
++	job := newJob("idempotent", "@hourly")
++
++	if err := scheduler.AddJob(job); err != nil {
++		t.Fatalf("AddJob() returned %v", err)
++	}
++	if err := scheduler.Start(); err != nil {
++		t.Fatalf("Start() returned %v", err)
++	}
++	if got := scheduler.IsRunning(); got != true {
++		t.Fatalf("IsRunning() after Start = %v, want true", got)
++	}
++	if err := scheduler.Stop(); err != nil {
++		t.Fatalf("first Stop() returned %v", err)
++	}
++	if got := scheduler.IsRunning(); got != false {
++		t.Fatalf("IsRunning() after first Stop = %v, want false", got)
++	}
++
++	if got := scheduler.IsRunning(); got != false {
++		t.Fatalf("IsRunning() after Stop remains = %v, want false", got)
++	}
++}
++
++func TestSchedulersKeepIndependentState(t *testing.T) {
++
++
++	a := core.NewScheduler(testLogger{})
++	b := core.NewScheduler(testLogger{})
++	jobA := newJob("a", "@hourly")
++
++	if err := a.AddJob(jobA); err != nil {
++		t.Fatalf("a.AddJob() returned %v", err)
++	}
++	if got := len(a.CronJobs()); got != 1 {
++		t.Fatalf("len(a.CronJobs()) after a.AddJob = %d, want 1", got)
++	}
++	if got := len(b.CronJobs()); got != 0 {
++		t.Fatalf("len(b.CronJobs()) after a.AddJob = %d, want 0", got)
++	}
++	requireAssignedCronID(t, a, jobA, "after a.AddJob")
++	if err := a.Start(); err != nil {
++		t.Fatalf("a.Start() returned %v", err)
++	}
++	if got := a.IsRunning(); got != true {
++		t.Fatalf("a.IsRunning() after a.Start = %v, want true", got)
++	}
++	if got := b.IsRunning(); got != false {
++		t.Fatalf("b.IsRunning() after a.Start = %v, want false", got)
++	}
++	if err := a.Stop(); err != nil {
++		t.Fatalf("a.Stop() returned %v", err)
++	}
++	if got := a.IsRunning(); got != false {
++		t.Fatalf("a.IsRunning() after a.Stop = %v, want false", got)
++	}
++	if got := b.IsRunning(); got != false {
++		t.Fatalf("b.IsRunning() after a.Stop = %v, want false", got)
++	}
++}
++
++func TestStartStopDoesNotLeakSchedulerGoroutines(t *testing.T) {
++
++
++
++	scheduler := core.NewScheduler(testLogger{})
++	job := newJob("stopped", "@every 1s")
++	job.started = make(chan struct{})
++	if err := scheduler.AddJob(job); err != nil {
++		t.Fatalf("AddJob() returned %v", err)
++	}
++	if err := scheduler.Start(); err != nil {
++		t.Fatalf("Start() returned %v", err)
++	}
++	if err := scheduler.Stop(); err != nil {
++		t.Fatalf("Stop() returned %v", err)
++	}
++	if got := scheduler.IsRunning(); got != false {
++		t.Fatalf("IsRunning() after Stop = %v, want false", got)
++	}
++
++	select {
++	case <-job.started:
++		t.Fatal("job fired after Stop, want no future scheduled runs")
++	case <-time.After(1200 * time.Millisecond):
++	}
++	if got := len(job.recordsSnapshot()); got != 0 {
++		t.Fatalf("stopped job run count = %d, want 0", got)
++	}
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,20 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++export GOTOOLCHAIN=local
++export GOPROXY=off
++export GOSUMDB=off
++export GOVCS="*:off"
++export GOFLAGS="${GOFLAGS:-} -mod=readonly"
++set -e
++cd /workspace/repo
++set -euo pipefail
++
++cd /workspace/repo
++exec go test -v -count=1 ./usercase-test-coderl/...

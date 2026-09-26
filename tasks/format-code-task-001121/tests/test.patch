@@ -1,0 +1,220 @@
+diff --git a/libbeat/processors/actions/decode_json_fields_recursive_test.go b/libbeat/processors/actions/decode_json_fields_recursive_test.go
+new file mode 100644
+index 000000000..f3d8a93a1
+--- /dev/null
++++ b/libbeat/processors/actions/decode_json_fields_recursive_test.go
+@@ -0,0 +1,199 @@
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++package actions_test
++
++import (
++	"testing"
++
++	"github.com/stretchr/testify/assert"
++
++	"github.com/elastic/beats/libbeat/beat"
++	"github.com/elastic/beats/libbeat/common"
++	_ "github.com/elastic/beats/libbeat/processors/actions"
++	"github.com/elastic/beats/libbeat/processors"
++)
++
++func runRecursiveDecoder(t *testing.T, yaml string, fields common.MapStr) *beat.Event {
++	t.Helper()
++
++	config, err := common.NewConfigWithYAML([]byte(yaml), "test")
++	if !assert.NoError(t, err) {
++		return nil
++	}
++	processor, err := processors.New([]*common.Config{config})
++	if !assert.NoError(t, err) {
++		return nil
++	}
++
++	event, err := processor.Run(&beat.Event{Fields: fields})
++	if !assert.NoError(t, err) {
++		return nil
++	}
++	if !assert.NotNil(t, event) {
++		return nil
++	}
++	return event
++}
++
++func eventValue(t *testing.T, event *beat.Event, key string) interface{} {
++	t.Helper()
++	if event == nil {
++		return nil
++	}
++	value, err := event.GetValue(key)
++	if !assert.NoError(t, err) {
++		return nil
++	}
++	return value
++}
++
++func mapValue(t *testing.T, value interface{}) common.MapStr {
++	t.Helper()
++	mapValue, ok := value.(map[string]interface{})
++	if !assert.True(t, ok, "expected decoded object, got %T", value) {
++		return common.MapStr{}
++	}
++	return common.MapStr(mapValue)
++}
++
++func arrayValue(t *testing.T, value interface{}) []interface{} {
++	t.Helper()
++	arrayValue, ok := value.([]interface{})
++	if !assert.True(t, ok, "expected decoded array, got %T", value) {
++		return nil
++	}
++	return arrayValue
++}
++
++func TestDecodeJSONFieldsRecursesThroughNestedObjects(t *testing.T) {
++payload := `{"outer":{"encoded":"{\"level\":\"one\",\"next\":\"{\\\"level\\\":\\\"two\\\",\\\"tail\\\":\\\"{\\\\\\\"level\\\\\\\":\\\\\\\"three\\\\\\\"}\\\"}\"}"},"plain":"not-json"}`
++	event := runRecursiveDecoder(t, `
++decode_json_fields:
++  fields: [payload]
++  target: decoded
++  max_depth: 3
++  process_array: true
++`, common.MapStr{
++		"payload": payload,
++	})
++
++	decoded := mapValue(t, eventValue(t, event, "decoded"))
++	outer := mapValue(t, decoded["outer"])
++	encoded := mapValue(t, outer["encoded"])
++	next := mapValue(t, encoded["next"])
++	assert.Equal(t, "one", encoded["level"])
++	assert.Equal(t, "two", next["level"])
++	assert.Equal(t, `{"level":"three"}`, next["tail"])
++	assert.Equal(t, "not-json", decoded["plain"])
++	assert.Equal(t, payload, eventValue(t, event, "payload"))
++}
++
++func TestDecodeJSONFieldsRecursesIntoArraysOnlyWhenEnabled(t *testing.T) {
++	payload := `{"objects":[{"encoded":"{\"kind\":\"object\"}"},"{\"kind\":\"string\"}",7],"outside":"{\"kind\":\"map\"}"}`
++
++	t.Run("enabled", func(t *testing.T) {
++		event := runRecursiveDecoder(t, `
++decode_json_fields:
++  fields: [payload]
++  target: decoded
++  max_depth: 3
++  process_array: true
++`, common.MapStr{"payload": payload})
++
++		decoded := mapValue(t, eventValue(t, event, "decoded"))
++		objects := arrayValue(t, decoded["objects"])
++		first := mapValue(t, objects[0])
++		encoded := mapValue(t, first["encoded"])
++		second := mapValue(t, objects[1])
++		outside := mapValue(t, decoded["outside"])
++		assert.Equal(t, "object", encoded["kind"])
++		assert.Equal(t, "string", second["kind"])
++		assert.EqualValues(t, 7, objects[2])
++		assert.Equal(t, "map", outside["kind"])
++	})
++
++	t.Run("disabled", func(t *testing.T) {
++		event := runRecursiveDecoder(t, `
++decode_json_fields:
++  fields: [payload]
++  target: decoded
++  max_depth: 3
++  process_array: false
++`, common.MapStr{"payload": payload})
++
++		decoded := mapValue(t, eventValue(t, event, "decoded"))
++		objects := arrayValue(t, decoded["objects"])
++		first := mapValue(t, objects[0])
++		outside := mapValue(t, decoded["outside"])
++		assert.Equal(t, `{"kind":"object"}`, first["encoded"])
++		assert.Equal(t, `{"kind":"string"}`, objects[1])
++		assert.EqualValues(t, 7, objects[2])
++		assert.Equal(t, "map", outside["kind"])
++	})
++}
++
++func TestDecodeJSONFieldsRecursiveRootTargetKeepsLegacyMergeRules(t *testing.T) {
++	payload := `{"existing":"replacement","nested":{"encoded":"{\"value\":2}"}}`
++	event := runRecursiveDecoder(t, `
++decode_json_fields:
++  fields: [payload]
++  target: ""
++  max_depth: 3
++  process_array: true
++  overwrite_keys: false
++`, common.MapStr{
++		"payload":  payload,
++		"existing": "preserved",
++	})
++
++	assert.Equal(t, "preserved", eventValue(t, event, "existing"))
++	assert.Equal(t, payload, eventValue(t, event, "payload"))
++	nested := mapValue(t, eventValue(t, event, "nested"))
++	encoded := mapValue(t, nested["encoded"])
++	assert.EqualValues(t, 2, encoded["value"])
++
++	overwrite := runRecursiveDecoder(t, `
++decode_json_fields:
++  fields: [payload]
++  target: ""
++  max_depth: 2
++  overwrite_keys: true
++`, common.MapStr{
++		"payload":  `{"existing":"replacement"}`,
++		"existing": "preserved",
++	})
++	assert.Equal(t, "replacement", eventValue(t, overwrite, "existing"))
++}
++
++func TestDecodeJSONFieldsMaxDepthOneDoesNotDecodeChildren(t *testing.T) {
++	event := runRecursiveDecoder(t, `
++decode_json_fields:
++  fields: [payload]
++  target: decoded
++  max_depth: 1
++  process_array: true
++`, common.MapStr{
++		"payload": `{"nested":{"encoded":"{\"value\":2}"},"array":["{\"value\":3}"]}`,
++	})
++
++	decoded := mapValue(t, eventValue(t, event, "decoded"))
++	nested := mapValue(t, decoded["nested"])
++	array := arrayValue(t, decoded["array"])
++	assert.Equal(t, `{"value":2}`, nested["encoded"])
++	assert.Equal(t, `{"value":3}`, array[0])
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,10 @@
++#!/bin/bash
++set -euo pipefail
++
++
++
++
++GO_TEST_GOPATH="$(mktemp -d)"
++mkdir -p "${GO_TEST_GOPATH}/src/github.com/elastic"
++ln -s "$(pwd)" "${GO_TEST_GOPATH}/src/github.com/elastic/beats"
++GO111MODULE=off GOPATH="${GO_TEST_GOPATH}" go test -vet=off github.com/elastic/beats/libbeat/processors/actions -run '^TestDecodeJSONFields(RecursesThroughNestedObjects|RecursesIntoArraysOnlyWhenEnabled|RecursiveRootTargetKeepsLegacyMergeRules|MaxDepthOneDoesNotDecodeChildren)$'

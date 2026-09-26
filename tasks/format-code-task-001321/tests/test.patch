@@ -1,0 +1,582 @@
+diff --git a/usercase-test-coderl/deployment-watcher.test.js b/usercase-test-coderl/deployment-watcher.test.js
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/deployment-watcher.test.js
+@@ -0,0 +1,546 @@
++/* eslint-env mocha */
++
++
++
++
++
++
++
++const chai = require('chai')
++const sinon = require('sinon')
++
++const DeploymentWatcher = require('../lib/watchers/deployment-watcher')
++const { DecisionResults } = require('../lib/plugins/plugin')
++const { DEPLOYMENT_ANNOTATION_NAME, EXPERIMENT_ANNOTATION_NAME } = require('../lib/watchers/constants')
++
++const { expect } = chai
++
++const descriptor = {
++  control: { name: 'control-deploy' },
++  treatment: { name: 'treatment-deploy' }
++}
++
++const controlDeployment = deployment('control:v1', 3)
++
++function deployment (image, replicas, annotationValue) {
++  const annotations = {}
++  if (annotationValue !== undefined) {
++    annotations[EXPERIMENT_ANNOTATION_NAME] = annotationValue
++  }
++  return {
++    metadata: { annotations },
++    spec: {
++      replicas,
++      template: {
++        spec: {
++          containers: [{ name: 'app', image }]
++        }
++      }
++    }
++  }
++}
++
++function createKubeClient (control = controlDeployment) {
++  const patches = []
++  const stream = { id: 'watch-stream' }
++  return {
++    patches,
++    stream,
++    apis: {
++      apps: {
++        v1: {
++          watch: {
++            namespaces: namespace => ({
++              deploy: name => ({
++                getStream: () => ({ stream, namespace, name })
++              })
++            })
++          },
++          namespaces: namespace => ({
++            deploy: name => ({
++              get: () => Promise.resolve({ body: control }),
++              patch: patch => {
++                patches.push({ namespace, name, body: patch.body })
++                return Promise.resolve({ body: patch.body })
++              }
++            })
++          })
++        }
++      }
++    }
++  }
++}
++
++function createPlugin (results) {
++  return {
++    starts: [],
++    stops: 0,
++    polls: [],
++    onExperimentStart: function (startTime) {
++      this.starts.push(startTime.toISOString())
++    },
++    onExperimentStop: function () {
++      this.stops += 1
++    },
++    onExperimentPoll: function (controlName, treatmentName) {
++      this.polls.push([controlName, treatmentName])
++      return Promise.resolve(results.shift())
++    }
++  }
++}
++
++function createLogger () {
++  return {
++    info: sinon.stub(),
++    warn: sinon.stub(),
++    error: sinon.stub()
++  }
++}
++
++function createWatcher ({ kubeClient = createKubeClient(), plugins = [createPlugin([])], pollerIntervalMilliseconds = 1000, logger = createLogger(), gatedDeploymentId = 'gd-acceptance' } = {}) {
++  return new DeploymentWatcher({
++    kubeClient,
++    logger,
++    deploymentDescriptor: descriptor,
++    namespace: 'qa',
++    plugins,
++    pollerIntervalMilliseconds,
++    gatedDeploymentId
++  })
++}
++
++async function flushPromises () {
++  for (let i = 0; i < 12; i += 1) {
++    await Promise.resolve()
++  }
++}
++
++function timeoutResourceCount () {
++  return process.getActiveResourcesInfo().filter(name => name === 'Timeout').length
++}
++
++function isTreatmentPatch (patch) {
++  return patch.namespace === 'qa' && patch.name === 'treatment-deploy'
++}
++
++function isControlPatch (patch) {
++  return patch.namespace === 'qa' && patch.name === 'control-deploy'
++}
++
++function experimentAnnotationValue (patch) {
++  return patch.body &&
++    patch.body.metadata &&
++    patch.body.metadata.annotations &&
++    patch.body.metadata.annotations[EXPERIMENT_ANNOTATION_NAME]
++}
++
++function deploymentStatusValue (patch) {
++  return patch.body &&
++    patch.body.metadata &&
++    patch.body.metadata.annotations &&
++    patch.body.metadata.annotations[DEPLOYMENT_ANNOTATION_NAME]
++}
++
++function isTreatmentScaleZeroPatch (patch) {
++  return isTreatmentPatch(patch) &&
++    patch.body &&
++    patch.body.spec &&
++    patch.body.spec.replicas === 0
++}
++
++function isExperimentAnnotationClearPatch (patch) {
++  return isTreatmentPatch(patch) && experimentAnnotationValue(patch) === null
++}
++
++function isExperimentAnnotationSetPatch (patch) {
++  return isTreatmentPatch(patch) &&
++    typeof experimentAnnotationValue(patch) === 'string' &&
++    experimentAnnotationValue(patch).length > 0
++}
++
++function isDeploymentStatusPatch (status) {
++  return patch => isTreatmentPatch(patch) && deploymentStatusValue(patch) === status
++}
++
++function controlPatchHasContainerImage (patch, image) {
++  const containers = patch.body &&
++    patch.body.spec &&
++    patch.body.spec.template &&
++    patch.body.spec.template.spec &&
++    patch.body.spec.template.spec.containers
++  return isControlPatch(patch) &&
++    Array.isArray(containers) &&
++    containers.some(container => container.image === image)
++}
++
++function findPatchIndex (patches, predicate, startIndex = 0) {
++  for (let i = startIndex; i < patches.length; i += 1) {
++    if (predicate(patches[i])) return i
++  }
++  return -1
++}
++
++function expectPatch (patches, predicate, message, startIndex = 0) {
++  const index = findPatchIndex(patches, predicate, startIndex)
++  expect(index, message).to.be.at.least(startIndex)
++  return index
++}
++
++function expectNoPatch (patches, predicate, message) {
++  expect(patches.some(predicate), message).to.equal(false)
++}
++
++describe('usercase DeploymentWatcher lifecycle acceptance', () => {
++  let clock
++
++  afterEach(async () => {
++    if (clock) {
++      clock.restore()
++      clock = null
++    }
++  })
++
++  it('returns a namespace-scoped treatment watch stream', () => {
++
++
++    const kubeClient = createKubeClient()
++    const watcher = createWatcher({ kubeClient })
++
++    expect(watcher.getStream()).to.deep.equal({
++      stream: { id: 'watch-stream' },
++      namespace: 'qa',
++      name: 'treatment-deploy'
++    })
++  })
++
++  it('clears experiment annotation and does not poll when added treatment has zero replicas', async () => {
++
++
++    const kubeClient = createKubeClient()
++    const plugin = createPlugin([])
++    const watcher = createWatcher({ kubeClient, plugins: [plugin] })
++
++    await watcher.onAdded(deployment('treatment:v2', 0))
++
++
++    expect(kubeClient.patches).to.have.lengthOf(1)
++    expect(kubeClient.patches[0]).to.satisfy(isExperimentAnnotationClearPatch)
++    expect(plugin.starts).to.deep.equal([])
++    expect(plugin.polls).to.deep.equal([])
++    expect(plugin.stops).to.equal(0)
++  })
++
++  it('scales treatment down as noHarm without plugins when treatment matches control', async () => {
++
++
++    const kubeClient = createKubeClient()
++    const plugin = createPlugin([])
++    const watcher = createWatcher({ kubeClient, plugins: [plugin] })
++
++    await watcher.onAdded(deployment('control:v1', 2))
++
++
++    expectPatch(kubeClient.patches, isTreatmentScaleZeroPatch, 'scaled treatment to zero')
++    expectPatch(kubeClient.patches, isDeploymentStatusPatch('noHarm'), 'set noHarm status')
++    expectNoPatch(kubeClient.patches, isExperimentAnnotationSetPatch, 'did not start experiment annotation')
++    expect(plugin.starts).to.deep.equal([])
++    expect(plugin.polls).to.deep.equal([])
++    expect(plugin.stops).to.equal(0)
++  })
++
++  it('starts a new experiment, persists the hash annotation, and keeps running on WAIT', async () => {
++
++
++    clock = sinon.useFakeTimers(new Date('2020-01-02T03:04:05.006Z').getTime())
++    const kubeClient = createKubeClient()
++    const plugin = createPlugin([DecisionResults.WAIT])
++    const watcher = createWatcher({ kubeClient, plugins: [plugin], pollerIntervalMilliseconds: 1000 })
++
++    await watcher.onAdded(deployment('treatment:v2', 2))
++    clock.tick(1000)
++    await flushPromises()
++
++
++    expect(kubeClient.patches).to.have.lengthOf(1)
++    expect(kubeClient.patches[0]).to.satisfy(isExperimentAnnotationSetPatch)
++    const startedAnnotation = JSON.parse(experimentAnnotationValue(kubeClient.patches[0]))
++    expect(startedAnnotation.startTime).to.equal('2020-01-02T03:04:05.006Z')
++    expect(startedAnnotation.podSpecHash).to.be.a('string').and.not.equal('')
++    expect(plugin.starts).to.deep.equal(['2020-01-02T03:04:05.006Z'])
++    expect(plugin.polls).to.deep.equal([['control-deploy', 'treatment-deploy']])
++    expect(plugin.stops).to.equal(0)
++
++    await watcher.onDeleted()
++  })
++
++  it('resumes from a valid same-hash annotation and ignores invalid or mismatched annotations', async () => {
++
++
++    clock = sinon.useFakeTimers(new Date('2019-07-10T22:50:18.234Z').getTime())
++    const sameHashClient = createKubeClient()
++    const sameHashWatcher = createWatcher({ kubeClient: sameHashClient, plugins: [createPlugin([])] })
++    await sameHashWatcher.onAdded(deployment('treatment:v2', 2))
++    const sameHash = experimentAnnotationValue(sameHashClient.patches[0])
++    await sameHashWatcher.onDeleted()
++
++    const mismatchedHashClient = createKubeClient()
++    const mismatchedHashWatcher = createWatcher({ kubeClient: mismatchedHashClient, plugins: [createPlugin([])] })
++    await mismatchedHashWatcher.onAdded(deployment('treatment:v3', 2))
++    const mismatchedHash = experimentAnnotationValue(mismatchedHashClient.patches[0])
++    await mismatchedHashWatcher.onDeleted()
++
++    clock.restore()
++    clock = sinon.useFakeTimers(new Date('2020-01-02T03:04:05.006Z').getTime())
++
++    const resumeClient = createKubeClient()
++    const resumePlugin = createPlugin([])
++    const resumeWatcher = createWatcher({ kubeClient: resumeClient, plugins: [resumePlugin] })
++    await resumeWatcher.onAdded(deployment('treatment:v2', 2, sameHash))
++    expect(resumePlugin.starts).to.deep.equal(['2019-07-10T22:50:18.234Z'])
++
++    expect(resumeClient.patches[0]).to.satisfy(isExperimentAnnotationSetPatch)
++    const resumedAnnotation = JSON.parse(experimentAnnotationValue(resumeClient.patches[0]))
++    expect(resumedAnnotation.startTime).to.equal('2019-07-10T22:50:18.234Z')
++    expect(resumedAnnotation.podSpecHash).to.be.a('string').and.not.equal('')
++    await resumeWatcher.onDeleted()
++
++    const invalidClient = createKubeClient()
++    const invalidPlugin = createPlugin([])
++    const invalidWatcher = createWatcher({ kubeClient: invalidClient, plugins: [invalidPlugin] })
++    await invalidWatcher.onAdded(deployment('treatment:v2', 2, 'not-json'))
++    expect(invalidPlugin.starts).to.deep.equal(['2020-01-02T03:04:05.006Z'])
++
++    expect(invalidClient.patches[0]).to.satisfy(isExperimentAnnotationSetPatch)
++    const invalidReplacement = JSON.parse(experimentAnnotationValue(invalidClient.patches[0]))
++    expect(invalidReplacement.startTime).to.equal('2020-01-02T03:04:05.006Z')
++    expect(invalidReplacement.podSpecHash).to.be.a('string').and.not.equal('')
++    await invalidWatcher.onDeleted()
++
++    const mismatchClient = createKubeClient()
++    const mismatchPlugin = createPlugin([])
++    const mismatchWatcher = createWatcher({ kubeClient: mismatchClient, plugins: [mismatchPlugin] })
++    await mismatchWatcher.onAdded(deployment('treatment:v2', 2, mismatchedHash))
++    expect(mismatchPlugin.starts).to.deep.equal(['2020-01-02T03:04:05.006Z'])
++
++    expect(mismatchClient.patches[0]).to.satisfy(isExperimentAnnotationSetPatch)
++    const mismatchReplacement = JSON.parse(experimentAnnotationValue(mismatchClient.patches[0]))
++    expect(mismatchReplacement.startTime).to.equal('2020-01-02T03:04:05.006Z')
++    expect(mismatchReplacement.podSpecHash).to.be.a('string').and.not.equal('')
++    await mismatchWatcher.onDeleted()
++  })
++
++  it('fails immediately on any FAIL result and treats plugin polling errors as WAIT', async () => {
++
++
++    clock = sinon.useFakeTimers(new Date('2020-01-02T03:04:05.006Z').getTime())
++    const kubeClient = createKubeClient()
++    const failingPlugin = createPlugin([DecisionResults.FAIL])
++    const throwingPlugin = createPlugin([])
++    throwingPlugin.onExperimentPoll = function (controlName, treatmentName) {
++      this.polls.push([controlName, treatmentName])
++      return Promise.reject(new Error('backend unavailable'))
++    }
++    const logger = createLogger()
++    const watcher = createWatcher({ kubeClient, plugins: [failingPlugin, throwingPlugin], logger })
++
++    await watcher.onAdded(deployment('treatment:v4', 2))
++    clock.tick(1000)
++    await flushPromises()
++
++
++    const failStartIndex = expectPatch(kubeClient.patches, isExperimentAnnotationSetPatch, 'started experiment before FAIL')
++    const failStartAnnotation = JSON.parse(experimentAnnotationValue(kubeClient.patches[failStartIndex]))
++    expect(failStartAnnotation.startTime).to.equal('2020-01-02T03:04:05.006Z')
++    expect(failStartAnnotation.podSpecHash).to.be.a('string').and.not.equal('')
++    const failClearIndex = expectPatch(kubeClient.patches, isExperimentAnnotationClearPatch, 'cleared experiment annotation after FAIL', failStartIndex + 1)
++    expectPatch(kubeClient.patches, isTreatmentScaleZeroPatch, 'scaled treatment to zero after FAIL', failClearIndex + 1)
++    expectPatch(kubeClient.patches, isDeploymentStatusPatch('harm'), 'set harm status after FAIL', failClearIndex + 1)
++    expect(failingPlugin.polls).to.deep.equal([['control-deploy', 'treatment-deploy']])
++    expect(throwingPlugin.polls).to.deep.equal([['control-deploy', 'treatment-deploy']])
++    expect(failingPlugin.stops).to.equal(1)
++    expect(throwingPlugin.stops).to.equal(1)
++    expect(logger.error.callCount).to.equal(1)
++  })
++
++  it('passes only when every plugin returns PASS and promotes treatment spec to control', async () => {
++
++
++    clock = sinon.useFakeTimers(new Date('2020-01-02T03:04:05.006Z').getTime())
++    const kubeClient = createKubeClient()
++    const firstPlugin = createPlugin([DecisionResults.PASS])
++    const secondPlugin = createPlugin([DecisionResults.PASS])
++    const watcher = createWatcher({ kubeClient, plugins: [firstPlugin, secondPlugin] })
++
++    await watcher.onAdded(deployment('treatment:v3', 2))
++    clock.tick(1000)
++    await flushPromises()
++
++
++    const passStartIndex = expectPatch(kubeClient.patches, isExperimentAnnotationSetPatch, 'started experiment before PASS')
++    const passStartAnnotation = JSON.parse(experimentAnnotationValue(kubeClient.patches[passStartIndex]))
++    expect(passStartAnnotation.startTime).to.equal('2020-01-02T03:04:05.006Z')
++    expect(passStartAnnotation.podSpecHash).to.be.a('string').and.not.equal('')
++    const passClearIndex = expectPatch(kubeClient.patches, isExperimentAnnotationClearPatch, 'cleared experiment annotation after PASS', passStartIndex + 1)
++    expectPatch(kubeClient.patches, patch => controlPatchHasContainerImage(patch, 'treatment:v3'), 'promoted treatment pod spec to control', passClearIndex + 1)
++    expectPatch(kubeClient.patches, isTreatmentScaleZeroPatch, 'scaled treatment to zero after PASS', passClearIndex + 1)
++    expectPatch(kubeClient.patches, isDeploymentStatusPatch('noHarm'), 'set noHarm status after PASS', passClearIndex + 1)
++    expect(firstPlugin.stops).to.equal(1)
++    expect(secondPlugin.stops).to.equal(1)
++  })
++
++  it('onModified leaves an unchanged running experiment alone but restarts when replicas or pod spec change', async () => {
++
++
++    clock = sinon.useFakeTimers(new Date('2020-01-02T03:04:05.006Z').getTime())
++    const kubeClient = createKubeClient()
++    const plugin = createPlugin([])
++    const watcher = createWatcher({ kubeClient, plugins: [plugin] })
++
++    await watcher.onAdded(deployment('treatment:v2', 2))
++    await watcher.onModified(deployment('treatment:v2', 2))
++
++    expect(kubeClient.patches).to.have.lengthOf(1)
++    expect(kubeClient.patches[0]).to.satisfy(isExperimentAnnotationSetPatch)
++    const initialModifiedAnnotation = JSON.parse(experimentAnnotationValue(kubeClient.patches[0]))
++    expect(initialModifiedAnnotation.startTime).to.equal('2020-01-02T03:04:05.006Z')
++    expect(initialModifiedAnnotation.podSpecHash).to.be.a('string').and.not.equal('')
++    expect(plugin.starts).to.deep.equal(['2020-01-02T03:04:05.006Z'])
++    expect(plugin.stops).to.equal(0)
++
++    await watcher.onModified(deployment('treatment:v2', 3))
++
++    const replicasClearIndex = expectPatch(kubeClient.patches, isExperimentAnnotationClearPatch, 'cleared running experiment after replica change', 1)
++    const replicasRestartIndex = expectPatch(kubeClient.patches, isExperimentAnnotationSetPatch, 'restarted experiment after replica change', replicasClearIndex + 1)
++    const replicasRestartAnnotation = JSON.parse(experimentAnnotationValue(kubeClient.patches[replicasRestartIndex]))
++    expect(replicasRestartAnnotation.startTime).to.equal('2020-01-02T03:04:05.006Z')
++    expect(replicasRestartAnnotation.podSpecHash).to.be.a('string').and.not.equal('')
++    expect(plugin.starts).to.deep.equal(['2020-01-02T03:04:05.006Z', '2020-01-02T03:04:05.006Z'])
++    expect(plugin.stops).to.equal(1)
++
++    await watcher.onModified(deployment('treatment:v5', 3))
++
++    const podSpecClearIndex = expectPatch(kubeClient.patches, isExperimentAnnotationClearPatch, 'cleared running experiment after pod spec change', replicasRestartIndex + 1)
++    const podSpecRestartIndex = expectPatch(kubeClient.patches, isExperimentAnnotationSetPatch, 'restarted experiment after pod spec change', podSpecClearIndex + 1)
++    const podSpecRestartAnnotation = JSON.parse(experimentAnnotationValue(kubeClient.patches[podSpecRestartIndex]))
++    expect(podSpecRestartAnnotation.startTime).to.equal('2020-01-02T03:04:05.006Z')
++    expect(podSpecRestartAnnotation.podSpecHash).to.be.a('string').and.not.equal('')
++    expect(plugin.starts).to.deep.equal([
++      '2020-01-02T03:04:05.006Z',
++      '2020-01-02T03:04:05.006Z',
++      '2020-01-02T03:04:05.006Z'
++    ])
++    expect(plugin.stops).to.equal(2)
++
++    await watcher.onDeleted()
++  })
++
++  it('onDeleted forgets the last deployment, stops the active poller, notifies plugins, and clears the experiment annotation', async () => {
++
++
++    clock = sinon.useFakeTimers(new Date('2020-01-02T03:04:05.006Z').getTime())
++    const kubeClient = createKubeClient()
++    const plugin = createPlugin([])
++    const watcher = createWatcher({ kubeClient, plugins: [plugin] })
++
++    await watcher.onAdded(deployment('treatment:v2', 2))
++    await watcher.onDeleted()
++    clock.tick(5000)
++    await flushPromises()
++
++
++    expect(kubeClient.patches[0]).to.satisfy(isExperimentAnnotationSetPatch)
++    const deleteStartAnnotation = JSON.parse(experimentAnnotationValue(kubeClient.patches[0]))
++    expect(deleteStartAnnotation.startTime).to.equal('2020-01-02T03:04:05.006Z')
++    expect(deleteStartAnnotation.podSpecHash).to.be.a('string').and.not.equal('')
++    expectPatch(kubeClient.patches, isExperimentAnnotationClearPatch, 'cleared experiment annotation on delete', 1)
++    expect(plugin.starts).to.deep.equal(['2020-01-02T03:04:05.006Z'])
++    expect(plugin.stops).to.equal(1)
++    expect(plugin.polls).to.deep.equal([])
++  })
++
++  it('throws the specific public TypeError when getStream is called before configuring a kube watch client', () => {
++
++
++    const watcher = createWatcher({ kubeClient: null })
++
++    expect(() => watcher.getStream()).to.throw(TypeError)
++  })
++
++  it('allows cleanup to be called twice without raising', async () => {
++
++
++    clock = sinon.useFakeTimers(new Date('2020-01-02T03:04:05.006Z').getTime())
++    const kubeClient = createKubeClient()
++    const plugin = createPlugin([])
++    const watcher = createWatcher({ kubeClient, plugins: [plugin] })
++
++    await watcher.onAdded(deployment('treatment:v2', 2))
++    await watcher.onDeleted()
++    await watcher.onDeleted()
++
++
++    expect(kubeClient.patches[0]).to.satisfy(isExperimentAnnotationSetPatch)
++    const cleanupStartAnnotation = JSON.parse(experimentAnnotationValue(kubeClient.patches[0]))
++    expect(cleanupStartAnnotation.startTime).to.equal('2020-01-02T03:04:05.006Z')
++    expect(cleanupStartAnnotation.podSpecHash).to.be.a('string').and.not.equal('')
++    expect(kubeClient.patches.filter(isExperimentAnnotationClearPatch)).to.have.lengthOf(1)
++    expect(plugin.stops).to.equal(1)
++  })
++
++  it('keeps experiment state independent across watcher instances', async () => {
++
++
++    clock = sinon.useFakeTimers(new Date('2020-01-02T03:04:05.006Z').getTime())
++    const kubeClientA = createKubeClient()
++    const kubeClientB = createKubeClient()
++    const pluginA = createPlugin([])
++    const pluginB = createPlugin([])
++    const watcherA = createWatcher({ kubeClient: kubeClientA, plugins: [pluginA], gatedDeploymentId: 'gd-a' })
++    const watcherB = createWatcher({ kubeClient: kubeClientB, plugins: [pluginB], gatedDeploymentId: 'gd-b' })
++
++    await watcherA.onAdded(deployment('treatment:v2', 2))
++
++
++    expect(kubeClientA.patches).to.have.lengthOf(1)
++    expect(kubeClientA.patches[0]).to.satisfy(isExperimentAnnotationSetPatch)
++    const watcherAAnnotation = JSON.parse(experimentAnnotationValue(kubeClientA.patches[0]))
++    expect(watcherAAnnotation.startTime).to.equal('2020-01-02T03:04:05.006Z')
++    expect(watcherAAnnotation.podSpecHash).to.be.a('string').and.not.equal('')
++    expect(kubeClientB.patches).to.deep.equal([])
++    expect(pluginA.starts).to.deep.equal(['2020-01-02T03:04:05.006Z'])
++    expect(pluginB.starts).to.deep.equal([])
++
++    await watcherB.onAdded(deployment('control:v1', 2))
++
++    expectPatch(kubeClientB.patches, isTreatmentScaleZeroPatch, 'watcher B scaled treatment to zero')
++    expectPatch(kubeClientB.patches, isDeploymentStatusPatch('noHarm'), 'watcher B set noHarm')
++    expectNoPatch(kubeClientB.patches, isExperimentAnnotationSetPatch, 'watcher B did not start an experiment')
++    expect(pluginB.starts).to.deep.equal([])
++
++    await watcherA.onDeleted()
++    await watcherB.onDeleted()
++  })
++
++  it('does not accumulate active poller timers across construct-use-cleanup cycles', async () => {
++
++
++    if (typeof process.getActiveResourcesInfo !== 'function') {
++      throw new TypeError('process.getActiveResourcesInfo is required for this leak floor')
++    }
++    const before = timeoutResourceCount()
++
++    for (let i = 0; i < 100; i += 1) {
++      const watcher = createWatcher({
++        kubeClient: createKubeClient(),
++        plugins: [createPlugin([])],
++        pollerIntervalMilliseconds: 60000,
++        gatedDeploymentId: `gd-cycle-${i}`
++      })
++      await watcher.onAdded(deployment('treatment:v2', 2))
++      await watcher.onDeleted()
++    }
++
++    const after = timeoutResourceCount()
++    expect(after - before).to.be.at.most(2)
++  })
++})
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,26 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++
++cd /workspace/repo
++
++export NO_UPDATE_NOTIFIER=1
++export npm_config_offline=true
++export npm_config_audit=false
++export npm_config_fund=false
++
++if [ ! -x ./node_modules/.bin/mocha ]; then
++  echo "Missing local ./node_modules/.bin/mocha; dependencies must be preinstalled for offline test execution." >&2
++  exit 1
++fi
++
++exec ./node_modules/.bin/mocha /workspace/repo/usercase-test-coderl/deployment-watcher.test.js --exit

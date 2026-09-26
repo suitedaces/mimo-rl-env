@@ -1,0 +1,5 @@
+When I send a request in Insomnia to a hostname that shares an IP with other virtual hosts, the server logs show it hitting the IP/default vhost instead of the named host, and HTTPS sometimes lands on the wrong site. I’m also seeing cookies behave differently than curl/browser on redirects — Set-Cookie comes back, but the next request doesn’t seem to carry the same jar state.
+
+- Requests should preserve the hostname the user entered when they are sent, so the server can route and negotiate the connection as that hostname rather than as a rewritten IP address.
+- Cookie state should behave consistently across a request and any redirects it follows: cookies already in the jar should be applied to outgoing requests, and cookies returned by responses should be reflected in the stored jar for later requests.
+- The exact transport details, request construction, and cookie storage mechanics are up to the implementation as long as the externally visible request routing and cookie behavior match the expectations above.

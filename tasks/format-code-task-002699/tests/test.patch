@@ -1,0 +1,264 @@
+diff --git a/lib/spack/spack/test/cmd/ci_dynamic_mapping.py b/lib/spack/spack/test/cmd/ci_dynamic_mapping.py
+new file mode 100644
+index 0000000000..c909551c1f
+--- /dev/null
++++ b/lib/spack/spack/test/cmd/ci_dynamic_mapping.py
+@@ -0,0 +1,231 @@
++
++
++
++
++import json
++import os
++import urllib.request
++from io import BytesIO
++from urllib.parse import parse_qs, urlparse
++
++import jsonschema
++import pytest
++
++import spack.ci as ci
++import spack.environment as ev
++import spack.main
++import spack.util.spack_yaml as syaml
++from spack.schema.ci import schema as ci_schema
++from spack.spec import Spec
++
++ci_cmd = spack.main.SpackCommand("ci")
++env_cmd = spack.main.SpackCommand("env")
++
++pytestmark = [
++    pytest.mark.usefixtures("mock_packages"),
++    pytest.mark.not_on_windows("does not run on windows"),
++    pytest.mark.maybeslow,
++]
++
++ENDPOINT = "https://fake.spack.io/mapper"
++
++
++@pytest.fixture()
++def ci_base_environment(working_env, tmpdir):
++    os.environ["CI_PROJECT_DIR"] = tmpdir.strpath
++    os.environ["CI_PIPELINE_ID"] = "7192"
++    os.environ["CI_JOB_NAME"] = "mock"
++
++
++def _ci_config(extra):
++    return f"""\
++spack:
++  specs:
++    - pkg-a
++  mirrors:
++    some-mirror: https://my.fake.mirror
++  ci:
++    pipeline-gen:
++    - dynamic-mapping:
++        endpoint: {ENDPOINT}
++{extra}
++"""
++
++
++def dynamic_mapping_setup(tmpdir):
++    filename = str(tmpdir.join("spack.yaml"))
++    with open(filename, "w") as f:
++        f.write(
++            _ci_config(
++                """\
++        require: ["variables"]
++        ignore: ["ignored_field"]
++        allow: ["variables", "retry"]
++"""
++            )
++        )
++
++    spec_a = Spec("pkg-a")
++    spec_a.concretize()
++    return ci.get_job_name(spec_a)
++
++
++def _patch_response(monkeypatch, payload, recorder=None):
++
++    real_open = urllib.request.OpenerDirector.open
++
++    def fake_open(self, fullurl, *args, **kwargs):
++        url = fullurl.full_url if isinstance(fullurl, urllib.request.Request) else fullurl
++        if "fake.spack.io" in url:
++            if recorder is not None:
++                recorder.append(url)
++            return BytesIO(json.dumps(payload).encode())
++        return real_open(self, fullurl, *args, **kwargs)
++
++    monkeypatch.setattr(urllib.request.OpenerDirector, "open", fake_open)
++
++
++
++
++
++def test_dynamic_mapping_schema_valid():
++    config = syaml.load(
++        """\
++ci:
++  pipeline-gen:
++  - dynamic-mapping:
++      endpoint: https://fake.spack.io/mapper
++      name: my-mapper
++      timeout: 10
++      verify_ssl: true
++      header:
++        PRIVATE_TOKEN: abc
++      allow:
++      - variables
++      ignore:
++      - script
++      require: []
++"""
++    )
++    jsonschema.validate(config, ci_schema)
++
++
++def test_dynamic_mapping_schema_requires_endpoint():
++    config = syaml.load(
++        """\
++ci:
++  pipeline-gen:
++  - dynamic-mapping:
++      allow:
++      - variables
++"""
++    )
++    with pytest.raises(jsonschema.ValidationError):
++        jsonschema.validate(config, ci_schema)
++
++
++def test_dynamic_mapping_schema_rejects_unknown_key():
++    config = syaml.load(
++        """\
++ci:
++  pipeline-gen:
++  - dynamic-mapping:
++      endpoint: https://fake.spack.io/mapper
++      not_a_real_option: true
++"""
++    )
++    with pytest.raises(jsonschema.ValidationError):
++        jsonschema.validate(config, ci_schema)
++
++
++
++
++
++def test_dynamic_mapping_missing_required_warns(
++    tmpdir,
++    working_env,
++    mutable_mock_env_path,
++    install_mockery,
++    mock_packages,
++    monkeypatch,
++    ci_base_environment,
++):
++
++    _patch_response(monkeypatch, {})
++
++    dynamic_mapping_setup(tmpdir)
++    with tmpdir.as_cwd():
++        env_cmd("create", "test", "./spack.yaml")
++        outputfile = str(tmpdir.join(".gitlab-ci.yml"))
++        with ev.read("test"):
++            output = ci_cmd("generate", "--output-file", outputfile)
++            assert "Response missing required keys: ['variables']" in output
++
++
++def test_dynamic_mapping_merges_allowed_keys(
++    tmpdir,
++    working_env,
++    mutable_mock_env_path,
++    install_mockery,
++    mock_packages,
++    monkeypatch,
++    ci_base_environment,
++):
++    payload = {
++        "variables": {"MY_VAR": "hello"},
++        "ignored_field": 0,
++        "unallowed_field": 0,
++    }
++    _patch_response(monkeypatch, payload)
++
++    label = dynamic_mapping_setup(tmpdir)
++    with tmpdir.as_cwd():
++        env_cmd("create", "test", "./spack.yaml")
++        outputfile = str(tmpdir.join(".gitlab-ci.yml"))
++        with ev.read("test"):
++            ci_cmd("generate", "--output-file", outputfile)
++            with open(outputfile) as of:
++                pipeline_doc = syaml.load(of.read())
++
++    assert label in pipeline_doc
++    job = pipeline_doc[label]
++
++
++    assert job.get("variables", {}).get("MY_VAR") == "hello"
++
++    assert "ignored_field" not in job
++    assert "unallowed_field" not in job
++
++
++def test_dynamic_mapping_request_carries_spec(
++    tmpdir,
++    working_env,
++    mutable_mock_env_path,
++    install_mockery,
++    mock_packages,
++    monkeypatch,
++    ci_base_environment,
++):
++    requested_urls = []
++    _patch_response(monkeypatch, {"variables": {"MY_VAR": "hi"}}, recorder=requested_urls)
++
++    dynamic_mapping_setup(tmpdir)
++    with tmpdir.as_cwd():
++        env_cmd("create", "test", "./spack.yaml")
++        outputfile = str(tmpdir.join(".gitlab-ci.yml"))
++        with ev.read("test"):
++            ci_cmd("generate", "--output-file", outputfile)
++
++    assert requested_urls, "no request was issued to the mapping endpoint"
++    specs_queried = []
++    for url in requested_urls:
++        parsed = urlparse(url)
++
++        assert parsed.path == urlparse(ENDPOINT).path
++
++        query = parse_qs(parsed.query)
++        assert "spec" in query
++        specs_queried.append(query["spec"][0])
++
++
++    assert any("pkg-a" in spec for spec in specs_queried)
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,22 @@
++#!/usr/bin/env bash
++
++
++
++
++set -euo pipefail
++HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++cd /testbed
++
++
++
++
++export PYTHONPATH="lib/spack/external:lib/spack/external/_vendoring:lib/spack${PYTHONPATH:+:$PYTHONPATH}"
++
++
++python -m pytest -q -p no:cacheprovider \
++    lib/spack/spack/test/schema.py \
++    lib/spack/spack/test/cmd/ci.py
++
++
++python -m pytest -q -p no:cacheprovider \
++    lib/spack/spack/test/cmd/ci_dynamic_mapping.py

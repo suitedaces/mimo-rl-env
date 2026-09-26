@@ -1,0 +1,605 @@
+diff --git a/usercase-test-coderl/test_static_capabilities.py b/usercase-test-coderl/test_static_capabilities.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/test_static_capabilities.py
+@@ -0,0 +1,579 @@
++
++
++
++import json
++import os
++import socket
++import subprocess
++import sys
++import textwrap
++
++import pytest
++
++import capa.rules
++import capa.capabilities.common
++import capa.capabilities.static
++import capa.features.common as ccommon
++import capa.features.file as ffile
++import capa.features.insn as finsn
++from capa.features.address import NO_ADDRESS, AbsoluteVirtualAddress
++from capa.features.extractors.base_extractor import (
++    BBHandle,
++    InsnHandle,
++    SampleHashes,
++    FunctionHandle,
++    StaticFeatureExtractor,
++)
++
++
++RULES_YAML = [
++    """
++    rule:
++      meta:
++        name: push 1000
++        scopes:
++          static: instruction
++          dynamic: process
++      features:
++        - and:
++          - mnemonic: push
++          - number: 1000
++    """,
++    """
++    rule:
++      meta:
++        name: tight loop
++        scopes:
++          static: basic block
++          dynamic: process
++      features:
++        - characteristic: tight loop
++    """,
++    """
++    rule:
++      meta:
++        name: kill thread loop
++        scopes:
++          static: function
++          dynamic: process
++      features:
++        - and:
++          - characteristic: loop
++          - match: tight loop
++    """,
++    """
++    rule:
++      meta:
++        name: kill thread program
++        scopes:
++          static: file
++          dynamic: process
++      features:
++        - and:
++          - section: .text
++          - match: kill thread loop
++    """,
++    """
++    rule:
++      meta:
++        name: push observed program
++        scopes:
++          static: file
++          dynamic: process
++      features:
++        - and:
++          - format: pe
++          - match: push 1000
++    """,
++    """
++    rule:
++      meta:
++        name: global arch program
++        scopes:
++          static: file
++          dynamic: process
++      features:
++        - arch: i386
++    """,
++    """
++    rule:
++      meta:
++        name: library only push
++        scopes:
++          static: instruction
++          dynamic: process
++      features:
++        - and:
++          - mnemonic: push
++          - number: 777
++    """,
++    """
++    rule:
++      meta:
++        name: library only recursive function
++        scopes:
++          static: function
++          dynamic: process
++      features:
++        - characteristic: recursive call
++    """,
++    """
++    rule:
++      meta:
++        name: import file rule
++        scopes:
++          static: file
++          dynamic: process
++      features:
++        - import: kernel32.CreateFileA
++    """,
++]
++
++
++FULL_SUMMARY = {
++    "feature_counts": {
++        "file": 7,
++        "functions": [
++            {"address": {"type": "absolute", "value": 4198400}, "count": 9},
++            {"address": {"type": "absolute", "value": 4202496}, "count": 2},
++        ],
++    },
++    "library_functions": [
++        {"address": {"type": "absolute", "value": 4206592}, "name": "static_lib_helper"},
++    ],
++    "matches": {
++        "global arch program": ["NO_ADDRESS"],
++        "import file rule": ["NO_ADDRESS"],
++        "kill thread loop": [4198400],
++        "kill thread program": ["NO_ADDRESS"],
++        "push 1000": [4223396],
++        "push observed program": ["NO_ADDRESS"],
++        "tight loop": [4198432],
++    },
++}
++
++NO_GLOBAL_SUMMARY = {
++    "feature_counts": {
++        "file": 5,
++        "functions": [
++            {"address": {"type": "absolute", "value": 4198400}, "count": 7},
++            {"address": {"type": "absolute", "value": 4202496}, "count": 0},
++        ],
++    },
++    "library_functions": [
++        {"address": {"type": "absolute", "value": 4206592}, "name": "static_lib_helper"},
++    ],
++    "matches": {
++        "import file rule": ["NO_ADDRESS"],
++        "kill thread loop": [4198400],
++        "kill thread program": ["NO_ADDRESS"],
++        "push 1000": [4223396],
++        "tight loop": [4198432],
++    },
++}
++
++NO_FILE_SECTION_SUMMARY = {
++    "feature_counts": {
++        "file": 6,
++        "functions": [
++            {"address": {"type": "absolute", "value": 4198400}, "count": 9},
++            {"address": {"type": "absolute", "value": 4202496}, "count": 2},
++        ],
++    },
++    "library_functions": [
++        {"address": {"type": "absolute", "value": 4206592}, "name": "static_lib_helper"},
++    ],
++    "matches": {
++        "global arch program": ["NO_ADDRESS"],
++        "import file rule": ["NO_ADDRESS"],
++        "kill thread loop": [4198400],
++        "push 1000": [4223396],
++        "push observed program": ["NO_ADDRESS"],
++        "tight loop": [4198432],
++    },
++}
++
++
++class ToyStaticExtractor(StaticFeatureExtractor):
++    def __init__(self, variant="full"):
++        super().__init__(SampleHashes(md5="0" * 32, sha1="1" * 40, sha256="2" * 64))
++        self.variant = variant
++        self.functions = [
++            FunctionHandle(AbsoluteVirtualAddress(0x401000), "main"),
++            FunctionHandle(AbsoluteVirtualAddress(0x402000), "helper"),
++            FunctionHandle(AbsoluteVirtualAddress(0x403000), "lib"),
++        ]
++        self.basic_blocks = {
++            0x401000: [
++                BBHandle(AbsoluteVirtualAddress(0x401020), "main-bb0"),
++                BBHandle(AbsoluteVirtualAddress(0x401050), "main-bb1"),
++            ],
++            0x402000: [BBHandle(AbsoluteVirtualAddress(0x402010), "helper-bb0")],
++            0x403000: [BBHandle(AbsoluteVirtualAddress(0x403010), "lib-bb0")],
++        }
++        self.instructions = {
++            0x401020: [
++                InsnHandle(AbsoluteVirtualAddress(0x4071A4), "push-1000"),
++                InsnHandle(AbsoluteVirtualAddress(0x4071AA), "nop"),
++            ],
++            0x401050: [InsnHandle(AbsoluteVirtualAddress(0x407200), "close")],
++            0x402010: [InsnHandle(AbsoluteVirtualAddress(0x402012), "mov")],
++            0x403010: [InsnHandle(AbsoluteVirtualAddress(0x403020), "push-777")],
++        }
++
++    def snapshot(self):
++        return {
++            "variant": self.variant,
++            "functions": [(int(f.address), f.inner) for f in self.functions],
++            "basic_blocks": {
++                str(k): [(int(bb.address), bb.inner) for bb in v] for k, v in sorted(self.basic_blocks.items())
++            },
++            "instructions": {
++                str(k): [(int(insn.address), insn.inner) for insn in v] for k, v in sorted(self.instructions.items())
++            },
++        }
++
++    def get_base_address(self):
++        return AbsoluteVirtualAddress(0x400000)
++
++    def extract_global_features(self):
++        if self.variant != "no-global":
++            yield ccommon.Arch("i386"), NO_ADDRESS
++            yield ccommon.Format("pe"), NO_ADDRESS
++
++    def extract_file_features(self):
++        if self.variant != "no-file-section":
++            yield ffile.Section(".text"), AbsoluteVirtualAddress(0x401000)
++        yield ffile.Import("kernel32.CreateFileA"), AbsoluteVirtualAddress(0x401234)
++
++    def get_functions(self):
++        yield from self.functions
++
++    def is_library_function(self, addr):
++        return int(addr) == 0x403000
++
++    def get_function_name(self, addr):
++        if int(addr) == 0x403000:
++            return "static_lib_helper"
++        raise KeyError(addr)
++
++    def extract_function_features(self, fh):
++        if int(fh.address) == 0x401000:
++            yield ccommon.Characteristic("loop"), fh.address
++        elif int(fh.address) == 0x403000:
++            yield ccommon.Characteristic("recursive call"), fh.address
++
++    def get_basic_blocks(self, fh):
++        yield from self.basic_blocks[int(fh.address)]
++
++    def extract_basic_block_features(self, fh, bbh):
++        if int(bbh.address) == 0x401020:
++            yield ccommon.Characteristic("tight loop"), bbh.address
++
++    def get_instructions(self, fh, bbh):
++        yield from self.instructions[int(bbh.address)]
++
++    def extract_insn_features(self, fh, bbh, ih):
++        if int(ih.address) == 0x4071A4:
++            yield finsn.Mnemonic("push"), ih.address
++            yield finsn.Number(1000), ih.address
++        elif int(ih.address) == 0x4071AA:
++            yield finsn.Mnemonic("nop"), ih.address
++        elif int(ih.address) == 0x403020:
++            yield finsn.Mnemonic("push"), ih.address
++            yield finsn.Number(777), ih.address
++
++
++def make_ruleset():
++    return capa.rules.RuleSet([capa.rules.Rule.from_yaml(textwrap.dedent(rule)) for rule in RULES_YAML])
++
++
++def address_to_plain(addr):
++    if addr == NO_ADDRESS:
++        return "NO_ADDRESS"
++    return int(addr)
++
++
++def summarize(capabilities):
++    return {
++        "matches": {
++            name: [address_to_plain(location) for location, _ in results]
++            for name, results in sorted(capabilities.matches.items())
++        },
++        "feature_counts": {
++            "file": capabilities.feature_counts.file,
++            "functions": [
++                {"address": count.address.model_dump(mode="json"), "count": count.count}
++                for count in capabilities.feature_counts.functions
++            ],
++        },
++        "library_functions": [
++            {"address": library.address.model_dump(mode="json"), "name": library.name}
++            for library in capabilities.library_functions
++        ],
++    }
++
++
++def ruleset_snapshot(ruleset):
++    return sorted((name, str(rule.scopes)) for name, rule in ruleset.rules.items())
++
++
++def assert_match_contains(summary, rule_name, expected_location=None):
++    assert rule_name in summary["matches"]
++    if expected_location is not None:
++        assert expected_location in summary["matches"][rule_name]
++
++
++def assert_no_match(summary, rule_name):
++    assert not summary["matches"].get(rule_name)
++
++
++def expected_analyzed_function_addresses(extractor):
++    return {
++        int(function.address)
++        for function in extractor.get_functions()
++        if not extractor.is_library_function(function.address)
++    }
++
++
++def assert_full_static_behavior(capabilities, extractor):
++    summary = summarize(capabilities)
++
++    assert isinstance(capabilities, capa.capabilities.common.Capabilities)
++    assert_match_contains(summary, "push 1000", 4223396)
++    assert_match_contains(summary, "tight loop")
++    assert_match_contains(summary, "kill thread loop")
++    assert_match_contains(summary, "kill thread program")
++    assert_match_contains(summary, "global arch program")
++    assert_match_contains(summary, "import file rule")
++    assert_match_contains(summary, "push observed program")
++    assert_no_match(summary, "library only push")
++    assert_no_match(summary, "library only recursive function")
++    assert_library_function_was_skipped(summary)
++    assert_feature_counts_are_populated(summary, extractor)
++
++
++def assert_library_function_was_skipped(summary):
++    assert summary["library_functions"] == [
++        {"address": {"type": "absolute", "value": 4206592}, "name": "static_lib_helper"},
++    ]
++
++
++def assert_feature_counts_are_populated(summary, extractor):
++    counts = summary["feature_counts"]
++    assert isinstance(counts["file"], int)
++    assert counts["file"] > 0
++
++    functions_by_address = {
++        item["address"]["value"]: item["count"]
++        for item in counts["functions"]
++    }
++    assert set(functions_by_address) == expected_analyzed_function_addresses(extractor)
++    for function in extractor.get_functions():
++        if extractor.is_library_function(function.address):
++            assert int(function.address) not in functions_by_address
++    assert all(isinstance(count, int) and count >= 0 for count in functions_by_address.values())
++    assert functions_by_address[4198400] > 0
++
++
++def test_common_entrypoint_instruction_rule_returns_push_1000_at_4071a4():
++
++
++
++
++    capabilities = capa.capabilities.common.find_capabilities(make_ruleset(), ToyStaticExtractor(), disable_progress=True)
++
++
++    assert_match_contains(summarize(capabilities), "push 1000", 4223396)
++
++
++def test_static_entrypoint_returns_full_static_capability_summary():
++
++
++
++
++    extractor = ToyStaticExtractor()
++    capabilities = capa.capabilities.static.find_static_capabilities(
++        make_ruleset(), extractor, disable_progress=True
++    )
++
++
++    assert_full_static_behavior(capabilities, extractor)
++
++
++def test_basic_block_function_and_file_rule_chain_matches_after_one_call():
++
++
++
++
++    capabilities = capa.capabilities.common.find_capabilities(make_ruleset(), ToyStaticExtractor(), disable_progress=True)
++
++    summary = summarize(capabilities)
++
++    assert_match_contains(summary, "tight loop")
++    assert_match_contains(summary, "kill thread loop")
++    assert_match_contains(summary, "kill thread program")
++
++
++def test_file_scope_rules_match_raw_file_global_and_promoted_lower_scope_features():
++
++
++
++
++    capabilities = capa.capabilities.common.find_capabilities(make_ruleset(), ToyStaticExtractor(), disable_progress=True)
++
++    summary = summarize(capabilities)
++
++    assert_match_contains(summary, "global arch program")
++    assert_match_contains(summary, "import file rule")
++    assert_match_contains(summary, "kill thread program")
++    assert_match_contains(summary, "push observed program")
++
++
++def test_no_global_variant_drops_global_dependent_file_matches_but_keeps_file_and_promoted_matches():
++
++
++
++
++    extractor = ToyStaticExtractor("no-global")
++    capabilities = capa.capabilities.common.find_capabilities(
++        make_ruleset(), extractor, disable_progress=True
++    )
++
++    summary = summarize(capabilities)
++
++    assert_no_match(summary, "global arch program")
++    assert_no_match(summary, "push observed program")
++    assert_match_contains(summary, "import file rule")
++    assert_match_contains(summary, "kill thread program")
++    assert_match_contains(summary, "push 1000", 4223396)
++    assert_library_function_was_skipped(summary)
++    assert_feature_counts_are_populated(summary, extractor)
++
++
++def test_no_file_section_variant_drops_section_dependent_file_match_only():
++
++
++
++
++    extractor = ToyStaticExtractor("no-file-section")
++    capabilities = capa.capabilities.common.find_capabilities(
++        make_ruleset(), extractor, disable_progress=True
++    )
++
++    summary = summarize(capabilities)
++
++    assert_no_match(summary, "kill thread program")
++    assert_match_contains(summary, "global arch program")
++    assert_match_contains(summary, "import file rule")
++    assert_match_contains(summary, "push observed program")
++    assert_match_contains(summary, "push 1000", 4223396)
++    assert_library_function_was_skipped(summary)
++    assert_feature_counts_are_populated(summary, extractor)
++
++
++def test_library_functions_are_skipped_and_recorded_with_names():
++
++
++
++
++    capabilities = capa.capabilities.common.find_capabilities(make_ruleset(), ToyStaticExtractor(), disable_progress=True)
++
++    summary = summarize(capabilities)
++
++    assert_library_function_was_skipped(summary)
++    assert_no_match(summary, "library only push")
++    assert_no_match(summary, "library only recursive function")
++
++
++def test_feature_counts_include_non_library_functions_and_file_scope_count():
++
++
++
++
++    extractor = ToyStaticExtractor()
++    capabilities = capa.capabilities.common.find_capabilities(make_ruleset(), extractor, disable_progress=True)
++
++
++    assert_feature_counts_are_populated(summarize(capabilities), extractor)
++
++
++def test_static_matcher_rejects_non_static_extractor_with_specific_exception_type():
++
++
++
++
++
++    with pytest.raises(Exception):
++        capa.capabilities.static.find_static_capabilities(make_ruleset(), object(), disable_progress=True)
++
++
++def test_referential_transparency_same_input_same_output():
++    ruleset = make_ruleset()
++    extractor = ToyStaticExtractor()
++
++    first = summarize(capa.capabilities.common.find_capabilities(ruleset, extractor, disable_progress=True))
++    second = summarize(capa.capabilities.common.find_capabilities(ruleset, extractor, disable_progress=True))
++
++
++    assert_match_contains(first, "push 1000", 4223396)
++    assert_match_contains(second, "push 1000", 4223396)
++    assert first == second
++
++
++def test_does_not_mutate_ruleset_or_extractor_inputs():
++    ruleset = make_ruleset()
++    extractor = ToyStaticExtractor()
++
++    first = summarize(capa.capabilities.common.find_capabilities(ruleset, extractor, disable_progress=True))
++
++
++    second = summarize(capa.capabilities.common.find_capabilities(ruleset, extractor, disable_progress=True))
++    assert first["matches"] == second["matches"]
++    assert_match_contains(second, "push 1000", 4223396)
++
++
++def test_no_global_state_matches_fresh_interpreter_result():
++    in_process = summarize(
++        capa.capabilities.common.find_capabilities(make_ruleset(), ToyStaticExtractor(), disable_progress=True)
++    )
++    script = """
++import importlib.util
++import json
++import sys
++
++sys.path.insert(0, "/workspace/repo")
++spec = importlib.util.spec_from_file_location("fixture_static_caps", "/workspace/repo/usercase-test-coderl/test_static_capabilities.py")
++module = importlib.util.module_from_spec(spec)
++spec.loader.exec_module(module)
++caps = module.capa.capabilities.common.find_capabilities(module.make_ruleset(), module.ToyStaticExtractor(), disable_progress=True)
++sys.stdout.write(json.dumps(module.summarize(caps), sort_keys=True))
++"""
++
++    completed = subprocess.run(
++        [sys.executable, "-c", script],
++        text=True,
++        stdout=subprocess.PIPE,
++        stderr=subprocess.PIPE,
++        check=True,
++    )
++
++    fresh_process = json.loads(completed.stdout)
++
++    assert in_process["matches"] == fresh_process["matches"]
++    assert_match_contains(fresh_process, "push 1000", 4223396)
++
++
++def test_no_undeclared_cwd_writes_or_network_connections(tmp_path, monkeypatch):
++    def fail_socket(*args, **kwargs):
++        raise AssertionError("static capability matching must not open network sockets")
++
++    monkeypatch.setattr(socket, "socket", fail_socket)
++    monkeypatch.chdir(tmp_path)
++    before = sorted(os.listdir(tmp_path))
++
++    summary = summarize(capa.capabilities.common.find_capabilities(make_ruleset(), ToyStaticExtractor(), disable_progress=True))
++
++
++    assert sorted(os.listdir(tmp_path)) == before
++    assert_match_contains(summary, "push 1000", 4223396)
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,16 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++cd /workspace/repo
++export PYTHONPATH="/workspace/repo${PYTHONPATH:+:${PYTHONPATH}}"
++export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
++exec python -m pytest /workspace/repo/usercase-test-coderl/test_static_capabilities.py -v

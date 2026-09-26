@@ -1,0 +1,499 @@
+diff --git a/linux_os/guide/system/permissions/files/permissions_var_log_dir/file_owner_var_log_syslog/tests/correct_owner.pass.sh b/linux_os/guide/system/permissions/files/permissions_var_log_dir/file_owner_var_log_syslog/tests/correct_owner.pass.sh
+new file mode 100644
+index 0000000000..5dbd79c4e6
+--- /dev/null
++++ b/linux_os/guide/system/permissions/files/permissions_var_log_dir/file_owner_var_log_syslog/tests/correct_owner.pass.sh
+@@ -0,0 +1,14 @@
++#!/bin/bash
++
++
++if [ ! -f /var/log/syslog ]; then
++    mkdir -p /var/log/
++    touch /var/log/syslog
++fi
++
++if ! grep -q "^syslog:" /etc/passwd; then
++    useradd syslog
++fi
++
++chown syslog /var/log/syslog
++
+diff --git a/linux_os/guide/system/permissions/files/permissions_var_log_dir/file_owner_var_log_syslog/tests/incorrect_owner.fail.sh b/linux_os/guide/system/permissions/files/permissions_var_log_dir/file_owner_var_log_syslog/tests/incorrect_owner.fail.sh
+new file mode 100644
+index 0000000000..c1855cbd56
+--- /dev/null
++++ b/linux_os/guide/system/permissions/files/permissions_var_log_dir/file_owner_var_log_syslog/tests/incorrect_owner.fail.sh
+@@ -0,0 +1,14 @@
++#!/bin/bash
++
++
++if [ ! -f /var/log/syslog ]; then
++    mkdir -p /var/log/
++    touch /var/log/syslog
++fi
++
++if ! grep -q "^syslog:" /etc/passwd; then
++    useradd syslog
++fi
++
++useradd testuser_123
++chown testuser_123 /var/log/syslog
+diff --git a/shared/templates/file_owner/tests/correct_owner.pass.sh b/shared/templates/file_owner/tests/correct_owner.pass.sh
+index f05418c94f..92b31b7d87 100644
+--- a/shared/templates/file_owner/tests/correct_owner.pass.sh
++++ b/shared/templates/file_owner/tests/correct_owner.pass.sh
+@@ -8,15 +8,15 @@ fi
+ {{% if FILE_REGEX %}}
+ echo "Create specific tests for this rule because of regex"
+ {{% elif RECURSIVE %}}
+-find -L {{{ path }}} -type d -exec chown {{{ FILEUID }}} {} \;
++find -L {{{ path }}} -type d -exec chown {{{ UID_OR_NAME }}} {} \;
+ {{% else %}}
+-chown {{{ FILEUID }}} {{{ path }}}
++chown {{{ UID_OR_NAME }}} {{{ path }}}
+ {{% endif %}}
+ {{% else %}}
+ if [ ! -f {{{ path }}} ]; then
+     mkdir -p "$(dirname '{{{ path }}}')"
+     touch {{{ path }}}
+ fi
+-chown {{{ FILEUID }}} {{{ path }}}
++chown {{{ UID_OR_NAME }}} {{{ path }}}
+ {{% endif %}}
+ {{% endfor %}}
+diff --git a/shared/templates/file_owner/tests/incorrect_owner.fail.sh b/shared/templates/file_owner/tests/incorrect_owner.fail.sh
+index 8d4ccfe0d5..82c16cb89a 100644
+--- a/shared/templates/file_owner/tests/incorrect_owner.fail.sh
++++ b/shared/templates/file_owner/tests/incorrect_owner.fail.sh
+@@ -13,6 +13,7 @@ useradd testuser_123
+ if [ ! -d {{{ path }}} ]; then
+     mkdir -p {{{ path }}}
+ fi
++touch "{{{ path }}}"/cac_file_owner_test_file
+ {{% if FILE_REGEX %}}
+ find -L {{{ path }}} {{{ FIND_RECURSE_ARGS }}} -type f -regex '{{{ FILE_REGEX[loop.index0] }}}' -exec chown testuser_123 {} \;
+ {{% elif RECURSIVE %}}
+diff --git a/tests/test_file_owner_uid_or_name_behavior.py b/tests/test_file_owner_uid_or_name_behavior.py
+new file mode 100644
+index 0000000000..6fa46dc554
+--- /dev/null
++++ b/tests/test_file_owner_uid_or_name_behavior.py
+@@ -0,0 +1,386 @@
++#!/usr/bin/env python3
++import importlib.util
++import os
++import random
++import re
++import shutil
++import subprocess
++import sys
++import tempfile
++import xml.etree.ElementTree as ET
++from pathlib import Path
++
++
++REPO_ROOT = Path(__file__).resolve().parents[1]
++OPENSHIFT_ROOT = REPO_ROOT / "applications" / "openshift"
++TEMPLATE_ROOT = REPO_ROOT / "shared" / "templates" / "file_owner"
++RULE_ID = "file_owner_fixture_uid_or_name"
++
++sys.path.insert(0, str(REPO_ROOT))
++
++import ssg.jinja  # noqa: E402
++
++
++def _assert(condition, message):
++    if not condition:
++        raise AssertionError(message)
++
++
++def _run(cmd, **kwargs):
++    result = subprocess.run(
++        cmd,
++        text=True,
++        stdout=subprocess.PIPE,
++        stderr=subprocess.PIPE,
++        **kwargs,
++    )
++    if result.returncode != 0:
++        raise AssertionError(
++            "command failed: {0}\nstdout:\n{1}\nstderr:\n{2}".format(
++                " ".join(cmd), result.stdout, result.stderr
++            )
++        )
++    return result
++
++
++def _load_template_preprocessor():
++
++
++
++    path = TEMPLATE_ROOT / "template.py"
++    spec = importlib.util.spec_from_file_location("fixture_file_owner_template", path)
++    module = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(module)
++    return module
++
++
++def _render_file_owner_template(lang, template_vars):
++    params = dict(template_vars)
++    params.setdefault("_rule_id", RULE_ID)
++    params.setdefault("recursive", "false")
++
++    preprocessor = _load_template_preprocessor()
++    processed = preprocessor.preprocess(params, lang)
++    substitutions = {key.upper(): value for key, value in processed.items()}
++    merged = ssg.jinja.load_macros()
++    merged.update(substitutions)
++
++    return ssg.jinja.process_file(str(TEMPLATE_ROOT / f"{lang}.template"), merged)
++
++
++def _parse_oval_fragment(rendered_oval):
++    wrapped = (
++        '<root xmlns:unix="urn:unix" xmlns:ind="urn:ind" xmlns:xsi="urn:xsi">'
++        + rendered_oval
++        + "</root>"
++    )
++    return ET.fromstring(wrapped)
++
++
++def _namespace(tag):
++    return {
++        "unix": f"{{urn:unix}}{tag}",
++        "ind": f"{{urn:ind}}{tag}",
++    }
++
++
++def _local_name(tag):
++    return tag.rsplit("}", 1)[-1]
++
++
++def _unique_user():
++    return "cacfo{0}{1}".format(os.getpid(), random.randrange(1000, 9999))
++
++
++def _ensure_user(name):
++    try:
++        import pwd
++
++        return pwd.getpwnam(name).pw_uid
++    except KeyError:
++        _run(["useradd", name])
++        return pwd.getpwnam(name).pw_uid
++
++
++def _delete_user(name):
++    subprocess.run(["userdel", "-r", name], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
++
++
++def _run_shell_script(script):
++    result = subprocess.run(
++        ["bash", "-e"],
++        input=script,
++        text=True,
++        stdout=subprocess.PIPE,
++        stderr=subprocess.PIPE,
++    )
++    if result.returncode != 0:
++        raise AssertionError(
++            "rendered shell remediation failed\nstdout:\n{0}\nstderr:\n{1}\nscript:\n{2}".format(
++                result.stdout, result.stderr, script
++            )
++        )
++
++
++def test_bash_remediation_accepts_numeric_uid_and_username():
++    _assert(os.geteuid() == 0, "ownership behavior checks must run as root")
++    _assert(shutil.which("useradd"), "useradd is required for username ownership checks")
++    _assert(shutil.which("userdel"), "userdel is required for username ownership cleanup")
++
++    owner_name = _unique_user()
++    try:
++        owner_uid = _ensure_user(owner_name)
++        _assert(owner_uid != 0, "dynamic test account should not be root")
++
++        with tempfile.TemporaryDirectory(prefix="cac-file-owner-") as tmpdir:
++            target = Path(tmpdir) / "owned_file"
++            target.write_text("fixture file_owner behavior\n", encoding="utf-8")
++
++            os.chown(target, 0, -1)
++            numeric_script = _render_file_owner_template(
++                "bash", {"filepath": str(target), "uid_or_name": str(owner_uid)}
++            )
++            _run_shell_script(numeric_script)
++            _assert(
++                target.stat().st_uid == owner_uid,
++                "numeric uid_or_name should be accepted by the generated remediation",
++            )
++
++            os.chown(target, 0, -1)
++            username_script = _render_file_owner_template(
++                "bash", {"filepath": str(target), "uid_or_name": owner_name}
++            )
++            _run_shell_script(username_script)
++            _assert(
++                target.stat().st_uid == owner_uid,
++                "username uid_or_name should be resolved by the system when remediation runs",
++            )
++    finally:
++        _delete_user(owner_name)
++
++
++def test_oval_check_numeric_uid_uses_integer_user_id():
++    for uid in ("0", "4242"):
++        rendered = _render_file_owner_template(
++            "oval", {"filepath": "/tmp/cac-file-owner-fixture", "uid_or_name": uid}
++        )
++        root = _parse_oval_fragment(rendered)
++        user_ids = list(root.iter(_namespace("user_id")["unix"]))
++        _assert(user_ids, "rendered numeric OVAL must contain a file owner user_id state")
++        _assert(
++            any(el.attrib.get("datatype") == "int" and (el.text or "").strip() == uid for el in user_ids),
++            "numeric uid_or_name should render as an integer user_id matching the configured UID",
++        )
++        _assert(
++            all("var_ref" not in el.attrib for el in user_ids),
++            "numeric uid_or_name should not require a runtime username lookup variable",
++        )
++        passwd_lookups = [
++            (el.text or "").strip()
++            for el in root.iter(_namespace("filepath")["ind"])
++            if (el.text or "").strip() == "/etc/passwd"
++        ]
++        _assert(
++            not passwd_lookups,
++            "numeric uid_or_name should keep the previous direct numeric UID behavior",
++        )
++
++
++def test_oval_check_username_resolves_owner_on_scanned_system():
++    username = "cac_fixture_owner_{0}".format(random.randrange(10000, 99999))
++    rendered = _render_file_owner_template(
++        "oval", {"filepath": "/tmp/cac-file-owner-fixture", "uid_or_name": username}
++    )
++    root = _parse_oval_fragment(rendered)
++
++    user_ids = list(root.iter(_namespace("user_id")["unix"]))
++    _assert(user_ids, "rendered username OVAL must contain a file owner user_id state")
++    _assert(
++        any("var_ref" in el.attrib for el in user_ids),
++        "username uid_or_name should compare file owner against a runtime-resolved UID",
++    )
++    _assert(
++        all((el.text or "").strip() != username for el in user_ids),
++        "username uid_or_name must not be emitted as a literal integer user_id",
++    )
++
++    var_refs = {
++        el.attrib["var_ref"]
++        for el in user_ids
++        if el.attrib.get("datatype") == "int" and "var_ref" in el.attrib
++    }
++    _assert(
++        var_refs,
++        "username uid_or_name should use a runtime variable for the expected UID",
++    )
++
++    variables = {el.attrib.get("id"): el for el in root.iter() if _local_name(el.tag).endswith("variable")}
++    connected_variables = [variables[var_ref] for var_ref in var_refs if var_ref in variables]
++    _assert(
++        connected_variables,
++        "username UID comparison should be backed by an OVAL variable definition",
++    )
++
++    component_refs = set()
++    for variable in connected_variables:
++        for element in variable.iter():
++            ref = element.attrib.get("object_ref")
++            if ref:
++                component_refs.add(ref)
++
++    lookup_objects = {el.attrib.get("id"): el for el in root.iter(_namespace("textfilecontent54_object")["ind"])}
++    connected_lookup_objects = [lookup_objects[ref] for ref in component_refs if ref in lookup_objects]
++    _assert(
++        connected_lookup_objects,
++        "runtime UID variable should be derived from scanned system account data",
++    )
++
++    lookup_text = "\n".join(
++        (element.text or "").strip()
++        for lookup_object in connected_lookup_objects
++        for element in lookup_object.iter()
++    )
++    _assert(
++        username in lookup_text,
++        "runtime UID lookup should be tied to the configured account name",
++    )
++
++
++def _line_indent(line):
++    return len(line) - len(line.lstrip(" "))
++
++
++def _strip_quotes(value):
++    value = value.strip()
++    if len(value) >= 2 and value[0] in ("'", '"') and value[-1] == value[0]:
++        return value[1:-1]
++    return value
++
++
++def _active_file_owner_template_vars(rule_path):
++    lines = rule_path.read_text(encoding="utf-8").splitlines()
++    for index, line in enumerate(lines):
++        stripped = line.strip()
++        if not stripped or stripped.startswith("#"):
++            continue
++        if stripped != "template:":
++            continue
++
++        template_indent = _line_indent(line)
++        block = []
++        for candidate in lines[index + 1 :]:
++            candidate_stripped = candidate.strip()
++            if (
++                candidate_stripped
++                and not candidate_stripped.startswith("#")
++                and _line_indent(candidate) <= template_indent
++            ):
++                break
++            block.append(candidate)
++
++        is_file_owner = False
++        vars_index = None
++        vars_indent = None
++        for block_index, block_line in enumerate(block):
++            block_stripped = block_line.strip()
++            if not block_stripped or block_stripped.startswith("#") or block_stripped.startswith("{{"):
++                continue
++            if block_stripped.startswith("name:"):
++                is_file_owner = _strip_quotes(block_stripped.split(":", 1)[1]) == "file_owner"
++            if block_stripped == "vars:":
++                vars_index = block_index
++                vars_indent = _line_indent(block_line)
++
++        if not is_file_owner or vars_index is None:
++            continue
++
++        vars_ = {}
++        for var_line in block[vars_index + 1 :]:
++            var_stripped = var_line.strip()
++            if not var_stripped or var_stripped.startswith("#") or var_stripped.startswith("{{"):
++                continue
++            if _line_indent(var_line) <= vars_indent:
++                break
++            match = re.match(r"([A-Za-z0-9_@-]+)\s*:\s*(.*)$", var_stripped)
++            if match:
++                vars_[match.group(1)] = _strip_quotes(match.group(2))
++        return vars_
++    return None
++
++
++def _base_file_owner_template_vars(relative_path):
++    try:
++        result = _run(["git", "show", "HEAD:{0}".format(relative_path)])
++    except AssertionError:
++        return None
++
++    with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as tmp:
++        tmp.write(result.stdout)
++        tmp_path = Path(tmp.name)
++    try:
++        return _active_file_owner_template_vars(tmp_path)
++    finally:
++        tmp_path.unlink(missing_ok=True)
++
++
++def test_openshift_file_owner_rules_use_uid_or_name_and_preserve_values():
++    discovered = {}
++    migrated_from_base = {}
++    offenders = []
++    for rule_path in OPENSHIFT_ROOT.rglob("rule.yml"):
++        vars_ = _active_file_owner_template_vars(rule_path)
++        if vars_ is None:
++            continue
++        relative = rule_path.relative_to(REPO_ROOT).as_posix()
++        discovered[relative] = vars_
++        base_vars = _base_file_owner_template_vars(relative)
++        if base_vars and "fileuid" in base_vars:
++            migrated_from_base[relative] = base_vars["fileuid"]
++        if "fileuid" in vars_ or "uid_or_name" not in vars_:
++            offenders.append(
++                "{0}: fileuid={1!r}, uid_or_name={2!r}".format(
++                    relative, vars_.get("fileuid"), vars_.get("uid_or_name")
++                )
++            )
++
++    _assert(discovered, "expected active OpenShift file_owner rules to exist")
++    _assert(
++        not offenders,
++        "active OpenShift file_owner rules must use uid_or_name instead of fileuid:\n"
++        + "\n".join(offenders),
++    )
++
++    _assert(
++        migrated_from_base,
++        "expected base OpenShift file_owner rules using fileuid to be migration targets",
++    )
++
++    wrong = []
++    for relative, expected in sorted(migrated_from_base.items()):
++        if relative not in discovered:
++            wrong.append("{0}: active file_owner rule disappeared".format(relative))
++            continue
++        actual = str(discovered[relative].get("uid_or_name"))
++        if actual != expected:
++            wrong.append("{0}: expected {1!r}, got {2!r}".format(relative, expected, actual))
++    _assert(
++        not wrong,
++        "OpenShift file_owner uid_or_name values must preserve the previous owner:\n"
++        + "\n".join(wrong),
++    )
++
++
++def main():
++    tests = [
++        test_bash_remediation_accepts_numeric_uid_and_username,
++        test_oval_check_numeric_uid_uses_integer_user_id,
++        test_oval_check_username_resolves_owner_on_scanned_system,
++        test_openshift_file_owner_rules_use_uid_or_name_and_preserve_values,
++    ]
++    for test in tests:
++        test()
++        print("PASS {0}".format(test.__name__))
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,27 @@
++#!/bin/bash
++set -uo pipefail
++cd /testbed
++
++
++SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++REPO_ROOT="/testbed"
++
++
++
++case "${1:-}" in
++  base)
++    python3 - <<'PY'
++import sys
++sys.path.insert(0, "/testbed")
++import ssg.jinja
++print("base smoke: ssg.jinja import ok")
++PY
++    ;;
++  new)
++    python3 /testbed/tests/test_file_owner_uid_or_name_behavior.py
++    ;;
++  *)
++    echo "usage: $0 base|new"
++    exit 2
++    ;;
++esac

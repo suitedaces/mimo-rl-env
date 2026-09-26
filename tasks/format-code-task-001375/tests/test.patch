@@ -1,0 +1,515 @@
+diff --git a/usercase-test-coderl/buffer-list.test.js b/usercase-test-coderl/buffer-list.test.js
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/buffer-list.test.js
+@@ -0,0 +1,487 @@
++const assert = require('assert');
++const fs = require('fs');
++const path = require('path');
++const vm = require('vm');
++
++const REPO_ROOT = '/workspace/repo';
++const BUILD_FILE = path.join(REPO_ROOT, 'build', 'omnitone.js');
++
++function loadOmnitone(extra = {}) {
++  const sandbox = {
++    window: {},
++    navigator: {
++      userAgent: 'Mozilla/5.0 Chrome/77.0.0 Linux',
++    },
++    performance: {
++      now: () => 12.345,
++    },
++    logs: [],
++    console: {
++      log: (...args) => sandbox.logs.push(args.join(' ')),
++    },
++    AudioBuffer: function AudioBuffer() {},
++  };
++
++  sandbox.window.console = sandbox.console;
++  sandbox.window.navigator = sandbox.navigator;
++  sandbox.window.performance = sandbox.performance;
++  sandbox.window.AudioContext = function AudioContext() {};
++  sandbox.window.OfflineAudioContext = function OfflineAudioContext() {};
++  sandbox.AudioContext = sandbox.window.AudioContext;
++  sandbox.OfflineAudioContext = sandbox.window.OfflineAudioContext;
++  sandbox.window.atob = (value) => Buffer.from(value, 'base64').toString('binary');
++  sandbox.XMLHttpRequest = function XMLHttpRequest() {
++    throw new Error('Unexpected XMLHttpRequest constructor');
++  };
++  sandbox.fetch = function fetch() {
++    throw new Error('Unexpected fetch call');
++  };
++
++  Object.assign(sandbox, extra);
++  sandbox.window.XMLHttpRequest = sandbox.XMLHttpRequest;
++  sandbox.window.fetch = sandbox.fetch;
++  vm.createContext(sandbox);
++  vm.runInContext(fs.readFileSync(BUILD_FILE, 'utf8'), sandbox, {
++    filename: BUILD_FILE,
++  });
++  return sandbox;
++}
++
++function bufferIds(audioBuffers) {
++  return Array.from(audioBuffers, (audioBuffer) => audioBuffer.id);
++}
++
++function bytesFromArrayBuffer(arrayBuffer) {
++  return Array.from(new Uint8Array(arrayBuffer));
++}
++
++function taggedArrayBuffer(tag, bytes = []) {
++  const arrayBuffer = new ArrayBuffer(bytes.length);
++  const view = new Uint8Array(arrayBuffer);
++  view.set(bytes);
++  Object.defineProperty(arrayBuffer, 'tag', {value: tag});
++  return arrayBuffer;
++}
++
++function createDecodeTask(arrayBuffer, success, failure) {
++  let resolvePromise;
++  let rejectPromise;
++  const promise = new Promise((resolve, reject) => {
++    resolvePromise = resolve;
++    rejectPromise = reject;
++  });
++  promise.catch(() => {});
++
++  return {
++    tag: arrayBuffer.tag,
++    success(audioBuffer) {
++      if (typeof success === 'function') {
++        success(audioBuffer);
++      }
++      resolvePromise(audioBuffer);
++    },
++    failure(error) {
++      if (typeof failure === 'function') {
++        failure(error);
++      }
++      rejectPromise(error);
++    },
++    promise,
++  };
++}
++
++async function flushAsync() {
++  await Promise.resolve();
++  await Promise.resolve();
++  await Promise.resolve();
++}
++
++function makeUrlHarness() {
++  const events = [];
++  const decodeTasks = [];
++  const fetchTasks = [];
++  class FakeXHR {
++    constructor() {
++      FakeXHR.instances.push(this);
++      this._listeners = {};
++    }
++    open(method, url) {
++      this.method = method;
++      this.url = url;
++      events.push(['open', method, url]);
++    }
++    addEventListener(type, listener) {
++      this._listeners[type] = this._listeners[type] || [];
++      this._listeners[type].push(listener);
++    }
++    _emit(type, event = {}) {
++      for (const listener of this._listeners[type] || []) {
++        listener.call(this, event);
++      }
++      const handler = this[`on${type}`];
++      if (typeof handler === 'function') {
++        handler.call(this, event);
++      }
++    }
++    send() {
++      events.push(['send', this.url]);
++    }
++  }
++  FakeXHR.instances = [];
++
++  const fakeFetch = (url) => {
++    events.push(['fetch', url]);
++    return new Promise((resolve, reject) => {
++      fetchTasks.push({url, resolve, reject});
++    });
++  };
++
++  const sandbox = loadOmnitone({XMLHttpRequest: FakeXHR, fetch: fakeFetch});
++  const context = new sandbox.AudioContext();
++  context.decodeAudioData = (arrayBuffer, success, failure) => {
++    events.push(['decode', arrayBuffer.tag]);
++    const task = createDecodeTask(arrayBuffer, success, failure);
++    decodeTasks.push(task);
++    return task.promise;
++  };
++
++  function requestedUrls() {
++    return [
++      ...FakeXHR.instances.map((instance) => instance.url),
++      ...fetchTasks.map((task) => task.url),
++    ];
++  }
++
++  async function respondUrl(url, status, statusText, tag) {
++    await flushAsync();
++    const xhr = FakeXHR.instances.find((instance) => instance.url === url);
++    if (xhr) {
++      xhr.status = status;
++      xhr.statusText = statusText;
++      xhr.response = taggedArrayBuffer(tag);
++      xhr.readyState = 4;
++      xhr._emit('readystatechange');
++      xhr._emit('load');
++      await flushAsync();
++      return;
++    }
++
++    const fetchTask = fetchTasks.find((task) => task.url === url);
++    assert.ok(fetchTask, `Expected URL request for ${url}`);
++    fetchTask.resolve({
++      ok: status === 200,
++      status,
++      statusText,
++      arrayBuffer: () => Promise.resolve(taggedArrayBuffer(tag)),
++    });
++    await flushAsync();
++  }
++
++  async function failUrl(url, error) {
++    await flushAsync();
++    const xhr = FakeXHR.instances.find((instance) => instance.url === url);
++    if (xhr) {
++      xhr._emit('error', error);
++      await flushAsync();
++      return;
++    }
++
++    const fetchTask = fetchTasks.find((task) => task.url === url);
++    assert.ok(fetchTask, `Expected URL request for ${url}`);
++    fetchTask.reject(error);
++    await flushAsync();
++  }
++
++  return {
++    sandbox,
++    context,
++    FakeXHR,
++    events,
++    decodeTasks,
++    requestedUrls,
++    respondUrl,
++    failUrl,
++  };
++}
++
++async function loadDefaultUrlOutOfOrder() {
++  const {sandbox, context, events, decodeTasks, requestedUrls, respondUrl} =
++      makeUrlHarness();
++  const promise = sandbox.Omnitone.createBufferList(
++      context, ['/hrir/wy.wav', '/hrir/zx.wav']);
++
++  await respondUrl('/hrir/zx.wav', 200, 'OK', 'arraybuffer:zx');
++  await respondUrl('/hrir/wy.wav', 200, 'OK', 'arraybuffer:wy');
++  decodeTasks.find((task) => task.tag === 'arraybuffer:zx')
++      .success({id: 'zxBuffer'});
++  decodeTasks.find((task) => task.tag === 'arraybuffer:wy')
++      .success({id: 'wyBuffer'});
++
++  return {
++    resultIds: bufferIds(await promise),
++    requestedUrls: requestedUrls().sort(),
++    decodedTags: events
++        .filter((event) => event[0] === 'decode')
++        .map((event) => event[1])
++        .sort(),
++  };
++}
++
++async function loadExplicitUrlOutOfOrder() {
++  const {sandbox, context, events, decodeTasks, requestedUrls, respondUrl} =
++      makeUrlHarness();
++  const promise = sandbox.Omnitone.createBufferList(
++      context,
++      ['/hrir/front.wav', '/hrir/middle.wav', '/hrir/rear.wav'],
++      {dataType: 'url'});
++
++  await respondUrl('/hrir/rear.wav', 200, 'OK', 'arraybuffer:rear');
++  await respondUrl('/hrir/front.wav', 200, 'OK', 'arraybuffer:front');
++  await respondUrl('/hrir/middle.wav', 200, 'OK', 'arraybuffer:middle');
++  decodeTasks.find((task) => task.tag === 'arraybuffer:rear')
++      .success({id: 'rearBuffer'});
++  decodeTasks.find((task) => task.tag === 'arraybuffer:middle')
++      .success({id: 'middleBuffer'});
++  decodeTasks.find((task) => task.tag === 'arraybuffer:front')
++      .success({id: 'frontBuffer'});
++
++  return {
++    resultIds: bufferIds(await promise),
++    requestedUrls: requestedUrls().sort(),
++    decodedTags: events
++        .filter((event) => event[0] === 'decode')
++        .map((event) => event[1])
++        .sort(),
++  };
++}
++
++async function loadBase64OutOfOrder() {
++  const sandbox = loadOmnitone();
++  const context = new sandbox.AudioContext();
++  const decodeInputs = [];
++  const decodeTasks = [];
++  context.decodeAudioData = (arrayBuffer, success, failure) => {
++    decodeInputs.push(bytesFromArrayBuffer(arrayBuffer));
++    const task = createDecodeTask(arrayBuffer, success, failure);
++    decodeTasks.push(task);
++    return task.promise;
++  };
++
++  const promise = sandbox.Omnitone.createBufferList(
++      context, ['QVo=', 'eHk='], {dataType: 'base64'});
++
++  await flushAsync();
++  decodeTasks[1].success({id: 'audioBufferB'});
++  decodeTasks[0].success({id: 'audioBufferA'});
++
++  return {resultIds: bufferIds(await promise), decodeInputs};
++}
++
++async function promiseRejected(promise) {
++  const timeout = new Promise((resolve) => {
++    setTimeout(() => resolve(false), 25);
++  });
++  return Promise.race([
++    promise.then(() => false, () => true),
++    timeout,
++  ]);
++}
++
++describe('Omnitone.createBufferList acceptance', function() {
++  it('loads default URL data and preserves caller order', async function() {
++
++
++
++    assert.deepStrictEqual(await loadDefaultUrlOutOfOrder(), {
++      resultIds: ['wyBuffer', 'zxBuffer'],
++      requestedUrls: ['/hrir/wy.wav', '/hrir/zx.wav'],
++      decodedTags: ['arraybuffer:wy', 'arraybuffer:zx'],
++    });
++  });
++
++  it('honors explicit url dataType while preserving a three-item order', async function() {
++
++
++
++    assert.deepStrictEqual(await loadExplicitUrlOutOfOrder(), {
++      resultIds: ['frontBuffer', 'middleBuffer', 'rearBuffer'],
++      requestedUrls: ['/hrir/front.wav', '/hrir/middle.wav', '/hrir/rear.wav'],
++      decodedTags: [
++        'arraybuffer:front',
++        'arraybuffer:middle',
++        'arraybuffer:rear',
++      ],
++    });
++  });
++
++  it('converts base64 payloads to ArrayBuffers before decoding', async function() {
++
++
++    assert.deepStrictEqual(await loadBase64OutOfOrder(), {
++      resultIds: ['audioBufferA', 'audioBufferB'],
++      decodeInputs: [
++        [65, 90],
++        [120, 121],
++      ],
++    });
++  });
++
++  it('throws Error for a non-AudioContext context', function() {
++
++
++    const sandbox = loadOmnitone();
++
++
++    assert.throws(
++        () => sandbox.Omnitone.createBufferList({}, ['/hrir/wy.wav']),
++        (error) => {
++          assert.strictEqual(error.name, 'Error');
++          return true;
++        });
++  });
++
++  it('rejects when a URL request returns a non-200 HTTP status', async function() {
++
++
++    const {sandbox, context, respondUrl} = makeUrlHarness();
++    const promise = sandbox.Omnitone.createBufferList(context, ['/missing.wav']);
++
++    await respondUrl('/missing.wav', 404, 'Not Found', 'arraybuffer:missing');
++
++
++    assert.strictEqual(await promiseRejected(promise), true);
++  });
++
++  it('rejects when a URL request hits a network error', async function() {
++
++
++    const {sandbox, context, failUrl} = makeUrlHarness();
++    const promise = sandbox.Omnitone.createBufferList(
++        context, ['/network.wav', '/still-pending.wav']);
++
++    await failUrl('/network.wav', new Error('network failed'));
++
++
++    assert.strictEqual(await promiseRejected(promise), true);
++  });
++
++  it('rejects when decodeAudioData fails for a URL payload', async function() {
++
++
++    const {sandbox, context, decodeTasks, respondUrl} = makeUrlHarness();
++    const promise = sandbox.Omnitone.createBufferList(
++        context, ['/bad.wav', '/pending.wav']);
++
++    await respondUrl('/bad.wav', 200, 'OK', 'arraybuffer:bad');
++    decodeTasks[0].failure('decoder exploded');
++
++
++    assert.strictEqual(await promiseRejected(promise), true);
++  });
++
++  it('logs per-item and final success messages when verbose is true', async function() {
++
++
++    const sandbox = loadOmnitone();
++    const context = new sandbox.AudioContext();
++    context.decodeAudioData = (arrayBuffer, success, failure) => {
++      const task = createDecodeTask(arrayBuffer, success, failure);
++      task.success({id: bytesFromArrayBuffer(arrayBuffer).join('-')});
++      return task.promise;
++    };
++    const logCountBeforeLoad = sandbox.logs.length;
++
++    await sandbox.Omnitone.createBufferList(
++        context, ['QQ==', 'Qg=='], {dataType: 'base64', verbose: true});
++
++    const loadLogs = sandbox.logs.slice(logCountBeforeLoad);
++
++    assert.ok(loadLogs.length >= 3);
++    assert.ok(loadLogs.every((line) => line.trim() !== ''));
++  });
++
++  it('is referentially transparent for repeated base64 calls', async function() {
++    assert.deepStrictEqual(
++        await loadBase64OutOfOrder(),
++        {
++          resultIds: ['audioBufferA', 'audioBufferB'],
++          decodeInputs: [
++            [65, 90],
++            [120, 121],
++          ],
++        });
++    assert.deepStrictEqual(await loadBase64OutOfOrder(), {
++      resultIds: ['audioBufferA', 'audioBufferB'],
++      decodeInputs: [
++        [65, 90],
++        [120, 121],
++      ],
++    });
++  });
++
++  it('keeps caller order while decoding distinct base64 payloads', async function() {
++    const sandbox = loadOmnitone();
++    const context = new sandbox.AudioContext();
++    const bufferData = ['QVo=', 'eHk='];
++    const options = {dataType: 'base64', verbose: false};
++    context.decodeAudioData = (arrayBuffer, success) => {
++      success({id: bytesFromArrayBuffer(arrayBuffer).join('-')});
++    };
++
++    assert.deepStrictEqual(
++        bufferIds(await sandbox.Omnitone.createBufferList(
++            context, bufferData, options)),
++        ['65-90', '120-121']);
++
++    assert.deepStrictEqual(bufferIds(await sandbox.Omnitone.createBufferList(
++        context, ['QVo=', 'eHk='], {dataType: 'base64', verbose: false})), [
++      '65-90',
++      '120-121',
++    ]);
++  });
++
++  it('accepts OfflineAudioContext for base64 input', async function() {
++
++
++    const sandbox = loadOmnitone();
++    const context = new sandbox.OfflineAudioContext();
++    const decodeTasks = [];
++    context.decodeAudioData = (arrayBuffer, success, failure) => {
++      const task = createDecodeTask(arrayBuffer, success, failure);
++      decodeTasks.push(task);
++      return task.promise;
++    };
++
++    const promise = sandbox.Omnitone.createBufferList(
++        context, ['QQ==', 'Qg=='], {dataType: 'base64'});
++
++    await flushAsync();
++    decodeTasks[1].success({id: 'audioBufferB'});
++    decodeTasks[0].success({id: 'audioBufferA'});
++
++
++    assert.deepStrictEqual(bufferIds(await promise), [
++      'audioBufferA',
++      'audioBufferB',
++    ]);
++  });
++
++  it('does not perform URL loading on the base64 path', async function() {
++    const sandbox = loadOmnitone({
++      XMLHttpRequest: function XMLHttpRequest() {
++        throw new Error('Base64 path must not create XMLHttpRequest');
++      },
++      fetch: function fetch() {
++        throw new Error('Base64 path must not call fetch');
++      },
++    });
++    const context = new sandbox.AudioContext();
++    context.decodeAudioData = (arrayBuffer, success) => success({id: 'audioBufferA'});
++
++
++    assert.deepStrictEqual(
++        bufferIds(await sandbox.Omnitone.createBufferList(
++            context, ['QVo='], {dataType: 'base64'})),
++        ['audioBufferA']);
++  });
++});
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,18 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++cd /workspace/repo
++test -x ./node_modules/.bin/rollup
++test -x ./node_modules/.bin/mocha
++mkdir -p build
++./node_modules/.bin/rollup -c >/dev/null
++exec ./node_modules/.bin/mocha /workspace/repo/usercase-test-coderl/buffer-list.test.js --reporter spec

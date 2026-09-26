@@ -1,0 +1,423 @@
+diff --git a/raiden/tests/unit/test_matrix_user_address_manager.py b/raiden/tests/unit/test_matrix_user_address_manager.py
+new file mode 100644
+index 000000000..4d26f75bf
+--- /dev/null
++++ b/raiden/tests/unit/test_matrix_user_address_manager.py
+@@ -0,0 +1,389 @@
++from unittest.mock import Mock
++
++import pytest
++from eth_utils import encode_hex, to_normalized_address
++from gevent.event import Event
++from matrix_client.errors import MatrixRequestError
++from matrix_client.user import User
++
++from raiden.network.transport.matrix import (
++    AddressReachability,
++    UserAddressManager,
++    UserPresence,
++)
++from raiden.tests.utils.factories import make_signer
++
++SERVER1 = 'server1'
++SERVER2 = 'server2'
++
++
++def make_user(signer, server):
++    user_id = f'@{to_normalized_address(signer.address)}:{server}'
++    displayname = encode_hex(signer.sign(user_id.encode()))
++    user = Mock(spec=User)
++    user.user_id = user_id
++    user.displayname = displayname
++    user.get_display_name = Mock(side_effect=lambda: user.displayname)
++    return user
++
++
++class FakeMatrixClient:
++
++
++    def __init__(self, user_id):
++        self.user_id = user_id
++        self._presence_listener = None
++        self.get_user_presence = Mock(side_effect=AssertionError('not configured'))
++
++    def add_presence_listener(self, callback):
++        self._presence_listener = callback
++
++    def emit_presence(self, user_id, presence):
++        assert self._presence_listener is not None, 'no presence listener registered'
++        event = {
++            'sender': user_id,
++            'type': 'm.presence',
++            'content': {'presence': presence.value},
++        }
++        self._presence_listener(event)
++
++    def emit_raw(self, event):
++        assert self._presence_listener is not None, 'no presence listener registered'
++        self._presence_listener(event)
++
++
++@pytest.fixture
++def signer1():
++    return make_signer()
++
++
++@pytest.fixture
++def signer2():
++    return make_signer()
++
++
++@pytest.fixture
++def own_signer():
++    return make_signer()
++
++
++@pytest.fixture
++def user1_s1(signer1):
++    return make_user(signer1, SERVER1)
++
++
++@pytest.fixture
++def user1_s2(signer1):
++    return make_user(signer1, SERVER2)
++
++
++@pytest.fixture
++def user2_s1(signer2):
++    return make_user(signer2, SERVER1)
++
++
++@pytest.fixture
++def own_user(own_signer):
++    return make_user(own_signer, SERVER1)
++
++
++@pytest.fixture
++def addr1(signer1):
++    return signer1.address
++
++
++@pytest.fixture
++def addr2(signer2):
++    return signer2.address
++
++
++@pytest.fixture
++def user_registry(user1_s1, user1_s2, user2_s1, own_user):
++    return {
++        u.user_id: u
++        for u in (user1_s1, user1_s2, user2_s1, own_user)
++    }
++
++
++@pytest.fixture
++def get_user(user_registry):
++    def _get_user(user_or_id):
++        if not isinstance(user_or_id, str):
++            return user_or_id
++        if user_or_id in user_registry:
++            return user_registry[user_or_id]
++        user = Mock(spec=User)
++        user.user_id = user_or_id
++        user.displayname = 'unknown'
++        user.get_display_name = Mock(side_effect=lambda: user.displayname)
++        return user
++    return _get_user
++
++
++@pytest.fixture
++def stop_event():
++    return Event()
++
++
++@pytest.fixture
++def reachability_events():
++    return []
++
++
++@pytest.fixture
++def presence_events():
++    return []
++
++
++@pytest.fixture
++def client(own_user):
++    return FakeMatrixClient(own_user.user_id)
++
++
++@pytest.fixture
++def manager(client, get_user, reachability_events, presence_events, stop_event):
++    def on_reachability(address, reachability):
++        reachability_events.append((address, reachability))
++
++    def on_presence(user, presence):
++        presence_events.append((user, presence))
++
++    return UserAddressManager(
++        client=client,
++        get_user_callable=get_user,
++        address_reachability_changed_callback=on_reachability,
++        user_presence_changed_callback=on_presence,
++        stop_event=stop_event,
++    )
++
++
++def reachability_count(events, address):
++    return len([1 for addr, _ in events if addr == address])
++
++
++def test_unknown_address_defaults(manager, addr1, user1_s1):
++    assert set(manager.known_addresses) == set()
++    assert not manager.is_address_known(addr1)
++    assert set(manager.get_userids_for_address(addr1)) == set()
++    assert manager.get_address_reachability(addr1) is AddressReachability.UNKNOWN
++    assert manager.get_userid_presence(user1_s1.user_id) is UserPresence.UNKNOWN
++
++
++def test_presence_for_untracked_address_is_ignored(
++        manager,
++        client,
++        addr1,
++        user1_s1,
++        reachability_events,
++        presence_events,
++):
++    client.emit_presence(user1_s1.user_id, UserPresence.ONLINE)
++
++    assert manager.get_address_reachability(addr1) is AddressReachability.UNKNOWN
++    assert reachability_events == []
++    assert presence_events == []
++    assert not manager.is_address_known(addr1)
++
++
++def test_presence_for_invalid_or_own_user_is_ignored(
++        manager,
++        client,
++        own_user,
++        reachability_events,
++        presence_events,
++):
++    client.emit_presence('bla:bla', UserPresence.ONLINE)
++    client.emit_presence(own_user.user_id, UserPresence.ONLINE)
++
++    assert reachability_events == []
++    assert presence_events == []
++
++
++def test_add_address_then_presence_makes_reachable(
++        manager,
++        client,
++        addr1,
++        user1_s1,
++        reachability_events,
++        presence_events,
++):
++    manager.add_address(addr1)
++
++    assert manager.is_address_known(addr1)
++    assert set(manager.known_addresses) == {addr1}
++
++    client.emit_presence(user1_s1.user_id, UserPresence.ONLINE)
++
++    assert manager.get_address_reachability(addr1) is AddressReachability.REACHABLE
++    assert set(manager.get_userids_for_address(addr1)) == {user1_s1.user_id}
++    assert manager.get_userid_presence(user1_s1.user_id) is UserPresence.ONLINE
++    assert reachability_count(reachability_events, addr1) == 1
++    assert reachability_events[-1] == (addr1, AddressReachability.REACHABLE)
++    assert len(presence_events) == 1
++    assert presence_events[-1][0].user_id == user1_s1.user_id
++    assert presence_events[-1][1] is UserPresence.ONLINE
++
++
++def test_unavailable_user_is_reachable(manager, client, addr1, user1_s1):
++    manager.add_address(addr1)
++    client.emit_presence(user1_s1.user_id, UserPresence.UNAVAILABLE)
++    assert manager.get_address_reachability(addr1) is AddressReachability.REACHABLE
++
++
++def test_offline_user_is_unreachable(manager, client, addr1, user1_s1):
++    manager.add_address(addr1)
++    client.emit_presence(user1_s1.user_id, UserPresence.OFFLINE)
++    assert manager.get_address_reachability(addr1) is AddressReachability.UNREACHABLE
++
++
++def test_callbacks_fire_only_on_transition(
++        manager,
++        client,
++        addr1,
++        user1_s1,
++        reachability_events,
++        presence_events,
++):
++    manager.add_address(addr1)
++    client.emit_presence(user1_s1.user_id, UserPresence.ONLINE)
++    client.emit_presence(user1_s1.user_id, UserPresence.ONLINE)
++    client.emit_presence(user1_s1.user_id, UserPresence.ONLINE)
++
++    assert reachability_count(reachability_events, addr1) == 1
++    assert len(presence_events) == 1
++
++
++def test_reachability_is_composed_across_users(
++        manager,
++        client,
++        addr1,
++        user1_s1,
++        user1_s2,
++        reachability_events,
++):
++    manager.add_address(addr1)
++
++    client.emit_presence(user1_s1.user_id, UserPresence.ONLINE)
++    assert manager.get_address_reachability(addr1) is AddressReachability.REACHABLE
++
++    client.emit_presence(user1_s1.user_id, UserPresence.OFFLINE)
++    assert manager.get_address_reachability(addr1) is AddressReachability.UNREACHABLE
++
++
++
++    client.emit_presence(user1_s2.user_id, UserPresence.ONLINE)
++    assert manager.get_address_reachability(addr1) is AddressReachability.REACHABLE
++
++
++    reachable_calls_before = reachability_count(reachability_events, addr1)
++    client.emit_presence(user1_s2.user_id, UserPresence.UNAVAILABLE)
++    assert manager.get_address_reachability(addr1) is AddressReachability.REACHABLE
++    assert reachability_count(reachability_events, addr1) == reachable_calls_before
++
++
++    client.emit_presence(user1_s2.user_id, UserPresence.OFFLINE)
++    assert manager.get_address_reachability(addr1) is AddressReachability.UNREACHABLE
++
++    assert manager.get_userid_presence(user1_s1.user_id) is UserPresence.OFFLINE
++    assert manager.get_userid_presence(user1_s2.user_id) is UserPresence.OFFLINE
++
++
++def test_add_userid_implicitly_tracks_address(manager, addr1, user1_s1):
++    manager.add_userid_for_address(addr1, user1_s1.user_id)
++    assert manager.is_address_known(addr1)
++    assert set(manager.get_userids_for_address(addr1)) == {user1_s1.user_id}
++
++
++def test_add_userids_for_address(manager, addr2, user2_s1, user1_s2):
++    manager.add_userids_for_address(addr2, {user2_s1.user_id, user1_s2.user_id})
++    assert manager.is_address_known(addr2)
++    assert set(manager.get_userids_for_address(addr2)) == {user2_s1.user_id, user1_s2.user_id}
++
++
++def test_force_presence_does_not_recompute_or_call_back(
++        manager,
++        addr1,
++        user1_s1,
++        reachability_events,
++        presence_events,
++):
++    manager.add_userid_for_address(addr1, user1_s1.user_id)
++    manager.force_user_presence(user1_s1, UserPresence.ONLINE)
++
++    assert manager.get_userid_presence(user1_s1.user_id) is UserPresence.ONLINE
++    assert manager.get_address_reachability(addr1) is AddressReachability.UNKNOWN
++    assert reachability_events == []
++    assert presence_events == []
++
++
++    manager.refresh_address_presence(addr1)
++
++    assert manager.get_address_reachability(addr1) is AddressReachability.REACHABLE
++    assert reachability_count(reachability_events, addr1) == 1
++    assert reachability_events[-1] == (addr1, AddressReachability.REACHABLE)
++
++    assert presence_events == []
++
++
++def test_refresh_queries_client_for_uncached_presence(
++        manager,
++        client,
++        addr2,
++        user2_s1,
++):
++    client.get_user_presence = Mock(return_value=UserPresence.ONLINE.value)
++
++    manager.add_userid_for_address(addr2, user2_s1.user_id)
++    manager.refresh_address_presence(addr2)
++
++    assert manager.get_address_reachability(addr2) is AddressReachability.REACHABLE
++    client.get_user_presence.assert_called_with(user2_s1.user_id)
++
++
++def test_refresh_treats_failed_lookup_as_unknown(manager, client, addr2, user2_s1):
++    client.get_user_presence = Mock(side_effect=MatrixRequestError(404))
++
++    manager.add_userid_for_address(addr2, user2_s1.user_id)
++    manager.refresh_address_presence(addr2)
++
++    assert manager.get_address_reachability(addr2) is AddressReachability.UNKNOWN
++
++
++def test_stop_event_disables_presence_processing(
++        manager,
++        client,
++        stop_event,
++        addr1,
++        user1_s1,
++        reachability_events,
++        presence_events,
++):
++    manager.add_address(addr1)
++    stop_event.set()
++
++    client.emit_presence(user1_s1.user_id, UserPresence.ONLINE)
++
++    assert reachability_events == []
++    assert presence_events == []
++    assert manager.get_address_reachability(addr1) is AddressReachability.UNKNOWN
++    assert manager.get_userid_presence(user1_s1.user_id) is UserPresence.UNKNOWN
++
++
++def test_non_presence_events_are_ignored(
++        manager,
++        client,
++        addr1,
++        user1_s1,
++        reachability_events,
++        presence_events,
++):
++    manager.add_address(addr1)
++    client.emit_raw({
++        'sender': user1_s1.user_id,
++        'type': 'm.room.message',
++        'content': {'presence': UserPresence.ONLINE.value},
++    })
++
++    assert reachability_events == []
++    assert presence_events == []
++    assert manager.get_address_reachability(addr1) is AddressReachability.UNKNOWN
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,23 @@
++#!/usr/bin/env bash
++
++
++
++
++set -euo pipefail
++HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++cd /testbed
++
++
++
++
++
++
++
++
++/root/.venv/bin/python -m pytest -q \
++    raiden/tests/unit/test_matrix_transport.py \
++    raiden/tests/unit/test_utils.py
++
++
++/root/.venv/bin/python -m pytest -q \
++    raiden/tests/unit/test_matrix_user_address_manager.py

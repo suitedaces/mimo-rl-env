@@ -1,0 +1,213 @@
+diff --git a/usercase-test-coderl/usecase.sh b/usercase-test-coderl/usecase.sh
+new file mode 100755
+--- /dev/null
++++ b/usercase-test-coderl/usecase.sh
+@@ -0,0 +1,191 @@
++#!/usr/bin/env bash
++
++set -u
++export LANG=C.UTF-8 LC_ALL=C.UTF-8 TZ=UTC
++export PATH="/usr/local/bin:${PATH}"
++export PIP_DISABLE_PIP_VERSION_CHECK=1
++export PIP_NO_INDEX=1
++export NLTK_DATA="/usr/local/share/nltk_data:${NLTK_DATA:-}"
++
++
++
++if ! command -v bsdetector >/dev/null 2>&1; then
++    ( cd /workspace/repo && python -m pip install --no-index --no-deps --no-build-isolation -e . >/tmp/bsdetector-fixture-pip.log 2>&1 ) \
++        || { echo "FAIL: build/install; see /tmp/bsdetector-fixture-pip.log" >&2; exit 1; }
++    hash -r
++fi
++BIN=$(command -v bsdetector || true)
++[ -n "$BIN" ] || { echo "FAIL: bsdetector command not installed" >&2; exit 1; }
++
++TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
++cd "$TMP" || exit 1
++fail() { echo "FAIL: $*" >&2; exit 1; }
++
++
++
++
++"$BIN" --help >out 2>err; ec=$?
++[ "$ec" -eq 0 ] || fail "F_help exit $ec; want 0"
++
++cat out err >combined
++grep -qi 'usage:' combined || fail "F_help missing usage text"
++grep -qF -- '-i FILE' combined || fail "F_help missing -i FILE"
++grep -qF -- '-o {json,tsv,html}' combined || fail "F_help missing -o choices"
++
++
++
++
++printf 'The cat sucks.\n\nThis is neutral.' > json_input.txt
++"$BIN" -i json_input.txt >out 2>err; ec=$?
++[ "$ec" -eq 0 ] || fail "F_json_default exit $ec; want 0"
++
++python - <<'PY' || fail "F_json_default invalid JSON report"
++import json
++import re
++from pathlib import Path
++
++raw = Path("out").read_text()
++data = json.loads(raw)
++assert isinstance(data, list), type(data)
++assert re.search(r"\n\s+\{", raw), "JSON array is not indented"
++texts = [item.get("text") for item in data]
++assert texts == ["The cat sucks.", "This is neutral."], texts
++required_feature_fields = {"word_cnt", "unique_word_cnt", "vader_sentiment", "neg_persp", "certainty"}
++for item in data:
++    assert isinstance(item, dict), type(item)
++    assert required_feature_fields.issubset(item), sorted(item)
++    assert len(set(item) - {"text"}) >= 5, item
++    assert item["word_cnt"] == 3, item
++    assert item["unique_word_cnt"] == 3, item
++assert "" not in texts
++PY
++[ ! -s err ] || fail "F_json_default unexpected stderr: $(cat err)"
++
++
++
++
++printf 'A\nThe cat sucks.\nThis is neutral.\n\n' > tsv_input.txt
++"$BIN" -i tsv_input.txt -o tsv >out 2>err; ec=$?
++[ "$ec" -eq 0 ] || fail "F_tsv exit $ec; want 0"
++
++python - <<'PY' || fail "F_tsv invalid TSV report"
++import csv
++from pathlib import Path
++
++
++rows = [row for row in csv.reader(Path("out").read_text().splitlines(), delimiter="\t") if row]
++assert len(rows) == 4, rows
++header = rows[0]
++assert header[0] == "sentence", header
++required_feature_fields = {"word_cnt", "unique_word_cnt", "vader_sentiment", "neg_persp", "certainty"}
++assert required_feature_fields.issubset(header[1:]), header
++assert [row[0] for row in rows[1:]] == ["A", "The cat sucks.", "This is neutral."], rows
++word_idx = header.index("word_cnt")
++unique_idx = header.index("unique_word_cnt")
++expected_counts = {"A": 1.0, "The cat sucks.": 3.0, "This is neutral.": 3.0}
++for row in rows[1:]:
++    assert len(row) == len(header), (header, row)
++    assert all(cell != "" for cell in row[1:]), row
++    assert float(row[word_idx]) == expected_counts[row[0]], row
++    assert float(row[unique_idx]) == expected_counts[row[0]], row
++PY
++
++grep -qi 'excel' err || fail "F_tsv stderr missing Excel hint: $(cat err)"
++
++
++
++
++printf 'Hey\nFour\nThe cat sucks.\n\n' > html_input.txt
++"$BIN" -i html_input.txt -o html >out 2>err; ec=$?
++[ "$ec" -eq 0 ] || fail "F_html exit $ec; want 0"
++
++python - <<'PY' || fail "F_html invalid HTML report"
++from html.parser import HTMLParser
++from pathlib import Path
++
++class TableParser(HTMLParser):
++    def __init__(self):
++        super().__init__()
++        self.in_cell = False
++        self.current_cell = []
++        self.current_row = None
++        self.rows = []
++        self.table_attrs = []
++
++    def handle_starttag(self, tag, attrs):
++        if tag == "table":
++            self.table_attrs.append(dict(attrs))
++        if tag == "tr":
++            self.current_row = []
++        if tag in {"td", "th"} and self.current_row is not None:
++            self.in_cell = True
++            self.current_cell = []
++
++    def handle_data(self, data):
++        if self.in_cell:
++            self.current_cell.append(data)
++
++    def handle_endtag(self, tag):
++        if tag in {"td", "th"} and self.in_cell:
++            self.current_row.append("".join(self.current_cell).strip())
++            self.in_cell = False
++        if tag == "tr" and self.current_row is not None:
++            self.rows.append(self.current_row)
++            self.current_row = None
++
++raw = Path("out").read_text()
++assert "html" in raw.lower(), raw[:200]
++assert raw.lower().find("html") < raw.lower().find("<table"), raw[:200]
++parser = TableParser()
++parser.feed(raw)
++assert parser.table_attrs, raw
++assert any("border" in attrs or "border" in attrs.get("style", "").lower() for attrs in parser.table_attrs), parser.table_attrs
++assert parser.rows, raw
++header, data_rows = parser.rows[0], parser.rows[1:]
++assert header and header[0] == "sentence", header
++required_feature_fields = {"word_cnt", "unique_word_cnt", "vader_sentiment", "neg_persp", "certainty"}
++assert required_feature_fields.issubset(header[1:]), header
++assert [row[0] for row in data_rows] == ["Four", "The cat sucks."], data_rows
++assert "Hey" not in [row[0] for row in data_rows], data_rows
++word_idx = header.index("word_cnt")
++unique_idx = header.index("unique_word_cnt")
++expected_counts = {"Four": 1.0, "The cat sucks.": 3.0}
++for row in data_rows:
++    assert len(row) == len(header), (header, row)
++    assert float(row[word_idx]) == expected_counts[row[0]], row
++    assert float(row[unique_idx]) == expected_counts[row[0]], row
++PY
++[ ! -s err ] || fail "F_html unexpected stderr: $(cat err)"
++
++
++
++
++"$BIN" -o json >out 2>err; ec=$?
++[ "$ec" -eq 2 ] || fail "F_missing_i exit $ec; want 2"
++[ ! -s out ] || fail "F_missing_i unexpected stdout: $(cat out)"
++
++grep -q -- '-i' err || fail "F_missing_i stderr does not mention -i: $(cat err)"
++grep -Eqi 'required|missing|error' err || fail "F_missing_i stderr is not a parser error: $(cat err)"
++
++
++
++
++printf 'The cat sucks.\n' > parser_input.txt
++"$BIN" -i parser_input.txt -o csv >out 2>err; ec=$?
++[ "$ec" -eq 2 ] || fail "F_bad_output exit $ec; want 2"
++[ ! -s out ] || fail "F_bad_output unexpected stdout: $(cat out)"
++
++grep -q -- '-o' err || fail "F_bad_output stderr does not mention -o: $(cat err)"
++grep -q 'csv' err || fail "F_bad_output stderr does not mention csv: $(cat err)"
++grep -Eq 'json|tsv|html|choice|invalid|unsupported' err \
++    || fail "F_bad_output stderr is not a choices/parser error: $(cat err)"
++
++
++
++
++"$BIN" -i does-not-exist.txt >out 2>err; ec=$?
++[ "$ec" -ne 0 ] || fail "F_unreadable_input exit 0; want non-zero"
++[ ! -s out ] || fail "F_unreadable_input emitted partial report: $(cat out)"
++
++echo "PASS"
++exit 0
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,12 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++exec bash /workspace/repo/usercase-test-coderl/usecase.sh

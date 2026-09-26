@@ -1,0 +1,227 @@
+diff --git a/test/test_recipe.py b/test/test_recipe.py
+index e28808c..dd0ed67 100644
+--- a/test/test_recipe.py
++++ b/test/test_recipe.py
+@@ -21,8 +21,12 @@ from __future__ import print_function
+ 
+ import logging # pylint: disable=unused-import
+ import os
++import shutil
++import tempfile
++import uuid
+ import unittest
+ 
++import hpccm
+ from hpccm.common import container_type
+ from hpccm.recipe import recipe
+ 
+@@ -253,3 +257,181 @@ RUN mkdir -p /var/tmp && wget -q -nc --no-check-certificate -P /var/tmp https://
+     rm -rf /var/tmp/openmpi-2.1.2.tar.bz2 /var/tmp/openmpi-2.1.2
+ ENV LD_LIBRARY_PATH=/usr/local/openmpi/lib:$LD_LIBRARY_PATH \
+     PATH=/usr/local/openmpi/bin:$PATH''')
++
++
++    def _write_recipe(self, directory, filename, contents):
++        """Create a temporary recipe fixture and return its path."""
++        path = os.path.join(directory, filename)
++        parent = os.path.dirname(path)
++        if not os.path.isdir(parent):
++            os.makedirs(parent)
++        with open(path, 'w') as f:
++            f.write(contents)
++        return path
++
++    def test_include_stage0_and_shared_values(self):
++        """included recipes contribute Stage0 state and shared values"""
++        tmpdir = tempfile.mkdtemp()
++        try:
++            fragment_name = 'shared-{}.py'.format(uuid.uuid4().hex)
++            image = 'stage0-image-{}:latest'.format(uuid.uuid4().hex)
++            package = 'stage0-package-{}'.format(uuid.uuid4().hex)
++            self._write_recipe(tmpdir, fragment_name,
++                               "Stage0 += baseimage(image={!r})\n"
++                               "extra_package = {!r}\n".format(image, package))
++            main = self._write_recipe(
++                tmpdir, 'main.py',
++                "hpccm.include({!r})\n"
++                "Stage0 += packages(ospackages=[extra_package])\n".format(
++                    fragment_name))
++
++            result = recipe(main)
++
++            self.assertIn('FROM {}'.format(image), result)
++            self.assertIn(package, result)
++        finally:
++            shutil.rmtree(tmpdir)
++
++    def test_include_arbitrary_sibling_recipe_name(self):
++        """include works for ordinary sibling recipe names"""
++        tmpdir = tempfile.mkdtemp()
++        try:
++            fragment_name = 'common-build-{}.py'.format(uuid.uuid4().hex)
++            image = 'sibling-image-{}:latest'.format(uuid.uuid4().hex)
++            package = 'sibling-package-{}'.format(uuid.uuid4().hex)
++            self._write_recipe(tmpdir, fragment_name,
++                               "Stage0 += baseimage(image={!r})\n"
++                               "custom_package = {!r}\n".format(
++                                   image, package))
++            main = self._write_recipe(
++                tmpdir, 'main.py',
++                "hpccm.include({!r})\n"
++                "Stage0 += packages(ospackages=[custom_package])\n".format(
++                    fragment_name))
++
++            result = recipe(main)
++
++            self.assertIn('FROM {}'.format(image), result)
++            self.assertIn(package, result)
++        finally:
++            shutil.rmtree(tmpdir)
++
++    def test_include_stage1_singularity_output(self):
++        """included recipes contribute Stage1 content for Singularity"""
++        tmpdir = tempfile.mkdtemp()
++        try:
++            fragment_name = 'stage1-{}.py'.format(uuid.uuid4().hex)
++            image = 'stage1-image-{}:latest'.format(uuid.uuid4().hex)
++            package = 'stage1-package-{}'.format(uuid.uuid4().hex)
++            self._write_recipe(tmpdir, fragment_name,
++                               "Stage1 += baseimage(image={!r})\n".format(
++                                   image))
++            main = self._write_recipe(
++                tmpdir, 'main.py',
++                "hpccm.include({!r})\n"
++                "Stage1 += packages(ospackages=[{!r}])\n".format(
++                    fragment_name, package))
++
++            result = recipe(main, ctype=container_type.SINGULARITY,
++                            singularity_version='3.2')
++
++            self.assertIn('From: {}'.format(image), result)
++            self.assertIn(package, result)
++        finally:
++            shutil.rmtree(tmpdir)
++
++    def test_include_relative_to_main_recipe_from_different_cwd(self):
++        """relative includes are resolved from the recipe file location"""
++        tmpdir = tempfile.mkdtemp()
++        old_cwd = os.getcwd()
++        try:
++            recipe_dir = os.path.join(tmpdir, 'recipes')
++            other_cwd = os.path.join(tmpdir, 'elsewhere')
++            os.makedirs(other_cwd)
++            fragment_name = os.path.join(
++                'fragments', 'toolchain-{}.py'.format(uuid.uuid4().hex))
++            image = 'relative-image-{}:latest'.format(uuid.uuid4().hex)
++            package = 'relative-package-{}'.format(uuid.uuid4().hex)
++            self._write_recipe(
++                recipe_dir, fragment_name,
++                "Stage0 += baseimage(image={!r})\n".format(image))
++            main = self._write_recipe(
++                recipe_dir, 'main.py',
++                "hpccm.include({!r})\n"
++                "Stage0 += packages(ospackages=[{!r}])\n".format(
++                    fragment_name, package))
++
++            os.chdir(other_cwd)
++            result = recipe(main)
++
++            self.assertIn('FROM {}'.format(image), result)
++            self.assertIn(package, result)
++        finally:
++            os.chdir(old_cwd)
++            shutil.rmtree(tmpdir)
++
++    def test_include_absolute_path(self):
++        """absolute include paths are used as absolute paths"""
++        tmpdir = tempfile.mkdtemp()
++        try:
++            image = 'absolute-image-{}:latest'.format(uuid.uuid4().hex)
++            package = 'absolute-package-{}'.format(uuid.uuid4().hex)
++            fragment = self._write_recipe(
++                tmpdir, 'absolute-{}.py'.format(uuid.uuid4().hex),
++                "Stage0 += baseimage(image={!r})\n".format(image))
++            main_dir = os.path.join(tmpdir, 'main-recipe')
++            main = self._write_recipe(
++                main_dir, 'main.py',
++                "hpccm.include({!r})\n"
++                "Stage0 += packages(ospackages=[{!r}])\n".format(
++                    fragment, package))
++
++            result = recipe(main)
++
++            self.assertIn('FROM {}'.format(image), result)
++            self.assertIn(package, result)
++        finally:
++            shutil.rmtree(tmpdir)
++
++    def test_include_missing_default_exits(self):
++        """missing includes exit by default"""
++        tmpdir = tempfile.mkdtemp()
++        try:
++            missing = os.path.join(
++                tmpdir, 'missing-{}.py'.format(uuid.uuid4().hex))
++            with self.assertRaises(SystemExit) as context:
++                hpccm.include(missing)
++            self.assertEqual(context.exception.code, 1)
++        finally:
++            shutil.rmtree(tmpdir)
++
++    def test_include_raise_exceptions_propagates(self):
++        """raise_exceptions=True propagates included recipe errors"""
++        tmpdir = tempfile.mkdtemp()
++        try:
++            error_name = 'IncludeRaised{}'.format(uuid.uuid4().hex)
++            bad = self._write_recipe(
++                tmpdir, 'bad-{}.py'.format(uuid.uuid4().hex),
++                "class {0}(Exception):\n"
++                "    pass\n"
++                "raise {0}\n".format(error_name))
++
++            with self.assertRaises(Exception) as context:
++                hpccm.include(bad, raise_exceptions=True)
++            self.assertEqual(type(context.exception).__name__, error_name)
++        finally:
++            shutil.rmtree(tmpdir)
++
++    def test_include_runtime_error_default_exits(self):
++        """runtime errors in included recipes exit by default"""
++        tmpdir = tempfile.mkdtemp()
++        try:
++            bad = self._write_recipe(
++                tmpdir, 'runtime-{}.py'.format(uuid.uuid4().hex),
++                "raise RuntimeError()\n")
++
++            with self.assertRaises(SystemExit) as context:
++                hpccm.include(bad)
++            self.assertEqual(context.exception.code, 1)
++        finally:
++            shutil.rmtree(tmpdir)
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,23 @@
++#!/bin/bash
++set -uo pipefail
++cd /testbed
++
++
++dev-switch python3 3.11
++python3 -m pip install -e . --no-input
++
++
++case "${1:-}" in
++  base)
++    python3 -m pytest test/test_recipe.py -v \
++      -k 'not test_include_stage0_and_shared_values and not test_include_arbitrary_sibling_recipe_name and not test_include_stage1_singularity_output and not test_include_relative_to_main_recipe_from_different_cwd and not test_include_absolute_path and not test_include_missing_default_exits and not test_include_raise_exceptions_propagates and not test_include_runtime_error_default_exits'
++    ;;
++  new)
++    python3 -m pytest test/test_recipe.py -v \
++      -k 'test_include_stage0_and_shared_values or test_include_arbitrary_sibling_recipe_name or test_include_stage1_singularity_output or test_include_relative_to_main_recipe_from_different_cwd or test_include_absolute_path or test_include_missing_default_exits or test_include_raise_exceptions_propagates or test_include_runtime_error_default_exits'
++    ;;
++  *)
++    echo "usage: $0 base|new"
++    exit 2
++    ;;
++esac

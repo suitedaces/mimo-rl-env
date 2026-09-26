@@ -1,0 +1,271 @@
+diff --git a/tests/client/test_client.py b/tests/client/test_client.py
+index fdacb380b3..d2cea42243 100644
+--- a/tests/client/test_client.py
++++ b/tests/client/test_client.py
+@@ -305,6 +305,10 @@ def test_get_flow_run_info(monkeypatch):
+     "flow_run_by_pk": {
+         "version": 0,
+         "parameters": {},
++        "context": {
++            "client_context": "visible",
++            "other_value": 17
++        },
+         "scheduled_start_time": "2019-01-25T19:15:58.632412+00:00",
+         "serialized_state": {
+             "type": "Pending",
+@@ -342,6 +346,7 @@ def test_get_flow_run_info(monkeypatch):
+         client = Client()
+     result = client.get_flow_run_info(flow_run_id="74-salt")
+     assert isinstance(result, FlowRunInfoResult)
++    assert result.context == {"client_context": "visible", "other_value": 17}
+     assert isinstance(result.scheduled_start_time, datetime.datetime)
+     assert result.scheduled_start_time.minute == 15
+     assert result.scheduled_start_time.year == 2019
+@@ -352,6 +357,45 @@ def test_get_flow_run_info(monkeypatch):
+     assert result.parameters == dict()
+ 
+ 
++def test_flow_run_info_returns_dynamic_context_field(monkeypatch):
++    context_payload = {"dynamic_context": "from-cloud", "window": {"days": 3}}
++
++    def post_response(url, headers=None, json=None):
++        flow_run = {
++            "version": 11,
++            "parameters": {},
++            "scheduled_start_time": "2019-01-25T19:15:58.632412+00:00",
++            "serialized_state": {
++                "type": "Pending",
++                "_result": {
++                    "type": "SafeResult",
++                    "value": "42",
++                    "result_handler": {"type": "JSONResultHandler"},
++                },
++                "message": None,
++                "__version__": "0.3.3+309.gf1db024",
++                "cached_inputs": None,
++            },
++            "task_runs": [],
++        }
++        if "context" in json["query"]:
++            flow_run["context"] = context_payload
++        return MagicMock(
++            json=MagicMock(return_value={"data": {"flow_run_by_pk": flow_run}})
++        )
++
++    post = MagicMock(side_effect=post_response)
++    monkeypatch.setattr("requests.post", post)
++    with set_temporary_config(
++        {"cloud.graphql": "http://my-cloud.foo", "cloud.auth_token": "secret_token"}
++    ):
++        client = Client()
++
++    result = client.get_flow_run_info(flow_run_id="74-salt")
++
++    assert result.context == context_payload
++
++
+ def test_get_flow_run_info_raises_informative_error(monkeypatch):
+     response = """
+     {
+diff --git a/tests/engine/cloud/test_cloud_flow_runner.py b/tests/engine/cloud/test_cloud_flow_runner.py
+index 1978eed62c..caec430ade 100644
+--- a/tests/engine/cloud/test_cloud_flow_runner.py
++++ b/tests/engine/cloud/test_cloud_flow_runner.py
+@@ -3,6 +3,7 @@ import time
+ from datetime import timedelta
+ from unittest.mock import MagicMock
+ 
++import pendulum
+ import pytest
+ 
+ import prefect
+@@ -201,6 +202,134 @@ def test_flow_runner_prioritizes_kwarg_states_over_db_states(monkeypatch, state)
+     assert states == [Running(), Success(result={})]
+ 
+ 
++def test_flow_runner_loads_context_from_cloud(monkeypatch):
++    flow = prefect.Flow(name="test")
++    scheduled_start_time = pendulum.parse("2019-01-25T19:15:58.632412+00:00")
++    get_flow_run_info = MagicMock(
++        return_value=MagicMock(
++            parameters={},
++            context={
++                "my_var": "cloud-value",
++                "secondary_context": {"nested": True},
++            },
++            version=3,
++            scheduled_start_time=scheduled_start_time,
++            state=Pending(),
++        )
++    )
++    set_flow_run_state = MagicMock()
++    client = MagicMock(
++        get_flow_run_info=get_flow_run_info, set_flow_run_state=set_flow_run_state
++    )
++    monkeypatch.setattr(
++        "prefect.engine.cloud.flow_runner.Client", MagicMock(return_value=client)
++    )
++
++    res = CloudFlowRunner(flow=flow).initialize_run(
++        state=Pending(), task_states={}, context={}, task_contexts={}, parameters={}
++    )
++
++    assert res.context["my_var"] == "cloud-value"
++    assert res.context["secondary_context"] == {"nested": True}
++
++
++def test_flow_runner_prefers_runtime_metadata_over_cloud_context(monkeypatch):
++    flow = prefect.Flow(name="test")
++    runtime_scheduled_start_time = pendulum.parse("2019-01-25T19:15:58.632412+00:00")
++    get_flow_run_info = MagicMock(
++        return_value=MagicMock(
++            parameters={},
++            context={
++                "custom_marker": "kept",
++                "scheduled_start_time": "not the runtime scheduled time",
++                "flow_run_version": "not the runtime version",
++            },
++            version=42,
++            scheduled_start_time=runtime_scheduled_start_time,
++            state=Pending(),
++        )
++    )
++    set_flow_run_state = MagicMock()
++    client = MagicMock(
++        get_flow_run_info=get_flow_run_info, set_flow_run_state=set_flow_run_state
++    )
++    monkeypatch.setattr(
++        "prefect.engine.cloud.flow_runner.Client", MagicMock(return_value=client)
++    )
++
++    res = CloudFlowRunner(flow=flow).initialize_run(
++        state=Pending(), task_states={}, context={}, task_contexts={}, parameters={}
++    )
++
++    assert res.context["custom_marker"] == "kept"
++    assert res.context["scheduled_start_time"] == runtime_scheduled_start_time
++    assert res.context["flow_run_version"] == 42
++
++
++def test_cloud_run_context_accepts_unexpected_keys_and_versions(monkeypatch):
++    flow = prefect.Flow(name="test")
++    scheduled_start_time = pendulum.parse("2019-01-25T19:15:58.632412+00:00")
++    context_payload = {
++        "feature_flag": True,
++        "date_window": {"start": "2019-01-01", "end": "2019-01-31"},
++    }
++    get_flow_run_info = MagicMock(
++        return_value=MagicMock(
++            parameters={},
++            context=context_payload,
++            version=9,
++            scheduled_start_time=scheduled_start_time,
++            state=Pending(),
++            task_runs=[],
++        )
++    )
++    client = MagicMock(get_flow_run_info=get_flow_run_info, set_flow_run_state=MagicMock())
++    monkeypatch.setattr(
++        "prefect.engine.cloud.flow_runner.Client", MagicMock(return_value=client)
++    )
++
++    res = CloudFlowRunner(flow=flow).initialize_run(
++        state=Pending(), task_states={}, context={}, task_contexts={}, parameters={}
++    )
++
++    assert res.context["feature_flag"] is True
++    assert res.context["date_window"] == {
++        "start": "2019-01-01",
++        "end": "2019-01-31",
++    }
++
++
++def test_cloud_runtime_metadata_wins_for_arbitrary_conflicts(monkeypatch):
++    flow = prefect.Flow(name="test")
++    runtime_scheduled_start_time = pendulum.parse("2019-02-01T00:00:00+00:00")
++    get_flow_run_info = MagicMock(
++        return_value=MagicMock(
++            parameters={},
++            context={
++                "custom_marker": "kept",
++                "scheduled_start_time": "cloud supplied conflict",
++                "flow_run_version": -999,
++            },
++            version=13,
++            scheduled_start_time=runtime_scheduled_start_time,
++            state=Pending(),
++            task_runs=[],
++        )
++    )
++    client = MagicMock(get_flow_run_info=get_flow_run_info, set_flow_run_state=MagicMock())
++    monkeypatch.setattr(
++        "prefect.engine.cloud.flow_runner.Client", MagicMock(return_value=client)
++    )
++
++    res = CloudFlowRunner(flow=flow).initialize_run(
++        state=Pending(), task_states={}, context={}, task_contexts={}, parameters={}
++    )
++
++    assert res.context["custom_marker"] == "kept"
++    assert res.context["scheduled_start_time"] == runtime_scheduled_start_time
++    assert res.context["flow_run_version"] == 13
++
++
+ def test_client_is_always_called_even_during_failures(client):
+     @prefect.task
+     def raise_me(x, y):
+diff --git a/tests/engine/cloud/test_cloud_flows.py b/tests/engine/cloud/test_cloud_flows.py
+index a0789b4fcb..0baf09c3ba 100644
+--- a/tests/engine/cloud/test_cloud_flows.py
++++ b/tests/engine/cloud/test_cloud_flows.py
+@@ -102,6 +102,7 @@ class MockedCloudClient(MagicMock):
+ 
+         return FlowRunInfoResult(
+             parameters={},
++            context=None,
+             version=flow_run.version,
+             scheduled_start_time=pendulum.parse("2019-01-25T19:15:58.632412+00:00"),
+             state=flow_run.state,
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,38 @@
++#!/bin/bash
++set -uo pipefail
++cd /testbed
++
++
++export PATH="$HOME/.pyenv/bin:$PATH"
++set +u
++eval "$(pyenv init -)"
++pyenv global 3.8.20
++set -u
++
++
++pip install -e . --no-deps -q
++
++case "${1:-}" in
++  base)
++    python -m pytest \
++      tests/client/test_client.py::test_client_initializes_from_config \
++      tests/client/test_client.py::test_get_flow_run_info_raises_informative_error \
++      tests/engine/cloud/test_cloud_flow_runner.py::test_task_runner_cls_is_cloud_task_runner \
++      tests/engine/cloud/test_cloud_flows.py::test_scheduled_start_time_is_in_context \
++      -v
++    ;;
++  new)
++    python -m pytest \
++      tests/client/test_client.py::test_get_flow_run_info \
++      tests/client/test_client.py::test_flow_run_info_returns_dynamic_context_field \
++      tests/engine/cloud/test_cloud_flow_runner.py::test_flow_runner_loads_context_from_cloud \
++      tests/engine/cloud/test_cloud_flow_runner.py::test_flow_runner_prefers_runtime_metadata_over_cloud_context \
++      tests/engine/cloud/test_cloud_flow_runner.py::test_cloud_run_context_accepts_unexpected_keys_and_versions \
++      tests/engine/cloud/test_cloud_flow_runner.py::test_cloud_runtime_metadata_wins_for_arbitrary_conflicts \
++      -v
++    ;;
++  *)
++    echo "usage: $0 base|new"
++    exit 2
++    ;;
++esac

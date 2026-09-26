@@ -1,0 +1,415 @@
+diff --git a/usercase-test-coderl/ttl_lifecycle_test.go b/usercase-test-coderl/ttl_lifecycle_test.go
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/ttl_lifecycle_test.go
+@@ -0,0 +1,384 @@
++package usercase_test_coderl
++
++import (
++	"fmt"
++	"io/ioutil"
++	"os"
++	"testing"
++	"time"
++
++	"github.com/ledisdb/ledisdb/config"
++	"github.com/ledisdb/ledisdb/ledis"
++)
++
++type ttlCase struct {
++	name    string
++	key     []byte
++	create  func(*ledis.DB, []byte) error
++	ttl     func(*ledis.DB, []byte) (int64, error)
++	expire  func(*ledis.DB, []byte, int64) (int64, error)
++	expAt   func(*ledis.DB, []byte, int64) (int64, error)
++	persist func(*ledis.DB, []byte) (int64, error)
++	count   func(*ledis.DB, []byte) (int64, error)
++}
++
++func allTTLCases() []ttlCase {
++	return []ttlCase{
++		{
++			name: "string", key: []byte("fixture:ttl:string"),
++			create:  func(db *ledis.DB, key []byte) error { return db.Set(key, []byte("value")) },
++			ttl:     (*ledis.DB).TTL,
++			expire:  (*ledis.DB).Expire,
++			expAt:   (*ledis.DB).ExpireAt,
++			persist: (*ledis.DB).Persist,
++			count:   (*ledis.DB).Exists,
++		},
++		{
++			name: "list", key: []byte("fixture:ttl:list"),
++			create: func(db *ledis.DB, key []byte) error {
++				_, err := db.LPush(key, []byte("left"), []byte("right"))
++				return err
++			},
++			ttl:     (*ledis.DB).LTTL,
++			expire:  (*ledis.DB).LExpire,
++			expAt:   (*ledis.DB).LExpireAt,
++			persist: (*ledis.DB).LPersist,
++			count:   (*ledis.DB).LLen,
++		},
++		{
++			name: "hash", key: []byte("fixture:ttl:hash"),
++			create: func(db *ledis.DB, key []byte) error {
++				_, err := db.HSet(key, []byte("field"), []byte("value"))
++				return err
++			},
++			ttl:     (*ledis.DB).HTTL,
++			expire:  (*ledis.DB).HExpire,
++			expAt:   (*ledis.DB).HExpireAt,
++			persist: (*ledis.DB).HPersist,
++			count:   (*ledis.DB).HLen,
++		},
++		{
++			name: "set", key: []byte("fixture:ttl:set"),
++			create: func(db *ledis.DB, key []byte) error {
++				_, err := db.SAdd(key, []byte("member-a"), []byte("member-b"))
++				return err
++			},
++			ttl:     (*ledis.DB).STTL,
++			expire:  (*ledis.DB).SExpire,
++			expAt:   (*ledis.DB).SExpireAt,
++			persist: (*ledis.DB).SPersist,
++			count:   (*ledis.DB).SCard,
++		},
++		{
++			name: "zset", key: []byte("fixture:ttl:zset"),
++			create: func(db *ledis.DB, key []byte) error {
++				_, err := db.ZAdd(key,
++					ledis.ScorePair{Score: 10, Member: []byte("member-a")},
++					ledis.ScorePair{Score: 20, Member: []byte("member-b")})
++				return err
++			},
++			ttl:     (*ledis.DB).ZTTL,
++			expire:  (*ledis.DB).ZExpire,
++			expAt:   (*ledis.DB).ZExpireAt,
++			persist: (*ledis.DB).ZPersist,
++			count:   (*ledis.DB).ZCard,
++		},
++	}
++}
++
++func openDB(t *testing.T, index int) (*ledis.Ledis, *ledis.DB, string) {
++	t.Helper()
++
++	dir, err := ioutil.TempDir("", "ledis-fixture-ttl-")
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	cfg := config.NewConfigDefault()
++	cfg.DataDir = dir
++	cfg.Databases = 8
++
++	l, err := ledis.Open(cfg)
++	if err != nil {
++		os.RemoveAll(dir)
++		t.Fatal(err)
++	}
++
++	db, err := l.Select(index)
++	if err != nil {
++		l.Close()
++		os.RemoveAll(dir)
++		t.Fatal(err)
++	}
++
++	return l, db, dir
++}
++
++func closeDB(l *ledis.Ledis, dir string) {
++	l.Close()
++	os.RemoveAll(dir)
++}
++
++func waitForFreshUnixSecond() {
++	for {
++		if time.Now().Nanosecond() < 100*1000*1000 {
++			return
++		}
++		time.Sleep(10 * time.Millisecond)
++	}
++}
++
++func assertNoError(t *testing.T, err error) {
++	t.Helper()
++	if err != nil {
++		t.Fatal(err)
++	}
++}
++
++func assertInt64(t *testing.T, label string, got int64, want int64) {
++	t.Helper()
++	if got != want {
++		t.Fatalf("%s: got %d, want %d", label, got, want)
++	}
++}
++
++func assertTTLWithinFreshExpire(t *testing.T, label string, got int64) {
++	t.Helper()
++	if got <= 0 || got > 60 {
++		t.Fatalf("%s: got %d, want positive TTL no greater than 60", label, got)
++	}
++}
++
++func TestTTLMethodsReportMissingNoExpirationExpireAndPersistForEveryType(t *testing.T) {
++
++
++	l, db, dir := openDB(t, 0)
++	defer closeDB(l, dir)
++
++	for _, tc := range allTTLCases() {
++		t.Run(tc.name, func(t *testing.T) {
++			ttl, err := tc.ttl(db, tc.key)
++			assertNoError(t, err)
++			assertInt64(t, "missing key ttl", ttl, -1)
++
++			count, err := tc.count(db, tc.key)
++			assertNoError(t, err)
++			assertInt64(t, "missing key count after ttl", count, 0)
++
++			assertNoError(t, tc.create(db, tc.key))
++			count, err = tc.count(db, tc.key)
++			assertNoError(t, err)
++
++			if count <= 0 {
++				t.Fatalf("created key count: got %d, want existing key", count)
++			}
++			countAfterCreate := count
++
++			ttl, err = tc.ttl(db, tc.key)
++			assertNoError(t, err)
++			assertInt64(t, "created key without expiration ttl", ttl, -1)
++
++			waitForFreshUnixSecond()
++
++			_, err = tc.expire(db, tc.key, 60)
++			assertNoError(t, err)
++
++			ttl, err = tc.ttl(db, tc.key)
++			assertNoError(t, err)
++
++			assertTTLWithinFreshExpire(t, "ttl after 60 second expire", ttl)
++			firstTTL := ttl
++
++			ttl, err = tc.ttl(db, tc.key)
++			assertNoError(t, err)
++
++			assertTTLWithinFreshExpire(t, "second ttl read", ttl)
++			if ttl > firstTTL {
++				t.Fatalf("second read keeps deadline unchanged: got %d after %d", ttl, firstTTL)
++			}
++
++			count, err = tc.count(db, tc.key)
++			assertNoError(t, err)
++
++			assertInt64(t, "count after ttl reads", count, countAfterCreate)
++
++
++			_, err = tc.persist(db, tc.key)
++			assertNoError(t, err)
++
++			ttl, err = tc.ttl(db, tc.key)
++			assertNoError(t, err)
++			assertInt64(t, "ttl after persist", ttl, -1)
++
++			count, err = tc.count(db, tc.key)
++			assertNoError(t, err)
++
++			assertInt64(t, "count after persist and ttl", count, countAfterCreate)
++		})
++	}
++}
++
++func TestTTLMethodsReportMinusOneAfterDeadlineHasPassed(t *testing.T) {
++
++
++	l, db, dir := openDB(t, 1)
++	defer closeDB(l, dir)
++
++	for _, tc := range allTTLCases() {
++		t.Run(tc.name, func(t *testing.T) {
++			assertNoError(t, tc.create(db, tc.key))
++
++
++			_, err := tc.expAt(db, tc.key, time.Now().Unix()+1)
++			assertNoError(t, err)
++
++			time.Sleep(1200 * time.Millisecond)
++			ttl, err := tc.ttl(db, tc.key)
++			assertNoError(t, err)
++			assertInt64(t, "ttl after deadline passed", ttl, -1)
++		})
++	}
++}
++
++func TestTTLMethodsRejectEmptyKeysConsistently(t *testing.T) {
++
++
++	l, db, dir := openDB(t, 2)
++	defer closeDB(l, dir)
++
++	for _, tc := range allTTLCases() {
++		t.Run(tc.name, func(t *testing.T) {
++			ttl, err := tc.ttl(db, []byte{})
++			assertInt64(t, "empty key ttl", ttl, -1)
++			if err == nil {
++				t.Fatal("empty key error: got nil, want invalid key size")
++			}
++			if err.Error() != "invalid key size" {
++				t.Fatalf("empty key error: got %q, want %q", err.Error(), "invalid key size")
++			}
++		})
++	}
++}
++
++func TestPersistStateCleanupIsIdempotent(t *testing.T) {
++
++
++	l, db, dir := openDB(t, 3)
++	defer closeDB(l, dir)
++
++	for _, tc := range allTTLCases() {
++		t.Run(tc.name, func(t *testing.T) {
++			assertNoError(t, tc.create(db, tc.key))
++			waitForFreshUnixSecond()
++
++			_, err := tc.expire(db, tc.key, 60)
++			assertNoError(t, err)
++
++			ttl, err := tc.ttl(db, tc.key)
++			assertNoError(t, err)
++
++			assertTTLWithinFreshExpire(t, "ttl before persist", ttl)
++
++
++			_, err = tc.persist(db, tc.key)
++			assertNoError(t, err)
++
++			ttl, err = tc.ttl(db, tc.key)
++			assertNoError(t, err)
++			assertInt64(t, "ttl after first persist", ttl, -1)
++
++
++			ttl, err = tc.ttl(db, tc.key)
++			assertNoError(t, err)
++			assertInt64(t, "second ttl after persist", ttl, -1)
++		})
++	}
++}
++
++func TestSelectedDBInstancesKeepTTLStateIndependent(t *testing.T) {
++
++
++	l, dbA, dir := openDB(t, 0)
++	defer closeDB(l, dir)
++
++	dbB, err := l.Select(1)
++	assertNoError(t, err)
++
++	for _, tc := range allTTLCases() {
++		t.Run(tc.name, func(t *testing.T) {
++			key := []byte("fixture:independent:" + tc.name)
++			assertNoError(t, tc.create(dbA, key))
++			countA, err := tc.count(dbA, key)
++			assertNoError(t, err)
++
++			if countA <= 0 {
++				t.Fatalf("dbA count before ttl: got %d, want existing key", countA)
++			}
++			countABeforeTTL := countA
++
++			waitForFreshUnixSecond()
++
++			_, err = tc.expire(dbA, key, 60)
++			assertNoError(t, err)
++
++			ttlA, err := tc.ttl(dbA, key)
++			assertNoError(t, err)
++
++			assertTTLWithinFreshExpire(t, "dbA ttl", ttlA)
++
++			countA, err = tc.count(dbA, key)
++			assertNoError(t, err)
++
++			assertInt64(t, "dbA count", countA, countABeforeTTL)
++
++			ttlB, err := tc.ttl(dbB, key)
++			assertNoError(t, err)
++			assertInt64(t, "dbB ttl", ttlB, -1)
++
++			countB, err := tc.count(dbB, key)
++			assertNoError(t, err)
++			assertInt64(t, "dbB count", countB, 0)
++		})
++	}
++}
++
++func TestLedisOpenSelectUseCloseCyclesSupportTTLLookups(t *testing.T) {
++
++
++	for i, tc := range allTTLCases() {
++		dir, err := ioutil.TempDir("", "ledis-fixture-lifecycle-")
++		if err != nil {
++			t.Fatal(err)
++		}
++
++		cfg := config.NewConfigDefault()
++		cfg.DataDir = dir
++		cfg.Databases = 2
++
++		l, err := ledis.Open(cfg)
++		if err != nil {
++			os.RemoveAll(dir)
++			t.Fatal(err)
++		}
++		db, err := l.Select(0)
++		if err != nil {
++			l.Close()
++			os.RemoveAll(dir)
++			t.Fatal(err)
++		}
++
++		key := []byte(fmt.Sprintf("fixture:lifecycle:%s:%03d", tc.name, i))
++		assertNoError(t, tc.create(db, key))
++		waitForFreshUnixSecond()
++
++		_, err = tc.expire(db, key, 60)
++		assertNoError(t, err)
++		ttl, err := tc.ttl(db, key)
++		assertNoError(t, err)
++
++		assertTTLWithinFreshExpire(t, "lifecycle ttl", ttl)
++
++		l.Close()
++		os.RemoveAll(dir)
++	}
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,21 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++
++cd /workspace/repo
++
++
++export GOFLAGS="-mod=vendor"
++export GOPROXY=off
++export GOSUMDB=off
++export GOTOOLCHAIN=local
++exec go test -v -count=1 ./usercase-test-coderl/...

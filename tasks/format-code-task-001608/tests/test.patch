@@ -1,0 +1,349 @@
+diff --git a/usercase-test-coderl/fixtures/sitecustomize.py b/usercase-test-coderl/fixtures/sitecustomize.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/fixtures/sitecustomize.py
+@@ -0,0 +1,85 @@
++import builtins
++import functools
++import importlib
++import ipaddress
++import socket
++import pickle
++import urllib.parse
++
++builtins.reduce = functools.reduce
++
++_original_socket_connect = socket.socket.connect
++_original_create_connection = socket.create_connection
++
++
++def _is_local_host(host):
++    if host in (None, "", "localhost", "0.0.0.0", "::", "::1"):
++        return True
++    try:
++        return ipaddress.ip_address(host).is_loopback
++    except ValueError:
++        return False
++
++
++def _host_from_address(address):
++    if isinstance(address, tuple) and address:
++        return address[0]
++    return None
++
++
++def _offline_connect(self, address):
++
++    if not _is_local_host(_host_from_address(address)):
++        raise RuntimeError("local offline guard blocked network connection to %r" % (address,))
++    return _original_socket_connect(self, address)
++
++
++def _offline_create_connection(address, *args, **kwargs):
++
++    if not _is_local_host(_host_from_address(address)):
++        raise RuntimeError("local offline guard blocked network connection to %r" % (address,))
++    return _original_create_connection(address, *args, **kwargs)
++
++
++socket.socket.connect = _offline_connect
++socket.create_connection = _offline_create_connection
++
++try:
++    nltk_util = importlib.import_module("nltk.util")
++    original_ngrams = nltk_util.ngrams
++
++    def list_ngrams(*args, **kwargs):
++        return list(original_ngrams(*args, **kwargs))
++
++    nltk_util.ngrams = list_ngrams
++except Exception:
++    pass
++
++try:
++    nltk_data = importlib.import_module("nltk.data")
++except Exception:
++    nltk_data = None
++
++if nltk_data is not None:
++    original_load = nltk_data.load
++
++    def compat_load(resource_url, *args, **kwargs):
++        try:
++            return original_load(resource_url, *args, **kwargs)
++        except Exception as original_error:
++            fmt = kwargs.get("format") if "format" in kwargs else (args[0] if args else "auto")
++            if fmt not in ("auto", "pickle") or not str(resource_url).endswith(".pickle"):
++                raise
++
++            try:
++                if str(resource_url).startswith("file:"):
++                    path = urllib.parse.urlparse(str(resource_url)).path
++                else:
++                    path = str(nltk_data.find(resource_url))
++
++                with open(path, "rb") as infile:
++                    return pickle.load(infile)
++            except Exception:
++                raise original_error
++
++    nltk_data.load = compat_load
+diff --git a/usercase-test-coderl/fixtures/coderl_classifier.py b/usercase-test-coderl/fixtures/coderl_classifier.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/fixtures/coderl_classifier.py
+@@ -0,0 +1,38 @@
++class ProbResult:
++    def __init__(self, probs):
++        self.probs = probs
++
++    def max(self):
++        return max(self.probs, key=self.probs.get)
++
++    def prob(self, label):
++        return self.probs[label]
++
++
++class FeatureClassifier:
++    _labels = ["alpha", "case_label", "punct_label", "ngram_label", "stop_label", "lowconf"]
++
++    def labels(self):
++        return list(self._labels)
++
++    def prob_classify(self, feats):
++        probs = dict((label, 0.01) for label in self._labels)
++
++        if "red" in feats and ("blue", "moon") in feats:
++            probs["ngram_label"] = 0.94
++        elif "CASETOKEN" in feats:
++            probs["case_label"] = 0.93
++        elif "!" in feats:
++            probs["punct_label"] = 0.92
++        elif "anchor" in feats and "the" not in feats:
++            probs["stop_label"] = 0.95
++        elif "below" in feats:
++            probs["lowconf"] = 0.85
++        elif "exact" in feats:
++            probs["alpha"] = 0.90
++        elif "alpha" in feats:
++            probs["alpha"] = 0.91
++        else:
++            probs["lowconf"] = 0.50
++
++        return ProbResult(probs)
+diff --git a/usercase-test-coderl/usecase.sh b/usercase-test-coderl/usecase.sh
+new file mode 100755
+--- /dev/null
++++ b/usercase-test-coderl/usecase.sh
+@@ -0,0 +1,190 @@
++#!/usr/bin/env bash
++
++set -u
++export LANG=C.UTF-8 LC_ALL=C.UTF-8 TZ=UTC
++export PYTHONDONTWRITEBYTECODE=1
++export PIP_NO_INDEX=1
++export PIP_DISABLE_PIP_VERSION_CHECK=1
++export UV_OFFLINE=1
++export NPM_CONFIG_OFFLINE=true
++
++fail() { echo "FAIL: $*" >&2; exit 1; }
++
++FIXTURES=/workspace/repo/usercase-test-coderl/fixtures
++export PYTHONPATH="$FIXTURES:/workspace/repo${PYTHONPATH:+:$PYTHONPATH}"
++
++( cd /workspace/repo && python -m py_compile classify_corpus.py ) \
++    || { echo "FAIL: build" >&2; exit 1; }
++
++BIN=/workspace/repo/classify_corpus.py
++[ -x "$BIN" ] || fail "classify_corpus.py is not executable"
++
++TMP=$(mktemp -d)
++trap 'rm -rf "$TMP"' EXIT
++cd "$TMP"
++
++NLTK_ROOT="$TMP/nltk_data"
++MOVIE_ROOT="$NLTK_ROOT/corpora/movie_reviews"
++MODEL_PATH="$NLTK_ROOT/classifiers/coderl_fixture.pickle"
++export NLTK_DATA="$NLTK_ROOT${NLTK_DATA:+:$NLTK_DATA}"
++
++mkdir -p "$NLTK_ROOT/classifiers" "$MOVIE_ROOT/pos" "$MOVIE_ROOT/neg" "$NLTK_ROOT/corpora/stopwords"
++
++cat > "$NLTK_ROOT/corpora/stopwords/english" <<'EOF'
++a
++an
++and
++are
++as
++at
++be
++by
++for
++from
++in
++is
++it
++of
++on
++or
++that
++the
++to
++was
++with
++EOF
++python - "$MODEL_PATH" <<'PY'
++import pickle
++import sys
++from coderl_classifier import FeatureClassifier
++
++with open(sys.argv[1], "wb") as outfile:
++    pickle.dump(FeatureClassifier(), outfile)
++PY
++
++labels=(alpha case_label punct_label ngram_label stop_label lowconf)
++
++reset_corpus() {
++    rm -rf "$MOVIE_ROOT"
++    mkdir -p "$MOVIE_ROOT/pos" "$MOVIE_ROOT/neg"
++    printf '%s' "$1" > "$MOVIE_ROOT/pos/doc.txt"
++}
++
++run_case() {
++    case_name=$1
++    corpus_text=$2
++    shift 2
++
++    reset_corpus "$corpus_text"
++    TARGET="$TMP/targets/$case_name"
++    rm -rf "$TARGET"
++    "$BIN" movie_reviews "$TARGET" --classifier classifiers/coderl_fixture.pickle "$@" >out 2>err
++    ec=$?
++}
++
++assert_absent_or_empty_file() {
++
++    [ ! -e "$1" ] || [ ! -s "$1" ] || fail "$2 expected no accepted text in $1; got: $(cat "$1")"
++}
++
++assert_file_literal() {
++    expected_file="$TMP/expected.$$"
++    printf '%s' "$2" > "$expected_file"
++    cmp -s "$expected_file" "$1" || fail "$3 content for $1: $(sed -n l "$1" 2>/dev/null)"
++    rm -f "$expected_file"
++}
++
++assert_stdout_line() {
++
++    grep -Fx -- "$2" out >/dev/null || fail "$1 missing stdout line '$2'; got: $(cat out)"
++}
++
++assert_trace_suppressed() {
++
++    if grep -E '^(loaded |loading |filename for category |classifying (paras|sents)$)' out err >/dev/null; then
++        fail "$1 expected trace progress lines to be suppressed; stdout: $(cat out); stderr: $(cat err)"
++    fi
++}
++
++
++
++
++run_case default $'Exact first. Exact second.\n\nBelow ignored.\n'
++[ "$ec" -eq 0 ] || fail "F1 exit $ec; want 0"
++assert_stdout_line F1 "loaded movie_reviews"
++assert_stdout_line F1 "loading classifiers/coderl_fixture.pickle"
++for label in "${labels[@]}"; do
++    assert_stdout_line F1 "filename for category $label: $TARGET/$label.txt"
++done
++assert_stdout_line F1 "classifying paras"
++[ -d "$TARGET" ] || fail "F1 target directory was not created"
++assert_file_literal "$TARGET/alpha.txt" $'Exact first. Exact second.\n\n' F1
++assert_absent_or_empty_file "$TARGET/lowconf.txt" F1
++
++
++
++
++run_case sents $'Alpha one. Alpha two.\n' --instances sents --trace 0
++[ "$ec" -eq 0 ] || fail "F2 exit $ec; want 0"
++assert_trace_suppressed F2
++assert_file_literal "$TARGET/alpha.txt" $'Alpha one.\n\nAlpha two.\n\n' F2
++
++
++
++
++run_case threshold $'Below accepted.\n' --threshold 0.8 --trace 0
++[ "$ec" -eq 0 ] || fail "F3 exit $ec; want 0"
++assert_trace_suppressed F3
++assert_file_literal "$TARGET/lowconf.txt" $'Below accepted.\n\n' F3
++assert_absent_or_empty_file "$TARGET/alpha.txt" F3
++
++
++
++
++run_case nolower $'CASETOKEN kept.\n' --no-lowercase --trace 0
++[ "$ec" -eq 0 ] || fail "F4 exit $ec; want 0"
++assert_trace_suppressed F4
++assert_file_literal "$TARGET/case_label.txt" $'CASETOKEN kept.\n\n' F4
++assert_absent_or_empty_file "$TARGET/alpha.txt" F4
++
++
++
++
++run_case punct $'Wow!\n' --punctuation --trace 0
++[ "$ec" -eq 0 ] || fail "F5 exit $ec; want 0"
++assert_trace_suppressed F5
++assert_file_literal "$TARGET/punct_label.txt" $'Wow!\n\n' F5
++assert_absent_or_empty_file "$TARGET/alpha.txt" F5
++
++
++
++
++run_case stop $'The anchor stays.\n' --filter-stopwords english --trace 0
++[ "$ec" -eq 0 ] || fail "F6 exit $ec; want 0"
++assert_trace_suppressed F6
++assert_file_literal "$TARGET/stop_label.txt" $'The anchor stays.\n\n' F6
++assert_absent_or_empty_file "$TARGET/alpha.txt" F6
++
++
++
++
++run_case ngrams $'Red alert. Blue moon.\n' --ngrams 1 --ngrams 2 --trace 0
++[ "$ec" -eq 0 ] || fail "F7 exit $ec; want 0"
++assert_trace_suppressed F7
++assert_file_literal "$TARGET/ngram_label.txt" $'Red alert. Blue moon.\n\n' F7
++assert_absent_or_empty_file "$TARGET/alpha.txt" F7
++
++
++
++
++reset_corpus $'Alpha missing.\n'
++TARGET="$TMP/targets/error"
++rm -rf "$TARGET"
++"$BIN" movie_reviews "$TARGET" >out 2>err
++ec=$?
++[ "$ec" -ne 0 ] || fail "F_err exit $ec; want non-zero"
++[ -s err ] || fail "F_err expected stderr"
++grep -q 'one of wordlist or classifier is needed' err || fail "F_err stderr: $(cat err)"
++
++echo "PASS"
++exit 0
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,16 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++export PIP_NO_INDEX=1
++export PIP_DISABLE_PIP_VERSION_CHECK=1
++export UV_OFFLINE=1
++export NPM_CONFIG_OFFLINE=true
++set -e
++cd /workspace/repo
++exec bash /workspace/repo/usercase-test-coderl/usecase.sh

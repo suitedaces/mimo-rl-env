@@ -1,0 +1,360 @@
+diff --git a/usercase-test-coderl/test_multi_optimizer_stateful.py b/usercase-test-coderl/test_multi_optimizer_stateful.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/test_multi_optimizer_stateful.py
+@@ -0,0 +1,329 @@
++
++
++
++
++
++
++
++
++
++
++
++import gc
++import tracemalloc
++
++import pytest
++
++import mlx.core as mx
++import mlx.optimizers as optim
++
++
++def _params():
++    return {
++        "layer": {
++            "weight": mx.array([[1.0, -2.0], [3.0, -4.0]]),
++            "bias": mx.array([0.5, -0.5]),
++        },
++        "head": {"scale": mx.array([2.0])},
++    }
++
++
++def _grads():
++    return {
++        "layer": {
++            "weight": mx.array([[0.25, -0.5], [0.75, -1.0]]),
++            "bias": mx.array([0.1, -0.2]),
++        },
++        "head": {"scale": mx.array([0.3])},
++    }
++
++
++def _multi_optimizer():
++    return optim.MultiOptimizer(
++        [optim.Adam(0.001), optim.SGD(0.1)],
++        filters=[lambda name, weight: weight.ndim > 1],
++    )
++
++
++def _as_float_tree(tree):
++    if isinstance(tree, dict):
++        return {k: _as_float_tree(v) for k, v in tree.items()}
++    if isinstance(tree, (list, tuple)):
++        return type(tree)(_as_float_tree(v) for v in tree)
++    return tree.tolist()
++
++
++def test_routes_matrix_weights_to_adam_and_1d_parameters_to_sgd():
++
++
++
++
++    optimizer = _multi_optimizer()
++    params = _params()
++    grads = _grads()
++
++    assert sorted(optimizer.state.keys()) == ["states"]
++    assert len(optimizer.state["states"]) == 2
++    assert sorted(optimizer.state["states"][0].keys()) == ["learning_rate", "step"]
++    assert sorted(optimizer.state["states"][1].keys()) == ["learning_rate", "step"]
++    assert optimizer.learning_rate.item() == pytest.approx(0.0010000000474974513)
++
++    optimizer.init(params)
++    assert sorted(optimizer.state["states"][0].keys()) == [
++        "layer",
++        "learning_rate",
++        "step",
++    ]
++    assert sorted(optimizer.state["states"][1].keys()) == [
++        "head",
++        "layer",
++        "learning_rate",
++        "step",
++    ]
++    assert int(optimizer.state["states"][0]["step"].item()) == 0
++    assert int(optimizer.state["states"][1]["step"].item()) == 0
++    assert sorted(optimizer.state["states"][0]["layer"].keys()) == ["weight"]
++    assert sorted(optimizer.state["states"][1]["layer"].keys()) == ["bias"]
++    assert sorted(optimizer.state["states"][1]["head"].keys()) == ["scale"]
++    assert optimizer.state["states"][0]["layer"]["weight"]["m"].tolist() == [
++        [0.0, 0.0],
++        [0.0, 0.0],
++    ]
++    assert optimizer.state["states"][0]["layer"]["weight"]["v"].tolist() == [
++        [0.0, 0.0],
++        [0.0, 0.0],
++    ]
++    assert optimizer.state["states"][1]["layer"]["bias"]["v"].tolist() == [0.0, 0.0]
++    assert optimizer.state["states"][1]["head"]["scale"]["v"].tolist() == [0.0]
++
++    updated = optimizer.apply_gradients(grads, params)
++    mx.eval(updated, optimizer.state)
++
++    assert _as_float_tree(updated) == {
++        "head": {"scale": [1.9700000286102295]},
++        "layer": {
++            "bias": [0.49000000953674316, -0.47999998927116394],
++            "weight": [
++                [0.9968377351760864, -1.9968377351760864],
++                [2.996837615966797, -3.996837615966797],
++            ],
++        },
++    }
++    assert int(optimizer.state["states"][0]["step"].item()) == 1
++    assert int(optimizer.state["states"][1]["step"].item()) == 1
++    assert optimizer.state["states"][0]["layer"]["weight"]["m"].tolist() == [
++        [0.02500000037252903, -0.05000000074505806],
++        [0.07500000298023224, -0.10000000149011612],
++    ]
++    assert optimizer.state["states"][0]["layer"]["weight"]["v"].tolist() == [
++        [6.25000029685907e-05, 0.0002500000118743628],
++        [0.000562500033993274, 0.0010000000474974513],
++    ]
++
++
++def test_single_optimizer_uses_fallback_for_the_whole_tree():
++
++
++
++
++    optimizer = optim.MultiOptimizer([optim.SGD(0.1)], filters=[])
++    params = _params()
++    grads = _grads()
++
++    optimizer.init(params)
++    assert len(optimizer.state["states"]) == 1
++    assert sorted(optimizer.state["states"][0].keys()) == [
++        "head",
++        "layer",
++        "learning_rate",
++        "step",
++    ]
++    assert sorted(optimizer.state["states"][0]["layer"].keys()) == ["bias", "weight"]
++    assert sorted(optimizer.state["states"][0]["head"].keys()) == ["scale"]
++
++    updated = optimizer.apply_gradients(grads, params)
++    mx.eval(updated, optimizer.state)
++
++    assert _as_float_tree(updated) == {
++        "head": {"scale": [1.9700000286102295]},
++        "layer": {
++            "bias": [0.49000000953674316, -0.47999998927116394],
++            "weight": [
++                [0.9750000238418579, -1.9500000476837158],
++                [2.924999952316284, -3.9000000953674316],
++            ],
++        },
++    }
++    assert int(optimizer.state["states"][0]["step"].item()) == 1
++
++
++def test_constructor_rejects_filter_count_that_is_not_one_less_than_optimizers():
++
++
++
++
++
++    with pytest.raises(ValueError):
++        optim.MultiOptimizer([optim.Adam(0.001), optim.SGD(0.1)], filters=[])
++
++
++    with pytest.raises(ValueError):
++        optim.MultiOptimizer(
++            [optim.Adam(0.001), optim.SGD(0.1)],
++            filters=[lambda name, weight: True, lambda name, weight: False],
++        )
++
++
++def test_state_getter_and_setter_round_trip_wrapped_optimizer_states():
++
++
++
++
++    source = _multi_optimizer()
++    target = _multi_optimizer()
++    params = _params()
++    grads = _grads()
++
++    source.init(params)
++    updated = source.apply_gradients(grads, params)
++    mx.eval(updated, source.state)
++
++    assert int(source.state["states"][0]["step"].item()) == 1
++    assert int(source.state["states"][1]["step"].item()) == 1
++    assert sorted(target.state["states"][0].keys()) == ["learning_rate", "step"]
++
++    target.state = source.state
++
++    assert int(target.state["states"][0]["step"].item()) == 1
++    assert int(target.state["states"][1]["step"].item()) == 1
++    assert sorted(target.state["states"][0].keys()) == [
++        "layer",
++        "learning_rate",
++        "step",
++    ]
++    assert sorted(target.state["states"][1].keys()) == [
++        "head",
++        "layer",
++        "learning_rate",
++        "step",
++    ]
++    assert target.state["states"][0]["layer"]["weight"]["m"].tolist() == [
++        [0.02500000037252903, -0.05000000074505806],
++        [0.07500000298023224, -0.10000000149011612],
++    ]
++    assert target.state["states"][1]["learning_rate"].item() == pytest.approx(
++        0.10000000149011612
++    )
++
++
++def test_state_setter_rejects_missing_or_wrong_length_states_list():
++
++
++
++
++    optimizer = _multi_optimizer()
++
++
++    with pytest.raises(ValueError):
++        optimizer.state = {}
++
++
++    with pytest.raises(ValueError):
++        optimizer.state = {"states": [optim.Adam(0.1).state]}
++
++
++    with pytest.raises(ValueError):
++        optimizer.state = {
++            "states": [
++                optim.Adam(0.1).state,
++                optim.SGD(0.1).state,
++                optim.SGD(0.2).state,
++            ]
++        }
++
++
++def test_learning_rate_getter_uses_first_optimizer_and_setter_updates_all():
++
++
++
++
++    optimizer = _multi_optimizer()
++
++    assert optimizer.learning_rate.item() == pytest.approx(0.0010000000474974513)
++    assert optimizer.state["states"][0]["learning_rate"].item() == pytest.approx(
++        0.0010000000474974513
++    )
++    assert optimizer.state["states"][1]["learning_rate"].item() == pytest.approx(
++        0.10000000149011612
++    )
++
++    optimizer.learning_rate = 0.25
++
++    assert optimizer.learning_rate.item() == pytest.approx(0.25)
++    assert optimizer.state["states"][0]["learning_rate"].item() == pytest.approx(0.25)
++    assert optimizer.state["states"][1]["learning_rate"].item() == pytest.approx(0.25)
++
++
++def test_instances_keep_independent_optimizer_state():
++
++
++
++
++    a = _multi_optimizer()
++    b = _multi_optimizer()
++    params = _params()
++    grads = _grads()
++
++    a.init(params)
++    updated = a.apply_gradients(grads, params)
++    mx.eval(updated, a.state)
++
++    assert int(a.state["states"][0]["step"].item()) == 1
++    assert int(a.state["states"][1]["step"].item()) == 1
++    assert sorted(a.state["states"][0].keys()) == ["layer", "learning_rate", "step"]
++    assert sorted(b.state["states"][0].keys()) == ["learning_rate", "step"]
++    assert int(b.state["states"][0]["step"].item()) == 0
++    assert int(b.state["states"][1]["step"].item()) == 0
++    assert b.state["states"][0]["learning_rate"].item() == pytest.approx(
++        0.0010000000474974513
++    )
++    assert b.state["states"][1]["learning_rate"].item() == pytest.approx(
++        0.10000000149011612
++    )
++
++
++def test_repeated_optimizer_sessions_do_not_retain_python_state_unboundedly():
++
++
++
++
++    tracemalloc.start()
++    try:
++        for cycle in range(150):
++            params = _params()
++            grads = _grads()
++            optimizer = _multi_optimizer()
++            optimizer.init(params)
++            updated = optimizer.apply_gradients(grads, params)
++            mx.eval(updated, optimizer.state)
++
++
++            assert sorted(updated.keys()) == ["head", "layer"]
++            assert sorted(updated["layer"].keys()) == ["bias", "weight"]
++            assert int(optimizer.state["states"][0]["step"].item()) == 1
++            assert int(optimizer.state["states"][1]["step"].item()) == 1
++            del updated, optimizer, params, grads
++            if cycle % 25 == 0:
++                gc.collect()
++
++        gc.collect()
++        current, peak = tracemalloc.get_traced_memory()
++    finally:
++        tracemalloc.stop()
++
++
++    assert peak >= current
++    fresh = _multi_optimizer()
++    assert len(fresh.state["states"]) == 2
++    assert int(fresh.state["states"][0]["step"].item()) == 0
++    assert int(fresh.state["states"][1]["step"].item()) == 0
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,21 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++
++
++set -euo pipefail
++
++cd /workspace/repo
++
++export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
++export PYTHONPATH="/workspace/repo/python${PYTHONPATH:+:$PYTHONPATH}"
++
++exec /opt/coderl_venv/bin/python -m pytest /workspace/repo/usercase-test-coderl/test_multi_optimizer_stateful.py -v

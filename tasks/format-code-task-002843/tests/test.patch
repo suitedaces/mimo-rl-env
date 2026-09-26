@@ -1,0 +1,272 @@
+diff --git a/pkg/cluster/admin_kind_test.go b/pkg/cluster/admin_kind_test.go
+new file mode 100644
+index 0000000..f8041ad
+--- /dev/null
++++ b/pkg/cluster/admin_kind_test.go
+@@ -0,0 +1,243 @@
++package cluster
++
++import (
++	"context"
++	"fmt"
++	"os"
++	"path/filepath"
++	"regexp"
++	"strings"
++	"testing"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++	"github.com/tilt-dev/ctlptl/pkg/api"
++	"k8s.io/apimachinery/pkg/version"
++	discoveryfake "k8s.io/client-go/discovery/fake"
++	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
++)
++
++const hiddenKindClusterName = "kind-ctlptl-hidden-test"
++
++type fakeKindInstall struct {
++	logPath   string
++	stdinPath string
++}
++
++func installFakeKind(t *testing.T, versionOutput string) fakeKindInstall {
++	t.Helper()
++
++	dir := t.TempDir()
++	logPath := filepath.Join(dir, "kind.log")
++	stdinPath := filepath.Join(dir, "kind-create-stdin.yaml")
++	versionFile := filepath.Join(dir, "kind-version-output")
++	require.NoError(t, os.WriteFile(versionFile, []byte(versionOutput), 0644))
++
++	script := fmt.Sprintf(`#!/bin/sh
++set -eu
++printf '%%s\n' "$*" >> %[1]q
++if [ "$1" = "version" ]; then
++  cat %[2]q
++  exit 0
++fi
++if [ "$1" = "create" ] && [ "$2" = "cluster" ]; then
++  cat > %[3]q
++  exit 0
++fi
++echo "unexpected kind invocation: $*" >&2
++exit 42
++`, logPath, versionFile, stdinPath)
++
++	kindPath := filepath.Join(dir, "kind")
++	require.NoError(t, os.WriteFile(kindPath, []byte(script), 0755))
++
++	oldPath := os.Getenv("PATH")
++	t.Setenv("PATH", dir+string(os.PathListSeparator)+oldPath)
++	return fakeKindInstall{logPath: logPath, stdinPath: stdinPath}
++}
++
++func newRealKindFixture(t *testing.T, versionOutput string) (*fixture, fakeKindInstall) {
++	t.Helper()
++
++	fakeKind := installFakeKind(t, versionOutput)
++	f := newFixture(t)
++	f.dockerClient.started = true
++	f.controller.dockerClient = f.dockerClient
++	f.dmachine.os = "linux"
++	f.fakeK8s.Discovery().(*discoveryfake.FakeDiscovery).FakedServerVersion = &version.Info{
++		GitVersion: "v1.19.0",
++	}
++	f.controller.configLoader = configLoader(func() (clientcmdapi.Config, error) {
++		cfg := *f.config.DeepCopy()
++		if createInvocation(readKindInvocations(t, fakeKind.logPath)) != "" {
++			cfg.Contexts[hiddenKindClusterName] = &clientcmdapi.Context{Cluster: hiddenKindClusterName}
++			cfg.Clusters[hiddenKindClusterName] = &clientcmdapi.Cluster{Server: "http://kind-ctlptl-hidden-test.localhost/"}
++			cfg.CurrentContext = hiddenKindClusterName
++		}
++		return cfg, nil
++	})
++	return f, fakeKind
++}
++
++func applyKindCluster(t *testing.T, versionOutput, kubernetesVersion string) (fakeKindInstall, error) {
++	t.Helper()
++
++	f, fakeKind := newRealKindFixture(t, versionOutput)
++	_, err := f.controller.Apply(context.Background(), &api.Cluster{
++		Name:              hiddenKindClusterName,
++		Product:           string(ProductKIND),
++		KubernetesVersion: kubernetesVersion,
++	})
++	return fakeKind, err
++}
++
++func readKindInvocations(t *testing.T, logPath string) []string {
++	t.Helper()
++	b, err := os.ReadFile(logPath)
++	if os.IsNotExist(err) {
++		return nil
++	}
++	require.NoError(t, err)
++	lines := strings.Split(strings.TrimSpace(string(b)), "\n")
++	if len(lines) == 1 && lines[0] == "" {
++		return nil
++	}
++	return lines
++}
++
++func createInvocation(lines []string) string {
++	for _, line := range lines {
++		if strings.HasPrefix(line, "create cluster ") || line == "create cluster" {
++			return line
++		}
++	}
++	return ""
++}
++
++func extractVersionPin(t *testing.T, fakeKind fakeKindInstall, createArgs string) string {
++	t.Helper()
++	if pin := versionInText(createArgs); pin != "" {
++		return pin
++	}
++	parts := strings.Fields(createArgs)
++	for i, p := range parts {
++		if p == "--config" && i+1 < len(parts) {
++			return readConfigImageIfPresent(t, fakeKind, parts[i+1])
++		}
++		if strings.HasPrefix(p, "--config=") {
++			return readConfigImageIfPresent(t, fakeKind, strings.TrimPrefix(p, "--config="))
++		}
++	}
++	return ""
++}
++
++func versionInText(text string) string {
++	re := regexp.MustCompile(`[^\s"']*v[0-9]+\.[0-9]+\.[0-9]+[^\s"']*`)
++	return re.FindString(text)
++}
++
++func readConfigImageIfPresent(t *testing.T, fakeKind fakeKindInstall, path string) string {
++	t.Helper()
++	if path == "-" {
++		path = fakeKind.stdinPath
++	}
++	b, err := os.ReadFile(path)
++	if err != nil {
++		return ""
++	}
++	return versionInText(string(b))
++}
++
++func assertNoCreateInvocation(t *testing.T, fakeKind fakeKindInstall) {
++	t.Helper()
++	assert.Empty(t, createInvocation(readKindInvocations(t, fakeKind.logPath)))
++}
++
++func TestKindClusterSpecAcceptsKubernetesVersion(t *testing.T) {
++	f := newFixture(t)
++	f.dockerClient.started = true
++	f.controller.dockerClient = f.dockerClient
++	f.dmachine.os = "linux"
++	f.newFakeAdmin(ProductKIND)
++
++	result, err := f.controller.Apply(context.Background(), &api.Cluster{
++		Name:              "kind-version-acceptance",
++		Product:           string(ProductKIND),
++		KubernetesVersion: "v1.19.0",
++	})
++
++	require.NoError(t, err)
++	assert.Equal(t, "kind-version-acceptance", result.Name)
++	assert.Equal(t, "v1.19.0", result.Status.KubernetesVersion)
++}
++
++func TestKindCreateWithKubernetesVersionAddsCompatibleVersionPin(t *testing.T) {
++	fakeKind, err := applyKindCluster(t, "kind v0.9.0", "v1.19.0")
++	require.NoError(t, err)
++
++	createArgs := createInvocation(readKindInvocations(t, fakeKind.logPath))
++	require.NotEmpty(t, createArgs, "expected ctlptl to invoke kind create cluster")
++	pin := extractVersionPin(t, fakeKind, createArgs)
++	require.NotEmpty(t, pin, "expected KIND create request to include a version pin")
++	assert.Regexp(t, regexp.MustCompile(`(^|[^0-9])v?1\.19\.`), pin)
++}
++
++func TestKindCreateWithoutKubernetesVersionDoesNotForceVersionPin(t *testing.T) {
++	fakeKind, err := applyKindCluster(t, "", "")
++	require.NoError(t, err)
++
++	createArgs := createInvocation(readKindInvocations(t, fakeKind.logPath))
++	require.NotEmpty(t, createArgs, "expected ctlptl to invoke kind create cluster")
++	assert.Empty(t, extractVersionPin(t, fakeKind, createArgs), "unversioned KIND clusters should preserve existing default create behavior")
++}
++
++func TestKindCreatePatchVersionsWithinSameMinorSelectSameCompatibleVersionPin(t *testing.T) {
++	fakeKindA, err := applyKindCluster(t, "kind v0.9.0", "v1.19.0")
++	require.NoError(t, err)
++	pinA := extractVersionPin(t, fakeKindA, createInvocation(readKindInvocations(t, fakeKindA.logPath)))
++	require.NotEmpty(t, pinA)
++
++	fakeKindB, err := applyKindCluster(t, "kind v0.9.0", "1.19.7")
++	require.NoError(t, err)
++	pinB := extractVersionPin(t, fakeKindB, createInvocation(readKindInvocations(t, fakeKindB.logPath)))
++	require.NotEmpty(t, pinB)
++
++	assert.Equal(t, pinA, pinB, "different patches in the same Kubernetes minor should resolve to the same compatible KIND target")
++	assert.Regexp(t, regexp.MustCompile(`(^|[^0-9])v?1\.19\.`), pinA)
++}
++
++func TestKindCreateUnknownKindVersionReturnsClearError(t *testing.T) {
++	fakeKind, err := applyKindCluster(t, "kind v123.0.0", "v1.19.0")
++
++	require.Error(t, err)
++	assert.NotEmpty(t, err.Error())
++	assertNoCreateInvocation(t, fakeKind)
++}
++
++func TestKindCreateUnsupportedKubernetesMinorReturnsClearError(t *testing.T) {
++	fakeKind, err := applyKindCluster(t, "kind v0.9.0", "v1.99.0")
++
++	require.Error(t, err)
++	assert.NotEmpty(t, err.Error())
++	assertNoCreateInvocation(t, fakeKind)
++}
++
++func TestKindCreateInvalidKubernetesVersionReturnsParseError(t *testing.T) {
++	for _, badVersion := range []string{"definitely-not-a-version", "v1.not-a-minor"} {
++		t.Run(badVersion, func(t *testing.T) {
++			fakeKind, err := applyKindCluster(t, "kind v0.9.0", badVersion)
++
++			require.Error(t, err)
++			assert.NotEmpty(t, err.Error())
++			assertNoCreateInvocation(t, fakeKind)
++		})
++	}
++}
++
++func TestKindCreateMalformedKindVersionOutputReturnsParseError(t *testing.T) {
++	fakeKind, err := applyKindCluster(t, "kind", "v1.19.0")
++
++	require.Error(t, err)
++	assert.NotEmpty(t, err.Error())
++	assertNoCreateInvocation(t, fakeKind)
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,18 @@
++#!/bin/bash
++set -uo pipefail
++cd /testbed
++
++
++
++case "${1:-}" in
++  base)
++    go test -v -count=1 -run 'TestClusterApplyKIND$|TestClusterApplyMinikubeVersion$' ./pkg/cluster/
++    ;;
++  new)
++    go test -v -count=1 -run 'TestKindClusterSpecAcceptsKubernetesVersion$|TestKindCreateWithKubernetesVersionAddsCompatibleVersionPin$|TestKindCreateWithoutKubernetesVersionDoesNotForceVersionPin$|TestKindCreatePatchVersionsWithinSameMinorSelectSameCompatibleVersionPin$|TestKindCreateUnknownKindVersionReturnsClearError$|TestKindCreateUnsupportedKubernetesMinorReturnsClearError$|TestKindCreateInvalidKubernetesVersionReturnsParseError$|TestKindCreateMalformedKindVersionOutputReturnsParseError$' ./pkg/cluster/
++    ;;
++  *)
++    echo "usage: $0 base|new"
++    exit 2
++    ;;
++esac

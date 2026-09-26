@@ -1,0 +1,544 @@
+diff --git a/usercase-test-coderl/test_periodic_send.py b/usercase-test-coderl/test_periodic_send.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/test_periodic_send.py
+@@ -0,0 +1,512 @@
++import threading
++import time
++from typing import Any
++
++import pytest
++
++import can
++
++
++class RecordingBus(can.BusABC):
++
++
++    def __init__(self) -> None:
++        self._sent: list[tuple[int, Any, bytes]] = []
++        self._sent_lock = threading.RLock()
++        super().__init__(channel=None)
++
++    def send(self, msg: can.Message, timeout: float | None = None) -> None:
++        with self._sent_lock:
++            self._sent.append((msg.arbitration_id, msg.channel, bytes(msg.data)))
++
++    def _recv_internal(self, timeout: float | None) -> tuple[can.Message | None, bool]:
++        return None, False
++
++    def snapshot(self) -> list[tuple[int, Any, bytes]]:
++        with self._sent_lock:
++            return list(self._sent)
++
++    def clear(self) -> None:
++        with self._sent_lock:
++            self._sent.clear()
++
++
++def wait_for_sends(
++    bus: RecordingBus, count: int, timeout: float = 0.5
++) -> list[tuple[int, Any, bytes]]:
++    deadline = time.monotonic() + timeout
++    while time.monotonic() < deadline:
++        snapshot = bus.snapshot()
++        if len(snapshot) >= count:
++            return snapshot
++        time.sleep(0.002)
++    return bus.snapshot()
++
++
++def assert_no_new_sends(bus: RecordingBus, quiet_time: float = 0.05) -> None:
++    bus.clear()
++    time.sleep(quiet_time)
++    assert bus.snapshot() == []
++
++
++def test_single_message_repeats_until_stop() -> None:
++
++
++
++
++    bus = RecordingBus()
++    task = bus.send_periodic(can.Message(arbitration_id=0x123, data=[1]), 0.01)
++
++    try:
++        assert wait_for_sends(bus, 3)[:3] == [
++            (291, None, b"\x01"),
++            (291, None, b"\x01"),
++            (291, None, b"\x01"),
++        ]
++        task.stop()
++        assert_no_new_sends(bus)
++    finally:
++        task.stop()
++        bus.shutdown()
++
++
++def test_two_message_sequence_cycles_in_order() -> None:
++
++
++
++
++    bus = RecordingBus()
++    msg_a = can.Message(arbitration_id=0x321, channel="vcan0", data=[10])
++    msg_b = can.Message(arbitration_id=0x321, channel="vcan0", data=[20])
++    task = bus.send_periodic([msg_a, msg_b], 0.01)
++
++    try:
++        assert wait_for_sends(bus, 6)[:6] == [
++            (801, "vcan0", b"\x0a"),
++            (801, "vcan0", b"\x14"),
++            (801, "vcan0", b"\x0a"),
++            (801, "vcan0", b"\x14"),
++            (801, "vcan0", b"\x0a"),
++            (801, "vcan0", b"\x14"),
++        ]
++    finally:
++        task.stop()
++        bus.shutdown()
++
++
++def test_duration_and_autostart_lifecycle() -> None:
++
++
++
++
++    duration_bus = RecordingBus()
++    duration_task = duration_bus.send_periodic(
++        can.Message(arbitration_id=0x124, data=[2]), 0.01, duration=0.05
++    )
++    try:
++        assert wait_for_sends(duration_bus, 3)[:3] == [
++            (292, None, b"\x02"),
++            (292, None, b"\x02"),
++            (292, None, b"\x02"),
++        ]
++        time.sleep(0.12)
++        assert_no_new_sends(duration_bus)
++    finally:
++        duration_task.stop()
++        duration_bus.shutdown()
++
++    autostart_bus = RecordingBus()
++    autostart_task = autostart_bus.send_periodic(
++        can.Message(arbitration_id=0x125, data=[3]), 0.01, autostart=False
++    )
++    try:
++        time.sleep(0.04)
++        assert autostart_bus.snapshot() == []
++        autostart_task.start()
++        assert wait_for_sends(autostart_bus, 3)[:3] == [
++            (293, None, b"\x03"),
++            (293, None, b"\x03"),
++            (293, None, b"\x03"),
++        ]
++    finally:
++        autostart_task.stop()
++        autostart_bus.shutdown()
++
++
++def test_modifier_callback_and_modify_data_change_future_payloads() -> None:
++
++
++
++
++    modifier_bus = RecordingBus()
++
++    def increment_first_byte(msg: can.Message) -> None:
++        msg.data[0] = (msg.data[0] + 1) % 256
++
++    modifier_task = modifier_bus.send_periodic(
++        can.Message(arbitration_id=0x126, data=[0, 0]),
++        0.01,
++        modifier_callback=increment_first_byte,
++    )
++    try:
++        assert wait_for_sends(modifier_bus, 5)[:5] == [
++            (294, None, b"\x01\x00"),
++            (294, None, b"\x02\x00"),
++            (294, None, b"\x03\x00"),
++            (294, None, b"\x04\x00"),
++            (294, None, b"\x05\x00"),
++        ]
++    finally:
++        modifier_task.stop()
++        modifier_bus.shutdown()
++
++    single_bus = RecordingBus()
++    single_task = single_bus.send_periodic(
++        can.Message(arbitration_id=0x127, data=[1]), 0.01
++    )
++    try:
++        wait_for_sends(single_bus, 2)
++        single_bus.clear()
++        single_task.modify_data(can.Message(arbitration_id=0x127, data=[9]))
++        assert wait_for_sends(single_bus, 3)[:3] == [
++            (295, None, b"\x09"),
++            (295, None, b"\x09"),
++            (295, None, b"\x09"),
++        ]
++    finally:
++        single_task.stop()
++        single_bus.shutdown()
++
++    sequence_bus = RecordingBus()
++    sequence_task = sequence_bus.send_periodic(
++        [
++            can.Message(arbitration_id=0x128, data=[1]),
++            can.Message(arbitration_id=0x128, data=[2]),
++        ],
++        0.01,
++    )
++    try:
++        wait_for_sends(sequence_bus, 2)
++        sequence_bus.clear()
++        sequence_task.modify_data(
++            [
++                can.Message(arbitration_id=0x128, data=[7]),
++                can.Message(arbitration_id=0x128, data=[8]),
++            ]
++        )
++        assert wait_for_sends(sequence_bus, 4)[:4] == [
++            (296, None, b"\x07"),
++            (296, None, b"\x08"),
++            (296, None, b"\x07"),
++            (296, None, b"\x08"),
++        ]
++    finally:
++        sequence_task.stop()
++        sequence_bus.shutdown()
++
++
++def test_invalid_periodic_inputs_raise_specific_value_errors() -> None:
++
++
++
++
++    with pytest.raises(ValueError) as not_messages:
++        RecordingBus().send_periodic(object(), 0.01)
++
++    assert isinstance(not_messages.value, ValueError)
++
++    with pytest.raises(ValueError) as empty_sequence:
++        RecordingBus().send_periodic([], 0.01)
++
++    assert isinstance(empty_sequence.value, ValueError)
++
++    with pytest.raises(ValueError) as mixed_ids:
++        RecordingBus().send_periodic(
++            [can.Message(arbitration_id=1), can.Message(arbitration_id=2)], 0.01
++        )
++
++    assert isinstance(mixed_ids.value, ValueError)
++
++    with pytest.raises(ValueError) as mixed_channels:
++        RecordingBus().send_periodic(
++            [
++                can.Message(arbitration_id=1, channel="a"),
++                can.Message(arbitration_id=1, channel="b"),
++            ],
++            0.01,
++        )
++
++    assert isinstance(mixed_channels.value, ValueError)
++
++
++def test_shutdown_stops_periodic_task_without_requiring_closed_send_error() -> None:
++
++
++
++
++    bus = RecordingBus()
++    task = bus.send_periodic(can.Message(arbitration_id=0x200, data=[1]), 0.01)
++
++    try:
++        assert wait_for_sends(bus, 2)[:2] == [
++            (512, None, b"\x01"),
++            (512, None, b"\x01"),
++        ]
++        bus.shutdown()
++
++        assert_no_new_sends(bus)
++    finally:
++        task.stop()
++        bus.shutdown()
++
++
++def test_modify_data_rejects_changed_task_shape() -> None:
++
++
++
++
++    bus = RecordingBus()
++    task = bus.send_periodic(
++        can.Message(arbitration_id=0x128, data=[1]), 0.01, autostart=False
++    )
++    try:
++        with pytest.raises(ValueError) as changed_id:
++            task.modify_data(can.Message(arbitration_id=0x129, data=[1]))
++
++        assert isinstance(changed_id.value, ValueError)
++
++        with pytest.raises(ValueError) as changed_count:
++            task.modify_data(
++                [
++                    can.Message(arbitration_id=0x128, data=[1]),
++                    can.Message(arbitration_id=0x128, data=[2]),
++                ]
++            )
++
++        assert isinstance(changed_count.value, ValueError)
++    finally:
++        task.stop()
++        bus.shutdown()
++
++
++def test_bus_task_tracking_store_task_and_individual_stop() -> None:
++
++
++
++
++    tracked_bus = RecordingBus()
++    tracked_task = tracked_bus.send_periodic(
++        can.Message(arbitration_id=0x130, data=[1]), 0.01
++    )
++    try:
++        assert wait_for_sends(tracked_bus, 3)[:3] == [
++            (304, None, b"\x01"),
++            (304, None, b"\x01"),
++            (304, None, b"\x01"),
++        ]
++        tracked_bus.stop_all_periodic_tasks(remove_tasks=True)
++        assert_no_new_sends(tracked_bus)
++        tracked_task.start()
++        assert wait_for_sends(tracked_bus, 2)[:2] == [
++            (304, None, b"\x01"),
++            (304, None, b"\x01"),
++        ]
++        tracked_bus.stop_all_periodic_tasks(remove_tasks=True)
++        tracked_bus.clear()
++        assert wait_for_sends(tracked_bus, 3)[:3] == [
++            (304, None, b"\x01"),
++            (304, None, b"\x01"),
++            (304, None, b"\x01"),
++        ]
++    finally:
++        tracked_task.stop()
++        tracked_bus.shutdown()
++
++    untracked_bus = RecordingBus()
++    untracked_task = untracked_bus.send_periodic(
++        can.Message(arbitration_id=0x131, data=[1]), 0.01, store_task=False
++    )
++    try:
++        assert wait_for_sends(untracked_bus, 3)[:3] == [
++            (305, None, b"\x01"),
++            (305, None, b"\x01"),
++            (305, None, b"\x01"),
++        ]
++        untracked_bus.stop_all_periodic_tasks(remove_tasks=True)
++        untracked_bus.clear()
++        assert wait_for_sends(untracked_bus, 3)[:3] == [
++            (305, None, b"\x01"),
++            (305, None, b"\x01"),
++            (305, None, b"\x01"),
++        ]
++    finally:
++        untracked_task.stop()
++        untracked_bus.shutdown()
++
++    individually_stopped_bus = RecordingBus()
++    individually_stopped_task = individually_stopped_bus.send_periodic(
++        can.Message(arbitration_id=0x132, data=[1]), 0.01
++    )
++    try:
++        wait_for_sends(individually_stopped_bus, 2)
++        individually_stopped_task.stop()
++        individually_stopped_bus.clear()
++        individually_stopped_task.start()
++        assert wait_for_sends(individually_stopped_bus, 2)[:2] == [
++            (306, None, b"\x01"),
++            (306, None, b"\x01"),
++        ]
++        individually_stopped_bus.stop_all_periodic_tasks(remove_tasks=True)
++        individually_stopped_bus.clear()
++        assert wait_for_sends(individually_stopped_bus, 3)[:3] == [
++            (306, None, b"\x01"),
++            (306, None, b"\x01"),
++            (306, None, b"\x01"),
++        ]
++    finally:
++        individually_stopped_task.stop()
++        individually_stopped_bus.shutdown()
++
++
++def test_shutdown_stops_tracked_periodic_tasks() -> None:
++
++
++
++
++    bus = RecordingBus()
++    task = bus.send_periodic(can.Message(arbitration_id=0x133, data=[1]), 0.01)
++
++    try:
++        assert wait_for_sends(bus, 3)[:3] == [
++            (307, None, b"\x01"),
++            (307, None, b"\x01"),
++            (307, None, b"\x01"),
++        ]
++        bus.shutdown()
++        assert_no_new_sends(bus)
++    finally:
++        task.stop()
++        bus.shutdown()
++
++
++def test_idempotent_task_stop_after_already_stopped() -> None:
++
++
++
++
++    bus = RecordingBus()
++    task = bus.send_periodic(can.Message(arbitration_id=0x150, data=[1]), 0.01)
++
++    try:
++        assert wait_for_sends(bus, 2)[:2] == [
++            (336, None, b"\x01"),
++            (336, None, b"\x01"),
++        ]
++        task.stop()
++        task.stop()
++        assert_no_new_sends(bus)
++    finally:
++        task.stop()
++        bus.shutdown()
++
++
++def test_two_bus_instances_keep_independent_periodic_state() -> None:
++
++
++
++
++    bus_a = RecordingBus()
++    bus_b = RecordingBus()
++    task_a = bus_a.send_periodic(can.Message(arbitration_id=0x141, data=[1]), 0.01)
++    task_b = bus_b.send_periodic(
++        can.Message(arbitration_id=0x142, data=[2]), 0.01, autostart=False
++    )
++
++    try:
++        assert wait_for_sends(bus_a, 3)[:3] == [
++            (321, None, b"\x01"),
++            (321, None, b"\x01"),
++            (321, None, b"\x01"),
++        ]
++        time.sleep(0.04)
++        assert bus_b.snapshot() == []
++        task_b.start()
++        assert wait_for_sends(bus_b, 2)[:2] == [
++            (322, None, b"\x02"),
++            (322, None, b"\x02"),
++        ]
++    finally:
++        task_a.stop()
++        task_b.stop()
++        bus_a.shutdown()
++        bus_b.shutdown()
++
++
++def test_periodic_cleanup_does_not_leak_sender_threads() -> None:
++
++
++
++
++    stopped_buses = []
++
++    for index in range(30):
++        bus = RecordingBus()
++        task = bus.send_periodic(
++            can.Message(arbitration_id=0x170 + index, data=[1]), 0.005
++        )
++        wait_for_sends(bus, 1)
++        task.stop()
++        bus.shutdown()
++        bus.clear()
++        stopped_buses.append(bus)
++
++    time.sleep(0.08)
++
++    assert all(bus.snapshot() == [] for bus in stopped_buses)
++
++
++def test_thread_safe_bus_allows_periodic_and_normal_send() -> None:
++
++
++
++
++    channel = "fixture-threadsafe-periodic"
++    with can.ThreadSafeBus(
++        channel=channel, interface="virtual", receive_own_messages=True
++    ) as bus:
++        task = bus.send_periodic(can.Message(arbitration_id=0x160, data=[6]), 0.01)
++        try:
++            periodic_messages = []
++            deadline = time.monotonic() + 0.5
++            while len(periodic_messages) < 3 and time.monotonic() < deadline:
++                msg = bus.recv(timeout=0.05)
++                if msg is not None:
++                    periodic_messages.append(
++                        (msg.arbitration_id, bytes(msg.data))
++                    )
++
++
++            assert periodic_messages[:3] == [
++                (352, b"\x06"),
++                (352, b"\x06"),
++                (352, b"\x06"),
++            ]
++
++            task.stop()
++            while bus.recv(timeout=0.01) is not None:
++                pass
++
++            bus.send(can.Message(arbitration_id=0x161, data=[7]))
++            normal_msg = bus.recv(timeout=0.2)
++            normal_observed = (
++                None
++                if normal_msg is None
++                else (
++                    normal_msg.arbitration_id,
++                    bytes(normal_msg.data),
++                )
++            )
++
++            assert normal_observed == (353, b"\x07")
++        finally:
++            task.stop()
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,22 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++cd /workspace/repo
++
++PYTHON="/workspace/repo/.venv/bin/python"
++if [[ ! -x "$PYTHON" ]]; then
++  PYTHON="python3"
++fi
++
++export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
++
++exec "$PYTHON" -m pytest -c /dev/null /workspace/repo/usercase-test-coderl/test_periodic_send.py -v

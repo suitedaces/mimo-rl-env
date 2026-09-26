@@ -1,0 +1,370 @@
+diff --git a/usercase-test-coderl/compile_to_instructions_test.go b/usercase-test-coderl/compile_to_instructions_test.go
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/compile_to_instructions_test.go
+@@ -0,0 +1,342 @@
++package usercase_test_coderl
++
++import (
++	"fmt"
++	"os"
++	"reflect"
++	"sort"
++	"strings"
++	"testing"
++
++	"github.com/goby-lang/goby/compiler"
++	"github.com/goby-lang/goby/compiler/bytecode"
++	"github.com/goby-lang/goby/compiler/parser"
++)
++
++
++
++
++
++
++type instructionSummary struct {
++	Action     string
++	Opcode     uint8
++	SourceLine int
++	Params     []string
++}
++
++type instructionSetSummary struct {
++	Name         string
++	Type         string
++	Instructions []instructionSummary
++}
++
++type expectedInstruction struct {
++	Action      string
++	SourceLine  int
++	ParamPrefix []string
++	ExactParams bool
++}
++
++func summarizeInstructionSets(t *testing.T, sets []*bytecode.InstructionSet) []instructionSetSummary {
++	t.Helper()
++
++	out := make([]instructionSetSummary, len(sets))
++	for setIndex, set := range sets {
++		out[setIndex] = instructionSetSummary{
++			Name:         set.Name(),
++			Type:         set.Type(),
++			Instructions: make([]instructionSummary, len(set.Instructions)),
++		}
++
++		for instructionIndex, instruction := range set.Instructions {
++			params := make([]string, len(instruction.Params))
++			for paramIndex, param := range instruction.Params {
++				params[paramIndex] = summarizeParam(param)
++			}
++
++			out[setIndex].Instructions[instructionIndex] = instructionSummary{
++				Action:     instruction.ActionName(),
++				Opcode:     instruction.Opcode,
++				SourceLine: instruction.SourceLine(),
++				Params:     params,
++			}
++		}
++	}
++
++	return out
++}
++
++func summarizeParam(param interface{}) string {
++	switch value := param.(type) {
++	case *bytecode.ArgSet:
++		return fmt.Sprintf("ArgSet(names=%v,types=%v)", value.Names(), value.Types())
++	default:
++		return fmt.Sprintf("%T:%v", param, param)
++	}
++}
++
++func requireCompiledSummary(t *testing.T, input string, mode parser.Mode) []instructionSetSummary {
++	t.Helper()
++
++	actualSets, err := compiler.CompileToInstructions(input, mode)
++	if err != nil {
++		t.Fatalf("CompileToInstructions returned error: %v", err)
++	}
++
++	return summarizeInstructionSets(t, actualSets)
++}
++
++func requireInstructionSet(t *testing.T, sets []instructionSetSummary, name, setType string) instructionSetSummary {
++	t.Helper()
++
++	for _, set := range sets {
++		if set.Name == name && set.Type == setType {
++			return set
++		}
++	}
++	t.Fatalf("expected instruction set %q/%q in %#v", name, setType, sets)
++	return instructionSetSummary{}
++}
++
++func assertInstructionPrefix(t *testing.T, got []instructionSummary, expected []expectedInstruction) {
++	t.Helper()
++
++	if len(got) < len(expected) {
++		t.Fatalf("expected at least %d instructions, got %#v", len(expected), got)
++	}
++	for i, want := range expected {
++		assertInstruction(t, i, got[i], want)
++	}
++}
++
++func assertInstruction(t *testing.T, index int, got instructionSummary, want expectedInstruction) {
++	t.Helper()
++
++	if got.Action != want.Action {
++		t.Fatalf("instruction %d action: expected %q, got %#v", index, want.Action, got)
++	}
++	if want.SourceLine > 0 && got.SourceLine != want.SourceLine {
++		t.Fatalf("instruction %d source line: expected %d, got %#v", index, want.SourceLine, got)
++	}
++	if len(got.Params) < len(want.ParamPrefix) {
++		t.Fatalf("instruction %d params: expected prefix %#v, got %#v", index, want.ParamPrefix, got.Params)
++	}
++	for paramIndex, wantParam := range want.ParamPrefix {
++		if got.Params[paramIndex] != wantParam {
++			t.Fatalf("instruction %d param %d: expected %q, got %#v", index, paramIndex, wantParam, got.Params)
++		}
++	}
++	if want.ExactParams && len(got.Params) != len(want.ParamPrefix) {
++		t.Fatalf("instruction %d params: expected exactly %#v, got %#v", index, want.ParamPrefix, got.Params)
++	}
++}
++
++func assertNormalArithmeticInstructions(t *testing.T) {
++	t.Helper()
++
++	actual := requireCompiledSummary(t, "1 + 2", parser.NormalMode)
++	if len(actual) != 1 {
++		t.Fatalf("expected one instruction set, got %#v", actual)
++	}
++	program := requireInstructionSet(t, actual, "ProgramStart", "ProgramStart")
++
++	assertInstructionPrefix(t, program.Instructions, []expectedInstruction{
++		{Action: "putobject", SourceLine: 1, ParamPrefix: []string{"int:1"}, ExactParams: true},
++		{Action: "putobject", SourceLine: 1, ParamPrefix: []string{"int:2"}, ExactParams: true},
++		{Action: "send", SourceLine: 1, ParamPrefix: []string{"string:+"}},
++		{Action: "pop", SourceLine: 1, ParamPrefix: []string{}, ExactParams: true},
++		{Action: "leave", SourceLine: 1, ParamPrefix: []string{}, ExactParams: true},
++	})
++}
++
++func assertTestModeModuleInstructions(t *testing.T) {
++	t.Helper()
++
++	actual := requireCompiledSummary(t, "module Foo\nend\n", parser.TestMode)
++	if len(actual) != 2 {
++		t.Fatalf("expected module and ProgramStart instruction sets, got %#v", actual)
++	}
++
++	module := requireInstructionSet(t, actual, "Foo", "DefClass")
++
++	assertInstructionPrefix(t, module.Instructions, []expectedInstruction{
++		{Action: "leave", ParamPrefix: []string{}, ExactParams: true},
++	})
++
++	program := requireInstructionSet(t, actual, "ProgramStart", "ProgramStart")
++
++	assertInstructionPrefix(t, program.Instructions, []expectedInstruction{
++		{Action: "putself", ParamPrefix: []string{}, ExactParams: true},
++		{Action: "def_class", ParamPrefix: []string{"string:module:Foo"}, ExactParams: true},
++		{Action: "pop", ParamPrefix: []string{}, ExactParams: true},
++		{Action: "leave", ParamPrefix: []string{}, ExactParams: true},
++	})
++}
++
++func assertMethodDefinitionInstructions(t *testing.T) {
++	t.Helper()
++
++	actual := requireCompiledSummary(t, "def bar(a)\n  99 + a\nend\n", parser.NormalMode)
++	if len(actual) != 2 {
++		t.Fatalf("expected method and ProgramStart instruction sets, got %#v", actual)
++	}
++
++	method := requireInstructionSet(t, actual, "bar", "Def")
++
++	assertInstructionPrefix(t, method.Instructions, []expectedInstruction{
++		{Action: "putobject", ParamPrefix: []string{"int:99"}, ExactParams: true},
++		{Action: "getlocal"},
++		{Action: "send", ParamPrefix: []string{"string:+"}},
++		{Action: "leave", ParamPrefix: []string{}, ExactParams: true},
++	})
++
++	program := requireInstructionSet(t, actual, "ProgramStart", "ProgramStart")
++
++	assertInstructionPrefix(t, program.Instructions, []expectedInstruction{
++		{Action: "putself", ParamPrefix: []string{}, ExactParams: true},
++		{Action: "putstring", ParamPrefix: []string{"string:bar"}, ExactParams: true},
++		{Action: "def_method", ParamPrefix: []string{"int:1"}, ExactParams: true},
++		{Action: "leave", ParamPrefix: []string{}, ExactParams: true},
++	})
++}
++
++func assertREPLCallInstructions(t *testing.T) {
++	t.Helper()
++
++	actual := requireCompiledSummary(t, "puts(1)\n", parser.REPLMode)
++	if len(actual) != 1 {
++		t.Fatalf("expected one ProgramStart instruction set, got %#v", actual)
++	}
++
++	program := requireInstructionSet(t, actual, "ProgramStart", "ProgramStart")
++
++	assertInstructionPrefix(t, program.Instructions, []expectedInstruction{
++		{Action: "putself", ParamPrefix: []string{}, ExactParams: true},
++		{Action: "putobject", ParamPrefix: []string{"int:1"}, ExactParams: true},
++		{Action: "send", ParamPrefix: []string{"string:puts", "int:1"}},
++		{Action: "leave", ParamPrefix: []string{}, ExactParams: true},
++	})
++}
++
++func TestNormalModeArithmeticExpressionInstructions(t *testing.T) {
++
++
++	assertNormalArithmeticInstructions(t)
++}
++
++func TestTestModeModuleProducesModuleAndProgramInstructionSets(t *testing.T) {
++
++
++	assertTestModeModuleInstructions(t)
++}
++
++func TestNormalModeMethodDefinitionUsesFreshGeneratorInstructionSets(t *testing.T) {
++
++
++	assertMethodDefinitionInstructions(t)
++}
++
++func TestREPLModeCallExpressionLeavesResultWithoutPop(t *testing.T) {
++
++
++	assertREPLCallInstructions(t)
++}
++
++func TestMalformedREPLInputReturnsParserMessageAndNoInstructionSets(t *testing.T) {
++
++
++	sets, err := compiler.CompileToInstructions("iff\nend\n", parser.REPLMode)
++	if err == nil {
++		t.Fatal("expected an error")
++	}
++
++	if err.Error() == "" || !strings.Contains(err.Error(), "unexpected end") || !strings.Contains(err.Error(), "Line: 1") {
++		t.Fatalf("unexpected error message: %q", err.Error())
++	}
++	if sets != nil {
++		t.Fatalf("expected nil instruction sets on parse error, got %#v", summarizeInstructionSets(t, sets))
++	}
++}
++
++func TestCompileToInstructionsIsReferentiallyTransparent(t *testing.T) {
++	input := "1 + 2"
++
++	first, err := compiler.CompileToInstructions(input, parser.NormalMode)
++	if err != nil {
++		t.Fatalf("first call failed: %v", err)
++	}
++	second, err := compiler.CompileToInstructions(input, parser.NormalMode)
++	if err != nil {
++		t.Fatalf("second call failed: %v", err)
++	}
++
++	firstSummary := summarizeInstructionSets(t, first)
++	secondSummary := summarizeInstructionSets(t, second)
++	if !reflect.DeepEqual(firstSummary, secondSummary) {
++		t.Fatalf("same input and mode produced different instruction data\nfirst:  %#v\nsecond: %#v", firstSummary, secondSummary)
++	}
++}
++
++func TestCompileToInstructionsDoesNotMutateInputString(t *testing.T) {
++	input := "module Foo\nend\n"
++	before := string([]byte(input))
++
++	if _, err := compiler.CompileToInstructions(input, parser.TestMode); err != nil {
++		t.Fatalf("compile failed: %v", err)
++	}
++
++	if input != before {
++		t.Fatalf("input string mutated: before %q after %q", before, input)
++	}
++}
++
++func TestCompileToInstructionsDoesNotDependOnHiddenInProcessState(t *testing.T) {
++
++	assertNormalArithmeticInstructions(t)
++	assertTestModeModuleInstructions(t)
++	assertREPLCallInstructions(t)
++	assertNormalArithmeticInstructions(t)
++}
++
++func TestCompileToInstructionsDoesNotWriteFilesInWorkingDirectory(t *testing.T) {
++	tmpDir := t.TempDir()
++	previousDir, err := os.Getwd()
++	if err != nil {
++		t.Fatalf("getwd failed: %v", err)
++	}
++	if err := os.Chdir(tmpDir); err != nil {
++		t.Fatalf("chdir to temp dir failed: %v", err)
++	}
++	defer func() {
++		if err := os.Chdir(previousDir); err != nil {
++			t.Fatalf("restore working directory failed: %v", err)
++		}
++	}()
++
++	before := directoryEntries(t, tmpDir)
++	if _, err := compiler.CompileToInstructions("1 + 2", parser.NormalMode); err != nil {
++		t.Fatalf("compile failed: %v", err)
++	}
++	after := directoryEntries(t, tmpDir)
++
++	if !reflect.DeepEqual(before, after) {
++		t.Fatalf("working directory changed\nbefore: %#v\nafter:  %#v", before, after)
++	}
++}
++
++func directoryEntries(t *testing.T, path string) []string {
++	t.Helper()
++
++	entries, err := os.ReadDir(path)
++	if err != nil {
++		t.Fatalf("ReadDir(%q) failed: %v", path, err)
++	}
++
++	names := make([]string, len(entries))
++	for i, entry := range entries {
++		names[i] = entry.Name()
++	}
++	sort.Strings(names)
++	return names
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,18 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++cd /workspace/repo
++export GOPROXY=off
++export GOSUMDB=off
++export GOTOOLCHAIN=local
++export GOFLAGS="${GOFLAGS:-} -mod=readonly"
++exec go test -v ./usercase-test-coderl/...

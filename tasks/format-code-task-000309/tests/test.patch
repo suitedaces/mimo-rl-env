@@ -1,0 +1,350 @@
+diff --git a/usercase-test-coderl/exp_operation_builders_test.go b/usercase-test-coderl/exp_operation_builders_test.go
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/exp_operation_builders_test.go
+@@ -0,0 +1,322 @@
++package usercase_test_coderl
++
++import (
++	"bytes"
++	"encoding/base64"
++	"os"
++	"path/filepath"
++	"reflect"
++	"sort"
++	"testing"
++	"unsafe"
++
++	as "github.com/aerospike/aerospike-client-go/v8"
++)
++
++
++
++
++
++
++
++
++
++
++const (
++	expReadOperationCode  = 7
++	expWriteOperationCode = 8
++)
++
++type operationSnapshot struct {
++	opCode           uint64
++	isWrite          bool
++	hasCustomEncoder bool
++	binName          string
++	payload          []byte
++}
++
++func unexportedInterface(v reflect.Value) any {
++	return reflect.NewAt(v.Type(), unsafe.Pointer(v.UnsafeAddr())).Elem().Interface()
++}
++
++func operationFields(t *testing.T, op *as.Operation) operationSnapshot {
++	t.Helper()
++	if op == nil {
++		t.Fatal("operation builder returned nil")
++	}
++
++	value := reflect.ValueOf(op).Elem()
++	opType := value.FieldByName("opType")
++	if !opType.IsValid() {
++		t.Fatal("operation missing opType field")
++	}
++
++	binValueField := value.FieldByName("binValue")
++	if !binValueField.IsValid() {
++		t.Fatal("operation missing binValue field")
++	}
++	encoderField := value.FieldByName("encoder")
++	if !encoderField.IsValid() {
++		t.Fatal("operation missing encoder field")
++	}
++	binValue, ok := unexportedInterface(binValueField).(as.Value)
++	if !ok || binValue == nil {
++		t.Fatalf("operation value should be an Aerospike Value, got %T", unexportedInterface(binValueField))
++	}
++
++	payload, ok := binValue.GetObject().([]byte)
++	if !ok {
++		t.Fatalf("operation value should contain packed expression bytes, got %T", binValue.GetObject())
++	}
++
++	return operationSnapshot{
++		opCode:           opType.FieldByName("op").Uint(),
++		isWrite:          opType.FieldByName("isWrite").Bool(),
++		hasCustomEncoder: !encoderField.IsNil(),
++		binName:          value.FieldByName("binName").String(),
++		payload:          append([]byte(nil), payload...),
++	}
++}
++
++func expectedPayload(t *testing.T, exp *as.Expression, flags int) []byte {
++	t.Helper()
++	encoded, err := exp.Base64()
++	if err != nil {
++		t.Fatalf("Base64 expression encoding: %v", err)
++	}
++	packedExpression, decodeErr := base64.StdEncoding.DecodeString(encoded)
++	if decodeErr != nil {
++		t.Fatalf("decode expression Base64 %q: %v", encoded, decodeErr)
++	}
++
++	payload := []byte{0x92}
++	payload = append(payload, packedExpression...)
++	payload = append(payload, packMsgpackInt(t, flags)...)
++	return payload
++}
++
++func packMsgpackInt(t *testing.T, n int) []byte {
++	t.Helper()
++	if n < 0 {
++		t.Fatalf("negative flags are not used by the expression operation spec: %d", n)
++	}
++	switch {
++	case n <= 0x7f:
++		return []byte{byte(n)}
++	case n <= 0xff:
++		return []byte{0xcc, byte(n)}
++	case n <= 0xffff:
++		return []byte{0xcd, byte(n >> 8), byte(n)}
++	default:
++		t.Fatalf("test helper only supports compact positive flags, got %d", n)
++		return nil
++	}
++}
++
++func assertExpressionOperation(t *testing.T, op *as.Operation, wantCode uint64, wantIsWrite bool, wantBinName string, wantPayload []byte) {
++	t.Helper()
++	actual := operationFields(t, op)
++
++
++	if actual.opCode != wantCode || actual.isWrite != wantIsWrite {
++		t.Fatalf("operation kind mismatch: expected code=%d isWrite=%v, got code=%d isWrite=%v", wantCode, wantIsWrite, actual.opCode, actual.isWrite)
++	}
++	if actual.binName != wantBinName {
++		t.Fatalf("operation bin name mismatch: expected %q, got %q", wantBinName, actual.binName)
++	}
++
++	if actual.hasCustomEncoder {
++		t.Fatal("operation should store the expression payload as the operation value, not behind a custom encoder")
++	}
++	if !bytes.Equal(actual.payload, wantPayload) {
++		t.Fatalf("operation payload mismatch:\nexpected %#v\nactual   %#v", wantPayload, actual.payload)
++	}
++}
++
++func dirEntries(t *testing.T, dir string) []string {
++	t.Helper()
++
++	entries, err := os.ReadDir(dir)
++	if err != nil {
++		t.Fatalf("ReadDir(%q): %v", dir, err)
++	}
++
++	names := make([]string, len(entries))
++	for i, entry := range entries {
++		names[i] = entry.Name()
++	}
++	sort.Strings(names)
++	return names
++}
++
++func TestExpReadOpSumDefaultOperation(t *testing.T) {
++
++
++	exp := as.ExpNumAdd(as.ExpIntBin("a"), as.ExpIntVal(5))
++
++	assertExpressionOperation(t, as.ExpReadOp("sum", exp, as.ExpReadFlagDefault), expReadOperationCode, false, "sum", expectedPayload(t, exp, int(as.ExpReadFlagDefault)))
++}
++
++func TestExpReadOpEvalNoFailOperation(t *testing.T) {
++
++
++	exp := as.ExpStringVal("guest")
++
++	assertExpressionOperation(t, as.ExpReadOp("nickname", exp, as.ExpReadFlagEvalNoFail), expReadOperationCode, false, "nickname", expectedPayload(t, exp, int(as.ExpReadFlagEvalNoFail)))
++}
++
++func TestExpWriteOpTotalDefaultOperation(t *testing.T) {
++
++
++	exp := as.ExpNumAdd(as.ExpIntBin("a"), as.ExpIntBin("b"))
++
++	assertExpressionOperation(t, as.ExpWriteOp("total", exp, as.ExpWriteFlagDefault), expWriteOperationCode, true, "total", expectedPayload(t, exp, int(as.ExpWriteFlagDefault)))
++}
++
++func TestExpWriteOpCreateAllowDeleteEvalNoFailOperation(t *testing.T) {
++
++
++	flags := as.ExpWriteFlagCreateOnly | as.ExpWriteFlagAllowDelete | as.ExpWriteFlagEvalNoFail
++	exp := as.ExpNilValue()
++
++	assertExpressionOperation(t, as.ExpWriteOp("maybe", exp, flags), expWriteOperationCode, true, "maybe", expectedPayload(t, exp, int(flags)))
++}
++
++func TestExpWriteOpUpdateOnlyPolicyNoFailOperation(t *testing.T) {
++
++
++	flags := as.ExpWriteFlagUpdateOnly | as.ExpWriteFlagPolicyNoFail
++	exp := as.ExpIntVal(42)
++
++	assertExpressionOperation(t, as.ExpWriteOp("score", exp, flags), expWriteOperationCode, true, "score", expectedPayload(t, exp, int(flags)))
++}
++
++func TestExpressionOperationFlagConstants(t *testing.T) {
++
++
++	actual := map[string]int{
++		"ExpReadFlagDefault":       int(as.ExpReadFlagDefault),
++		"ExpReadFlagEvalNoFail":    int(as.ExpReadFlagEvalNoFail),
++		"ExpWriteFlagDefault":      int(as.ExpWriteFlagDefault),
++		"ExpWriteFlagCreateOnly":   int(as.ExpWriteFlagCreateOnly),
++		"ExpWriteFlagUpdateOnly":   int(as.ExpWriteFlagUpdateOnly),
++		"ExpWriteFlagAllowDelete":  int(as.ExpWriteFlagAllowDelete),
++		"ExpWriteFlagPolicyNoFail": int(as.ExpWriteFlagPolicyNoFail),
++		"ExpWriteFlagEvalNoFail":   int(as.ExpWriteFlagEvalNoFail),
++	}
++	expected := map[string]int{
++		"ExpReadFlagDefault":       0,
++		"ExpReadFlagEvalNoFail":    16,
++		"ExpWriteFlagDefault":      0,
++		"ExpWriteFlagCreateOnly":   1,
++		"ExpWriteFlagUpdateOnly":   2,
++		"ExpWriteFlagAllowDelete":  4,
++		"ExpWriteFlagPolicyNoFail": 8,
++		"ExpWriteFlagEvalNoFail":   16,
++	}
++
++	if !reflect.DeepEqual(actual, expected) {
++		t.Fatalf("expression operation flag constants mismatch:\nexpected %#v\nactual   %#v", expected, actual)
++	}
++}
++
++func TestExpressionOperationBuilderPanicsWhenExpressionCannotBePacked(t *testing.T) {
++
++
++	cases := map[string]func(){
++		"ExpReadOp": func() { _ = as.ExpReadOp("bad", &as.Expression{}, as.ExpReadFlagDefault) },
++		"ExpWriteOp": func() {
++			_ = as.ExpWriteOp("bad", &as.Expression{}, as.ExpWriteFlagDefault)
++		},
++	}
++	for name, call := range cases {
++		t.Run(name, func(t *testing.T) {
++			defer func() {
++				recovered := recover()
++
++				if recovered == nil {
++					t.Fatalf("expected %s to panic for an unpackable empty Expression", name)
++				}
++			}()
++			call()
++		})
++	}
++}
++
++func TestExpressionOperationBuildersAreReferentiallyTransparent(t *testing.T) {
++	exp := as.ExpNumAdd(as.ExpIntBin("a"), as.ExpIntVal(5))
++	expected := expectedPayload(t, exp, int(as.ExpReadFlagDefault))
++	first := as.ExpReadOp("sum", exp, as.ExpReadFlagDefault)
++	second := as.ExpReadOp("sum", exp, as.ExpReadFlagDefault)
++
++	assertExpressionOperation(t, first, expReadOperationCode, false, "sum", expected)
++	assertExpressionOperation(t, second, expReadOperationCode, false, "sum", expected)
++
++	if !reflect.DeepEqual(operationFields(t, first), operationFields(t, second)) {
++		t.Fatalf("same ExpReadOp input should return equivalent operations:\nfirst  %#v\nsecond %#v", operationFields(t, first), operationFields(t, second))
++	}
++}
++
++func TestExpressionOperationBuildersDoNotMutateExpressionInput(t *testing.T) {
++	exp := as.ExpNumAdd(as.ExpIntBin("a"), as.ExpIntVal(5))
++	before, err := exp.Base64()
++	if err != nil {
++		t.Fatalf("Base64 before builder: %v", err)
++	}
++
++	_ = as.ExpReadOp("sum", exp, as.ExpReadFlagDefault)
++	after, err := exp.Base64()
++	if err != nil {
++		t.Fatalf("Base64 after builder: %v", err)
++	}
++
++
++	if before == "" || after != before {
++		t.Fatalf("builder mutated expression encoding:\nbefore %q\nafter  %q", before, after)
++	}
++}
++
++func TestExpressionOperationBuildersDoNotUseGlobalStateAcrossOtherCalls(t *testing.T) {
++	exp := as.ExpNumAdd(as.ExpIntBin("a"), as.ExpIntVal(5))
++	expected := expectedPayload(t, exp, int(as.ExpReadFlagDefault))
++	first := as.ExpReadOp("sum", exp, as.ExpReadFlagDefault)
++
++	_ = as.ExpWriteOp("total", as.ExpNumAdd(as.ExpIntBin("a"), as.ExpIntBin("b")), as.ExpWriteFlagDefault)
++	_ = as.ExpReadOp("nickname", as.ExpStringVal("guest"), as.ExpReadFlagEvalNoFail)
++	_ = as.ExpWriteOp("maybe", as.ExpNilValue(), as.ExpWriteFlagCreateOnly|as.ExpWriteFlagAllowDelete|as.ExpWriteFlagEvalNoFail)
++
++	again := as.ExpReadOp("sum", exp, as.ExpReadFlagDefault)
++
++	assertExpressionOperation(t, first, expReadOperationCode, false, "sum", expected)
++	assertExpressionOperation(t, again, expReadOperationCode, false, "sum", expected)
++
++	if !reflect.DeepEqual(operationFields(t, first), operationFields(t, again)) {
++		t.Fatalf("operation builder result changed across intervening calls:\nfirst %#v\nagain %#v", operationFields(t, first), operationFields(t, again))
++	}
++}
++
++func TestExpressionOperationBuildersDoNotWriteInCurrentDirectory(t *testing.T) {
++	tmp := t.TempDir()
++	before := dirEntries(t, tmp)
++
++	oldWd, err := os.Getwd()
++	if err != nil {
++		t.Fatalf("Getwd: %v", err)
++	}
++	if err := os.Chdir(tmp); err != nil {
++		t.Fatalf("Chdir(%q): %v", tmp, err)
++	}
++	defer func() {
++		if err := os.Chdir(oldWd); err != nil {
++			t.Fatalf("restore working directory %q: %v", oldWd, err)
++		}
++	}()
++
++	_ = as.ExpReadOp("sum", as.ExpNumAdd(as.ExpIntBin("a"), as.ExpIntVal(5)), as.ExpReadFlagDefault)
++	_ = as.ExpWriteOp("total", as.ExpNumAdd(as.ExpIntBin("a"), as.ExpIntBin("b")), as.ExpWriteFlagDefault)
++
++	after := dirEntries(t, tmp)
++	if !reflect.DeepEqual(after, before) {
++		t.Fatalf("operation builders wrote files in cwd %s:\nbefore %#v\nafter  %#v", filepath.Clean(tmp), before, after)
++	}
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,18 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++cd /workspace/repo
++export GOTOOLCHAIN=local
++export GOPROXY=off
++export GOSUMDB=off
++export GOFLAGS="${GOFLAGS:-} -mod=vendor"
++exec go test -v ./usercase-test-coderl/...

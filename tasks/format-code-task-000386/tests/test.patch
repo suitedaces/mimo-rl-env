@@ -1,0 +1,412 @@
+diff --git a/fxhttpclient/module_test.go b/fxhttpclient/module_test.go
+index 14b62cc..36c262e 100644
+--- a/fxhttpclient/module_test.go
++++ b/fxhttpclient/module_test.go
+@@ -12,6 +12,7 @@ import (
+ 	"github.com/ankorstore/yokai/fxhttpclient"
+ 	"github.com/ankorstore/yokai/fxhttpclient/testdata/factory"
+ 	"github.com/ankorstore/yokai/fxlog"
++	"github.com/ankorstore/yokai/fxmetrics"
+ 	"github.com/ankorstore/yokai/fxtrace"
+ 	"github.com/ankorstore/yokai/log"
+ 	"github.com/ankorstore/yokai/log/logtest"
+@@ -35,6 +36,7 @@ func TestModule(t *testing.T) {
+ 		fx.NopLogger,
+ 		fxconfig.FxConfigModule,
+ 		fxlog.FxLogModule,
++		fxmetrics.FxMetricsModule,
+ 		fxtrace.FxTraceModule,
+ 		fxhttpclient.FxHttpClientModule,
+ 		fx.Populate(&httpClient, &logger, &logBuffer, &traceExporter),
+@@ -186,6 +188,7 @@ func TestModuleDecoration(t *testing.T) {
+ 		fx.NopLogger,
+ 		fxconfig.FxConfigModule,
+ 		fxlog.FxLogModule,
++		fxmetrics.FxMetricsModule,
+ 		fxtrace.FxTraceModule,
+ 		fxhttpclient.FxHttpClientModule,
+ 		fx.Decorate(factory.NewTestHttpClientFactory),
+diff --git a/fxhttpclient/metrics_hidden_test.go b/fxhttpclient/metrics_hidden_test.go
+new file mode 100644
+index 0000000..75879c1
+--- /dev/null
++++ b/fxhttpclient/metrics_hidden_test.go
+@@ -0,0 +1,357 @@
++package fxhttpclient_test
++
++import (
++	"context"
++	"fmt"
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"os"
++	"path/filepath"
++	"strconv"
++	"strings"
++	"testing"
++
++	"github.com/ankorstore/yokai/fxconfig"
++	"github.com/ankorstore/yokai/fxhttpclient"
++	"github.com/ankorstore/yokai/fxlog"
++	"github.com/ankorstore/yokai/fxmetrics"
++	"github.com/ankorstore/yokai/fxtrace"
++	"github.com/prometheus/client_golang/prometheus"
++	dto "github.com/prometheus/client_model/go"
++	"github.com/stretchr/testify/require"
++	"go.uber.org/fx"
++	"go.uber.org/fx/fxtest"
++)
++
++type hiddenMetricsApp struct {
++	client   *http.Client
++	registry *prometheus.Registry
++	stop     func()
++}
++
++func startHiddenMetricsApp(t *testing.T, yaml string) hiddenMetricsApp {
++	t.Helper()
++
++	configDir := t.TempDir()
++	require.NoError(t, os.WriteFile(filepath.Join(configDir, "config.yaml"), []byte(yaml), 0o600))
++
++
++
++
++	oldConfigPath, hadConfigPath := os.LookupEnv("APP_CONFIG_PATH")
++	require.NoError(t, os.Setenv("APP_CONFIG_PATH", configDir))
++
++	var client *http.Client
++	var registry *prometheus.Registry
++
++	app := fxtest.New(
++		t,
++		fx.NopLogger,
++		fxconfig.FxConfigModule,
++		fxlog.FxLogModule,
++		fxmetrics.FxMetricsModule,
++		fxtrace.FxTraceModule,
++		fxhttpclient.FxHttpClientModule,
++		fx.Populate(&client, &registry),
++	)
++	app.RequireStart()
++
++	return hiddenMetricsApp{
++		client:   client,
++		registry: registry,
++		stop: func() {
++			app.RequireStop()
++			if hadConfigPath {
++				require.NoError(t, os.Setenv("APP_CONFIG_PATH", oldConfigPath))
++			} else {
++				require.NoError(t, os.Unsetenv("APP_CONFIG_PATH"))
++			}
++		},
++	}
++}
++
++func hiddenBaseConfig(metricsBlock string) string {
++	return fmt.Sprintf(`
++app:
++  name: app
++modules:
++  log:
++    level: info
++  trace:
++    processor:
++      type: noop
++  http:
++    client:
++      timeout: 2s
++%s
++`, indent(metricsBlock, 6))
++}
++
++func indent(s string, spaces int) string {
++	if strings.TrimSpace(s) == "" {
++		return ""
++	}
++	prefix := strings.Repeat(" ", spaces)
++	lines := strings.Split(strings.TrimRight(s, "\n"), "\n")
++	for i := range lines {
++		if strings.TrimSpace(lines[i]) != "" {
++			lines[i] = prefix + lines[i]
++		}
++	}
++	return strings.Join(lines, "\n") + "\n"
++}
++
++func statusServer(t *testing.T, statuses ...int) *httptest.Server {
++	t.Helper()
++	index := 0
++	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		status := statuses[index%len(statuses)]
++		index++
++		w.WriteHeader(status)
++		_, _ = io.WriteString(w, strconv.Itoa(status))
++	}))
++}
++
++func doHiddenRequest(t *testing.T, client *http.Client, method, url string) {
++	t.Helper()
++	req, err := http.NewRequestWithContext(context.Background(), method, url, nil)
++	require.NoError(t, err)
++	resp, err := client.Do(req)
++	require.NoError(t, err)
++	_, _ = io.Copy(io.Discard, resp.Body)
++	require.NoError(t, resp.Body.Close())
++}
++
++func gatherHiddenFamilies(t *testing.T, registry *prometheus.Registry) map[string]*dto.MetricFamily {
++	t.Helper()
++	families, err := registry.Gather()
++	require.NoError(t, err)
++	out := make(map[string]*dto.MetricFamily, len(families))
++	for _, family := range families {
++		out[family.GetName()] = family
++	}
++	return out
++}
++
++func requireNoFamily(t *testing.T, families map[string]*dto.MetricFamily, name string) {
++	t.Helper()
++	if _, ok := families[name]; ok {
++		t.Fatalf("did not expect metric family %q to be gathered", name)
++	}
++}
++
++func requireCounterValue(t *testing.T, family *dto.MetricFamily, expected float64, labels map[string]string) {
++	t.Helper()
++	for _, metric := range family.GetMetric() {
++		if labelsMatch(metric, labels) {
++			require.NotNil(t, metric.Counter)
++			require.Equal(t, expected, metric.Counter.GetValue())
++			return
++		}
++	}
++	t.Fatalf("missing counter metric with labels %#v in family %s", labels, family.GetName())
++}
++
++func requireHistogramSample(t *testing.T, family *dto.MetricFamily, expectedCount uint64, labels map[string]string, expectedBuckets []float64) {
++	t.Helper()
++	for _, metric := range family.GetMetric() {
++		if !labelsMatch(metric, labels) {
++			continue
++		}
++		require.NotNil(t, metric.Histogram)
++		require.Equal(t, expectedCount, metric.Histogram.GetSampleCount())
++		require.GreaterOrEqual(t, metric.Histogram.GetSampleSum(), 0.0)
++
++		seenBuckets := map[float64]bool{}
++		var highestCumulative uint64
++		for _, bucket := range metric.Histogram.GetBucket() {
++			seenBuckets[bucket.GetUpperBound()] = true
++			if bucket.GetCumulativeCount() > highestCumulative {
++				highestCumulative = bucket.GetCumulativeCount()
++			}
++		}
++		for _, expectedBucket := range expectedBuckets {
++			require.Truef(t, seenBuckets[expectedBucket], "missing configured histogram bucket %v", expectedBucket)
++		}
++		require.Equal(t, expectedCount, highestCumulative)
++		return
++	}
++	t.Fatalf("missing histogram metric with labels %#v in family %s", labels, family.GetName())
++}
++
++func labelsMatch(metric *dto.Metric, labels map[string]string) bool {
++	actual := map[string]string{}
++	for _, label := range metric.GetLabel() {
++		actual[label.GetName()] = label.GetValue()
++	}
++	for key, value := range labels {
++		if actual[key] != value {
++			return false
++		}
++	}
++	return true
++}
++
++func TestFxHttpClientMetricsDisabledByDefault(t *testing.T) {
++	app := startHiddenMetricsApp(t, hiddenBaseConfig(""))
++	defer app.stop()
++
++	server := statusServer(t, http.StatusAccepted)
++	defer server.Close()
++
++	doHiddenRequest(t, app.client, http.MethodGet, server.URL)
++
++	families := gatherHiddenFamilies(t, app.registry)
++	requireNoFamily(t, families, "app_httpclient_client_requests_total")
++	requireNoFamily(t, families, "app_httpclient_client_request_duration_seconds")
++}
++
++func TestFxHttpClientMetricsEnabledWithCustomConfig(t *testing.T) {
++	app := startHiddenMetricsApp(t, hiddenBaseConfig(`
++metrics:
++  collect:
++    enabled: true
++    namespace: hiddenapp
++    subsystem: outbound
++  buckets: 0.02, 0.2, 2
++  normalize: true
++`))
++	defer app.stop()
++
++	server := statusServer(t, http.StatusCreated)
++	defer server.Close()
++
++	doHiddenRequest(t, app.client, http.MethodPatch, server.URL)
++
++	families := gatherHiddenFamilies(t, app.registry)
++	counter := families["hiddenapp_outbound_client_requests_total"]
++	require.NotNil(t, counter)
++	histogram := families["hiddenapp_outbound_client_request_duration_seconds"]
++	require.NotNil(t, histogram)
++	requireCounterValue(t, counter, 1, map[string]string{
++		"method": http.MethodPatch,
++		"status": "2xx",
++		"url":    server.URL,
++	})
++	requireHistogramSample(t, histogram, 1, map[string]string{
++		"method": http.MethodPatch,
++		"url":    server.URL,
++	}, []float64{0.02, 0.2, 2})
++}
++
++func TestFxHttpClientMetricsRequestsCounter(t *testing.T) {
++	app := startHiddenMetricsApp(t, hiddenBaseConfig(`
++metrics:
++  collect:
++    enabled: true
++  normalize: true
++`))
++	defer app.stop()
++
++	server := statusServer(t, http.StatusCreated, http.StatusTooManyRequests, http.StatusTooManyRequests)
++	defer server.Close()
++
++	doHiddenRequest(t, app.client, http.MethodPost, server.URL)
++	doHiddenRequest(t, app.client, http.MethodPost, server.URL)
++	doHiddenRequest(t, app.client, http.MethodPost, server.URL)
++
++	counter := gatherHiddenFamilies(t, app.registry)["app_httpclient_client_requests_total"]
++	require.NotNil(t, counter)
++	requireCounterValue(t, counter, 1, map[string]string{
++		"method": http.MethodPost,
++		"status": "2xx",
++		"url":    server.URL,
++	})
++	requireCounterValue(t, counter, 2, map[string]string{
++		"method": http.MethodPost,
++		"status": "4xx",
++		"url":    server.URL,
++	})
++}
++
++func TestFxHttpClientMetricsRequestDurationHistogram(t *testing.T) {
++	app := startHiddenMetricsApp(t, hiddenBaseConfig(`
++metrics:
++  collect:
++    enabled: true
++  buckets: 0.01, 0.1, 1
++  normalize: true
++`))
++	defer app.stop()
++
++	server := statusServer(t, http.StatusNoContent, http.StatusNoContent)
++	defer server.Close()
++
++	doHiddenRequest(t, app.client, http.MethodPut, server.URL)
++	doHiddenRequest(t, app.client, http.MethodPut, server.URL)
++
++	histogram := gatherHiddenFamilies(t, app.registry)["app_httpclient_client_request_duration_seconds"]
++	require.NotNil(t, histogram)
++	requireHistogramSample(t, histogram, 2, map[string]string{
++		"method": http.MethodPut,
++		"url":    server.URL,
++	}, []float64{0.01, 0.1, 1})
++}
++
++func TestFxHttpClientMetricsStatusNormalizationToggle(t *testing.T) {
++	normalized := startHiddenMetricsApp(t, hiddenBaseConfig(`
++metrics:
++  collect:
++    enabled: true
++  normalize: true
++`))
++	defer normalized.stop()
++
++	normalizedServer := statusServer(t, http.StatusCreated, http.StatusNotFound)
++	defer normalizedServer.Close()
++	doHiddenRequest(t, normalized.client, http.MethodGet, normalizedServer.URL)
++	doHiddenRequest(t, normalized.client, http.MethodGet, normalizedServer.URL)
++	normalizedCounter := gatherHiddenFamilies(t, normalized.registry)["app_httpclient_client_requests_total"]
++	require.NotNil(t, normalizedCounter)
++	requireCounterValue(t, normalizedCounter, 1, map[string]string{"method": http.MethodGet, "status": "2xx", "url": normalizedServer.URL})
++	requireCounterValue(t, normalizedCounter, 1, map[string]string{"method": http.MethodGet, "status": "4xx", "url": normalizedServer.URL})
++
++	raw := startHiddenMetricsApp(t, hiddenBaseConfig(`
++metrics:
++  collect:
++    enabled: true
++  normalize: false
++`))
++	defer raw.stop()
++
++	rawServer := statusServer(t, http.StatusCreated, http.StatusNotFound)
++	defer rawServer.Close()
++	doHiddenRequest(t, raw.client, http.MethodGet, rawServer.URL)
++	doHiddenRequest(t, raw.client, http.MethodGet, rawServer.URL)
++	rawCounter := gatherHiddenFamilies(t, raw.registry)["app_httpclient_client_requests_total"]
++	require.NotNil(t, rawCounter)
++	requireCounterValue(t, rawCounter, 1, map[string]string{"method": http.MethodGet, "status": "201", "url": rawServer.URL})
++	requireCounterValue(t, rawCounter, 1, map[string]string{"method": http.MethodGet, "status": "404", "url": rawServer.URL})
++}
++
++func TestFxHttpClientReadmeMentionsMetricsIntegration(t *testing.T) {
++	content, err := os.ReadFile("README.md")
++	require.NoError(t, err)
++	text := string(content)
++
++	require.Contains(t, text, "metrics")
++	require.Contains(t, text, "fxmetrics")
++	require.Contains(t, text, "modules:")
++	require.Contains(t, text, "metrics:")
++	require.Contains(t, text, "collect:")
++	require.Contains(t, text, "normalize:")
++}
++
++func TestFxHttpClientDocsContainMetricsSection(t *testing.T) {
++	content, err := os.ReadFile("../docs/modules/fxhttpclient.md")
++	require.NoError(t, err)
++	text := string(content)
++
++	require.Contains(t, text, "modules:")
++	require.Contains(t, text, "http:")
++	require.Contains(t, text, "client:")
++	require.Contains(t, text, "metrics:")
++	require.Contains(t, text, "client_requests_total")
++	require.Contains(t, text, "client_request_duration_seconds")
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,16 @@
++#!/bin/bash
++set -uo pipefail
++cd /testbed/fxhttpclient
++
++case "${1:-}" in
++  base)
++    go test -v -count=1 -run '^(TestModule|TestModuleDecoration)$'
++    ;;
++  new)
++    go test -v -count=1 -run '^(TestFxHttpClientMetricsDisabledByDefault|TestFxHttpClientMetricsEnabledWithCustomConfig|TestFxHttpClientMetricsRequestsCounter|TestFxHttpClientMetricsRequestDurationHistogram|TestFxHttpClientMetricsStatusNormalizationToggle|TestFxHttpClientReadmeMentionsMetricsIntegration|TestFxHttpClientDocsContainMetricsSection)$'
++    ;;
++  *)
++    echo "usage: $0 base|new"
++    exit 2
++    ;;
++esac

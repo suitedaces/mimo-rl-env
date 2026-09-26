@@ -1,0 +1,354 @@
+diff --git a/alicloud/data_source_alicloud_cr_chart_repositories_hidden_test.go b/alicloud/data_source_alicloud_cr_chart_repositories_hidden_test.go
+new file mode 100644
+index 000000000..2654de3fc
+--- /dev/null
++++ b/alicloud/data_source_alicloud_cr_chart_repositories_hidden_test.go
+@@ -0,0 +1,321 @@
++package alicloud
++
++import (
++	"fmt"
++	"os"
++	"reflect"
++	"sort"
++	"strings"
++	"testing"
++
++	"github.com/agiledragon/gomonkey/v2"
++	"github.com/alibabacloud-go/tea-rpc/client"
++	util "github.com/alibabacloud-go/tea-utils/service"
++	"github.com/hashicorp/terraform-plugin-sdk/helper/schema"
++
++	"github.com/aliyun/terraform-provider-alicloud/alicloud/connectivity"
++)
++
++func hiddenChartRepoObjects() []interface{} {
++	return hiddenChartRepoObjectsFor("cri-hidden")
++}
++
++func hiddenChartRepoObjectsFor(instanceID string) []interface{} {
++	return []interface{}{
++		map[string]interface{}{
++			"RepoId":            "repo-id-alpha",
++			"CreateTime":        "2024-01-02T03:04:05Z",
++			"InstanceId":        instanceID,
++			"RepoName":          "app-alpha",
++			"RepoNamespaceName": "team-a",
++			"RepoType":          "PUBLIC",
++			"Summary":           "alpha summary",
++		},
++		map[string]interface{}{
++			"RepoId":            "repo-id-beta",
++			"CreateTime":        "2024-02-03T04:05:06Z",
++			"InstanceId":        instanceID,
++			"RepoName":          "app-beta",
++			"RepoNamespaceName": "team-b",
++			"RepoType":          "PRIVATE",
++			"Summary":           "beta summary",
++		},
++		map[string]interface{}{
++			"RepoId":            "repo-id-db",
++			"CreateTime":        "2024-03-04T05:06:07Z",
++			"InstanceId":        instanceID,
++			"RepoName":          "db-alpha",
++			"RepoNamespaceName": "team-a",
++			"RepoType":          "PUBLIC",
++			"Summary":           "db summary",
++		},
++		map[string]interface{}{
++			"RepoId":            "repo-id-alpha-other-ns",
++			"CreateTime":        "2024-04-05T06:07:08Z",
++			"InstanceId":        instanceID,
++			"RepoName":          "app-alpha",
++			"RepoNamespaceName": "team-c",
++			"RepoType":          "PRIVATE",
++			"Summary":           "same repo name, different namespace",
++		},
++	}
++}
++
++func TestUnitAlicloudCrChartRepositoriesSchema(t *testing.T) {
++	p := Provider().(*schema.Provider)
++	ds, ok := p.DataSourcesMap["alicloud_cr_chart_repositories"]
++	if !ok {
++		t.Fatalf("expected provider to expose data source alicloud_cr_chart_repositories")
++	}
++	if ds.Schema["instance_id"] == nil || !ds.Schema["instance_id"].Required {
++		t.Fatalf("instance_id should be a required input")
++	}
++	if ds.Schema["name_regex"] == nil || ds.Schema["name_regex"].ValidateFunc == nil {
++		t.Fatalf("name_regex should have validation for invalid regular expressions")
++	}
++	_, errs := ds.Schema["name_regex"].ValidateFunc("[", "name_regex")
++	if len(errs) == 0 {
++		t.Fatalf("invalid name_regex should be rejected during validation")
++	}
++	for _, field := range []string{"ids", "names", "output_file", "repositories"} {
++		if ds.Schema[field] == nil {
++			t.Fatalf("expected public schema field %q to exist", field)
++		}
++	}
++	repoSchema, ok := ds.Schema["repositories"].Elem.(*schema.Resource)
++	if !ok {
++		t.Fatalf("repositories should expose nested repository objects")
++	}
++	for _, field := range []string{
++		"chart_repository_id", "create_time", "instance_id", "id",
++		"repo_name", "repo_namespace_name", "repo_type", "summary",
++	} {
++		if repoSchema.Schema[field] == nil {
++			t.Fatalf("repositories item missing public field %q", field)
++		}
++	}
++}
++
++func TestUnitAlicloudCrChartRepositoriesReadFiltersAndOutputs(t *testing.T) {
++	d := readHiddenChartRepos(t, map[string]interface{}{
++		"instance_id": "cri-hidden",
++	}, hiddenChartRepoObjects())
++	repos := repositoryStateByID(t, d)
++
++	if got := len(repos); got != 4 {
++		t.Fatalf("expected four repositories, got %d", got)
++	}
++	assertRepositoryFields(t, repos["cri-hidden:team-a:app-alpha"], map[string]string{
++		"chart_repository_id": "repo-id-alpha",
++		"create_time":         "2024-01-02T03:04:05Z",
++		"instance_id":         "cri-hidden",
++		"repo_namespace_name": "team-a",
++		"repo_name":           "app-alpha",
++		"repo_type":           "PUBLIC",
++		"summary":             "alpha summary",
++		"id":                  "cri-hidden:team-a:app-alpha",
++	})
++
++	assertStringSet(t, stateStringList(d, "ids"), []string{
++		"cri-hidden:team-a:app-alpha",
++		"cri-hidden:team-b:app-beta",
++		"cri-hidden:team-a:db-alpha",
++		"cri-hidden:team-c:app-alpha",
++	})
++	assertStringSet(t, stateStringList(d, "names"), []string{"app-alpha", "app-beta", "db-alpha", "app-alpha"})
++}
++
++func TestUnitAlicloudCrChartRepositoriesReadUsesConfiguredInstance(t *testing.T) {
++	instanceID := "cri-other"
++	d := readHiddenChartRepos(t, map[string]interface{}{
++		"instance_id": instanceID,
++	}, hiddenChartRepoObjectsFor(instanceID))
++	repos := repositoryStateByID(t, d)
++
++	if got := len(repos); got != 4 {
++		t.Fatalf("expected four repositories for configured instance, got %d", got)
++	}
++	assertRepositoryFields(t, repos["cri-other:team-a:app-alpha"], map[string]string{
++		"chart_repository_id": "repo-id-alpha",
++		"create_time":         "2024-01-02T03:04:05Z",
++		"instance_id":         instanceID,
++		"repo_namespace_name": "team-a",
++		"repo_name":           "app-alpha",
++		"repo_type":           "PUBLIC",
++		"summary":             "alpha summary",
++		"id":                  "cri-other:team-a:app-alpha",
++	})
++	assertStringSet(t, stateStringList(d, "ids"), []string{
++		"cri-other:team-a:app-alpha",
++		"cri-other:team-b:app-beta",
++		"cri-other:team-a:db-alpha",
++		"cri-other:team-c:app-alpha",
++	})
++}
++
++func TestUnitAlicloudCrChartRepositoriesReadNameRegex(t *testing.T) {
++	appRepos := readHiddenChartRepos(t, map[string]interface{}{
++		"instance_id": "cri-hidden",
++		"name_regex":  "^app-",
++	}, hiddenChartRepoObjects())
++	if got := len(repositoryStateByID(t, appRepos)); got != 3 {
++		t.Fatalf("expected three app repositories, got %d", got)
++	}
++	assertStringSet(t, stateStringList(appRepos, "names"), []string{"app-alpha", "app-beta", "app-alpha"})
++	assertStringSet(t, stateStringList(appRepos, "ids"), []string{
++		"cri-hidden:team-a:app-alpha",
++		"cri-hidden:team-b:app-beta",
++		"cri-hidden:team-c:app-alpha",
++	})
++
++	betaOnly := readHiddenChartRepos(t, map[string]interface{}{
++		"instance_id": "cri-hidden",
++		"name_regex":  "beta$",
++	}, hiddenChartRepoObjects())
++	if got := len(repositoryStateByID(t, betaOnly)); got != 1 {
++		t.Fatalf("expected one beta repository, got %d", got)
++	}
++	assertStringSet(t, stateStringList(betaOnly, "names"), []string{"app-beta"})
++}
++
++func TestUnitAlicloudCrChartRepositoriesReadIDsFilter(t *testing.T) {
++	d := readHiddenChartRepos(t, map[string]interface{}{
++		"instance_id": "cri-hidden",
++		"ids": []interface{}{
++			"cri-hidden:team-b:app-beta",
++			"cri-hidden:team-c:app-alpha",
++		},
++	}, hiddenChartRepoObjects())
++
++	if got := len(repositoryStateByID(t, d)); got != 2 {
++		t.Fatalf("expected two repositories after ids filtering, got %d", got)
++	}
++	assertStringSet(t, stateStringList(d, "ids"), []string{
++		"cri-hidden:team-b:app-beta",
++		"cri-hidden:team-c:app-alpha",
++	})
++	assertStringSet(t, stateStringList(d, "names"), []string{"app-beta", "app-alpha"})
++}
++
++func TestUnitAlicloudCrChartRepositoriesReadOutputFile(t *testing.T) {
++	output, err := os.CreateTemp("", "alicloud-cr-chart-repos-*.json")
++	if err != nil {
++		t.Fatal(err)
++	}
++	path := output.Name()
++	output.Close()
++	os.Remove(path)
++	defer os.Remove(path)
++
++	d := readHiddenChartRepos(t, map[string]interface{}{
++		"instance_id": "cri-hidden",
++		"name_regex":  "^app-",
++		"output_file": path,
++	}, hiddenChartRepoObjects())
++	if got := len(repositoryStateByID(t, d)); got != 3 {
++		t.Fatalf("expected three returned repositories, got %d", got)
++	}
++	body, err := os.ReadFile(path)
++	if err != nil {
++		t.Fatalf("expected output_file to be created: %v", err)
++	}
++	content := string(body)
++	for _, want := range []string{"app-alpha", "app-beta", "cri-hidden", "team-a", "team-b", "team-c"} {
++		if !strings.Contains(content, want) {
++			t.Fatalf("output_file content missing returned repository data %q: %s", want, content)
++		}
++	}
++	if strings.Contains(content, "db-alpha") || strings.Contains(content, "repo-id-db") {
++		t.Fatalf("output_file should not contain filtered-out repositories: %s", content)
++	}
++}
++
++func readHiddenChartRepos(t *testing.T, attrs map[string]interface{}, repos []interface{}) *schema.ResourceData {
++	t.Helper()
++	ds := Provider().(*schema.Provider).DataSourcesMap["alicloud_cr_chart_repositories"]
++	if ds == nil {
++		t.Fatalf("data source alicloud_cr_chart_repositories is not registered")
++	}
++	d := ds.Data(nil)
++	for k, v := range attrs {
++		if err := d.Set(k, v); err != nil {
++			t.Fatalf("setting %s: %v", k, err)
++		}
++	}
++
++
++	patchClient := gomonkey.ApplyMethod(reflect.TypeOf(&connectivity.AliyunClient{}), "NewAcrClient", func(_ *connectivity.AliyunClient) (*client.Client, error) {
++		return &client.Client{}, nil
++	})
++	defer patchClient.Reset()
++
++	patchRequest := gomonkey.ApplyMethod(reflect.TypeOf(&client.Client{}), "DoRequest", func(_ *client.Client, action *string, _ *string, _ *string, _ *string, _ *string, _ map[string]interface{}, request map[string]interface{}, _ *util.RuntimeOptions) (map[string]interface{}, error) {
++		if action == nil || *action != "ListChartRepository" {
++			t.Fatalf("expected chart repository list request, got %v", action)
++		}
++		if want := fmt.Sprint(attrs["instance_id"]); want != "" && fmt.Sprint(request["InstanceId"]) != want {
++			t.Fatalf("request InstanceId = %q, want %q", fmt.Sprint(request["InstanceId"]), want)
++		}
++		return map[string]interface{}{"Repositories": repos}, nil
++	})
++	defer patchRequest.Reset()
++
++	if err := ds.Read(d, &connectivity.AliyunClient{RegionId: "cn-hidden"}); err != nil {
++		t.Fatalf("reading chart repositories data source: %v", err)
++	}
++	return d
++}
++
++func repositoryStateByID(t *testing.T, d *schema.ResourceData) map[string]map[string]string {
++	t.Helper()
++	raw, ok := d.Get("repositories").([]interface{})
++	if !ok {
++		t.Fatalf("repositories has unexpected type %T", d.Get("repositories"))
++	}
++	out := make(map[string]map[string]string, len(raw))
++	for _, item := range raw {
++		m, ok := item.(map[string]interface{})
++		if !ok {
++			t.Fatalf("repository item has unexpected type %T", item)
++		}
++		id := fmt.Sprint(m["id"])
++		values := make(map[string]string, len(m))
++		for k, v := range m {
++			values[k] = fmt.Sprint(v)
++		}
++		out[id] = values
++	}
++	return out
++}
++
++func assertRepositoryFields(t *testing.T, got map[string]string, want map[string]string) {
++	t.Helper()
++	if got == nil {
++		t.Fatalf("expected repository id %q to exist", want["id"])
++	}
++	for key, wantValue := range want {
++		if got[key] != wantValue {
++			t.Fatalf("repository field %s = %q, want %q", key, got[key], wantValue)
++		}
++	}
++}
++
++func stateStringList(d *schema.ResourceData, key string) []string {
++	raw := d.Get(key).([]interface{})
++	out := make([]string, 0, len(raw))
++	for _, v := range raw {
++		out = append(out, v.(string))
++	}
++	return out
++}
++
++func assertStringSet(t *testing.T, got, want []string) {
++	t.Helper()
++	gotCopy := append([]string(nil), got...)
++	wantCopy := append([]string(nil), want...)
++	sort.Strings(gotCopy)
++	sort.Strings(wantCopy)
++	if !reflect.DeepEqual(gotCopy, wantCopy) {
++		t.Fatalf("string set mismatch\ngot:  %#v\nwant: %#v", gotCopy, wantCopy)
++	}
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,22 @@
++#!/bin/bash
++set -uo pipefail
++cd /testbed
++
++
++export ALICLOUD_ACCESS_KEY=mock
++export ALICLOUD_SECRET_KEY=mock
++export ALICLOUD_REGION=cn-beijing
++
++
++case "${1:-}" in
++  base)
++    go test -v -gcflags=all=-l -run "TestAccAlicloudCRRepoDataSource|TestAccAlicloudAmqpBinding|TestAccAlicloudCRChartRepository" ./alicloud/ -timeout 30m
++    ;;
++  new)
++    go test -v -gcflags=all=-l -run "TestUnitAlicloudCrChartRepositories(Schema|ReadFiltersAndOutputs|ReadUsesConfiguredInstance|ReadNameRegex|ReadIDsFilter|ReadOutputFile)$" ./alicloud/ -timeout 30m
++    ;;
++  *)
++    echo "usage: $0 base|new"
++    exit 2
++    ;;
++esac

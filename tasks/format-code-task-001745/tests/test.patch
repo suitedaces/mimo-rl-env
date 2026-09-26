@@ -1,0 +1,425 @@
+diff --git a/pkg/minikube/audit/logFile_test.go b/pkg/minikube/audit/logFile_test.go
+index ccea36276..e5b6de86c 100644
+--- a/pkg/minikube/audit/logFile_test.go
++++ b/pkg/minikube/audit/logFile_test.go
+@@ -17,11 +17,17 @@ limitations under the License.
+ package audit
+ 
+ import (
++	"encoding/json"
+ 	"io"
+ 	"io/ioutil"
+ 	"os"
++	"strings"
+ 	"testing"
+ 	"time"
++
++	"github.com/spf13/viper"
++	"k8s.io/minikube/pkg/minikube/config"
++	"k8s.io/minikube/pkg/version"
+ )
+ 
+ func TestLogFile(t *testing.T) {
+@@ -38,18 +44,92 @@ func TestLogFile(t *testing.T) {
+ 		}
+ 		defer os.Remove(f.Name())
+ 
+-		oldLogFile := *currentLogFile
+-		defer func() { currentLogFile = &oldLogFile }()
++		oldLogFile := currentLogFile
++		defer func() { currentLogFile = oldLogFile }()
+ 		currentLogFile = f
+ 
+-		e := newEntry("start", "-v", "user1", time.Now(), time.Now())
+-		if err := appendToLog(e); err != nil {
+-			t.Fatalf("Error appendingToLog: %v", err)
+-		}
++		oldArgs := os.Args
++		os.Args = []string{"minikube", "start", "-v"}
++		defer func() { os.Args = oldArgs }()
++
++		Log(time.Now())
+ 
+ 		b := make([]byte, 100)
+ 		if _, err := f.Read(b); err != nil && err != io.EOF {
+ 			t.Errorf("Log was not appended to file: %v", err)
+ 		}
+ 	})
++
++	t.Run("LogWritesVersion", func(t *testing.T) {
++		f, err := ioutil.TempFile("", "audit.json")
++		if err != nil {
++			t.Fatalf("Error creating temporary file: %v", err)
++		}
++		defer os.Remove(f.Name())
++
++		oldLogFile := currentLogFile
++		defer func() { currentLogFile = oldLogFile }()
++		currentLogFile = f
++
++		oldArgs := os.Args
++		os.Args = []string{"minikube", "delete", "-p", "audit-version-profile", "--alsologtostderr"}
++		defer func() { os.Args = oldArgs }()
++
++		oldProfile := viper.GetString(config.ProfileName)
++		oldUser := viper.GetString(config.UserFlag)
++		viper.Set(config.ProfileName, "audit-version-profile")
++		viper.Set(config.UserFlag, "audit-version-user")
++		defer func() {
++			viper.Set(config.ProfileName, oldProfile)
++			viper.Set(config.UserFlag, oldUser)
++		}()
++
++		Log(time.Now())
++
++		if _, err := f.Seek(0, 0); err != nil {
++			t.Fatalf("failed seeking to start of file: %v", err)
++		}
++		bytes, err := ioutil.ReadAll(f)
++		if err != nil {
++			t.Fatalf("failed reading file: %v", err)
++		}
++		lines := strings.Split(strings.TrimSpace(string(bytes)), "\n")
++		if len(lines) == 0 || lines[0] == "" {
++			t.Fatalf("log file is empty, expected appended event")
++		}
++
++		var event struct {
++			Data map[string]string `json:"data"`
++		}
++		if err := json.Unmarshal([]byte(lines[len(lines)-1]), &event); err != nil {
++			t.Fatalf("failed unmarshalling appended audit event: %v\n%s", err, lines[len(lines)-1])
++		}
++
++		if got, want := event.Data["command"], "delete"; got != want {
++			t.Errorf("data[command] = %q, want %q", got, want)
++		}
++		if got, want := event.Data["profile"], "audit-version-profile"; got != want {
++			t.Errorf("data[profile] = %q, want %q", got, want)
++		}
++		if got, want := event.Data["user"], "audit-version-user"; got != want {
++			t.Errorf("data[user] = %q, want %q", got, want)
++		}
++		if want := version.GetVersion(); !mapContainsValue(event.Data, want) {
++			t.Errorf("audit event data does not include current minikube version %q: %#v", want, event.Data)
++		}
++		for _, key := range []string{"args", "startTime", "endTime"} {
++			if event.Data[key] == "" {
++				t.Errorf("data[%s] is empty or missing in appended audit event", key)
++			}
++		}
++	})
++}
++
++func mapContainsValue(data map[string]string, want string) bool {
++	for _, got := range data {
++		if got == want {
++			return true
++		}
++	}
++	return false
+ }
+diff --git a/pkg/minikube/audit/report_test.go b/pkg/minikube/audit/report_test.go
+new file mode 100644
+index 000000000..40f7c8aab
+--- /dev/null
++++ b/pkg/minikube/audit/report_test.go
+@@ -0,0 +1,255 @@
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++package audit
++
++import (
++	"fmt"
++	"io/ioutil"
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/spf13/viper"
++	"k8s.io/minikube/pkg/minikube/config"
++	"k8s.io/minikube/pkg/minikube/constants"
++	"k8s.io/minikube/pkg/minikube/localpath"
++	"k8s.io/minikube/pkg/version"
++)
++
++func withAuditLogFile(t *testing.T, contents string) *os.File {
++	t.Helper()
++
++	f, err := ioutil.TempFile("", "audit-report-*.json")
++	if err != nil {
++		t.Fatalf("failed creating temporary audit log: %v", err)
++	}
++	t.Cleanup(func() {
++		_ = f.Close()
++		_ = os.Remove(f.Name())
++	})
++
++	if contents != "" {
++		if _, err := f.WriteString(contents); err != nil {
++			t.Fatalf("failed writing audit log fixture: %v", err)
++		}
++	}
++	if _, err := f.Seek(0, 0); err != nil {
++		t.Fatalf("failed seeking audit log fixture: %v", err)
++	}
++
++	oldLogFile := currentLogFile
++	currentLogFile = f
++	t.Cleanup(func() { currentLogFile = oldLogFile })
++	return f
++}
++
++func logAuditCommand(t *testing.T, command string, args []string, profile string, user string, startTime time.Time) {
++	t.Helper()
++
++	oldArgs := os.Args
++	os.Args = append([]string{"minikube", command}, args...)
++	defer func() { os.Args = oldArgs }()
++
++	oldProfile := viper.GetString(config.ProfileName)
++	oldUser := viper.GetString(config.UserFlag)
++	viper.Set(config.ProfileName, profile)
++	viper.Set(config.UserFlag, user)
++	defer func() {
++		viper.Set(config.ProfileName, oldProfile)
++		viper.Set(config.UserFlag, oldUser)
++	}()
++
++	Log(startTime)
++}
++
++func TestReportRejectsNonPositiveLineCount(t *testing.T) {
++	for _, n := range []int{0, -5} {
++		t.Run(fmt.Sprintf("n=%d", n), func(t *testing.T) {
++			report, err := Report(n)
++			if err == nil {
++				t.Fatalf("Report(%d) error = nil, want an error", n)
++			}
++			if report != nil {
++				t.Fatalf("Report(%d) report = %#v, want nil", n, report)
++			}
++		})
++	}
++}
++
++func TestReportReturnsMostRecentEntriesAsTable(t *testing.T) {
++	f := withAuditLogFile(t, "")
++	startAlpha := time.Date(2021, time.February, 2, 11, 0, 0, 0, time.UTC)
++	startBeta := time.Date(2021, time.February, 3, 12, 0, 0, 0, time.UTC)
++	startGamma := time.Date(2021, time.February, 4, 13, 0, 0, 0, time.UTC)
++
++	logAuditCommand(t, "delete", []string{"--all"}, "old-profile", "old-user", time.Date(2021, time.February, 1, 10, 0, 0, 0, time.UTC))
++	logAuditCommand(t, "start", []string{"-p", "alpha"}, "alpha", "user-a", startAlpha)
++	logAuditCommand(t, "stop", []string{"-p", "beta"}, "beta", "user-b", startBeta)
++	logAuditCommand(t, "logs", []string{"-p", "gamma", "--file=-"}, "gamma", "user-c", startGamma)
++	if _, err := f.Seek(0, 0); err != nil {
++		t.Fatalf("failed seeking audit log fixture: %v", err)
++	}
++
++	report, err := Report(3)
++	if err != nil {
++		t.Fatalf("Report(3) returned error: %v", err)
++	}
++	table := report.ASCIITable()
++
++	for _, want := range []string{
++		"start", "-p alpha", "alpha", "user-a", startAlpha.Format(constants.TimeFormat),
++		"stop", "-p beta", "beta", "user-b", startBeta.Format(constants.TimeFormat),
++		"logs", "-p gamma --file=-", "gamma", "user-c", startGamma.Format(constants.TimeFormat),
++	} {
++		if !strings.Contains(table, want) {
++			t.Errorf("ASCIITable() missing value %q\n%s", want, table)
++		}
++	}
++	if got, want := strings.Count(table, version.GetVersion()), 3; got < want {
++		t.Errorf("ASCIITable() includes current version %d times, want at least %d\n%s", got, want, table)
++	}
++
++	for _, omitted := range []string{"delete", "--all", "old-profile", "old-user"} {
++		if strings.Contains(table, omitted) {
++			t.Errorf("ASCIITable() contains older omitted value %q\n%s", omitted, table)
++		}
++	}
++}
++
++func TestASCIITableIncludesExpectedColumnsAndRows(t *testing.T) {
++	f := withAuditLogFile(t, "")
++	startA := time.Date(2021, time.February, 5, 14, 0, 0, 0, time.UTC)
++	startB := time.Date(2021, time.February, 6, 15, 0, 0, 0, time.UTC)
++
++	logAuditCommand(t, "profile", []string{"list"}, "prof-a", "reader-a", startA)
++	logAuditCommand(t, "update-context", []string{"--profile", "prof-b"}, "prof-b", "reader-b", startB)
++	if _, err := f.Seek(0, 0); err != nil {
++		t.Fatalf("failed seeking audit log fixture: %v", err)
++	}
++
++	report, err := Report(10)
++	if err != nil {
++		t.Fatalf("Report(10) returned error: %v", err)
++	}
++	table := report.ASCIITable()
++
++	for _, value := range []string{
++		"profile", "list", "prof-a", "reader-a", startA.Format(constants.TimeFormat),
++		"update-context", "--profile prof-b", "prof-b", "reader-b", startB.Format(constants.TimeFormat),
++	} {
++		if !strings.Contains(table, value) {
++			t.Errorf("ASCIITable() missing row value %q\n%s", value, table)
++		}
++	}
++	if got, want := strings.Count(table, version.GetVersion()), 2; got < want {
++		t.Errorf("ASCIITable() includes current version %d times, want at least %d\n%s", got, want, table)
++	}
++}
++
++func TestReportCanReadEntryWrittenByLogInSameProcess(t *testing.T) {
++	f := withAuditLogFile(t, "")
++
++	oldArgs := os.Args
++	os.Args = []string{"minikube", "addons", "enable", "metrics-server", "-p", "same-process-profile"}
++	t.Cleanup(func() { os.Args = oldArgs })
++
++	oldProfile := viper.GetString(config.ProfileName)
++	oldUser := viper.GetString(config.UserFlag)
++	viper.Set(config.ProfileName, "same-process-profile")
++	viper.Set(config.UserFlag, "same-process-user")
++	t.Cleanup(func() {
++		viper.Set(config.ProfileName, oldProfile)
++		viper.Set(config.UserFlag, oldUser)
++	})
++
++	Log(time.Now())
++
++	if _, err := f.Seek(0, 0); err != nil {
++		t.Fatalf("failed seeking audit log after Log: %v", err)
++	}
++	report, err := Report(1)
++	if err != nil {
++		t.Fatalf("Report(1) after Log returned error: %v", err)
++	}
++	table := report.ASCIITable()
++
++	for _, want := range []string{"addons", "enable", "metrics-server", "same-process-profile", "same-process-user", version.GetVersion()} {
++		if !strings.Contains(table, want) {
++			t.Errorf("ASCIITable() after Log missing %q\n%s", want, table)
++		}
++	}
++}
++
++func TestReportCanReadEntryWrittenThroughDefaultLogFile(t *testing.T) {
++	tempHome, err := ioutil.TempDir("", "audit-home-*")
++	if err != nil {
++		t.Fatalf("failed creating temporary minikube home: %v", err)
++	}
++	t.Cleanup(func() { _ = os.RemoveAll(tempHome) })
++
++	oldHome := os.Getenv(localpath.MinikubeHome)
++	if err := os.Setenv(localpath.MinikubeHome, tempHome); err != nil {
++		t.Fatalf("failed setting minikube home: %v", err)
++	}
++	t.Cleanup(func() { _ = os.Setenv(localpath.MinikubeHome, oldHome) })
++
++	if err := os.MkdirAll(filepath.Dir(localpath.AuditLog()), 0755); err != nil {
++		t.Fatalf("failed creating audit log directory: %v", err)
++	}
++
++	oldLogFile := currentLogFile
++	currentLogFile = nil
++	t.Cleanup(func() {
++		if currentLogFile != nil && currentLogFile != oldLogFile {
++			_ = currentLogFile.Close()
++		}
++		currentLogFile = oldLogFile
++	})
++
++	oldArgs := os.Args
++	os.Args = []string{"minikube", "profile", "list", "-p", "default-file-profile"}
++	t.Cleanup(func() { os.Args = oldArgs })
++
++	oldProfile := viper.GetString(config.ProfileName)
++	oldUser := viper.GetString(config.UserFlag)
++	viper.Set(config.ProfileName, "default-file-profile")
++	viper.Set(config.UserFlag, "default-file-user")
++	t.Cleanup(func() {
++		viper.Set(config.ProfileName, oldProfile)
++		viper.Set(config.UserFlag, oldUser)
++	})
++
++	Log(time.Now())
++	if currentLogFile != nil {
++		if _, err := currentLogFile.Seek(0, 0); err != nil {
++			t.Fatalf("failed seeking default audit log after Log: %v", err)
++		}
++	}
++
++	report, err := Report(1)
++	if err != nil {
++		t.Fatalf("Report(1) after default Log returned error: %v", err)
++	}
++	table := report.ASCIITable()
++	for _, want := range []string{"profile", "list -p default-file-profile", "default-file-profile", "default-file-user", version.GetVersion()} {
++		if !strings.Contains(table, want) {
++			t.Errorf("ASCIITable() from default log file missing %q\n%s", want, table)
++		}
++	}
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,38 @@
++#!/bin/bash
++set -uo pipefail
++cd /testbed
++
++
++mkdir -p /root/.minikube/logs
++
++GOBINDATA_BIN="/testbed/.build_env/go-bindata"
++if [ ! -x "$GOBINDATA_BIN" ]; then
++    GOBINDATA_BIN="/tmp/gopath/bin/go-bindata"
++fi
++if [ ! -x "$GOBINDATA_BIN" ]; then
++    GOBINDATA_BIN="/usr/local/bin/go-bindata"
++fi
++if [ ! -f pkg/minikube/translate/translations.go ]; then
++    "$GOBINDATA_BIN" -nomemcopy -o pkg/minikube/translate/translations.go -pkg translate translations/ 2>/dev/null || \
++    echo "//go:build ignore" > pkg/minikube/translate/translations.go
++fi
++if [ ! -f pkg/minikube/assets/assets.go ]; then
++    "$GOBINDATA_BIN" -nomemcopy -o pkg/minikube/assets/assets.go -pkg assets deploy/addons/... 2>/dev/null || \
++    echo "//go:build ignore" > pkg/minikube/assets/assets.go
++fi
++
++
++FIXTURE_VERSION_LDFLAGS="-X k8s.io/minikube/pkg/version.version=v9.99.0-fixture"
++
++case "${1:-}" in
++  base)
++    go test -v -count=1 -ldflags "$FIXTURE_VERSION_LDFLAGS" ./pkg/minikube/audit/ -run '^TestAudit$'
++    ;;
++  new)
++    go test -v -count=1 -ldflags "$FIXTURE_VERSION_LDFLAGS" ./pkg/minikube/audit/ -run '^(TestLogFile|TestReportRejectsNonPositiveLineCount|TestReportReturnsMostRecentEntriesAsTable|TestASCIITableIncludesExpectedColumnsAndRows|TestReportCanReadEntryWrittenByLogInSameProcess|TestReportCanReadEntryWrittenThroughDefaultLogFile)$'
++    ;;
++  *)
++    echo "usage: $0 base|new"
++    exit 2
++    ;;
++esac

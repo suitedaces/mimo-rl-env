@@ -1,0 +1,427 @@
+diff --git a/usercase-test-coderl/test_scene_loader.py b/usercase-test-coderl/test_scene_loader.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/test_scene_loader.py
+@@ -0,0 +1,393 @@
++from __future__ import annotations
++
++
++
++
++
++
++import gc
++import pickle
++from pathlib import Path
++
++import numpy as np
++import pytest
++
++import navsim.common.dataclasses as dataclasses_module
++from navsim.common.dataclasses import AgentInput, Scene, SceneFilter, SensorConfig
++from navsim.common.dataloader import SceneLoader
++
++
++CAMERA_NAMES = (
++    "CAM_F0",
++    "CAM_L0",
++    "CAM_L1",
++    "CAM_L2",
++    "CAM_R0",
++    "CAM_R1",
++    "CAM_R2",
++    "CAM_B0",
++)
++
++
++def _camera_dict() -> dict:
++    return {
++        name: {
++            "data_path": "missing.png",
++            "sensor2lidar_rotation": np.eye(3),
++            "sensor2lidar_translation": np.zeros(3),
++            "cam_intrinsic": np.eye(3),
++            "distortion": np.zeros(5),
++        }
++        for name in CAMERA_NAMES
++    }
++
++
++def _frame(log_name: str, token: str, index: int, roadblock_ids=None) -> dict:
++    if roadblock_ids is None:
++        roadblock_ids = ["rb"]
++
++    return {
++        "token": token,
++        "scene_token": f"scene_{token}",
++        "log_name": log_name,
++        "timestamp": 1000 + index,
++        "roadblock_ids": roadblock_ids,
++        "traffic_lights": [("tl", True)],
++        "map_location": "us-ma-boston",
++        "ego2global_translation": [float(index), float(index * 2), 0.0],
++        "ego2global_rotation": [1.0, 0.0, 0.0, 0.0],
++        "ego_dynamic_state": [index + 0.1, index + 0.2, index + 0.3, index + 0.4],
++        "driving_command": np.array([index, index + 1, index + 2], dtype=np.int64),
++        "cams": _camera_dict(),
++        "lidar_path": "missing.pcd",
++        "anns": {
++            "gt_boxes": np.zeros((0, 7), dtype=np.float32),
++            "gt_names": [],
++            "gt_velocity_3d": np.zeros((0, 3), dtype=np.float32),
++            "instance_tokens": [],
++            "track_tokens": [],
++        },
++    }
++
++
++def _write_log(data_path: Path, log_name: str, tokens: list[str], offset: int = 0, no_route_tokens=None) -> None:
++    if no_route_tokens is None:
++        no_route_tokens = set()
++
++    frames = [
++        _frame(
++            log_name=log_name,
++            token=token,
++            index=offset + index,
++            roadblock_ids=[] if token in no_route_tokens else ["rb"],
++        )
++        for index, token in enumerate(tokens)
++    ]
++    with open(data_path / f"{log_name}.pkl", "wb") as file:
++        pickle.dump(frames, file)
++
++
++def _paths(tmp_path: Path) -> tuple[Path, Path]:
++    data_path = tmp_path / "data"
++    sensor_blobs_path = tmp_path / "sensor_blobs"
++    data_path.mkdir()
++    sensor_blobs_path.mkdir()
++    return data_path, sensor_blobs_path
++
++
++def test_token_filter_retains_window_state_and_indexing(tmp_path: Path) -> None:
++
++
++
++    data_path, sensor_blobs_path = _paths(tmp_path)
++    _write_log(data_path, "log_a", ["a0", "a1", "a2", "a3"])
++
++    loader = SceneLoader(
++        data_path=data_path,
++        sensor_blobs_path=sensor_blobs_path,
++        scene_filter=SceneFilter(
++            num_history_frames=2,
++            num_future_frames=1,
++            frame_interval=1,
++            has_route=True,
++            tokens=["a1", "a2"],
++        ),
++        sensor_config=SensorConfig.build_no_sensors(),
++    )
++
++    assert loader.tokens == ["a1", "a2"]
++    assert len(loader) == 2
++    assert loader[0] == "a1"
++    assert loader[1] == "a2"
++    assert loader.num_history_frames == 2
++    assert loader.num_future_frames == 1
++    assert loader.get_tokens_list_per_log() == {"log_a": ["a1", "a2"]}
++
++
++def test_log_name_filter_and_max_scenes_boundaries(tmp_path: Path) -> None:
++
++
++
++    data_path, sensor_blobs_path = _paths(tmp_path)
++    _write_log(data_path, "log_a", ["a0", "a1"])
++    _write_log(data_path, "log_b", ["b0", "b1"], offset=10)
++
++    log_a_loader = SceneLoader(
++        data_path=data_path,
++        sensor_blobs_path=sensor_blobs_path,
++        scene_filter=SceneFilter(
++            num_history_frames=1,
++            num_future_frames=0,
++            has_route=True,
++            log_names=["log_a"],
++        ),
++        sensor_config=SensorConfig.build_no_sensors(),
++    )
++    assert log_a_loader.tokens == ["a0", "a1"]
++    assert len(log_a_loader) == 2
++    assert log_a_loader.get_tokens_list_per_log() == {"log_a": ["a0", "a1"]}
++
++    capped_loader = SceneLoader(
++        data_path=data_path,
++        sensor_blobs_path=sensor_blobs_path,
++        scene_filter=SceneFilter(
++            num_history_frames=1,
++            num_future_frames=0,
++            has_route=True,
++            log_names=["log_a"],
++            max_scenes=1,
++        ),
++        sensor_config=SensorConfig.build_no_sensors(),
++    )
++    assert capped_loader.tokens == ["a0"]
++    assert len(capped_loader) == 1
++    assert capped_loader[0] == "a0"
++    assert capped_loader.get_tokens_list_per_log() == {"log_a": ["a0"]}
++
++
++def test_frame_window_interval_route_and_short_window_filtering(tmp_path: Path) -> None:
++
++
++
++    data_path, sensor_blobs_path = _paths(tmp_path)
++    _write_log(data_path, "log_route", ["r0", "r1", "r2", "r3", "r4"], no_route_tokens={"r1"})
++
++    loader = SceneLoader(
++        data_path=data_path,
++        sensor_blobs_path=sensor_blobs_path,
++        scene_filter=SceneFilter(
++            num_history_frames=2,
++            num_future_frames=1,
++            frame_interval=2,
++            has_route=True,
++        ),
++        sensor_config=SensorConfig.build_no_sensors(),
++    )
++
++    assert loader.tokens == ["r3"]
++    assert len(loader) == 1
++    assert loader[0] == "r3"
++    assert loader.num_history_frames == 2
++    assert loader.num_future_frames == 1
++    assert loader.get_tokens_list_per_log() == {"log_route": ["r3"]}
++
++
++def test_scene_and_agent_input_lookup_use_stored_window(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
++
++
++
++    data_path, sensor_blobs_path = _paths(tmp_path)
++    _write_log(data_path, "log_a", ["a0", "a1", "a2", "a3"])
++
++    def fake_get_maps_api(map_root, map_version, map_name):
++        return {"map_root": map_root, "map_version": map_version, "map_name": map_name}
++
++    monkeypatch.setattr(dataclasses_module, "get_maps_api", fake_get_maps_api)
++    loader = SceneLoader(
++        data_path=data_path,
++        sensor_blobs_path=sensor_blobs_path,
++        scene_filter=SceneFilter(
++            num_history_frames=2,
++            num_future_frames=1,
++            frame_interval=1,
++            has_route=True,
++            tokens=["a1"],
++        ),
++        sensor_config=SensorConfig.build_no_sensors(),
++    )
++
++    scene = loader.get_scene_from_token("a1")
++
++    assert isinstance(scene, Scene)
++    assert scene.scene_metadata.log_name == "log_a"
++    assert scene.scene_metadata.scene_token == "scene_a1"
++    assert scene.scene_metadata.map_name == "us-ma-boston"
++    assert scene.scene_metadata.initial_token == "a1"
++    assert scene.scene_metadata.num_history_frames == 2
++    assert scene.scene_metadata.num_future_frames == 1
++
++    assert scene.map_api["map_name"] == "us-ma-boston"
++    assert len(scene.frames) == 3
++    assert [frame.token for frame in scene.frames] == ["a0", "a1", "a2"]
++    assert scene.frames[1].timestamp == 1001
++    assert scene.frames[1].roadblock_ids == ["rb"]
++    assert scene.frames[1].traffic_lights == [("tl", True)]
++    assert scene.frames[1].ego_status.in_global_frame is True
++
++    assert scene.frames[1].ego_status.ego_pose.tolist() == pytest.approx([1.0, 2.0, 0.0])
++    assert scene.frames[1].ego_status.ego_velocity.tolist() == pytest.approx([1.1, 1.2])
++    assert scene.frames[1].ego_status.ego_acceleration.tolist() == pytest.approx([1.3, 1.4])
++    assert scene.frames[1].annotations.boxes.shape == (0, 7)
++    assert scene.frames[1].cameras.cam_f0.image is None
++    assert scene.frames[1].lidar.lidar_pc is None
++
++    agent_input = loader.get_agent_input_from_token("a1")
++
++    assert isinstance(agent_input, AgentInput)
++    assert len(agent_input.ego_statuses) == 2
++    assert len(agent_input.cameras) == 2
++    assert len(agent_input.lidars) == 2
++
++    assert agent_input.ego_statuses[0].ego_pose.tolist() == pytest.approx([-1.0, -2.0, 0.0])
++    assert agent_input.ego_statuses[1].ego_pose.tolist() == pytest.approx([0.0, 0.0, 0.0])
++    assert agent_input.ego_statuses[1].ego_velocity.tolist() == pytest.approx([1.1, 1.2])
++    assert agent_input.ego_statuses[1].ego_acceleration.tolist() == pytest.approx([1.3, 1.4])
++    assert agent_input.ego_statuses[1].driving_command.tolist() == [1, 2, 3]
++    assert agent_input.cameras[0].cam_f0.image is None
++    assert agent_input.lidars[0].lidar_pc is None
++
++
++def test_invalid_token_lookups_raise_assertion_error(tmp_path: Path) -> None:
++
++
++
++    data_path, sensor_blobs_path = _paths(tmp_path)
++    _write_log(data_path, "log_a", ["a0", "a1", "a2"])
++    loader = SceneLoader(
++        data_path=data_path,
++        sensor_blobs_path=sensor_blobs_path,
++        scene_filter=SceneFilter(
++            num_history_frames=2,
++            num_future_frames=1,
++            frame_interval=1,
++            has_route=True,
++            tokens=["a1"],
++        ),
++        sensor_config=SensorConfig.build_no_sensors(),
++    )
++
++    with pytest.raises(AssertionError):
++        loader.get_scene_from_token("missing")
++    with pytest.raises(AssertionError):
++        loader.get_agent_input_from_token("missing")
++
++
++def test_tokens_list_per_log_groups_each_log_in_accepted_order(tmp_path: Path) -> None:
++
++
++
++    data_path, sensor_blobs_path = _paths(tmp_path)
++    _write_log(data_path, "log_a", ["a0", "a1", "a2"])
++    _write_log(data_path, "log_b", ["b0", "b1", "b2"], offset=10)
++
++    loader = SceneLoader(
++        data_path=data_path,
++        sensor_blobs_path=sensor_blobs_path,
++        scene_filter=SceneFilter(
++            num_history_frames=1,
++            num_future_frames=0,
++            has_route=True,
++            tokens=["a0", "a2", "b0", "b2"],
++        ),
++        sensor_config=SensorConfig.build_no_sensors(),
++    )
++
++    assert loader.tokens == ["a0", "a2", "b0", "b2"]
++    assert len(loader) == 4
++    assert loader.get_tokens_list_per_log() == {"log_a": ["a0", "a2"], "log_b": ["b0", "b2"]}
++
++
++def test_two_loader_instances_keep_independent_retained_state(tmp_path: Path) -> None:
++
++
++
++    data_path, sensor_blobs_path = _paths(tmp_path)
++    _write_log(data_path, "log_a", ["a0", "a1", "a2"])
++    _write_log(data_path, "log_b", ["b0", "b1", "b2"], offset=10)
++
++    loader_a = SceneLoader(
++        data_path=data_path,
++        sensor_blobs_path=sensor_blobs_path,
++        scene_filter=SceneFilter(
++            num_history_frames=1,
++            num_future_frames=0,
++            has_route=True,
++            log_names=["log_a"],
++            tokens=["a0", "a2"],
++        ),
++        sensor_config=SensorConfig.build_no_sensors(),
++    )
++    loader_b = SceneLoader(
++        data_path=data_path,
++        sensor_blobs_path=sensor_blobs_path,
++        scene_filter=SceneFilter(
++            num_history_frames=1,
++            num_future_frames=0,
++            has_route=True,
++            log_names=["log_b"],
++            tokens=["b1"],
++        ),
++        sensor_config=SensorConfig.build_no_sensors(),
++    )
++
++    assert loader_a.tokens == ["a0", "a2"]
++    assert len(loader_a) == 2
++    assert loader_a.get_tokens_list_per_log() == {"log_a": ["a0", "a2"]}
++    assert loader_b.tokens == ["b1"]
++    assert len(loader_b) == 1
++    assert loader_b.get_tokens_list_per_log() == {"log_b": ["b1"]}
++
++
++def test_repeated_construct_lookup_and_drop_preserves_lookup_contract(tmp_path: Path) -> None:
++
++
++
++    data_path, sensor_blobs_path = _paths(tmp_path)
++    _write_log(data_path, "log_a", ["a0", "a1", "a2"])
++
++
++
++    for _ in range(100):
++        loader = SceneLoader(
++            data_path=data_path,
++            sensor_blobs_path=sensor_blobs_path,
++            scene_filter=SceneFilter(
++                num_history_frames=2,
++                num_future_frames=1,
++                frame_interval=1,
++                has_route=True,
++                tokens=["a1"],
++            ),
++            sensor_config=SensorConfig.build_no_sensors(),
++        )
++        assert loader.tokens == ["a1"]
++        assert loader.get_agent_input_from_token("a1").ego_statuses[1].ego_pose.tolist() == pytest.approx(
++            [0.0, 0.0, 0.0]
++        )
++        del loader
++        gc.collect()
++
++    final_loader = SceneLoader(
++        data_path=data_path,
++        sensor_blobs_path=sensor_blobs_path,
++        scene_filter=SceneFilter(
++            num_history_frames=2,
++            num_future_frames=1,
++            frame_interval=1,
++            has_route=True,
++            tokens=["a1"],
++        ),
++        sensor_config=SensorConfig.build_no_sensors(),
++    )
++    assert final_loader.tokens == ["a1"]
++    assert final_loader.get_tokens_list_per_log() == {"log_a": ["a1"]}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,24 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++
++cd /workspace/repo
++
++
++
++
++export PYTHONPATH="/workspace/repo${PYTHONPATH:+:${PYTHONPATH}}"
++
++
++export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
++
++exec python -m pytest /workspace/repo/usercase-test-coderl/test_scene_loader.py -v

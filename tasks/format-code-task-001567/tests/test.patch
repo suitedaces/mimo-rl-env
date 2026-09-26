@@ -1,0 +1,275 @@
+diff --git a/usercase-test-coderl/test_lazy_getitem.py b/usercase-test-coderl/test_lazy_getitem.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/test_lazy_getitem.py
+@@ -0,0 +1,237 @@
++
++
++
++
++
++
++
++from __future__ import annotations
++
++import os
++import pickle
++import socket
++import subprocess
++import sys
++
++import pytest
++
++from redun import Scheduler, task
++
++
++NAMESPACE = "usercase_test_coderl"
++
++
++@task(namespace=NAMESPACE)
++def make_pair() -> tuple[str, int]:
++    return ("Bob", 20)
++
++
++@task(namespace=NAMESPACE)
++def explosive_pair() -> tuple[str, int]:
++    raise AssertionError("explosive_pair should not execute during expression construction")
++
++
++@task(namespace=NAMESPACE)
++def items() -> list[str]:
++    return ["a", "b", "c"]
++
++
++@task(namespace=NAMESPACE)
++def numbers() -> list[int]:
++    return [10, 20, 30, 40, 50]
++
++
++@task(namespace=NAMESPACE)
++def outputs() -> dict[str, int]:
++    return {"value": 3, "other": 8}
++
++
++@task(namespace=NAMESPACE)
++def describe(name: str, age: int) -> str:
++    return f"{name} is {age}"
++
++
++@task(namespace=NAMESPACE)
++def echo(value):
++    return value
++
++
++@task(namespace="usercase_test_coderl_fresh", name="items")
++def fresh_items() -> list[str]:
++    return ["a", "b", "c"]
++
++
++def run_expr(expr):
++    return Scheduler().run(expr, cache=False)
++
++
++def assert_readable_item_repr(actual: str, task_name: str, key_repr: str) -> None:
++
++    assert actual.endswith(f"{task_name}()[{key_repr}]")
++    assert "SimpleExpression" not in actual
++
++
++def assert_slice_expanded_to_item_exprs(exprs, task_name: str, key_reprs: list[str]) -> None:
++
++    assert isinstance(exprs, list)
++    assert len(exprs) == len(key_reprs)
++    for expr, key_repr in zip(exprs, key_reprs):
++        assert_readable_item_repr(repr(expr), task_name, key_repr)
++
++
++def test_pair_indexing_is_lazy_at_construction_and_has_readable_repr():
++
++
++
++    actual = repr(explosive_pair()[0])
++
++    assert_readable_item_repr(actual, "explosive_pair", "0")
++
++
++def test_tuple_positions_feed_downstream_task_after_scheduling():
++
++
++
++    actual = run_expr(describe(make_pair()[0], make_pair()[1]))
++
++    assert actual == "Bob is 20"
++
++
++def test_list_integer_index_evaluates_to_selected_element():
++
++
++
++    actual = run_expr(echo(items()[1]))
++
++    assert actual == "b"
++
++
++def test_mapping_key_index_evaluates_to_selected_value_and_formats_key_repr():
++
++
++
++    expr = outputs()["value"]
++    actual = run_expr(echo(expr))
++
++    assert_readable_item_repr(repr(expr), "outputs", "'value'")
++    assert actual == 3
++
++
++def test_explicit_start_stop_slice_expands_to_lazy_item_list():
++
++
++
++    exprs = items()[1:3]
++    actual = run_expr(echo(exprs))
++
++    assert_slice_expanded_to_item_exprs(exprs, "items", ["1", "2"])
++    assert actual == ["b", "c"]
++
++
++def test_omitted_start_slice_expands_from_zero():
++
++
++
++    exprs = items()[:2]
++    actual = run_expr(echo(exprs))
++
++    assert_slice_expanded_to_item_exprs(exprs, "items", ["0", "1"])
++    assert actual == ["a", "b"]
++
++
++def test_start_stop_step_slice_expands_with_step():
++
++
++
++    exprs = numbers()[1:5:2]
++    actual = run_expr(echo(exprs))
++
++    assert_slice_expanded_to_item_exprs(exprs, "numbers", ["1", "3"])
++    assert actual == [20, 40]
++
++
++def test_invalid_out_of_range_index_surfaces_index_error_during_scheduler_evaluation():
++
++
++
++
++    with pytest.raises(IndexError):
++        run_expr(echo(items()[5]))
++
++
++def test_referential_transparency_for_repeated_indexing_observation():
++    first = repr(items()[1])
++    second = repr(items()[1])
++
++    assert_readable_item_repr(first, "items", "1")
++    assert_readable_item_repr(second, "items", "1")
++    assert first == second
++
++
++def test_indexing_does_not_mutate_original_expression():
++    expr = items()
++    expr_snapshot = pickle.loads(pickle.dumps(expr))
++    snapshot_repr = repr(expr_snapshot)
++    snapshot_hash = expr_snapshot.get_hash()
++
++    original_repr = repr(expr)
++    single = repr(expr[1])
++    sliced = expr[1:3]
++
++
++    assert snapshot_repr == original_repr
++    assert_readable_item_repr(single, "items", "1")
++    assert_slice_expanded_to_item_exprs(sliced, "items", ["1", "2"])
++    assert repr(expr) == snapshot_repr
++    assert expr.get_hash() == snapshot_hash
++
++
++def test_no_global_state_across_fresh_python_process(tmp_path):
++    script = tmp_path / "fresh_process_check.py"
++    script.write_text(
++        "\n".join(
++            [
++                "import sys",
++                "sys.path.insert(0, '/workspace/repo')",
++                "from redun import task",
++                "@task(namespace='usercase_test_coderl_fresh', name='items')",
++                "def fresh_items():",
++                "    return ['a', 'b', 'c']",
++                "sys.stdout.write(repr(fresh_items()[1]))",
++            ]
++        )
++    )
++
++    in_process = repr(fresh_items()[1])
++    completed = subprocess.run(
++        [sys.executable, str(script)],
++        check=True,
++        text=True,
++        capture_output=True,
++    )
++
++    assert_readable_item_repr(in_process, "items", "1")
++    assert_readable_item_repr(completed.stdout, "items", "1")
++    assert completed.stdout == in_process
++
++
++def test_indexing_construction_has_no_undeclared_filesystem_or_network_side_effects(
++    tmp_path, monkeypatch
++):
++    def deny_socket(*args, **kwargs):
++        raise AssertionError("lazy indexing construction must not create network sockets")
++
++    monkeypatch.setattr(socket, "socket", deny_socket)
++
++    old_cwd = os.getcwd()
++    os.chdir(tmp_path)
++    try:
++        before = sorted(path.relative_to(tmp_path) for path in tmp_path.rglob("*"))
++        actual = repr(make_pair()[0])
++        after = sorted(path.relative_to(tmp_path) for path in tmp_path.rglob("*"))
++    finally:
++        os.chdir(old_cwd)
++
++    assert_readable_item_repr(actual, "make_pair", "0")
++    assert before == []
++    assert after == []
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,28 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++
++cd /workspace/repo
++
++if [[ -x /workspace/repo/.venv/bin/python ]]; then
++  PYTHON_BIN=/workspace/repo/.venv/bin/python
++else
++  PYTHON_BIN=${PYTHON:-python3}
++fi
++
++export PYTHONPATH="/workspace/repo${PYTHONPATH:+:${PYTHONPATH}}"
++export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
++export PIP_NO_INDEX=1
++export UV_NO_NETWORK=1
++export AWS_EC2_METADATA_DISABLED=true
++
++exec "${PYTHON_BIN}" -m pytest /workspace/repo/usercase-test-coderl/test_lazy_getitem.py -v

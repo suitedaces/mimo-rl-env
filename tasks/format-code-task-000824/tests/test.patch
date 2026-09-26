@@ -1,0 +1,330 @@
+diff --git a/commands/scp_test.go b/commands/scp_test.go
+index 71207f2d..59e21eb2 100644
+--- a/commands/scp_test.go
++++ b/commands/scp_test.go
+@@ -1,6 +1,7 @@
+ package commands
+ 
+ import (
++	"os"
+ 	"os/exec"
+ 	"testing"
+ 
+@@ -40,6 +41,14 @@ func (l *MockHostInfoLoader) load(name string) (HostInfo, error) {
+ 	return &info, nil
+ }
+ 
++type MockHostInfoMapLoader map[string]MockHostInfo
++
++func (l MockHostInfoMapLoader) load(name string) (HostInfo, error) {
++	info := l[name]
++	info.name = name
++	return &info, nil
++}
++
+ func TestGetInfoForLocalScpArg(t *testing.T) {
+ 	host, path, opts, err := getInfoForScpArg("/tmp/foo", nil)
+ 	assert.Nil(t, host)
+@@ -99,19 +108,13 @@ func TestGetScpCmd(t *testing.T) {
+ 
+ 	cmd, err := getScpCmd("/tmp/foo", "myfunhost:/home/docker/foo", true, &hostInfoLoader)
+ 
+-	expectedArgs := append(
+-		baseSSHArgs,
+-		"-3",
+-		"-r",
+-		"-i",
+-		"/fake/keypath/id_rsa",
+-		"/tmp/foo",
+-		"root@12.34.56.78:/home/docker/foo",
+-	)
+-	expectedCmd := exec.Command("/usr/bin/scp", expectedArgs...)
+-
+-	assert.Equal(t, expectedCmd, cmd)
+ 	assert.NoError(t, err)
++	assert.Contains(t, cmd.Args, "-3")
++	assert.Contains(t, cmd.Args, "-r")
++	assertContainsArgPair(t, cmd.Args, "-i", "/fake/keypath/id_rsa")
++	assert.Contains(t, cmd.Args, "/tmp/foo")
++	assert.Contains(t, cmd.Args, "root@12.34.56.78:/home/docker/foo")
++	assertIdentitiesOnlyPresent(t, cmd.Args)
+ }
+ 
+ func TestGetScpCmdWithoutSshKey(t *testing.T) {
+@@ -134,3 +137,235 @@ func TestGetScpCmdWithoutSshKey(t *testing.T) {
+ 	assert.Equal(t, expectedCmd, cmd)
+ 	assert.NoError(t, err)
+ }
++
++func TestGetScpCmdAllowsAgentWhenDestinationMachineHasNoExplicitKey(t *testing.T) {
++	hostInfoLoader := MockHostInfoLoader{MockHostInfo{
++		ip:          "1.2.3.4",
++		sshUsername: "user",
++	}}
++
++	cmd, err := getScpCmd("/tmp/foo", "myfunhost:/home/docker/foo", false, &hostInfoLoader)
++
++	assert.NoError(t, err)
++	assertIdentitiesOnlyAbsent(t, cmd.Args)
++}
++
++func TestGetScpCmdAllowsAgentWhenSourceMachineHasNoExplicitKey(t *testing.T) {
++	hostInfoLoader := MockHostInfoLoader{MockHostInfo{
++		ip:          "1.2.3.4",
++		sshUsername: "user",
++	}}
++
++	cmd, err := getScpCmd("myfunhost:/home/docker/foo", "/tmp/foo", false, &hostInfoLoader)
++
++	assert.NoError(t, err)
++	assertIdentitiesOnlyAbsent(t, cmd.Args)
++}
++
++func TestGetScpCmdAllowsAgentWhenEitherRemoteMachineHasNoExplicitKey(t *testing.T) {
++	testCases := []struct {
++		name  string
++		src   string
++		dest  string
++		hosts MockHostInfoMapLoader
++	}{
++		{
++			name: "source missing explicit key",
++			src:  "source-host:/tmp/foo",
++			dest: "dest-host:/tmp/foo",
++			hosts: MockHostInfoMapLoader{
++				"source-host": {
++					ip:          "1.2.3.4",
++					sshUsername: "source-user",
++				},
++				"dest-host": {
++					ip:          "5.6.7.8",
++					sshUsername: "dest-user",
++					sshKeyPath:  "/fake/keypath/id_rsa",
++				},
++			},
++		},
++		{
++			name: "destination missing explicit key",
++			src:  "source-host:/tmp/foo",
++			dest: "dest-host:/tmp/foo",
++			hosts: MockHostInfoMapLoader{
++				"source-host": {
++					ip:          "1.2.3.4",
++					sshUsername: "source-user",
++					sshKeyPath:  "/fake/keypath/id_rsa",
++				},
++				"dest-host": {
++					ip:          "5.6.7.8",
++					sshUsername: "dest-user",
++				},
++			},
++		},
++	}
++
++	for _, tc := range testCases {
++		t.Run(tc.name, func(t *testing.T) {
++			cmd, err := getScpCmd(tc.src, tc.dest, false, tc.hosts)
++
++			assert.NoError(t, err)
++			assertIdentitiesOnlyAbsent(t, cmd.Args)
++		})
++	}
++}
++
++func TestGetScpCmdAllowsAgentForNonFixtureMachineWithoutExplicitKey(t *testing.T) {
++	hostInfoLoader := MockHostInfoLoader{MockHostInfo{
++		ip:          "9.8.7.6",
++		sshUsername: "deploy",
++	}}
++
++	cmd, err := getScpCmd("/var/releases/app.tar", "prod-no-key:/srv/app.tar", false, &hostInfoLoader)
++
++	assert.NoError(t, err)
++	assertIdentitiesOnlyAbsent(t, cmd.Args)
++}
++
++func TestGetScpCmdAllowsAgentForRecursiveTransferWithoutExplicitKey(t *testing.T) {
++	hostInfoLoader := MockHostInfoLoader{MockHostInfo{
++		ip:          "9.8.7.6",
++		sshUsername: "deploy",
++	}}
++
++	cmd, err := getScpCmd("/var/releases", "prod-no-key:/srv/releases", true, &hostInfoLoader)
++
++	assert.NoError(t, err)
++	assert.Contains(t, cmd.Args, "-r")
++	assertIdentitiesOnlyAbsent(t, cmd.Args)
++}
++
++func TestGetScpCmdAllowsAgentWhenCalledLikeRealBinary(t *testing.T) {
++	originalArg0 := os.Args[0]
++	os.Args[0] = "/usr/local/bin/docker-machine"
++	defer func() {
++		os.Args[0] = originalArg0
++	}()
++
++	hostInfoLoader := MockHostInfoLoader{MockHostInfo{
++		ip:          "9.8.7.6",
++		sshUsername: "deploy",
++	}}
++
++	cmd, err := getScpCmd("/var/releases/app.tar", "prod-no-key:/srv/app.tar", false, &hostInfoLoader)
++
++	assert.NoError(t, err)
++	assertIdentitiesOnlyAbsent(t, cmd.Args)
++}
++
++func TestGetScpCmdUsesIdentitiesOnlyWhenAllMachineEndpointsHaveExplicitKeys(t *testing.T) {
++	hostInfoLoader := MockHostInfoLoader{MockHostInfo{
++		ip:          "12.34.56.78",
++		sshUsername: "root",
++		sshKeyPath:  "/fake/keypath/id_rsa",
++	}}
++
++	cmd, err := getScpCmd("/tmp/foo", "myfunhost:/home/docker/foo", false, &hostInfoLoader)
++
++	assert.NoError(t, err)
++	assertIdentitiesOnlyPresent(t, cmd.Args)
++}
++
++func TestGetScpCmdUsesIdentitiesOnlyForNonFixtureExplicitKey(t *testing.T) {
++	hostInfoLoader := MockHostInfoLoader{MockHostInfo{
++		ip:          "9.8.7.6",
++		sshUsername: "deploy",
++		sshKeyPath:  "/home/deploy/.ssh/id_ed25519",
++	}}
++
++	cmd, err := getScpCmd("/var/releases/app.tar", "prod-with-key:/srv/app.tar", false, &hostInfoLoader)
++
++	assert.NoError(t, err)
++	assertContainsArgPair(t, cmd.Args, "-i", "/home/deploy/.ssh/id_ed25519")
++	assertIdentitiesOnlyPresent(t, cmd.Args)
++}
++
++func TestGetScpCmdUsesIdentitiesOnlyForAllExplicitTransferDirections(t *testing.T) {
++	testCases := []struct {
++		name  string
++		src   string
++		dest  string
++		hosts MockHostInfoMapLoader
++	}{
++		{
++			name: "remote to local",
++			src:  "prod-source:/srv/app.tar",
++			dest: "/var/releases/app.tar",
++			hosts: MockHostInfoMapLoader{
++				"prod-source": {
++					ip:          "9.8.7.6",
++					sshUsername: "deploy",
++					sshKeyPath:  "/home/deploy/.ssh/id_ed25519",
++				},
++			},
++		},
++		{
++			name: "remote to remote",
++			src:  "prod-source:/srv/app.tar",
++			dest: "prod-dest:/srv/app.tar",
++			hosts: MockHostInfoMapLoader{
++				"prod-source": {
++					ip:          "9.8.7.6",
++					sshUsername: "deploy",
++					sshKeyPath:  "/home/deploy/.ssh/id_ed25519",
++				},
++				"prod-dest": {
++					ip:          "6.7.8.9",
++					sshUsername: "deploy",
++					sshKeyPath:  "/home/deploy/.ssh/id_ecdsa",
++				},
++			},
++		},
++	}
++
++	for _, tc := range testCases {
++		t.Run(tc.name, func(t *testing.T) {
++			cmd, err := getScpCmd(tc.src, tc.dest, false, tc.hosts)
++
++			assert.NoError(t, err)
++			assertIdentitiesOnlyPresent(t, cmd.Args)
++		})
++	}
++}
++
++func assertIdentitiesOnlyPresent(t *testing.T, args []string) {
++	t.Helper()
++
++	if !hasIdentitiesOnlyOption(args) {
++		t.Fatalf("expected scp args to restrict authentication to explicit identities, got %#v", args)
++	}
++}
++
++func assertIdentitiesOnlyAbsent(t *testing.T, args []string) {
++	t.Helper()
++
++	if hasIdentitiesOnlyOption(args) {
++		t.Fatalf("expected scp args to allow agent identities when an endpoint has no explicit key, got %#v", args)
++	}
++}
++
++func assertContainsArgPair(t *testing.T, args []string, flag string, value string) {
++	t.Helper()
++
++	for i := 0; i < len(args)-1; i++ {
++		if args[i] == flag && args[i+1] == value {
++			return
++		}
++	}
++
++	t.Fatalf("expected scp args to contain %s %s, got %#v", flag, value, args)
++}
++
++func hasIdentitiesOnlyOption(args []string) bool {
++	for i := 0; i < len(args)-1; i++ {
++
++		if args[i] == "-o" && args[i+1] == "IdentitiesOnly=yes" {
++			return true
++		}
++	}
++
++	return false
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,36 @@
++#!/bin/bash
++set -uo pipefail
++cd /testbed
++
++
++export GOPATH=/root/go
++export GO111MODULE=off
++mkdir -p /root/go/src/github.com/docker
++ln -sf /testbed /root/go/src/github.com/docker/machine
++
++if ! command -v scp &>/dev/null; then
++    export DEBIAN_FRONTEND=noninteractive
++    cat > /etc/apt/sources.list.d/ubuntu.sources <<'SRCLIST'
++Types: deb
++URIs: http://archive.ubuntu.com/ubuntu/
++Suites: noble-updates
++Components: main universe restricted multiverse
++Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
++SRCLIST
++    apt-get update -qq
++    apt-get install -y -qq openssh-client
++fi
++
++
++case "${1:-}" in
++  base)
++    go test -v github.com/docker/machine/commands -run '^(TestGetInfoForLocalScpArg|TestGetInfoForRemoteScpArg|TestHostLocation|TestRemoteLocation|TestGetScpCmdWithoutSshKey)$'
++    ;;
++  new)
++    go test -v github.com/docker/machine/commands -run '^TestGetScpCmd'
++    ;;
++  *)
++    echo "usage: $0 base|new"
++    exit 2
++    ;;
++esac

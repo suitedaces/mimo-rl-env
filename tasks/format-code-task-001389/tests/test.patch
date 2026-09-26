@@ -1,0 +1,296 @@
+diff --git a/js/modules/k6/grpc/client_maxsize_test.go b/js/modules/k6/grpc/client_maxsize_test.go
+new file mode 100644
+index 000000000..0fe3aca34
+--- /dev/null
++++ b/js/modules/k6/grpc/client_maxsize_test.go
+@@ -0,0 +1,270 @@
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++package grpc
++
++import (
++	"context"
++	"net/url"
++	"os"
++	"testing"
++
++	"github.com/dop251/goja"
++	"github.com/sirupsen/logrus"
++	"github.com/spf13/afero"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++	"google.golang.org/grpc/test/grpc_testing"
++	"gopkg.in/guregu/null.v3"
++
++	"go.k6.io/k6/js/common"
++	"go.k6.io/k6/js/modulestest"
++	"go.k6.io/k6/lib"
++	"go.k6.io/k6/lib/fsext"
++	"go.k6.io/k6/lib/testutils/httpmultibin"
++	"go.k6.io/k6/metrics"
++)
++
++
++
++type maxSizeTestState struct {
++	rt      *goja.Runtime
++	vuState *lib.State
++	env     *common.InitEnvironment
++	httpBin *httpmultibin.HTTPMultiBin
++	samples chan metrics.SampleContainer
++}
++
++func setupMaxSizeTest(t *testing.T) maxSizeTestState {
++	t.Helper()
++
++	root, err := lib.NewGroup("", nil)
++	require.NoError(t, err)
++	tb := httpmultibin.NewHTTPMultiBin(t)
++	samples := make(chan metrics.SampleContainer, 1000)
++	state := &lib.State{
++		Group:     root,
++		Dialer:    tb.Dialer,
++		TLSConfig: tb.TLSClientConfig,
++		Samples:   samples,
++		Options: lib.Options{
++			SystemTags: metrics.NewSystemTagSet(
++				metrics.TagName,
++				metrics.TagURL,
++			),
++			UserAgent: null.StringFrom("k6-test"),
++		},
++		BuiltinMetrics: metrics.RegisterBuiltinMetrics(
++			metrics.NewRegistry(),
++		),
++		Tags: lib.NewTagMap(nil),
++	}
++
++	cwd, err := os.Getwd()
++	require.NoError(t, err)
++	fs := afero.NewOsFs()
++	if isWindows {
++		fs = fsext.NewTrimFilePathSeparatorFs(fs)
++	}
++	initEnv := &common.InitEnvironment{
++		Logger: logrus.New(),
++		CWD:    &url.URL{Path: cwd},
++		FileSystems: map[string]afero.Fs{
++			"file": fs,
++		},
++	}
++
++	rt := goja.New()
++	rt.SetFieldNameMapper(common.FieldNameMapper{})
++
++	return maxSizeTestState{
++		rt:      rt,
++		httpBin: tb,
++		vuState: state,
++		env:     initEnv,
++		samples: samples,
++	}
++}
++
++
++
++func (ts maxSizeTestState) run(t *testing.T, setup func(*httpmultibin.HTTPMultiBin), initCode, vuCode string) (goja.Value, error) {
++	t.Helper()
++
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	mvu := &modulestest.VU{
++		RuntimeField: ts.rt,
++		InitEnvField: ts.env,
++		CtxField:     ctx,
++	}
++
++	m, ok := New().NewModuleInstance(mvu).(*ModuleInstance)
++	require.True(t, ok)
++	require.NoError(t, ts.rt.Set("grpc", m.Exports().Named))
++
++	if setup != nil {
++		setup(ts.httpBin)
++	}
++
++	replace := func(code string) (goja.Value, error) {
++		return ts.rt.RunString(ts.httpBin.Replacer.Replace(code))
++	}
++
++	_, err := replace(initCode)
++	require.NoError(t, err)
++
++	mvu.StateField = ts.vuState
++	return replace(vuCode)
++}
++
++const maxSizeInit = `
++	var client = new grpc.Client();
++	client.load([], "../../../../vendor/google.golang.org/grpc/test/grpc_testing/test.proto");`
++
++func TestConnectMaxSizeValidation(t *testing.T) {
++	t.Parallel()
++
++	tests := []struct {
++		name   string
++		params string
++		errSub string
++	}{
++		{
++			name:   "ReceiveNotInteger",
++			params: `{ maxReceiveSize: "abc" }`,
++			errSub: "invalid maxReceiveSize value: 'abc', it needs to be an integer",
++		},
++		{
++			name:   "ReceiveBoolean",
++			params: `{ maxReceiveSize: true }`,
++			errSub: "it needs to be an integer",
++		},
++		{
++			name:   "ReceiveNegative",
++			params: `{ maxReceiveSize: -7 }`,
++			errSub: "invalid maxReceiveSize value: '-7', it needs to be a positive integer",
++		},
++		{
++			name:   "SendNotInteger",
++			params: `{ maxSendSize: "abc" }`,
++			errSub: "invalid maxSendSize value: 'abc', it needs to be an integer",
++		},
++		{
++			name:   "SendNegative",
++			params: `{ maxSendSize: -1 }`,
++			errSub: "invalid maxSendSize value: '-1', it needs to be a positive integer",
++		},
++	}
++
++	for _, tt := range tests {
++		tt := tt
++		t.Run(tt.name, func(t *testing.T) {
++			t.Parallel()
++			ts := setupMaxSizeTest(t)
++			_, err := ts.run(t, nil, maxSizeInit,
++				`client.connect("GRPCBIN_ADDR", `+tt.params+`);`)
++			require.Error(t, err)
++			assert.Contains(t, err.Error(), tt.errSub)
++		})
++	}
++}
++
++func TestConnectMaxSizeAcceptsValidValues(t *testing.T) {
++	t.Parallel()
++
++
++
++	ts := setupMaxSizeTest(t)
++	ts.httpBin.GRPCStub.EmptyCallFunc = func(context.Context, *grpc_testing.Empty) (*grpc_testing.Empty, error) {
++		return &grpc_testing.Empty{}, nil
++	}
++	_, err := ts.run(t, nil, maxSizeInit, `
++		client.connect("GRPCBIN_ADDR", { maxReceiveSize: 1048576, maxSendSize: 1048576 });
++		var resp = client.invoke("grpc.testing.TestService/EmptyCall", {})
++		if (resp.status !== grpc.StatusOK) {
++			throw new Error("unexpected status: " + resp.status)
++		}`)
++	require.NoError(t, err)
++}
++
++func TestConnectMaxReceiveSizeDefaultAllowsLargeResponse(t *testing.T) {
++	t.Parallel()
++
++
++
++	ts := setupMaxSizeTest(t)
++	ts.httpBin.GRPCStub.UnaryCallFunc = func(context.Context, *grpc_testing.SimpleRequest) (*grpc_testing.SimpleResponse, error) {
++		return &grpc_testing.SimpleResponse{
++			Payload: &grpc_testing.Payload{
++				Body: make([]byte, 64*1024),
++			},
++		}, nil
++	}
++	_, err := ts.run(t, nil, maxSizeInit, `
++		client.connect("GRPCBIN_ADDR");
++		var resp = client.invoke("grpc.testing.TestService/UnaryCall", {})
++		if (resp.status !== grpc.StatusOK) {
++			throw new Error("unexpected status: " + resp.status)
++		}`)
++	require.NoError(t, err)
++}
++
++func TestConnectMaxReceiveSizeLimitsResponse(t *testing.T) {
++	t.Parallel()
++
++
++
++	ts := setupMaxSizeTest(t)
++	ts.httpBin.GRPCStub.UnaryCallFunc = func(context.Context, *grpc_testing.SimpleRequest) (*grpc_testing.SimpleResponse, error) {
++		return &grpc_testing.SimpleResponse{
++			Payload: &grpc_testing.Payload{
++				Body: make([]byte, 8*1024),
++			},
++		}, nil
++	}
++	_, err := ts.run(t, nil, maxSizeInit, `
++		client.connect("GRPCBIN_ADDR", { maxReceiveSize: 64 });
++		var resp = client.invoke("grpc.testing.TestService/UnaryCall", {})
++		if (resp.status !== grpc.StatusResourceExhausted) {
++			throw new Error("unexpected status: " + resp.status)
++		}`)
++	require.NoError(t, err)
++}
++
++func TestConnectMaxSendSizeLimitsRequest(t *testing.T) {
++	t.Parallel()
++
++
++
++	ts := setupMaxSizeTest(t)
++	ts.httpBin.GRPCStub.UnaryCallFunc = func(context.Context, *grpc_testing.SimpleRequest) (*grpc_testing.SimpleResponse, error) {
++		return &grpc_testing.SimpleResponse{}, nil
++	}
++
++	_, err := ts.run(t, nil, maxSizeInit, `
++		client.connect("GRPCBIN_ADDR", { maxSendSize: 64 });
++		var big = "A".repeat(8000);
++		var resp = client.invoke("grpc.testing.TestService/UnaryCall", { payload: { body: big } })
++		if (resp.status !== grpc.StatusResourceExhausted) {
++			throw new Error("unexpected status: " + resp.status)
++		}`)
++	require.NoError(t, err)
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,15 @@
++#!/usr/bin/env bash
++
++
++
++set -euo pipefail
++HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++cd /testbed
++
++
++
++
++go test ./js/modules/k6/grpc/ -run 'TestClient$|TestDebugStat|TestClientInvokeHeadersDeprecated|TestResolveFileDescriptors' -count=1
++
++
++go test ./js/modules/k6/grpc/ -run 'TestConnectMax' -count=1

@@ -1,0 +1,318 @@
+diff --git a/docs/js/codespec-search-test.js b/docs/js/codespec-search-test.js
+new file mode 100644
+index 0000000000..fadc829ebb
+--- /dev/null
++++ b/docs/js/codespec-search-test.js
+@@ -0,0 +1,302 @@
++const assert = require('assert');
++const fs = require('fs');
++const vm = require('vm');
++
++const SEARCH_SOURCE = fs.readFileSync('docs/js/search.js', 'utf8');
++const ELASTIC_SOURCE = fs.readFileSync('docs/js/elasticlunr.min.js', 'utf8');
++
++function escapeText(value) {
++  return String(value)
++    .replace(/&/g, '&amp;')
++    .replace(/</g, '&lt;')
++    .replace(/>/g, '&gt;');
++}
++
++function escapeAttribute(value) {
++  return escapeText(value).replace(/"/g, '&quot;');
++}
++
++class Element {
++  constructor(tagName) {
++    this.tagName = tagName.toLowerCase();
++    this.children = [];
++    this.attributes = Object.create(null);
++    this._text = '';
++    this._rawHtml = null;
++  }
++
++  setAttribute(name, value) {
++    this.attributes[name] = String(value);
++  }
++
++  getAttribute(name) {
++    return Object.prototype.hasOwnProperty.call(this.attributes, name)
++      ? this.attributes[name]
++      : null;
++  }
++
++  appendChild(child) {
++    this._rawHtml = null;
++    this._text = '';
++    this.children.push(child);
++    return child;
++  }
++
++  append(...children) {
++    for (const child of children) this.appendChild(child);
++  }
++
++  replaceChildren(...children) {
++    this._rawHtml = null;
++    this._text = '';
++    this.children = children;
++  }
++
++  removeChild(child) {
++    const index = this.children.indexOf(child);
++    if (index >= 0) this.children.splice(index, 1);
++    return child;
++  }
++
++  get firstChild() {
++    return this.children.length ? this.children[0] : null;
++  }
++
++  set textContent(value) {
++    this._rawHtml = null;
++    this.children = [];
++    this._text = String(value);
++  }
++
++  get textContent() {
++    if (this._rawHtml !== null) return stripMarkup(this._rawHtml);
++    return this._text + this.children.map(childText).join('');
++  }
++
++  set innerText(value) { this.textContent = value; }
++  get innerText() { return this.textContent; }
++
++  set innerHTML(value) {
++    this.children = [];
++    this._text = '';
++    this._rawHtml = String(value);
++  }
++
++  get innerHTML() {
++    if (this._rawHtml !== null) return this._rawHtml;
++    return escapeText(this._text) + this.children.map(serialize).join('');
++  }
++
++  set value(value) { this.setAttribute('value', value); }
++  get value() { return this.getAttribute('value') || ''; }
++  set href(value) { this.setAttribute('href', value); }
++  get href() { return this.getAttribute('href') || ''; }
++  set className(value) { this.setAttribute('class', value); }
++  get className() { return this.getAttribute('class') || ''; }
++}
++
++class DocumentFragment extends Element {
++  constructor() { super('#fragment'); }
++}
++
++function childText(child) {
++  return typeof child === 'string' ? child : child.textContent;
++}
++
++function serialize(child) {
++  if (typeof child === 'string') return escapeText(child);
++  if (child instanceof DocumentFragment) return child.innerHTML;
++  const attrs = Object.keys(child.attributes)
++    .map(name => ` ${name}="${escapeAttribute(child.attributes[name])}"`)
++    .join('');
++  return `<${child.tagName}${attrs}>${child.innerHTML}</${child.tagName}>`;
++}
++
++function stripMarkup(html) {
++  return html
++    .replace(/<[^>]*>/g, '')
++    .replace(/&lt;/g, '<')
++    .replace(/&gt;/g, '>')
++    .replace(/&quot;/g, '"')
++    .replace(/&amp;/g, '&');
++}
++
++function runSearch(search, store) {
++  const searchBox = new Element('input');
++  const results = new Element('ul');
++  const document = {
++    getElementById(id) {
++      if (id === 'search-box') return searchBox;
++      if (id === 'search-results') return results;
++      return null;
++    },
++    createElement(tagName) { return new Element(tagName); },
++    createTextNode(text) { return String(text); },
++    createDocumentFragment() { return new DocumentFragment(); }
++  };
++  const context = {
++    console,
++    document,
++    URL,
++    URLSearchParams,
++    window: {
++      location: {
++        search,
++        href: `https://docs.example/search.html${search}`,
++        origin: 'https://docs.example'
++      },
++      store
++    },
++    setTimeout,
++    clearTimeout
++  };
++  context.window.window = context.window;
++  context.window.document = document;
++  context.window.URL = URL;
++  context.window.URLSearchParams = URLSearchParams;
++  vm.createContext(context);
++  vm.runInContext(ELASTIC_SOURCE, context, { filename: 'elasticlunr.min.js' });
++  context.window.elasticlunr = context.elasticlunr;
++  vm.runInContext(SEARCH_SOURCE, context, { filename: 'search.js' });
++  return { searchBox, results, html: results.innerHTML, text: results.textContent };
++}
++
++function count(haystack, needle) {
++  return haystack.split(needle).length - 1;
++}
++
++function testQueryDecodingAndBlankQueries() {
++  const decoded = runSearch('?other=x&query=++Scala+Guide++', {
++    one: { title: 'Scala Guide', author: '', content: 'A useful Scala Guide.', url: 'guide.html' }
++  });
++  assert.strictEqual(decoded.searchBox.getAttribute('value'), 'Scala Guide',
++    'the displayed query should be plus-decoded and trimmed');
++  assert(decoded.text.includes('Scala Guide'), 'the normalized query should be searched');
++
++  const blank = runSearch('?query=++++', {
++    one: { title: 'Anything', author: '', content: 'Anything', url: 'anything.html' }
++  });
++  assert.strictEqual(blank.searchBox.value, '', 'blank queries should display as empty');
++  assert.strictEqual(blank.html, '', 'blank queries should not render a no-results message');
++
++  assert.doesNotThrow(() => runSearch('?query=%ZZ', {}),
++    'malformed percent escapes should not crash search-page initialization');
++
++  const valueless = runSearch('?query', {
++    one: { title: 'Anything', content: 'Anything', url: 'anything.html' }
++  });
++  assert.strictEqual(valueless.searchBox.value, '', 'a valueless query parameter should display as blank');
++  assert.strictEqual(valueless.html, '', 'a valueless query parameter should not run a search');
++
++  const missing = runSearch('?other=value', {
++    one: { title: 'Anything', content: 'Anything', url: 'anything.html' }
++  });
++  assert.strictEqual(missing.searchBox.value, '', 'a missing query parameter should display as blank');
++  assert.strictEqual(missing.html, '', 'a missing query parameter should not run a search');
++}
++
++function testCompleteRankedStoreSearch() {
++  const inherited = { inherited: { title: 'Scala inherited', content: 'Scala', url: 'bad.html' } };
++  const store = Object.create(inherited);
++  store.contentHit = { title: 'Reference', content: 'Scala appears in content.', url: 'reference.html' };
++  store.authorHit = { title: 'Biography', author: 'Scala', content: '', url: 'biography.html' };
++  store.titleHit = { title: 'Scala Language', url: 'language.html' };
++
++  const rendered = runSearch('?query=scala', store);
++  assert.strictEqual(count(rendered.html, '<li'), 3,
++    'all own matching records, and no inherited records, should render once');
++  assert(rendered.html.indexOf('Scala Language') < rendered.html.indexOf('Biography') &&
++      rendered.html.indexOf('Biography') < rendered.html.indexOf('Reference'),
++    'the search engine ranking should be preserved (title, then author, then content hit)');
++  assert.strictEqual(count(rendered.html, 'class="result-text"'), 3,
++    'every result should have one snippet even when optional content is absent');
++  assert(!rendered.html.includes('Scala inherited'), 'prototype properties are not search records');
++  assert(!rendered.html.includes('undefined'), 'missing optional author/content values should be harmless');
++
++  const none = runSearch('?query=absent', store);
++  assert.strictEqual(none.text, 'No results found', 'a nonblank query with no matches needs an empty state');
++}
++
++function testSingleCaseInsensitiveContextSnippet() {
++  const prefix = 'p'.repeat(240);
++  const suffix = 's'.repeat(240);
++  const rendered = runSearch('?query=scala', {
++    one: {
++      title: 'Snippet',
++      author: '',
++      content: `${prefix} Scala middle SCALA ${suffix}`,
++      url: 'snippet.html'
++    }
++  });
++
++  assert.strictEqual(count(rendered.html, '<li'), 1, 'one search hit should produce one result item');
++  assert.strictEqual(count(rendered.html, 'class="result-text"'), 1,
++    'multiple occurrences must stay in one snippet for that result');
++  assert.strictEqual((rendered.html.match(/<mark(?:\s[^>]*)?>scala<\/mark>/gi) || []).length, 2,
++    'literal matches should be highlighted case-insensitively while preserving their text');
++  assert(/<mark(?:\s[^>]*)?>Scala<\/mark>/.test(rendered.html),
++    'highlighting should preserve the first match casing');
++  assert(/<mark(?:\s[^>]*)?>SCALA<\/mark>/.test(rendered.html),
++    'highlighting should preserve the later match casing');
++  const snippet = rendered.html.match(/<p[^>]*class="[^"]*result-text[^"]*"[^>]*>([\s\S]*?)<\/p>/);
++  assert(snippet, 'the result should contain a result-text paragraph');
++  assert(stripMarkup(snippet[1]).length <= 153,
++    'the snippet should contain at most 150 source characters plus an ellipsis');
++  assert(rendered.text.includes('middle'), 'the bounded snippet should retain context around the match');
++}
++
++function testSafeMarkupAndHighlightLinks() {
++  const rendered = runSearch('?query=a%26b', {
++    one: {
++      title: '<img src=x onerror="boom"> a&b',
++      author: '',
++      content: '<script>boom()</script> a&b',
++      url: 'guide.html?lang=en#part'
++    }
++  });
++  assert(!rendered.html.includes('<img'), 'record titles must be rendered as text');
++  assert(!rendered.html.includes('<script'), 'record content must be rendered as text');
++  assert(rendered.html.includes('&lt;img') && rendered.html.includes('&lt;script'),
++    'escaped source text should remain visible');
++  assert(rendered.html.includes('href="guide.html?lang=en&amp;highlight=a%26b#part"'),
++    'highlight parameters should be encoded, appended with &, and placed before fragments');
++
++  const maliciousUrl = runSearch('?query=needle', {
++    one: { title: 'needle', content: 'needle', url: 'javascript:alert(1)' }
++  });
++  assert(!/href="\s*javascript:/i.test(maliciousUrl.html),
++    'unsafe URL schemes must not become executable result links');
++
++  const safeHttpsUrl = runSearch('?query=needle', {
++    one: { title: 'needle', content: 'needle', url: 'https://docs.example/guide?lang=en#part' }
++  });
++  assert(safeHttpsUrl.html.includes(
++    'href="https://docs.example/guide?lang=en&amp;highlight=needle#part"'),
++    'ordinary HTTPS documentation links should remain clickable');
++
++  const maliciousQuery = runSearch('?query=%3Cimg%3E', {
++    one: { title: 'img', content: 'before <img> after', url: 'image.html' }
++  });
++  assert(!maliciousQuery.html.includes('<img>'), 'query text used for highlighting must not become markup');
++  assert(maliciousQuery.html.includes('&lt;img&gt;'), 'the literal query match should remain visible');
++}
++
++const tests = [
++  testQueryDecodingAndBlankQueries,
++  testCompleteRankedStoreSearch,
++  testSingleCaseInsensitiveContextSnippet,
++  testSafeMarkupAndHighlightLinks
++];
++
++let failures = 0;
++for (const test of tests) {
++  try {
++    test();
++    console.log(`PASS ${test.name}`);
++  } catch (error) {
++    failures += 1;
++    console.error(`FAIL ${test.name}: ${error.stack || error}`);
++  }
++}
++
++if (failures) process.exit(1);
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,5 @@
++#!/bin/bash
++set -euo pipefail
++
++
++node docs/js/codespec-search-test.js

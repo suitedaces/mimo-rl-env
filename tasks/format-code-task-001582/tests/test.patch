@@ -1,0 +1,301 @@
+diff --git a/usercase-test-coderl/cash_move_coins_test.go b/usercase-test-coderl/cash_move_coins_test.go
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/cash_move_coins_test.go
+@@ -0,0 +1,268 @@
++package usercase_test_coderl
++
++import (
++	stderrors "errors"
++	"fmt"
++	"testing"
++
++	weave "github.com/iov-one/weave"
++	"github.com/iov-one/weave/coin"
++	weaveerrors "github.com/iov-one/weave/errors"
++	"github.com/iov-one/weave/migration"
++	"github.com/iov-one/weave/orm"
++	"github.com/iov-one/weave/store"
++	"github.com/iov-one/weave/x/cash"
++)
++
++func TestMoveCoinsCreatesDestinationAndUpdatesBalances(t *testing.T) {
++
++
++	ctrl := cash.NewController(cash.NewBucket())
++	db := initializedCashStore()
++	source := weave.NewAddress([]byte("fixture source"))
++	destination := weave.NewAddress([]byte("fixture destination"))
++
++	assertBalanceErrorKind(t, ctrl, db, source, weaveerrors.ErrNotFound, true)
++	mustMint(t, ctrl, db, source, coin.NewCoin(50000, 0, "MONY"))
++	assertBalanceStrings(t, ctrl, db, source, []string{"50000 MONY"})
++	assertBalanceErrorKind(t, ctrl, db, destination, weaveerrors.ErrNotFound, true)
++
++	err := ctrl.MoveCoins(db, source, destination, coin.NewCoin(300, 0, "MONY"))
++	if got := err; got != nil {
++		t.Fatalf("MoveCoins error = %v, want <nil>", got)
++	}
++	assertBalanceStrings(t, ctrl, db, source, []string{"49700 MONY"})
++	assertBalanceStrings(t, ctrl, db, destination, []string{"300 MONY"})
++}
++
++func TestMoveCoinsToSelfLeavesTotalBalance(t *testing.T) {
++
++
++	ctrl := cash.NewController(cash.NewBucket())
++	db := initializedCashStore()
++	source := weave.NewAddress([]byte("fixture source"))
++
++	mustMint(t, ctrl, db, source, coin.NewCoin(50000, 0, "MONY"))
++	assertBalanceStrings(t, ctrl, db, source, []string{"50000 MONY"})
++
++	err := ctrl.MoveCoins(db, source, source, coin.NewCoin(300, 0, "MONY"))
++	if got := err; got != nil {
++		t.Fatalf("MoveCoins self-transfer error = %v, want <nil>", got)
++	}
++	assertBalanceStrings(t, ctrl, db, source, []string{"50000 MONY"})
++}
++
++func TestMoveCoinsRejectsZeroAmountWithoutCreditingDestination(t *testing.T) {
++
++
++	assertRejectedTransfer(t, coin.NewCoin(0, 0, "MONY"), weaveerrors.ErrAmount)
++}
++
++func TestMoveCoinsRejectsNegativeAmountWithoutCreditingDestination(t *testing.T) {
++
++
++	assertRejectedTransfer(t, coin.NewCoin(-300, 0, "MONY"), weaveerrors.ErrAmount)
++}
++
++func TestMoveCoinsRejectsMissingSourceWithoutCreditingDestination(t *testing.T) {
++
++
++	ctrl := cash.NewController(cash.NewBucket())
++	db := initializedCashStore()
++	source := weave.NewAddress([]byte("fixture missing source"))
++	destination := weave.NewAddress([]byte("fixture destination"))
++
++	err := ctrl.MoveCoins(db, source, destination, coin.NewCoin(300, 0, "MONY"))
++	assertErrorKind(t, err, weaveerrors.ErrEmpty, true)
++	assertBalanceErrorKind(t, ctrl, db, source, weaveerrors.ErrNotFound, true)
++	assertBalanceErrorKind(t, ctrl, db, destination, weaveerrors.ErrNotFound, true)
++}
++
++func TestMoveCoinsRejectsAmountLargerThanBalanceWithoutCreditingDestination(t *testing.T) {
++
++
++	assertRejectedTransfer(t, coin.NewCoin(50001, 0, "MONY"), weaveerrors.ErrAmount)
++}
++
++func TestMoveCoinsRejectsTickerSourceDoesNotHoldWithoutCreditingDestination(t *testing.T) {
++
++
++	assertRejectedTransfer(t, coin.NewCoin(300, 0, "BAD"), weaveerrors.ErrAmount)
++}
++
++func TestMoveCoinsPropagatesWalletLoadAndSaveErrors(t *testing.T) {
++
++
++	source := weave.NewAddress([]byte("fixture source"))
++	destination := weave.NewAddress([]byte("fixture destination"))
++	amount := coin.NewCoin(300, 0, "MONY")
++
++	sourceLoadErr := stderrors.New("source load failed")
++	sourceLoadBucket := &faultingBucket{inner: cash.NewBucket(), getErr: sourceLoadErr}
++	sourceLoadCtrl := cash.NewController(sourceLoadBucket)
++	sourceLoadDB := initializedCashStore()
++	mustMint(t, cash.NewController(cash.NewBucket()), sourceLoadDB, source, coin.NewCoin(50000, 0, "MONY"))
++	sourceLoadBucket.armed = true
++	if got := sourceLoadCtrl.MoveCoins(sourceLoadDB, source, destination, amount); got != sourceLoadErr {
++		t.Fatalf("source load error = %v, want %v", got, sourceLoadErr)
++	}
++
++	destinationLoadErr := stderrors.New("destination load failed")
++	destinationLoadBucket := &faultingBucket{inner: cash.NewBucket(), getOrCreateErr: destinationLoadErr}
++	destinationLoadCtrl := cash.NewController(destinationLoadBucket)
++	destinationLoadDB := initializedCashStore()
++	mustMint(t, destinationLoadCtrl, destinationLoadDB, source, coin.NewCoin(50000, 0, "MONY"))
++	destinationLoadBucket.armed = true
++	if got := destinationLoadCtrl.MoveCoins(destinationLoadDB, source, destination, amount); got != destinationLoadErr {
++		t.Fatalf("destination load error = %v, want %v", got, destinationLoadErr)
++	}
++
++	sourceSaveErr := stderrors.New("source save failed")
++	sourceSaveBucket := &faultingBucket{inner: cash.NewBucket(), saveErr: sourceSaveErr, failSaveNumber: 1}
++	sourceSaveCtrl := cash.NewController(sourceSaveBucket)
++	sourceSaveDB := initializedCashStore()
++	mustMint(t, sourceSaveCtrl, sourceSaveDB, source, coin.NewCoin(50000, 0, "MONY"))
++	sourceSaveBucket.saveCalls = 0
++	sourceSaveBucket.armed = true
++	if got := sourceSaveCtrl.MoveCoins(sourceSaveDB, source, destination, amount); got != sourceSaveErr {
++		t.Fatalf("source save error = %v, want %v", got, sourceSaveErr)
++	}
++
++	destinationSaveErr := stderrors.New("destination save failed")
++	destinationSaveBucket := &faultingBucket{inner: cash.NewBucket(), saveErr: destinationSaveErr, failSaveNumber: 2}
++	destinationSaveCtrl := cash.NewController(destinationSaveBucket)
++	destinationSaveDB := initializedCashStore()
++	mustMint(t, destinationSaveCtrl, destinationSaveDB, source, coin.NewCoin(50000, 0, "MONY"))
++	destinationSaveBucket.saveCalls = 0
++	destinationSaveBucket.armed = true
++	if got := destinationSaveCtrl.MoveCoins(destinationSaveDB, source, destination, amount); got != destinationSaveErr {
++		t.Fatalf("destination save error = %v, want %v", got, destinationSaveErr)
++	}
++}
++
++func TestMoveCoinsControllerInstancesKeepIndependentState(t *testing.T) {
++
++
++	ctrlA := cash.NewController(cash.NewBucket())
++	ctrlB := cash.NewController(cash.NewBucket())
++	dbA := initializedCashStore()
++	dbB := initializedCashStore()
++	source := weave.NewAddress([]byte("fixture source"))
++	destination := weave.NewAddress([]byte("fixture destination"))
++
++	mustMint(t, ctrlA, dbA, source, coin.NewCoin(50000, 0, "MONY"))
++	mustMint(t, ctrlB, dbB, source, coin.NewCoin(50000, 0, "MONY"))
++	if got := ctrlA.MoveCoins(dbA, source, destination, coin.NewCoin(300, 0, "MONY")); got != nil {
++		t.Fatalf("session A MoveCoins error = %v, want <nil>", got)
++	}
++
++	assertBalanceStrings(t, ctrlA, dbA, source, []string{"49700 MONY"})
++	assertBalanceStrings(t, ctrlA, dbA, destination, []string{"300 MONY"})
++	assertBalanceStrings(t, ctrlB, dbB, source, []string{"50000 MONY"})
++	assertBalanceErrorKind(t, ctrlB, dbB, destination, weaveerrors.ErrNotFound, true)
++}
++
++func TestMoveCoinsRepeatedConstructUseAndDropPreservesBalances(t *testing.T) {
++
++
++	for i := 0; i < 120; i++ {
++		ctrl := cash.NewController(cash.NewBucket())
++		db := initializedCashStore()
++		source := weave.NewAddress([]byte(fmt.Sprintf("fixture source %03d", i)))
++		destination := weave.NewAddress([]byte(fmt.Sprintf("fixture destination %03d", i)))
++		mustMint(t, ctrl, db, source, coin.NewCoin(50000, 0, "MONY"))
++		if got := ctrl.MoveCoins(db, source, destination, coin.NewCoin(300, 0, "MONY")); got != nil {
++			t.Fatalf("cycle %d MoveCoins error = %v, want <nil>", i, got)
++		}
++
++		assertBalanceStrings(t, ctrl, db, source, []string{"49700 MONY"})
++		assertBalanceStrings(t, ctrl, db, destination, []string{"300 MONY"})
++	}
++}
++
++func assertRejectedTransfer(t *testing.T, amount coin.Coin, wantKind *weaveerrors.Error) {
++	t.Helper()
++	ctrl := cash.NewController(cash.NewBucket())
++	db := initializedCashStore()
++	source := weave.NewAddress([]byte("fixture source"))
++	destination := weave.NewAddress([]byte("fixture destination"))
++
++	mustMint(t, ctrl, db, source, coin.NewCoin(50000, 0, "MONY"))
++	err := ctrl.MoveCoins(db, source, destination, amount)
++	assertErrorKind(t, err, wantKind, true)
++	assertBalanceStrings(t, ctrl, db, source, []string{"50000 MONY"})
++	assertBalanceErrorKind(t, ctrl, db, destination, weaveerrors.ErrNotFound, true)
++}
++
++func initializedCashStore() weave.KVStore {
++	db := store.MemStore()
++	migration.MustInitPkg(db, "cash")
++	return db
++}
++
++func mustMint(t *testing.T, ctrl cash.BaseController, db weave.KVStore, addr weave.Address, amount coin.Coin) {
++	t.Helper()
++	if got := ctrl.CoinMint(db, addr, amount); got != nil {
++		t.Fatalf("CoinMint error = %v, want <nil>", got)
++	}
++}
++
++func assertBalanceStrings(t *testing.T, ctrl cash.BaseController, db weave.KVStore, addr weave.Address, want []string) {
++	t.Helper()
++	gotCoins, err := ctrl.Balance(db, addr)
++	if got := err; got != nil {
++		t.Fatalf("Balance error = %v, want <nil>", got)
++	}
++	got := make([]string, len(gotCoins))
++	for i, c := range gotCoins {
++		got[i] = c.String()
++	}
++	if fmt.Sprintf("%v", got) != fmt.Sprintf("%v", want) {
++		t.Fatalf("Balance strings = %v, want %v", got, want)
++	}
++}
++
++func assertBalanceErrorKind(t *testing.T, ctrl cash.BaseController, db weave.KVStore, addr weave.Address, wantKind *weaveerrors.Error, want bool) {
++	t.Helper()
++	_, err := ctrl.Balance(db, addr)
++	assertErrorKind(t, err, wantKind, want)
++}
++
++func assertErrorKind(t *testing.T, err error, wantKind *weaveerrors.Error, want bool) {
++	t.Helper()
++	if got := wantKind.Is(err); got != want {
++		t.Fatalf("%v.Is(%v) = %t, want %t", wantKind, err, got, want)
++	}
++}
++
++type faultingBucket struct {
++	inner          cash.Bucket
++	armed          bool
++	getErr         error
++	getOrCreateErr error
++	saveErr        error
++	failSaveNumber int
++	saveCalls      int
++}
++
++func (b *faultingBucket) GetOrCreate(db weave.KVStore, key weave.Address) (orm.Object, error) {
++	if b.armed && b.getOrCreateErr != nil {
++		return nil, b.getOrCreateErr
++	}
++	return b.inner.GetOrCreate(db, key)
++}
++
++func (b *faultingBucket) Get(db weave.ReadOnlyKVStore, key []byte) (orm.Object, error) {
++	if b.armed && b.getErr != nil {
++		return nil, b.getErr
++	}
++	return b.inner.Get(db, key)
++}
++
++func (b *faultingBucket) Save(db weave.KVStore, obj orm.Object) error {
++	b.saveCalls++
++	if b.armed && b.saveErr != nil && b.saveCalls == b.failSaveNumber {
++		return b.saveErr
++	}
++	return b.inner.Save(db, obj)
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,23 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++cd /workspace/repo
++
++export GO111MODULE=on
++export GOPATH=/root/go
++export GOMODCACHE=/root/go/pkg/mod
++export GOPROXY=off
++export GOSUMDB=off
++export GOTOOLCHAIN=local
++export GOFLAGS="${GOFLAGS:-} -mod=readonly"
++
++exec go test -v -count=1 ./usercase-test-coderl/...

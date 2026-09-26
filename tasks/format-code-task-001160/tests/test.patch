@@ -1,0 +1,228 @@
+diff --git a/api/tests/opentrons/protocol_engine/commands/heater_shaker/test_speed_state_contract.py b/api/tests/opentrons/protocol_engine/commands/heater_shaker/test_speed_state_contract.py
+new file mode 100644
+index 0000000000..d026100b03
+--- /dev/null
++++ b/api/tests/opentrons/protocol_engine/commands/heater_shaker/test_speed_state_contract.py
+@@ -0,0 +1,211 @@
++
++
++import pytest
++from decoy import Decoy
++
++from opentrons.types import DeckSlotName
++from opentrons.protocol_engine import actions, commands
++from opentrons.protocol_engine.commands import heater_shaker as hs_commands
++from opentrons.protocol_engine.commands.heater_shaker.set_and_wait_for_shake_speed import (
++    SetAndWaitForShakeSpeedImpl,
++)
++from opentrons.protocol_engine import errors
++from opentrons.protocol_engine.errors import InvalidTargetSpeedError
++from opentrons.protocol_engine.execution import EquipmentHandler
++from opentrons.protocol_engine.state import StateView
++from opentrons.protocol_engine.state.module_substates import (
++    HeaterShakerModuleId,
++    HeaterShakerModuleSubState,
++)
++from opentrons.protocol_engine.state.modules import ModuleStore, ModuleView
++from opentrons.protocol_engine.types import DeckSlotLocation, ModuleDefinition, ModuleModel
++from opentrons.hardware_control.modules import HeaterShaker
++
++
++def _load_heater_shaker(definition: ModuleDefinition) -> commands.LoadModule:
++    return commands.LoadModule.construct(
++        params=commands.LoadModuleParams(
++            model=ModuleModel.HEATER_SHAKER_MODULE_V1,
++            location=DeckSlotLocation(slotName=DeckSlotName.SLOT_1),
++        ),
++        result=commands.LoadModuleResult(
++            moduleId="hs-id",
++            model=ModuleModel.HEATER_SHAKER_MODULE_V1,
++            serialNumber="serial",
++            definition=definition,
++        ),
++    )
++
++
++def _get_heater_shaker_state(store: ModuleStore) -> HeaterShakerModuleSubState:
++    return ModuleView(
++        state=store.state, virtualize_modules=False
++    ).get_heater_shaker_module_substate("hs-id")
++
++
++async def test_set_speed_returns_normalized_target_and_calls_hardware(
++    decoy: Decoy, state_view: StateView, equipment: EquipmentHandler
++) -> None:
++    subject = SetAndWaitForShakeSpeedImpl(state_view=state_view, equipment=equipment)
++    params = hs_commands.SetAndWaitForShakeSpeedParams(moduleId="input-hs", rpm=1234.56)
++    substate = decoy.mock(cls=HeaterShakerModuleSubState)
++    hardware = decoy.mock(cls=HeaterShaker)
++    decoy.when(
++        state_view.modules.get_heater_shaker_module_substate(module_id="input-hs")
++    ).then_return(substate)
++    decoy.when(substate.module_id).then_return(HeaterShakerModuleId("hs-id"))
++    decoy.when(substate.validate_target_speed(rpm=1234.56)).then_return(1235)
++    decoy.when(
++        equipment.get_module_hardware_api(HeaterShakerModuleId("hs-id"))
++    ).then_return(hardware)
++    result = await subject.execute(params)
++    assert result.dict().get("targetSpeed") == 1235
++    decoy.verify(await hardware.set_speed(rpm=1235), times=1)
++
++
++async def test_set_speed_returns_normalized_target_for_virtual_module(
++    decoy: Decoy, state_view: StateView, equipment: EquipmentHandler
++) -> None:
++    subject = SetAndWaitForShakeSpeedImpl(state_view=state_view, equipment=equipment)
++    params = hs_commands.SetAndWaitForShakeSpeedParams(moduleId="input-hs", rpm=200.5)
++    substate = decoy.mock(cls=HeaterShakerModuleSubState)
++    decoy.when(
++        state_view.modules.get_heater_shaker_module_substate(module_id="input-hs")
++    ).then_return(substate)
++    decoy.when(substate.module_id).then_return(HeaterShakerModuleId("hs-id"))
++    decoy.when(substate.validate_target_speed(rpm=200.5)).then_return(200)
++    decoy.when(
++        equipment.get_module_hardware_api(HeaterShakerModuleId("hs-id"))
++    ).then_return(None)
++
++    result = await subject.execute(params)
++
++    assert result.dict().get("targetSpeed") == 200
++
++
++def test_loaded_speed_is_unset_and_getter_reports_that_state(
++    heater_shaker_v1_def: ModuleDefinition,
++) -> None:
++    store = ModuleStore()
++    store.handle_action(
++        actions.UpdateCommandAction(
++            command=_load_heater_shaker(heater_shaker_v1_def)
++        )
++    )
++    substate = _get_heater_shaker_state(store)
++    assert getattr(substate, "target_speed", object()) is None
++    no_target_error = getattr(errors, "NoTargetSpeedSetError", None)
++    assert no_target_error is not None
++    with pytest.raises(no_target_error):
++        substate.get_target_speed()  # type: ignore[attr-defined]
++
++
++def test_set_and_deactivate_speed_preserve_temperature(
++    heater_shaker_v1_def: ModuleDefinition,
++) -> None:
++    store = ModuleStore()
++    store.handle_action(
++        actions.UpdateCommandAction(
++            command=_load_heater_shaker(heater_shaker_v1_def)
++        )
++    )
++    store.handle_action(
++        actions.UpdateCommandAction(
++            command=hs_commands.SetTargetTemperature.construct(
++                params=hs_commands.SetTargetTemperatureParams(
++                    moduleId="hs-id", celsius=60
++                ),
++                result=hs_commands.SetTargetTemperatureResult(),
++            )
++        )
++    )
++    store.handle_action(
++        actions.UpdateCommandAction(
++            command=hs_commands.SetAndWaitForShakeSpeed.construct(
++                params=hs_commands.SetAndWaitForShakeSpeedParams(
++                    moduleId="hs-id", rpm=500.6
++                ),
++                result=hs_commands.SetAndWaitForShakeSpeedResult.construct(
++                    targetSpeed=501
++                ),
++            )
++        )
++    )
++    substate = _get_heater_shaker_state(store)
++    assert getattr(substate, "target_speed", None) == 501
++    assert substate.get_plate_target_temperature() == 60
++    assert substate.get_target_speed() == 501  # type: ignore[attr-defined]
++    store.handle_action(
++        actions.UpdateCommandAction(
++            command=hs_commands.DeactivateShaker.construct(
++                params=hs_commands.DeactivateShakerParams(moduleId="hs-id"),
++                result=hs_commands.DeactivateShakerResult(),
++            )
++        )
++    )
++    substate = _get_heater_shaker_state(store)
++    assert getattr(substate, "target_speed", object()) is None
++    assert substate.get_plate_target_temperature() == 60
++
++
++def test_temperature_commands_preserve_speed(
++    heater_shaker_v1_def: ModuleDefinition,
++) -> None:
++    store = ModuleStore()
++    store.handle_action(
++        actions.UpdateCommandAction(
++            command=_load_heater_shaker(heater_shaker_v1_def)
++        )
++    )
++    store.handle_action(
++        actions.UpdateCommandAction(
++            command=hs_commands.SetAndWaitForShakeSpeed.construct(
++                params=hs_commands.SetAndWaitForShakeSpeedParams(
++                    moduleId="hs-id", rpm=800
++                ),
++                result=hs_commands.SetAndWaitForShakeSpeedResult.construct(
++                    targetSpeed=800
++                ),
++            )
++        )
++    )
++    store.handle_action(
++        actions.UpdateCommandAction(
++            command=hs_commands.SetTargetTemperature.construct(
++                params=hs_commands.SetTargetTemperatureParams(
++                    moduleId="hs-id", celsius=70
++                ),
++                result=hs_commands.SetTargetTemperatureResult(),
++            )
++        )
++    )
++    substate = _get_heater_shaker_state(store)
++    assert getattr(substate, "target_speed", None) == 800
++    assert substate.get_plate_target_temperature() == 70
++
++    store.handle_action(
++        actions.UpdateCommandAction(
++            command=hs_commands.DeactivateHeater.construct(
++                params=hs_commands.DeactivateHeaterParams(moduleId="hs-id"),
++                result=hs_commands.DeactivateHeaterResult(),
++            )
++        )
++    )
++    substate = _get_heater_shaker_state(store)
++    assert getattr(substate, "target_speed", None) == 800
++    assert substate.get_target_speed() == 800  # type: ignore[attr-defined]
++
++
++@pytest.mark.parametrize("rpm", [199.9, 3000.1])
++def test_speed_validation_rejects_values_outside_inclusive_range(rpm: float) -> None:
++    with pytest.raises(InvalidTargetSpeedError):
++        HeaterShakerModuleSubState.validate_target_speed(rpm)
++
++
++@pytest.mark.parametrize(
++    ("rpm", "expected"), [(200, 200), (1234.56, 1235), (3000, 3000)]
++)
++def test_speed_validation_normalizes_values_in_inclusive_range(
++    rpm: float, expected: int
++) -> None:
++    assert HeaterShakerModuleSubState.validate_target_speed(rpm) == expected
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,6 @@
++#!/bin/bash
++set -euo pipefail
++
++
++cd api
++pytest -q tests/opentrons/protocol_engine/commands/heater_shaker/test_speed_state_contract.py

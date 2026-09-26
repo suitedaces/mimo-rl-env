@@ -1,0 +1,490 @@
+diff --git a/usercase-test-coderl/fixtures/asn_api_server.py b/usercase-test-coderl/fixtures/asn_api_server.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/fixtures/asn_api_server.py
+@@ -0,0 +1,56 @@
++#!/usr/bin/env python3
++import http.server
++import json
++import sys
++from pathlib import Path
++
++
++port_file = Path(sys.argv[1])
++request_log = Path(sys.argv[2])
++counts = {}
++
++
++class Handler(http.server.BaseHTTPRequestHandler):
++    def do_GET(self):
++        counts[self.path] = counts.get(self.path, 0) + 1
++        auth = self.headers.get("Authorization", "")
++        with request_log.open("a", encoding="utf-8") as log:
++            log.write(f"GET {self.path} auth={auth}\n")
++
++        if self.path == "/AS401":
++            self.send_response(401)
++            self.send_header("Content-Type", "application/json")
++            self.end_headers()
++            self.wfile.write(
++                b'{"status":"401","error":{"title":"Unauthorized","message":"nope"}}'
++            )
++            return
++
++        names = {
++            "/AS1": "Boundary Network",
++            "/AS123": "Example Network",
++        }
++        if self.path == "/AS124":
++            name = "Cached Network" if counts[self.path] == 1 else "Fresh Network"
++        else:
++            name = names.get(self.path, "Unexpected Network")
++
++        body = json.dumps(
++            {
++                "asn": self.path.lstrip("/"),
++                "name": name,
++                "registry": "arin",
++            }
++        ).encode("utf-8")
++        self.send_response(200)
++        self.send_header("Content-Type", "application/json")
++        self.end_headers()
++        self.wfile.write(body)
++
++    def log_message(self, *args):
++        return
++
++
++server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
++port_file.write_text(str(server.server_port), encoding="utf-8")
++server.serve_forever()
+diff --git a/usercase-test-coderl/usecase.sh b/usercase-test-coderl/usecase.sh
+new file mode 100755
+--- /dev/null
++++ b/usercase-test-coderl/usecase.sh
+@@ -0,0 +1,403 @@
++#!/usr/bin/env bash
++
++set -u
++export LANG=C LC_ALL=C TZ=UTC
++
++export GOPROXY=off
++export GOSUMDB=off
++export GOTOOLCHAIN=local
++
++REPO=/workspace/repo
++FIXTURES="$REPO/usercase-test-coderl/fixtures"
++TMP=$(mktemp -d)
++SERVER_PID=""
++
++cleanup() {
++    if [ -n "$SERVER_PID" ]; then
++        kill "$SERVER_PID" 2>/dev/null || true
++        wait "$SERVER_PID" 2>/dev/null || true
++    fi
++    rm -rf "$TMP"
++}
++trap cleanup EXIT
++
++fail() {
++    echo "FAIL: $*" >&2
++    exit 1
++}
++
++PORT_FILE="$TMP/api.port"
++REQLOG="$TMP/requests.log"
++python3 "$FIXTURES/asn_api_server.py" "$PORT_FILE" "$REQLOG" &
++SERVER_PID=$!
++for _ in $(seq 1 50); do
++    [ -s "$PORT_FILE" ] && break
++    sleep 0.1
++done
++[ -s "$PORT_FILE" ] || fail "mock ASN API did not start"
++PORT=$(cat "$PORT_FILE")
++
++CLIENT_SRC="$REPO/vendor/github.com/ipinfo/go/v2/ipinfo/client.go"
++PATCHED_CLIENT="$TMP/client.go"
++OVERLAY="$TMP/overlay.json"
++python3 - "$CLIENT_SRC" "$PATCHED_CLIENT" "$OVERLAY" "$PORT" <<'PY'
++import json
++import pathlib
++import re
++import sys
++
++src, patched, overlay, port = sys.argv[1:5]
++text = pathlib.Path(src).read_text(encoding="utf-8")
++text, count = re.subn(
++    r'defaultBaseURL\s+=\s+"[^"]+"',
++    f'defaultBaseURL     = "http://127.0.0.1:{port}/"',
++    text,
++    count=1,
++)
++if count != 1:
++    raise SystemExit("could not patch defaultBaseURL")
++pathlib.Path(patched).write_text(text, encoding="utf-8")
++pathlib.Path(overlay).write_text(
++    json.dumps({"Replace": {src: patched}}),
++    encoding="utf-8",
++)
++PY
++
++( cd "$REPO" && go build -mod=vendor -overlay "$OVERLAY" -o "$TMP/ipinfo" ./ipinfo ) \
++    || fail "build"
++BIN="$TMP/ipinfo"
++OUT="$TMP/out"
++ERR="$TMP/err"
++
++make_config() {
++    cfg=$1
++    token=$2
++    cache_enabled=${3:-true}
++    mkdir -p "$cfg/ipinfo"
++    printf '{"cache_enabled":%s,"token":"%s","open_browser":true}' \
++        "$cache_enabled" "$token" > "$cfg/ipinfo/config.json"
++}
++
++run_cli() {
++    cfg=$1
++    shift
++    rm -f "$OUT" "$ERR"
++    XDG_CONFIG_HOME="$cfg" HOME="$cfg/home" "$BIN" "$@" >"$OUT" 2>"$ERR"
++    ec=$?
++}
++
++run_completion() {
++    cfg=$1
++    line=$2
++    rm -f "$OUT" "$ERR"
++    COMP_LINE="$line" COMP_POINT=${#line} XDG_CONFIG_HOME="$cfg" HOME="$cfg/home" \
++        "$BIN" >"$OUT" 2>"$ERR"
++    ec=$?
++}
++
++assert_file_eq_literal() {
++    file=$1
++    label=$2
++    expected="$TMP/expected"
++    cat > "$expected"
++    if ! cmp -s "$file" "$expected"; then
++        echo "FAIL: $label mismatch" >&2
++        echo "got:" >&2
++        sed -n '1,120p' "$file" >&2
++        exit 1
++    fi
++}
++
++assert_empty() {
++    file=$1
++    label=$2
++    [ ! -s "$file" ] || fail "$label not empty: $(sed -n '1,20p' "$file")"
++}
++
++assert_line() {
++    file=$1
++    line=$2
++    label=$3
++    grep -Fqx -- "$line" "$file" || fail "$label missing line: $line"
++}
++
++assert_line_with_terms() {
++    file=$1
++    label=$2
++    shift 2
++    while IFS= read -r line; do
++        ok=1
++        for term in "$@"; do
++            case "$line" in
++                *"$term"*) ;;
++                *) ok=0 ;;
++            esac
++        done
++        [ "$ok" -eq 1 ] && return 0
++    done < "$file"
++    fail "$label missing line containing: $*"
++}
++
++assert_json_asn_details() {
++    file=$1
++    label=$2
++    expected_asn=$3
++    expected_name=$4
++    expected_registry=$5
++    python3 - "$file" "$label" "$expected_asn" "$expected_name" "$expected_registry" <<'PY'
++import json
++import pathlib
++import sys
++
++path, label, expected_asn, expected_name, expected_registry = sys.argv[1:6]
++raw = pathlib.Path(path).read_text(encoding="utf-8")
++try:
++    data = json.loads(raw)
++except Exception as exc:
++    raise SystemExit(f"FAIL: {label} is not valid JSON: {exc}")
++if not isinstance(data, dict):
++    raise SystemExit(f"FAIL: {label} JSON is not an object")
++expected = {
++    "asn": expected_asn,
++    "name": expected_name,
++    "registry": expected_registry,
++}
++for key, value in expected.items():
++    if data.get(key) != value:
++        raise SystemExit(f"FAIL: {label} {key}={data.get(key)!r}; want {value!r}")
++if '\n  "' not in raw:
++    raise SystemExit(f"FAIL: {label} is not indented JSON")
++PY
++}
++
++assert_yaml_asn_details() {
++    file=$1
++    label=$2
++    expected_asn=$3
++    expected_name=$4
++    expected_registry=$5
++    parser="$TMP/assert_yaml.go"
++    cat > "$parser" <<'EOF'
++package main
++
++import (
++	"fmt"
++	"os"
++
++	"gopkg.in/yaml.v3"
++)
++
++func main() {
++	if len(os.Args) != 5 {
++		fmt.Fprintln(os.Stderr, "usage: assert_yaml <file> <asn> <name> <registry>")
++		os.Exit(2)
++	}
++	raw, err := os.ReadFile(os.Args[1])
++	if err != nil {
++		fmt.Fprintln(os.Stderr, err)
++		os.Exit(2)
++	}
++	var data map[string]interface{}
++	if err := yaml.Unmarshal(raw, &data); err != nil {
++		fmt.Fprintf(os.Stderr, "not valid YAML: %v\n", err)
++		os.Exit(2)
++	}
++	expected := map[string]string{
++		"asn":      os.Args[2],
++		"name":     os.Args[3],
++		"registry": os.Args[4],
++	}
++	for key, want := range expected {
++		if got := fmt.Sprint(data[key]); got != want {
++			fmt.Fprintf(os.Stderr, "%s=%q; want %q\n", key, got, want)
++			os.Exit(2)
++		}
++	}
++}
++EOF
++    if ! ( cd "$REPO" && go run -mod=vendor "$parser" "$file" "$expected_asn" "$expected_name" "$expected_registry" ); then
++        fail "$label does not contain the expected ASN details as YAML"
++    fi
++}
++
++request_count() {
++    if [ -f "$REQLOG" ]; then
++        wc -l < "$REQLOG" | tr -d '[:space:]'
++    else
++        printf '0'
++    fi
++}
++
++assert_last_request() {
++    expected=$1
++    actual=$(tail -n 1 "$REQLOG" 2>/dev/null || true)
++    [ "$actual" = "$expected" ] || fail "last request '$actual'; want '$expected'"
++}
++
++
++
++
++make_config "$TMP/cfg_f1" ""
++run_cli "$TMP/cfg_f1" AS123 --field asn,name,registry --token fixture-token
++[ "$ec" -eq 0 ] || fail "F1 exit $ec; want 0"
++assert_file_eq_literal "$OUT" "F1 stdout" <<'EOF'
++asn,name,registry
++AS123,Example Network,arin
++EOF
++assert_empty "$ERR" "F1 stderr"
++assert_last_request "GET /AS123 auth=Bearer fixture-token"
++
++
++
++
++make_config "$TMP/cfg_f2" "saved-token"
++run_cli "$TMP/cfg_f2" as123 --nocolor
++[ "$ec" -eq 0 ] || fail "F2 exit $ec; want 0"
++
++assert_json_asn_details "$OUT" "F2 stdout" "AS123" "Example Network" "arin"
++assert_empty "$ERR" "F2 stderr"
++if grep -q $'\033' "$OUT"; then
++    fail "F2 stdout contains ANSI color escapes despite --nocolor"
++fi
++assert_last_request "GET /AS123 auth=Bearer saved-token"
++
++
++
++
++make_config "$TMP/cfg_f3" ""
++run_cli "$TMP/cfg_f3" AS123 -t fixture-token -y
++[ "$ec" -eq 0 ] || fail "F3 exit $ec; want 0"
++
++assert_yaml_asn_details "$OUT" "F3 stdout" "AS123" "Example Network" "arin"
++assert_empty "$ERR" "F3 stderr"
++assert_last_request "GET /AS123 auth=Bearer fixture-token"
++
++
++
++
++make_config "$TMP/cfg_f4" ""
++run_cli "$TMP/cfg_f4" AS1 --field asn,name,registry --token fixture-token
++[ "$ec" -eq 0 ] || fail "F4 exit $ec; want 0"
++assert_file_eq_literal "$OUT" "F4 stdout" <<'EOF'
++asn,name,registry
++AS1,Boundary Network,arin
++EOF
++assert_empty "$ERR" "F4 stderr"
++assert_last_request "GET /AS1 auth=Bearer fixture-token"
++
++
++
++
++make_config "$TMP/cfg_f5" ""
++before=$(request_count)
++run_cli "$TMP/cfg_f5" AS123 --help
++after=$(request_count)
++[ "$ec" -eq 0 ] || fail "F5 exit $ec; want 0"
++[ "$after" -eq "$before" ] || fail "F5 made an API request"
++assert_empty "$ERR" "F5 stderr"
++
++assert_line "$OUT" "Usage: ipinfo AS123 [<opts>]" "F5 help"
++assert_line_with_terms "$OUT" "F5 help --token" "--token"
++assert_line_with_terms "$OUT" "F5 help --nocache" "--nocache"
++assert_line_with_terms "$OUT" "F5 help --field" "--field"
++assert_line_with_terms "$OUT" "F5 help --nocolor" "--nocolor"
++assert_line_with_terms "$OUT" "F5 help --json" "--json"
++assert_line_with_terms "$OUT" "F5 help --yaml" "--yaml"
++
++
++
++
++make_config "$TMP/cfg_f6" ""
++before=$(request_count)
++run_cli "$TMP/cfg_f6" AS123 -h
++after=$(request_count)
++[ "$ec" -eq 0 ] || fail "F6 exit $ec; want 0"
++[ "$after" -eq "$before" ] || fail "F6 made an API request"
++assert_empty "$ERR" "F6 stderr"
++assert_line "$OUT" "Usage: ipinfo AS123 [<opts>]" "F6 help"
++
++assert_line_with_terms "$OUT" "F6 help --yaml" "--yaml"
++
++
++
++
++make_config "$TMP/cfg_f7" ""
++before=$(request_count)
++run_cli "$TMP/cfg_f7" AS123
++after=$(request_count)
++[ "$ec" -eq 0 ] || fail "F7 exit $ec; want GT normal error exit 0"
++[ "$after" -eq "$before" ] || fail "F7 made an API request without a token"
++assert_empty "$OUT" "F7 stdout"
++assert_file_eq_literal "$ERR" "F7 stderr" <<'EOF'
++err: ASN lookups require a token; login via `ipinfo init`.
++EOF
++
++
++
++
++make_config "$TMP/cfg_f8" ""
++run_cli "$TMP/cfg_f8" AS401 --token bad-token
++[ "$ec" -eq 0 ] || fail "F8 exit $ec; want GT normal error exit 0"
++assert_empty "$OUT" "F8 stdout"
++assert_file_eq_literal "$ERR" "F8 stderr" <<'EOF'
++err: Token does not have access to ASN API
++EOF
++assert_last_request "GET /AS401 auth=Bearer bad-token"
++
++
++
++
++make_config "$TMP/cfg_f9" "saved-token"
++before=$(request_count)
++run_cli "$TMP/cfg_f9" AS124 --field asn,name,registry
++[ "$ec" -eq 0 ] || fail "F9a exit $ec; want 0"
++assert_file_eq_literal "$OUT" "F9a stdout" <<'EOF'
++asn,name,registry
++AS124,Cached Network,arin
++EOF
++run_cli "$TMP/cfg_f9" AS124 --field asn,name,registry
++middle=$(request_count)
++[ "$ec" -eq 0 ] || fail "F9b exit $ec; want 0"
++assert_file_eq_literal "$OUT" "F9b stdout" <<'EOF'
++asn,name,registry
++AS124,Cached Network,arin
++EOF
++[ "$middle" -eq $((before + 1)) ] || fail "F9b did not use the cached response"
++run_cli "$TMP/cfg_f9" AS124 --nocache --field asn,name,registry
++after=$(request_count)
++[ "$ec" -eq 0 ] || fail "F9c exit $ec; want 0"
++assert_file_eq_literal "$OUT" "F9c stdout" <<'EOF'
++asn,name,registry
++AS124,Fresh Network,arin
++EOF
++[ "$after" -eq $((middle + 1)) ] || fail "F9c did not make a fresh request with --nocache"
++assert_last_request "GET /AS124 auth=Bearer saved-token"
++
++
++
++
++make_config "$TMP/cfg_f10" ""
++run_cli "$TMP/cfg_f10" --help
++[ "$ec" -eq 0 ] || fail "F10 exit $ec; want 0"
++assert_empty "$ERR" "F10 stderr"
++
++assert_line_with_terms "$OUT" "F10 top-level help" "<asn>" "ASN"
++
++
++
++
++make_config "$TMP/cfg_f11" ""
++before=$(request_count)
++run_completion "$TMP/cfg_f11" "ipinfo AS123 --"
++after=$(request_count)
++[ "$ec" -eq 0 ] || fail "F11 exit $ec; want 0"
++[ "$after" -eq "$before" ] || fail "F11 completion made an API request"
++assert_empty "$ERR" "F11 stderr"
++assert_line "$OUT" "--token" "F11 completion"
++assert_line "$OUT" "--nocache" "F11 completion"
++assert_line "$OUT" "--field" "F11 completion"
++assert_line "$OUT" "--nocolor" "F11 completion"
++assert_line "$OUT" "--json" "F11 completion"
++
++echo "PASS"
++exit 0
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,16 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++
++export GOPROXY=off
++export GOSUMDB=off
++export GOTOOLCHAIN=local
++set -e
++cd /workspace/repo
++exec bash /workspace/repo/usercase-test-coderl/usecase.sh

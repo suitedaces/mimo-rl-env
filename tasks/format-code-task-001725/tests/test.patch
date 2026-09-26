@@ -1,0 +1,218 @@
+diff --git a/cmd/clusterctl/client/init_test.go b/cmd/clusterctl/client/init_test.go
+index 3d3f2e29d..3c79992ac 100644
+--- a/cmd/clusterctl/client/init_test.go
++++ b/cmd/clusterctl/client/init_test.go
+@@ -545,6 +545,143 @@ func Test_clusterctlClient_Init(t *testing.T) {
+ 	}
+ }
+ 
++func Test_clusterctlClient_Init_idempotent(t *testing.T) {
++	type args struct {
++		coreProvider           string
++		bootstrapProvider      []string
++		controlPlaneProvider   []string
++		infrastructureProvider []string
++	}
++	type want struct {
++		provider        Provider
++		version         string
++		targetNamespace string
++	}
++	tests := []struct {
++		name    string
++		client  *fakeClient
++		args    args
++		want    []want
++		wantErr bool
++	}{
++		{
++
++
++
++			name:   "Init (with a fully initialized cluster) same explicit versions skips all providers",
++			client: fakeFullyInitializedCluster(),
++			args: args{
++				coreProvider:           fmt.Sprintf("%s:v1.0.0", config.ClusterAPIProviderName),
++				bootstrapProvider:      []string{fmt.Sprintf("%s:v2.0.0", config.KubeadmBootstrapProviderName)},
++				controlPlaneProvider:   []string{fmt.Sprintf("%s:v2.0.0", config.KubeadmControlPlaneProviderName)},
++				infrastructureProvider: []string{"infra:v3.0.0"},
++			},
++			want:    nil,
++			wantErr: false,
++		},
++		{
++
++
++
++			name:   "Init (with a fully initialized cluster) same default versions (no version specified) skips all providers",
++			client: fakeFullyInitializedCluster(),
++			args: args{
++				coreProvider:           config.ClusterAPIProviderName,
++				bootstrapProvider:      []string{config.KubeadmBootstrapProviderName},
++				controlPlaneProvider:   []string{config.KubeadmControlPlaneProviderName},
++				infrastructureProvider: []string{"infra"},
++			},
++			want:    nil,
++			wantErr: false,
++		},
++		{
++
++
++			name:   "Init (with capi installed) idempotent on capi, installs other providers",
++			client: fakeIdempotentCapiInstalledCluster(),
++			args: args{
++				coreProvider:           fmt.Sprintf("%s:v1.0.0", config.ClusterAPIProviderName),
++				bootstrapProvider:      []string{fmt.Sprintf("%s:v2.0.0", config.KubeadmBootstrapProviderName)},
++				controlPlaneProvider:   []string{fmt.Sprintf("%s:v2.0.0", config.KubeadmControlPlaneProviderName)},
++				infrastructureProvider: []string{"infra:v3.0.0"},
++			},
++			want: []want{
++				{
++					provider:        bootstrapProviderConfig,
++					version:         "v2.0.0",
++					targetNamespace: "ns2",
++				},
++				{
++					provider:        controlPlaneProviderConfig,
++					version:         "v2.0.0",
++					targetNamespace: "ns3",
++				},
++				{
++					provider:        infraProviderConfig,
++					version:         "v3.0.0",
++					targetNamespace: "ns4",
++				},
++			},
++			wantErr: false,
++		},
++		{
++
++
++			name:   "Init (with capi installed) errors when explicit core version diverges",
++			client: fakeIdempotentCapiInstalledCluster(),
++			args: args{
++				coreProvider: fmt.Sprintf("%s:v1.1.0", config.ClusterAPIProviderName),
++			},
++			wantErr: true,
++		},
++		{
++
++
++
++			name:   "Init (with a fully initialized cluster) errors when bootstrap version diverges",
++			client: fakeFullyInitializedCluster(),
++			args: args{
++				coreProvider:           fmt.Sprintf("%s:v1.0.0", config.ClusterAPIProviderName),
++				bootstrapProvider:      []string{fmt.Sprintf("%s:v2.1.0", config.KubeadmBootstrapProviderName)},
++				controlPlaneProvider:   []string{fmt.Sprintf("%s:v2.0.0", config.KubeadmControlPlaneProviderName)},
++				infrastructureProvider: []string{"infra:v3.0.0"},
++			},
++			wantErr: true,
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			g := NewWithT(t)
++
++			input := cluster.Kubeconfig{Path: "kubeconfig", Context: "mgmt-context"}
++			g.Expect(tt.client.clusters[input].ProviderInventory().EnsureCustomResourceDefinitions()).To(Succeed())
++
++			got, err := tt.client.Init(InitOptions{
++				Kubeconfig:              Kubeconfig{Path: "kubeconfig", Context: "mgmt-context"},
++				CoreProvider:            tt.args.coreProvider,
++				BootstrapProviders:      tt.args.bootstrapProvider,
++				ControlPlaneProviders:   tt.args.controlPlaneProvider,
++				InfrastructureProviders: tt.args.infrastructureProvider,
++			})
++			if tt.wantErr {
++				g.Expect(err).To(HaveOccurred())
++				return
++			}
++			g.Expect(err).NotTo(HaveOccurred())
++
++			g.Expect(got).To(HaveLen(len(tt.want)))
++			for i, gItem := range got {
++				w := tt.want[i]
++				g.Expect(gItem.Name()).To(Equal(w.provider.Name()))
++				g.Expect(gItem.Type()).To(Equal(w.provider.Type()))
++				g.Expect(gItem.Version()).To(Equal(w.version))
++				g.Expect(gItem.TargetNamespace()).To(Equal(w.targetNamespace))
++			}
++		})
++	}
++}
++
+ var (
+ 	capiProviderConfig         = config.NewProvider(config.ClusterAPIProviderName, "url", clusterctlv1.CoreProviderType)
+ 	bootstrapProviderConfig    = config.NewProvider(config.KubeadmBootstrapProviderName, "url", clusterctlv1.BootstrapProviderType)
+@@ -754,6 +891,47 @@ func fakeInitializedCluster() *fakeClient {
+ 	return client
+ }
+ 
++
++
++
++
++
++func fakeIdempotentCapiInstalledCluster() *fakeClient {
++	client := fakeEmptyCluster()
++
++	input := cluster.Kubeconfig{
++		Path:    "kubeconfig",
++		Context: "mgmt-context",
++	}
++	p := client.clusters[input].Proxy()
++	fp := p.(*test.FakeProxy)
++
++	fp.WithProviderInventory(capiProviderConfig.Name(), capiProviderConfig.Type(), "v1.0.0", "ns1")
++
++	return client
++}
++
++
++
++
++func fakeFullyInitializedCluster() *fakeClient {
++	client := fakeEmptyCluster()
++
++	input := cluster.Kubeconfig{
++		Path:    "kubeconfig",
++		Context: "mgmt-context",
++	}
++	p := client.clusters[input].Proxy()
++	fp := p.(*test.FakeProxy)
++
++	fp.WithProviderInventory(capiProviderConfig.Name(), capiProviderConfig.Type(), "v1.0.0", "ns1")
++	fp.WithProviderInventory(bootstrapProviderConfig.Name(), bootstrapProviderConfig.Type(), "v2.0.0", "ns2")
++	fp.WithProviderInventory(controlPlaneProviderConfig.Name(), controlPlaneProviderConfig.Type(), "v2.0.0", "ns3")
++	fp.WithProviderInventory(infraProviderConfig.Name(), infraProviderConfig.Type(), "v3.0.0", "ns4")
++
++	return client
++}
++
+ func componentsYAML(ns string) []byte {
+ 	var namespaceYaml = []byte("apiVersion: v1\n" +
+ 		"kind: Namespace\n" +
+diff --git a/test_commands.json b/test_commands.json
+new file mode 100644
+index 000000000..f4d734d41
+--- /dev/null
++++ b/test_commands.json
+@@ -0,0 +1,3 @@
++{
++  "test_commands": ["go test ./cmd/clusterctl/client/ -run Test_clusterctlClient_Init_idempotent -count=1"]
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,8 @@
++#!/usr/bin/env bash
++
++set -uo pipefail
++cd /testbed
++rc=0
++go test ./cmd/clusterctl/client/ -run Test_clusterctlClient_Init_idempotent -count=1
++rc=$(( rc | $? ))
++exit $rc

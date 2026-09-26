@@ -1,0 +1,529 @@
+diff --git a/usercase-test-coderl/test_data_labeler_predict_pipeline.py b/usercase-test-coderl/test_data_labeler_predict_pipeline.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/test_data_labeler_predict_pipeline.py
+@@ -0,0 +1,499 @@
++import warnings
++
++import numpy as np
++import pandas as pd
++import pytest
++
++import dataprofiler as dp
++from dataprofiler.labelers import BaseDataLabeler
++from dataprofiler.labelers.base_model import BaseModel
++from dataprofiler.labelers.data_processing import (
++    BaseDataPostprocessor,
++    BaseDataPreprocessor,
++)
++
++
++class RecordingPreprocessor(BaseDataPreprocessor):
++    def __init__(self, **parameters):
++        self.calls = []
++        super().__init__(**parameters)
++
++    def _validate_parameters(self, parameters):
++        unknown = set(parameters) - {"shared", "stage"}
++        if unknown:
++            raise ValueError(f"bad params {unknown}")
++
++    @classmethod
++    def help(cls):
++        print("RecordingPreprocessor")
++
++    def process(self, data, labels=None, label_mapping=None, batch_size=32):
++        values = tuple(str(x) for x in np.reshape(data, -1).tolist())
++        self.calls.append({"data": values, "batch_size": batch_size})
++        return [
++            {
++                "values": values,
++                "batch_size": batch_size,
++                "call_index": len(self.calls),
++            }
++        ]
++
++
++class RecordingModel(BaseModel):
++    def __init__(self, label_mapping=None, parameters=None):
++        self.calls = []
++        super().__init__(label_mapping or {"A": 1, "B": 2}, parameters or {})
++
++    def _need_to_reconstruct_model(self):
++        return False
++
++    def _validate_parameters(self, parameters):
++        unknown = set(parameters) - {"shared", "stage"}
++        if unknown:
++            raise ValueError(f"bad params {unknown}")
++
++    def _construct_model(self):
++        return None
++
++    def _reconstruct_model(self):
++        return None
++
++    def reset_weights(self):
++        return None
++
++    def predict(self, data, batch_size, show_confidences, verbose):
++        samples = list(data)
++        self.calls.append(
++            {
++                "samples": samples,
++                "batch_size": batch_size,
++                "show_confidences": show_confidences,
++                "verbose": verbose,
++            }
++        )
++        if show_confidences:
++            return {
++                "pred": [2, 1],
++                "conf": [0.25, 0.75],
++                "model_call_index": len(self.calls),
++                "verbose": verbose,
++                "batch_size": batch_size,
++            }
++        return {
++            "pred": [1, 2],
++            "model_call_index": len(self.calls),
++            "verbose": verbose,
++            "batch_size": batch_size,
++        }
++
++    @classmethod
++    def load_from_disk(cls, dirpath):
++        return cls()
++
++    def save_to_disk(self, dirpath):
++        return None
++
++
++class RecordingPostprocessor(BaseDataPostprocessor):
++    def __init__(self, **parameters):
++        self.calls = []
++        super().__init__(**parameters)
++
++    def _validate_parameters(self, parameters):
++        unknown = set(parameters) - {"shared", "stage"}
++        if unknown:
++            raise ValueError(f"bad params {unknown}")
++
++    @classmethod
++    def help(cls):
++        print("RecordingPostprocessor")
++
++    def process(self, data, results, label_mapping):
++        values = tuple(str(x) for x in np.reshape(data, -1).tolist())
++        reverse = {v: k for k, v in label_mapping.items()}
++        output = {
++            "pred": [reverse[x] for x in results["pred"]],
++            "postprocess_call_index": len(self.calls) + 1,
++            "data_seen": list(values),
++            "model_call_index": results["model_call_index"],
++            "model_verbose": results["verbose"],
++            "model_batch_size": results["batch_size"],
++        }
++        if "conf" in results:
++            output["conf"] = results["conf"]
++        self.calls.append(
++            {
++                "data": values,
++                "results": results,
++                "label_mapping": dict(label_mapping),
++                "output": dict(output),
++            }
++        )
++        return output
++
++
++def make_labeler(preprocessor=None, model=None, postprocessor=None):
++    return dp.DataLabeler.load_with_components(
++        preprocessor or RecordingPreprocessor(),
++        model or RecordingModel(),
++        postprocessor or RecordingPostprocessor(),
++    )
++
++
++def test_predict_runs_pipeline_and_returns_postprocessor_dictionary():
++
++
++
++
++    labeler = make_labeler()
++
++    assert labeler.preprocessor.calls == []
++    assert labeler.model.calls == []
++    assert labeler.postprocessor.calls == []
++
++    first_result = labeler.predict(["abc", "def"])
++    assert first_result == {
++        "pred": ["A", "B"],
++        "postprocess_call_index": 1,
++        "data_seen": ["abc", "def"],
++        "model_call_index": 1,
++        "model_verbose": True,
++        "model_batch_size": 32,
++    }
++    assert labeler.preprocessor.calls == [
++        {"data": ("abc", "def"), "batch_size": 32}
++    ]
++    assert labeler.model.calls == [
++        {
++            "samples": [
++                {
++                    "values": ("abc", "def"),
++                    "batch_size": 32,
++                    "call_index": 1,
++                }
++            ],
++            "batch_size": 32,
++            "show_confidences": False,
++            "verbose": True,
++        }
++    ]
++    assert labeler.postprocessor.calls == [
++        {
++            "data": ("abc", "def"),
++            "results": {
++                "pred": [1, 2],
++                "model_call_index": 1,
++                "verbose": True,
++                "batch_size": 32,
++            },
++            "label_mapping": {"A": 1, "B": 2},
++            "output": {
++                "pred": ["A", "B"],
++                "postprocess_call_index": 1,
++                "data_seen": ["abc", "def"],
++                "model_call_index": 1,
++                "model_verbose": True,
++                "model_batch_size": 32,
++            },
++        }
++    ]
++
++
++def test_predict_threads_batch_options_and_evolves_component_state():
++
++
++
++
++    labeler = make_labeler()
++
++    first_result = labeler.predict(["abc", "def"])
++    second_result = labeler.predict(
++        ["abc"],
++        batch_size=8,
++        predict_options={"show_confidences": True},
++        verbose=False,
++    )
++
++    assert first_result == {
++        "pred": ["A", "B"],
++        "postprocess_call_index": 1,
++        "data_seen": ["abc", "def"],
++        "model_call_index": 1,
++        "model_verbose": True,
++        "model_batch_size": 32,
++    }
++    assert second_result == {
++        "pred": ["B", "A"],
++        "postprocess_call_index": 2,
++        "data_seen": ["abc"],
++        "model_call_index": 2,
++        "model_verbose": False,
++        "model_batch_size": 8,
++        "conf": [0.25, 0.75],
++    }
++    assert labeler.preprocessor.calls == [
++        {"data": ("abc", "def"), "batch_size": 32},
++        {"data": ("abc",), "batch_size": 8},
++    ]
++    assert labeler.model.calls == [
++        {
++            "samples": [
++                {
++                    "values": ("abc", "def"),
++                    "batch_size": 32,
++                    "call_index": 1,
++                }
++            ],
++            "batch_size": 32,
++            "show_confidences": False,
++            "verbose": True,
++        },
++        {
++            "samples": [
++                {"values": ("abc",), "batch_size": 8, "call_index": 2}
++            ],
++            "batch_size": 8,
++            "show_confidences": True,
++            "verbose": False,
++        },
++    ]
++
++
++@pytest.mark.parametrize(
++    ("data", "expected"),
++    [
++        (
++            ["abc", "def"],
++            {
++                "pred": ["A", "B"],
++                "postprocess_call_index": 1,
++                "data_seen": ["abc", "def"],
++                "model_call_index": 1,
++                "model_verbose": True,
++                "model_batch_size": 32,
++            },
++        ),
++        (
++            np.array(["ghi", "jkl"], dtype=object),
++            {
++                "pred": ["A", "B"],
++                "postprocess_call_index": 1,
++                "data_seen": ["ghi", "jkl"],
++                "model_call_index": 1,
++                "model_verbose": True,
++                "model_batch_size": 32,
++            },
++        ),
++        (
++            pd.Series(["mno", "pqr"], dtype=object),
++            {
++                "pred": ["A", "B"],
++                "postprocess_call_index": 1,
++                "data_seen": ["mno", "pqr"],
++                "model_call_index": 1,
++                "model_verbose": True,
++                "model_batch_size": 32,
++            },
++        ),
++        (
++            pd.DataFrame({"col": ["stu", "vwx"]}),
++            {
++                "pred": ["A", "B"],
++                "postprocess_call_index": 1,
++                "data_seen": ["stu", "vwx"],
++                "model_call_index": 1,
++                "model_verbose": True,
++                "model_batch_size": 32,
++            },
++        ),
++        (
++            dp.Data(data=pd.DataFrame({"col": ["yz", "12"]}), data_type="csv"),
++            {
++                "pred": ["A", "B"],
++                "postprocess_call_index": 1,
++                "data_seen": ["yz", "12"],
++                "model_call_index": 1,
++                "model_verbose": True,
++                "model_batch_size": 32,
++            },
++        ),
++    ],
++)
++def test_predict_accepts_all_query_input_shapes(data, expected):
++
++
++
++
++    labeler = make_labeler()
++
++    assert labeler.predict(data) == expected
++
++
++def test_predict_rejects_plain_string_input_with_type_error():
++
++
++
++
++    labeler = make_labeler()
++
++
++    with pytest.raises(TypeError):
++        labeler.predict("abc")
++
++    assert labeler.preprocessor.calls == []
++    assert labeler.model.calls == []
++    assert labeler.postprocessor.calls == []
++
++
++def test_base_data_labeler_load_with_components_predicts_when_configured():
++
++
++
++
++    labeler = BaseDataLabeler.load_with_components(
++        RecordingPreprocessor(),
++        RecordingModel(),
++        RecordingPostprocessor(),
++    )
++
++
++    assert labeler.predict(["abc", "def"]) == {
++        "pred": ["A", "B"],
++        "postprocess_call_index": 1,
++        "data_seen": ["abc", "def"],
++        "model_call_index": 1,
++        "model_verbose": True,
++        "model_batch_size": 32,
++    }
++
++
++def test_pipeline_mismatch_warns_and_continues_by_default():
++
++
++
++
++    labeler = make_labeler(
++        RecordingPreprocessor(shared="pre"),
++        RecordingModel(parameters={"shared": "model"}),
++        RecordingPostprocessor(shared="post"),
++    )
++
++    with warnings.catch_warnings(record=True) as caught:
++        warnings.simplefilter("always")
++        result = labeler.predict(["abc", "def"])
++
++    assert result == {
++        "pred": ["A", "B"],
++        "postprocess_call_index": 1,
++        "data_seen": ["abc", "def"],
++        "model_call_index": 1,
++        "model_verbose": True,
++        "model_batch_size": 32,
++    }
++
++    assert any(isinstance(w.message, RuntimeWarning) for w in caught)
++
++
++def test_pipeline_mismatch_raises_runtime_error_when_requested():
++
++
++
++
++    labeler = make_labeler(
++        RecordingPreprocessor(shared="pre"),
++        RecordingModel(parameters={"shared": "model"}),
++        RecordingPostprocessor(shared="post"),
++    )
++
++
++    with pytest.raises(RuntimeError):
++        labeler.predict(["abc", "def"], error_on_mismatch=True)
++
++
++    assert labeler.model.calls == []
++    assert labeler.postprocessor.calls == []
++
++
++def test_two_labeler_instances_keep_independent_component_state():
++
++
++
++
++    a = make_labeler()
++    b = make_labeler()
++
++    assert a.predict(["left", "right"]) == {
++        "pred": ["A", "B"],
++        "postprocess_call_index": 1,
++        "data_seen": ["left", "right"],
++        "model_call_index": 1,
++        "model_verbose": True,
++        "model_batch_size": 32,
++    }
++    assert a.predict(
++        ["left"],
++        batch_size=8,
++        predict_options={"show_confidences": True},
++        verbose=False,
++    ) == {
++        "pred": ["B", "A"],
++        "postprocess_call_index": 2,
++        "data_seen": ["left"],
++        "model_call_index": 2,
++        "model_verbose": False,
++        "model_batch_size": 8,
++        "conf": [0.25, 0.75],
++    }
++    assert b.predict(["solo", "other"]) == {
++        "pred": ["A", "B"],
++        "postprocess_call_index": 1,
++        "data_seen": ["solo", "other"],
++        "model_call_index": 1,
++        "model_verbose": True,
++        "model_batch_size": 32,
++    }
++
++    assert a.preprocessor.calls == [
++        {"data": ("left", "right"), "batch_size": 32},
++        {"data": ("left",), "batch_size": 8},
++    ]
++    assert b.preprocessor.calls == [
++        {"data": ("solo", "other"), "batch_size": 32}
++    ]
++    assert a.postprocessor.calls[1]["output"] == {
++        "pred": ["B", "A"],
++        "postprocess_call_index": 2,
++        "data_seen": ["left"],
++        "model_call_index": 2,
++        "model_verbose": False,
++        "model_batch_size": 8,
++        "conf": [0.25, 0.75],
++    }
++    assert b.postprocessor.calls[0]["output"] == {
++        "pred": ["A", "B"],
++        "postprocess_call_index": 1,
++        "data_seen": ["solo", "other"],
++        "model_call_index": 1,
++        "model_verbose": True,
++        "model_batch_size": 32,
++    }
++
++
++def test_construct_predict_discard_cycles_return_postprocessor_output():
++
++
++
++
++
++
++    for _ in range(10):
++        labeler = make_labeler()
++        assert labeler.predict(["abc", "def"]) == {
++            "pred": ["A", "B"],
++            "postprocess_call_index": 1,
++            "data_seen": ["abc", "def"],
++            "model_call_index": 1,
++            "model_verbose": True,
++            "model_batch_size": 32,
++        }
++        del labeler
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,20 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++
++cd /workspace/repo
++
++
++export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
++export AWS_EC2_METADATA_DISABLED=true
++
++exec python -m pytest /workspace/repo/usercase-test-coderl/test_data_labeler_predict_pipeline.py -v

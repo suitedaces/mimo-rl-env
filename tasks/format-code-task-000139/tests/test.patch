@@ -1,0 +1,272 @@
+diff --git a/pkg/cmd/apply/apply_behavior_test.go b/pkg/cmd/apply/apply_behavior_test.go
+new file mode 100644
+index 0000000..17c485d
+--- /dev/null
++++ b/pkg/cmd/apply/apply_behavior_test.go
+@@ -0,0 +1,160 @@
++package apply
++
++import (
++	"bytes"
++	"io"
++	"reflect"
++	"testing"
++
++	"github.com/bytedance/mockey"
++	"github.com/stretchr/testify/assert"
++
++	apiv1 "kusionstack.io/kusion/pkg/apis/core/v1"
++	v1 "kusionstack.io/kusion/pkg/apis/status/v1"
++	"kusionstack.io/kusion/pkg/engine/operation"
++	"kusionstack.io/kusion/pkg/engine/operation/models"
++)
++
++func TestApplyCommandDoesNotExposeBackendFlags(t *testing.T) {
++	cmd := NewCmdApply()
++
++	for _, name := range []string{"backend-type", "backend-config", "backend-config-file", "backend", "state-backend", "state-storage-config"} {
++		assert.Nilf(t, cmd.Flags().Lookup(name), "apply should not expose legacy backend flag %q", name)
++	}
++
++	var help bytes.Buffer
++	cmd.SetOut(&help)
++	cmd.SetErr(&help)
++	_ = cmd.Help()
++	assert.NotContains(t, help.String(), "--backend-")
++}
++
++func TestApplyCommandRejectsLegacyBackendFlag(t *testing.T) {
++	cmd := NewCmdApply()
++	cmd.SetOut(&bytes.Buffer{})
++	cmd.SetErr(&bytes.Buffer{})
++	cmd.SetArgs([]string{"--backend-type=local"})
++
++	err := cmd.Execute()
++	if assert.Error(t, err) {
++		assert.Contains(t, err.Error(), "unknown flag")
++		assert.Contains(t, err.Error(), "backend-type")
++	}
++}
++
++func TestApplyRunAssociatesPreviewWithDefaultWorkspace(t *testing.T) {
++	mockey.PatchConvey("apply run preview workspace", t, func() {
++		mockPatchDetectProjectAndStack()
++		mockPatchBuildIntent()
++		mockPatchNewKubernetesRuntime()
++
++		var previewWorkspace string
++		mockey.Mock((*operation.PreviewOperation).Preview).To(
++			func(_ *operation.PreviewOperation, request *operation.PreviewRequest) (*operation.PreviewResponse, v1.Status) {
++				previewWorkspace = request.Workspace
++				return &operation.PreviewResponse{
++					Order: &models.ChangeOrder{
++						StepKeys:    []string{},
++						ChangeSteps: map[string]*models.ChangeStep{},
++					},
++				}, nil
++			},
++		).Build()
++
++		o := NewApplyOptions()
++		o.Yes = true
++		o.DryRun = true
++
++		err := o.Run()
++		assert.NoError(t, err)
++		assert.Equal(t, "default", previewWorkspace)
++	})
++}
++
++func TestApplyRunSendsDefaultWorkspaceToApplyRequest(t *testing.T) {
++	mockey.PatchConvey("apply run apply request workspace", t, func() {
++		mockPatchDetectProjectAndStack()
++		mockPatchBuildIntent()
++		mockPatchNewKubernetesRuntime()
++
++		mockey.Mock((*operation.PreviewOperation).Preview).To(
++			func(_ *operation.PreviewOperation, request *operation.PreviewRequest) (*operation.PreviewResponse, v1.Status) {
++				return &operation.PreviewResponse{
++					Order: &models.ChangeOrder{
++						StepKeys: []string{sa1.ID},
++						ChangeSteps: map[string]*models.ChangeStep{
++							sa1.ID: {
++								ID:     sa1.ID,
++								Action: models.Create,
++								From:   &sa1,
++							},
++						},
++					},
++				}, nil
++			},
++		).Build()
++
++		clusterArg := "cluster-should-be-ignored"
++		var applyWorkspace string
++		var captured *operation.ApplyRequest
++		mockey.Mock((*operation.ApplyOperation).Apply).To(
++			func(op *operation.ApplyOperation, request *operation.ApplyRequest) (*operation.ApplyResponse, v1.Status) {
++				captured = request
++				applyWorkspace = request.Workspace
++				op.MsgCh <- models.Message{
++					ResourceID: sa1.ResourceKey(),
++					OpResult:   models.Success,
++					OpErr:      nil,
++				}
++				close(op.MsgCh)
++				return &operation.ApplyResponse{}, nil
++			},
++		).Build()
++
++		o := NewApplyOptions()
++		o.Yes = true
++		o.Arguments = map[string]string{"cluster": clusterArg}
++
++		err := o.Run()
++		assert.NoError(t, err)
++		assert.Equal(t, "default", applyWorkspace)
++		assert.NotEqual(t, clusterArg, applyWorkspace)
++
++		if assert.NotNil(t, captured) {
++			assert.Equal(t, p.Name, captured.Project.Name)
++			assert.Equal(t, s.Name, captured.Stack.Name)
++			assert.Equal(t, sa1.ResourceKey(), captured.Intent.Resources[0].ResourceKey())
++
++			requestValue := reflect.ValueOf(captured.Request)
++			clusterField := requestValue.FieldByName("Cluster")
++			if clusterField.IsValid() && clusterField.Kind() == reflect.String {
++				assert.NotEqual(t, clusterArg, clusterField.String(), "cluster argument must not be forwarded as apply request routing value")
++			}
++		}
++	})
++}
++
++func newChangesForTest(project *apiv1.Project, stack *apiv1.Stack, workspace string, order *models.ChangeOrder) *models.Changes {
++	fn := reflect.ValueOf(models.NewChanges)
++	args := []reflect.Value{reflect.ValueOf(project), reflect.ValueOf(stack)}
++	if fn.Type().NumIn() == 4 {
++		args = append(args, reflect.ValueOf(workspace))
++	}
++	args = append(args, reflect.ValueOf(order))
++	return fn.Call(args)[0].Interface().(*models.Changes)
++}
++
++func runApplyForTest(o *Options, planResources *apiv1.Intent, changes *models.Changes, out io.Writer) error {
++	fn := reflect.ValueOf(Apply)
++	results := fn.Call([]reflect.Value{
++		reflect.ValueOf(o),
++		reflect.Zero(fn.Type().In(1)),
++		reflect.ValueOf(planResources),
++		reflect.ValueOf(changes),
++		reflect.ValueOf(out),
++	})
++	if results[0].IsNil() {
++		return nil
++	}
++	return results[0].Interface().(error)
++}
+diff --git a/pkg/cmd/apply/options_test.go b/pkg/cmd/apply/options_test.go
+index 656b2bc..20b8f2d 100644
+--- a/pkg/cmd/apply/options_test.go
++++ b/pkg/cmd/apply/options_test.go
+@@ -4,7 +4,6 @@ import (
+ 	"context"
+ 	"errors"
+ 	"os"
+-	"path/filepath"
+ 	"reflect"
+ 	"testing"
+ 
+@@ -21,7 +20,6 @@ import (
+ 	opsmodels "kusionstack.io/kusion/pkg/engine/operation/models"
+ 	"kusionstack.io/kusion/pkg/engine/runtime"
+ 	"kusionstack.io/kusion/pkg/engine/runtime/kubernetes"
+-	"kusionstack.io/kusion/pkg/engine/states/local"
+ 	"kusionstack.io/kusion/pkg/project"
+ )
+ 
+@@ -182,7 +180,6 @@ func newSA(name string) apiv1.Resource {
+ }
+ 
+ func Test_apply(t *testing.T) {
+-	stateStorage := &local.FileSystemState{Path: filepath.Join("", local.KusionStateFileFile)}
+ 	mockey.PatchConvey("dry run", t, func() {
+ 		planResources := &apiv1.Intent{Resources: []apiv1.Resource{sa1}}
+ 		order := &opsmodels.ChangeOrder{
+@@ -195,10 +192,10 @@ func Test_apply(t *testing.T) {
+ 				},
+ 			},
+ 		}
+-		changes := opsmodels.NewChanges(p, s, order)
++		changes := newChangesForTest(p, s, "default", order)
+ 		o := NewApplyOptions()
+ 		o.DryRun = true
+-		err := Apply(o, stateStorage, planResources, changes, os.Stdout)
++		err := runApplyForTest(o, planResources, changes, os.Stdout)
+ 		assert.Nil(t, err)
+ 	})
+ 	mockey.PatchConvey("apply success", t, func() {
+@@ -220,9 +217,9 @@ func Test_apply(t *testing.T) {
+ 				},
+ 			},
+ 		}
+-		changes := opsmodels.NewChanges(p, s, order)
++		changes := newChangesForTest(p, s, "default", order)
+ 
+-		err := Apply(o, stateStorage, planResources, changes, os.Stdout)
++		err := runApplyForTest(o, planResources, changes, os.Stdout)
+ 		assert.Nil(t, err)
+ 	})
+ 	mockey.PatchConvey("apply failed", t, func() {
+@@ -240,9 +237,9 @@ func Test_apply(t *testing.T) {
+ 				},
+ 			},
+ 		}
+-		changes := opsmodels.NewChanges(p, s, order)
++		changes := newChangesForTest(p, s, "default", order)
+ 
+-		err := Apply(o, stateStorage, planResources, changes, os.Stdout)
++		err := runApplyForTest(o, planResources, changes, os.Stdout)
+ 		assert.NotNil(t, err)
+ 	})
+ }
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,36 @@
++#!/bin/bash
++set -uo pipefail
++cd /testbed
++
++
++export GOROOT=/opt/go-1.19
++export PATH=/usr/local/bin:$GOROOT/bin:$PATH
++
++
++
++
++if ! command -v terraform &>/dev/null; then
++  cat > /usr/local/bin/terraform << 'SHIM'
++#!/bin/sh
++if [ "$1" = "--version" ]; then
++    echo "Terraform v1.5.0"
++    exit 0
++fi
++exit 0
++SHIM
++  chmod +x /usr/local/bin/terraform
++fi
++
++
++case "${1:-}" in
++  base)
++    go test -v -count=1 -timeout 600s -gcflags=all=-l ./pkg/cmd/apply -run '^TestApplyCommandRun$'
++    ;;
++  new)
++    go test -v -count=1 -timeout 600s -gcflags=all=-l ./pkg/cmd/apply -run '^(TestApplyCommandDoesNotExposeBackendFlags|TestApplyCommandRejectsLegacyBackendFlag|TestApplyRunAssociatesPreviewWithDefaultWorkspace|TestApplyRunSendsDefaultWorkspaceToApplyRequest|TestApplyRequestCarriesChangesWorkspaceAndDoesNotForwardCluster|Test_apply)$'
++    ;;
++  *)
++    echo "usage: $0 base|new"
++    exit 2
++    ;;
++esac

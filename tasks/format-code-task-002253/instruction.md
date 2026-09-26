@@ -1,0 +1,9 @@
+I want the `pearl` CLI to provide package discovery through `pearl list` and `pearl search PATTERN`.
+
+`pearl list` should scan the resolved package catalog and print every available package. `pearl search PATTERN` should treat `PATTERN` as a case-insensitive regular expression and include a package when it matches the package's `repo/package` name, description, or any keyword. For normal output, each result should be printed as two stdout lines: `repo/package [installed]` for installed packages or `repo/package` for uninstalled packages, followed by an indented description line such as `    Awesome git dotfiles`.
+
+Both commands should accept `-p`/`--package-only`, `-t`/`--dependency-tree`, and `-i`/`--installed-only`. With `--package-only`, stdout should contain only one `repo/package` name per line, which is the format startup scripts can consume. With `--installed-only`, only packages whose installed directory exists should be returned. Without `--installed-only`, matching uninstalled packages should be listed before matching installed packages. With `--dependency-tree`, results should be ordered so dependencies appear before packages that depend on them.
+
+For example, if the catalog contains uninstalled `repo-test/pkg-b-test` and installed `repo-test/pkg-a-test`, both matching `pkg`, then `pearl list --package-only` should print `repo-test/pkg-b-test` followed by `repo-test/pkg-a-test`, while `pearl list --package-only --installed-only` should print only `repo-test/pkg-a-test`. If `repo-test/pkg-a-test` has keyword `pkg-manager`, then `pearl search pkg-manager --package-only` should print `repo-test/pkg-a-test`.
+
+Successful `list` and `search` runs should exit 0. `pearl list --help` and `pearl search --help` should print command-specific usage to stdout with exit 0 and show the package-only, dependency-tree, and installed-only flags. Running `pearl search` without `PATTERN` should fail with argparse-style usage on stderr and exit 2.

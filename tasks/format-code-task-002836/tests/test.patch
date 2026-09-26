@@ -1,0 +1,276 @@
+diff --git a/usercase-test-coderl/test_yolo_world_prompt_cache.py b/usercase-test-coderl/test_yolo_world_prompt_cache.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/test_yolo_world_prompt_cache.py
+@@ -0,0 +1,244 @@
++
++
++import torch
++import torch.nn as nn
++from mmdet.registry import MODELS
++from mmdet.structures import DetDataSample
++from mmengine.structures import InstanceData
++
++from yolo_world.models.detectors import YOLOWorldDetector
++
++
++@MODELS.register_module(force=True)
++class FixturePromptCacheBackbone(nn.Module):
++    def __init__(self):
++        super().__init__()
++        self.call_log = []
++        self.forward_text_results = []
++
++    @staticmethod
++    def _signature(texts):
++        return tuple(tuple(group) for group in texts)
++
++    def forward_text(self, texts):
++        self.call_log.append(("forward_text", self._signature(texts)))
++        values = []
++        for index, group in enumerate(texts):
++            values.append([float(len("|".join(group))), float(index) + 0.25])
++        result = torch.tensor([values], dtype=torch.float32)
++        self.forward_text_results.append(result)
++        return result
++
++    def forward_image(self, batch_inputs):
++        self.call_log.append(("forward_image", tuple(batch_inputs.shape)))
++        return (batch_inputs.mean(dim=(2, 3), keepdim=True),)
++
++    def forward(self, batch_inputs, texts):
++        self.call_log.append(("forward", self._signature(texts)))
++        return self.forward_image(batch_inputs), self.forward_text(texts)
++
++
++@MODELS.register_module(force=True)
++class FixturePromptCacheHead(nn.Module):
++    def __init__(self, train_cfg=None, test_cfg=None):
++        super().__init__()
++        self.num_classes = -1
++        self.predict_num_classes_seen = None
++        self.predict_txt_feats = None
++        self.forward_txt_feats = None
++
++    def predict(self, img_feats, txt_feats, batch_data_samples, rescale=True):
++        self.predict_num_classes_seen = self.num_classes
++        self.predict_txt_feats = txt_feats.detach().clone()
++        instances = InstanceData()
++        instances.labels = torch.tensor([0, int(self.num_classes) - 1])
++        instances.scores = torch.tensor([0.90, 0.40])
++        instances.bboxes = torch.tensor([[1.0, 2.0, 3.0, 4.0],
++                                         [5.0, 6.0, 7.0, 8.0]])
++        return [instances for _ in batch_data_samples]
++
++    def forward(self, img_feats, txt_feats):
++        self.forward_txt_feats = txt_feats.detach().clone()
++        return (txt_feats.sum(dim=-1), torch.tensor([float(len(img_feats))]))
++
++
++def make_model():
++    return YOLOWorldDetector(
++        backbone=dict(type="FixturePromptCacheBackbone"),
++        neck=None,
++        bbox_head=dict(type="FixturePromptCacheHead"),
++        use_syncbn=False,
++    )
++
++
++def batch_inputs():
++    return torch.arange(48, dtype=torch.float32).reshape(1, 3, 4, 4)
++
++
++def assert_image_only_path(call_log):
++
++
++    assert call_log
++    assert all(entry == ("forward_image", (1, 3, 4, 4)) for entry in call_log)
++
++
++def test_reparameterize_stores_prompt_list_and_exact_text_tensor():
++
++
++
++    model = make_model()
++
++
++    assert isinstance(model, YOLOWorldDetector)
++
++    result = model.reparameterize([["cat"], ["dog"], [" "]])
++
++    assert result is None
++    assert model.backbone.call_log == [
++        ("forward_text", (("cat",), ("dog",), (" ",)))
++    ]
++
++
++def test_predict_without_sample_texts_reuses_cached_features_and_class_count():
++
++
++
++    model = make_model()
++    model.reparameterize([["cat"], ["dog"], [" "]])
++    model.backbone.call_log.clear()
++
++    results = model.predict(batch_inputs(), [DetDataSample()], rescale=True)
++
++    assert results[0].pred_instances.labels.tolist() == [0, 2]
++
++
++    assert len(results[0].pred_instances.scores) == 2
++    assert model.bbox_head.predict_num_classes_seen == 3
++
++
++    assert torch.equal(model.bbox_head.predict_txt_feats,
++                       model.backbone.forward_text_results[0])
++    assert_image_only_path(model.backbone.call_log)
++
++
++def test_forward_with_none_data_samples_uses_cached_prompts():
++
++
++
++    model = make_model()
++    model.reparameterize([["cat"], ["dog"], [" "]])
++    model.backbone.call_log.clear()
++
++    outputs = model._forward(batch_inputs(), None)
++
++    assert outputs[0].tolist() == [[3.25, 4.25, 3.25]]
++    assert outputs[1].tolist() == [1.0]
++
++
++    assert torch.equal(model.bbox_head.forward_txt_feats,
++                       model.backbone.forward_text_results[0])
++    assert_image_only_path(model.backbone.call_log)
++
++
++def test_predict_after_reparameterize_accepts_textless_sample_without_error():
++
++
++
++    model = make_model()
++    model.reparameterize([["cat"], ["dog"], [" "]])
++    model.backbone.call_log.clear()
++
++    result = model.predict(batch_inputs(), [DetDataSample()], rescale=True)
++
++
++
++    assert result[0].pred_instances.labels.tolist() == [0, 2]
++    assert_image_only_path(model.backbone.call_log)
++
++
++def test_reparameterize_again_replaces_cached_prompts_and_features():
++
++
++
++    model = make_model()
++
++    first = model.reparameterize([["cat"], ["dog"], [" "]])
++    second = model.reparameterize([["owl"], ["sparrow"]])
++
++    assert first is None
++    assert second is None
++    assert model.backbone.call_log == [
++        ("forward_text", (("cat",), ("dog",), (" ",))),
++        ("forward_text", (("owl",), ("sparrow",))),
++    ]
++
++    model.backbone.call_log.clear()
++    results = model.predict(batch_inputs(), [DetDataSample()], rescale=True)
++    assert results[0].pred_instances.labels.tolist() == [0, 1]
++    assert model.bbox_head.predict_num_classes_seen == 2
++
++
++    assert torch.equal(model.bbox_head.predict_txt_feats,
++                       model.backbone.forward_text_results[1])
++    assert_image_only_path(model.backbone.call_log)
++
++
++def test_two_detector_instances_keep_independent_cached_prompts():
++
++
++
++    first = make_model()
++    second = make_model()
++
++    first.reparameterize([["red"], ["blue"]])
++    second.reparameterize([["cyan"], ["magenta"], ["black"]])
++
++
++
++    assert first.backbone.call_log == [("forward_text", (("red",),
++                                                         ("blue",)))]
++    assert second.backbone.call_log == [("forward_text", (("cyan",),
++                                                          ("magenta",),
++                                                          ("black",)))]
++    first.backbone.call_log.clear()
++    second.backbone.call_log.clear()
++
++    first_result = first.predict(batch_inputs(), [DetDataSample()],
++                                 rescale=True)
++    second_result = second.predict(batch_inputs(), [DetDataSample()],
++                                   rescale=True)
++
++    assert first_result[0].pred_instances.labels.tolist() == [0, 1]
++    assert first.bbox_head.predict_num_classes_seen == 2
++
++
++    assert torch.equal(first.bbox_head.predict_txt_feats,
++                       first.backbone.forward_text_results[0])
++    assert second_result[0].pred_instances.labels.tolist() == [0, 2]
++    assert second.bbox_head.predict_num_classes_seen == 3
++
++
++    assert torch.equal(second.bbox_head.predict_txt_feats,
++                       second.backbone.forward_text_results[0])
++
++
++def test_repeated_cached_sessions_keep_instance_prompt_state_separate():
++
++
++
++    models = []
++    for prompts in ([[f"class-{idx}"] for idx in range(size)]
++                    for size in (1, 2, 4)):
++        model = make_model()
++        model.reparameterize(prompts)
++        result = model.predict(batch_inputs(), [DetDataSample()], rescale=True)
++        assert result[0].pred_instances.labels.tolist() == [0, len(prompts) - 1]
++
++
++        assert model.bbox_head.predict_num_classes_seen == len(prompts)
++        assert torch.equal(model.bbox_head.predict_txt_feats,
++                           model.backbone.forward_text_results[0])
++        models.append(model)
++
++    assert [model.bbox_head.predict_num_classes_seen
++            for model in models] == [1, 2, 4]
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,22 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++
++cd /workspace/repo
++export PYTHONPATH="/workspace/repo:/workspace/repo/third_party/mmyolo:${PYTHONPATH:-}"
++export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
++export HF_HUB_OFFLINE=1
++export TRANSFORMERS_OFFLINE=1
++export PIP_NO_INDEX=1
++export PIP_DISABLE_PIP_VERSION_CHECK=1
++
++exec python -m pytest /workspace/repo/usercase-test-coderl/test_yolo_world_prompt_cache.py -v

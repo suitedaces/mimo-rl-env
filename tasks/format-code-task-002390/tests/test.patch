@@ -1,0 +1,491 @@
+diff --git a/usercase-test-coderl/test_ecosystems_service.py b/usercase-test-coderl/test_ecosystems_service.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/test_ecosystems_service.py
+@@ -0,0 +1,461 @@
++from __future__ import annotations
++
++from pathlib import Path
++import subprocess
++from typing import Any
++from urllib.parse import parse_qs, urlparse
++
++import pytest
++import requests
++from packaging.version import Version
++
++from pip_audit._service import (
++    ConnectionError,
++    EcosystemsService,
++    ResolvedDependency,
++    ServiceError,
++    SkippedDependency,
++)
++
++
++class _Response:
++    def __init__(self, payload: Any, status_error: Exception | None = None) -> None:
++        self._payload = payload
++        self._status_error = status_error
++
++    def raise_for_status(self) -> None:
++        if self._status_error is not None:
++            raise self._status_error
++
++    def json(self) -> Any:
++        return self._payload
++
++
++class _RecordingRequest:
++    def __init__(self, *responses: _Response | Exception) -> None:
++        self._responses = list(responses)
++        self.calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
++
++    def __call__(self, *args: Any, **kwargs: Any) -> _Response:
++        self.calls.append((args, kwargs))
++        if not self._responses:
++            raise AssertionError("unexpected provider request")
++        response = self._responses.pop(0)
++        if isinstance(response, Exception):
++            raise response
++        return response
++
++
++def _resolved() -> ResolvedDependency:
++    return ResolvedDependency("Foo_Bar", Version("1.0.0"))
++
++
++def _install_request_recorder(
++    monkeypatch: pytest.MonkeyPatch, *responses: _Response | Exception
++) -> _RecordingRequest:
++    recorder = _RecordingRequest(*responses)
++
++
++    monkeypatch.setattr(requests.sessions.Session, "request", recorder)
++    return recorder
++
++
++def _call_method_url_kwargs(
++    call: tuple[tuple[Any, ...], dict[str, Any]]
++) -> tuple[str, str, dict[str, Any]]:
++    args, kwargs = call
++    method = args[0] if len(args) > 0 else kwargs.get("method")
++    url = args[1] if len(args) > 1 else kwargs.get("url")
++    assert method is not None
++    assert url is not None
++    return str(method).upper(), str(url), kwargs
++
++
++def _assert_esms_request(
++    call: tuple[tuple[Any, ...], dict[str, Any]], expected_timeout: int
++) -> None:
++    method, url, kwargs = _call_method_url_kwargs(call)
++    parsed = urlparse(url)
++    params: dict[str, list[str]] = parse_qs(parsed.query)
++    raw_params = kwargs.get("params") or {}
++    for key, value in raw_params.items():
++        params[key] = value if isinstance(value, list) else [value]
++
++
++
++    assert method == "GET"
++    assert parsed.scheme == "https"
++    assert parsed.netloc == "advisories.ecosyste.ms"
++    assert parsed.path == "/api/v1/advisories"
++    assert params == {"ecosystem": ["pypi"], "package_name": ["foo-bar"]}
++    assert kwargs["timeout"] == expected_timeout
++
++
++def test_skipped_dependency_returns_same_dependency_without_network(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++
++
++
++
++
++    service = EcosystemsService(cache_dir=tmp_path / "cache", timeout=13)
++    recorder = _install_request_recorder(monkeypatch)
++    dep = SkippedDependency(name="foo", skip_reason="skip-reason")
++
++    actual_dep, vulns = service.query(dep)
++
++    assert actual_dep == SkippedDependency(name="foo", skip_reason="skip-reason")
++    assert vulns == []
++    assert recorder.calls == []
++
++
++def test_resolved_dependency_empty_response_uses_canonical_query_and_timeout(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++
++
++
++
++
++    service = EcosystemsService(cache_dir=tmp_path / "cache", timeout=13)
++    recorder = _install_request_recorder(monkeypatch, _Response([]))
++
++    actual_dep, vulns = service.query(_resolved())
++
++    assert actual_dep == ResolvedDependency("Foo_Bar", Version("1.0.0"))
++    assert vulns == []
++    assert len(recorder.calls) == 1
++    _assert_esms_request(recorder.calls[0], expected_timeout=13)
++
++
++def test_advisory_normalization_is_stateful_across_repeated_queries(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++
++
++
++
++
++    payload = [
++        {
++            "identifiers": ["GHSA-x", "PYSEC-2024-1", "CVE-2024-1"],
++            "title": "first line\nsecond line",
++            "description": "fallback desc",
++            "withdrawn_at": None,
++            "packages": [
++                {
++                    "package_name": "foo-bar",
++                    "ecosystem": "pypi",
++                    "versions": [
++                        {
++                            "vulnerable_version_range": "< 1.0.1",
++                            "first_patched_version": "1.0.1",
++                        }
++                    ],
++                }
++            ],
++            "published": "2024-01-02T03:04:05Z",
++        }
++    ]
++    service = EcosystemsService(cache_dir=tmp_path / "cache", timeout=13)
++    recorder = _install_request_recorder(monkeypatch, _Response([]), _Response(payload))
++
++    first_dep, first_vulns = service.query(_resolved())
++    second_dep, second_vulns = service.query(_resolved())
++
++    assert first_dep == ResolvedDependency("Foo_Bar", Version("1.0.0"))
++    assert first_vulns == []
++    assert second_dep == ResolvedDependency("Foo_Bar", Version("1.0.0"))
++    assert len(second_vulns) == 1
++    assert second_vulns[0].id == "PYSEC-2024-1"
++    assert second_vulns[0].aliases == {"GHSA-x", "CVE-2024-1"}
++    assert second_vulns[0].description == "first line second line"
++    assert second_vulns[0].fix_versions == [Version("1.0.1")]
++
++    assert second_vulns[0].published is None or hasattr(second_vulns[0].published, "isoformat")
++    assert len(recorder.calls) == 2
++    _assert_esms_request(recorder.calls[0], expected_timeout=13)
++    _assert_esms_request(recorder.calls[1], expected_timeout=13)
++
++
++@pytest.mark.parametrize(
++    ("title", "description", "expected"),
++    [
++        ("", "fallback\ndescription", "fallback description"),
++        (None, "fallback\ndescription", "fallback description"),
++        ("", "", "N/A"),
++        (None, None, "N/A"),
++    ],
++)
++def test_description_fallbacks_are_normalized(
++    tmp_path: Path,
++    monkeypatch: pytest.MonkeyPatch,
++    title: str | None,
++    description: str | None,
++    expected: str,
++) -> None:
++
++
++
++
++
++    payload = [
++        {
++            "identifiers": ["GHSA-y"],
++            "title": title,
++            "description": description,
++            "withdrawn_at": None,
++            "packages": [
++                {
++                    "package_name": "foo-bar",
++                    "ecosystem": "pypi",
++                    "versions": [
++                        {
++                            "vulnerable_version_range": "= 1.0.0",
++                            "first_patched_version": "1.0.2",
++                        }
++                    ],
++                }
++            ],
++        }
++    ]
++    service = EcosystemsService(cache_dir=tmp_path / "cache", timeout=2)
++    _install_request_recorder(monkeypatch, _Response(payload))
++
++    actual_dep, vulns = service.query(_resolved())
++
++    assert actual_dep == ResolvedDependency("Foo_Bar", Version("1.0.0"))
++    assert len(vulns) == 1
++    assert vulns[0].id == "GHSA-y"
++    assert vulns[0].aliases == set()
++    assert vulns[0].description == expected
++    assert vulns[0].fix_versions == [Version("1.0.2")]
++
++
++def test_filtering_ignores_irrelevant_advisories_and_accepts_exact_match(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++
++
++
++
++
++    payload = [
++        {
++            "identifiers": ["PYSEC-withdrawn"],
++            "title": "withdrawn",
++            "description": "d",
++            "withdrawn_at": "2024-01-01T00:00:00Z",
++            "packages": [
++                {
++                    "package_name": "foo-bar",
++                    "ecosystem": "pypi",
++                    "versions": [
++                        {"vulnerable_version_range": "< 9", "first_patched_version": "9"}
++                    ],
++                }
++            ],
++        },
++        {
++            "identifiers": ["PYSEC-rubygems"],
++            "title": "wrong ecosystem",
++            "description": "d",
++            "withdrawn_at": None,
++            "packages": [
++                {
++                    "package_name": "foo-bar",
++                    "ecosystem": "rubygems",
++                    "versions": [
++                        {"vulnerable_version_range": "< 9", "first_patched_version": "9"}
++                    ],
++                }
++            ],
++        },
++        {
++            "identifiers": ["PYSEC-other"],
++            "title": "wrong package",
++            "description": "d",
++            "withdrawn_at": None,
++            "packages": [
++                {
++                    "package_name": "other",
++                    "ecosystem": "pypi",
++                    "versions": [
++                        {"vulnerable_version_range": "< 9", "first_patched_version": "9"}
++                    ],
++                }
++            ],
++        },
++        {
++            "identifiers": ["PYSEC-range"],
++            "title": "wrong range",
++            "description": "d",
++            "withdrawn_at": None,
++            "packages": [
++                {
++                    "package_name": "foo-bar",
++                    "ecosystem": "pypi",
++                    "versions": [
++                        {
++                            "vulnerable_version_range": ">= 2.0.0",
++                            "first_patched_version": "2.0.1",
++                        }
++                    ],
++                }
++            ],
++        },
++        {
++            "identifiers": ["PYSEC-exact"],
++            "title": "exact match",
++            "description": "d",
++            "withdrawn_at": None,
++            "packages": [
++                {
++                    "package_name": "foo-bar",
++                    "ecosystem": "pypi",
++                    "versions": [
++                        {
++                            "vulnerable_version_range": "= 1.0.0",
++                            "first_patched_version": "1.0.3",
++                        }
++                    ],
++                }
++            ],
++        },
++    ]
++    service = EcosystemsService(cache_dir=tmp_path / "cache", timeout=5)
++    _install_request_recorder(monkeypatch, _Response(payload))
++
++    actual_dep, vulns = service.query(_resolved())
++
++    assert actual_dep == ResolvedDependency("Foo_Bar", Version("1.0.0"))
++    assert len(vulns) == 1
++    assert vulns[0].id == "PYSEC-exact"
++    assert vulns[0].aliases == set()
++    assert vulns[0].description == "exact match"
++    assert vulns[0].fix_versions == [Version("1.0.3")]
++
++
++def test_connect_timeout_raises_specific_connection_error(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++
++
++
++
++
++    service = EcosystemsService(cache_dir=tmp_path / "cache", timeout=6)
++    _install_request_recorder(monkeypatch, requests.ConnectTimeout())
++
++    with pytest.raises(
++        ConnectionError, match="Could not connect to ESMS' vulnerability feed"
++    ) as error:
++        service.query(_resolved())
++
++    assert str(error.value) == "Could not connect to ESMS' vulnerability feed"
++
++
++def test_http_status_error_raises_service_error(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++
++
++
++
++
++    service = EcosystemsService(cache_dir=tmp_path / "cache", timeout=6)
++    _install_request_recorder(monkeypatch, _Response([], requests.HTTPError("boom")))
++
++    with pytest.raises(ServiceError) as error:
++        service.query(_resolved())
++
++
++
++    assert isinstance(error.value, ServiceError)
++
++
++def test_two_service_instances_keep_timeout_and_sessions_independent(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++
++
++
++
++
++    first = EcosystemsService(cache_dir=tmp_path / "first-cache", timeout=3)
++    second = EcosystemsService(cache_dir=tmp_path / "second-cache", timeout=9)
++    recorder = _install_request_recorder(
++        monkeypatch, _Response([]), _Response([]), _Response([])
++    )
++
++    first_dep, first_vulns = first.query(_resolved())
++    second_dep, second_vulns = second.query(_resolved())
++    first_again_dep, first_again_vulns = first.query(_resolved())
++
++    assert first_dep == ResolvedDependency("Foo_Bar", Version("1.0.0"))
++    assert first_vulns == []
++    assert second_dep == ResolvedDependency("Foo_Bar", Version("1.0.0"))
++    assert second_vulns == []
++    assert first_again_dep == ResolvedDependency("Foo_Bar", Version("1.0.0"))
++    assert first_again_vulns == []
++    assert len(recorder.calls) == 3
++    _assert_esms_request(recorder.calls[0], expected_timeout=3)
++    _assert_esms_request(recorder.calls[1], expected_timeout=9)
++    _assert_esms_request(recorder.calls[2], expected_timeout=3)
++
++
++def test_constructed_service_can_issue_a_provider_request(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++
++
++
++
++
++
++
++    def fail_if_pip_cache_dir(*args: Any, **kwargs: Any) -> subprocess.CompletedProcess[Any]:
++        raise AssertionError("EcosystemsService should not query pip's cache directory")
++
++
++
++    monkeypatch.setattr(subprocess, "run", fail_if_pip_cache_dir)
++    service = EcosystemsService(cache_dir=None, timeout=1)
++    recorder = _install_request_recorder(monkeypatch, _Response([]))
++
++    actual_dep, vulns = service.query(_resolved())
++
++    assert actual_dep == ResolvedDependency("Foo_Bar", Version("1.0.0"))
++    assert vulns == []
++    assert len(recorder.calls) == 1
++    _assert_esms_request(recorder.calls[0], expected_timeout=1)
++
++
++def test_construct_query_cycles_remain_stateful(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++
++
++
++
++
++    dep = _resolved()
++    recorder = _install_request_recorder(
++        monkeypatch, _Response([]), _Response([]), _Response([]), _Response([]), _Response([])
++    )
++
++
++
++    for index in range(5):
++        service = EcosystemsService(cache_dir=tmp_path / f"cache-{index}", timeout=1)
++        actual_dep, vulns = service.query(dep)
++
++        assert actual_dep == ResolvedDependency("Foo_Bar", Version("1.0.0"))
++        assert vulns == []
++
++    assert len(recorder.calls) == 5
++    for call in recorder.calls:
++        _assert_esms_request(call, expected_timeout=1)
++    assert actual_dep == ResolvedDependency("Foo_Bar", Version("1.0.0"))
++    assert vulns == []
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,20 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++
++cd /workspace/repo
++
++export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
++export PIP_DISABLE_PIP_VERSION_CHECK=1
++export PIP_NO_INDEX=1
++
++exec /opt/stage4a_venv/bin/python -m pytest /workspace/repo/usercase-test-coderl/test_ecosystems_service.py -v

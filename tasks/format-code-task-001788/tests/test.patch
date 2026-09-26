@@ -1,0 +1,264 @@
+diff --git a/contractcourt/anchor_deadline_test.go b/contractcourt/anchor_deadline_test.go
+new file mode 100644
+index 000000000..480636874
+--- /dev/null
++++ b/contractcourt/anchor_deadline_test.go
+@@ -0,0 +1,233 @@
++package contractcourt
++
++import (
++	"testing"
++
++	"github.com/btcsuite/btcd/wire"
++	"github.com/lightningnetwork/lnd/channeldb"
++	"github.com/lightningnetwork/lnd/input"
++	"github.com/lightningnetwork/lnd/lntypes"
++	"github.com/lightningnetwork/lnd/lnwallet"
++	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
++	"github.com/lightningnetwork/lnd/sweep"
++	"github.com/stretchr/testify/require"
++)
++
++
++
++
++type deadlineRecordingSweeper struct {
++	confTargets []uint32
++}
++
++func (s *deadlineRecordingSweeper) SweepInput(inp input.Input,
++	params sweep.Params) (chan sweep.Result, error) {
++
++	s.confTargets = append(s.confTargets, params.Fee.ConfTarget)
++
++	result := make(chan sweep.Result, 1)
++	result <- sweep.Result{Tx: &wire.MsgTx{}}
++	return result, nil
++}
++
++func (s *deadlineRecordingSweeper) CreateSweepTx(inputs []input.Input,
++	feePref sweep.FeePreference, currentBlockHeight uint32) (*wire.MsgTx,
++	error) {
++
++	return &wire.MsgTx{}, nil
++}
++
++func (s *deadlineRecordingSweeper) RelayFeePerKW() chainfee.SatPerKWeight {
++	return 253
++}
++
++func (s *deadlineRecordingSweeper) UpdateParams(inp wire.OutPoint,
++	params sweep.ParamsUpdate) (chan sweep.Result, error) {
++
++	result := make(chan sweep.Result, 1)
++	result <- sweep.Result{Tx: &wire.MsgTx{}}
++	return result, nil
++}
++
++var _ UtxoSweeper = (*deadlineRecordingSweeper)(nil)
++
++
++
++func makeAnchor() *lnwallet.AnchorResolution {
++	return &lnwallet.AnchorResolution{
++		AnchorSignDescriptor: input.SignDescriptor{
++			Output: &wire.TxOut{Value: 1},
++		},
++	}
++}
++
++
++
++
++func TestAnchorSweepDeadline(t *testing.T) {
++	const heightHint = uint32(1000)
++	const expiryBase = heightHint + 10
++
++
++	rHash := lntypes.Hash{1, 2, 3}
++
++
++	dustOutgoing := channeldb.HTLC{
++		HtlcIndex:     1,
++		RefundTimeout: expiryBase + 1,
++		OutputIndex:   -1,
++	}
++
++	outgoingSoon := channeldb.HTLC{
++		HtlcIndex:     2,
++		RefundTimeout: expiryBase + 2,
++		OutputIndex:   0,
++	}
++
++	outgoingLate := channeldb.HTLC{
++		HtlcIndex:     3,
++		RefundTimeout: expiryBase + 100,
++		OutputIndex:   0,
++	}
++
++	incomingPreimage := channeldb.HTLC{
++		HtlcIndex:     4,
++		RefundTimeout: expiryBase + 3,
++		OutputIndex:   0,
++		RHash:         rHash,
++	}
++
++	incomingNoPreimage := channeldb.HTLC{
++		HtlcIndex:     5,
++		RefundTimeout: expiryBase + 4,
++		OutputIndex:   0,
++	}
++
++	outgoingExpired := channeldb.HTLC{
++		HtlcIndex:     6,
++		RefundTimeout: heightHint,
++		OutputIndex:   0,
++	}
++
++	set := func(in, out []channeldb.HTLC) htlcSet {
++		inMap := make(map[uint64]channeldb.HTLC)
++		for _, h := range in {
++			inMap[h.HtlcIndex] = h
++		}
++		outMap := make(map[uint64]channeldb.HTLC)
++		for _, h := range out {
++			outMap[h.HtlcIndex] = h
++		}
++		return htlcSet{incomingHTLCs: inMap, outgoingHTLCs: outMap}
++	}
++
++	testCases := []struct {
++		name     string
++		htlcs    htlcSet
++		anchors  int
++		deadline uint32
++	}{
++		{
++
++
++			name:     "no active htlcs uses default",
++			htlcs:    htlcSet{},
++			anchors:  1,
++			deadline: 144,
++		},
++		{
++
++			name:     "outgoing htlc dictates deadline",
++			htlcs:    set(nil, []channeldb.HTLC{outgoingSoon}),
++			anchors:  1,
++			deadline: outgoingSoon.RefundTimeout - heightHint,
++		},
++		{
++
++
++			name: "incoming with preimage used",
++			htlcs: set(
++				[]channeldb.HTLC{incomingPreimage},
++				[]channeldb.HTLC{outgoingLate},
++			),
++			anchors:  1,
++			deadline: incomingPreimage.RefundTimeout - heightHint,
++		},
++		{
++
++
++			name: "incoming without preimage ignored",
++			htlcs: set(
++				[]channeldb.HTLC{incomingNoPreimage},
++				[]channeldb.HTLC{outgoingLate},
++			),
++			anchors:  1,
++			deadline: outgoingLate.RefundTimeout - heightHint,
++		},
++		{
++
++			name: "dust htlc ignored",
++			htlcs: set(
++				nil,
++				[]channeldb.HTLC{dustOutgoing, outgoingLate},
++			),
++			anchors:  1,
++			deadline: outgoingLate.RefundTimeout - heightHint,
++		},
++		{
++
++			name:     "passed deadline uses 1",
++			htlcs:    set(nil, []channeldb.HTLC{outgoingExpired}),
++			anchors:  1,
++			deadline: 1,
++		},
++		{
++
++
++			name:     "all anchors share deadline",
++			htlcs:    set(nil, []channeldb.HTLC{outgoingSoon}),
++			anchors:  3,
++			deadline: outgoingSoon.RefundTimeout - heightHint,
++		},
++	}
++
++	for _, tc := range testCases {
++		tc := tc
++		t.Run(tc.name, func(t *testing.T) {
++			log := &mockArbitratorLog{
++				state:     StateDefault,
++				newStates: make(chan ArbitratorState, 5),
++			}
++			chanArbCtx, err := createTestChannelArbitrator(t, log)
++			require.NoError(t, err)
++
++			chanArb := chanArbCtx.chanArb
++
++
++			preimageDB := newMockWitnessBeacon()
++			preimageDB.lookupPreimage[rHash] = lntypes.Preimage{1, 2, 3}
++			chanArb.cfg.PreimageDB = preimageDB
++			chanArb.cfg.Registry = &mockRegistry{}
++
++
++			sweeper := &deadlineRecordingSweeper{}
++			chanArb.cfg.Sweeper = sweeper
++
++
++			chanArb.activeHTLCs[LocalHtlcSet] = tc.htlcs
++
++			anchors := make([]*lnwallet.AnchorResolution, tc.anchors)
++			for i := range anchors {
++				anchors[i] = makeAnchor()
++			}
++
++			err = chanArb.sweepAnchors(anchors, heightHint)
++			require.NoError(t, err)
++
++			require.Len(t, sweeper.confTargets, tc.anchors)
++			for _, target := range sweeper.confTargets {
++				require.Equal(t, tc.deadline, target)
++			}
++		})
++	}
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,20 @@
++#!/usr/bin/env bash
++
++
++
++
++set -euo pipefail
++HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++cd /testbed
++
++
++
++
++
++
++
++
++go test ./contractcourt/ -count=1
++
++
++go test ./contractcourt/ -run 'TestAnchorSweepDeadline' -count=1

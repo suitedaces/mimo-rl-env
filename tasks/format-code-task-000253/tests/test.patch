@@ -1,0 +1,267 @@
+diff --git a/gcloud/tests/taskflow3/test_node_timeout_feature.py b/gcloud/tests/taskflow3/test_node_timeout_feature.py
+new file mode 100644
+index 000000000..6fc91ffff
+--- /dev/null
++++ b/gcloud/tests/taskflow3/test_node_timeout_feature.py
+@@ -0,0 +1,202 @@
++# -*- coding: utf-8 -*-
++
++
++
++
++
++
++
++
++
++
++
++import copy
++
++from django.test import TestCase
++from mock import MagicMock, ANY, call
++
++from pipeline import exceptions
++
++from gcloud.taskflow3.utils import parse_node_timeout_configs
++from gcloud.taskflow3.domains.node_timeout_strategy import node_timeout_handler
++from pipeline_web.parser.format import format_web_data_to_pipeline
++
++
++class ParseNodeTimeoutConfigsTestCase(TestCase):
++    def test_collects_enabled_service_activities(self):
++        tree = {
++            "activities": {
++                "a1": {"type": "ServiceActivity",
++                       "timeout_config": {"enable": True, "seconds": 30, "action": "forced_fail"}},
++                "a2": {"type": "ServiceActivity",
++                       "timeout_config": {"enable": True, "seconds": 5, "action": "forced_fail_and_skip"}},
++            }
++        }
++        configs = parse_node_timeout_configs(tree)
++        by_id = {c["node_id"]: c for c in configs}
++        self.assertEqual(set(by_id.keys()), {"a1", "a2"})
++        self.assertEqual(by_id["a1"], {"node_id": "a1", "action": "forced_fail", "timeout": 30})
++        self.assertEqual(by_id["a2"], {"node_id": "a2", "action": "forced_fail_and_skip", "timeout": 5})
++
++    def test_skips_disabled_or_missing_config(self):
++        tree = {
++            "activities": {
++                "a1": {"type": "ServiceActivity"},
++                "a2": {"type": "ServiceActivity", "timeout_config": {"enable": False, "seconds": 30,
++                                                                     "action": "forced_fail"}},
++                "a3": {"type": "ServiceActivity", "timeout_config": {"seconds": 30, "action": "forced_fail"}},
++            }
++        }
++        self.assertEqual(parse_node_timeout_configs(tree), [])
++
++    def test_skips_invalid_seconds(self):
++        tree = {
++            "activities": {
++                "missing": {"type": "ServiceActivity",
++                            "timeout_config": {"enable": True, "action": "forced_fail"}},
++                "string": {"type": "ServiceActivity",
++                           "timeout_config": {"enable": True, "seconds": "30", "action": "forced_fail"}},
++                "zero": {"type": "ServiceActivity",
++                         "timeout_config": {"enable": True, "seconds": 0, "action": "forced_fail"}},
++                "negative": {"type": "ServiceActivity",
++                             "timeout_config": {"enable": True, "seconds": -5, "action": "forced_fail"}},
++                "valid": {"type": "ServiceActivity",
++                          "timeout_config": {"enable": True, "seconds": 12, "action": "forced_fail"}},
++            }
++        }
++        configs = parse_node_timeout_configs(tree)
++        self.assertEqual([c["node_id"] for c in configs], ["valid"])
++        self.assertEqual(configs[0]["timeout"], 12)
++
++    def test_recurses_into_subprocess(self):
++        tree = {
++            "activities": {
++                "top": {"type": "ServiceActivity",
++                        "timeout_config": {"enable": True, "seconds": 30, "action": "forced_fail"}},
++                "sub": {
++                    "type": "SubProcess",
++                    "timeout_config": {"enable": True, "seconds": 99, "action": "forced_fail"},
++                    "pipeline": {
++                        "activities": {
++                            "inner": {"type": "ServiceActivity",
++                                      "timeout_config": {"enable": True, "seconds": 7,
++                                                         "action": "forced_fail_and_skip"}},
++                            "deep_sub": {
++                                "type": "SubProcess",
++                                "pipeline": {
++                                    "activities": {
++                                        "deep": {"type": "ServiceActivity",
++                                                 "timeout_config": {"enable": True, "seconds": 3,
++                                                                    "action": "forced_fail"}},
++                                    }
++                                },
++                            },
++                        }
++                    },
++                },
++            }
++        }
++        by_id = {c["node_id"]: c for c in parse_node_timeout_configs(tree)}
++
++        self.assertEqual(set(by_id.keys()), {"top", "inner", "deep"})
++        self.assertEqual(by_id["inner"]["timeout"], 7)
++        self.assertEqual(by_id["deep"]["timeout"], 3)
++        self.assertEqual(by_id["deep"]["action"], "forced_fail")
++
++
++class NodeTimeoutHandlerTestCase(TestCase):
++    def test_forced_fail(self):
++        task = MagicMock()
++        task.nodes_action = MagicMock(return_value={"result": True})
++        handler = node_timeout_handler["forced_fail"]
++        result = handler.deal_with_timeout_node(task, "node_id")
++        self.assertEqual(result, {"result": True})
++        task.nodes_action.assert_called_once_with("forced_fail", "node_id", ANY)
++
++    def test_forced_fail_and_skip_when_fail_succeeds(self):
++        task = MagicMock()
++        task.nodes_action = MagicMock(side_effect=[{"result": True}, {"result": True, "data": "skipped"}])
++        handler = node_timeout_handler["forced_fail_and_skip"]
++        result = handler.deal_with_timeout_node(task, "node_id")
++
++        self.assertEqual(result, {"result": True, "data": "skipped"})
++        self.assertEqual(task.nodes_action.call_count, 2)
++        task.nodes_action.assert_has_calls(
++            [call("forced_fail", "node_id", ANY), call("skip", "node_id", ANY)]
++        )
++
++    def test_forced_fail_and_skip_when_fail_fails(self):
++        task = MagicMock()
++        task.nodes_action = MagicMock(return_value={"result": False, "message": "boom"})
++        handler = node_timeout_handler["forced_fail_and_skip"]
++        result = handler.deal_with_timeout_node(task, "node_id")
++
++        self.assertEqual(result, {"result": False, "message": "boom"})
++        task.nodes_action.assert_called_once_with("forced_fail", "node_id", ANY)
++
++
++def _build_web_pipeline(activity):
++    return {
++        "activities": {"act1": activity},
++        "constants": {},
++        "outputs": [],
++        "start_event": {"id": "s", "type": "EmptyStartEvent", "name": "", "incoming": "", "outgoing": "l1"},
++        "end_event": {"id": "e", "type": "EmptyEndEvent", "name": "", "incoming": ["l2"], "outgoing": ""},
++        "flows": {
++            "l1": {"id": "l1", "source": "s", "target": "act1"},
++            "l2": {"id": "l2", "source": "act1", "target": "e"},
++        },
++        "gateways": {},
++        "line": [],
++        "location": [],
++        "id": "root",
++    }
++
++def _service_activity(**overrides):
++    activity = {
++        "id": "act1",
++        "type": "ServiceActivity",
++        "name": "n",
++        "optional": False,
++        "error_ignorable": False,
++        "incoming": ["l1"],
++        "outgoing": "l2",
++        "stage_name": "",
++        "component": {"code": "sleep_timer", "version": "legacy", "data": {}},
++    }
++    activity.update(overrides)
++    return activity
++
++
++class TimeoutConfigConflictValidationTestCase(TestCase):
++    def test_timeout_only_converts_successfully(self):
++        web = _build_web_pipeline(
++            _service_activity(timeout_config={"enable": True, "seconds": 30, "action": "forced_fail"})
++        )
++        result = format_web_data_to_pipeline(copy.deepcopy(web))
++        self.assertIn("act1", result["activities"])
++
++    def test_timeout_with_error_ignorable_rejected(self):
++        web = _build_web_pipeline(
++            _service_activity(
++                error_ignorable=True,
++                timeout_config={"enable": True, "seconds": 30, "action": "forced_fail"},
++            )
++        )
++        with self.assertRaises(exceptions.InvalidOperationException):
++            format_web_data_to_pipeline(copy.deepcopy(web))
++
++    def test_timeout_with_auto_retry_rejected(self):
++        web = _build_web_pipeline(
++            _service_activity(
++                auto_retry={"enable": True, "times": 2},
++                timeout_config={"enable": True, "seconds": 30, "action": "forced_fail"},
++            )
++        )
++        with self.assertRaises(exceptions.InvalidOperationException):
++            format_web_data_to_pipeline(copy.deepcopy(web))
++
++    def test_no_timeout_with_error_ignorable_ok(self):
++        web = _build_web_pipeline(_service_activity(error_ignorable=True))
++        result = format_web_data_to_pipeline(copy.deepcopy(web))
++        self.assertIn("act1", result["activities"])
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,54 @@
++#!/usr/bin/env bash
++
++
++
++set -euo pipefail
++HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++cd /testbed
++
++
++
++
++PY=/testbed/.build_env/venv/bin/python
++
++
++
++cat > /testbed/local_settings.py <<'EOF'
++# -*- coding: utf-8 -*-
++DATABASES = {"default": {"ENGINE": "django.db.backends.sqlite3", "NAME": "db.sqlite3"}}
++LOG_LEVEL = "DEBUG"
++BK_IAM_SKIP = 1
++COMPATIBLE_MODULE_MAP = {}
++ROOT_URLCONF = "_minimal_urls"
++EOF
++
++
++
++
++SHIM_DIR="$(mktemp -d)"
++cat > "$SHIM_DIR/sitecustomize.py" <<'EOF'
++try:
++    import celery
++    if not hasattr(celery, "task"):
++        celery.task = celery.shared_task
++except Exception:
++    pass
++EOF
++cat > "$SHIM_DIR/_minimal_urls.py" <<'EOF'
++urlpatterns = []
++EOF
++
++# shellcheck disable=SC1091
++source scripts/develop/sites/community/env.sh
++export PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python
++export BKAPP_AUTO_UPDATE_VARIABLE_MODELS=0
++export BKAPP_AUTO_UPDATE_COMPONENT_MODELS=0
++export PYTHONPATH="$SHIM_DIR:${PYTHONPATH:-}"
++
++
++"$PY" manage.py test \
++    pipeline_web.tests.parser.format.test_format_web_data_to_pipeline \
++    gcloud.tests.taskflow3.domains.test_auto_retry
++
++
++"$PY" manage.py test gcloud.tests.taskflow3.test_node_timeout_feature

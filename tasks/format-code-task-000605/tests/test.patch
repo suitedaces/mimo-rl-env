@@ -1,0 +1,259 @@
+diff --git a/test/data_join/test_dfs_client.py b/test/data_join/test_dfs_client.py
+new file mode 100644
+index 00000000..f7b29dd0
+--- /dev/null
++++ b/test/data_join/test_dfs_client.py
+@@ -0,0 +1,202 @@
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++# coding: utf-8
++
++import os
++import shutil
++import sys
++import tempfile
++import types
++import unittest
++
++
++
++
++
++
++
++
++
++
++sys.modules.setdefault('tensorflow_io', types.ModuleType('tensorflow_io'))
++sys.modules.setdefault('fedlearner.trainer',
++                       types.ModuleType('fedlearner.trainer'))
++
++
++def _install_tf_stub():
++    try:
++        from tensorflow.compat.v1 import gfile  # noqa: F401
++        return
++    except Exception:  # pylint: disable=broad-except
++        pass
++
++    class _OpError(Exception):
++        pass
++
++    class _GFile(object):
++        @staticmethod
++        def Exists(path):
++            return os.path.exists(path)
++
++        @staticmethod
++        def IsDirectory(path):
++            return os.path.isdir(path)
++
++        @staticmethod
++        def ListDirectory(path):
++            return os.listdir(path)
++
++        @staticmethod
++        def MakeDirs(path):
++            os.makedirs(path, exist_ok=True)
++
++        @staticmethod
++        def Open(path, mode='r'):
++            return open(path, mode)
++
++        @staticmethod
++        def Remove(path):
++            if not os.path.exists(path):
++                raise _OpError('not found: %s' % path)
++            os.remove(path)
++
++        @staticmethod
++        def DeleteRecursively(path):
++            if not os.path.exists(path):
++                raise _OpError('not found: %s' % path)
++            shutil.rmtree(path)
++
++    tf = types.ModuleType('tensorflow')
++    compat = types.ModuleType('tensorflow.compat')
++    v1 = types.ModuleType('tensorflow.compat.v1')
++    errors = types.ModuleType('tensorflow.compat.v1.errors')
++    errors.OpError = _OpError
++    gfile = _GFile()
++    v1.gfile = gfile
++    v1.errors = errors
++    compat.v1 = v1
++    tf.compat = compat
++    tf.errors = errors
++    gfile_mod = types.ModuleType('tensorflow.compat.v1.gfile')
++    sys.modules['tensorflow'] = tf
++    sys.modules['tensorflow.compat'] = compat
++    sys.modules['tensorflow.compat.v1'] = v1
++    sys.modules['tensorflow.compat.v1.errors'] = errors
++    sys.modules['tensorflow.compat.v1.gfile'] = gfile_mod
++
++
++_install_tf_stub()
++
++from fedlearner.common.dfs_client import DFSClient
++
++
++class TestDFSClient(unittest.TestCase):
++    def setUp(self):
++        self.base_dir = tempfile.mkdtemp(prefix='dfs_test_')
++        self.client = DFSClient(self.base_dir)
++
++    def tearDown(self):
++        shutil.rmtree(self.base_dir, ignore_errors=True)
++
++    def test_set_get_roundtrip(self):
++
++        self.assertIsNone(self.client.get_data('missing'))
++
++
++        self.assertTrue(self.client.set_data('fl_key', b'fl_value'))
++        self.assertEqual(self.client.get_data('fl_key'), b'fl_value')
++
++
++        self.assertTrue(self.client.set_data('fl_key1', 'fl_value'))
++        self.assertEqual(self.client.get_data('fl_key1'), b'fl_value')
++
++
++        self.assertTrue(self.client.set_data('fl_key', b'updated'))
++        self.assertEqual(self.client.get_data('fl_key'), b'updated')
++
++    def test_cas(self):
++        self.client.set_data('fl_key', b'fl_value')
++
++        self.assertFalse(self.client.cas('fl_key', b'wrong', b'fl_value2'))
++        self.assertEqual(self.client.get_data('fl_key'), b'fl_value')
++
++        self.assertTrue(self.client.cas('fl_key', b'fl_value', b'fl_value1'))
++        self.assertEqual(self.client.get_data('fl_key'), b'fl_value1')
++
++
++        self.client.set_data('fl_key1', 'fl_value')
++        self.assertFalse(self.client.cas('fl_key1', 'fl_value1', b'fl_value2'))
++        self.assertTrue(self.client.cas('fl_key1', 'fl_value', 'fl_value1'))
++        self.assertEqual(self.client.get_data('fl_key1'), b'fl_value1')
++
++
++        self.assertTrue(self.client.cas('fl_key2', None, 'fl_value2'))
++        self.assertEqual(self.client.get_data('fl_key2'), b'fl_value2')
++
++    def test_prefix_listing_and_hierarchy(self):
++
++        self.client.set_data('fl_key', b'fl_value1')
++        self.client.set_data('fl_key/c', '3')
++        self.client.set_data('fl_key/a', '1')
++        self.client.set_data('fl_key/b', '2')
++
++        expected = [(b'fl_key', b'fl_value1'), (b'fl_key/a', b'1'),
++                    (b'fl_key/b', b'2'), (b'fl_key/c', b'3')]
++        self.assertEqual(self.client.get_prefix_kvs('fl_key'), expected)
++
++
++        self.assertEqual(self.client.get_prefix_kvs('fl_key', True),
++                         expected[1:])
++
++
++        self.assertEqual(self.client.get_prefix_kvs('nope'), [])
++
++    def test_delete(self):
++        self.client.set_data('fl_key', b'fl_value')
++        self.client.delete('fl_key')
++        self.assertIsNone(self.client.get_data('fl_key'))
++
++    def test_delete_prefix(self):
++        self.client.set_data('fl_key', b'fl_value1')
++        self.client.set_data('fl_key/a', '1')
++        self.client.set_data('fl_key/b', '2')
++
++        self.assertTrue(self.client.delete_prefix('fl_key'))
++        self.assertEqual(self.client.get_prefix_kvs('fl_key'), [])
++        self.assertIsNone(self.client.get_data('fl_key'))
++
++        self.assertFalse(self.client.delete_prefix('fl_key'))
++
++    def test_persisted_on_filesystem(self):
++
++
++        self.client.set_data('fl_key', b'fl_value')
++        self.client.set_data('fl_key/a', '1')
++
++
++        written = []
++        for root, _, files in os.walk(self.base_dir):
++            written.extend(os.path.join(root, f) for f in files)
++        self.assertTrue(written)
++
++
++        other = DFSClient(self.base_dir)
++        self.assertEqual(other.get_data('fl_key'), b'fl_value')
++        self.assertEqual(other.get_prefix_kvs('fl_key'),
++                         [(b'fl_key', b'fl_value'), (b'fl_key/a', b'1')])
++
++
++if __name__ == '__main__':
++    unittest.main()
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,46 @@
++#!/usr/bin/env bash
++
++
++
++set -euo pipefail
++HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++cd /testbed
++
++
++
++
++
++
++
++
++
++STUBDIR="$(mktemp -d)"
++trap 'rm -rf "$STUBDIR"' EXIT
++cat > "$STUBDIR/sitecustomize.py" <<'PY'
++import sys
++import types
++
++
++def _ensure(name):
++    try:
++        __import__(name)
++    except Exception:  # pylint: disable=broad-except
++        sys.modules[name] = types.ModuleType(name)
++
++
++_ensure('tensorflow_io')
++_ensure('etcd3')
++try:
++    __import__('tensorflow')
++except Exception:  # pylint: disable=broad-except
++    sys.modules.setdefault('fedlearner.trainer',
++                           types.ModuleType('fedlearner.trainer'))
++PY
++export PYTHONPATH="$STUBDIR:/testbed:${PYTHONPATH:-}"
++
++
++python test/data_join/test_etcd_client.py
++python test/data_join/test_mysql_client.py
++
++
++python test/data_join/test_dfs_client.py

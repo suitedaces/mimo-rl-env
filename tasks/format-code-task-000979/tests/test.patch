@@ -1,0 +1,179 @@
+diff --git a/pkg/protocol/trailer_contract_test.go b/pkg/protocol/trailer_contract_test.go
+new file mode 100644
+index 0000000..7be3511
+--- /dev/null
++++ b/pkg/protocol/trailer_contract_test.go
+@@ -0,0 +1,163 @@
++package protocol_test
++
++import (
++	"strings"
++	"testing"
++
++	"github.com/cloudwego/hertz/pkg/common/test/mock"
++	"github.com/cloudwego/hertz/pkg/protocol"
++	"github.com/cloudwego/hertz/pkg/protocol/http1/ext"
++)
++
++func trailerNames(t *testing.T, tr *protocol.Trailer) []string {
++	t.Helper()
++	var names []string
++	tr.VisitAll(func(k, _ []byte) { names = append(names, string(k)) })
++	return names
++}
++
++func TestTrailerDeclarationNormalizesAndIgnoresEmptySegments(t *testing.T) {
++	var tr protocol.Trailer
++	if err := tr.SetTrailers([]byte(" \tfoo\t, Bar ,\tbaz \t")); err != nil {
++		t.Fatalf("SetTrailers returned unexpected error: %v", err)
++	}
++	if got := strings.Join(trailerNames(t, &tr), ","); got != "Foo,Bar,Baz" {
++		t.Fatalf("unexpected declared trailer names %q", got)
++	}
++	if got := string(tr.GetBytes()); got != "Foo, Bar, Baz" {
++		t.Fatalf("unexpected Trailer header value %q", got)
++	}
++}
++
++func TestTrailerDeclarationInvalidUpdateIsAtomic(t *testing.T) {
++	for _, declaration := range []string{"Foo, Bad Key, Bar", "Foo, Content-Type, Bar"} {
++		var tr protocol.Trailer
++		if err := tr.Set("Existing", "old"); err != nil {
++			t.Fatal(err)
++		}
++		if err := tr.SetTrailers([]byte(declaration)); err == nil {
++			t.Fatalf("expected invalid declaration %q to return an error", declaration)
++		}
++		if got := string(tr.Peek("Existing")); got != "old" {
++			t.Fatalf("existing trailer was lost after rejected update: %q", got)
++		}
++		if tr.Peek("Foo") != nil || tr.Peek("Bar") != nil {
++			t.Fatal("partially accepted declarations remain after rejected update")
++		}
++	}
++}
++
++func TestTrailerDeclarationEmptyInputDoesNotPanic(t *testing.T) {
++	var tr protocol.Trailer
++	if err := tr.Set("Existing", "old"); err != nil {
++		t.Fatal(err)
++	}
++	panicked := false
++	func() {
++		defer func() {
++			if recover() != nil {
++				panicked = true
++			}
++		}()
++		if err := tr.SetTrailers([]byte(" ,\t , ")); err != nil {
++			t.Fatalf("empty declaration returned unexpected error: %v", err)
++		}
++	}()
++	if panicked {
++		t.Fatal("SetTrailers panicked on empty list elements")
++	}
++	if got := string(tr.Peek("Existing")); got != "old" {
++		t.Fatalf("empty declaration changed prior trailer state: %q", got)
++	}
++}
++
++func TestTrailerRejectsInvalidFieldNames(t *testing.T) {
++	for _, key := range []string{"Bad Key", "Bad\tKey", "Bad\r\nX"} {
++		var tr protocol.Trailer
++		if err := tr.Set(key, "value"); err == nil {
++			t.Errorf("Set accepted invalid trailer field name %q", key)
++		}
++		if err := tr.Add(key, "value"); err == nil {
++			t.Errorf("Add accepted invalid trailer field name %q", key)
++		}
++		if !tr.Empty() {
++			t.Errorf("invalid trailer field name %q mutated trailer state", key)
++		}
++	}
++	for _, key := range []string{"Content-Type", "Transfer-Encoding", "Host"} {
++		var tr protocol.Trailer
++		if err := tr.Set(key, "value"); err == nil {
++			t.Errorf("Set accepted forbidden trailer field %q", key)
++		}
++		if err := tr.Add(key, "value"); err == nil {
++			t.Errorf("Add accepted forbidden trailer field %q", key)
++		}
++		if !tr.Empty() {
++			t.Errorf("forbidden trailer field %q mutated trailer state", key)
++		}
++	}
++}
++
++func TestChunkedTrailersUpdateOnlyDeclaredNames(t *testing.T) {
++	var tr protocol.Trailer
++	if err := tr.SetTrailers([]byte("Foo, Bar")); err != nil {
++		t.Fatal(err)
++	}
++	rd := mock.NewZeroCopyReader("0\r\nFoo: one\r\nBar: two\r\nBaz: ignored\r\n\r\n")
++	if err := ext.ReadTrailer(&tr, rd); err != nil {
++		t.Fatalf("ReadTrailer returned unexpected error: %v", err)
++	}
++	if got := string(tr.Peek("Foo")); got != "one" {
++		t.Fatalf("unexpected Foo trailer value %q", got)
++	}
++	if got := string(tr.Peek("Bar")); got != "two" {
++		t.Fatalf("unexpected Bar trailer value %q", got)
++	}
++	if tr.Peek("Baz") != nil {
++		t.Fatal("undeclared Baz trailer was accepted")
++	}
++}
++
++func TestChunkedMalformedTrailerReturnsErrorAndClearsState(t *testing.T) {
++	var tr protocol.Trailer
++	if err := tr.SetTrailers([]byte("Foo")); err != nil {
++		t.Fatal(err)
++	}
++	rd := mock.NewZeroCopyReader("0\r\nFoo: one\r\nBad Key: value\r\n\r\n")
++	if err := ext.ReadTrailer(&tr, rd); err == nil {
++		t.Fatal("expected malformed trailer field to return an error")
++	}
++	if !tr.Empty() {
++		t.Fatal("trailer declarations were retained after malformed wire data")
++	}
++}
++
++func TestChunkedForbiddenTrailerReturnsErrorAndClearsState(t *testing.T) {
++	var tr protocol.Trailer
++	if err := tr.SetTrailers([]byte("Foo")); err != nil {
++		t.Fatal(err)
++	}
++	rd := mock.NewZeroCopyReader("0\r\nFoo: one\r\nContent-Type: text/plain\r\n\r\n")
++	if err := ext.ReadTrailer(&tr, rd); err == nil {
++		t.Fatal("expected forbidden trailer field to return an error")
++	}
++	if !tr.Empty() {
++		t.Fatal("trailer state was retained after forbidden wire data")
++	}
++}
++
++func TestTrailerCopyPreservesDeclarationState(t *testing.T) {
++	var src, dst protocol.Trailer
++	src.DisableNormalizing()
++	if err := src.SetTrailers([]byte("x-custom")); err != nil {
++		t.Fatal(err)
++	}
++	src.UpdateArgBytes([]byte("x-custom"), []byte("value"))
++	src.CopyTo(&dst)
++	if !dst.IsDisableNormalizing() {
++		t.Fatal("copy lost DisableNormalizing state")
++	}
++	if got := string(dst.Peek("x-custom")); got != "value" {
++		t.Fatalf("copy lost trailer value: %q", got)
++	}
++}
+
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,4 @@
++#!/bin/bash
++set -euo pipefail
++
++go test ./pkg/protocol ./pkg/protocol/http1/ext

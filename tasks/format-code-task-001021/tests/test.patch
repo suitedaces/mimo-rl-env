@@ -1,0 +1,379 @@
+diff --git a/artemis/modules/utils/wappalyzer/codespec_batch_cli_test.go b/artemis/modules/utils/wappalyzer/codespec_batch_cli_test.go
+new file mode 100644
+index 00000000..e1c74119
+--- /dev/null
++++ b/artemis/modules/utils/wappalyzer/codespec_batch_cli_test.go
+@@ -0,0 +1,362 @@
++package main_test
++
++import (
++	"encoding/json"
++	"fmt"
++	"net/http"
++	"net/http/httptest"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"strconv"
++	"strings"
++	"sync/atomic"
++	"testing"
++)
++
++func buildCodespecScanner(t *testing.T) string {
++	t.Helper()
++	binary := filepath.Join(t.TempDir(), "wappalyzer-codespec")
++	command := exec.Command("go", "build", "-o", binary, ".")
++	output, err := command.CombinedOutput()
++	if err != nil {
++		t.Fatalf("build scanner: %v\n%s", err, output)
++	}
++	return binary
++}
++
++func writeCodespecTargets(t *testing.T, contents string) string {
++	t.Helper()
++	path := filepath.Join(t.TempDir(), "targets.txt")
++	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
++		t.Fatal(err)
++	}
++	return path
++}
++
++func runCodespecScanner(t *testing.T, binary string, args ...string) ([]byte, []byte, error) {
++	t.Helper()
++	command := exec.Command(binary, args...)
++	var stdout strings.Builder
++	var stderr strings.Builder
++	command.Stdout = &stdout
++	command.Stderr = &stderr
++	err := command.Run()
++	return []byte(stdout.String()), []byte(stderr.String()), err
++}
++
++func decodeCodespecResults(t *testing.T, output []byte) map[string][]string {
++	t.Helper()
++	var results map[string][]string
++	if err := json.Unmarshal(output, &results); err != nil {
++		t.Fatalf("stdout is not one JSON result object: %v\nstdout: %s", err, output)
++	}
++	return results
++}
++
++func containsCodespecTechnology(technologies []string, name string) bool {
++	for _, technology := range technologies {
++		if technology == name || strings.HasPrefix(technology, name+":") {
++			return true
++		}
++	}
++	return false
++}
++
++func technologyCodespecServer(t *testing.T, status int, hits *atomic.Int32) *httptest.Server {
++	t.Helper()
++	return httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
++		if hits != nil {
++			hits.Add(1)
++		}
++		response.Header().Set("Server", "nginx/1.25.4")
++		response.Header().Set("X-Powered-By", "PHP/8.2.12")
++		response.WriteHeader(status)
++		_, _ = response.Write([]byte(`<!doctype html><html><head><meta name="generator" content="WordPress 6.5"><script src="/jquery-3.7.1.min.js"></script></head></html>`))
++	}))
++}
++
++func TestCodespecInputNormalizationAndFetchOnce(t *testing.T) {
++	binary := buildCodespecScanner(t)
++	var hits atomic.Int32
++	server := technologyCodespecServer(t, http.StatusOK, &hits)
++	defer server.Close()
++
++	first := server.URL + "/first"
++	second := server.URL + "/second#section"
++	input := fmt.Sprintf("  # %s/commented-out\n\n  %s  \n%s\n\t%s\t\n", server.URL, first, second, first)
++	stdout, stderr, err := runCodespecScanner(t, binary, writeCodespecTargets(t, input))
++	if err != nil {
++		t.Fatalf("scanner failed: %v\nstderr: %s", err, stderr)
++	}
++	results := decodeCodespecResults(t, stdout)
++
++	if hits.Load() != 2 {
++		t.Fatalf("expected one fetch per unique normalized target, got %d", hits.Load())
++	}
++	if len(results) != 2 {
++		t.Fatalf("expected exactly two target keys, got %#v", results)
++	}
++	if _, ok := results[first]; !ok {
++		t.Errorf("missing normalized first target %q in %#v", first, results)
++	}
++	if _, ok := results[second]; !ok {
++		t.Errorf("missing original target including fragment %q in %#v", second, results)
++	}
++}
++
++func TestCodespecMixedSuccessFailureContinuesBatch(t *testing.T) {
++	binary := buildCodespecScanner(t)
++	server := technologyCodespecServer(t, http.StatusOK, nil)
++	defer server.Close()
++
++	invalid := "codespec target without a scheme"
++	stdout, stderr, err := runCodespecScanner(
++		t,
++		binary,
++		writeCodespecTargets(t, server.URL+"\n"+invalid+"\n"),
++	)
++	if err != nil {
++		t.Fatalf("a target-level failure aborted the batch: %v\nstderr: %s", err, stderr)
++	}
++	results := decodeCodespecResults(t, stdout)
++
++	if technologies, ok := results[invalid]; !ok || technologies == nil || len(technologies) != 0 {
++		t.Errorf("failed target must be present with a non-null empty list, got %#v", results[invalid])
++	}
++	technologies, ok := results[server.URL]
++	if !ok || len(technologies) < 2 {
++		t.Fatalf("successful target was not fingerprinted: %#v", results)
++	}
++	if !strings.Contains(string(stderr), invalid) {
++		t.Errorf("failure diagnostic does not identify %q: %s", invalid, stderr)
++	}
++}
++
++func writeCodespecIncompleteResponse(response http.ResponseWriter, header string) {
++	hijacker := response.(http.Hijacker)
++	connection, buffer, err := hijacker.Hijack()
++	if err != nil {
++		return
++	}
++	defer connection.Close()
++	_, _ = buffer.WriteString("HTTP/1.1 200 OK\r\n" + header + "\r\nContent-Length: 4096\r\n\r\n<html>partial")
++	_ = buffer.Flush()
++}
++
++func TestCodespecRequestFailureRetriesOnce(t *testing.T) {
++	binary := buildCodespecScanner(t)
++	var hits atomic.Int32
++	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
++		if hits.Add(1) == 1 {
++			connection, _, err := response.(http.Hijacker).Hijack()
++			if err == nil {
++				_ = connection.Close()
++			}
++			return
++		}
++		response.Header().Set("X-Powered-By", "PHP/8.2.12")
++		_, _ = response.Write([]byte("<html>complete</html>"))
++	}))
++	defer server.Close()
++
++	stdout, stderr, err := runCodespecScanner(t, binary, writeCodespecTargets(t, server.URL+"\n"))
++	if err != nil {
++		t.Fatalf("request failure aborted the batch: %v\nstderr: %s", err, stderr)
++	}
++	results := decodeCodespecResults(t, stdout)
++	if hits.Load() != 2 {
++		t.Fatalf("expected one retry after request failure, got %d requests", hits.Load())
++	}
++	if !containsCodespecTechnology(results[server.URL], "PHP") {
++		t.Fatalf("retry response was not fingerprinted: %#v", results)
++	}
++	if len(stderr) != 0 {
++		t.Errorf("recovered request failure produced a diagnostic: %s", stderr)
++	}
++}
++
++func TestCodespecResponseReadFailureRetriesAndDiscardsPartialData(t *testing.T) {
++	binary := buildCodespecScanner(t)
++	var hits atomic.Int32
++	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
++		if hits.Add(1) == 1 {
++			writeCodespecIncompleteResponse(response, "Server: nginx/1.25.4")
++			return
++		}
++		response.Header().Set("X-Powered-By", "PHP/8.2.12")
++		_, _ = response.Write([]byte("<html>complete</html>"))
++	}))
++	defer server.Close()
++
++	stdout, stderr, err := runCodespecScanner(t, binary, writeCodespecTargets(t, server.URL+"\n"))
++	if err != nil {
++		t.Fatalf("response read failure aborted the batch: %v\nstderr: %s", err, stderr)
++	}
++	results := decodeCodespecResults(t, stdout)
++	if hits.Load() != 2 {
++		t.Fatalf("expected one retry after the incomplete response, got %d requests", hits.Load())
++	}
++	if !containsCodespecTechnology(results[server.URL], "PHP") {
++		t.Fatalf("retry response was not fingerprinted: %#v", results)
++	}
++	if containsCodespecTechnology(results[server.URL], "Nginx") {
++		t.Fatalf("partial first response leaked into the result: %#v", results)
++	}
++	if len(stderr) != 0 {
++		t.Errorf("recovered failure produced a diagnostic: %s", stderr)
++	}
++}
++
++func TestCodespecExhaustedResponseFailureIsExplicit(t *testing.T) {
++	binary := buildCodespecScanner(t)
++	var hits atomic.Int32
++	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
++		hits.Add(1)
++		writeCodespecIncompleteResponse(response, "Server: nginx/1.25.4")
++	}))
++	defer server.Close()
++
++	stdout, stderr, err := runCodespecScanner(t, binary, writeCodespecTargets(t, server.URL+"\n"))
++	if err != nil {
++		t.Fatalf("exhausted target failure aborted the batch: %v\nstderr: %s", err, stderr)
++	}
++	results := decodeCodespecResults(t, stdout)
++	if hits.Load() != 2 {
++		t.Fatalf("expected exactly two attempts, got %d", hits.Load())
++	}
++	if technologies, ok := results[server.URL]; !ok || technologies == nil || len(technologies) != 0 {
++		t.Errorf("exhausted response failure must produce an explicit empty result, got %#v", results)
++	}
++	if !strings.Contains(string(stderr), server.URL) {
++		t.Errorf("response failure diagnostic does not identify target: %s", stderr)
++	}
++}
++
++func TestCodespecNon2xxResponseRemainsFingerprintable(t *testing.T) {
++	binary := buildCodespecScanner(t)
++	var hits atomic.Int32
++	server := technologyCodespecServer(t, http.StatusServiceUnavailable, &hits)
++	defer server.Close()
++
++	stdout, stderr, err := runCodespecScanner(t, binary, writeCodespecTargets(t, server.URL+"\n"))
++	if err != nil {
++		t.Fatalf("scanner failed on an HTTP response: %v\nstderr: %s", err, stderr)
++	}
++	results := decodeCodespecResults(t, stdout)
++	if !containsCodespecTechnology(results[server.URL], "Nginx") {
++		t.Fatalf("503 response headers were not fingerprinted: %#v", results[server.URL])
++	}
++	if hits.Load() != 1 {
++		t.Fatalf("received HTTP status was retried, got %d requests", hits.Load())
++	}
++}
++
++func TestCodespecResponseBodyAnalysisIsLimitedToOneMiB(t *testing.T) {
++	binary := buildCodespecScanner(t)
++	marker := `<meta name="generator" content="WordPress 6.5">`
++	filler := strings.Repeat(" ", 1024*1024+128)
++	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
++		if request.URL.Path == "/early" {
++			_, _ = response.Write([]byte(marker + filler))
++			return
++		}
++		_, _ = response.Write([]byte(filler + marker))
++	}))
++	defer server.Close()
++
++	early := server.URL + "/early"
++	late := server.URL + "/late"
++	stdout, stderr, err := runCodespecScanner(t, binary, writeCodespecTargets(t, early+"\n"+late+"\n"))
++	if err != nil {
++		t.Fatalf("oversized response aborted the batch: %v\nstderr: %s", err, stderr)
++	}
++	results := decodeCodespecResults(t, stdout)
++	if !containsCodespecTechnology(results[early], "WordPress") {
++		t.Fatalf("technology inside the analysis prefix was lost: %#v", results[early])
++	}
++	if containsCodespecTechnology(results[late], "WordPress") {
++		t.Fatalf("technology beyond the 1 MiB analysis prefix was used: %#v", results[late])
++	}
++}
++
++func TestCodespecRedirectLimitAndOriginalResultKey(t *testing.T) {
++	binary := buildCodespecScanner(t)
++	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
++		step, err := strconv.Atoi(strings.TrimPrefix(request.URL.Path, "/"))
++		if err != nil {
++			http.Error(response, "bad test path", http.StatusBadRequest)
++			return
++		}
++		if step < 6 {
++			http.Redirect(response, request, fmt.Sprintf("/%d", step+1), http.StatusFound)
++			return
++		}
++		response.Header().Set("Server", "nginx/1.25.4")
++		_, _ = response.Write([]byte("<html>final</html>"))
++	}))
++	defer server.Close()
++
++	fiveRedirects := server.URL + "/1"
++	sixRedirects := server.URL + "/0"
++	stdout, stderr, err := runCodespecScanner(
++		t,
++		binary,
++		writeCodespecTargets(t, fiveRedirects+"\n"+sixRedirects+"\n"),
++	)
++	if err != nil {
++		t.Fatalf("redirect target failure aborted the batch: %v\nstderr: %s", err, stderr)
++	}
++	results := decodeCodespecResults(t, stdout)
++	if !containsCodespecTechnology(results[fiveRedirects], "Nginx") {
++		t.Fatalf("five-redirect response was not fingerprinted under its input key: %#v", results)
++	}
++	if technologies, ok := results[sixRedirects]; !ok || technologies == nil || len(technologies) != 0 {
++		t.Fatalf("six-redirect target must be an explicit failure: %#v", results)
++	}
++	if _, finalURLWasUsed := results[server.URL+"/6"]; finalURLWasUsed {
++		t.Fatalf("redirect destination was used as a result key: %#v", results)
++	}
++	if !strings.Contains(string(stderr), sixRedirects) {
++		t.Errorf("redirect-limit diagnostic does not identify target: %s", stderr)
++	}
++}
++
++func TestCodespecSuccessfulRunKeepsStderrClean(t *testing.T) {
++	binary := buildCodespecScanner(t)
++	server := technologyCodespecServer(t, http.StatusOK, nil)
++	defer server.Close()
++
++	stdout, stderr, err := runCodespecScanner(t, binary, writeCodespecTargets(t, server.URL+"\n"))
++	if err != nil {
++		t.Fatalf("scanner failed: %v\nstderr: %s", err, stderr)
++	}
++	decodeCodespecResults(t, stdout)
++	if len(stderr) != 0 {
++		t.Errorf("successful run wrote diagnostics to stderr: %s", stderr)
++	}
++}
++
++func TestCodespecInvalidInvocationFailsBeforeScanning(t *testing.T) {
++	binary := buildCodespecScanner(t)
++	var hits atomic.Int32
++	server := technologyCodespecServer(t, http.StatusOK, &hits)
++	defer server.Close()
++	targets := writeCodespecTargets(t, server.URL+"\n")
++
++	for name, args := range map[string][]string{
++		"missing path":   nil,
++		"extra argument": {targets, "unexpected"},
++		"directory path": {t.TempDir()},
++	} {
++		t.Run(name, func(t *testing.T) {
++			stdout, _, err := runCodespecScanner(t, binary, args...)
++			if err == nil {
++				t.Fatalf("invalid invocation succeeded; stdout: %s", stdout)
++			}
++		})
++	}
++	if hits.Load() != 0 {
++		t.Fatalf("invalid invocation triggered %d HTTP requests", hits.Load())
++	}
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,6 @@
++#!/bin/bash
++set -euo pipefail
++
++
++cd artemis/modules/utils/wappalyzer
++go test -count=1 -run '^TestCodespec' .

@@ -1,0 +1,205 @@
+diff --git a/lib/lru/codespec_cache_contract_test.go b/lib/lru/codespec_cache_contract_test.go
+new file mode 100644
+index 00000000..ec9e9a3b
+--- /dev/null
++++ b/lib/lru/codespec_cache_contract_test.go
+@@ -0,0 +1,189 @@
++package lru_test
++
++import (
++	"fmt"
++	"reflect"
++	"sync"
++	"testing"
++
++	lru "awesome-golang-algorithm/lib/lru"
++)
++
++type contractValue string
++
++func (v contractValue) Len() int { return len(v) }
++
++type extendedCache interface {
++	Peek(string) (lru.Value, bool)
++	Contains(string) bool
++	Remove(string) bool
++	Purge()
++	Resize(int64) int
++	Keys() []string
++	Bytes() int64
++}
++
++func extended(t *testing.T, c *lru.Cache) extendedCache {
++	t.Helper()
++	e, ok := interface{}(c).(extendedCache)
++	if !ok {
++		t.Fatal("Cache does not expose the required inspection, removal, purge, and resize operations")
++	}
++	return e
++}
++
++func TestCodespecReplacementAccounting(t *testing.T) {
++	var evicted []string
++	c := lru.New(10, func(key string, _ lru.Value) { evicted = append(evicted, key) })
++	e := extended(t, c)
++	c.Add("a", contractValue("1234"))
++	c.Add("b", contractValue("5678"))
++	c.Add("a", contractValue("12345678"))
++	if v, ok := c.Get("a"); !ok || v != contractValue("12345678") {
++		t.Fatalf("replacement Get(a) = (%v, %v)", v, ok)
++	}
++	if _, ok := c.Get("b"); ok {
++		t.Fatal("growing a replacement did not evict the LRU key")
++	}
++	if e.Bytes() != 9 || !reflect.DeepEqual(evicted, []string{"b"}) {
++		t.Fatalf("growing replacement: bytes=%d callbacks=%v, want 9 and [b]", e.Bytes(), evicted)
++	}
++
++	c = lru.New(12, nil)
++	e = extended(t, c)
++	c.Add("a", contractValue("12345"))
++	c.Add("b", contractValue("12345"))
++	c.Add("a", contractValue(""))
++	c.Add("c", contractValue("1234"))
++	if got := e.Keys(); !reflect.DeepEqual(got, []string{"c", "a", "b"}) {
++		t.Fatalf("keys after shrinking replacement = %v, want [c a b]", got)
++	}
++	if e.Bytes() != 12 {
++		t.Fatalf("Bytes after shrinking replacement = %d, want 12", e.Bytes())
++	}
++}
++
++func TestCodespecInspectionOrderAndSnapshot(t *testing.T) {
++	c := lru.New(0, nil)
++	e := extended(t, c)
++	c.Add("alpha", contractValue("1"))
++	c.Add("beta", contractValue("22"))
++	c.Add("gamma", contractValue("333"))
++	c.Get("alpha")
++	if v, ok := e.Peek("beta"); !ok || v != contractValue("22") {
++		t.Fatalf("Peek(beta) = (%v, %v)", v, ok)
++	}
++	if !e.Contains("gamma") || e.Contains("missing") {
++		t.Fatal("Contains does not distinguish present and absent keys")
++	}
++	if _, ok := e.Peek("missing"); ok {
++		t.Fatal("Peek reported a hit for a missing key")
++	}
++	want := []string{"alpha", "gamma", "beta"}
++	keys := e.Keys()
++	if !reflect.DeepEqual(keys, want) {
++		t.Fatalf("Keys = %v, want %v", keys, want)
++	}
++	keys[0] = "changed"
++	if got := e.Keys(); !reflect.DeepEqual(got, want) {
++		t.Fatalf("mutating Keys result changed cache order: %v", got)
++	}
++	if e.Bytes() != 20 {
++		t.Fatalf("Bytes = %d, want 20", e.Bytes())
++	}
++}
++
++func TestCodespecRemoveAndPurge(t *testing.T) {
++	var evicted []string
++	c := lru.New(0, func(key string, _ lru.Value) { evicted = append(evicted, key) })
++	e := extended(t, c)
++	c.Add("a", contractValue("A"))
++	c.Add("b", contractValue("B"))
++	c.Add("c", contractValue("C"))
++	c.Get("a")
++	if !e.Remove("c") || e.Remove("c") || e.Remove("missing") {
++		t.Fatal("Remove return value does not reflect key presence")
++	}
++	if e.Bytes() != 4 || !reflect.DeepEqual(evicted, []string{"c"}) {
++		t.Fatalf("Remove state: bytes=%d callbacks=%v", e.Bytes(), evicted)
++	}
++	e.Purge()
++	if c.Len() != 0 || e.Bytes() != 0 || len(e.Keys()) != 0 {
++		t.Fatalf("Purge left state: len=%d bytes=%d keys=%v", c.Len(), e.Bytes(), e.Keys())
++	}
++	if !reflect.DeepEqual(evicted, []string{"c", "b", "a"}) {
++		t.Fatalf("callback order = %v, want [c b a]", evicted)
++	}
++	e.Purge()
++	if !reflect.DeepEqual(evicted, []string{"c", "b", "a"}) {
++		t.Fatalf("empty Purge emitted callbacks: %v", evicted)
++	}
++}
++
++func TestCodespecResize(t *testing.T) {
++	var evicted []string
++	c := lru.New(0, func(key string, _ lru.Value) { evicted = append(evicted, key) })
++	e := extended(t, c)
++	for _, key := range []string{"a", "b", "c"} {
++		c.Add(key, contractValue("22"))
++	}
++	if n := e.Resize(6); n != 1 || !reflect.DeepEqual(e.Keys(), []string{"c", "b"}) {
++		t.Fatalf("Resize(6): evicted=%d keys=%v", n, e.Keys())
++	}
++	if n := e.Resize(2); n != 2 || c.Len() != 0 || e.Bytes() != 0 {
++		t.Fatalf("Resize(2): evicted=%d len=%d bytes=%d", n, c.Len(), e.Bytes())
++	}
++	if !reflect.DeepEqual(evicted, []string{"a", "b", "c"}) {
++		t.Fatalf("resize callback order = %v", evicted)
++	}
++	if n := e.Resize(0); n != 0 {
++		t.Fatalf("Resize(0) evicted %d entries", n)
++	}
++	c.Add("large", contractValue("larger than every previous bound"))
++	if c.Len() != 1 {
++		t.Fatal("zero capacity is not unlimited after Resize(0)")
++	}
++	if n := e.Resize(5); n != 1 || c.Len() != 0 {
++		t.Fatalf("oversized resize: evicted=%d len=%d", n, c.Len())
++	}
++}
++
++func TestCodespecConcurrentSurface(t *testing.T) {
++	c := lru.New(256, func(string, lru.Value) {})
++	e := extended(t, c)
++	var wg sync.WaitGroup
++	for worker := 0; worker < 8; worker++ {
++		worker := worker
++		wg.Add(1)
++		go func() {
++			defer wg.Done()
++			for i := 0; i < 200; i++ {
++				key := fmt.Sprintf("%d-%d", worker, i%16)
++				c.Add(key, contractValue("payload"))
++				c.Get(key)
++				e.Peek(key)
++				e.Contains(key)
++				e.Keys()
++				e.Bytes()
++				c.Len()
++				if i%5 == 0 {
++					e.Remove(key)
++				}
++				if i%37 == 0 {
++					c.RemoveOldest()
++				}
++				if i%53 == 0 {
++					e.Resize(256)
++				}
++				if i%97 == 0 {
++					e.Purge()
++				}
++			}
++		}()
++	}
++	wg.Wait()
++	e.Purge()
++	if c.Len() != 0 || e.Bytes() != 0 || len(e.Keys()) != 0 {
++		t.Fatalf("invalid final state: len=%d bytes=%d keys=%v", c.Len(), e.Bytes(), e.Keys())
++	}
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,5 @@
++#!/bin/bash
++set -euo pipefail
++
++
++go test -race ./lib/lru

@@ -1,0 +1,287 @@
+diff --git a/cloudconfig/podcfg/image_test.go b/cloudconfig/podcfg/image_test.go
+index 3e67ec4e8e..e851a6ea34 100644
+--- a/cloudconfig/podcfg/image_test.go
++++ b/cloudconfig/podcfg/image_test.go
+@@ -4,6 +4,8 @@
+ package podcfg_test
+ 
+ import (
++	"github.com/juju/charm/v8"
++	"github.com/juju/errors"
+ 	jc "github.com/juju/testing/checkers"
+ 	"github.com/juju/version/v2"
+ 	gc "gopkg.in/check.v1"
+@@ -11,8 +13,6 @@ import (
+ 	"github.com/juju/juju/cloudconfig/podcfg"
+ 	"github.com/juju/juju/controller"
+ 	"github.com/juju/juju/testing"
+-	"github.com/juju/systems"
+-	"github.com/juju/systems/channel"
+ )
+ 
+ type imageSuite struct {
+@@ -34,27 +34,51 @@ func (*imageSuite) TestGetJujuOCIImagePath(c *gc.C) {
+ 	c.Assert(path, jc.DeepEquals, "testing-old-repo/jujud-old-operator:2.6-beta3")
+ }
+ 
+-func (*imageSuite) TestImageForBase(c *gc.C) {
+-	_, err := podcfg.ImageForBase("", systems.Base{})
+-	c.Assert(err, gc.ErrorMatches, `base name not valid`)
++func (*imageSuite) TestImageForBaseRejectsEmptyBaseName(c *gc.C) {
++	_, err := podcfg.ImageForBase("", charm.Base{})
++	c.Assert(err, jc.Satisfies, errors.IsNotValid)
++	c.Assert(err.Error(), gc.Equals, "empty base name not valid")
+ 
+-	_, err = podcfg.ImageForBase("", systems.Base{Name: "ubuntu"})
+-	c.Assert(err, gc.ErrorMatches, `channel "" not valid`)
++	_, err = podcfg.ImageForBase("example.test/juju", charm.Base{
++		Channel: charm.Channel{
++			Track: "20.04",
++			Risk:  charm.Stable,
++		},
++	})
++	c.Assert(err, jc.Satisfies, errors.IsNotValid)
++	c.Assert(err.Error(), gc.Equals, "empty base name not valid")
++}
++
++func (*imageSuite) TestImageForBaseRejectsInvalidCharmBaseChannel(c *gc.C) {
++	_, err := podcfg.ImageForBase("", charm.Base{Name: "ubuntu"})
++	c.Assert(err, jc.Satisfies, errors.IsNotValid)
+ 
+-	_, err = podcfg.ImageForBase("", systems.Base{Name: "ubuntu", Channel: channel.Channel{
++	_, err = podcfg.ImageForBase("", charm.Base{Name: "ubuntu", Channel: charm.Channel{
+ 		Track: "20.04",
+ 	}})
+-	c.Assert(err, gc.ErrorMatches, `channel "" not valid`)
++	c.Assert(err, jc.Satisfies, errors.IsNotValid)
++}
+ 
+-	path, err := podcfg.ImageForBase("", systems.Base{Name: "ubuntu", Channel: channel.Channel{
+-		Track: "20.04", Risk: channel.Stable,
+-	}})
++func (*imageSuite) TestImageForBaseUsesCharmBaseStable(c *gc.C) {
++	path, err := podcfg.ImageForBase("", charm.Base{
++		Name: "ubuntu",
++		Channel: charm.Channel{
++			Track: "20.04",
++			Risk:  charm.Stable,
++		},
++	})
+ 	c.Assert(err, jc.ErrorIsNil)
+ 	c.Assert(path, gc.DeepEquals, `jujusolutions/charm-base:ubuntu-20.04`)
++}
+ 
+-	path, err = podcfg.ImageForBase("", systems.Base{Name: "ubuntu", Channel: channel.Channel{
+-		Track: "20.04", Risk: channel.Edge,
+-	}})
++func (*imageSuite) TestImageForBaseUsesCharmBaseNonStable(c *gc.C) {
++	path, err := podcfg.ImageForBase("example.test/juju", charm.Base{
++		Name: "ubuntu",
++		Channel: charm.Channel{
++			Track: "22.04",
++			Risk:  charm.Edge,
++		},
++	})
+ 	c.Assert(err, jc.ErrorIsNil)
+-	c.Assert(path, gc.DeepEquals, `jujusolutions/charm-base:ubuntu-20.04-edge`)
++	c.Assert(path, gc.DeepEquals, `example.test/juju/charm-base:ubuntu-22.04-edge`)
+ }
+diff --git a/worker/caasapplicationprovisioner/application_test.go b/worker/caasapplicationprovisioner/application_test.go
+index 9f6871bb08..7b4dd8a7bf 100644
+--- a/worker/caasapplicationprovisioner/application_test.go
++++ b/worker/caasapplicationprovisioner/application_test.go
+@@ -372,6 +372,164 @@ func (s *ApplicationWorkerSuite) TestWorker(c *gc.C) {
+ 	workertest.CleanKill(c, appWorker)
+ }
+ 
++func (s *ApplicationWorkerSuite) TestWorkerUsesSeriesToResolveCharmBaseImage(c *gc.C) {
++	for _, test := range []struct {
++		series        string
++		expectedImage string
++	}{{
++		series:        "focal",
++		expectedImage: "example.test/juju/charm-base:ubuntu-20.04",
++	}, {
++		series:        "hirsute",
++		expectedImage: "example.test/juju/charm-base:ubuntu-21.04",
++	}} {
++		c.Logf("series %s", test.series)
++
++		ctrl := gomock.NewController(c)
++		s.assertWorkerUsesSeriesToResolveCharmBaseImage(c, ctrl, test.series, test.expectedImage)
++		ctrl.Finish()
++	}
++}
++
++func (s *ApplicationWorkerSuite) assertWorkerUsesSeriesToResolveCharmBaseImage(c *gc.C, ctrl *gomock.Controller, seriesName, expectedImage string) {
++	appCharmURL := &charm.URL{
++		Schema:   "cs",
++		Name:     "test",
++		Revision: -1,
++	}
++	appCharmInfo := &charmscommon.CharmInfo{
++		Meta: &charm.Meta{
++			Name: "test",
++			Containers: map[string]charm.Container{
++				"test": {
++					Resource: "test-oci",
++				},
++			},
++			Resources: map[string]charmresource.Meta{
++				"test-oci": {
++					Type: charmresource.TypeContainerImage,
++				},
++			},
++		},
++		Manifest: &charm.Manifest{
++			Bases: []charm.Base{{
++				Name: "ubuntu",
++				Channel: charm.Channel{
++					Track: "20.04",
++					Risk:  charm.Stable,
++				},
++			}},
++		},
++	}
++	appProvisioningInfo := api.ProvisioningInfo{
++		Series:    seriesName,
++		CharmURL:  appCharmURL,
++		ImageRepo: "example.test/juju",
++	}
++	ociResources := map[string]resources.DockerImageDetails{
++		"test-oci": {
++			RegistryPath: "example.test/workload:1.0",
++		},
++	}
++
++	appStateChan := make(chan struct{}, 1)
++	appStateWatcher := watchertest.NewMockNotifyWatcher(appStateChan)
++	appChan := make(chan struct{}, 1)
++	appWatcher := watchertest.NewMockNotifyWatcher(appChan)
++	appReplicasChan := make(chan struct{}, 1)
++	appReplicasWatcher := watchertest.NewMockNotifyWatcher(appReplicasChan)
++	appScaleChan := make(chan struct{}, 1)
++	appScaleWatcher := watchertest.NewMockNotifyWatcher(appScaleChan)
++	appTrustHashChan := make(chan []string, 1)
++	appTrustHashWatcher := watchertest.NewMockStringsWatcher(appTrustHashChan)
++
++	brokerApp := caasmocks.NewMockApplication(ctrl)
++	broker := mocks.NewMockCAASBroker(ctrl)
++	facade := mocks.NewMockCAASProvisionerFacade(ctrl)
++	unitFacade := mocks.NewMockCAASUnitProvisionerFacade(ctrl)
++
++	ensureDone := make(chan struct{})
++	deleteDone := make(chan struct{})
++
++	facade.EXPECT().ApplicationCharmURL("test").Return(appCharmURL, nil).AnyTimes()
++	facade.EXPECT().CharmInfo("cs:test").Return(appCharmInfo, nil).AnyTimes()
++	facade.EXPECT().SetPassword("test", gomock.Any()).Return(nil).AnyTimes()
++	broker.EXPECT().Application("test", caas.DeploymentStateful).Return(brokerApp).AnyTimes()
++	unitFacade.EXPECT().WatchApplicationScale("test").Return(appScaleWatcher, nil).AnyTimes()
++	unitFacade.EXPECT().WatchApplicationTrustHash("test").Return(appTrustHashWatcher, nil).AnyTimes()
++	facade.EXPECT().WatchApplication("test").Return(appStateWatcher, nil).AnyTimes()
++	facade.EXPECT().ProvisioningInfo("test").Return(appProvisioningInfo, nil).AnyTimes()
++	facade.EXPECT().ApplicationOCIResources("test").Return(ociResources, nil).AnyTimes()
++	brokerApp.EXPECT().Exists().Return(caas.DeploymentState{}, nil).AnyTimes()
++	brokerApp.EXPECT().Watch().Return(appWatcher, nil).AnyTimes()
++	brokerApp.EXPECT().WatchReplicas().Return(appReplicasWatcher, nil).AnyTimes()
++	brokerApp.EXPECT().Delete().Return(nil).AnyTimes()
++	facade.EXPECT().Units("test").Return([]names.Tag(nil), nil).AnyTimes()
++	brokerApp.EXPECT().State().Return(caas.ApplicationState{}, nil).AnyTimes()
++	facade.EXPECT().SetOperatorStatus("test", status.Active, "deployed", nil).DoAndReturn(func(string, status.Status, string, map[string]interface{}) error {
++		select {
++		case <-ensureDone:
++		default:
++			close(ensureDone)
++		}
++		return nil
++	}).AnyTimes()
++	brokerApp.EXPECT().Ensure(gomock.Any()).DoAndReturn(func(config caas.ApplicationConfig) error {
++		c.Check(config.CharmBaseImage.RegistryPath, gc.Equals, expectedImage)
++		c.Check(config.Containers["test"].Image.RegistryPath, gc.Equals, "example.test/workload:1.0")
++		return nil
++	}).AnyTimes()
++	facade.EXPECT().GarbageCollect("test", []names.Tag(nil), 0, []string(nil), true).DoAndReturn(func(string, []names.Tag, int, []string, bool) error {
++		select {
++		case <-deleteDone:
++		default:
++			close(deleteDone)
++		}
++		return nil
++	}).AnyTimes()
++	lifeCalls := 0
++	facade.EXPECT().Life("test").DoAndReturn(func(string) (life.Value, error) {
++		lifeCalls++
++		if lifeCalls == 1 {
++			return life.Alive, nil
++		}
++		return life.Dead, nil
++	}).AnyTimes()
++
++	config := caasapplicationprovisioner.AppWorkerConfig{
++		Name:       "test",
++		Facade:     facade,
++		Broker:     broker,
++		ModelTag:   s.modelTag,
++		Clock:      s.clock,
++		Logger:     s.logger,
++		UnitFacade: unitFacade,
++	}
++	startFunc := caasapplicationprovisioner.NewAppWorker(config)
++	c.Assert(startFunc, gc.NotNil)
++	appWorker, err := startFunc()
++	c.Assert(err, jc.ErrorIsNil)
++	c.Assert(appWorker, gc.NotNil)
++
++	go appWorker.(appNotifyWorker).Notify()
++
++	select {
++	case <-ensureDone:
++	case <-time.After(coretesting.ShortWait):
++		c.Fatalf("timed out waiting for worker")
++	}
++
++	appWorker.(appNotifyWorker).Notify()
++
++	select {
++	case <-deleteDone:
++	case <-time.After(coretesting.ShortWait):
++		c.Fatalf("timed out waiting for worker to stop")
++	}
++
++	workertest.CleanKill(c, appWorker)
++}
++
+ type appNotifyWorker interface {
+ 	worker.Worker
+ 	Notify()
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,25 @@
++#!/bin/bash
++set -uo pipefail
++cd /testbed
++
++
++set -e
++
++
++case "${1:-}" in
++  base)
++    go test -count=1 -v \
++      ./apiserver/facades/controller/caasunitprovisioner/ \
++      ./caas/kubernetes/provider/application/ \
++      ./cloudconfig/podcfg/ \
++      ./pki/
++    ;;
++  new)
++    go test -count=1 -v ./cloudconfig/podcfg/ ./worker/caasapplicationprovisioner/ \
++      -check.f 'TestImageForBaseRejectsEmptyBaseName|TestImageForBaseRejectsInvalidCharmBaseChannel|TestImageForBaseUsesCharmBaseStable|TestImageForBaseUsesCharmBaseNonStable|TestWorkerUsesSeriesToResolveCharmBaseImage'
++    ;;
++  *)
++    echo "usage: $0 base|new"
++    exit 2
++    ;;
++esac

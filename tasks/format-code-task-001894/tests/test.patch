@@ -1,0 +1,208 @@
+diff --git a/controller/controller_test.go b/controller/controller_test.go
+index 17abb163..42bb0805 100644
+--- a/controller/controller_test.go
++++ b/controller/controller_test.go
+@@ -883,3 +883,181 @@ func TestControllerDualStackConfig(t *testing.T) {
+ 		t.Fatalf("SetConfig that deletes the config was accepted")
+ 	}
+ }
++
++func TestControllerLoadBalancerIPsAnnotation(t *testing.T) {
++	cfg := &config.Config{
++		Pools: map[string]*config.Pool{
++			"pool-dual": {
++				Protocol:   config.BGP,
++				AutoAssign: true,
++				CIDR:       []*net.IPNet{ipnet("1.2.3.0/31"), ipnet("1000::/127")},
++			},
++		},
++	}
++
++	type tc struct {
++		name    string
++		svc     *v1.Service
++		wantIPs []string
++		wantErr bool
++	}
++
++	tests := []tc{
++		{
++			name: "annotation single ipv4",
++			svc: &v1.Service{
++				ObjectMeta: metav1.ObjectMeta{
++					Annotations: map[string]string{
++						"metallb.universe.tf/loadBalancerIPs": "1.2.3.1",
++					},
++				},
++				Spec: v1.ServiceSpec{
++					Type:       "LoadBalancer",
++					ClusterIPs: []string{"1.2.3.4"},
++				},
++			},
++			wantIPs: []string{"1.2.3.1"},
++		},
++		{
++			name: "annotation single ipv6",
++			svc: &v1.Service{
++				ObjectMeta: metav1.ObjectMeta{
++					Annotations: map[string]string{
++						"metallb.universe.tf/loadBalancerIPs": "1000::",
++					},
++				},
++				Spec: v1.ServiceSpec{
++					Type:       "LoadBalancer",
++					ClusterIPs: []string{"3000::1"},
++				},
++			},
++			wantIPs: []string{"1000::"},
++		},
++		{
++			name: "annotation dual-stack v4 v6",
++			svc: &v1.Service{
++				ObjectMeta: metav1.ObjectMeta{
++					Annotations: map[string]string{
++						"metallb.universe.tf/loadBalancerIPs": "1.2.3.1,1000::",
++					},
++				},
++				Spec: v1.ServiceSpec{
++					Type:       "LoadBalancer",
++					ClusterIPs: []string{"1.2.3.4", "3000::1"},
++				},
++			},
++			wantIPs: []string{"1.2.3.1", "1000::"},
++		},
++		{
++			name: "annotation dual-stack with whitespace",
++			svc: &v1.Service{
++				ObjectMeta: metav1.ObjectMeta{
++					Annotations: map[string]string{
++						"metallb.universe.tf/loadBalancerIPs": "1.2.3.1, 1000::",
++					},
++				},
++				Spec: v1.ServiceSpec{
++					Type:       "LoadBalancer",
++					ClusterIPs: []string{"1.2.3.4", "3000::1"},
++				},
++			},
++			wantIPs: []string{"1.2.3.1", "1000::"},
++		},
++		{
++			name: "annotation invalid IP",
++			svc: &v1.Service{
++				ObjectMeta: metav1.ObjectMeta{
++					Annotations: map[string]string{
++						"metallb.universe.tf/loadBalancerIPs": "not-an-ip",
++					},
++				},
++				Spec: v1.ServiceSpec{
++					Type:       "LoadBalancer",
++					ClusterIPs: []string{"1.2.3.4"},
++				},
++			},
++			wantErr: true,
++		},
++		{
++			name: "annotation IP family mismatch",
++			svc: &v1.Service{
++				ObjectMeta: metav1.ObjectMeta{
++					Annotations: map[string]string{
++						"metallb.universe.tf/loadBalancerIPs": "1.2.3.1",
++					},
++				},
++				Spec: v1.ServiceSpec{
++					Type:       "LoadBalancer",
++					ClusterIPs: []string{"3000::1"},
++				},
++			},
++			wantErr: true,
++		},
++		{
++			name: "spec.LoadBalancerIP preserved without annotation",
++			svc: &v1.Service{
++				Spec: v1.ServiceSpec{
++					Type:           "LoadBalancer",
++					LoadBalancerIP: "1.2.3.1",
++					ClusterIPs:     []string{"1.2.3.4"},
++				},
++			},
++			wantIPs: []string{"1.2.3.1"},
++		},
++		{
++			name: "empty annotation falls back to auto-allocation",
++			svc: &v1.Service{
++				ObjectMeta: metav1.ObjectMeta{
++					Annotations: map[string]string{
++						"metallb.universe.tf/loadBalancerIPs": "",
++					},
++				},
++				Spec: v1.ServiceSpec{
++					Type:       "LoadBalancer",
++					ClusterIPs: []string{"1.2.3.4"},
++				},
++			},
++			wantIPs: []string{"1.2.3.0"},
++		},
++	}
++
++	l := log.NewNopLogger()
++
++	for _, test := range tests {
++		t.Run(test.name, func(t *testing.T) {
++			k := &testK8S{t: t}
++			c := &controller{
++				ips:    allocator.New(),
++				client: k,
++			}
++			if c.SetConfig(l, cfg) == k8s.SyncStateError {
++				t.Fatalf("SetConfig failed")
++			}
++			c.MarkSynced(l)
++
++			if c.SetBalancer(l, "test", test.svc, k8s.EpsOrSlices{}) == k8s.SyncStateError {
++				t.Fatalf("SetBalancer returned SyncStateError")
++			}
++
++			if test.wantErr != k.loggedWarning {
++				t.Fatalf("loggedWarning got %v, want %v", k.loggedWarning, test.wantErr)
++			}
++
++			if test.wantErr {
++				return
++			}
++
++			got := k.gotService(test.svc)
++			if got == nil {
++				t.Fatalf("expected service to be mutated, but no mutation recorded")
++			}
++			var gotIPs []string
++			for _, ing := range got.Status.LoadBalancer.Ingress {
++				gotIPs = append(gotIPs, ing.IP)
++			}
++			if diff := cmp.Diff(test.wantIPs, gotIPs); diff != "" {
++				t.Errorf("status IPs mismatch (-want +got):\n%s", diff)
++			}
++		})
++	}
++}
+diff --git a/test_commands.json b/test_commands.json
+new file mode 100644
+index 00000000..f4728156
+--- /dev/null
++++ b/test_commands.json
+@@ -0,0 +1,3 @@
++{
++  "test_commands": ["go test ./controller/ -run TestControllerLoadBalancerIPsAnnotation -v"]
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,8 @@
++#!/usr/bin/env bash
++
++set -uo pipefail
++cd /testbed
++rc=0
++go test ./controller/ -run TestControllerLoadBalancerIPsAnnotation -v
++rc=$(( rc | $? ))
++exit $rc

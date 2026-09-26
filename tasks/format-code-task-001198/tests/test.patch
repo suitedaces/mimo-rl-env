@@ -1,0 +1,434 @@
+diff --git a/tests/checks/codespec_profile_composition_test.py b/tests/checks/codespec_profile_composition_test.py
+new file mode 100644
+index 0000000..851f809
+--- /dev/null
++++ b/tests/checks/codespec_profile_composition_test.py
+@@ -0,0 +1,416 @@
++import sys
++import types
++
++import pytest
++
++from fontbakery.checkrunner import CheckRunner
++from fontbakery.configuration import Configuration
++from fontbakery.fonts_profile import profile_factory, setup_context
++from fontbakery.status import FAIL, INFO, PASS, WARN
++
++
++FILE_SIZE_CHECK = "com.google.fonts/check/file_size"
++UNITS_PER_EM_CHECK = "com.google.fonts/check/unitsperem"
++
++
++class ResultCollector:
++    def __init__(self):
++        self.results = []
++
++    def start(self, order):
++        self.order = order
++
++    def receive_result(self, result):
++        self.results.append(result)
++
++    def end(self):
++        pass
++
++
++def install_profile(monkeypatch, short_name, profile_data):
++    full_name = f"fontbakery.profiles.{short_name}"
++    module = types.ModuleType(full_name)
++    module.PROFILE = profile_data
++    monkeypatch.setitem(sys.modules, full_name, module)
++    return module
++
++
++def run_file_size_check(profile, path, check_config=None):
++    supplied = {
++        "explicit_checks": [FILE_SIZE_CHECK],
++        "full_lists": True,
++    }
++    if check_config is not None:
++        supplied[FILE_SIZE_CHECK] = check_config
++    runner = CheckRunner(
++        profile,
++        setup_context([str(path)]),
++        Configuration(**supplied),
++    )
++    collector = ResultCollector()
++    runner.run([collector])
++    assert len(collector.results) == 1
++    return collector.results[0].results
++
++
++def only_subresult(results):
++    assert len(results) == 1
++    return results[0]
++
++
++def test_codespec_nested_defaults_merge_in_include_order(monkeypatch):
++    base = install_profile(
++        monkeypatch,
++        "codespec_defaults_base",
++        {
++            "name": "codespec-defaults-base",
++            "sections": {"Base": [FILE_SIZE_CHECK]},
++            "configuration_defaults": {
++                FILE_SIZE_CHECK: {
++                    "WARN_SIZE": 10,
++                    "FAIL_SIZE": 100,
++                    "base_marker": "base",
++                }
++            },
++        },
++    )
++    middle = install_profile(
++        monkeypatch,
++        "codespec_defaults_middle",
++        {
++            "name": "codespec-defaults-middle",
++            "include_profiles": ["codespec_defaults_base"],
++            "sections": {},
++            "configuration_defaults": {
++                FILE_SIZE_CHECK: {
++                    "WARN_SIZE": 20,
++                    "middle_marker": "middle",
++                }
++            },
++        },
++    )
++    install_profile(
++        monkeypatch,
++        "codespec_defaults_sibling",
++        {
++            "name": "codespec-defaults-sibling",
++            "sections": {},
++            "configuration_defaults": {
++                FILE_SIZE_CHECK: {
++                    "WARN_SIZE": 30,
++                    "sibling_marker": "sibling",
++                }
++            },
++        },
++    )
++
++    middle_profile = profile_factory(middle)
++    assert middle_profile.configuration_defaults[FILE_SIZE_CHECK] == {
++        "WARN_SIZE": 20,
++        "FAIL_SIZE": 100,
++        "base_marker": "base",
++        "middle_marker": "middle",
++    }
++
++    root = install_profile(
++        monkeypatch,
++        "codespec_defaults_root",
++        {
++            "name": "codespec-defaults-root",
++            "include_profiles": [
++                "codespec_defaults_middle",
++                "codespec_defaults_sibling",
++            ],
++            "sections": {},
++            "configuration_defaults": {
++                FILE_SIZE_CHECK: {
++                    "root_marker": "root",
++                }
++            },
++        },
++    )
++    profile = profile_factory(root)
++    assert profile.configuration_defaults[FILE_SIZE_CHECK] == {
++        "WARN_SIZE": 30,
++        "FAIL_SIZE": 100,
++        "base_marker": "base",
++        "middle_marker": "middle",
++        "sibling_marker": "sibling",
++        "root_marker": "root",
++    }
++
++
++def test_codespec_user_check_config_merges_over_profile_defaults(
++    monkeypatch, tmp_path
++):
++    module = install_profile(
++        monkeypatch,
++        "codespec_runtime_config",
++        {
++            "name": "codespec-runtime-config",
++            "sections": {"Runtime": [FILE_SIZE_CHECK]},
++            "configuration_defaults": {
++                FILE_SIZE_CHECK: {"WARN_SIZE": 40, "FAIL_SIZE": 100}
++            },
++        },
++    )
++    profile = profile_factory(module)
++
++    font_path = tmp_path / "configured.ttf"
++    font_path.write_bytes(b"x" * 60)
++    result = only_subresult(
++        run_file_size_check(profile, font_path, {"WARN_SIZE": 55})
++    )
++    assert (result.status, result.message.code) == (WARN, "large-font")
++
++    small_font_path = tmp_path / "explicit-zero.ttf"
++    small_font_path.write_bytes(b"x" * 20)
++    result = only_subresult(
++        run_file_size_check(profile, small_font_path, {"WARN_SIZE": 0})
++    )
++    assert (result.status, result.message.code) == (WARN, "large-font")
++
++
++def test_codespec_override_rules_merge_by_message_code(monkeypatch, tmp_path):
++    install_profile(
++        monkeypatch,
++        "codespec_override_base",
++        {
++            "name": "codespec-override-base",
++            "sections": {"Policy": [FILE_SIZE_CHECK]},
++            "overrides": {
++                FILE_SIZE_CHECK: [
++                    {
++                        "code": "large-font",
++                        "status": "INFO",
++                        "reason": "Base profile accepts moderately large files.",
++                    },
++                    {
++                        "code": "massive-font",
++                        "status": "WARN",
++                        "reason": "Base profile only warns for massive files.",
++                    },
++                ]
++            },
++        },
++    )
++    child = install_profile(
++        monkeypatch,
++        "codespec_override_child",
++        {
++            "name": "codespec-override-child",
++            "include_profiles": ["codespec_override_base"],
++            "sections": {},
++            "configuration_defaults": {
++                FILE_SIZE_CHECK: {"WARN_SIZE": 40, "FAIL_SIZE": 100}
++            },
++            "overrides": {
++                FILE_SIZE_CHECK: [
++                    {
++                        "code": "massive-font",
++                        "status": "FAIL",
++                        "reason": "Child profile rejects massive files.",
++                    }
++                ]
++            },
++        },
++    )
++    profile = profile_factory(child)
++
++    moderate = tmp_path / "moderate.ttf"
++    moderate.write_bytes(b"x" * 60)
++    result = only_subresult(run_file_size_check(profile, moderate))
++    assert (result.status, result.message.code) == (INFO, "large-font")
++
++    massive = tmp_path / "massive.ttf"
++    massive.write_bytes(b"x" * 120)
++    result = only_subresult(run_file_size_check(profile, massive))
++    assert (result.status, result.message.code) == (FAIL, "massive-font")
++
++
++def test_codespec_later_include_then_local_override_wins(monkeypatch, tmp_path):
++    for suffix, status in (("first", "INFO"), ("second", "FAIL")):
++        install_profile(
++            monkeypatch,
++            f"codespec_ordered_override_{suffix}",
++            {
++                "name": f"codespec-ordered-override-{suffix}",
++                "sections": {suffix: [FILE_SIZE_CHECK]} if suffix == "first" else {},
++                "overrides": {
++                    FILE_SIZE_CHECK: [
++                        {
++                            "code": "large-font",
++                            "status": status,
++                            "reason": f"Policy from {suffix} include.",
++                        }
++                    ]
++                },
++            },
++        )
++
++    ordered_root = install_profile(
++        monkeypatch,
++        "codespec_ordered_override_root",
++        {
++            "name": "codespec-ordered-override-root",
++            "include_profiles": [
++                "codespec_ordered_override_first",
++                "codespec_ordered_override_second",
++            ],
++            "sections": {},
++            "configuration_defaults": {
++                FILE_SIZE_CHECK: {"WARN_SIZE": 40, "FAIL_SIZE": 100}
++            },
++        },
++    )
++    font_path = tmp_path / "ordered.ttf"
++    font_path.write_bytes(b"x" * 60)
++    result = only_subresult(
++        run_file_size_check(profile_factory(ordered_root), font_path)
++    )
++    assert (result.status, result.message.code) == (FAIL, "large-font")
++
++    local_root = install_profile(
++        monkeypatch,
++        "codespec_local_override_root",
++        {
++            "name": "codespec-local-override-root",
++            "include_profiles": ["codespec_ordered_override_root"],
++            "sections": {},
++            "configuration_defaults": {
++                FILE_SIZE_CHECK: {"WARN_SIZE": 40, "FAIL_SIZE": 100}
++            },
++            "overrides": {
++                FILE_SIZE_CHECK: [
++                    {
++                        "code": "large-font",
++                        "status": "PASS",
++                        "reason": "The including profile has final say.",
++                    }
++                ]
++            },
++        },
++    )
++    result = only_subresult(
++        run_file_size_check(profile_factory(local_root), font_path)
++    )
++    assert (result.status, result.message.code) == (PASS, "large-font")
++
++
++def test_codespec_duplicate_checks_keep_first_section(monkeypatch):
++    install_profile(
++        monkeypatch,
++        "codespec_duplicate_first",
++        {
++            "name": "codespec-duplicate-first",
++            "sections": {
++                "First section": [FILE_SIZE_CHECK, UNITS_PER_EM_CHECK]
++            },
++        },
++    )
++    install_profile(
++        monkeypatch,
++        "codespec_duplicate_second",
++        {
++            "name": "codespec-duplicate-second",
++            "sections": {"Second section": [FILE_SIZE_CHECK]},
++        },
++    )
++    root = install_profile(
++        monkeypatch,
++        "codespec_duplicate_root",
++        {
++            "name": "codespec-duplicate-root",
++            "include_profiles": [
++                "codespec_duplicate_first",
++                "codespec_duplicate_second",
++            ],
++            "sections": {"Root section": [FILE_SIZE_CHECK]},
++        },
++    )
++    profile = profile_factory(root)
++    placements = [
++        (section.name, check.id)
++        for section in profile.sections
++        for check in section.checks
++    ]
++    assert placements == [
++        ("First section", FILE_SIZE_CHECK),
++        ("First section", UNITS_PER_EM_CHECK),
++    ]
++
++
++def test_codespec_profile_compilation_is_deeply_isolated(monkeypatch):
++    source = {
++        "name": "codespec-isolated",
++        "sections": {"Policy": [FILE_SIZE_CHECK]},
++        "configuration_defaults": {
++            FILE_SIZE_CHECK: {"WARN_SIZE": 40, "FAIL_SIZE": 100}
++        },
++        "overrides": {
++            FILE_SIZE_CHECK: [
++                {
++                    "code": "large-font",
++                    "status": "INFO",
++                    "reason": "Original policy.",
++                }
++            ]
++        },
++    }
++    module = install_profile(monkeypatch, "codespec_isolated", source)
++    first = profile_factory(module)
++
++    source["configuration_defaults"][FILE_SIZE_CHECK]["WARN_SIZE"] = 999
++    source["overrides"][FILE_SIZE_CHECK][0]["status"] = "FAIL"
++    assert first.configuration_defaults[FILE_SIZE_CHECK]["WARN_SIZE"] == 40
++    assert first.overrides[FILE_SIZE_CHECK][0]["status"] == "INFO"
++
++    first.configuration_defaults[FILE_SIZE_CHECK]["FAIL_SIZE"] = 777
++    first.overrides[FILE_SIZE_CHECK][0]["reason"] = "Mutated result."
++    assert source["configuration_defaults"][FILE_SIZE_CHECK]["FAIL_SIZE"] == 100
++    assert source["overrides"][FILE_SIZE_CHECK][0]["reason"] == "Original policy."
++
++    second = profile_factory(module)
++    assert second.configuration_defaults[FILE_SIZE_CHECK] == {
++        "WARN_SIZE": 999,
++        "FAIL_SIZE": 100,
++    }
++    assert second.overrides[FILE_SIZE_CHECK][0]["reason"] == "Original policy."
++
++
++def test_codespec_include_cycle_reports_the_chain(monkeypatch):
++    first = install_profile(
++        monkeypatch,
++        "codespec_cycle_first",
++        {
++            "name": "codespec-cycle-first",
++            "include_profiles": ["codespec_cycle_second"],
++            "sections": {},
++        },
++    )
++    install_profile(
++        monkeypatch,
++        "codespec_cycle_second",
++        {
++            "name": "codespec-cycle-second",
++            "include_profiles": ["codespec_cycle_third"],
++            "sections": {},
++        },
++    )
++    install_profile(
++        monkeypatch,
++        "codespec_cycle_third",
++        {
++            "name": "codespec-cycle-third",
++            "include_profiles": ["codespec_cycle_first"],
++            "sections": {},
++        },
++    )
++
++    with pytest.raises(ValueError) as exc_info:
++        profile_factory(first)
++
++    message = str(exc_info.value).lower()
++    assert "cycle" in message
++    for name in ("codespec_cycle_first", "codespec_cycle_second", "codespec_cycle_third"):
++        assert name in message
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,7 @@
++#!/bin/bash
++set -euo pipefail
++
++
++pytest -q \
++  tests/checks/codespec_profile_composition_test.py \
++  tests/checks/external_profile_test.py

@@ -1,0 +1,872 @@
+diff --git a/usercase-test-coderl/offline_network_guard.js b/usercase-test-coderl/offline_network_guard.js
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/offline_network_guard.js
+@@ -0,0 +1,124 @@
++
++'use strict';
++
++const childProcess = require('child_process');
++const dgram = require('dgram');
++const dns = require('dns');
++const http = require('http');
++const https = require('https');
++const net = require('net');
++const tls = require('tls');
++
++function offlineError(target) {
++  return new Error('local offline network guard blocked ' + target);
++}
++
++function isLocalHost(host) {
++  if (host === undefined || host === null || host === '') return true;
++  host = String(host).replace(/^\[|\]$/g, '').toLowerCase();
++  return (
++    host === 'localhost' ||
++    host === '0.0.0.0' ||
++    host === '::' ||
++    host === '::1' ||
++    host === '127.0.0.1' ||
++    /^127\.\d+\.\d+\.\d+$/.test(host)
++  );
++}
++
++function hostFromRequestArgs(args) {
++  const first = args[0];
++  const second = args[1];
++  if (first instanceof URL) return first.hostname;
++  if (typeof first === 'string') return new URL(first).hostname;
++  if (first && typeof first === 'object') return first.hostname || first.host;
++  if (second && typeof second === 'object') return second.hostname || second.host;
++  return undefined;
++}
++
++function hostFromConnectArgs(args) {
++  const first = args[0];
++  if (first && typeof first === 'object') return first.hostname || first.host;
++  if (typeof first === 'number') return args[1];
++  return first;
++}
++
++function assertLocal(host, target) {
++  if (!isLocalHost(host)) throw offlineError(target + ' to ' + host);
++}
++
++function wrapRequest(module, name) {
++  const original = module[name];
++  module[name] = function () {
++    assertLocal(hostFromRequestArgs(arguments), module === https ? 'https.' + name : 'http.' + name);
++    return original.apply(this, arguments);
++  };
++}
++
++wrapRequest(http, 'request');
++wrapRequest(http, 'get');
++wrapRequest(https, 'request');
++wrapRequest(https, 'get');
++
++const originalNetConnect = net.connect;
++const originalNetCreateConnection = net.createConnection;
++const originalSocketConnect = net.Socket.prototype.connect;
++net.connect = function () {
++  assertLocal(hostFromConnectArgs(arguments), 'net.connect');
++  return originalNetConnect.apply(this, arguments);
++};
++net.createConnection = function () {
++  assertLocal(hostFromConnectArgs(arguments), 'net.createConnection');
++  return originalNetCreateConnection.apply(this, arguments);
++};
++net.Socket.prototype.connect = function () {
++  assertLocal(hostFromConnectArgs(arguments), 'net.Socket.connect');
++  return originalSocketConnect.apply(this, arguments);
++};
++
++const originalTlsConnect = tls.connect;
++tls.connect = function () {
++  assertLocal(hostFromConnectArgs(arguments), 'tls.connect');
++  return originalTlsConnect.apply(this, arguments);
++};
++
++const originalDgramCreateSocket = dgram.createSocket;
++dgram.createSocket = function () {
++  const socket = originalDgramCreateSocket.apply(this, arguments);
++  const originalSend = socket.send;
++  socket.send = function () {
++    const host = arguments.length >= 4 ? arguments[arguments.length - 2] : undefined;
++    assertLocal(host, 'dgram.send');
++    return originalSend.apply(this, arguments);
++  };
++  return socket;
++};
++
++const originalLookup = dns.lookup;
++dns.lookup = function (hostname) {
++  assertLocal(hostname, 'dns.lookup');
++  return originalLookup.apply(this, arguments);
++};
++if (dns.promises && dns.promises.lookup) {
++  const originalPromisesLookup = dns.promises.lookup;
++  dns.promises.lookup = function (hostname) {
++    assertLocal(hostname, 'dns.promises.lookup');
++    return originalPromisesLookup.apply(this, arguments);
++  };
++}
++
++if (globalThis.fetch) {
++  const originalFetch = globalThis.fetch;
++  globalThis.fetch = function (input) {
++    const url = typeof input === 'string' || input instanceof URL ? new URL(input) : new URL(input.url);
++    assertLocal(url.hostname, 'fetch');
++    return originalFetch.apply(this, arguments);
++  };
++}
++
++['exec', 'execFile', 'fork', 'spawn', 'execSync', 'execFileSync', 'spawnSync'].forEach(function (name) {
++  const original = childProcess[name];
++  childProcess[name] = function () {
++    throw offlineError('child_process.' + name);
++  };
++});
+diff --git a/usercase-test-coderl/routing_lifecycle.test.js b/usercase-test-coderl/routing_lifecycle.test.js
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/routing_lifecycle.test.js
+@@ -0,0 +1,716 @@
++const assert = require('assert');
++const fs = require('fs');
++const path = require('path');
++const vm = require('vm');
++
++
++
++
++
++
++
++
++
++
++
++const REPO = '/workspace/repo';
++const PUBLIC_SCRIPTS = [
++  'lib/davis.js',
++  'lib/davis.utils.js',
++  'lib/davis.listener.js',
++  'lib/davis.event.js',
++  'lib/davis.logger.js',
++  'lib/davis.route.js',
++  'lib/davis.router.js',
++  'lib/davis.history.js',
++  'lib/davis.location.js',
++  'lib/davis.request.js',
++  'lib/davis.app.js'
++];
++
++function loadDavis(currentPath) {
++  const bindingLog = [];
++  const activeDelegates = {};
++  let activeDelegateCount = 0;
++  let maxActiveDelegateCount = 0;
++  let delegateCalls = 0;
++  let undelegateCalls = 0;
++
++  function keyFor(selector, eventName) {
++    return selector + ':' + eventName;
++  }
++
++  function JQueryObject(target) {
++    this.target = target;
++  }
++
++  JQueryObject.prototype.delegate = function (selector, eventName) {
++    const key = keyFor(selector, eventName);
++    activeDelegates[key] = (activeDelegates[key] || 0) + 1;
++    activeDelegateCount += 1;
++    maxActiveDelegateCount = Math.max(maxActiveDelegateCount, activeDelegateCount);
++    delegateCalls += 1;
++    bindingLog.push('delegate:' + selector + ':' + eventName);
++    return this;
++  };
++
++  JQueryObject.prototype.undelegate = function (selector, eventName) {
++    const key = keyFor(selector, eventName);
++    if (activeDelegates[key]) {
++      activeDelegates[key] -= 1;
++      activeDelegateCount -= 1;
++    }
++    undelegateCalls += 1;
++    bindingLog.push('undelegate:' + selector + ':' + eventName);
++    return this;
++  };
++
++  JQueryObject.prototype.prop = function () { return ''; };
++  JQueryObject.prototype.attr = function () { return ''; };
++  JQueryObject.prototype.serialize = function () { return ''; };
++  JQueryObject.prototype.submit = function () {
++    bindingLog.push('submit');
++    return this;
++  };
++
++  function $(target) {
++    return new JQueryObject(target);
++  }
++
++  $.extend = function () {
++    const out = {};
++    for (let i = 0; i < arguments.length; i += 1) {
++      const obj = arguments[i];
++      if (!obj) continue;
++      for (const key in obj) out[key] = obj[key];
++    }
++    return out;
++  };
++
++  $.param = function (obj) {
++    return Object.keys(obj).map(function (key) {
++      return encodeURIComponent(key) + '=' + encodeURIComponent(obj[key]);
++    }).join('&');
++  };
++
++  const consoleLog = [];
++  const context = {
++    console: {
++      log: function (message) { consoleLog.push('log:' + message); },
++      info: function (message) { consoleLog.push('info:' + message); },
++      warn: function (message) { consoleLog.push('warn:' + message); },
++      error: function (message) { consoleLog.push('error:' + message); }
++    },
++    window: {
++      jQuery: $,
++      console: {
++        info: function (message) { consoleLog.push('info:' + message); },
++        warn: function (message) { consoleLog.push('warn:' + message); },
++        error: function (message) { consoleLog.push('error:' + message); }
++      },
++      history: {
++        pushState: function () {},
++        replaceState: function () {}
++      },
++      addEventListener: function () {},
++      location: {
++        pathname: currentPath || '/',
++        search: '',
++        host: 'example.com',
++        protocol: 'http:'
++      }
++    },
++    document: {
++      title: 'Design Title',
++      createElement: function () {
++        return {
++          href: '',
++          host: 'example.com',
++          protocol: 'http:',
++          nodeName: 'A'
++        };
++      }
++    },
++    history: {
++      pushState: function () {},
++      replaceState: function () {}
++    },
++    setTimeout: setTimeout,
++    clearTimeout: clearTimeout
++  };
++
++  context.jQuery = $;
++  context.window.window = context.window;
++  context.window.document = context.document;
++
++  vm.createContext(context);
++  PUBLIC_SCRIPTS.forEach(function (scriptPath) {
++    vm.runInContext(
++      fs.readFileSync(path.join(REPO, scriptPath), 'utf8'),
++      context,
++      { filename: scriptPath }
++    );
++  });
++
++  return {
++    Davis: context.Davis,
++    bindingLog: bindingLog,
++    consoleLog: consoleLog,
++    listenerStats: function () {
++      return {
++        activeDelegates: activeDelegateCount,
++        maxActiveDelegates: maxActiveDelegateCount,
++        delegateCalls: delegateCalls,
++        undelegateCalls: undelegateCalls
++      };
++    }
++  };
++}
++
++function installLocationDelegate(Davis, log, currentPath) {
++  const handlers = [];
++  Davis.location.setLocationDelegate({
++    current: function () {
++      log.push('delegate:current');
++      return currentPath || '/';
++    },
++    onChange: function (handler) {
++      handlers.push(handler);
++      log.push('delegate:onChange:' + handlers.length);
++    },
++    assign: function (request) {
++      log.push('delegate:assign:' + request.toString());
++      handlers.forEach(function (handler) { handler(request); });
++    },
++    replace: function (request) {
++      log.push('delegate:replace:' + request.toString());
++      handlers.forEach(function (handler) { handler(request); });
++    }
++  });
++  return handlers;
++}
++
++function eventArgsToString(args) {
++  return Array.prototype.slice.call(args).map(function (arg) {
++    return arg && arg.toString ? arg.toString() : String(arg);
++  }).join('|');
++}
++
++function recordEvents(app, log, events) {
++  events.forEach(function (eventName) {
++    app.bind(eventName, function () {
++
++      log.push('event:' + eventName + ':' + eventArgsToString([arguments[0]]));
++    });
++  });
++}
++
++function assertBindingLogEntries(actual, expected) {
++  assert.deepStrictEqual(actual.slice().sort(), expected.slice().sort());
++}
++
++function test(name, fn) {
++  try {
++    fn();
++    console.log('ok - ' + name);
++  } catch (error) {
++    console.error('not ok - ' + name);
++    throw error;
++  }
++}
++
++test('start binds once and stop unbinds listeners', function () {
++
++
++
++
++  const harness = loadDavis('/');
++  const Davis = harness.Davis;
++  const log = [];
++  installLocationDelegate(Davis, log, '/');
++  const app = new Davis.App();
++
++  app.bind('start', function () { log.push('event:start:' + app.running); });
++  app.bind('stop', function () { log.push('event:stop:' + app.running); });
++
++  log.push('fresh:running:' + app.running);
++  app.start();
++  log.push('after-start:running:' + app.running);
++  app.start();
++  log.push('after-second-start:running:' + app.running);
++  app.stop();
++  log.push('after-stop:running:' + app.running);
++
++
++  assert.deepStrictEqual(log.filter(function (entry) {
++    return entry.indexOf('delegate:onChange:') !== 0;
++  }), [
++    'fresh:running:false',
++    'event:start:false',
++    'after-start:running:true',
++    'after-second-start:running:true',
++    'event:stop:true',
++    'after-stop:running:false'
++  ]);
++  assert.deepStrictEqual(log.filter(function (entry) {
++    return entry.indexOf('delegate:onChange:') === 0;
++  }), ['delegate:onChange:1']);
++
++  assertBindingLogEntries(harness.bindingLog, [
++    'delegate:form:submit',
++    'delegate:a:click',
++    'undelegate:a:click',
++    'undelegate:form:submit'
++  ]);
++  assert.deepStrictEqual(harness.listenerStats(), {
++    activeDelegates: 0,
++    maxActiveDelegates: 2,
++    delegateCalls: 2,
++    undelegateCalls: 2
++  });
++});
++
++test('unsupported browser triggers unsupported and remains stopped', function () {
++
++
++
++
++  const harness = loadDavis('/');
++  const Davis = harness.Davis;
++  const log = [];
++  installLocationDelegate(Davis, log, '/');
++  Davis.supported = function () { return false; };
++  const app = new Davis.App();
++
++  app.bind('unsupported', function () { log.push('event:unsupported:' + app.running); });
++
++  log.push('fresh:running:' + app.running);
++  app.start();
++  log.push('after-start:running:' + app.running);
++
++  assert.deepStrictEqual(log, [
++    'fresh:running:false',
++    'event:unsupported:false',
++    'after-start:running:false'
++  ]);
++  assert.deepStrictEqual(harness.bindingLog, []);
++  assert.deepStrictEqual(harness.listenerStats(), {
++    activeDelegates: 0,
++    maxActiveDelegates: 0,
++    delegateCalls: 0,
++    undelegateCalls: 0
++  });
++});
++
++test('request delivered before start is ignored by the app session', function () {
++
++
++
++
++  const harness = loadDavis('/');
++  const Davis = harness.Davis;
++  const log = [];
++  installLocationDelegate(Davis, log, '/');
++  const app = new Davis.App();
++
++  recordEvents(app, log, ['lookupRoute', 'runRoute', 'routeComplete', 'requestHalted', 'routeNotFound']);
++  app.get('/cold', function (request) { log.push('route:' + request.toString()); });
++
++  Davis.location.assign(new Davis.Request('/cold'));
++  log.push('after-request-running:' + app.running);
++
++  assert.deepStrictEqual(log, [
++    'delegate:assign:GET /cold',
++    'after-request-running:false'
++  ]);
++  assert.deepStrictEqual(harness.bindingLog, []);
++});
++
++test('matching request runs before filters route and after filters in order', function () {
++
++
++
++
++  const harness = loadDavis('/');
++  const Davis = harness.Davis;
++  const log = [];
++  installLocationDelegate(Davis, log, '/');
++  const app = new Davis.App();
++
++  recordEvents(app, log, ['lookupRoute', 'runRoute', 'routeComplete', 'requestHalted', 'routeNotFound']);
++  app.before('/alpha', function (request) {
++    log.push('before1:' + request.toString());
++    return true;
++  });
++  app.before('/alpha', function (request) {
++    log.push('before2:' + request.toString());
++  });
++  app.get('/alpha', function (request) {
++    log.push('route:' + request.toString());
++  });
++  app.after('/alpha', function (request) {
++    log.push('after:' + request.toString());
++    return true;
++  });
++
++  app.start();
++  log.push('running:' + app.running);
++  Davis.location.assign(new Davis.Request('/alpha'));
++  log.push('after-request-running:' + app.running);
++
++
++  assert.deepStrictEqual(log, [
++    'delegate:onChange:1',
++    'running:true',
++    'delegate:assign:GET /alpha',
++    'before1:GET /alpha',
++    'before2:GET /alpha',
++    'event:lookupRoute:GET /alpha',
++    'event:runRoute:GET /alpha',
++    'route:GET /alpha',
++    'event:routeComplete:GET /alpha',
++    'after:GET /alpha',
++    'after-request-running:true'
++  ]);
++
++  assertBindingLogEntries(harness.bindingLog, [
++    'delegate:form:submit',
++    'delegate:a:click'
++  ]);
++});
++
++test('before filter returning false halts the request', function () {
++
++
++
++
++  const harness = loadDavis('/');
++  const Davis = harness.Davis;
++  const log = [];
++  installLocationDelegate(Davis, log, '/');
++  const app = new Davis.App();
++
++  recordEvents(app, log, ['lookupRoute', 'runRoute', 'routeComplete', 'requestHalted', 'routeNotFound']);
++  app.before('/halt', function (request) {
++    log.push('before1:' + request.toString());
++    return false;
++  });
++  app.before('/halt', function (request) {
++    log.push('before2:' + request.toString());
++    return true;
++  });
++  app.get('/halt', function (request) {
++    log.push('route:' + request.toString());
++  });
++  app.after('/halt', function (request) {
++    log.push('after:' + request.toString());
++  });
++
++  app.start();
++  Davis.location.assign(new Davis.Request('/halt'));
++  log.push('after-request-running:' + app.running);
++
++  assert.deepStrictEqual(log, [
++    'delegate:onChange:1',
++    'delegate:assign:GET /halt',
++    'before1:GET /halt',
++    'event:requestHalted:GET /halt',
++    'after-request-running:true'
++  ]);
++});
++
++test('non page load route miss delegates to server when handling is disabled', function () {
++
++
++
++
++  const harness = loadDavis('/');
++  const Davis = harness.Davis;
++  const log = [];
++  installLocationDelegate(Davis, log, '/');
++  const app = new Davis.App();
++
++  app.bind('routeNotFound', function (request) {
++    log.push('event:routeNotFound:' + request.toString() + ':pageLoad=' + request.isForPageLoad);
++  });
++  app.bind('stop', function () { log.push('event:stop:' + app.running); });
++
++  app.start();
++  Davis.location.assign(new Davis.Request({
++    fullPath: '/missing',
++    delegateToServer: function () { log.push('delegateToServer'); }
++  }));
++  log.push('after-miss-running:' + app.running);
++
++  assert.deepStrictEqual(log, [
++    'delegate:onChange:1',
++    'delegate:assign:GET /missing',
++    'event:routeNotFound:GET /missing:pageLoad=false',
++    'event:stop:true',
++    'delegateToServer',
++    'after-miss-running:false'
++  ]);
++
++  assertBindingLogEntries(harness.bindingLog, [
++    'delegate:form:submit',
++    'delegate:a:click',
++    'undelegate:a:click',
++    'undelegate:form:submit'
++  ]);
++});
++
++test('page load route miss does not delegate to server', function () {
++
++
++
++
++  const harness = loadDavis('/missing-load');
++  const Davis = harness.Davis;
++  const log = [];
++  installLocationDelegate(Davis, log, '/missing-load');
++  const app = new Davis.App();
++
++  app.configure(function (settings) { settings.generateRequestOnPageLoad = true; });
++  app.bind('routeNotFound', function (request) {
++    log.push('event:routeNotFound:' + request.toString() + ':pageLoad=' + request.isForPageLoad);
++  });
++  app.bind('stop', function () { log.push('event:stop:' + app.running); });
++
++  app.start();
++  log.push('after-start-running:' + app.running);
++
++  assert.deepStrictEqual(log, [
++    'delegate:onChange:1',
++    'delegate:current',
++    'event:routeNotFound:GET /missing-load:pageLoad=true',
++    'after-start-running:true'
++  ]);
++
++  assertBindingLogEntries(harness.bindingLog, [
++    'delegate:form:submit',
++    'delegate:a:click'
++  ]);
++});
++
++test('generated page load request uses the same successful route pipeline', function () {
++
++
++
++
++  const harness = loadDavis('/load');
++  const Davis = harness.Davis;
++  const log = [];
++  installLocationDelegate(Davis, log, '/load');
++  const app = new Davis.App();
++
++  app.configure(function (settings) { settings.generateRequestOnPageLoad = true; });
++  recordEvents(app, log, ['lookupRoute', 'runRoute', 'routeComplete']);
++  app.before('/load', function (request) {
++    log.push('before:' + request.toString() + ':pageLoad=' + request.isForPageLoad);
++    return true;
++  });
++  app.get('/load', function (request) {
++    log.push('route:' + request.toString() + ':pageLoad=' + request.isForPageLoad);
++  });
++  app.after('/load', function (request) {
++    log.push('after:' + request.toString() + ':pageLoad=' + request.isForPageLoad);
++  });
++
++  app.start();
++  log.push('after-start-running:' + app.running);
++
++
++  assert.deepStrictEqual(log, [
++    'delegate:onChange:1',
++    'delegate:current',
++    'before:GET /load:pageLoad=true',
++    'event:lookupRoute:GET /load',
++    'event:runRoute:GET /load',
++    'route:GET /load:pageLoad=true',
++    'event:routeComplete:GET /load',
++    'after:GET /load:pageLoad=true',
++    'after-start-running:true'
++  ]);
++});
++
++test('route errors are rethrown when throwErrors is true', function () {
++
++
++
++
++  const harness = loadDavis('/');
++  const Davis = harness.Davis;
++  const log = [];
++  installLocationDelegate(Davis, log, '/');
++  const app = new Davis.App();
++
++  app.configure(function (settings) { settings.throwErrors = true; });
++  app.bind('routeError', function (request, route, error) {
++
++    log.push('event:routeError' + (error && error.name ? ':' + error.name : ''));
++  });
++  app.get('/boom', function () {
++    throw new TypeError('route exploded');
++  });
++
++  app.start();
++  assert.throws(function () {
++    Davis.location.assign(new Davis.Request('/boom'));
++  }, TypeError);
++  log.push('after-error-running:' + app.running);
++
++
++  assert.deepStrictEqual(log.filter(function (entry) {
++    return entry.indexOf('delegate:') === 0;
++  }), ['delegate:onChange:1', 'delegate:assign:GET /boom']);
++  assert(log.some(function (entry) { return entry.indexOf('event:routeError') === 0; }));
++  assert(log.indexOf('after-error-running:true') !== -1);
++});
++
++test('route errors are logged when throwErrors is false', function () {
++
++
++
++
++  const harness = loadDavis('/');
++  const Davis = harness.Davis;
++  const log = [];
++  installLocationDelegate(Davis, log, '/');
++  const app = new Davis.App();
++
++  app.configure(function (settings) { settings.throwErrors = false; });
++  app.logger.error = function (message) {
++    const rendered = message && message.message ? message.message : message;
++    log.push('logger:error:' + rendered);
++  };
++  app.bind('routeError', function (request, route, error) {
++
++    log.push('event:routeError' + (error && error.name ? ':' + error.name : ''));
++  });
++  app.get('/boom', function () {
++    throw new TypeError('route exploded');
++  });
++
++  app.start();
++  Davis.location.assign(new Davis.Request('/boom'));
++  log.push('assign:returned');
++  log.push('after-error-running:' + app.running);
++
++
++  assert.deepStrictEqual(log.filter(function (entry) {
++    return entry.indexOf('delegate:') === 0;
++  }), ['delegate:onChange:1', 'delegate:assign:GET /boom']);
++  assert(log.some(function (entry) { return entry.indexOf('event:routeError') === 0; }));
++  assert(log.some(function (entry) { return entry.indexOf('logger:error:') === 0 && entry !== 'logger:error:'; }));
++  assert(log.indexOf('assign:returned') !== -1);
++  assert(log.indexOf('after-error-running:true') !== -1);
++});
++
++test('stop can be called twice without throwing', function () {
++
++
++
++
++  const harness = loadDavis('/');
++  const Davis = harness.Davis;
++  const log = [];
++  installLocationDelegate(Davis, log, '/');
++  const app = new Davis.App();
++
++  app.bind('stop', function () { log.push('event:stop:' + app.running); });
++  app.start();
++  assert.doesNotThrow(function () {
++    app.stop();
++    log.push('after-first-stop-running:' + app.running);
++    app.stop();
++    log.push('after-second-stop-running:' + app.running);
++  });
++
++  assert.deepStrictEqual(log, [
++    'delegate:onChange:1',
++    'event:stop:true',
++    'after-first-stop-running:false',
++    'event:stop:false',
++    'after-second-stop-running:false'
++  ]);
++
++  assertBindingLogEntries(harness.bindingLog, [
++    'delegate:form:submit',
++    'delegate:a:click',
++    'undelegate:a:click',
++    'undelegate:form:submit',
++    'undelegate:a:click',
++    'undelegate:form:submit'
++  ]);
++});
++
++test('two app instances keep independent running state', function () {
++
++
++
++
++  const harness = loadDavis('/');
++  const Davis = harness.Davis;
++  const log = [];
++  installLocationDelegate(Davis, log, '/');
++  const appA = new Davis.App();
++  const appB = new Davis.App();
++
++  appA.bind('start', function () { log.push('a:start:' + appA.running + ':' + appB.running); });
++  appA.bind('stop', function () { log.push('a:stop:' + appA.running + ':' + appB.running); });
++  appB.bind('start', function () { log.push('b:start:' + appA.running + ':' + appB.running); });
++
++  log.push('fresh:' + appA.running + ':' + appB.running);
++  appA.start();
++  log.push('after-a-start:' + appA.running + ':' + appB.running);
++  appB.start();
++  log.push('after-b-start:' + appA.running + ':' + appB.running);
++  appA.stop();
++  log.push('after-a-stop:' + appA.running + ':' + appB.running);
++
++
++  assert.deepStrictEqual(log.filter(function (entry) {
++    return entry.indexOf('delegate:onChange:') !== 0;
++  }), [
++    'fresh:false:false',
++    'a:start:false:false',
++    'after-a-start:true:false',
++    'b:start:true:false',
++    'after-b-start:true:true',
++    'a:stop:true:true',
++    'after-a-stop:false:true'
++  ]);
++  assert.deepStrictEqual(log.filter(function (entry) {
++    return entry.indexOf('delegate:onChange:') === 0;
++  }), ['delegate:onChange:1', 'delegate:onChange:2']);
++  assert.deepStrictEqual(harness.listenerStats(), {
++    activeDelegates: 2,
++    maxActiveDelegates: 4,
++    delegateCalls: 4,
++    undelegateCalls: 2
++  });
++});
++
++test('repeated construct start stop cycles do not leak delegated listeners', function () {
++
++
++
++
++  const harness = loadDavis('/');
++  const Davis = harness.Davis;
++  const log = [];
++  installLocationDelegate(Davis, log, '/');
++
++  for (let i = 0; i < 120; i += 1) {
++    const app = new Davis.App();
++    app.start();
++    app.stop();
++  }
++
++  assert.deepStrictEqual(harness.listenerStats(), {
++    activeDelegates: 0,
++    maxActiveDelegates: 2,
++    delegateCalls: 240,
++    undelegateCalls: 240
++  });
++});
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,17 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="--max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++cd /workspace/repo
++
++exec node \
++  --require /workspace/repo/usercase-test-coderl/offline_network_guard.js \
++  /workspace/repo/usercase-test-coderl/routing_lifecycle.test.js

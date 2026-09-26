@@ -1,0 +1,473 @@
+diff --git a/usercase-test-coderl/dump_import_test.go b/usercase-test-coderl/dump_import_test.go
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/dump_import_test.go
+@@ -0,0 +1,440 @@
++package usercase_test_coderl
++
++import (
++	"bytes"
++	"encoding/binary"
++	"encoding/hex"
++	"errors"
++	"fmt"
++	"io"
++	"os"
++	"path/filepath"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/ledisdb/ledisdb/config"
++	"github.com/ledisdb/ledisdb/ledis"
++	"github.com/siddontang/go/snappy"
++)
++
++type dumpRecord struct {
++	keyHex   string
++	valueHex string
++}
++
++type parsedDump struct {
++	commitID uint64
++	records  []dumpRecord
++}
++
++func TestDumpWritesConcreteStreamToAnyWriter(t *testing.T) {
++
++
++	root := t.TempDir()
++	src := openLedis(t, filepath.Join(root, "src"))
++	defer src.Close()
++	db := selectDB(t, src, 0)
++	mustSet(t, db, "alpha", "one")
++	mustSet(t, db, "beta", "two")
++	if n, err := db.HSet([]byte("hash"), []byte("field"), []byte("h-value")); err != nil {
++		t.Fatalf("HSet failed: %v", err)
++	} else if n != 1 {
++		t.Fatalf("HSet new-field count = %d, want 1", n)
++	}
++
++	var buf bytes.Buffer
++	if err := src.Dump(&buf); err != nil {
++		t.Fatalf("Dump failed: %v", err)
++	}
++
++	if got := buf.Len(); got <= 8 {
++		t.Fatalf("dump byte length = %d, want more than 8-byte header", got)
++	}
++
++	parsed := parseDumpStream(t, buf.Bytes())
++	want := []dumpRecord{
++		{keyHex: "0001616c706861", valueHex: "6f6e65"},
++		{keyHex: "000162657461", valueHex: "74776f"},
++		{keyHex: "00020004686173683a6669656c64", valueHex: "682d76616c7565"},
++		{keyHex: "000368617368", valueHex: "0100000000000000"},
++	}
++
++	if !recordsEqual(parsed.records, want) {
++		t.Fatalf("parsed records = %#v, want %#v", parsed.records, want)
++	}
++}
++
++func TestDumpFileAndLoadDumpFileRoundTripIntoSeparateLedis(t *testing.T) {
++
++
++	root := t.TempDir()
++	src := openLedis(t, filepath.Join(root, "src"))
++	defer src.Close()
++	srcDB := selectDB(t, src, 0)
++	mustSet(t, srcDB, "alpha", "one")
++	mustSet(t, srcDB, "beta", "two")
++	if _, err := srcDB.HSet([]byte("hash"), []byte("field"), []byte("h-value")); err != nil {
++		t.Fatalf("HSet failed: %v", err)
++	}
++
++	dumpPath := filepath.Join(root, "ledis.dump")
++	if err := src.DumpFile(dumpPath); err != nil {
++		t.Fatalf("DumpFile failed: %v", err)
++	}
++
++	if info, err := os.Stat(dumpPath); err != nil {
++		t.Fatalf("dump file stat failed: %v", err)
++	} else if info.Size() <= 8 {
++		t.Fatalf("dump file size = %d, want more than 8-byte header", info.Size())
++	}
++	dumpBytes, err := os.ReadFile(dumpPath)
++	if err != nil {
++		t.Fatalf("read dump file failed: %v", err)
++	}
++	parsed := parseDumpStream(t, dumpBytes)
++
++	dst := openLedis(t, filepath.Join(root, "dst"))
++	defer dst.Close()
++	dstDB := selectDB(t, dst, 0)
++	mustSet(t, dstDB, "stale", "old")
++
++	head, err := dst.LoadDumpFile(dumpPath)
++	if err != nil {
++		t.Fatalf("LoadDumpFile failed: %v", err)
++	}
++
++	if head.CommitID != parsed.commitID {
++		t.Fatalf("loaded CommitID = %d, want stream CommitID %d", head.CommitID, parsed.commitID)
++	}
++	assertStringValue(t, dstDB, "alpha", "one")
++	assertStringValue(t, dstDB, "beta", "two")
++	assertMissingValue(t, dstDB, "stale")
++	assertHashStringValue(t, dstDB, "hash", "field", "h-value")
++}
++
++func TestLoadDumpReadsAnyReaderAndClearsBeforeApplying(t *testing.T) {
++
++
++	root := t.TempDir()
++	src := openLedis(t, filepath.Join(root, "src"))
++	defer src.Close()
++	srcDB := selectDB(t, src, 0)
++	mustSet(t, srcDB, "alpha", "one")
++	mustSet(t, srcDB, "beta", "two")
++
++	var buf bytes.Buffer
++	if err := src.Dump(&buf); err != nil {
++		t.Fatalf("Dump failed: %v", err)
++	}
++	dumpBytes := append([]byte(nil), buf.Bytes()...)
++	wantCommitID := uint64(0x0102030405060708)
++	binary.BigEndian.PutUint64(dumpBytes[:8], wantCommitID)
++
++	dst := openLedis(t, filepath.Join(root, "dst"))
++	defer dst.Close()
++	dstDB := selectDB(t, dst, 0)
++	mustSet(t, dstDB, "stale", "old")
++
++	head, err := dst.LoadDump(bytes.NewReader(dumpBytes))
++	if err != nil {
++		t.Fatalf("LoadDump failed: %v", err)
++	}
++
++	if head.CommitID != wantCommitID {
++		t.Fatalf("loaded CommitID = %d, want stream CommitID %d", head.CommitID, wantCommitID)
++	}
++	assertStringValue(t, dstDB, "alpha", "one")
++	assertStringValue(t, dstDB, "beta", "two")
++	assertMissingValue(t, dstDB, "stale")
++}
++
++func TestDumpIsPointInTimeWhenWritesStartAfterDumpStarts(t *testing.T) {
++
++
++	root := t.TempDir()
++	src := openLedis(t, filepath.Join(root, "src"))
++	defer src.Close()
++	srcDB := selectDB(t, src, 0)
++	for i := 0; i < 300; i++ {
++		mustSet(t, srcDB, fmt.Sprintf("m%03d", i), fmt.Sprintf("value-%03d-abcdefghijklmnopqrstuvwxyz", i))
++	}
++
++	w := newGatedWriter()
++	dumpDone := make(chan error, 1)
++	go func() {
++		dumpDone <- src.Dump(w)
++	}()
++	select {
++	case <-w.started:
++	case <-time.After(5 * time.Second):
++		t.Fatal("Dump did not start writing within 5s")
++	}
++
++	setDone := make(chan error, 1)
++	go func() {
++		setDone <- srcDB.Set([]byte("zz-after-start"), []byte("after-start"))
++	}()
++	time.Sleep(20 * time.Millisecond)
++	w.release()
++
++	if err := <-setDone; err != nil {
++		t.Fatalf("post-start Set failed: %v", err)
++	}
++	if err := <-dumpDone; err != nil {
++		t.Fatalf("Dump failed: %v", err)
++	}
++
++	dst := openLedis(t, filepath.Join(root, "dst"))
++	defer dst.Close()
++	dstDB := selectDB(t, dst, 0)
++	if _, err := dst.LoadDump(bytes.NewReader(w.bytes())); err != nil {
++		t.Fatalf("LoadDump failed: %v", err)
++	}
++	assertStringValue(t, srcDB, "zz-after-start", "after-start")
++	assertMissingValue(t, dstDB, "zz-after-start")
++	if keys, err := dstDB.Scan(ledis.KV, nil, 1000, true, ""); err != nil {
++		t.Fatalf("Scan failed: %v", err)
++	} else if len(keys) != 300 {
++		t.Fatalf("loaded KV key count = %d, want 300", len(keys))
++	}
++}
++
++func TestLoadDumpRejectsUnreadableMalformedTruncatedAndBadSnappyInputs(t *testing.T) {
++
++
++	root := t.TempDir()
++	l := openLedis(t, filepath.Join(root, "dst"))
++	defer l.Close()
++
++
++	if _, err := l.LoadDumpFile(filepath.Join(root, "missing.dump")); err == nil {
++		t.Fatal("LoadDumpFile missing path error = nil, want error")
++	}
++
++
++	if _, err := l.LoadDump(bytes.NewReader([]byte{1, 2, 3})); err == nil {
++		t.Fatal("short header error = nil, want error")
++	}
++
++	badSnappyKey := make([]byte, 13)
++	binary.BigEndian.PutUint64(badSnappyKey[:8], 0)
++	binary.BigEndian.PutUint16(badSnappyKey[8:10], 3)
++	copy(badSnappyKey[10:], []byte{0xff, 0xff, 0xff})
++
++	if _, err := l.LoadDump(bytes.NewReader(badSnappyKey)); err == nil {
++		t.Fatal("bad snappy error = nil, want error")
++	}
++
++	truncatedRecord := []byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 9, 7, 24}
++
++	if _, err := l.LoadDump(bytes.NewReader(truncatedRecord)); err == nil {
++		t.Fatal("truncated record error = nil, want error")
++	}
++}
++
++func TestTwoLedisInstancesKeepIndependentStateUntilExplicitLoad(t *testing.T) {
++
++
++	root := t.TempDir()
++	a := openLedis(t, filepath.Join(root, "a"))
++	defer a.Close()
++	b := openLedis(t, filepath.Join(root, "b"))
++	defer b.Close()
++	aDB := selectDB(t, a, 0)
++	bDB := selectDB(t, b, 0)
++
++	mustSet(t, aDB, "alpha", "one")
++	mustSet(t, aDB, "beta", "two")
++
++	assertStringValue(t, aDB, "alpha", "one")
++	assertStringValue(t, aDB, "beta", "two")
++	assertMissingValue(t, bDB, "alpha")
++	assertMissingValue(t, bDB, "beta")
++}
++
++func TestOpenUseCloseCyclesDumpAndLoadRepeatedly(t *testing.T) {
++
++
++
++	root := t.TempDir()
++
++	for i := 0; i < 3; i++ {
++		src := openLedis(t, filepath.Join(root, fmt.Sprintf("src-%03d", i)))
++		srcDB := selectDB(t, src, 0)
++		mustSet(t, srcDB, "alpha", "one")
++		dumpPath := filepath.Join(root, fmt.Sprintf("cycle-%03d.dump", i))
++		if err := src.DumpFile(dumpPath); err != nil {
++			t.Fatalf("cycle %d DumpFile failed: %v", i, err)
++		}
++
++		dst := openLedis(t, filepath.Join(root, fmt.Sprintf("dst-%03d", i)))
++		dstDB := selectDB(t, dst, 0)
++		head, err := dst.LoadDumpFile(dumpPath)
++		if err != nil {
++			t.Fatalf("cycle %d LoadDumpFile failed: %v", i, err)
++		}
++
++		if head == nil {
++			t.Fatalf("cycle %d LoadDumpFile returned nil DumpHead", i)
++		}
++		assertStringValue(t, dstDB, "alpha", "one")
++		src.Close()
++		dst.Close()
++	}
++}
++
++type gatedWriter struct {
++	started chan struct{}
++	gate    chan struct{}
++	once    sync.Once
++	buf     bytes.Buffer
++}
++
++func newGatedWriter() *gatedWriter {
++	return &gatedWriter{started: make(chan struct{}), gate: make(chan struct{})}
++}
++
++func (w *gatedWriter) Write(p []byte) (int, error) {
++	w.once.Do(func() {
++		close(w.started)
++		<-w.gate
++	})
++	return w.buf.Write(p)
++}
++
++func (w *gatedWriter) release() {
++	close(w.gate)
++}
++
++func (w *gatedWriter) bytes() []byte {
++	return w.buf.Bytes()
++}
++
++func openLedis(t *testing.T, dir string) *ledis.Ledis {
++	t.Helper()
++	cfg := config.NewConfigDefault()
++	cfg.DataDir = dir
++	if err := os.RemoveAll(dir); err != nil {
++		t.Fatalf("RemoveAll(%q) failed: %v", dir, err)
++	}
++	l, err := ledis.Open(cfg)
++	if err != nil {
++		t.Fatalf("ledis.Open(%q) failed: %v", dir, err)
++	}
++	return l
++}
++
++func selectDB(t *testing.T, l *ledis.Ledis, index int) *ledis.DB {
++	t.Helper()
++	db, err := l.Select(index)
++	if err != nil {
++		t.Fatalf("Select(%d) failed: %v", index, err)
++	}
++	return db
++}
++
++func mustSet(t *testing.T, db *ledis.DB, key string, value string) {
++	t.Helper()
++	if err := db.Set([]byte(key), []byte(value)); err != nil {
++		t.Fatalf("Set(%q, %q) failed: %v", key, value, err)
++	}
++}
++
++func assertStringValue(t *testing.T, db *ledis.DB, key string, want string) {
++	t.Helper()
++	got, err := db.Get([]byte(key))
++	if err != nil {
++		t.Fatalf("Get(%q) failed: %v", key, err)
++	}
++	if got == nil {
++		t.Fatalf("Get(%q) = nil, want %q", key, want)
++	}
++	if string(got) != want {
++		t.Fatalf("Get(%q) = %q, want %q", key, string(got), want)
++	}
++}
++
++func assertMissingValue(t *testing.T, db *ledis.DB, key string) {
++	t.Helper()
++	got, err := db.Get([]byte(key))
++	if err != nil {
++		t.Fatalf("Get(%q) failed: %v", key, err)
++	}
++	if got != nil {
++		t.Fatalf("Get(%q) = %q, want nil", key, string(got))
++	}
++}
++
++func assertHashStringValue(t *testing.T, db *ledis.DB, key string, field string, want string) {
++	t.Helper()
++	got, err := db.HGet([]byte(key), []byte(field))
++	if err != nil {
++		t.Fatalf("HGet(%q, %q) failed: %v", key, field, err)
++	}
++	if string(got) != want {
++		t.Fatalf("HGet(%q, %q) = %q, want %q", key, field, string(got), want)
++	}
++}
++
++func parseDumpStream(t *testing.T, data []byte) parsedDump {
++	t.Helper()
++	r := bytes.NewReader(data)
++	var out parsedDump
++	if err := binary.Read(r, binary.BigEndian, &out.commitID); err != nil {
++		t.Fatalf("read dump header failed: %v", err)
++	}
++	for {
++		var keyLen uint16
++		if err := binary.Read(r, binary.BigEndian, &keyLen); err != nil {
++			if errors.Is(err, io.EOF) {
++				break
++			}
++			t.Fatalf("read key length failed: %v", err)
++		}
++		keyCompressed := make([]byte, keyLen)
++		if _, err := io.ReadFull(r, keyCompressed); err != nil {
++			t.Fatalf("read compressed key failed: %v", err)
++		}
++		key, err := snappy.Decode(nil, keyCompressed)
++		if err != nil {
++			t.Fatalf("decode key failed: %v", err)
++		}
++
++		var valueLen uint32
++		if err := binary.Read(r, binary.BigEndian, &valueLen); err != nil {
++			t.Fatalf("read value length failed: %v", err)
++		}
++		valueCompressed := make([]byte, valueLen)
++		if _, err := io.ReadFull(r, valueCompressed); err != nil {
++			t.Fatalf("read compressed value failed: %v", err)
++		}
++		value, err := snappy.Decode(nil, valueCompressed)
++		if err != nil {
++			t.Fatalf("decode value failed: %v", err)
++		}
++		out.records = append(out.records, dumpRecord{
++			keyHex:   hex.EncodeToString(key),
++			valueHex: hex.EncodeToString(value),
++		})
++	}
++	return out
++}
++
++func recordsEqual(a []dumpRecord, b []dumpRecord) bool {
++	if len(a) != len(b) {
++		return false
++	}
++
++	counts := make(map[dumpRecord]int, len(a))
++	for _, record := range a {
++		counts[record]++
++	}
++	for _, record := range b {
++		if counts[record] == 0 {
++			return false
++		}
++		counts[record]--
++	}
++	return true
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,23 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++export GO111MODULE=on
++export GOPROXY=off
++export GOSUMDB=off
++export GONOSUMDB='*'
++export GONOPROXY='*'
++export GOVCS='*:off'
++export GOTOOLCHAIN=local
++unset GOFLAGS
++set -e
++cd /workspace/repo
++set -euo pipefail
++cd /workspace/repo
++
++exec go test -mod=vendor -v -count=1 ./usercase-test-coderl/...

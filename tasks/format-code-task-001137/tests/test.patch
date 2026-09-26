@@ -1,0 +1,251 @@
+diff --git a/tests/test_location_aware_rewrites.py b/tests/test_location_aware_rewrites.py
+new file mode 100644
+index 0000000..84e8f67
+--- /dev/null
++++ b/tests/test_location_aware_rewrites.py
+@@ -0,0 +1,232 @@
++import sys
++
++import pytest
++
++from doc_comments_ai import app, utils
++from doc_comments_ai.constants import Language
++from doc_comments_ai.treesitter import Treesitter
++
++
++def _replacement(start_byte, end_byte, content):
++    replacement_type = getattr(utils, "SourceReplacement", None)
++    assert replacement_type is not None, "utils.SourceReplacement must be public"
++    return replacement_type(
++        start_byte=start_byte,
++        end_byte=end_byte,
++        content=content,
++    )
++
++
++def _batch_writer():
++    writer = getattr(utils, "write_code_snippets_to_file", None)
++    assert callable(writer), "utils.write_code_snippets_to_file must be public"
++    return writer
++
++
++def test_method_nodes_expose_utf8_byte_ranges():
++    source = 'label = "caf\u00e9"\n\ndef describe():\n    return "na\u00efve"\n'
++    method = Treesitter.create_treesitter(Language.PYTHON).parse(source.encode())[0]
++
++    assert hasattr(method, "start_byte")
++    assert hasattr(method, "end_byte")
++    assert method.start_byte == source.encode().index(b"def describe")
++    assert source.encode()[method.start_byte : method.end_byte].decode() == (
++        method.method_source_code
++    )
++    assert method.end_byte == method.node.end_byte
++
++
++def test_source_replacement_is_a_public_value_object():
++    replacement = _replacement(2, 7, "new")
++
++    assert replacement.start_byte == 2
++    assert replacement.end_byte == 7
++    assert replacement.content == "new"
++
++
++def test_batch_writer_uses_original_utf8_offsets_and_accepts_unsorted_iterables(
++    tmp_path,
++):
++    path = tmp_path / "unicode.py"
++    original = "title = '\u03c0'\nalpha\nmiddle\nomega\n"
++    path.write_text(original, encoding="utf-8")
++    raw = original.encode()
++    alpha_start = raw.index(b"alpha")
++    omega_start = raw.index(b"omega")
++
++    replacements = (
++        replacement
++        for replacement in [
++            _replacement(omega_start, omega_start + len(b"omega"), "\u03a9"),
++            _replacement(alpha_start, alpha_start + len(b"alpha"), "A\u03bbPHA"),
++        ]
++    )
++    _batch_writer()(str(path), replacements)
++
++    assert path.read_text(encoding="utf-8") == "title = '\u03c0'\nA\u03bbPHA\nmiddle\n\u03a9\n"
++
++
++def test_batch_writer_allows_adjacent_ranges(tmp_path):
++    path = tmp_path / "adjacent.txt"
++    path.write_text("abcdef", encoding="utf-8")
++
++    _batch_writer()(
++        str(path),
++        [_replacement(3, 6, "right"), _replacement(0, 3, "left")],
++    )
++
++    assert path.read_text(encoding="utf-8") == "leftright"
++
++
++@pytest.mark.parametrize(
++    "source,replacement_specs",
++    [
++        (
++            "abcdef",
++            [(0, 3, "one"), (2, 5, "two")],
++        ),
++        ("abcdef", [(-1, 2, "bad")]),
++        ("abcdef", [(2, 7, "bad")]),
++        ("abcdef", [(4, 4, "bad")]),
++        ("\u00e9x", [(1, 2, "bad")]),
++    ],
++)
++def test_invalid_batches_raise_without_changing_the_file(
++    tmp_path, source, replacement_specs
++):
++    path = tmp_path / "invalid.txt"
++    path.write_text(source, encoding="utf-8")
++    replacements = [_replacement(*spec) for spec in replacement_specs]
++
++    with pytest.raises(ValueError):
++        _batch_writer()(str(path), replacements)
++
++    assert path.read_text(encoding="utf-8") == source
++
++
++def test_invalid_item_prevents_other_valid_edits(tmp_path):
++    path = tmp_path / "atomic.txt"
++    path.write_text("first second", encoding="utf-8")
++
++    with pytest.raises(ValueError):
++        _batch_writer()(
++            str(path),
++            [_replacement(0, 5, "changed"), _replacement(6, 99, "invalid")],
++        )
++
++    assert path.read_text(encoding="utf-8") == "first second"
++
++
++def test_empty_batch_is_a_noop(tmp_path):
++    path = tmp_path / "empty.txt"
++    path.write_text("unchanged\n", encoding="utf-8")
++
++    _batch_writer()(str(path), iter(()))
++
++    assert path.read_text(encoding="utf-8") == "unchanged\n"
++
++
++class _QuietSpinner:
++    def start(self):
++        pass
++
++    def stop(self):
++        pass
++
++
++def _prepare_cli(monkeypatch, responses):
++    class FakeLLM:
++        def __init__(self, *args, **kwargs):
++            self.response_index = 0
++
++        def generate_doc_comment(self, language, code, inline=False):
++            response = responses[self.response_index]
++            self.response_index += 1
++            if isinstance(response, Exception):
++                raise response
++            return response
++
++    monkeypatch.setattr(app.llm, "LLM", FakeLLM)
++    monkeypatch.setattr(app.utils, "is_openai_api_key_available", lambda: None)
++    monkeypatch.setattr(app.utils, "has_unstaged_changes", lambda path: False)
++    monkeypatch.setattr(app.utils, "count_tokens", lambda code: 1)
++    monkeypatch.setattr(app, "yaspin", lambda **kwargs: _QuietSpinner())
++
++
++def test_cli_rewrites_identical_methods_independently_and_keeps_indentation(
++    tmp_path, monkeypatch
++):
++    path = tmp_path / "Demo.java"
++    original = """class Demo {
++    void repeat() {
++        return;
++    }
++
++    void repeat() {
++        return;
++    }
++}
++"""
++    path.write_text(original, encoding="utf-8")
++    responses = [
++        """```java
++/** generated first */
++void repeat() {
++    return;
++}
++```""",
++        """```java
++/** generated second */
++void repeat() {
++    return;
++}
++```""",
++    ]
++    _prepare_cli(monkeypatch, responses)
++    monkeypatch.setattr(sys, "argv", ["aicomment", str(path)])
++
++    app.run()
++
++    assert path.read_text(encoding="utf-8") == """class Demo {
++    /** generated first */
++    void repeat() {
++        return;
++    }
++
++    /** generated second */
++    void repeat() {
++        return;
++    }
++}
++"""
++
++
++def test_cli_does_not_write_partial_results_when_generation_fails(tmp_path, monkeypatch):
++    path = tmp_path / "Failure.java"
++    original = """class Failure {
++    void first() {}
++    void second() {}
++}
++"""
++    path.write_text(original, encoding="utf-8")
++    _prepare_cli(
++        monkeypatch,
++        ["```java\n/** ready */\nvoid first() {}\n```", RuntimeError("LLM failed")],
++    )
++    monkeypatch.setattr(sys, "argv", ["aicomment", str(path)])
++
++    with pytest.raises(RuntimeError, match="LLM failed"):
++        app.run()
++
++    assert path.read_text(encoding="utf-8") == original
++
++
++def test_legacy_single_replacement_remains_available(tmp_path):
++    path = tmp_path / "legacy.py"
++    path.write_text("before\n    old()\nafter\n", encoding="utf-8")
++
++    utils.write_code_snippet_to_file(str(path), "old()", "new()\nmore()")
++
++    assert path.read_text(encoding="utf-8") == (
++        "before\n    new()\n    more()\nafter\n"
++    )
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,8 @@
++#!/bin/bash
++set -euo pipefail
++
++.venv/bin/pytest -q \
++  tests/test_location_aware_rewrites.py \
++  tests/treesitter_query_test.py::test_python_qery \
++  tests/treesitter_query_test.py::test_java_qery \
++  tests/response_parser_test.py

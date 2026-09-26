@@ -1,0 +1,454 @@
+diff --git a/pkg/nfs/path_confinement_verifier_test.go b/pkg/nfs/path_confinement_verifier_test.go
+new file mode 100644
+index 00000000..ba0cfd92
+--- /dev/null
++++ b/pkg/nfs/path_confinement_verifier_test.go
+@@ -0,0 +1,438 @@
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++package nfs
++
++import (
++	"os"
++	"path/filepath"
++	"testing"
++
++	"github.com/container-storage-interface/spec/lib/go/csi"
++	"golang.org/x/net/context"
++	"google.golang.org/grpc/codes"
++	"google.golang.org/grpc/status"
++	mount "k8s.io/mount-utils"
++)
++
++func codespecConfinementServers(t *testing.T) (*ControllerServer, *NodeServer, *mount.FakeMounter, string) {
++	t.Helper()
++	workingDir := t.TempDir()
++	mounter := mount.NewFakeMounter(nil)
++	driver := NewDriver(&DriverOptions{
++		DriverName:            DefaultDriverName,
++		WorkingMountDir:       workingDir,
++		MountPermissions:      0755,
++		DefaultOnDeletePolicy: delete,
++	})
++	ns := NewNodeServer(driver, mounter)
++	driver.ns = ns
++	return NewControllerServer(driver), ns, mounter, workingDir
++}
++
++func codespecMountCapability() *csi.VolumeCapability {
++	return &csi.VolumeCapability{
++		AccessType: &csi.VolumeCapability_Mount{Mount: &csi.VolumeCapability_MountVolume{}},
++		AccessMode: &csi.VolumeCapability_AccessMode{
++			Mode: csi.VolumeCapability_AccessMode_MULTI_NODE_MULTI_WRITER,
++		},
++	}
++}
++
++func codespecAssertNoControllerSideEffects(t *testing.T, mounter *mount.FakeMounter, workingDir string) {
++	t.Helper()
++	if actions := mounter.GetLog(); len(actions) != 0 {
++		t.Fatalf("request reached the mounter: %+v", actions)
++	}
++	entries, err := os.ReadDir(workingDir)
++	if err != nil {
++		t.Fatalf("working directory was changed or removed: %v", err)
++	}
++	if len(entries) != 0 {
++		t.Fatalf("working directory was populated: %v", entries)
++	}
++}
++
++func codespecAssertCode(t *testing.T, err error, want codes.Code) {
++	t.Helper()
++	if got := status.Code(err); got != want {
++		t.Fatalf("unexpected gRPC result: got %v (%v), want %v", got, err, want)
++	}
++}
++
++func TestCodespecNodePublishConfinesShareAndSubDir(t *testing.T) {
++	tests := []struct {
++		name    string
++		context map[string]string
++	}{
++		{name: "parent subdirectory", context: map[string]string{paramServer: "nfs.example", paramShare: "/exports", paramSubDir: "tenant/../private"}},
++		{name: "absolute subdirectory", context: map[string]string{paramServer: "nfs.example", paramShare: "/exports", paramSubDir: "/private"}},
++		{name: "dot component", context: map[string]string{paramServer: "nfs.example", paramShare: "/exports", paramSubDir: "tenant/./private"}},
++		{name: "unsafe substituted metadata", context: map[string]string{paramServer: "nfs.example", paramShare: "/exports", paramSubDir: "tenant/" + pvcNamespaceMetadata + "/data", pvcNamespaceKey: "../private"}},
++		{name: "parent share component", context: map[string]string{paramServer: "nfs.example", paramShare: "/exports/../private", paramSubDir: "data"}},
++	}
++
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			_, ns, mounter, _ := codespecConfinementServers(t)
++			target := filepath.Join(t.TempDir(), "target")
++			_, err := ns.NodePublishVolume(context.Background(), &csi.NodePublishVolumeRequest{
++				VolumeId:         "volume-safe",
++				TargetPath:       target,
++				VolumeContext:    tc.context,
++				VolumeCapability: codespecMountCapability(),
++			})
++			codespecAssertCode(t, err, codes.InvalidArgument)
++			if actions := mounter.GetLog(); len(actions) != 0 {
++				t.Fatalf("invalid publish reached the mounter: %+v", actions)
++			}
++			if _, statErr := os.Stat(target); !os.IsNotExist(statErr) {
++				t.Fatalf("invalid publish created its target: %v", statErr)
++			}
++		})
++	}
++}
++
++func TestCodespecNodePublishAllowsSafeNestedSubDir(t *testing.T) {
++	tests := []struct {
++		name       string
++		share      string
++		subDir     string
++		wantSource string
++	}{
++		{name: "nested export and subdirectory", share: "/exports/team/", subDir: "tenant/project/.data", wantSource: "[2001:db8::1]:/exports/team/tenant/project/.data"},
++		{name: "root export", share: "/", subDir: "tenant/data", wantSource: "[2001:db8::1]:/tenant/data"},
++	}
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			_, ns, mounter, _ := codespecConfinementServers(t)
++			target := filepath.Join(t.TempDir(), "target")
++			_, err := ns.NodePublishVolume(context.Background(), &csi.NodePublishVolumeRequest{
++				VolumeId:   "volume-safe",
++				TargetPath: target,
++				VolumeContext: map[string]string{
++					paramServer: "2001:db8::1",
++					paramShare:  tc.share,
++					paramSubDir: tc.subDir,
++				},
++				VolumeCapability: codespecMountCapability(),
++			})
++			if err != nil {
++				t.Fatalf("safe nested publish failed: %v", err)
++			}
++			found := false
++			for _, action := range mounter.GetLog() {
++				if action.Action == mount.FakeActionMount && action.Source == tc.wantSource && action.Target == target {
++					found = true
++				}
++			}
++			if !found {
++				t.Fatalf("safe source was not mounted; actions: %+v", mounter.GetLog())
++			}
++		})
++	}
++}
++
++func TestCodespecCreateVolumeRejectsUnsafeGeneratedPaths(t *testing.T) {
++	tests := []struct {
++		name       string
++		volumeName string
++		parameters map[string]string
++	}{
++		{name: "unsafe default subdirectory", volumeName: "../escape", parameters: map[string]string{paramServer: "nfs.example", paramShare: "/exports"}},
++		{name: "delimiter in volume name", volumeName: "pv#other", parameters: map[string]string{paramServer: "nfs.example", paramShare: "/exports"}},
++		{name: "parent subdirectory", volumeName: "pv-safe", parameters: map[string]string{paramServer: "nfs.example", paramShare: "/exports", paramSubDir: "tenant/../escape"}},
++		{name: "absolute subdirectory", volumeName: "pv-safe", parameters: map[string]string{paramServer: "nfs.example", paramShare: "/exports", paramSubDir: "/escape"}},
++		{name: "unsafe metadata expansion", volumeName: "pv-safe", parameters: map[string]string{paramServer: "nfs.example", paramShare: "/exports", paramSubDir: "tenant/" + pvcNameMetadata + "/data", pvcNameKey: "../escape"}},
++		{name: "unsafe share", volumeName: "pv-safe", parameters: map[string]string{paramServer: "nfs.example", paramShare: "/exports/../private", paramSubDir: "data"}},
++		{name: "delimiter in server", volumeName: "pv-safe", parameters: map[string]string{paramServer: "nfs.example#other", paramShare: "/exports", paramSubDir: "data"}},
++		{name: "delimiter in share", volumeName: "pv-safe", parameters: map[string]string{paramServer: "nfs.example", paramShare: "/exports#other", paramSubDir: "data"}},
++		{name: "delimiter in subdirectory", volumeName: "pv-safe", parameters: map[string]string{paramServer: "nfs.example", paramShare: "/exports", paramSubDir: "data#other"}},
++	}
++
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			cs, _, mounter, workingDir := codespecConfinementServers(t)
++			_, err := cs.CreateVolume(context.Background(), &csi.CreateVolumeRequest{
++				Name:               tc.volumeName,
++				Parameters:         tc.parameters,
++				VolumeCapabilities: []*csi.VolumeCapability{codespecMountCapability()},
++			})
++			codespecAssertCode(t, err, codes.InvalidArgument)
++			codespecAssertNoControllerSideEffects(t, mounter, workingDir)
++		})
++	}
++}
++
++func TestCodespecCreateVolumePreservesSafeNestedSubDir(t *testing.T) {
++	cs, _, mounter, _ := codespecConfinementServers(t)
++	resp, err := cs.CreateVolume(context.Background(), &csi.CreateVolumeRequest{
++		Name: "pv-safe",
++		Parameters: map[string]string{
++			paramServer: "nfs.example",
++			paramShare:  "/exports/team/",
++			paramSubDir: "tenant/project/.data",
++		},
++		VolumeCapabilities: []*csi.VolumeCapability{codespecMountCapability()},
++	})
++	if err != nil {
++		t.Fatalf("safe nested provisioning failed: %v", err)
++	}
++	if got, want := resp.GetVolume().GetVolumeId(), "nfs.example#exports/team#tenant/project/.data#pv-safe#"; got != want {
++		t.Fatalf("unexpected volume ID: got %q, want %q", got, want)
++	}
++	if got := resp.GetVolume().GetVolumeContext()[paramSubDir]; got != "tenant/project/.data" {
++		t.Fatalf("nested subdirectory changed: got %q", got)
++	}
++	found := false
++	for _, action := range mounter.GetLog() {
++		if action.Action == mount.FakeActionMount && (action.Source == "nfs.example:/exports/team" || action.Source == "nfs.example:/exports/team/") {
++			found = true
++		}
++	}
++	if !found {
++		t.Fatalf("safe share was not mounted; actions: %+v", mounter.GetLog())
++	}
++}
++
++func TestCodespecContentSourceValidationPrecedesDestinationMutation(t *testing.T) {
++	tests := []struct {
++		name   string
++		source *csi.VolumeContentSource
++	}{
++		{
++			name: "unsafe volume ID",
++			source: &csi.VolumeContentSource{Type: &csi.VolumeContentSource_Volume{
++				Volume: &csi.VolumeContentSource_VolumeSource{VolumeId: "nfs.example#exports#../escape#source-pv#"},
++			}},
++		},
++		{
++			name: "empty volume subdirectory",
++			source: &csi.VolumeContentSource{Type: &csi.VolumeContentSource_Volume{
++				Volume: &csi.VolumeContentSource_VolumeSource{VolumeId: "nfs.example#exports###"},
++			}},
++		},
++		{
++			name: "unsafe volume ID working component",
++			source: &csi.VolumeContentSource{Type: &csi.VolumeContentSource_Volume{
++				Volume: &csi.VolumeContentSource_VolumeSource{VolumeId: "nfs.example#exports#source#../source-pv#"},
++			}},
++		},
++		{
++			name: "unsafe snapshot archive path",
++			source: &csi.VolumeContentSource{Type: &csi.VolumeContentSource_Snapshot{
++				Snapshot: &csi.VolumeContentSource_SnapshotSource{SnapshotId: "nfs.example#exports#snap-safe#../snap-safe#source-pv"},
++			}},
++		},
++		{
++			name: "noncanonical snapshot archive path",
++			source: &csi.VolumeContentSource{Type: &csi.VolumeContentSource_Snapshot{
++				Snapshot: &csi.VolumeContentSource_SnapshotSource{SnapshotId: "nfs.example#exports#snap-safe#other-safe-path#source-pv"},
++			}},
++		},
++	}
++
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			cs, _, mounter, workingDir := codespecConfinementServers(t)
++			_, err := cs.CreateVolume(context.Background(), &csi.CreateVolumeRequest{
++				Name: "destination-pv",
++				Parameters: map[string]string{
++					paramServer: "nfs.example",
++					paramShare:  "/exports",
++				},
++				VolumeCapabilities:  []*csi.VolumeCapability{codespecMountCapability()},
++				VolumeContentSource: tc.source,
++			})
++			codespecAssertCode(t, err, codes.NotFound)
++			codespecAssertNoControllerSideEffects(t, mounter, workingDir)
++		})
++	}
++}
++
++func TestCodespecCreateSnapshotValidatesAllPathsBeforeMount(t *testing.T) {
++	tests := []struct {
++		name     string
++		request  *csi.CreateSnapshotRequest
++		wantCode codes.Code
++	}{
++		{
++			name: "unsafe source volume ID",
++			request: &csi.CreateSnapshotRequest{
++				Name:           "snap-safe",
++				SourceVolumeId: "nfs.example#exports#../escape#source-pv#",
++			},
++			wantCode: codes.NotFound,
++		},
++		{
++			name: "unsafe snapshot name",
++			request: &csi.CreateSnapshotRequest{
++				Name:           "../snap",
++				SourceVolumeId: "nfs.example#exports#source#source-pv#",
++			},
++			wantCode: codes.InvalidArgument,
++		},
++		{
++			name: "delimiter in snapshot name",
++			request: &csi.CreateSnapshotRequest{
++				Name:           "snap#other",
++				SourceVolumeId: "nfs.example#exports#source#source-pv#",
++			},
++			wantCode: codes.InvalidArgument,
++		},
++		{
++			name: "unsafe snapshot share override",
++			request: &csi.CreateSnapshotRequest{
++				Name:           "snap-safe",
++				SourceVolumeId: "nfs.example#exports#source#source-pv#",
++				Parameters:     map[string]string{paramShare: "/snapshots/../private"},
++			},
++			wantCode: codes.InvalidArgument,
++		},
++		{
++			name: "delimiter in snapshot server override",
++			request: &csi.CreateSnapshotRequest{
++				Name:           "snap-safe",
++				SourceVolumeId: "nfs.example#exports#source#source-pv#",
++				Parameters:     map[string]string{paramServer: "nfs.example#other"},
++			},
++			wantCode: codes.InvalidArgument,
++		},
++		{
++			name: "delimiter in snapshot share override",
++			request: &csi.CreateSnapshotRequest{
++				Name:           "snap-safe",
++				SourceVolumeId: "nfs.example#exports#source#source-pv#",
++				Parameters:     map[string]string{paramShare: "/snapshots#other"},
++			},
++			wantCode: codes.InvalidArgument,
++		},
++	}
++
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			cs, _, mounter, workingDir := codespecConfinementServers(t)
++			_, err := cs.CreateSnapshot(context.Background(), tc.request)
++			codespecAssertCode(t, err, tc.wantCode)
++			codespecAssertNoControllerSideEffects(t, mounter, workingDir)
++		})
++	}
++}
++
++func TestCodespecUnsafeDeleteIDsStayIdempotentWithoutSideEffects(t *testing.T) {
++	t.Run("volumes", func(t *testing.T) {
++		ids := []string{
++			"nfs.example#exports###delete",
++			"nfs.example#exports#../sentinel#safe#delete",
++			"nfs.example#exports#data#../safe#delete",
++			"nfs.example#exports/../private#data#safe#delete",
++			"nfs.example#exports#data#.#delete",
++			"nfs.example#exports#data#safe#delete#extra",
++			"nfs.example/exports/.",
++		}
++		for _, id := range ids {
++			t.Run(id, func(t *testing.T) {
++				cs, _, mounter, workingDir := codespecConfinementServers(t)
++				if err := os.MkdirAll(filepath.Join(workingDir, "sentinel"), 0755); err != nil {
++					t.Fatal(err)
++				}
++				mounter.ResetLog()
++				resp, err := cs.DeleteVolume(context.Background(), &csi.DeleteVolumeRequest{VolumeId: id})
++				if err != nil || resp == nil {
++					t.Fatalf("unsafe delete was not idempotent: resp=%v err=%v", resp, err)
++				}
++				if actions := mounter.GetLog(); len(actions) != 0 {
++					t.Fatalf("unsafe volume ID reached the mounter: %+v", actions)
++				}
++				if _, statErr := os.Stat(filepath.Join(workingDir, "sentinel")); statErr != nil {
++					t.Fatalf("unsafe volume ID changed local data: %v", statErr)
++				}
++			})
++		}
++	})
++
++	t.Run("snapshots", func(t *testing.T) {
++		ids := []string{
++			"nfs.example#exports###source-pv",
++			"nfs.example#exports#snap-safe#snap-safe#",
++			"nfs.example#exports#snap-safe#different-path#source-pv",
++			"nfs.example#exports#snap-safe#snap-safe#../source-pv",
++			"nfs.example#exports#.#.#source-pv",
++		}
++		for _, id := range ids {
++			t.Run(id, func(t *testing.T) {
++				cs, _, mounter, workingDir := codespecConfinementServers(t)
++				if err := os.MkdirAll(filepath.Join(workingDir, "sentinel"), 0755); err != nil {
++					t.Fatal(err)
++				}
++				mounter.ResetLog()
++				resp, err := cs.DeleteSnapshot(context.Background(), &csi.DeleteSnapshotRequest{SnapshotId: id})
++				if err != nil || resp == nil {
++					t.Fatalf("unsafe delete was not idempotent: resp=%v err=%v", resp, err)
++				}
++				if actions := mounter.GetLog(); len(actions) != 0 {
++					t.Fatalf("unsafe snapshot ID reached the mounter: %+v", actions)
++				}
++				if _, statErr := os.Stat(filepath.Join(workingDir, "sentinel")); statErr != nil {
++					t.Fatalf("unsafe snapshot ID changed local data: %v", statErr)
++				}
++			})
++		}
++	})
++
++	cs, _, mounter, workingDir := codespecConfinementServers(t)
++	resp, err := cs.DeleteVolume(context.Background(), &csi.DeleteVolumeRequest{VolumeId: "malformed-id"})
++	if err != nil || resp == nil {
++		t.Fatalf("malformed delete compatibility changed: resp=%v err=%v", resp, err)
++	}
++	codespecAssertNoControllerSideEffects(t, mounter, workingDir)
++}
++
++func TestCodespecLegacyNestedVolumeIDRemainsUsable(t *testing.T) {
++	tests := []struct {
++		name     string
++		volumeID string
++		wantID   string
++	}{
++		{name: "legacy slash ID with nested base", volumeID: "nfs.example/exports/team/source-pv", wantID: "nfs.example#exports/team#snap-safe#snap-safe#source-pv"},
++		{name: "compact three-field ID", volumeID: "nfs.example#exports/team#source-pv", wantID: "nfs.example#exports/team#snap-safe#snap-safe#source-pv"},
++	}
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			cs, _, _, workingDir := codespecConfinementServers(t)
++			sourcePath := filepath.Join(workingDir, "source-pv", "source-pv")
++			if err := os.MkdirAll(sourcePath, 0755); err != nil {
++				t.Fatal(err)
++			}
++			if err := os.WriteFile(filepath.Join(sourcePath, "payload"), []byte("compatible"), 0644); err != nil {
++				t.Fatal(err)
++			}
++			resp, err := cs.CreateSnapshot(context.Background(), &csi.CreateSnapshotRequest{
++				Name:           "snap-safe",
++				SourceVolumeId: tc.volumeID,
++			})
++			if err != nil {
++				t.Fatalf("valid volume ID was rejected: %v", err)
++			}
++			if got := resp.GetSnapshot().GetSnapshotId(); got != tc.wantID {
++				t.Fatalf("unexpected snapshot ID: got %q, want %q", got, tc.wantID)
++			}
++			if !resp.GetSnapshot().GetReadyToUse() {
++				t.Fatal("snapshot from valid volume ID is not ready")
++			}
++		})
++	}
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,5 @@
++#!/bin/bash
++set -euo pipefail
++
++
++go test ./pkg/nfs -run '^(TestCodespec.*|TestNfsVolFromId|TestNewNFSVolume|TestNodePublishVolume|TestDeleteVolume|TestCreateSnapshot|TestDeleteSnapshot)$' -count=1

@@ -1,0 +1,410 @@
+diff --git a/usercase-test-coderl/test_gcp_fetch.py b/usercase-test-coderl/test_gcp_fetch.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/test_gcp_fetch.py
+@@ -0,0 +1,380 @@
++
++
++
++
++
++
++
++
++
++
++
++import os
++import sys
++import types
++
++import pytest
++
++
++CONTENT = b"bitbake-gcs-fetcher-content\n"
++CURRENT_STATE = None
++
++
++class FakeNotFound(Exception):
++    pass
++
++
++class FakeGCSState:
++    def __init__(self, scenario="success"):
++        self.scenario = scenario
++        self.calls = []
++
++
++class FakeBlob:
++    def __init__(self, bucket_name, blob_name):
++        self.bucket_name = bucket_name
++        self.blob_name = blob_name
++
++    def download_to_filename(self, filename):
++        CURRENT_STATE.calls.append(
++            ("download_to_filename", self.bucket_name, self.blob_name, os.path.basename(filename))
++        )
++        if CURRENT_STATE.scenario == "notfound":
++            raise FakeNotFound("missing")
++        if CURRENT_STATE.scenario == "missingfile":
++            return None
++        with open(filename, "wb") as target:
++            if CURRENT_STATE.scenario == "zero":
++                target.write(b"")
++            else:
++                target.write(CONTENT)
++        return None
++
++
++    def download_to_file(self, file_obj):
++        CURRENT_STATE.calls.append(("download_to_file", self.bucket_name, self.blob_name))
++        if CURRENT_STATE.scenario == "notfound":
++            raise FakeNotFound("missing")
++        if CURRENT_STATE.scenario == "missingfile":
++            return None
++        if CURRENT_STATE.scenario == "zero":
++            file_obj.write(b"")
++        else:
++            file_obj.write(CONTENT)
++        return None
++
++    def download_as_bytes(self):
++        CURRENT_STATE.calls.append(("download_as_bytes", self.bucket_name, self.blob_name))
++        if CURRENT_STATE.scenario == "notfound":
++            raise FakeNotFound("missing")
++        if CURRENT_STATE.scenario == "missingfile":
++            return None
++        if CURRENT_STATE.scenario == "zero":
++            return b""
++        return CONTENT
++
++    def exists(self):
++        CURRENT_STATE.calls.append(("exists", self.bucket_name, self.blob_name))
++        return CURRENT_STATE.scenario != "notfound"
++
++
++class FakeBucket:
++    def __init__(self, bucket_name):
++        self.bucket_name = bucket_name
++
++    def blob(self, blob_name):
++        CURRENT_STATE.calls.append(("blob", self.bucket_name, blob_name))
++        return FakeBlob(self.bucket_name, blob_name)
++
++
++class FakeStorageClient:
++    def __init__(self, project=None):
++        if CURRENT_STATE is not None:
++            CURRENT_STATE.calls.append(("Client", project))
++
++    def bucket(self, bucket_name):
++        CURRENT_STATE.calls.append(("bucket", bucket_name))
++        return FakeBucket(bucket_name)
++
++
++def install_fake_google_modules():
++    google = types.ModuleType("google")
++    cloud = types.ModuleType("google.cloud")
++    storage = types.ModuleType("google.cloud.storage")
++    api_core = types.ModuleType("google.api_core")
++    exceptions = types.ModuleType("google.api_core.exceptions")
++
++    storage.Client = FakeStorageClient
++    exceptions.NotFound = FakeNotFound
++    cloud.storage = storage
++    api_core.exceptions = exceptions
++    google.cloud = cloud
++    google.api_core = api_core
++
++    sys.modules["google"] = google
++    sys.modules["google.cloud"] = cloud
++    sys.modules["google.cloud.storage"] = storage
++    sys.modules["google.api_core"] = api_core
++    sys.modules["google.api_core.exceptions"] = exceptions
++
++
++install_fake_google_modules()
++
++import bb.data  # noqa: E402
++import bb.fetch2  # noqa: E402
++
++
++@pytest.fixture(autouse=True)
++def fake_gcs_success():
++    global CURRENT_STATE
++    CURRENT_STATE = FakeGCSState("success")
++    yield CURRENT_STATE
++
++
++@pytest.fixture
++def datastore(tmp_path):
++    dldir = tmp_path / "download"
++    dldir.mkdir()
++    d = bb.data.init()
++    d.setVar("DL_DIR", str(dldir))
++    d.setVar("PREMIRRORS", "")
++    d.setVar("MIRRORS", "")
++    d.setVar("BB_STRICT_CHECKSUM", "ignore")
++    d.setVar("PN", "gcp-fetch-acceptance")
++    return d
++
++
++def fetcher(url, datastore):
++    return bb.fetch2.Fetch([url], datastore)
++
++
++def target_path(fetch, url):
++    return fetch.localpath(url)
++
++
++def assert_download_attempted_for(calls, bucket, blob_name):
++
++    assert any(
++        call[0] in {"download_to_filename", "download_to_file", "download_as_bytes"}
++        and call[1] == bucket
++        and call[2] == blob_name
++        for call in calls
++    )
++
++
++def assert_target_has_fake_object(path):
++
++    assert os.path.getsize(path) > 0
++    assert open(path, "rb").read() == CONTENT
++
++
++def test_gs_url_default_filename_downloads_and_checkstatus_uses_stripped_object_path(datastore, fake_gcs_success):
++
++
++
++
++    url = "gs://example-bucket/releases/pkg-1.0.tar.gz"
++    f = fetcher(url, datastore)
++
++
++    assert target_path(f, url)
++    assert os.path.basename(target_path(f, url)) == "pkg-1.0.tar.gz"
++
++
++    f.download()
++    assert os.path.exists(target_path(f, url)) is True
++    assert_target_has_fake_object(target_path(f, url))
++    assert ("bucket", "example-bucket") in fake_gcs_success.calls
++    assert ("blob", "example-bucket", "releases/pkg-1.0.tar.gz") in fake_gcs_success.calls
++    assert_download_attempted_for(fake_gcs_success.calls, "example-bucket", "releases/pkg-1.0.tar.gz")
++
++
++    f.checkstatus()
++    assert ("exists", "example-bucket", "releases/pkg-1.0.tar.gz") in fake_gcs_success.calls
++
++
++def test_gs_url_downloadfilename_overrides_local_filename_and_keeps_object_path(datastore, fake_gcs_success):
++
++
++
++
++    url = "gs://example-bucket/releases/pkg;downloadfilename=source.tar.gz"
++    f = fetcher(url, datastore)
++
++
++    assert target_path(f, url)
++    assert os.path.basename(target_path(f, url)) == "source.tar.gz"
++
++
++    f.download()
++    assert os.path.exists(target_path(f, url)) is True
++    assert_target_has_fake_object(target_path(f, url))
++    assert ("blob", "example-bucket", "releases/pkg") in fake_gcs_success.calls
++    assert_download_attempted_for(fake_gcs_success.calls, "example-bucket", "releases/pkg")
++
++
++def test_storage_notfound_during_download_raises_fetcherror(datastore, fake_gcs_success):
++
++
++
++
++    fake_gcs_success.scenario = "notfound"
++    url = "gs://example-bucket/releases/pkg-1.0.tar.gz"
++    f = fetcher(url, datastore)
++
++    with pytest.raises(bb.fetch2.FetchError) as excinfo:
++        f.download()
++
++
++    assert isinstance(excinfo.value, bb.fetch2.FetchError)
++    assert os.path.exists(target_path(f, url)) is False
++    assert_download_attempted_for(fake_gcs_success.calls, "example-bucket", "releases/pkg-1.0.tar.gz")
++
++
++def test_download_success_but_missing_target_raises_fetcherror(datastore, fake_gcs_success):
++
++
++
++
++    fake_gcs_success.scenario = "missingfile"
++    url = "gs://example-bucket/releases/pkg-1.0.tar.gz"
++    f = fetcher(url, datastore)
++
++    with pytest.raises(bb.fetch2.FetchError) as excinfo:
++        f.download()
++
++
++    assert isinstance(excinfo.value, bb.fetch2.FetchError)
++    assert os.path.exists(target_path(f, url)) is False
++
++
++def test_download_zero_byte_target_raises_fetcherror_and_removes_file(datastore, fake_gcs_success):
++
++
++
++
++    fake_gcs_success.scenario = "zero"
++    url = "gs://example-bucket/releases/pkg-1.0.tar.gz"
++    f = fetcher(url, datastore)
++
++    with pytest.raises(bb.fetch2.FetchError) as excinfo:
++        f.download()
++
++
++    assert isinstance(excinfo.value, bb.fetch2.FetchError)
++    assert os.path.exists(target_path(f, url)) is False
++
++
++def test_checkstatus_missing_blob_raises_fetcherror(datastore, fake_gcs_success):
++
++
++
++
++    fake_gcs_success.scenario = "notfound"
++    url = "gs://example-bucket/releases/pkg-1.0.tar.gz"
++    f = fetcher(url, datastore)
++
++    with pytest.raises(bb.fetch2.FetchError) as excinfo:
++        f.checkstatus()
++
++
++    assert isinstance(excinfo.value, bb.fetch2.FetchError)
++    assert ("exists", "example-bucket", "releases/pkg-1.0.tar.gz") in fake_gcs_success.calls
++
++
++def test_network_disabled_blocks_download_before_blob_download(datastore, fake_gcs_success):
++
++
++
++
++    datastore.setVar("BB_NO_NETWORK", "1")
++    url = "gs://example-bucket/releases/pkg-1.0.tar.gz"
++    f = fetcher(url, datastore)
++
++    with pytest.raises(bb.fetch2.NetworkAccess) as excinfo:
++        f.download()
++
++
++    assert excinfo.value.url == url
++    assert [
++        call for call in fake_gcs_success.calls if call[0] == "download_to_filename"
++    ] == []
++    assert [
++        call
++        for call in fake_gcs_success.calls
++        if call[0] in {"download_to_file", "download_as_bytes"}
++    ] == []
++
++
++def test_network_disabled_blocks_checkstatus_before_existence_check(datastore, fake_gcs_success):
++
++
++
++
++    datastore.setVar("BB_NO_NETWORK", "1")
++    url = "gs://example-bucket/releases/pkg-1.0.tar.gz"
++    f = fetcher(url, datastore)
++
++    with pytest.raises(bb.fetch2.NetworkAccess) as excinfo:
++        f.checkstatus()
++
++
++    assert excinfo.value.url == url
++    assert [call for call in fake_gcs_success.calls if call[0] == "exists"] == []
++
++
++def test_two_fetch_instances_keep_independent_url_state(datastore, fake_gcs_success):
++
++
++
++
++    url_a = "gs://example-bucket/releases/pkg-1.0.tar.gz"
++    url_b = "gs://another-bucket/assets/other.bin"
++    a = fetcher(url_a, datastore)
++    b = fetcher(url_b, datastore)
++
++    assert os.path.basename(target_path(a, url_a)) == "pkg-1.0.tar.gz"
++    assert os.path.basename(target_path(b, url_b)) == "other.bin"
++
++
++    a.download()
++    assert os.path.exists(target_path(a, url_a)) is True
++    assert_target_has_fake_object(target_path(a, url_a))
++    assert os.path.exists(target_path(b, url_b)) is False
++
++
++    b.checkstatus()
++    assert ("exists", "another-bucket", "assets/other.bin") in fake_gcs_success.calls
++
++
++def test_download_writes_target_file(datastore):
++
++
++
++
++    url = "gs://example-bucket/releases/pkg-1.0.tar.gz"
++    f = fetcher(url, datastore)
++
++    f.download()
++    assert os.path.exists(target_path(f, url)) is True
++    assert_target_has_fake_object(target_path(f, url))
++
++
++def test_zero_byte_cleanup_leak_floor_over_many_fetch_sessions(datastore, fake_gcs_success):
++
++
++
++
++    fake_gcs_success.scenario = "zero"
++    url = "gs://example-bucket/releases/pkg-1.0.tar.gz"
++
++    for _ in range(100):
++        f = fetcher(url, datastore)
++        with pytest.raises(bb.fetch2.FetchError):
++            f.download()
++
++        assert os.path.exists(target_path(f, url)) is False
++
++    dldir_entries = sorted(os.listdir(datastore.getVar("DL_DIR")))
++
++    assert "pkg-1.0.tar.gz" not in dldir_entries
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,20 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++
++cd /workspace/repo
++export PYTHONPATH="/workspace/repo/lib${PYTHONPATH:+:${PYTHONPATH}}"
++export PYTHONDONTWRITEBYTECODE=1
++export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
++unset PYTEST_ADDOPTS
++
++exec python -m pytest --rootdir=/workspace/repo -c /dev/null -p no:cacheprovider /workspace/repo/usercase-test-coderl/test_gcp_fetch.py -v

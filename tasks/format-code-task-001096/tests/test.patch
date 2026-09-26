@@ -1,0 +1,342 @@
+diff --git a/__tests__/codespec-output-folder.test.ts b/__tests__/codespec-output-folder.test.ts
+new file mode 100644
+index 0000000..d8afd0f
+--- /dev/null
++++ b/__tests__/codespec-output-folder.test.ts
+@@ -0,0 +1,320 @@
++import { spawnSync, SpawnSyncReturns } from "child_process";
++import fs from "fs";
++import os from "os";
++import path from "path";
++import chokidar from "chokidar";
++
++import { watch } from "../lib/core/watch";
++
++jest.mock("chokidar");
++
++const repositoryRoot = path.resolve(__dirname, "..");
++const cliPath = path.join(repositoryRoot, "lib", "cli.ts");
++const tsNodeRegister = require.resolve("ts-node/register");
++const temporaryDirectories: string[] = [];
++
++const makeTemporaryDirectory = (): string => {
++  const directory = fs.mkdtempSync(
++    path.join(os.tmpdir(), "tsm-codespec-output-folder-")
++  );
++  temporaryDirectories.push(directory);
++  return directory;
++};
++
++const makeDirectory = (directory: string): void => {
++  fs.mkdirSync(directory, { recursive: true } as any);
++};
++
++const writeSource = (
++  root: string,
++  relativePath: string,
++  className: string
++): string => {
++  const sourcePath = path.join(root, relativePath);
++  makeDirectory(path.dirname(sourcePath));
++  fs.writeFileSync(sourcePath, `.${className} { color: red; }\n`);
++  return sourcePath;
++};
++
++const writeDefinition = (
++  root: string,
++  relativeSourcePath: string,
++  className: string
++): string => {
++  const definitionPath = path.join(root, `${relativeSourcePath}.d.ts`);
++  makeDirectory(path.dirname(definitionPath));
++  fs.writeFileSync(definitionPath, `export const ${className}: string;\n`);
++  return definitionPath;
++};
++
++const runCli = (
++  cwd: string,
++  args: string[]
++): SpawnSyncReturns<string> =>
++  spawnSync(process.execPath, ["-r", tsNodeRegister, cliPath, ...args], {
++    cwd,
++    encoding: "utf8",
++    env: {
++      ...process.env,
++      TS_NODE_PROJECT: path.join(repositoryRoot, "tsconfig.json"),
++    },
++  });
++
++const combinedOutput = (result: SpawnSyncReturns<string>): string =>
++  `${result.stdout || ""}${result.stderr || ""}`;
++const readFile = (file: string): string => fs.readFileSync(file, "utf8");
++
++const waitFor = async (predicate: () => boolean): Promise<void> => {
++  for (let attempt = 0; attempt < 50 && !predicate(); attempt += 1) {
++    await new Promise((resolve) => setImmediate(resolve));
++  }
++  expect(predicate()).toBe(true);
++};
++
++afterEach(() => {
++  temporaryDirectories.splice(0).forEach((directory) => {
++    (fs as any).rmSync(directory, { recursive: true, force: true });
++  });
++  jest.clearAllMocks();
++});
++
++describe("output folder CLI contract", () => {
++  test("documents the long option and short alias", () => {
++    const result = runCli(repositoryRoot, ["--help"]);
++
++    expect(result.status).toBe(0);
++    expect(result.stdout).toMatch(/--outputFolder,\s+-o/);
++  });
++
++  test("maps a directory input into a relative output folder", () => {
++    const workspace = makeTemporaryDirectory();
++    const sourceRoot = path.join(workspace, "styles");
++    const outputRoot = path.join(workspace, "types");
++    const rootSource = writeSource(sourceRoot, "base.scss", "base");
++    const nestedSource = writeSource(
++      sourceRoot,
++      path.join("components", "button.scss"),
++      "button"
++    );
++
++    const result = runCli(workspace, [
++      "styles",
++      "--outputFolder",
++      "types",
++      "--implementation",
++      "node-sass",
++      "--logLevel",
++      "silent",
++    ]);
++
++    expect(result.status).toBe(0);
++    expect(readFile(path.join(outputRoot, "base.scss.d.ts"))).toBe(
++      "export const base: string;\n"
++    );
++    expect(
++      readFile(path.join(outputRoot, "components", "button.scss.d.ts"))
++    ).toBe("export const button: string;\n");
++    expect(fs.existsSync(`${rootSource}.d.ts`)).toBe(false);
++    expect(fs.existsSync(`${nestedSource}.d.ts`)).toBe(false);
++  });
++
++  test("uses the non-glob prefix as the root and retains ignore behavior", () => {
++    const workspace = makeTemporaryDirectory();
++    const sourceRoot = path.join(workspace, "styles");
++    const outputRoot = path.join(workspace, "types");
++    const firstSource = writeSource(sourceRoot, "first.scss", "first");
++    const nestedSource = writeSource(
++      sourceRoot,
++      path.join("nested", "second.scss"),
++      "second"
++    );
++    const ignoredSource = writeSource(
++      sourceRoot,
++      path.join("nested", "ignored.scss"),
++      "ignored"
++    );
++
++    const result = runCli(workspace, [
++      "styles/**/*.scss",
++      "-o",
++      "types",
++      "--ignore",
++      "**/ignored.scss",
++      "--implementation",
++      "node-sass",
++      "--logLevel",
++      "silent",
++    ]);
++
++    expect(result.status).toBe(0);
++    expect(readFile(path.join(outputRoot, "first.scss.d.ts"))).toBe(
++      "export const first: string;\n"
++    );
++    expect(
++      readFile(path.join(outputRoot, "nested", "second.scss.d.ts"))
++    ).toBe("export const second: string;\n");
++    expect(
++      fs.existsSync(path.join(outputRoot, "nested", "ignored.scss.d.ts"))
++    ).toBe(false);
++    expect(fs.existsSync(`${firstSource}.d.ts`)).toBe(false);
++    expect(fs.existsSync(`${nestedSource}.d.ts`)).toBe(false);
++    expect(fs.existsSync(`${ignoredSource}.d.ts`)).toBe(false);
++  });
++});
++
++describe("output folder watch contract", () => {
++  test("writes changes and removes the mapped declaration on unlink", async () => {
++    const workspace = makeTemporaryDirectory();
++    const sourceRoot = path.join(workspace, "styles");
++    const outputRoot = path.join(workspace, "types");
++    const sourcePath = writeSource(
++      sourceRoot,
++      path.join("nested", "live.scss"),
++      "firstVersion"
++    );
++    const outputPath = path.join(
++      outputRoot,
++      "nested",
++      "live.scss.d.ts"
++    );
++    const handlers: { [event: string]: (file: string) => void } = {};
++    let watcher: any;
++    watcher = {
++      on: jest.fn((event: string, handler: (file: string) => void) => {
++        handlers[event] = handler;
++        return watcher;
++      }),
++    };
++    (chokidar.watch as jest.Mock).mockReturnValue(watcher);
++    const log = jest.spyOn(console, "log").mockImplementation();
++
++    watch(path.join(sourceRoot, "**/*.scss"), {
++      banner: "",
++      watch: true,
++      ignoreInitial: true,
++      exportType: "named",
++      exportTypeName: "ClassNames",
++      exportTypeInterface: "Styles",
++      listDifferent: false,
++      ignore: [],
++      includePaths: [sourceRoot],
++      implementation: "node-sass",
++      quoteType: "single",
++      logLevel: "silent",
++      outputFolder: outputRoot,
++    } as any);
++
++    handlers.add(sourcePath);
++    await waitFor(() => fs.existsSync(outputPath));
++    expect(fs.readFileSync(outputPath, "utf8")).toBe(
++      "export const firstVersion: string;\n"
++    );
++    expect(fs.existsSync(`${sourcePath}.d.ts`)).toBe(false);
++
++    fs.writeFileSync(sourcePath, ".secondVersion { color: blue; }\n");
++    handlers.change(sourcePath);
++    await waitFor(
++      () =>
++        fs.existsSync(outputPath) &&
++        fs.readFileSync(outputPath, "utf8").indexOf("secondVersion") >= 0
++    );
++    expect(fs.readFileSync(outputPath, "utf8")).toBe(
++      "export const secondVersion: string;\n"
++    );
++
++    fs.unlinkSync(sourcePath);
++    handlers.unlink(sourcePath);
++    expect(fs.existsSync(outputPath)).toBe(false);
++    log.mockRestore();
++  });
++});
++
++describe("output folder listDifferent contract", () => {
++  const listArgs = [
++    "styles/**/*.scss",
++    "--outputFolder",
++    "types",
++    "--listDifferent",
++    "--implementation",
++    "node-sass",
++  ];
++
++  test("accepts an up-to-date mapped declaration without writing", () => {
++    const workspace = makeTemporaryDirectory();
++    const sourceRoot = path.join(workspace, "styles");
++    const outputRoot = path.join(workspace, "types");
++    const sourcePath = writeSource(sourceRoot, "valid.scss", "valid");
++    const definitionPath = writeDefinition(
++      outputRoot,
++      "valid.scss",
++      "valid"
++    );
++    const before = fs.statSync(definitionPath).mtimeMs;
++
++    const result = runCli(workspace, listArgs);
++
++    expect(result.status).toBe(0);
++    expect(combinedOutput(result)).not.toContain("[INVALID TYPES]");
++    expect(fs.readFileSync(definitionPath, "utf8")).toBe(
++      "export const valid: string;\n"
++    );
++    expect(fs.statSync(definitionPath).mtimeMs).toBe(before);
++    expect(fs.existsSync(`${sourcePath}.d.ts`)).toBe(false);
++  });
++
++  test("reports stale mapped content and exits with status one", () => {
++    const workspace = makeTemporaryDirectory();
++    const sourceRoot = path.join(workspace, "styles");
++    const outputRoot = path.join(workspace, "types");
++    writeSource(sourceRoot, "stale.scss", "stale");
++    const definitionPath = writeDefinition(
++      outputRoot,
++      "stale.scss",
++      "wrong"
++    );
++
++    const result = runCli(workspace, listArgs);
++
++    expect(result.status).toBe(1);
++    expect(combinedOutput(result)).toContain("[INVALID TYPES]");
++    expect(fs.readFileSync(definitionPath, "utf8")).toBe(
++      "export const wrong: string;\n"
++    );
++  });
++
++  test("reports a missing mapped declaration without creating output", () => {
++    const workspace = makeTemporaryDirectory();
++    const sourceRoot = path.join(workspace, "styles");
++    const outputRoot = path.join(workspace, "types");
++    writeSource(sourceRoot, "missing.scss", "missing");
++
++    const result = runCli(workspace, listArgs);
++    const output = combinedOutput(result);
++
++    expect(result.status).toBe(1);
++    expect(output).toContain("[INVALID TYPES]");
++    expect(output).not.toContain("ENOENT");
++    expect(fs.existsSync(outputRoot)).toBe(false);
++  });
++
++  test("does not validate sources excluded by ignore patterns", () => {
++    const workspace = makeTemporaryDirectory();
++    const sourceRoot = path.join(workspace, "styles");
++    const outputRoot = path.join(workspace, "types");
++    writeSource(sourceRoot, "included.scss", "included");
++    writeSource(sourceRoot, "ignored.scss", "ignored");
++    writeDefinition(outputRoot, "included.scss", "included");
++
++    const result = runCli(workspace, [
++      ...listArgs,
++      "--ignore",
++      "**/ignored.scss",
++    ]);
++
++    expect(result.status).toBe(0);
++    expect(combinedOutput(result)).not.toContain("[INVALID TYPES]");
++    expect(
++      fs.existsSync(path.join(outputRoot, "ignored.scss.d.ts"))
++    ).toBe(false);
++  });
++});
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,11 @@
++#!/bin/bash
++set -euo pipefail
++
++
++./node_modules/.bin/jest __tests__/codespec-output-folder.test.ts --runInBand
++./node_modules/.bin/jest \
++  __tests__/core/write-file.test.ts \
++  __tests__/core/remove-file.test.ts \
++  __tests__/core/list-different.test.ts \
++  --runInBand
++./node_modules/.bin/tsc --noEmit

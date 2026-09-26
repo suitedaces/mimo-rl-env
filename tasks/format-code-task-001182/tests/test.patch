@@ -1,0 +1,358 @@
+diff --git a/tests/Codespec/BulkSubscriptionContractTest.php b/tests/Codespec/BulkSubscriptionContractTest.php
+new file mode 100644
+index 0000000..f73b2b1
+--- /dev/null
++++ b/tests/Codespec/BulkSubscriptionContractTest.php
+@@ -0,0 +1,342 @@
++<?php
++
++namespace Spatie\Newsletter\CodespecTest;
++
++use DrewM\MailChimp\MailChimp;
++use InvalidArgumentException;
++use PHPUnit\Framework\TestCase;
++use Spatie\Newsletter\Exceptions\InvalidNewsletterList;
++use Spatie\Newsletter\Newsletter;
++use Spatie\Newsletter\NewsletterListCollection;
++
++class RecordingBulkMailChimp extends MailChimp
++{
++    public $requests = [];
++
++    private $results;
++
++    private $lastError = false;
++
++    public function __construct(array $results = [])
++    {
++        $this->results = $results;
++    }
++
++    public function post($method, $args = [], $timeout = self::TIMEOUT)
++    {
++        $this->requests[] = [
++            'method' => $method,
++            'args' => $args,
++            'timeout' => $timeout,
++        ];
++
++        $next = array_shift($this->results);
++        if ($next === null) {
++            $next = ['response' => ['id' => 'unconfigured-batch'], 'error' => false];
++        }
++
++        $this->lastError = $next['error'];
++
++        return $next['response'];
++    }
++
++    public function getLastError()
++    {
++        return $this->lastError;
++    }
++}
++
++class BulkSubscriptionContractTest extends TestCase
++{
++    public function test_bulk_subscription_is_a_public_newsletter_operation()
++    {
++        $newsletter = $this->newsletter(new RecordingBulkMailChimp());
++
++        $this->requireBulkSubscriptionApi($newsletter);
++    }
++
++    public function test_defaults_and_both_list_selection_paths_reach_the_batch_api()
++    {
++        $api = new RecordingBulkMailChimp([
++            ['response' => ['id' => 'default-list-batch'], 'error' => false],
++            ['response' => ['id' => 'named-list-batch'], 'error' => false],
++        ]);
++        $newsletter = $this->newsletter($api);
++        $this->requireBulkSubscriptionApi($newsletter);
++
++        $defaultResult = $newsletter->subscribeMany([' Alice@Example.COM ']);
++        $namedResult = $newsletter->subscribeMany(['bob@example.com'], 'list2');
++
++        $this->assertSame([
++            ['id' => 'default-list-batch'],
++        ], $defaultResult);
++        $this->assertSame([
++            ['id' => 'named-list-batch'],
++        ], $namedResult);
++        $this->assertCount(2, $api->requests);
++
++        $defaultOperation = $this->operation($api->requests[0], 0);
++        $this->assertSame('member-0', $defaultOperation['operation_id']);
++        $this->assertSame('PUT', $defaultOperation['method']);
++        $this->assertSame(
++            'lists/123/members/'.md5('alice@example.com'),
++            $defaultOperation['path']
++        );
++        $this->assertEquals([
++            'email_address' => 'Alice@Example.COM',
++            'status_if_new' => 'subscribed',
++            'email_type' => 'html',
++        ], json_decode($defaultOperation['body'], true));
++
++        $namedOperation = $this->operation($api->requests[1], 0);
++        $this->assertSame(
++            'lists/456/members/'.md5('bob@example.com'),
++            $namedOperation['path']
++        );
++    }
++
++    public function test_global_and_member_options_have_explicit_precedence_without_truthiness_loss()
++    {
++        $api = new RecordingBulkMailChimp([
++            ['response' => ['id' => 'precedence-batch'], 'error' => false],
++        ]);
++        $newsletter = $this->newsletter($api);
++        $this->requireBulkSubscriptionApi($newsletter);
++
++        $newsletter->subscribeMany([
++            [
++                'email_address' => ' Member@Example.com ',
++                'status_if_new' => 'subscribed',
++                'email_type' => '',
++                'merge_fields' => [],
++                'marketing_permissions' => false,
++            ],
++        ], '', [
++            'email_address' => 'must-not-replace@example.com',
++            'status_if_new' => 'pending',
++            'email_type' => 'text',
++            'merge_fields' => ['SOURCE' => 'global'],
++            'language' => '',
++        ]);
++
++        $operation = $this->operation($api->requests[0], 0);
++        $this->assertEquals([
++            'email_address' => 'Member@Example.com',
++            'status_if_new' => 'subscribed',
++            'email_type' => '',
++            'merge_fields' => [],
++            'language' => '',
++            'marketing_permissions' => false,
++        ], json_decode($operation['body'], true));
++        $this->assertSame(
++            'lists/123/members/'.md5('member@example.com'),
++            $operation['path']
++        );
++    }
++
++    public function test_duplicates_are_collapsed_by_normalized_address_with_last_occurrence_order()
++    {
++        $api = new RecordingBulkMailChimp([
++            ['response' => ['id' => 'deduplicated-batch'], 'error' => false],
++        ]);
++        $newsletter = $this->newsletter($api);
++        $this->requireBulkSubscriptionApi($newsletter);
++
++        $newsletter->subscribeMany([
++            [
++                'email_address' => 'First@Example.com',
++                'merge_fields' => ['VERSION' => 'old'],
++            ],
++            'second@example.com',
++            [
++                'email_address' => ' first@EXAMPLE.com ',
++                'merge_fields' => ['VERSION' => 'new'],
++            ],
++        ]);
++
++        $operations = $api->requests[0]['args']['operations'];
++        $this->assertCount(2, $operations);
++        $this->assertSame('member-0', $operations[0]['operation_id']);
++        $this->assertSame('member-1', $operations[1]['operation_id']);
++        $this->assertSame(
++            'lists/123/members/'.md5('second@example.com'),
++            $operations[0]['path']
++        );
++        $this->assertSame(
++            'lists/123/members/'.md5('first@example.com'),
++            $operations[1]['path']
++        );
++        $this->assertEquals(
++            ['VERSION' => 'new'],
++            json_decode($operations[1]['body'], true)['merge_fields']
++        );
++    }
++
++    public function test_more_than_500_unique_members_are_chunked_with_global_operation_ids()
++    {
++        $api = new RecordingBulkMailChimp([
++            ['response' => ['id' => 'chunk-one'], 'error' => false],
++            ['response' => ['id' => 'chunk-two'], 'error' => false],
++        ]);
++        $newsletter = $this->newsletter($api);
++        $this->requireBulkSubscriptionApi($newsletter);
++        $members = [];
++        $members[] = [
++            'email_address' => 'Boundary@Example.com',
++            'merge_fields' => ['VERSION' => 'old'],
++        ];
++        for ($index = 1; $index <= 500; $index++) {
++            $members[] = "member{$index}@example.com";
++        }
++        $members[] = [
++            'email_address' => ' boundary@example.COM ',
++            'merge_fields' => ['VERSION' => 'new'],
++        ];
++
++        $result = $newsletter->subscribeMany($members);
++
++        $this->assertSame([
++            ['id' => 'chunk-one'],
++            ['id' => 'chunk-two'],
++        ], $result);
++        $this->assertCount(2, $api->requests);
++        $this->assertCount(500, $api->requests[0]['args']['operations']);
++        $this->assertCount(1, $api->requests[1]['args']['operations']);
++        $this->assertSame(
++            'member-499',
++            $api->requests[0]['args']['operations'][499]['operation_id']
++        );
++        $this->assertSame(
++            'member-500',
++            $api->requests[1]['args']['operations'][0]['operation_id']
++        );
++        $lastOperation = $api->requests[1]['args']['operations'][0];
++        $this->assertSame(
++            'lists/123/members/'.md5('boundary@example.com'),
++            $lastOperation['path']
++        );
++        $this->assertEquals(
++            ['VERSION' => 'new'],
++            json_decode($lastOperation['body'], true)['merge_fields']
++        );
++    }
++
++    public function test_all_members_are_validated_before_any_batch_is_submitted()
++    {
++        $invalidSets = [
++            [
++                'members' => ['valid@example.com', '   '],
++                'message' => 'Member at index 1 must provide a non-empty email_address.',
++            ],
++            [
++                'members' => [
++                    ['email_address' => 'valid@example.com'],
++                    ['merge_fields' => []],
++                ],
++                'message' => 'Member at index 1 must provide a non-empty email_address.',
++            ],
++            [
++                'members' => [123],
++                'message' => 'Member at index 0 must provide a non-empty email_address.',
++            ],
++        ];
++
++        foreach ($invalidSets as $invalidSet) {
++            $api = new RecordingBulkMailChimp();
++            $newsletter = $this->newsletter($api);
++            $this->requireBulkSubscriptionApi($newsletter);
++
++            try {
++                $newsletter->subscribeMany($invalidSet['members']);
++                $this->fail('Invalid member input was accepted.');
++            } catch (InvalidArgumentException $exception) {
++                $this->assertSame($invalidSet['message'], $exception->getMessage());
++            }
++
++            $this->assertSame([], $api->requests);
++        }
++    }
++
++    public function test_an_unknown_list_fails_before_batch_submission()
++    {
++        $api = new RecordingBulkMailChimp();
++        $newsletter = $this->newsletter($api);
++        $this->requireBulkSubscriptionApi($newsletter);
++
++        try {
++            $newsletter->subscribeMany(['valid@example.com'], 'unknown-list');
++            $this->fail('An unknown list name was accepted.');
++        } catch (InvalidNewsletterList $exception) {
++            $this->assertStringContainsString('unknown-list', $exception->getMessage());
++        }
++
++        $this->assertSame([], $api->requests);
++    }
++
++    public function test_empty_input_is_a_no_op_with_an_empty_receipt_list()
++    {
++        $api = new RecordingBulkMailChimp();
++        $newsletter = $this->newsletter($api);
++        $this->requireBulkSubscriptionApi($newsletter);
++
++        $result = $newsletter->subscribeMany([]);
++
++        $this->assertSame([], $result);
++        $this->assertSame([], $api->requests);
++    }
++
++    public function test_api_error_stops_later_chunks_and_returns_false()
++    {
++        $api = new RecordingBulkMailChimp([
++            ['response' => ['id' => 'accepted-chunk'], 'error' => false],
++            ['response' => ['id' => 'rejected-chunk'], 'error' => 'batch rejected'],
++            ['response' => ['id' => 'must-not-run'], 'error' => false],
++        ]);
++        $newsletter = $this->newsletter($api);
++        $this->requireBulkSubscriptionApi($newsletter);
++        $members = [];
++        for ($index = 0; $index < 1001; $index++) {
++            $members[] = "failure{$index}@example.com";
++        }
++
++        $result = $newsletter->subscribeMany($members);
++
++        $this->assertFalse($result);
++        $this->assertCount(2, $api->requests);
++        $this->assertCount(500, $api->requests[1]['args']['operations']);
++        $this->assertSame(
++            'member-500',
++            $api->requests[1]['args']['operations'][0]['operation_id']
++        );
++    }
++
++    private function newsletter(RecordingBulkMailChimp $api)
++    {
++        $lists = NewsletterListCollection::createFromConfig([
++            'lists' => [
++                'list1' => ['id' => 123],
++                'list2' => ['id' => 456],
++            ],
++            'defaultListName' => 'list1',
++        ]);
++
++        return new Newsletter($api, $lists);
++    }
++
++    private function requireBulkSubscriptionApi(Newsletter $newsletter)
++    {
++        $this->assertTrue(
++            is_callable([$newsletter, 'subscribeMany']),
++            'Newsletter::subscribeMany() must be a public callable method.'
++        );
++    }
++
++    private function operation(array $request, $index)
++    {
++        $this->assertSame('batches', $request['method']);
++        $this->assertArrayHasKey('operations', $request['args']);
++        $this->assertArrayHasKey($index, $request['args']['operations']);
++
++        return $request['args']['operations'][$index];
++    }
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,5 @@
++#!/bin/bash
++set -euo pipefail
++
++
++vendor/bin/phpunit --no-configuration --colors=never tests/Codespec/BulkSubscriptionContractTest.php

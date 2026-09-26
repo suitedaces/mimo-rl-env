@@ -1,0 +1,226 @@
+diff --git a/src/olympia/api/tests/jwt_replay_cache_codespec.py b/src/olympia/api/tests/jwt_replay_cache_codespec.py
+new file mode 100644
+index 0000000000..a48bd6cfba
+--- /dev/null
++++ b/src/olympia/api/tests/jwt_replay_cache_codespec.py
+@@ -0,0 +1,6 @@
++from caching.backends.locmem import LocMemCache
++
++
++class FailingReplayCache(LocMemCache):
++    def add(self, *args, **kwargs):
++        raise RuntimeError('codespec cache outage')
+diff --git a/src/olympia/api/tests/jwt_replay_settings_codespec.py b/src/olympia/api/tests/jwt_replay_settings_codespec.py
+new file mode 100644
+index 0000000000..e87d6e7651
+--- /dev/null
++++ b/src/olympia/api/tests/jwt_replay_settings_codespec.py
+@@ -0,0 +1,15 @@
++import os
++
++from settings_test import *  # noqa
++
++
++CACHES = {
++    'default': {
++        'BACKEND': (
++            'olympia.api.tests.jwt_replay_cache_codespec.'
++            'FailingReplayCache'
++            if os.environ.get('CODESPEC_JWT_CACHE_FAIL') else
++            'django.core.cache.backends.filebased.FileBasedCache'),
++        'LOCATION': os.environ['CODESPEC_JWT_CACHE_DIR'],
++    }
++}
+diff --git a/src/olympia/api/tests/test_jwt_replay_codespec.py b/src/olympia/api/tests/test_jwt_replay_codespec.py
+new file mode 100644
+index 0000000000..cbf596a469
+--- /dev/null
++++ b/src/olympia/api/tests/test_jwt_replay_codespec.py
+@@ -0,0 +1,175 @@
++# -*- coding: utf-8 -*-
++from datetime import datetime, timedelta
++import os
++import shutil
++import subprocess
++import sys
++import tempfile
++from unittest import TestCase
++
++from django.conf import settings
++from django.core.cache import cache
++
++from freezegun import freeze_time
++import jwt
++from rest_framework.exceptions import AuthenticationFailed
++from rest_framework_jwt.settings import api_settings
++
++from olympia.api.jwt_auth import jwt_decode_handler
++
++
++class FakeAPIKey(object):
++    def __init__(self, secret):
++        self.secret = secret
++
++
++class TestJWTReplayProtectionCodespec(TestCase):
++    secret = 'codespec-shared-secret'
++
++    def setUp(self):
++        cache.clear()
++
++    def encode(self, issuer='codespec-issuer', jti='codespec-jti',
++               secret=None, issued_at=None, lifetime=60):
++        issued_at = issued_at or datetime.utcnow()
++        payload = {
++            'iss': issuer,
++            'iat': issued_at,
++            'exp': issued_at + timedelta(seconds=lifetime),
++        }
++        if jti is not None:
++            payload['jti'] = jti
++        token = jwt.encode(
++            payload, secret or self.secret, api_settings.JWT_ALGORITHM)
++        return token.decode('utf-8')
++
++    def decode(self, token, secrets=None):
++        secrets = secrets or {'codespec-issuer': self.secret}
++
++        def get_api_key(key):
++            return FakeAPIKey(secrets[key])
++
++        return jwt_decode_handler(token, get_api_key=get_api_key)
++
++    def assert_authentication_error(self, token, message, secrets=None):
++        with self.assertRaises(AuthenticationFailed) as exc:
++            self.decode(token, secrets=secrets)
++        assert exc.exception.detail == message
++
++    def test_accepts_unique_string_ids_and_boundary_length(self):
++        payload = self.decode(self.encode(jti=u'nonce-☃'))
++        assert set(payload) == {'iss', 'iat', 'exp', 'jti'}
++        assert payload['iss'] == 'codespec-issuer'
++        assert payload['jti'] == u'nonce-☃'
++        assert payload['exp'] - payload['iat'] == 60
++
++        boundary_id = 'x' * 255
++        payload = self.decode(self.encode(jti=boundary_id))
++        assert payload['jti'] == boundary_id
++
++    def test_requires_a_nonempty_string_id(self):
++        self.assert_authentication_error(
++            self.encode(jti=None),
++            'JWT jti (JWT ID) claim is missing.')
++
++        invalid_message = (
++            'JWT jti (JWT ID) claim must be a non-empty string no longer '
++            'than 255 characters.')
++        for counter, invalid_jti in enumerate(('', 7, ['nonce'], 'x' * 256)):
++            self.assert_authentication_error(
++                self.encode(jti=invalid_jti, issuer='invalid-%s' % counter),
++                invalid_message,
++                secrets={'invalid-%s' % counter: self.secret})
++
++    def test_rejects_replay_across_worker_processes(self):
++        cache_dir = tempfile.mkdtemp(prefix='codespec-jwt-cache-')
++        self.addCleanup(shutil.rmtree, cache_dir)
++        token = self.encode(jti='cross-process-nonce', lifetime=120)
++        env = os.environ.copy()
++        env['DJANGO_SETTINGS_MODULE'] = (
++            'olympia.api.tests.jwt_replay_settings_codespec')
++        env['CODESPEC_JWT_CACHE_DIR'] = cache_dir
++        command = [
++            sys.executable, '-c',
++            ('import sys; '
++             'from olympia.api.jwt_auth import jwt_decode_handler; '
++             'K = type("K", (object,), {"secret": sys.argv[2]}); '
++             'jwt_decode_handler(sys.argv[1], '
++             'get_api_key=lambda **kw: K())'),
++            token, self.secret,
++        ]
++
++        assert subprocess.call(command, env=env) == 0
++        assert subprocess.call(command, env=env) != 0
++
++    def test_nonce_scope_is_unambiguous_and_per_issuer(self):
++        secrets = {
++            'alpha': 'alpha-secret',
++            'alpha:beta': 'alpha-beta-secret',
++            'other': 'other-secret',
++        }
++        self.decode(self.encode(
++            issuer='alpha:beta', jti='gamma',
++            secret=secrets['alpha:beta']), secrets)
++        self.decode(self.encode(
++            issuer='alpha', jti='beta:gamma', secret=secrets['alpha']),
++            secrets)
++        self.decode(self.encode(
++            issuer='other', jti='gamma', secret=secrets['other']), secrets)
++
++        replay = self.encode(
++            issuer='alpha:beta', jti='gamma',
++            secret=secrets['alpha:beta'])
++        self.assert_authentication_error(
++            replay, 'JWT jti (JWT ID) has already been used.', secrets)
++
++    def test_rejected_tokens_do_not_consume_the_id(self):
++        bad_signature = self.encode(
++            jti='bad-signature-then-valid', secret='wrong-secret')
++        with self.assertRaises(jwt.DecodeError):
++            self.decode(bad_signature)
++        self.decode(self.encode(jti='bad-signature-then-valid'))
++
++        too_long = settings.MAX_APIKEY_JWT_AUTH_TOKEN_LIFETIME + 1
++        self.assert_authentication_error(
++            self.encode(jti='too-long-then-valid', lifetime=too_long),
++            'JWT exp (expiration) is too long.')
++        self.decode(self.encode(jti='too-long-then-valid'))
++
++    def test_cache_outage_fails_closed_with_authentication_error(self):
++        cache_dir = tempfile.mkdtemp(prefix='codespec-jwt-cache-failure-')
++        self.addCleanup(shutil.rmtree, cache_dir)
++        token = self.encode(jti='cache-failure-nonce')
++        env = os.environ.copy()
++        env['DJANGO_SETTINGS_MODULE'] = (
++            'olympia.api.tests.jwt_replay_settings_codespec')
++        env['CODESPEC_JWT_CACHE_DIR'] = cache_dir
++        env['CODESPEC_JWT_CACHE_FAIL'] = '1'
++        command = [
++            sys.executable, '-c',
++            ('import sys; '
++             'from rest_framework.exceptions import AuthenticationFailed; '
++             'from olympia.api.jwt_auth import jwt_decode_handler; '
++             'K = type("K", (object,), {"secret": sys.argv[2]}); '
++             'status = 3; '
++             '\ntry: jwt_decode_handler(sys.argv[1], '
++             'get_api_key=lambda **kw: K())'
++             '\nexcept AuthenticationFailed as exc: '
++             'status = 0 if exc.detail == '
++             '"JWT replay protection is temporarily unavailable." else 4'
++             '\nsys.exit(status)'),
++            token, self.secret,
++        ]
++        assert subprocess.call(command, env=env) == 0
++
++    def test_reservation_expires_after_token_validity_and_leeway(self):
++        with freeze_time('2017-01-01 00:00:00'):
++            token = self.encode(jti='expiring-nonce', lifetime=10)
++            self.decode(token)
++
++        with freeze_time('2017-01-01 00:00:12'):
++            self.assert_authentication_error(
++                token, 'JWT jti (JWT ID) has already been used.')
++
++        with freeze_time('2017-01-01 00:00:16'):
++            self.decode(self.encode(jti='expiring-nonce', lifetime=10))
+
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,6 @@
++#!/bin/bash
++set -euo pipefail
++
++
++PYTHONPATH=src DJANGO_SETTINGS_MODULE=settings_test \
++  py.test -q src/olympia/api/tests/test_jwt_replay_codespec.py

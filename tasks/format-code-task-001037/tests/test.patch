@@ -1,0 +1,158 @@
+diff --git a/src/paperless_tika/tests/test_response_compat_synthesis.py b/src/paperless_tika/tests/test_response_compat_synthesis.py
+new file mode 100644
+index 000000000..19366a202
+--- /dev/null
++++ b/src/paperless_tika/tests/test_response_compat_synthesis.py
+@@ -0,0 +1,140 @@
++import datetime
++from pathlib import Path
++from types import SimpleNamespace
++from unittest import mock
++
++from django.test import TestCase
++
++from documents.parsers import ParseError
++from paperless_mail.parsers import MailDocumentParser
++from paperless_tika.parsers import TikaDocumentParser
++
++
++class TikaResponseCompatibilityTests(TestCase):
++    def setUp(self):
++        self.parser = TikaDocumentParser(logging_group=None)
++        self.mail_parser = MailDocumentParser(logging_group=None)
++        self.document = Path(self.parser.tempdir) / "input.docx"
++        self.document.touch()
++
++    def tearDown(self):
++        self.parser.cleanup()
++        self.mail_parser.cleanup()
++
++    def _client(self, response=None, error=None):
++        client = mock.MagicMock()
++        client.__enter__.return_value = client
++        if error is not None:
++            client.tika.as_text.from_file.side_effect = error
++        else:
++            client.tika.as_text.from_file.return_value = response
++        return client
++
++    def test_parse_modern_response_uses_top_level_fields(self):
++        created = datetime.datetime(2024, 2, 3, 4, 5, tzinfo=datetime.timezone.utc)
++        response = SimpleNamespace(content="  modern text  ", created=created)
++
++        with (
++            mock.patch("paperless_tika.parsers.TikaClient", return_value=self._client(response)),
++            mock.patch.object(self.parser, "convert_to_pdf", return_value="modern.pdf"),
++        ):
++            self.parser.parse(self.document, "application/vnd.openxmlformats-officedocument.wordprocessingml.document", "scan.docx")
++
++        self.assertEqual(self.parser.get_text(), "modern text")
++        self.assertEqual(self.parser.get_date(), created)
++        self.assertEqual(self.parser.get_archive_path(), "modern.pdf")
++
++    def test_parse_legacy_response_keeps_metadata_compatibility(self):
++        created = datetime.datetime(2023, 8, 9, tzinfo=datetime.timezone.utc)
++        response = SimpleNamespace(
++            content="legacy text",
++            metadata=SimpleNamespace(created=created),
++        )
++
++        with (
++            mock.patch("paperless_tika.parsers.TikaClient", return_value=self._client(response)),
++            mock.patch.object(self.parser, "convert_to_pdf", return_value="legacy.pdf"),
++        ):
++            self.parser.parse(self.document, "application/msword")
++
++        self.assertEqual(self.parser.get_text(), "legacy text")
++        self.assertEqual(self.parser.get_date(), created)
++
++    def test_parse_missing_content_and_date_is_empty_and_undated(self):
++        response = SimpleNamespace(content=None, created=None)
++
++        with (
++            mock.patch("paperless_tika.parsers.TikaClient", return_value=self._client(response)),
++            mock.patch.object(self.parser, "convert_to_pdf", return_value="empty.pdf"),
++        ):
++            self.parser.parse(self.document, "application/msword")
++
++        self.assertEqual(self.parser.get_text(), "")
++        self.assertIsNone(self.parser.get_date())
++        self.assertEqual(self.parser.get_archive_path(), "empty.pdf")
++
++    def test_parse_invalid_date_does_not_abort_conversion(self):
++        class InvalidDateResponse:
++            content = "usable text"
++
++            @property
++            def created(self):
++                raise ValueError("bad date")
++
++        with (
++            mock.patch(
++                "paperless_tika.parsers.TikaClient",
++                return_value=self._client(InvalidDateResponse()),
++            ),
++            mock.patch.object(self.parser, "convert_to_pdf", return_value="invalid-date.pdf"),
++        ):
++            self.parser.parse(self.document, "application/msword")
++
++        self.assertEqual(self.parser.get_text(), "usable text")
++        self.assertIsNone(self.parser.get_date())
++        self.assertEqual(self.parser.get_archive_path(), "invalid-date.pdf")
++
++    def test_parse_client_failure_is_parse_error(self):
++        client_error = RuntimeError("connection refused")
++        with mock.patch(
++            "paperless_tika.parsers.TikaClient",
++            return_value=self._client(error=client_error),
++        ):
++            with self.assertRaises(ParseError) as raised:
++                self.parser.parse(self.document, "application/msword")
++
++        self.assertIn("Could not parse", str(raised.exception))
++        self.assertIn("connection refused", str(raised.exception))
++        self.assertIs(raised.exception.__cause__, client_error)
++
++    def test_extract_metadata_accepts_mapping_response(self):
++        metadata_response = {"title": "Invoice", "pages": 2}
++        client = self._client()
++        client.metadata.from_file.return_value = metadata_response
++
++        with mock.patch("paperless_tika.parsers.TikaClient", return_value=client):
++            metadata = self.parser.extract_metadata(self.document, "application/msword")
++
++        self.assertEqual(
++            metadata,
++            [
++                {"namespace": "", "prefix": "", "key": "title", "value": "Invoice"},
++                {"namespace": "", "prefix": "", "key": "pages", "value": 2},
++            ],
++        )
++
++    def test_mail_html_parse_uses_modern_content_field(self):
++        client = self._client()
++        client.tika.as_text.from_buffer.return_value = SimpleNamespace(
++            content="  html text  ",
++        )
++
++        with mock.patch("paperless_mail.parsers.TikaClient", return_value=client):
++            self.assertEqual(self.mail_parser.tika_parse("<p>ignored</p>"), "html text")
++
++    def test_mail_html_parse_missing_content_is_empty(self):
++        client = self._client()
++        client.tika.as_text.from_buffer.return_value = SimpleNamespace(content=None)
++
++        with mock.patch("paperless_mail.parsers.TikaClient", return_value=client):
++            self.assertEqual(self.mail_parser.tika_parse("<p>ignored</p>"), "")
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,7 @@
++#!/bin/bash
++set -euo pipefail
++
++
++REPO_ROOT="$(git rev-parse --show-toplevel)"
++cd "${REPO_ROOT}/src"
++"${REPO_ROOT}/.venv/bin/python" -m pytest -o addopts='' paperless_tika/tests/test_response_compat_synthesis.py -q

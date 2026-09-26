@@ -1,0 +1,339 @@
+diff --git a/usercase-test-coderl/test_segformer_head.py b/usercase-test-coderl/test_segformer_head.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/test_segformer_head.py
+@@ -0,0 +1,306 @@
++
++
++import pytest
++import torch
++import torch.nn as nn
++from mmcv.utils.parrots_wrapper import SyncBatchNorm
++
++from mmseg.models import build_head
++from mmseg.models.decode_heads import SegFormerHead
++
++
++
++
++SyncBatchNorm._specify_ddp_gpu_num = lambda self, gpu_size: None
++
++
++def _make_head(num_classes=19, in_channels=None, embed_dim=8, in_index=None):
++    if in_channels is None:
++        in_channels = [32, 64, 160, 256]
++    if in_index is None:
++        in_index = [0, 1, 2, 3]
++    return SegFormerHead(
++        feature_strides=[4, 8, 16, 32],
++        in_channels=in_channels,
++        in_index=in_index,
++        channels=embed_dim,
++        num_classes=num_classes,
++        decoder_params={"embed_dim": embed_dim},
++    )
++
++
++def _projection_input_channels(head, embed_dim):
++    projection_inputs = []
++    for module in head.modules():
++        if isinstance(module, nn.Linear) and module.out_features == embed_dim:
++            projection_inputs.append(module.in_features)
++        elif (
++            isinstance(module, nn.Conv2d)
++            and module.out_channels == embed_dim
++            and module.kernel_size == (1, 1)
++        ):
++            projection_inputs.append(module.in_channels)
++    return projection_inputs
++
++
++def test_direct_constructor_exposes_four_scale_decode_state():
++
++
++
++    torch.manual_seed(3407)
++    head = _make_head(in_channels=[5, 7, 11, 13], embed_dim=3)
++
++    assert head.__class__.__name__ == "SegFormerHead"
++
++
++
++    projection_inputs = _projection_input_channels(head, embed_dim=3)
++    for in_channel in [5, 7, 11, 13]:
++        assert in_channel in projection_inputs
++    assert sum(p.numel() for p in head.parameters()) > 0
++
++
++def test_build_head_config_selects_segformer_head():
++
++
++
++    cfg = {
++        "type": "SegFormerHead",
++        "feature_strides": [4, 8, 16, 32],
++        "in_channels": [32, 64, 160, 256],
++        "in_index": [0, 1, 2, 3],
++        "channels": 8,
++        "num_classes": 19,
++        "decoder_params": {"embed_dim": 8},
++    }
++
++    head = build_head(cfg)
++
++    assert head.__class__.__name__ == "SegFormerHead"
++
++
++    head.eval()
++    inputs = [
++        torch.ones(1, 32, 8, 8),
++        torch.ones(1, 64, 4, 4),
++        torch.ones(1, 160, 2, 2),
++        torch.ones(1, 256, 1, 1),
++    ]
++    with torch.no_grad():
++        logits = head(inputs)
++    assert tuple(logits.shape) == (1, 19, 8, 8)
++
++
++def test_forward_cityscapes_example_returns_finest_resolution_logits():
++
++
++
++    torch.manual_seed(3407)
++    head = _make_head()
++    head.eval()
++    inputs = [
++        torch.ones(2, 32, 128, 128),
++        torch.ones(2, 64, 64, 64) * 2,
++        torch.ones(2, 160, 32, 32) * 3,
++        torch.ones(2, 256, 16, 16) * 4,
++    ]
++
++    with torch.no_grad():
++        logits = head(inputs)
++
++    assert tuple(logits.shape) == (2, 19, 128, 128)
++
++    assert torch.isfinite(logits).all()
++
++
++def test_forward_ade20k_example_returns_150_class_logits():
++
++
++
++    torch.manual_seed(3407)
++    head = _make_head(
++        num_classes=150,
++        in_channels=[64, 128, 320, 512],
++        embed_dim=16,
++    )
++    head.eval()
++    inputs = [
++        torch.ones(1, 64, 64, 64),
++        torch.ones(1, 128, 32, 32) * 2,
++        torch.ones(1, 320, 16, 16) * 3,
++        torch.ones(1, 512, 8, 8) * 4,
++    ]
++
++    with torch.no_grad():
++        logits = head(inputs)
++
++    assert tuple(logits.shape) == (1, 150, 64, 64)
++
++    assert torch.isfinite(logits).all()
++
++
++def test_forward_uses_configured_input_indices():
++
++
++
++    torch.manual_seed(11)
++    head = SegFormerHead(
++        feature_strides=[4, 8, 16, 32],
++        in_channels=[4, 5, 6, 7],
++        in_index=[1, 2, 3, 4],
++        channels=3,
++        num_classes=2,
++        decoder_params={"embed_dim": 3},
++    )
++    head.eval()
++    inputs = [
++        torch.full((1, 99, 20, 20), 9.0),
++        torch.ones(1, 4, 10, 10),
++        torch.ones(1, 5, 5, 5) * 2,
++        torch.ones(1, 6, 3, 3) * 3,
++        torch.ones(1, 7, 2, 2) * 4,
++    ]
++
++    with torch.no_grad():
++        logits = head(inputs)
++
++    assert tuple(logits.shape) == (1, 2, 10, 10)
++
++
++
++    assert torch.isfinite(logits).all()
++
++
++def test_forward_changes_when_coarsest_scale_changes():
++
++
++
++    head = SegFormerHead(
++        feature_strides=[4, 8, 16, 32],
++        in_channels=[1, 1, 1, 1],
++        in_index=[0, 1, 2, 3],
++        channels=2,
++        num_classes=1,
++        decoder_params={"embed_dim": 2},
++    )
++    head.eval()
++    with torch.no_grad():
++        for param in head.parameters():
++            param.fill_(1.0)
++        state = head.state_dict()
++        for key, value in state.items():
++            if key.endswith("running_mean"):
++                value.fill_(0.0)
++            elif key.endswith("running_var"):
++                value.fill_(1.0)
++        head.load_state_dict(state)
++
++    base_inputs = [
++        torch.ones(1, 1, 6, 6),
++        torch.ones(1, 1, 3, 3) * 2,
++        torch.ones(1, 1, 2, 2) * 3,
++        torch.ones(1, 1, 1, 1) * 4,
++    ]
++    changed_inputs = [
++        base_inputs[0],
++        base_inputs[1],
++        base_inputs[2],
++        torch.ones(1, 1, 1, 1) * 8,
++    ]
++
++    with torch.no_grad():
++        base_logits = head(base_inputs)
++        changed_logits = head(changed_inputs)
++
++    assert tuple(base_logits.shape) == (1, 1, 6, 6)
++    assert tuple(changed_logits.shape) == (1, 1, 6, 6)
++
++
++    assert not torch.allclose(base_logits, changed_logits)
++
++
++def test_constructor_rejects_feature_stride_count_mismatch():
++
++
++
++    with pytest.raises(AssertionError):
++        SegFormerHead(
++            feature_strides=[4, 8, 16],
++            in_channels=[32, 64, 160, 256],
++            in_index=[0, 1, 2, 3],
++            channels=8,
++            num_classes=19,
++            decoder_params={"embed_dim": 8},
++        )
++
++
++def test_constructor_rejects_when_first_stride_is_not_smallest():
++
++
++
++    with pytest.raises(AssertionError):
++        SegFormerHead(
++            feature_strides=[8, 4, 16, 32],
++            in_channels=[32, 64, 160, 256],
++            in_index=[0, 1, 2, 3],
++            channels=8,
++            num_classes=19,
++            decoder_params={"embed_dim": 8},
++        )
++
++
++def test_separate_instances_own_separate_parameter_storage():
++
++
++
++    head_a = _make_head(embed_dim=4)
++    head_b = _make_head(embed_dim=4)
++    param_a = next(head_a.parameters())
++    param_b = next(head_b.parameters())
++
++    with torch.no_grad():
++        param_b.fill_(1.25)
++        param_a.fill_(2.0)
++
++
++
++    assert len(list(head_a.parameters())) > 0
++    assert len(list(head_b.parameters())) > 0
++    ptrs_a = {p.data_ptr() for p in head_a.parameters()}
++    ptrs_b = {p.data_ptr() for p in head_b.parameters()}
++    assert ptrs_a.isdisjoint(ptrs_b)
++
++    snapshots_b = [p.detach().clone() for p in head_b.parameters()]
++    with torch.no_grad():
++        for param in head_a.parameters():
++            param.add_(3.0)
++    for before, after in zip(snapshots_b, head_b.parameters()):
++        assert torch.equal(before, after)
++
++
++def test_repeated_construct_forward_cycles_keep_returning_dense_logits():
++
++
++
++    shapes = []
++
++    for _ in range(100):
++        head = _make_head(num_classes=2, in_channels=[1, 1, 1, 1], embed_dim=2)
++        head.eval()
++        inputs = [
++            torch.ones(1, 1, 4, 4),
++            torch.ones(1, 1, 2, 2),
++            torch.ones(1, 1, 1, 1),
++            torch.ones(1, 1, 1, 1),
++        ]
++        with torch.no_grad():
++            logits = head(inputs)
++        assert tuple(logits.shape) == (1, 2, 4, 4)
++        shapes.append(tuple(logits.shape))
++        del logits
++        del inputs
++        del head
++
++
++
++    assert shapes == [(1, 2, 4, 4)] * 100
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,23 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++cd /workspace/repo
++
++
++
++
++export PYTHONPATH="/workspace/repo${PYTHONPATH:+:${PYTHONPATH}}"
++export PIP_NO_INDEX=1
++export PIP_DISABLE_PIP_VERSION_CHECK=1
++export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
++
++exec python -m pytest --rootdir=/workspace/repo -c /dev/null /workspace/repo/usercase-test-coderl/test_segformer_head.py -v

@@ -1,0 +1,288 @@
+diff --git a/http3/server_test.go b/http3/server_test.go
+index 1e33061a4db..b27d85f545b 100644
+--- a/http3/server_test.go
++++ b/http3/server_test.go
+@@ -860,7 +860,7 @@ func TestServerClosing(t *testing.T) {
+ 	require.ErrorIs(t, s.ServeQUICConn(nil), http.ErrServerClosed)
+ }
+ 
+-func TestHandlesConcurrentServeAndClose(t *testing.T) {
++func TestServerConcurrentServeAndClose(t *testing.T) {
+ 	addr, err := net.ResolveUDPAddr("udp", "localhost:0")
+ 	require.NoError(t, err)
+ 	c, err := net.ListenUDP("udp", addr)
+@@ -879,3 +879,134 @@ func TestHandlesConcurrentServeAndClose(t *testing.T) {
+ 		t.Fatal("timeout")
+ 	}
+ }
++
++func TestServerGracefulShutdown(t *testing.T) {
++	s := &Server{TLSConfig: testdata.GetTLSConfig()}
++	s.init()
++
++	mockCtrl := gomock.NewController(t)
++	controlStr := mockquic.NewMockStream(mockCtrl)
++	controlStrChan := make(chan []byte, 1)
++	controlStr.EXPECT().Write(gomock.Any()).DoAndReturn(func(b []byte) (int, error) {
++		controlStrChan <- b
++		return len(b), nil
++	}).AnyTimes()
++
++	streamChan := make(chan quic.Stream, 1)
++	testDone := make(chan struct{})
++	conn := mockquic.NewMockEarlyConnection(mockCtrl)
++	conn.EXPECT().OpenUniStream().Return(controlStr, nil)
++	conn.EXPECT().AcceptUniStream(gomock.Any()).DoAndReturn(func(context.Context) (quic.ReceiveStream, error) {
++		<-testDone
++		return nil, assert.AnError
++	}).MaxTimes(1)
++	conn.EXPECT().AcceptStream(gomock.Any()).DoAndReturn(func(ctx context.Context) (quic.Stream, error) {
++		select {
++		case <-ctx.Done():
++			return nil, ctx.Err()
++		case str, ok := <-streamChan:
++			if !ok {
++				return nil, assert.AnError
++			}
++			return str, nil
++		}
++	}).AnyTimes()
++	conn.EXPECT().RemoteAddr().Return(&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1337}).AnyTimes()
++	conn.EXPECT().LocalAddr().AnyTimes()
++	conn.EXPECT().Context().Return(context.Background()).AnyTimes()
++
++	firstStream := mockquic.NewMockStream(mockCtrl)
++	firstStreamAccepted := make(chan struct{}, 1)
++	firstStream.EXPECT().Read(gomock.Any()).DoAndReturn(func(b []byte) (int, error) {
++		firstStreamAccepted <- struct{}{}
++		<-testDone
++		return 0, assert.AnError
++	})
++	firstStream.EXPECT().StreamID().Return(quic.StreamID(1337)).AnyTimes()
++	firstStream.EXPECT().Context().Return(context.Background()).AnyTimes()
++	streamChan <- firstStream
++
++	go s.ServeQUICConn(conn)
++
++	var r bytes.Buffer
++	fp := &frameParser{r: &r}
++
++	select {
++	case b := <-controlStrChan:
++		_, l, err := quicvarint.Parse(b)
++		require.NoError(t, err)
++		r.Write(b[l:])
++		f, err := fp.ParseNext()
++		require.NoError(t, err)
++		require.IsType(t, &settingsFrame{}, f)
++	case <-time.After(time.Second):
++		t.Fatal("timeout")
++	}
++
++	select {
++	case <-firstStreamAccepted:
++	case <-time.After(time.Second):
++		t.Fatal("timeout")
++	}
++
++	time.Sleep(scaleDuration(10 * time.Millisecond))
++
++	ctx, cancel := context.WithCancel(context.Background())
++	errChan := make(chan error)
++	go func() {
++		errChan <- s.Shutdown(ctx)
++	}()
++
++	select {
++	case b := <-controlStrChan:
++		r.Write(b)
++		f, err := fp.ParseNext()
++		require.NoError(t, err)
++		require.Equal(t, &goAwayFrame{StreamID: 1337 + 4}, f)
++	case <-time.After(time.Second):
++		t.Fatal("timeout")
++	}
++
++	select {
++	case <-errChan:
++		t.Fatal("didn't expect Shutdown to return")
++	case <-time.After(scaleDuration(10 * time.Millisecond)):
++	}
++
++
++	for range 3 {
++		resetChan := make(chan struct{}, 2)
++		str := mockquic.NewMockStream(mockCtrl)
++		str.EXPECT().StreamID().AnyTimes()
++		str.EXPECT().Context().Return(context.Background()).AnyTimes()
++		str.EXPECT().CancelRead(quic.StreamErrorCode(ErrCodeRequestRejected)).Do(func(sec quic.StreamErrorCode) {
++			resetChan <- struct{}{}
++		})
++		str.EXPECT().CancelWrite(quic.StreamErrorCode(ErrCodeRequestRejected)).Do(func(sec quic.StreamErrorCode) {
++			resetChan <- struct{}{}
++		})
++		streamChan <- str
++
++		for range 2 {
++			select {
++			case <-resetChan:
++			case <-time.After(time.Second):
++				t.Fatal("expected stream reset")
++			}
++		}
++	}
++
++
++	conn.EXPECT().CloseWithError(quic.ApplicationErrorCode(ErrCodeNoError), gomock.Any())
++	cancel()
++	firstStream.EXPECT().CancelRead(gomock.Any())
++	firstStream.EXPECT().CancelWrite(gomock.Any())
++	close(testDone)
++
++	select {
++	case err := <-errChan:
++		require.ErrorIs(t, err, context.Canceled)
++	case <-time.After(time.Second):
++		t.Fatal("timeout")
++	}
++}
+diff --git a/integrationtests/self/http_shutdown_test.go b/integrationtests/self/http_shutdown_test.go
+index 8d6771821dd..fd1e00e2c22 100644
+--- a/integrationtests/self/http_shutdown_test.go
++++ b/integrationtests/self/http_shutdown_test.go
+@@ -4,11 +4,13 @@ import (
+ 	"context"
+ 	"fmt"
+ 	"io"
++	"net"
+ 	"net/http"
+ 	"testing"
+ 	"time"
+ 
+ 	"github.com/quic-go/quic-go/http3"
++	quicproxy "github.com/quic-go/quic-go/integrationtests/tools/proxy"
+ 
+ 	"github.com/stretchr/testify/require"
+ )
+@@ -23,7 +25,7 @@ func TestHTTPShutdown(t *testing.T) {
+ 		go func() {
+ 			require.NoError(t, server.Close())
+ 		}()
+-		time.Sleep(50 * time.Millisecond) // make sure the server started shutting down
++		time.Sleep(scaleDuration(10 * time.Millisecond))
+ 	})
+ 
+ 	_, err := client.Get(fmt.Sprintf("https://localhost:%d/shutdown", port))
+@@ -34,7 +36,7 @@ func TestHTTPShutdown(t *testing.T) {
+ }
+ 
+ func TestGracefulShutdownShortRequest(t *testing.T) {
+-	delay := scaleDuration(50 * time.Millisecond)
++	delay := scaleDuration(25 * time.Millisecond)
+ 
+ 	var server *http3.Server
+ 	mux := http.NewServeMux()
+@@ -71,7 +73,7 @@ func TestGracefulShutdownShortRequest(t *testing.T) {
+ }
+ 
+ func TestGracefulShutdownLongLivedRequest(t *testing.T) {
+-	delay := scaleDuration(50 * time.Millisecond)
++	delay := scaleDuration(25 * time.Millisecond)
+ 	errChan := make(chan error, 1)
+ 	requestChan := make(chan time.Duration, 1)
+ 
+@@ -125,3 +127,72 @@ func TestGracefulShutdownLongLivedRequest(t *testing.T) {
+ 		t.Fatal("did not receive request duration")
+ 	}
+ }
++
++func TestGracefulShutdownPendingStreams(t *testing.T) {
++	rtt := scaleDuration(25 * time.Millisecond)
++
++	handlerChan := make(chan struct{}, 1)
++	mux := http.NewServeMux()
++	mux.HandleFunc("/helloworld", func(w http.ResponseWriter, r *http.Request) {
++		handlerChan <- struct{}{}
++		time.Sleep(rtt)
++		w.Write([]byte("hello world"))
++	})
++	var server *http3.Server
++	port := startHTTPServer(t, mux, func(s *http3.Server) { server = s })
++	client := newHTTP3Client(t)
++
++	proxy := quicproxy.Proxy{
++		Conn:       newUDPConnLocalhost(t),
++		ServerAddr: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: port},
++		DelayPacket: func(_ quicproxy.Direction, _, _ net.Addr, data []byte) time.Duration {
++			return rtt
++		},
++	}
++	require.NoError(t, proxy.Start())
++	defer proxy.Close()
++	proxyPort := proxy.LocalAddr().(*net.UDPAddr).Port
++
++	errChan := make(chan error, 1)
++	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("https://localhost:%d/helloworld", proxyPort), nil)
++	require.NoError(t, err)
++	go func() {
++		resp, err := client.Do(req)
++		if err != nil {
++			errChan <- err
++			return
++		}
++		if resp.StatusCode != http.StatusOK {
++			errChan <- fmt.Errorf("expected status code %d, got %d", http.StatusOK, resp.StatusCode)
++		}
++	}()
++
++	select {
++	case <-handlerChan:
++	case <-time.After(time.Second):
++		t.Fatal("did not receive request")
++	}
++
++	shutdownChan := make(chan error, 1)
++	ctx, cancel := context.WithCancel(context.Background())
++	go func() { shutdownChan <- server.Shutdown(ctx) }()
++	time.Sleep(rtt / 2)
++
++
++	for range 3 {
++		req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("https://localhost:%d/helloworld", proxyPort), nil)
++		require.NoError(t, err)
++		_, err = client.Do(req)
++		var h3err *http3.Error
++		require.ErrorAs(t, err, &h3err)
++		require.Equal(t, http3.ErrCodeRequestRejected, h3err.ErrorCode)
++	}
++
++	cancel()
++	select {
++	case err := <-shutdownChan:
++		require.ErrorIs(t, err, context.Canceled)
++	case <-time.After(time.Second):
++		t.Fatal("shutdown did not complete")
++	}
++}
+diff --git a/mimo_build_env.tar.gz.b64 b/mimo_build_env.tar.gz.b64
+new file mode 100644
+--- /dev/null
++++ b/mimo_build_env.tar.gz.b64
+@@ -0,0 +1,6 @@
++H4sIAAAAAAAAA+3Sy06EMBQGYNZ9ijqz5tJBYOVal0bZEy7lkkBr2oIbH95SNWPMOLNwJsb4f5vC
++4XDa8BNU8zA2BRdL6F1KZGVJ4lbr6+quWbJjuyhK08z2MZZGiUeTi53ok1mbUlHqKSnNsb5Tz/+o
++YJ+/4doUtZymUjSB7s+3x6n84yze5x+t+V+nzOYfne8I3/vn+W+vwmoQYVXqnmhuqM9J3VD3L1S8
++IWRLH2ZB11tNWyUn2hvzFIeaq4WrYq0HnSSddC3UX6hfy1mYG0aD8K31wIxBGN6p0gxSuKodN7au
++vdD9bBr5LI6O9pWdt8lt+S7P7x/fX3lZC7eqrHk7jx/FjT3H4e3Ib396AAAAAAAAAAAAAAAAAAAA
++AIAfewWgIpgpACgAAA==
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,6 @@
++#!/usr/bin/env bash
++
++set -uo pipefail
++cd /testbed || exit 1
++base64 -d mimo_build_env.tar.gz.b64 | tar -xzf - -C /testbed || exit 1
++exec bash -lc 'cd /testbed && bash -eo pipefail /testbed/.build_env/test_command.sh'

@@ -1,0 +1,7 @@
+I want the LaTeX utility module to export two pure helpers for choosing a project's TeX entry file from an in-memory file tree.
+
+`findTexFiles(files: FileNode[]): string[]` should walk the provided `FileNode` tree depth-first in the order nodes appear, include only nodes where `type` is `file` and the name ends with `.tex`, and return their `path` values. For example, with root files `main.tex`, `README.md`, and `refs.bib`, it returns `["main.tex"]`; with a root `main.tex` plus a `chapters` directory containing `ch1.tex` and `ch2.tex`, it returns `["main.tex", "chapters/ch1.tex", "chapters/ch2.tex"]`; with no `.tex` files it returns `[]`.
+
+`findMainTexFile(files: FileNode[]): string | null` should pick the most likely main file from the same tree without reading the filesystem. It should prefer root-level files named `main.tex`, `paper.tex`, `thesis.tex`, `document.tex`, or `report.tex`; otherwise use the first root-level `.tex` file; otherwise search recursively, prefer those same common basenames, then fall back to the first `.tex` path found. For examples, root files `intro.tex`, `main.tex`, and `appendix.tex` return `"main.tex"`; root files `paper.tex` and `appendix.tex` return `"paper.tex"`; root files `README.md` and `myfile.tex` return `"myfile.tex"`; a tree with only `src/main.tex` returns `"src/main.tex"`; and a tree with no `.tex` files returns `null`.
+
+Both helpers should be deterministic, should not mutate the input tree, and should not perform filesystem, network, or global-state side effects.

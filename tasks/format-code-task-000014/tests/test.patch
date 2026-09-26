@@ -1,0 +1,523 @@
+diff --git a/usercase-test-coderl/kafka_producer_stateful_test.go b/usercase-test-coderl/kafka_producer_stateful_test.go
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/kafka_producer_stateful_test.go
+@@ -0,0 +1,494 @@
++package usercase_test_coderl
++
++import (
++	"fmt"
++	"os"
++	"reflect"
++	"runtime"
++	"sort"
++	"strings"
++	"testing"
++	"unsafe"
++
++	"github.com/8treenet/freedom/infra/kafka"
++	"github.com/IBM/sarama"
++)
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++func TestKafkaProducerStartNewMsgAndPublishSession(t *testing.T) {
++
++
++
++
++	impl := closeableProducer(t)
++	mustNoError(t, impl.Close())
++
++	broker := newProducerBroker(t, "orders")
++	defer broker.Close()
++	defer impl.Close()
++
++	cfg := sarama.NewConfig()
++	cfg.Version = sarama.V2_1_0_0
++	cfg.Producer.RequiredAcks = sarama.WaitForLocal
++	cfg.Producer.Return.Errors = false
++	cfg.Producer.Return.Successes = false
++	if cfg.Producer.Return.Errors != false {
++		t.Fatalf("fresh cfg Return.Errors = %v, want false", cfg.Producer.Return.Errors)
++	}
++	if cfg.Producer.Return.Successes != false {
++		t.Fatalf("fresh cfg Return.Successes = %v, want false", cfg.Producer.Return.Successes)
++	}
++
++	producer := kafka.GetProducer()
++	producer.Start([]string{broker.Addr()}, cfg)
++	if cfg.Producer.Return.Errors != true {
++		t.Fatalf("after Start Return.Errors = %v, want true", cfg.Producer.Return.Errors)
++	}
++	if cfg.Producer.Return.Successes != true {
++		t.Fatalf("after Start Return.Successes = %v, want true", cfg.Producer.Return.Successes)
++	}
++	mustNoError(t, producer.Restart())
++
++	msg := producer.NewMsg("orders", []byte("paid"))
++
++	if msg == nil {
++		t.Fatal("NewMsg returned nil")
++	}
++	if msg.GetMessageKey() != "" {
++		t.Fatalf("fresh msg key = %q, want empty string", msg.GetMessageKey())
++	}
++
++	if len(msg.GetHeader()) != 0 {
++		t.Fatalf("fresh msg headers = %#v, want no headers", msg.GetHeader())
++	}
++
++	headerReturn := msg.SetMessageKey("order-1").
++		SetHeader(map[string]interface{}{"x-request-id": "r1"}).
++		SetHeader(map[string]interface{}{"attempt": 2})
++
++	if headerReturn == nil {
++		t.Fatal("SetHeader chain returned nil")
++	}
++	msg = headerReturn
++	if msg.GetMessageKey() != "order-1" {
++		t.Fatalf("after SetMessageKey key = %q, want %q", msg.GetMessageKey(), "order-1")
++	}
++	if got := fmt.Sprint(msg.GetHeader()["x-request-id"]); got != "r1" {
++		t.Fatalf("header x-request-id = %q, want %q", got, "r1")
++	}
++	if got := fmt.Sprint(msg.GetHeader()["attempt"]); got != "2" {
++		t.Fatalf("header attempt = %q, want %q", got, "2")
++	}
++
++	mustNoError(t, msg.Publish())
++	sent := onlyProducedRecord(t, broker, "orders")
++	if sent.topic != "orders" {
++		t.Fatalf("produced topic = %q, want %q", sent.topic, "orders")
++	}
++
++	if sent.partition < 0 {
++		t.Fatalf("produced partition = %d, want a valid non-negative partition", sent.partition)
++	}
++	if sent.key != "order-1" {
++		t.Fatalf("produced key = %q, want %q", sent.key, "order-1")
++	}
++	if sent.value != "paid" {
++		t.Fatalf("produced value = %q, want %q", sent.value, "paid")
++	}
++	if !reflect.DeepEqual(sent.headers, map[string]string{"attempt": "2", "x-request-id": "r1"}) {
++		t.Fatalf("produced headers = %#v, want %#v", sent.headers, map[string]string{"attempt": "2", "x-request-id": "r1"})
++	}
++	if msg.GetExecution() != nil {
++		t.Fatalf("after successful Publish execution = %v, want nil", msg.GetExecution())
++	}
++}
++
++func TestKafkaProducerGeneratedMessageKeySession(t *testing.T) {
++
++
++
++
++	impl := closeableProducer(t)
++	mustNoError(t, impl.Close())
++
++	broker := newProducerBroker(t, "orders")
++	defer broker.Close()
++	defer impl.Close()
++
++	cfg := sarama.NewConfig()
++	cfg.Version = sarama.V2_1_0_0
++	kafka.GetProducer().Start([]string{broker.Addr()}, cfg)
++	mustNoError(t, kafka.GetProducer().Restart())
++
++	msg := kafka.GetProducer().NewMsg("orders", []byte("paid"))
++	if msg.GetMessageKey() != "" {
++		t.Fatalf("fresh generated-key msg key = %q, want empty string", msg.GetMessageKey())
++	}
++	mustNoError(t, msg.Publish())
++
++	sent := onlyProducedRecord(t, broker, "orders")
++
++	generated := sent.key
++	if len(generated) != 32 {
++		t.Fatalf("generated key length = %d, want 32", len(generated))
++	}
++	if strings.Contains(generated, "-") != false {
++		t.Fatalf("generated key contains dash = %v, want false", strings.Contains(generated, "-"))
++	}
++	if generated != strings.ToUpper(generated) {
++		t.Fatalf("generated key = %q, want uppercase", generated)
++	}
++	if sent.value != "paid" {
++		t.Fatalf("produced generated-key value = %q, want %q", sent.value, "paid")
++	}
++}
++
++func TestKafkaProducerPublishBeforeInitializedReturnsSpecificError(t *testing.T) {
++
++
++
++
++	impl := closeableProducer(t)
++	mustNoError(t, impl.Close())
++
++	msg := kafka.GetProducer().NewMsg("orders", []byte("paid"))
++	err := msg.Publish()
++	if err == nil {
++		t.Fatal("Publish before initialized error = nil, want producer is not initialized")
++	}
++	if err.Error() != "producer is not initialized" {
++		t.Fatalf("Publish before initialized error = %q, want %q", err.Error(), "producer is not initialized")
++	}
++	if msg.GetExecution() == nil {
++		t.Fatal("GetExecution after failed Publish = nil, want producer is not initialized error")
++	}
++	if msg.GetExecution().Error() != "producer is not initialized" {
++		t.Fatalf("GetExecution after failed Publish = %q, want %q", msg.GetExecution().Error(), "producer is not initialized")
++	}
++}
++
++func TestKafkaMessagesKeepIndependentState(t *testing.T) {
++
++
++
++
++	a := kafka.GetProducer().NewMsg("orders", []byte("paid"))
++	b := kafka.GetProducer().NewMsg("orders", []byte("refunded"))
++
++	a.SetMessageKey("order-1").SetHeader(map[string]interface{}{"x-request-id": "r1"})
++	if a.GetMessageKey() != "order-1" {
++		t.Fatalf("message a key = %q, want %q", a.GetMessageKey(), "order-1")
++	}
++	if got := fmt.Sprint(a.GetHeader()["x-request-id"]); got != "r1" {
++		t.Fatalf("message a header x-request-id = %q, want %q", got, "r1")
++	}
++	if b.GetMessageKey() != "" {
++		t.Fatalf("message b key = %q, want empty string", b.GetMessageKey())
++	}
++
++	if len(b.GetHeader()) != 0 {
++		t.Fatalf("message b headers = %#v, want no headers", b.GetHeader())
++	}
++
++	b.SetMessageKey("order-2").SetHeader(map[string]interface{}{"x-request-id": "r2", "attempt": 1})
++	if a.GetMessageKey() != "order-1" {
++		t.Fatalf("message a key after mutating b = %q, want %q", a.GetMessageKey(), "order-1")
++	}
++	if fmt.Sprint(a.GetHeader()["x-request-id"]) != "r1" {
++		t.Fatalf("message a x-request-id after mutating b = %q, want %q", fmt.Sprint(a.GetHeader()["x-request-id"]), "r1")
++	}
++	if b.GetMessageKey() != "order-2" {
++		t.Fatalf("message b key = %q, want %q", b.GetMessageKey(), "order-2")
++	}
++	if fmt.Sprint(b.GetHeader()["x-request-id"]) != "r2" {
++		t.Fatalf("message b x-request-id = %q, want %q", fmt.Sprint(b.GetHeader()["x-request-id"]), "r2")
++	}
++	if fmt.Sprint(b.GetHeader()["attempt"]) != "1" {
++		t.Fatalf("message b attempt = %q, want %q", fmt.Sprint(b.GetHeader()["attempt"]), "1")
++	}
++}
++
++func TestKafkaProducerCloseIsIdempotent(t *testing.T) {
++
++
++
++
++	impl := closeableProducer(t)
++	mustNoError(t, impl.Close())
++	mustNoError(t, impl.Close())
++}
++
++func TestKafkaProducerCloseReleasesResourcesAcrossCycles(t *testing.T) {
++
++
++
++
++	impl := closeableProducer(t)
++	mustNoError(t, impl.Close())
++
++	broker := newProducerBroker(t, "orders")
++	defer broker.Close()
++	defer impl.Close()
++
++	runtime.GC()
++	baseFDs := countFDs(t)
++	baseGoroutines := runtime.NumGoroutine()
++
++	for i := 0; i < 120; i++ {
++		cfg := sarama.NewConfig()
++		cfg.Version = sarama.V2_1_0_0
++		kafka.GetProducer().Start([]string{broker.Addr()}, cfg)
++		mustNoError(t, kafka.GetProducer().Restart())
++		msg := kafka.GetProducer().NewMsg("orders", []byte("paid")).SetMessageKey(fmt.Sprintf("order-%d", i))
++		mustNoError(t, msg.Publish())
++		mustNoError(t, impl.Close())
++	}
++
++	runtime.GC()
++	afterFDs := countFDs(t)
++	afterGoroutines := runtime.NumGoroutine()
++
++	if afterFDs > baseFDs+30 {
++		t.Fatalf("fd count after 120 producer cycles = %d, want <= %d", afterFDs, baseFDs+30)
++	}
++
++	if afterGoroutines > baseGoroutines+30 {
++		t.Fatalf("goroutines after 120 producer cycles = %d, want <= %d", afterGoroutines, baseGoroutines+30)
++	}
++}
++
++func TestZZZKafkaProducerMiddlewareOrderStopAndExecution(t *testing.T) {
++
++
++
++
++	impl := closeableProducer(t)
++	mustNoError(t, impl.Close())
++
++	broker := newProducerBroker(t, "orders")
++	defer broker.Close()
++	defer impl.Close()
++
++	cfg := sarama.NewConfig()
++	cfg.Version = sarama.V2_1_0_0
++	kafka.GetProducer().Start([]string{broker.Addr()}, cfg)
++	mustNoError(t, kafka.GetProducer().Restart())
++
++	var events []string
++	kafka.InstallMiddleware(
++		func(msg *kafka.Msg) {
++			events = append(events, "first-before:"+msg.GetMessageKey())
++			if msg.IsStopped() != false {
++				t.Fatalf("first middleware IsStopped = %v, want false", msg.IsStopped())
++			}
++			msg.Next()
++			if msg.GetExecution() != nil {
++				t.Fatalf("first middleware GetExecution after Next = %v, want nil", msg.GetExecution())
++			}
++			events = append(events, "first-after")
++		},
++		func(msg *kafka.Msg) {
++			events = append(events, "second-before:"+fmt.Sprint(len(msg.GetHeader())))
++			msg.Next()
++			events = append(events, "second-after")
++		},
++	)
++
++	msg := kafka.GetProducer().NewMsg("orders", []byte("paid")).
++		SetMessageKey("order-1").
++		SetHeader(map[string]interface{}{"x-request-id": "r1"})
++	mustNoError(t, msg.Publish())
++	if !reflect.DeepEqual(events, []string{"first-before:order-1", "second-before:1", "second-after", "first-after"}) {
++		t.Fatalf("middleware events = %#v, want %#v", events, []string{"first-before:order-1", "second-before:1", "second-after", "first-after"})
++	}
++	if msg.IsStopped() != false {
++		t.Fatalf("published middleware msg IsStopped = %v, want false", msg.IsStopped())
++	}
++	if msg.GetExecution() != nil {
++		t.Fatalf("published middleware msg GetExecution = %v, want nil", msg.GetExecution())
++	}
++	if countProduceRequests(broker) != 1 {
++		t.Fatalf("produce requests after continued middleware = %d, want 1", countProduceRequests(broker))
++	}
++
++	var stopEvents []string
++	kafka.InstallMiddleware(func(msg *kafka.Msg) {
++		stopEvents = append(stopEvents, "stop-before")
++		msg.Stop()
++		stopEvents = append(stopEvents, fmt.Sprintf("stopped:%v", msg.IsStopped()))
++	})
++
++	stopped := kafka.GetProducer().NewMsg("orders", []byte("blocked")).SetMessageKey("order-stop")
++	if err := stopped.Publish(); err != nil {
++		t.Fatalf("stopped Publish error = %v, want nil", err)
++	}
++	if !reflect.DeepEqual(stopEvents, []string{"stop-before", "stopped:true"}) {
++		t.Fatalf("stop middleware events = %#v, want %#v", stopEvents, []string{"stop-before", "stopped:true"})
++	}
++	if stopped.IsStopped() != true {
++		t.Fatalf("stopped msg IsStopped = %v, want true", stopped.IsStopped())
++	}
++	if stopped.GetExecution() != nil {
++		t.Fatalf("stopped msg GetExecution = %v, want nil", stopped.GetExecution())
++	}
++	if countProduceRequests(broker) != 1 {
++		t.Fatalf("produce requests after stopped middleware = %d, want 1", countProduceRequests(broker))
++	}
++}
++
++type producedRecord struct {
++	topic     string
++	partition int32
++	key       string
++	value     string
++	headers   map[string]string
++}
++
++func closeableProducer(t *testing.T) *kafka.ProducerImpl {
++	t.Helper()
++	impl, ok := kafka.GetProducer().(*kafka.ProducerImpl)
++	if !ok {
++		t.Fatalf("GetProducer concrete type = %T, want *kafka.ProducerImpl", kafka.GetProducer())
++	}
++	return impl
++}
++
++func newProducerBroker(t *testing.T, topic string) *sarama.MockBroker {
++	t.Helper()
++	broker := sarama.NewMockBroker(t, 1)
++	broker.SetHandlerByMap(map[string]sarama.MockResponse{
++		"ApiVersionsRequest": sarama.NewMockApiVersionsResponse(t),
++		"MetadataRequest": sarama.NewMockMetadataResponse(t).
++			SetBroker(broker.Addr(), broker.BrokerID()).
++			SetLeader(topic, 0, broker.BrokerID()),
++		"ProduceRequest": sarama.NewMockProduceResponse(t).
++			SetVersion(7).
++			SetError(topic, 0, sarama.ErrNoError),
++	})
++	return broker
++}
++
++func onlyProducedRecord(t *testing.T, broker *sarama.MockBroker, topic string) producedRecord {
++	t.Helper()
++	records := producedRecords(t, broker)
++	var matches []producedRecord
++	for _, record := range records {
++		if record.topic == topic {
++			matches = append(matches, record)
++		}
++	}
++	if len(matches) != 1 {
++		t.Fatalf("produced records for %q = %d (%#v), want 1", topic, len(matches), matches)
++	}
++	return matches[0]
++}
++
++func countProduceRequests(broker *sarama.MockBroker) int {
++	count := 0
++	for _, exchange := range broker.History() {
++		if _, ok := exchange.Request.(*sarama.ProduceRequest); ok {
++			count++
++		}
++	}
++	return count
++}
++
++func producedRecords(t *testing.T, broker *sarama.MockBroker) []producedRecord {
++	t.Helper()
++	var out []producedRecord
++	for _, exchange := range broker.History() {
++		req, ok := exchange.Request.(*sarama.ProduceRequest)
++		if !ok {
++			continue
++		}
++		for topic, partitions := range produceRequestRecords(req) {
++			for partition, records := range partitions {
++				if records.RecordBatch != nil {
++					for _, record := range records.RecordBatch.Records {
++						out = append(out, producedRecord{
++							topic:     topic,
++							partition: partition,
++							key:       string(record.Key),
++							value:     string(record.Value),
++							headers:   recordHeaders(record.Headers),
++						})
++					}
++					continue
++				}
++				if records.MsgSet != nil {
++					for _, block := range records.MsgSet.Messages {
++						for _, msgBlock := range block.Messages() {
++							out = append(out, producedRecord{
++								topic:     topic,
++								partition: partition,
++								key:       string(msgBlock.Msg.Key),
++								value:     string(msgBlock.Msg.Value),
++								headers:   map[string]string{},
++							})
++						}
++					}
++				}
++			}
++		}
++	}
++	sort.Slice(out, func(i, j int) bool {
++		if out[i].topic != out[j].topic {
++			return out[i].topic < out[j].topic
++		}
++		if out[i].partition != out[j].partition {
++			return out[i].partition < out[j].partition
++		}
++		return out[i].key < out[j].key
++	})
++	return out
++}
++
++func produceRequestRecords(req *sarama.ProduceRequest) map[string]map[int32]sarama.Records {
++	value := reflect.ValueOf(req).Elem().FieldByName("records")
++	return reflect.NewAt(value.Type(), unsafe.Pointer(value.UnsafeAddr())).
++		Elem().
++		Interface().(map[string]map[int32]sarama.Records)
++}
++
++func recordHeaders(headers []*sarama.RecordHeader) map[string]string {
++	out := make(map[string]string, len(headers))
++	for _, header := range headers {
++		out[string(header.Key)] = string(header.Value)
++	}
++	return out
++}
++
++func countFDs(t *testing.T) int {
++	t.Helper()
++	entries, err := os.ReadDir("/proc/self/fd")
++	if err != nil {
++		t.Fatalf("read /proc/self/fd: %v", err)
++	}
++	return len(entries)
++}
++
++func mustNoError(t *testing.T, err error) {
++	t.Helper()
++	if err != nil {
++		t.Fatalf("unexpected error: %v", err)
++	}
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,19 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++
++cd /workspace/repo
++
++export GOPROXY=off
++export GOSUMDB=off
++export GOTOOLCHAIN=local
++exec go test -v -count=1 ./usercase-test-coderl/...

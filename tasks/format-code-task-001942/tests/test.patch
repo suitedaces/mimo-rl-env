@@ -1,0 +1,163 @@
+diff --git a/tests/api/crud/test_functions.py b/tests/api/crud/test_functions.py
+index 72d994a08..a18b6aaaa 100644
+--- a/tests/api/crud/test_functions.py
++++ b/tests/api/crud/test_functions.py
+@@ -12,12 +12,38 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ #
++import contextlib
++
+ import sqlalchemy.orm
+ 
+ import mlrun.common.schemas
+ import server.api.crud
+ 
+ 
++@contextlib.contextmanager
++def _capture_function_table_writes(db: sqlalchemy.orm.Session):
++    statements = []
++    bind = db.get_bind()
++
++    def before_cursor_execute(
++        conn, cursor, statement, parameters, context, executemany
++    ):
++        normalized = " ".join(statement.lower().split())
++        is_function_write = (
++            normalized.startswith("update ")
++            or normalized.startswith("insert ")
++            or normalized.startswith("replace ")
++        ) and "functions" in normalized
++        if is_function_write:
++            statements.append(statement)
++
++    sqlalchemy.event.listen(bind, "before_cursor_execute", before_cursor_execute)
++    try:
++        yield statements
++    finally:
++        sqlalchemy.event.remove(bind, "before_cursor_execute", before_cursor_execute)
++
++
+ def test_set_function_deletion_task_id_updates_correctly(db: sqlalchemy.orm.Session):
+     function_name = "test_function"
+     function_tag = "latest"
+@@ -72,15 +98,29 @@ def test_update_functions_with_api_gateway_url(db: sqlalchemy.orm.Session):
+     # check that URL is there
+     assert updated_function["status"]["external_invocation_urls"][0] == gw_host
+ 
+-    # try to add existed external invocation URL
+-    server.api.crud.Functions().add_function_external_invocation_url(
+-        db, uri, project, gw_host
++
++    with _capture_function_table_writes(db) as write_statements:
++        server.api.crud.Functions().add_function_external_invocation_url(
++            db, uri, project, gw_host + "/"
++        )
++    assert write_statements == []
++    updated_function = server.api.crud.Functions().get_function(
++        db, project=project, name=function_name, tag=function_tag
+     )
++
++    assert updated_function["status"]["external_invocation_urls"] == [gw_host]
++
++    missing_url = "https://another-gateway.example.com/invoke"
++    with _capture_function_table_writes(db) as write_statements:
++        server.api.crud.Functions().delete_function_external_invocation_url(
++            db, uri, project, missing_url + "/"
++        )
++    assert write_statements == []
+     updated_function = server.api.crud.Functions().get_function(
+         db, project=project, name=function_name, tag=function_tag
+     )
+-    # check that URL isn't duplicated
+-    assert len(updated_function["status"]["external_invocation_urls"]) == 1
++
++    assert updated_function["status"]["external_invocation_urls"] == [gw_host]
+ 
+     # delete URL from the list
+     server.api.crud.Functions().delete_function_external_invocation_url(
+diff --git a/tests/common/schemas/test_api_gateway.py b/tests/common/schemas/test_api_gateway.py
+new file mode 100644
+index 000000000..565333c58
+--- /dev/null
++++ b/tests/common/schemas/test_api_gateway.py
+@@ -0,0 +1,31 @@
++import pytest
++
++import mlrun.common.schemas
++
++
++@pytest.mark.parametrize(
++    "host,path,expected",
++    [
++        (
++            "https://gateway-one.example.com",
++            "/invoke/",
++            "https://gateway-one.example.com/invoke",
++        ),
++        ("https://gateway-two.example.com/", "", "https://gateway-two.example.com"),
++    ],
++)
++def test_schema_invoke_url_does_not_keep_trailing_slash_variants(host, path, expected):
++    gateway = mlrun.common.schemas.APIGateway(
++        metadata=mlrun.common.schemas.APIGatewayMetadata(name="test-gateway"),
++        spec=mlrun.common.schemas.APIGatewaySpec(
++            name="test-gateway",
++            host=host,
++            path=path,
++            upstreams=[
++                mlrun.common.schemas.APIGatewayUpstream(
++                    nucliofunction={"name": "test-function"}
++                )
++            ],
++        ),
++    )
++    assert gateway.get_invoke_url() == expected
+diff --git a/tests/projects/test_project.py b/tests/projects/test_project.py
+index f189716ad..8d976c7c0 100644
+--- a/tests/projects/test_project.py
++++ b/tests/projects/test_project.py
+@@ -1893,7 +1893,7 @@ def test_create_api_gateway_valid(
+     assert "metadata" in gateway_dict
+     assert "spec" in gateway_dict
+ 
+-    assert gateway.invoke_url == "https://gateway-f1-f2-project-name.some-domain.com/"
++    assert gateway.invoke_url == "https://gateway-f1-f2-project-name.some-domain.com"
+     if authentication_mode == mlrun.common.schemas.APIGatewayAuthenticationMode.basic:
+         assert gateway.authentication.authentication_mode == "basicAuth"
+     elif (
+@@ -1999,7 +1999,7 @@ def test_list_api_gateways(patched_list_api_gateways, context):
+     assert gateways[0].host == "http://gateway-f1-f2-project-name.some-domain.com"
+     assert gateways[0].spec.functions == ["project-name/my-func1"]
+ 
+-    assert gateways[1].invoke_url == "http://test-basic-default.domain.com/"
++    assert gateways[1].invoke_url == "http://test-basic-default.domain.com"
+ 
+ 
+ def test_project_create_remote():
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,21 @@
++#!/bin/bash
++set -uo pipefail
++cd /testbed
++
++case "${1:-}" in
++  base)
++    python3 -m pytest tests/api/crud/test_functions.py tests/projects/test_project.py -x -v -k "test_set_function_deletion_task_id_updates_correctly"
++    ;;
++  new)
++    python3 -m pytest \
++      tests/common/schemas/test_api_gateway.py::test_schema_invoke_url_does_not_keep_trailing_slash_variants \
++      tests/api/crud/test_functions.py::test_update_functions_with_api_gateway_url \
++      tests/projects/test_project.py::test_create_api_gateway_valid \
++      tests/projects/test_project.py::test_list_api_gateways \
++      -x -v
++    ;;
++  *)
++    echo "usage: $0 base|new"
++    exit 2
++    ;;
++esac

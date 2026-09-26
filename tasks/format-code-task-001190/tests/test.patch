@@ -1,0 +1,363 @@
+diff --git a/usercase-test-coderl/usecase.sh b/usercase-test-coderl/usecase.sh
+new file mode 100755
+--- /dev/null
++++ b/usercase-test-coderl/usecase.sh
+@@ -0,0 +1,336 @@
++#!/usr/bin/env bash
++
++set -u
++export LANG=C.UTF-8 LC_ALL=C.UTF-8 TZ=UTC
++export RNV_TELEMETRY_DISABLED=1
++export NO_UPDATE_NOTIFIER=1
++export npm_config_offline=true
++export npm_config_audit=false
++export npm_config_fund=false
++
++
++
++( cd /workspace/repo && ./node_modules/.bin/lerna run compile ) || { echo "FAIL: build" >&2; exit 1; }
++
++BIN=(node /workspace/repo/packages/rnv/lib/bin.js)
++
++TMP=$(mktemp -d)
++trap 'rm -rf "$TMP"' EXIT
++fail() { echo "FAIL: $*" >&2; exit 1; }
++
++clean_output() {
++    perl -pe 's/\e\[[0-9;?]*[A-Za-z]//g; s/\r/\n/g' "$1"
++}
++
++assert_empty_err() {
++    local label="$1"
++
++    [ -e err ] || fail "$label missing stderr capture"
++}
++
++assert_has_line() {
++    local file="$1"
++    local needle="$2"
++    grep -Fqx "$needle" "$file" || fail "missing line '$needle' in $file"
++}
++
++assert_contains() {
++    local file="$1"
++    local needle="$2"
++    grep -Fq "$needle" "$file" || fail "missing '$needle' in $file"
++}
++
++assert_line_before() {
++    local file="$1"
++    local first="$2"
++    local second="$3"
++    local first_line second_line
++    first_line=$(grep -Fnm1 "$first" "$file" | cut -d: -f1)
++    second_line=$(grep -Fnm1 "$second" "$file" | cut -d: -f1)
++    [ -n "$first_line" ] || fail "missing '$first' in $file"
++    [ -n "$second_line" ] || fail "missing '$second' in $file"
++    [ "$first_line" -lt "$second_line" ] || fail "expected '$first' before '$second' in $file"
++}
++
++assert_section_contains() {
++    local file="$1"
++    local section="$2"
++    local needle="$3"
++
++    awk -v section="$section" -v needle="$needle" '
++        $0 == section { in_section = 1; next }
++        in_section && $0 ~ /^[^[:space:]].*:$/ { exit }
++        in_section && index($0, needle) { found = 1; exit }
++        END { exit found ? 0 : 1 }
++    ' "$file" || fail "missing '$needle' in $section section of $file"
++}
++
++assert_project_configured() {
++    local label="$1"
++
++    [ -d platformBuilds ] || fail "$label expected project configure to create platformBuilds"
++}
++
++make_project() {
++    local dir="$1"
++    mkdir -p "$dir/buildHooks/src" "$dir/node_modules" "$dir/home"
++    cat > "$dir/package.json" <<'JSON'
++{"name":"rnv-hook-probe","version":"1.0.0","devDependencies":{}}
++JSON
++    cat > "$dir/renative.json" <<'JSON'
++{"projectName":"rnv-hook-probe","workspaceID":"rnv","defaults":{"supportedPlatforms":[]},"paths":{"appConfigsDir":"./appConfigs","platformAssetsDir":"./platformAssets","platformBuildsDir":"./platformBuilds"}}
++JSON
++}
++
++write_hooks_two() {
++    local dir="$1"
++    cat > "$dir/buildHooks/src/index.js" <<'JS'
++const fs = require('fs');
++const path = require('path');
++function mark(name, ctx) {
++  fs.appendFileSync(path.join(process.cwd(), 'hook-events.log'), name + '|' + ctx.command + '|' + ctx.subCommand + '\n');
++}
++exports.hooks = {
++  alphaHook: async (ctx) => mark('alphaHook', ctx),
++  betaHook: async (ctx) => mark('betaHook', ctx),
++};
++exports.pipes = {};
++JS
++}
++
++write_hook_one() {
++    local dir="$1"
++    cat > "$dir/buildHooks/src/index.js" <<'JS'
++const fs = require('fs');
++const path = require('path');
++exports.hooks = {
++  alphaHook: async (ctx) => fs.appendFileSync(path.join(process.cwd(), 'hook-events.log'), 'alphaHook|' + ctx.command + '|' + ctx.subCommand + '\n'),
++};
++exports.pipes = {};
++JS
++}
++
++run_rnv() {
++    HOME="$PWD/home" "${BIN[@]}" "$@" --mono --no-intro --no-summary --only --skip-dependency-check --offline >out 2>err
++}
++
++BASE_ARGS=(--mono --no-intro --no-summary --only --skip-dependency-check --offline)
++
++
++
++
++P="$TMP/f1_short_x"
++make_project "$P"
++write_hooks_two "$P"
++cd "$P" || exit 1
++run_rnv hooks run -x alphaHook; ec=$?
++clean_output out >clean
++[ "$ec" -eq 0 ] || fail "F1 exit $ec; want 0"
++assert_empty_err "F1"
++assert_project_configured "F1"
++EXPECTED_EVENTS='alphaHook|hooks|run'
++[ "$(cat hook-events.log)" = "$EXPECTED_EVENTS" ] || fail "F1 hook-events: $(cat hook-events.log)"
++[ -f buildHooks/dist/index.js ] || fail "F1 expected compiled buildHooks/dist/index.js"
++
++
++
++
++P="$TMP/f2_long_exe_method"
++make_project "$P"
++write_hooks_two "$P"
++cd "$P" || exit 1
++run_rnv hooks run --exe-method betaHook; ec=$?
++[ "$ec" -eq 0 ] || fail "F2 exit $ec; want 0"
++assert_empty_err "F2"
++EXPECTED_EVENTS='betaHook|hooks|run'
++[ "$(cat hook-events.log)" = "$EXPECTED_EVENTS" ] || fail "F2 hook-events: $(cat hook-events.log)"
++
++
++
++
++P="$TMP/f3_prompt_absent"
++make_project "$P"
++
++write_hook_one "$P"
++cd "$P" || exit 1
++printf '\n' | HOME="$PWD/home" timeout 10s "${BIN[@]}" hooks run "${BASE_ARGS[@]}" >out 2>err; ec=$?
++clean_output out >clean
++[ "$ec" -eq 0 ] || fail "F3 exit $ec; want 0"
++assert_empty_err "F3"
++grep -Fq "Pick an available hook:" clean || fail "F3 prompt message missing"
++EXPECTED_EVENTS='alphaHook|hooks|run'
++[ "$(cat hook-events.log)" = "$EXPECTED_EVENTS" ] || fail "F3 hook-events: $(cat hook-events.log)"
++
++
++
++
++P="$TMP/f4_prompt_unknown"
++make_project "$P"
++
++write_hook_one "$P"
++cd "$P" || exit 1
++printf '\n' | HOME="$PWD/home" timeout 10s "${BIN[@]}" hooks run -x missingHook "${BASE_ARGS[@]}" >out 2>err; ec=$?
++clean_output out >clean
++[ "$ec" -eq 0 ] || fail "F4 exit $ec; want 0"
++assert_empty_err "F4"
++grep -Fq "Pick an available hook:" clean || fail "F4 prompt message missing"
++EXPECTED_EVENTS='alphaHook|hooks|run'
++[ "$(cat hook-events.log)" = "$EXPECTED_EVENTS" ] || fail "F4 hook-events: $(cat hook-events.log)"
++
++
++
++
++P="$TMP/f5_zero_hooks"
++make_project "$P"
++cat > "$P/buildHooks/src/index.js" <<'JS'
++exports.hooks = {};
++exports.pipes = { sparePipe: [async () => {}] };
++JS
++cd "$P" || exit 1
++run_rnv hooks run; ec=$?
++[ "$ec" -eq 0 ] || fail "F5 exit $ec; want 0"
++assert_empty_err "F5"
++[ ! -e hook-events.log ] || fail "F5 should not run a hook: $(cat hook-events.log)"
++
++
++
++
++P="$TMP/f6_run_forced_rebuild"
++make_project "$P"
++mkdir -p "$P/buildHooks/dist"
++cat > "$P/buildHooks/src/index.js" <<'JS'
++const fs = require('fs');
++const path = require('path');
++exports.hooks = { rebuildHook: async () => fs.writeFileSync(path.join(process.cwd(), 'rebuild-marker.txt'), 'fresh-src\n') };
++exports.pipes = {};
++JS
++cat > "$P/buildHooks/dist/index.js" <<'JS'
++const fs = require('fs');
++const path = require('path');
++exports.hooks = { rebuildHook: async () => fs.writeFileSync(path.join(process.cwd(), 'rebuild-marker.txt'), 'stale-dist\n') };
++exports.pipes = {};
++JS
++cd "$P" || exit 1
++run_rnv hooks run -x rebuildHook; ec=$?
++[ "$ec" -eq 0 ] || fail "F6 exit $ec; want 0"
++assert_empty_err "F6"
++EXPECTED_MARKER='fresh-src'
++[ "$(cat rebuild-marker.txt)" = "$EXPECTED_MARKER" ] || fail "F6 marker: $(cat rebuild-marker.txt)"
++
++
++
++
++P="$TMP/f7_run_load_error"
++make_project "$P"
++cat > "$P/buildHooks/src/index.js" <<'JS'
++exports.pipes = { pipeOnly: [async () => {}] };
++JS
++cd "$P" || exit 1
++run_rnv hooks run -x missing; ec=$?
++cat out err >combined
++clean_output combined >clean
++[ "$ec" -ne 0 ] || fail "F7 expected non-zero exit"
++assert_empty_err "F7"
++grep -Fq "Build hooks have not been compiled properly!" clean || fail "F7 missing load failure message"
++
++
++
++
++P="$TMP/f8_list_with_pipes"
++make_project "$P"
++cat > "$P/buildHooks/src/index.js" <<'JS'
++exports.hooks = { alphaHook: async () => {}, betaHook: async () => {} };
++exports.pipes = { deployPipe: [async () => {}], watchPipe: [async () => {}] };
++JS
++cd "$P" || exit 1
++run_rnv hooks list; ec=$?
++clean_output out >clean
++[ "$ec" -eq 0 ] || fail "F8 exit $ec; want 0"
++assert_empty_err "F8"
++assert_project_configured "F8"
++assert_has_line clean "Hooks:"
++assert_section_contains clean "Hooks:" "alphaHook"
++assert_section_contains clean "Hooks:" "betaHook"
++assert_has_line clean "Pipes:"
++assert_line_before clean "Hooks:" "Pipes:"
++assert_section_contains clean "Pipes:" "deployPipe"
++assert_section_contains clean "Pipes:" "watchPipe"
++
++
++
++
++P="$TMP/f9_list_no_pipes"
++make_project "$P"
++cat > "$P/buildHooks/src/index.js" <<'JS'
++exports.hooks = { soloHook: async () => {} };
++JS
++cd "$P" || exit 1
++run_rnv hooks list; ec=$?
++clean_output out >clean
++[ "$ec" -eq 0 ] || fail "F9 exit $ec; want 0"
++assert_empty_err "F9"
++assert_has_line clean "Hooks:"
++assert_section_contains clean "Hooks:" "soloHook"
++
++
++
++
++
++P="$TMP/f10_list_forced_rebuild"
++make_project "$P"
++mkdir -p "$P/buildHooks/dist"
++cat > "$P/buildHooks/src/index.js" <<'JS'
++exports.hooks = { rebuildHook: async () => {} };
++exports.pipes = { freshPipe: [async () => {}] };
++JS
++cat > "$P/buildHooks/dist/index.js" <<'JS'
++exports.hooks = { staleHook: async () => {} };
++exports.pipes = { stalePipe: [async () => {}] };
++JS
++cd "$P" || exit 1
++run_rnv hooks list; ec=$?
++clean_output out >clean
++[ "$ec" -eq 0 ] || fail "F10 exit $ec; want 0"
++assert_empty_err "F10"
++assert_section_contains clean "Hooks:" "rebuildHook"
++assert_section_contains clean "Pipes:" "freshPipe"
++! grep -Fq "staleHook" clean || fail "F10 used stale hook bundle"
++! grep -Fq "stalePipe" clean || fail "F10 used stale pipe bundle"
++
++
++
++
++P="$TMP/f11_list_empty_error"
++make_project "$P"
++cat > "$P/buildHooks/src/index.js" <<'JS'
++exports.pipes = { pipeOnly: [async () => {}] };
++JS
++cd "$P" || exit 1
++run_rnv hooks list; ec=$?
++cat out err >combined
++clean_output combined >clean
++[ "$ec" -ne 0 ] || fail "F11 expected non-zero exit"
++assert_empty_err "F11"
++grep -Fq "Your buildHooks object is empty!" clean || fail "F11 missing empty buildHooks message"
++
++
++
++
++P="$TMP/f12_pipes"
++make_project "$P"
++cat > "$P/buildHooks/src/index.js" <<'JS'
++exports.hooks = { gammaHook: async () => {} };
++exports.pipes = { deployPipe: [async () => {}], watchPipe: [async () => {}] };
++JS
++cd "$P" || exit 1
++run_rnv hooks pipes; ec=$?
++clean_output out >clean
++[ "$ec" -eq 0 ] || fail "F12 exit $ec; want 0"
++assert_empty_err "F12"
++assert_project_configured "F12"
++assert_has_line clean "Pipes:"
++assert_section_contains clean "Pipes:" "deployPipe"
++assert_section_contains clean "Pipes:" "watchPipe"
++
++echo "PASS"
++exit 0
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,17 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++export RNV_TELEMETRY_DISABLED=1
++export NO_UPDATE_NOTIFIER=1
++export npm_config_offline=true
++export npm_config_audit=false
++export npm_config_fund=false
++set -e
++cd /workspace/repo
++exec bash /workspace/repo/usercase-test-coderl/usecase.sh

@@ -1,0 +1,331 @@
+diff --git a/usercase-test-coderl/test_remove_imports_stateful.py b/usercase-test-coderl/test_remove_imports_stateful.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/test_remove_imports_stateful.py
+@@ -0,0 +1,288 @@
++import gc
++import textwrap
++from typing import Union
++
++import pytest
++
++import libcst as cst
++import libcst.matchers as m
++from libcst.codemod import (
++    CodemodContext,
++    TransformSuccess,
++    VisitorBasedCodemodCommand,
++    transform_module,
++)
++from libcst.codemod.visitors import RemoveImportsVisitor
++from libcst.metadata import QualifiedNameProvider, ScopeProvider
++
++
++def _clean_code(source: str) -> str:
++    code = textwrap.dedent(source)
++    lines = code.split("\n")
++    while lines and lines[0] == "":
++        lines = lines[1:]
++    while lines and lines[-1] == "":
++        lines = lines[:-1]
++    return "\n".join(lines) + "\n"
++
++
++def _run_remove_with_context(source: str, context: CodemodContext) -> str:
++    return RemoveImportsVisitor(context).transform_module(cst.parse_module(source)).code
++
++
++def test_context_scheduled_removals_evolve_and_remove_only_unused_imports() -> None:
++
++
++
++
++    context = CodemodContext()
++
++    assert (
++        _run_remove_with_context("import os\nprint(os.getcwd())\n", context)
++        == "import os\nprint(os.getcwd())\n"
++    )
++
++    RemoveImportsVisitor.remove_unused_import(context, "typing", "Optional")
++
++    assert (
++        _run_remove_with_context(
++            "from typing import Optional, List\nx: List[int]\n", context
++        )
++        == "from typing import List\nx: List[int]\n"
++    )
++
++    RemoveImportsVisitor.remove_unused_import(context, "os")
++
++    assert (
++        _run_remove_with_context(
++            "from typing import Optional\nimport os\nvalue = 1\n", context
++        )
++        == "value = 1\n"
++    )
++    assert (
++        _run_remove_with_context("import os, sys\nprint(sys.version)\n", context)
++        == "import sys\nprint(sys.version)\n"
++    )
++    assert (
++        _run_remove_with_context("import os\nprint(os.getcwd())\n", context)
++        == "import os\nprint(os.getcwd())\n"
++    )
++
++
++def test_direct_constructor_input_applies_without_mutating_context() -> None:
++
++
++
++
++    context = CodemodContext()
++    visitor = RemoveImportsVisitor(context, [("typing", "Optional", None)])
++
++
++    assert (
++        visitor.transform_module(
++            cst.parse_module("from typing import Optional, List\nx: List[int]\n")
++        ).code
++        == "from typing import List\nx: List[int]\n"
++    )
++
++
++def test_constructor_combines_prior_context_state_with_direct_input() -> None:
++
++
++
++
++    context = CodemodContext()
++    RemoveImportsVisitor.remove_unused_import(context, "os")
++
++    visitor = RemoveImportsVisitor(context, [("typing", "Optional", None)])
++
++
++    assert (
++        visitor.transform_module(
++            cst.parse_module("import os\nfrom typing import Optional\nvalue = 3\n")
++        ).code
++        == "value = 3\n"
++    )
++
++
++def test_alias_specific_removal_keeps_differently_aliased_imports() -> None:
++
++
++
++
++    matching = CodemodContext()
++    RemoveImportsVisitor.remove_unused_import(matching, "pkg.mod", "Thing", "Alias")
++    assert (
++        _run_remove_with_context(
++            "from pkg.mod import Thing as Alias, Other\nprint(Other)\n", matching
++        )
++        == "from pkg.mod import Other\nprint(Other)\n"
++    )
++
++    different = CodemodContext()
++    RemoveImportsVisitor.remove_unused_import(different, "pkg.mod", "Thing", "Alias")
++    assert (
++        _run_remove_with_context(
++            "from pkg.mod import Thing as Different, Other\nprint(Other)\n",
++            different,
++        )
++        == "from pkg.mod import Thing as Different, Other\nprint(Other)\n"
++    )
++
++
++def test_parenthesized_import_comment_is_preserved_on_remaining_alias() -> None:
++
++
++
++
++    context = CodemodContext()
++    RemoveImportsVisitor.remove_unused_import(context, "pkg.mod", "Thing")
++
++    result = _run_remove_with_context(
++        _clean_code(
++            """
++            from pkg.mod import (
++                Thing,
++                # keep near Other
++                Other,
++            )
++            print(Other)
++            """
++        ),
++        context,
++    )
++
++    assert "Thing" not in result
++    assert "Other" in result
++    assert "# keep near Other" in result
++    assert cst.parse_module(result).code == result
++
++
++def test_node_based_helper_schedules_deleted_annotation_import() -> None:
++
++
++
++
++
++    class RemoveAnnotatedAssignment(VisitorBasedCodemodCommand):
++        METADATA_DEPENDENCIES = (QualifiedNameProvider, ScopeProvider)
++
++        def leave_AnnAssign(
++            self, original_node: cst.AnnAssign, updated_node: cst.AnnAssign
++        ) -> Union[cst.RemovalSentinel, cst.AnnAssign]:
++            if m.matches(original_node, m.AnnAssign(target=m.Name("x"))):
++                self.remove_unused_import_by_node(original_node)
++                return cst.RemoveFromParent()
++            return updated_node
++
++    result = transform_module(
++        RemoveAnnotatedAssignment(CodemodContext()),
++        "from typing import Optional\nx: Optional[int] = None\ny = 1\n",
++    )
++
++    assert isinstance(result, TransformSuccess)
++    assert result.code == "y = 1\n"
++
++
++def test_relative_importfrom_without_absolute_context_raises_value_error() -> None:
++
++
++
++
++    context = CodemodContext()
++    statement = cst.ensure_type(
++        cst.parse_statement("from .foo import Bar\n"), cst.SimpleStatementLine
++    )
++    import_node = statement.body[0]
++
++
++    with pytest.raises(ValueError):
++        RemoveImportsVisitor.remove_unused_import_by_node(context, import_node)
++
++
++def test_codemod_command_helper_auto_runs_scheduled_cleanup() -> None:
++
++
++
++
++
++    class ScheduleTypingRemoval(VisitorBasedCodemodCommand):
++        def visit_Module(self, node: cst.Module) -> None:
++            self.remove_unused_import("typing", "Optional")
++
++    result = transform_module(
++        ScheduleTypingRemoval(CodemodContext()),
++        "from typing import Optional, List\nx: List[int]\n",
++    )
++
++    assert isinstance(result, TransformSuccess)
++    assert result.code == "from typing import List\nx: List[int]\n"
++
++
++def test_two_contexts_keep_independent_scheduled_state() -> None:
++
++
++
++
++    a = CodemodContext()
++    b = CodemodContext()
++
++    RemoveImportsVisitor.remove_unused_import(a, "typing", "Optional")
++    RemoveImportsVisitor.remove_unused_import(a, "os")
++    RemoveImportsVisitor.remove_unused_import(b, "sys")
++
++
++    assert (
++        _run_remove_with_context(
++            "from typing import Optional\nimport os\nimport sys\n", a
++        )
++        == "import sys\n"
++    )
++    assert (
++        _run_remove_with_context(
++            "from typing import Optional\nimport os\nimport sys\n", b
++        )
++        == "from typing import Optional\nimport os\n"
++    )
++
++
++def test_repeated_construct_schedule_transform_drop_cycles_do_not_retain_heap() -> None:
++
++
++
++
++    source = "import os, sys\nprint(sys.version)\n"
++    gc.collect()
++    completed_cycles = 0
++
++    for _ in range(150):
++        context = CodemodContext()
++        RemoveImportsVisitor.remove_unused_import(context, "os")
++        assert _run_remove_with_context(source, context) == (
++            "import sys\nprint(sys.version)\n"
++        )
++        completed_cycles += 1
++        del context
++    gc.collect()
++
++
++    assert completed_cycles == 150
++
++
++def test_reusing_visitor_for_second_transform_keeps_scheduled_cleanup_idempotent() -> None:
++
++
++
++
++    context = CodemodContext()
++    RemoveImportsVisitor.remove_unused_import(context, "os")
++
++
++    assert RemoveImportsVisitor(context).transform_module(
++        cst.parse_module("import os\nvalue=1\n")
++    ).code == ("value=1\n")
++    assert RemoveImportsVisitor(context).transform_module(
++        cst.parse_module("import os\nvalue=2\n")
++    ).code == (
++        "value=2\n"
++    )
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,33 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++
++cd /workspace/repo
++
++PYTHON_BIN="${PYTHON_BIN:-/workspace/stage4a-venv/bin/python}"
++if [ ! -x "$PYTHON_BIN" ]; then
++  echo "local offline venv is missing: $PYTHON_BIN" >&2
++  exit 1
++fi
++
++export PIP_NO_INDEX=1
++export PIP_DISABLE_PIP_VERSION_CHECK=1
++export CARGO_NET_OFFLINE=true
++export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
++
++NATIVE_SO="$(find "$(dirname "$PYTHON_BIN")/../lib" -path '*/site-packages/libcst/native*.so' -print -quit)"
++if [ -n "$NATIVE_SO" ] && ! compgen -G "/workspace/repo/libcst/native*.so" >/dev/null; then
++  cp "$NATIVE_SO" /workspace/repo/libcst/
++fi
++
++cd /workspace/repo
++exec "$PYTHON_BIN" -m pytest /workspace/repo/usercase-test-coderl/test_remove_imports_stateful.py -v

@@ -1,0 +1,375 @@
+diff --git a/usercase-test-coderl/usecase.sh b/usercase-test-coderl/usecase.sh
+new file mode 100755
+--- /dev/null
++++ b/usercase-test-coderl/usecase.sh
+@@ -0,0 +1,353 @@
++#!/usr/bin/env bash
++
++set -u
++export LANG=C.UTF-8 LC_ALL=C.UTF-8 TZ=UTC
++
++cd /workspace/repo || { echo "FAIL: cannot cd to repo" >&2; exit 1; }
++
++if command -v python >/dev/null 2>&1; then
++    PY=python
++elif command -v python3 >/dev/null 2>&1; then
++    PY=python3
++else
++    echo "FAIL: python interpreter not found" >&2
++    exit 1
++fi
++
++BIN=/workspace/repo/backend/rve-backend.py
++TMP=$(mktemp -d)
++trap 'rm -rf "$TMP"' EXIT
++fail() { echo "FAIL: $*" >&2; exit 1; }
++
++make_blocking_runtime_dir() {
++    local dir="$1"
++    mkdir -p "$dir"
++    for module in torch torchvision tensorrt torch_tensorrt ncnn rife_ncnn_vulkan_python upscale_ncnn_py; do
++        printf 'raise ImportError("blocked %s")\n' "$module" > "$dir/$module.py"
++    done
++}
++
++assert_first_line_prefix() {
++    local label="$1"
++    local file="$2"
++    local prefix="$3"
++    local first
++    first=$(head -n 1 "$file")
++    case "$first" in
++        "$prefix"?*) ;;
++        *) fail "$label should start with '$prefix'";;
++    esac
++}
++
++assert_last_line_eq() {
++    local label="$1"
++    local file="$2"
++    local expected="$3"
++    local last
++    last=$(tail -n 1 "$file")
++    [ "$last" = "$expected" ] || fail "$label should end with '$expected'"
++}
++
++assert_contains_line() {
++    local label="$1"
++    local file="$2"
++    local expected="$3"
++    grep -Fxq "$expected" "$file" || {
++        echo "FAIL: $label missing line: $expected" >&2
++        echo "--- actual ---" >&2
++        sed -n '1,120p' "$file" >&2
++        exit 1
++    }
++}
++
++assert_not_contains() {
++    local label="$1"
++    local file="$2"
++    local unexpected="$3"
++    ! grep -Fq "$unexpected" "$file" || fail "$label should not contain: $unexpected"
++}
++
++assert_available_has() {
++    local label="$1"
++    local expected="$2"
++    local line
++    line=$(tail -n 1 out)
++    case "$line" in
++        Available\ Backends:*\[*"$expected"*\]*) ;;
++        *) fail "$label Available Backends should contain '$expected'; got '$line'";;
++    esac
++}
++
++assert_available_lacks() {
++    local label="$1"
++    local unexpected="$2"
++    local line
++    line=$(tail -n 1 out)
++    case "$line" in
++        Available\ Backends:*"$unexpected"*) fail "$label Available Backends should not contain '$unexpected'; got '$line'";;
++        Available\ Backends:*) ;;
++        *) fail "$label report should end with Available Backends; got '$line'";;
++    esac
++}
++
++assert_no_report_on_stderr() {
++    local label="$1"
++    ! grep -q "RVE Backend Version:" err || fail "$label availability report should not be on stderr"
++    ! grep -q "Available Backends:" err || fail "$label backend list should not be on stderr"
++}
++
++assert_adjacent_lines() {
++    local label="$1"
++    local file="$2"
++    local first="$3"
++    local second="$4"
++    grep -FxA1 "$first" "$file" | grep -Fxq "$second" || fail "$label should print '$first' followed by '$second'"
++}
++
++run_list_backends() {
++    local runtime_dir="$1"
++    PYTHONPATH="$runtime_dir" "$PY" "$BIN" --list_backends >out 2>err
++    ec=$?
++}
++
++make_blocking_runtime_dir "$TMP/none"
++
++make_blocking_runtime_dir "$TMP/torch_cuda"
++cat > "$TMP/torch_cuda/torch.py" <<'PY'
++__version__ = "2.9.0+cu128"
++float16 = "float16"
++class _Tensor:
++    def to(self, device=None):
++        return self
++def tensor(values, dtype=None):
++    return _Tensor()
++class _Props:
++    def __init__(self, name):
++        self.name = name
++class _Cuda:
++    @staticmethod
++    def is_available(): return True
++    @staticmethod
++    def device_count(): return 2
++    @staticmethod
++    def get_device_properties(index):
++        return _Props(["NVIDIA RTX 5090", "NVIDIA RTX 4070 Ti"][index])
++class _Xpu:
++    @staticmethod
++    def is_available(): return False
++class _Mps:
++    @staticmethod
++    def is_available(): return False
++class _Backends:
++    mps = _Mps()
++cuda = _Cuda()
++xpu = _Xpu()
++backends = _Backends()
++PY
++printf '' > "$TMP/torch_cuda/torchvision.py"
++
++make_blocking_runtime_dir "$TMP/ncnn"
++cat > "$TMP/ncnn/rife_ncnn_vulkan_python.py" <<'PY'
++class Rife:
++    pass
++PY
++cat > "$TMP/ncnn/ncnn.py" <<'PY'
++__version__ = "1.0-fixture"
++def get_gpu_count(): return 2
++class _Info:
++    def __init__(self, name):
++        self._name = name
++    def device_name(self):
++        return self._name
++class _Device:
++    def __init__(self, name):
++        self._name = name
++    def info(self):
++        return _Info(self._name)
++def get_gpu_device(index):
++    return _Device(["Vulkan GPU A", "Vulkan GPU B"][index])
++PY
++cat > "$TMP/ncnn/upscale_ncnn_py.py" <<'PY'
++class UPSCALE:
++    pass
++PY
++
++make_blocking_runtime_dir "$TMP/trt_ok"
++cat > "$TMP/trt_ok/torch.py" <<'PY'
++__version__ = "2.9.0+cu128"
++float16 = "float16"
++class _Tensor:
++    def to(self, device=None):
++        return self
++def tensor(values, dtype=None):
++    return _Tensor()
++class _Props:
++    def __init__(self, name):
++        self.name = name
++class _Cuda:
++    @staticmethod
++    def is_available(): return True
++    @staticmethod
++    def device_count(): return 1
++    @staticmethod
++    def get_device_properties(index):
++        return _Props("NVIDIA RTX 6000 Ada")
++class _Xpu:
++    @staticmethod
++    def is_available(): return False
++class _Mps:
++    @staticmethod
++    def is_available(): return False
++class _Backends:
++    mps = _Mps()
++cuda = _Cuda()
++xpu = _Xpu()
++backends = _Backends()
++PY
++printf '' > "$TMP/trt_ok/torchvision.py"
++printf '__version__ = "10.13.3"\n' > "$TMP/trt_ok/tensorrt.py"
++printf '' > "$TMP/trt_ok/torch_tensorrt.py"
++
++make_blocking_runtime_dir "$TMP/trt_bad"
++cat > "$TMP/trt_bad/torch.py" <<'PY'
++__version__ = "2.9.0+cu128"
++float16 = "float16"
++class _Tensor:
++    def to(self, device=None):
++        raise RuntimeError("float16 unsupported on Fixture GPU")
++def tensor(values, dtype=None):
++    return _Tensor()
++class _Props:
++    def __init__(self, name):
++        self.name = name
++class _Cuda:
++    @staticmethod
++    def is_available(): return True
++    @staticmethod
++    def device_count(): return 1
++    @staticmethod
++    def get_device_properties(index):
++        return _Props("NVIDIA GTX 1060")
++class _Xpu:
++    @staticmethod
++    def is_available(): return False
++class _Mps:
++    @staticmethod
++    def is_available(): return False
++class _Backends:
++    mps = _Mps()
++cuda = _Cuda()
++xpu = _Xpu()
++backends = _Backends()
++PY
++printf '' > "$TMP/trt_bad/torchvision.py"
++printf '__version__ = "10.13.3"\n' > "$TMP/trt_bad/tensorrt.py"
++printf '' > "$TMP/trt_bad/torch_tensorrt.py"
++
++cd "$TMP" || fail "cannot cd to tmp"
++
++
++
++
++run_list_backends "$TMP/none"
++[ "$ec" -eq 0 ] || fail "F1 exit $ec; want 0"
++
++assert_first_line_prefix "F1 stdout" out "RVE Backend Version: "
++assert_adjacent_lines "F1 stdout" out "Half precision support: False" "Available Backends: []"
++assert_last_line_eq "F1 stdout" out "Available Backends: []"
++
++assert_no_report_on_stderr "F1"
++
++
++
++
++run_list_backends "$TMP/torch_cuda"
++[ "$ec" -eq 0 ] || fail "F2 exit $ec; want 0"
++
++assert_first_line_prefix "F2 stdout" out "RVE Backend Version: "
++assert_contains_line "F2 stdout" out "PyTorch Version: 2.9.0+cu128"
++assert_contains_line "F2 stdout" out "PyTorch GPU 0: NVIDIA RTX 5090"
++assert_contains_line "F2 stdout" out "PyTorch GPU 1: NVIDIA RTX 4070 Ti"
++assert_contains_line "F2 stdout" out "Half precision support: True"
++assert_available_has "F2 stdout" "pytorch (cuda)"
++assert_available_lacks "F2 stdout" "tensorrt"
++assert_available_lacks "F2 stdout" "ncnn"
++
++assert_no_report_on_stderr "F2"
++
++
++
++
++run_list_backends "$TMP/ncnn"
++[ "$ec" -eq 0 ] || fail "F3 exit $ec; want 0"
++
++assert_first_line_prefix "F3 stdout" out "RVE Backend Version: "
++assert_contains_line "F3 stdout" out "NCNN Version: 20220729"
++assert_contains_line "F3 stdout" out "NCNN GPU 0: Vulkan GPU A"
++assert_contains_line "F3 stdout" out "NCNN GPU 1: Vulkan GPU B"
++assert_contains_line "F3 stdout" out "Half precision support: False"
++assert_available_has "F3 stdout" "ncnn"
++assert_available_lacks "F3 stdout" "pytorch"
++assert_available_lacks "F3 stdout" "tensorrt"
++
++assert_no_report_on_stderr "F3"
++
++
++
++
++run_list_backends "$TMP/trt_ok"
++[ "$ec" -eq 0 ] || fail "F4 exit $ec; want 0"
++
++assert_first_line_prefix "F4 stdout" out "RVE Backend Version: "
++assert_contains_line "F4 stdout" out "TensorRT Version: 10.13.3"
++assert_contains_line "F4 stdout" out "PyTorch Version: 2.9.0+cu128"
++assert_contains_line "F4 stdout" out "PyTorch GPU 0: NVIDIA RTX 6000 Ada"
++assert_contains_line "F4 stdout" out "Half precision support: True"
++assert_available_has "F4 stdout" "tensorrt"
++assert_available_has "F4 stdout" "pytorch (cuda)"
++assert_available_lacks "F4 stdout" "ncnn"
++
++assert_no_report_on_stderr "F4"
++case "$(tail -n 1 out)" in Available\ Backends:*) ;; *) fail "F4 report should end with Available Backends";; esac
++
++
++
++
++run_list_backends "$TMP/trt_bad"
++[ "$ec" -eq 0 ] || fail "F5 exit $ec; want 0"
++
++assert_first_line_prefix "F5 stdout" out "RVE Backend Version: "
++grep -Fq "ERROR: Cannot use tensorrt backend, as it is not supported on your current GPU" out || fail "F5 stdout should include unsupported TensorRT error"
++grep -Fq "PyTorch Version: 2.9.0+cu128" out || fail "F5 stdout should include PyTorch version"
++assert_contains_line "F5 stdout" out "PyTorch GPU 0: NVIDIA GTX 1060"
++assert_contains_line "F5 stdout" out "Half precision support: False"
++assert_available_has "F5 stdout" "pytorch (cuda)"
++assert_available_lacks "F5 stdout" "tensorrt"
++
++assert_no_report_on_stderr "F5"
++
++
++
++
++run_list_backends "$TMP/none"
++[ "$ec" -eq 0 ] || fail "F6 exit $ec; want 0"
++
++assert_first_line_prefix "F6 stdout" out "RVE Backend Version: "
++assert_last_line_eq "F6 stdout" out "Available Backends: []"
++
++assert_no_report_on_stderr "F6"
++
++
++
++
++PYTHONPATH="$TMP/none" "$PY" "$BIN" --list_backends -i "$TMP/missing-input.mp4" -o "$TMP/missing-output.mp4" >out 2>err
++ec=$?
++[ "$ec" -eq 0 ] || fail "F7 exit $ec; want 0"
++
++assert_first_line_prefix "F7 stdout" out "RVE Backend Version: "
++assert_last_line_eq "F7 stdout" out "Available Backends: []"
++
++assert_no_report_on_stderr "F7"
++
++echo "PASS"
++exit 0
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,12 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++exec bash /workspace/repo/usercase-test-coderl/usecase.sh

@@ -1,0 +1,301 @@
+diff --git a/python/ray/tests/test_tempfile.py b/python/ray/tests/test_tempfile.py
+index 191c9287e5..dafdc5caa7 100644
+--- a/python/ray/tests/test_tempfile.py
++++ b/python/ray/tests/test_tempfile.py
+@@ -3,7 +3,10 @@ from __future__ import division
+ from __future__ import print_function
+ 
+ import os
++import re
+ import shutil
++import subprocess
++import tempfile
+ import time
+ import pytest
+ import ray
+@@ -16,6 +19,35 @@ except NameError:
+     FileNotFoundError = OSError
+ 
+ 
++_OLD_SECONDS_ONLY_SESSION_RE = re.compile(
++    r"^session_\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}_\d+$")
++
++
++def _make_temp_root():
++    return tempfile.mkdtemp(prefix="ray-session-root-")
++
++
++def _session_dir_from_node(node):
++    logs_dir = os.path.abspath(node.get_logs_dir_path())
++    sockets_dir = os.path.abspath(node.get_sockets_dir_path())
++    assert os.path.basename(logs_dir) == "logs"
++    assert os.path.basename(sockets_dir) == "sockets"
++    session_from_logs = os.path.dirname(logs_dir)
++    session_from_sockets = os.path.dirname(sockets_dir)
++    assert session_from_logs == session_from_sockets
++    return session_from_logs
++
++
++def _assert_session_layout(root, session_dir):
++    root = os.path.abspath(root)
++    session_dir = os.path.abspath(session_dir)
++    assert os.path.dirname(session_dir) == root
++    assert os.path.basename(session_dir).startswith("session_")
++    assert os.path.isdir(session_dir)
++    assert os.path.isdir(os.path.join(session_dir, "logs"))
++    assert os.path.isdir(os.path.join(session_dir, "sockets"))
++
++
+ def test_conn_cluster():
+     # plasma_store_socket_name
+     with pytest.raises(Exception) as exc_info:
+@@ -44,12 +78,99 @@ def test_conn_cluster():
+         "temp_dir must not be provided.")
+ 
+ 
+-def test_tempdir():
+-    ray.init(temp_dir="/tmp/i_am_a_temp_dir")
+-    assert os.path.exists(
+-        "/tmp/i_am_a_temp_dir"), "Specified temp dir not found."
+-    ray.shutdown()
+-    shutil.rmtree("/tmp/i_am_a_temp_dir", ignore_errors=True)
++def test_explicit_temp_dir_uses_session_subdir_for_runtime_files():
++    root = _make_temp_root()
++    try:
++        ray.init(temp_dir=root, num_cpus=0)
++        session_dir = _session_dir_from_node(ray.worker._global_node)
++        _assert_session_layout(root, session_dir)
++        assert not os.path.isdir(os.path.join(root, "logs"))
++        assert not os.path.isdir(os.path.join(root, "sockets"))
++    finally:
++        ray.shutdown()
++        shutil.rmtree(root, ignore_errors=True)
++
++
++def test_session_directory_name_has_high_precision_timestamp():
++    root = _make_temp_root()
++    try:
++        ray.init(temp_dir=root, num_cpus=0)
++        session_name = os.path.basename(
++            _session_dir_from_node(ray.worker._global_node))
++        assert session_name.startswith("session_")
++        assert not _OLD_SECONDS_ONLY_SESSION_RE.match(session_name)
++    finally:
++        ray.shutdown()
++        shutil.rmtree(root, ignore_errors=True)
++
++
++def test_multiple_starts_create_distinct_session_dirs_under_same_root():
++    root = _make_temp_root()
++    session_dirs = set()
++    try:
++        for _ in range(3):
++            ray.init(temp_dir=root, num_cpus=0)
++            session_dir = _session_dir_from_node(ray.worker._global_node)
++            _assert_session_layout(root, session_dir)
++            session_dirs.add(session_dir)
++            ray.shutdown()
++        assert len(session_dirs) == 3
++    finally:
++        ray.shutdown()
++        shutil.rmtree(root, ignore_errors=True)
++
++
++def test_cli_temp_dir_uses_session_subdir():
++    root = _make_temp_root()
++    try:
++        subprocess.check_call(
++            ["ray", "start", "--head", "--temp-dir={}".format(root)])
++        session_dirs = [
++            os.path.join(root, entry)
++            for entry in os.listdir(root)
++            if entry.startswith("session_")
++            and os.path.isdir(os.path.join(root, entry))
++        ]
++        usable_session_dirs = [
++            session_dir for session_dir in session_dirs
++            if os.path.isdir(os.path.join(session_dir, "logs"))
++            and os.path.isdir(os.path.join(session_dir, "sockets"))
++        ]
++        assert usable_session_dirs
++        assert not os.path.isdir(os.path.join(root, "logs"))
++        assert not os.path.isdir(os.path.join(root, "sockets"))
++    finally:
++        subprocess.call(["ray", "stop"])
++        shutil.rmtree(root, ignore_errors=True)
++
++
++def test_default_temp_dir_creates_session_under_tmp_ray():
++    ray.init(num_cpus=0)
++    try:
++        session_dir = _session_dir_from_node(ray.worker._global_node)
++        _assert_session_layout("/tmp/ray", session_dir)
++    finally:
++        ray.shutdown()
++
++
++def test_worker_nodes_share_head_session_directory():
++    root = _make_temp_root()
++    stale_session_dir = os.path.join(
++        root, "session_2000-01-01_00-00-00_extra_1")
++    os.makedirs(os.path.join(stale_session_dir, "logs"))
++    os.makedirs(os.path.join(stale_session_dir, "sockets"))
++    cluster = Cluster(False)
++    try:
++        head = cluster.add_node(num_cpus=0, temp_dir=root)
++        worker = cluster.add_node(num_cpus=0)
++        head_session_dir = _session_dir_from_node(head)
++        worker_session_dir = _session_dir_from_node(worker)
++        assert head_session_dir == worker_session_dir
++        assert head_session_dir != stale_session_dir
++        _assert_session_layout(root, head_session_dir)
++    finally:
++        cluster.shutdown()
++        shutil.rmtree(root, ignore_errors=True)
+ 
+ 
+ def test_raylet_socket_name():
+@@ -95,7 +216,8 @@ def test_temp_plasma_store_socket():
+ def test_raylet_tempfiles():
+     ray.init(num_cpus=0)
+     node = ray.worker._global_node
+-    top_levels = set(os.listdir(node.get_temp_dir_path()))
++    session_dir = _session_dir_from_node(node)
++    top_levels = set(os.listdir(session_dir))
+     assert top_levels.issuperset({"sockets", "logs"})
+     log_files = set(os.listdir(node.get_logs_dir_path()))
+     assert log_files.issuperset({
+@@ -110,7 +232,9 @@ def test_raylet_tempfiles():
+ 
+     ray.init(num_cpus=2)
+     node = ray.worker._global_node
+-    top_levels = set(os.listdir(node.get_temp_dir_path()))
++    session_dir = _session_dir_from_node(node)
++    assert os.path.basename(session_dir).startswith("session_")
++    top_levels = set(os.listdir(session_dir))
+     assert top_levels.issuperset({"sockets", "logs"})
+     time.sleep(3)  # wait workers to start
+     log_files = set(os.listdir(node.get_logs_dir_path()))
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,118 @@
++#!/usr/bin/env bash
++set -uo pipefail
++cd /testbed
++
++
++trap '' USR1
++
++
++if [ -z "${_IN_SETSID:-}" ]; then
++    export _IN_SETSID=1
++    exec setsid bash "$0" "$@"
++fi
++
++
++set +u
++export PATH="$HOME/.pyenv/bin:$PATH"
++eval "$(pyenv init -)"
++pyenv global 3.7.17
++python - <<'PY'
++import importlib.util
++import subprocess
++import sys
++
++packages = []
++if importlib.util.find_spec("pyarrow") is None:
++    packages.append("pyarrow==0.14.1")
++if packages:
++    subprocess.check_call([sys.executable, "-m", "pip", "install"] + packages)
++PY
++python - <<'PY'
++import os
++import shutil
++import site
++
++target = "/testbed/python/ray/_raylet.so"
++if not os.path.exists(target):
++    for root in site.getsitepackages():
++        candidate = os.path.join(root, "ray", "_raylet.so")
++        if os.path.exists(candidate):
++            shutil.copy2(candidate, target)
++            break
++generated_target = "/testbed/python/ray/core/generated"
++if not os.path.exists(os.path.join(generated_target, "ErrorTableData.py")):
++    for root in site.getsitepackages():
++        candidate = os.path.join(root, "ray", "core", "generated")
++        if os.path.exists(os.path.join(candidate, "ErrorTableData.py")):
++            for current_root, dirs, files in os.walk(candidate):
++                rel = os.path.relpath(current_root, candidate)
++                dest_root = (generated_target if rel == "." else
++                             os.path.join(generated_target, rel))
++                if not os.path.exists(dest_root):
++                    os.makedirs(dest_root)
++                for filename in files:
++                    dest = os.path.join(dest_root, filename)
++                    if not os.path.exists(dest):
++                        shutil.copy2(os.path.join(current_root, filename), dest)
++            break
++ray_core_src_target = "/testbed/python/ray/core/src"
++if (not os.path.exists(os.path.join(
++        ray_core_src_target, "ray", "thirdparty", "redis", "src",
++        "redis-server")) or not os.path.exists(os.path.join(
++            ray_core_src_target, "plasma", "plasma_store_server"))):
++    for root in site.getsitepackages():
++        candidate = os.path.join(root, "ray", "core", "src")
++        if os.path.exists(os.path.join(
++                candidate, "ray", "thirdparty", "redis", "src",
++                "redis-server")):
++            for current_root, dirs, files in os.walk(candidate):
++                rel = os.path.relpath(current_root, candidate)
++                dest_root = (ray_core_src_target if rel == "." else
++                             os.path.join(ray_core_src_target, rel))
++                if not os.path.exists(dest_root):
++                    os.makedirs(dest_root)
++                for filename in files:
++                    dest = os.path.join(dest_root, filename)
++                    if not os.path.exists(dest):
++                        shutil.copy2(os.path.join(current_root, filename), dest)
++            break
++PY
++export PYTHONPATH=/testbed/python:${PYTHONPATH:-}
++set -u
++
++
++cd /testbed/python
++
++run_pytest() {
++    local tests_expr="$1"
++    python - <<PY
++import os
++import shutil
++import signal as _sig
++import sys
++
++_sig.signal(_sig.SIGUSR1, _sig.SIG_IGN)
++
++for d in ['/tmp/ray', '/tmp/i_am_a_temp_dir', '/tmp/i_am_a_temp_dir2']:
++    shutil.rmtree(d, ignore_errors=True)
++
++import pytest
++
++args = ['-x', '-v', '--tb=short'] + ${tests_expr}
++ec = pytest.main(args)
++sys.exit(0 if str(ec) == 'ExitCode.OK' else 1)
++PY
++}
++
++case "${1:-}" in
++  base)
++    run_pytest "['ray/tests/test_tempfile.py::test_conn_cluster', 'ray/tests/test_tempfile.py::test_raylet_socket_name', 'ray/tests/test_tempfile.py::test_temp_plasma_store_socket']"
++    ;;
++  new)
++    run_pytest "['ray/tests/test_tempfile.py::test_explicit_temp_dir_uses_session_subdir_for_runtime_files', 'ray/tests/test_tempfile.py::test_session_directory_name_has_high_precision_timestamp', 'ray/tests/test_tempfile.py::test_multiple_starts_create_distinct_session_dirs_under_same_root', 'ray/tests/test_tempfile.py::test_cli_temp_dir_uses_session_subdir', 'ray/tests/test_tempfile.py::test_default_temp_dir_creates_session_under_tmp_ray', 'ray/tests/test_tempfile.py::test_worker_nodes_share_head_session_directory', 'ray/tests/test_tempfile.py::test_raylet_tempfiles']"
++    ;;
++  *)
++    echo "usage: $0 base|new"
++    exit 2
++    ;;
++esac

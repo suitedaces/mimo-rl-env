@@ -1,0 +1,291 @@
+diff --git a/core/networking/peerstore_test.go b/core/networking/peerstore_test.go
+new file mode 100644
+index 0000000000..847f2cc415
+--- /dev/null
++++ b/core/networking/peerstore_test.go
+@@ -0,0 +1,99 @@
++package networking_test
++
++import (
++	"context"
++	"database/sql"
++	"testing"
++	"time"
++
++	p2ppeer "github.com/libp2p/go-libp2p-core/peer"
++	ma "github.com/multiformats/go-multiaddr"
++	"github.com/smartcontractkit/chainlink/core/internal/cltest"
++	"github.com/smartcontractkit/chainlink/core/networking"
++	"github.com/stretchr/testify/require"
++)
++
++func TestNewPeerstorePersistsPeerDataAcrossReconstruction(t *testing.T) {
++	_, orm, cleanup := cltest.BootstrapThrowawayORM(t, "peerstore_addr", true)
++	defer cleanup()
++	db := orm.DB.DB()
++	ctx := context.Background()
++
++	first, err := networking.NewPeerstore(ctx, db)
++	require.NoError(t, err)
++	peerID := mustPeerID(t, "12D3KooWL1yndUw9T2oWXjhfjdwSscWA78YCpUdduA3Cnn4dCtph")
++	addr := mustMultiaddr(t, "/ip4/127.0.0.1/tcp/12000/p2p/12D3KooWL1yndUw9T2oWXjhfjdwSscWA78YCpUdduA3Cnn4dCtph")
++
++	first.AddAddr(peerID, addr, time.Hour)
++	require.GreaterOrEqual(t, peerstoreRowCount(t, db), 1)
++
++	second, err := networking.NewPeerstore(ctx, db)
++	require.NoError(t, err)
++	require.Contains(t, peerIDsAsStrings(second.Peers()), peerID.String())
++	require.Contains(t, multiaddrsAsStrings(second.Addrs(peerID)), addr.String())
++}
++
++func TestNewPeerstorePersistsProtocolsAcrossReconstruction(t *testing.T) {
++	_, orm, cleanup := cltest.BootstrapThrowawayORM(t, "peerstore_protocols", true)
++	defer cleanup()
++	db := orm.DB.DB()
++	ctx := context.Background()
++
++	first, err := networking.NewPeerstore(ctx, db)
++	require.NoError(t, err)
++	peerID := mustPeerID(t, "12D3KooWPCUQczn5M34VZvj6kMkyWkYqM2seFxF6cE2bSwjfRRr2")
++	protocols := []string{
++		"/chainlink/ocr/1.0.0",
++		"/chainlink/ocr/2.0.0",
++	}
++
++	require.NoError(t, first.AddProtocols(peerID, protocols...))
++	require.GreaterOrEqual(t, peerstoreRowCount(t, db), 1)
++
++	second, err := networking.NewPeerstore(ctx, db)
++	require.NoError(t, err)
++	got, err := second.GetProtocols(peerID)
++	require.NoError(t, err)
++	require.Contains(t, got, protocols[0])
++	require.Contains(t, got, protocols[1])
++}
++
++func peerstoreRowCount(t *testing.T, db *sql.DB) int {
++	t.Helper()
++
++	var count int
++	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM p2p_peerstore`).Scan(&count))
++	return count
++}
++
++func mustPeerID(t *testing.T, value string) p2ppeer.ID {
++	t.Helper()
++
++	peerID, err := p2ppeer.Decode(value)
++	require.NoError(t, err)
++	return peerID
++}
++
++func mustMultiaddr(t *testing.T, value string) ma.Multiaddr {
++	t.Helper()
++
++	addr, err := ma.NewMultiaddr(value)
++	require.NoError(t, err)
++	return addr
++}
++
++func peerIDsAsStrings(peers []p2ppeer.ID) []string {
++	values := make([]string, 0, len(peers))
++	for _, peerID := range peers {
++		values = append(values, peerID.String())
++	}
++	return values
++}
++
++func multiaddrsAsStrings(addrs []ma.Multiaddr) []string {
++	values := make([]string, 0, len(addrs))
++	for _, addr := range addrs {
++		values = append(values, addr.String())
++	}
++	return values
++}
+diff --git a/core/store/migrations/p2p_peerstore_test.go b/core/store/migrations/p2p_peerstore_test.go
+new file mode 100644
+index 0000000000..dfa3f3fc4b
+--- /dev/null
++++ b/core/store/migrations/p2p_peerstore_test.go
+@@ -0,0 +1,81 @@
++package migrations_test
++
++import (
++	"database/sql"
++	"testing"
++
++	"github.com/smartcontractkit/chainlink/core/internal/cltest"
++	"github.com/stretchr/testify/require"
++)
++
++func TestMigrationsCreateP2PPeerstoreTable(t *testing.T) {
++	store, cleanup := cltest.NewStore(t)
++	defer cleanup()
++	db := store.DB.DB()
++
++	require.True(t, tableExists(t, db, "p2p_peerstore"))
++
++	keyColumn := columnInfo(t, db, "p2p_peerstore", "key")
++	require.Equal(t, "text", keyColumn.dataType)
++	require.Equal(t, "NO", keyColumn.isNullable)
++	require.True(t, columnIsPrimaryKey(t, db, "p2p_peerstore", "key"))
++
++	dataColumn := columnInfo(t, db, "p2p_peerstore", "data")
++	require.Equal(t, "bytea", dataColumn.dataType)
++	require.Equal(t, "NO", dataColumn.isNullable)
++}
++
++type postgresColumnInfo struct {
++	dataType   string
++	isNullable string
++}
++
++func tableExists(t *testing.T, db *sql.DB, tableName string) bool {
++	t.Helper()
++
++	var exists bool
++	require.NoError(t, db.QueryRow(`
++		SELECT EXISTS (
++			SELECT 1
++			FROM information_schema.tables
++			WHERE table_schema = current_schema()
++				AND table_name = $1
++		)
++	`, tableName).Scan(&exists))
++	return exists
++}
++
++func columnInfo(t *testing.T, db *sql.DB, tableName, columnName string) postgresColumnInfo {
++	t.Helper()
++
++	var info postgresColumnInfo
++	require.NoError(t, db.QueryRow(`
++		SELECT data_type, is_nullable
++		FROM information_schema.columns
++		WHERE table_schema = current_schema()
++			AND table_name = $1
++			AND column_name = $2
++	`, tableName, columnName).Scan(&info.dataType, &info.isNullable))
++	return info
++}
++
++func columnIsPrimaryKey(t *testing.T, db *sql.DB, tableName, columnName string) bool {
++	t.Helper()
++
++	var exists bool
++	require.NoError(t, db.QueryRow(`
++		SELECT EXISTS (
++			SELECT 1
++			FROM information_schema.table_constraints tc
++			JOIN information_schema.key_column_usage kcu
++				ON tc.constraint_schema = kcu.constraint_schema
++				AND tc.constraint_name = kcu.constraint_name
++				AND tc.table_name = kcu.table_name
++			WHERE tc.table_schema = current_schema()
++				AND tc.table_name = $1
++				AND tc.constraint_type = 'PRIMARY KEY'
++				AND kcu.column_name = $2
++		)
++	`, tableName, columnName).Scan(&exists))
++	return exists
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,94 @@
++#!/bin/bash
++set -uo pipefail
++cd /testbed
++
++
++set -e
++
++
++if ! pg_isready -q 2>/dev/null; then
++    pg_ctlcluster 16 main start 2>/dev/null || true
++    sleep 2
++fi
++
++
++if grep -q "scram-sha-256\|md5\|peer" /etc/postgresql/16/main/pg_hba.conf 2>/dev/null; then
++    sed -i 's/scram-sha-256/trust/g; s/md5/trust/g; s/peer/trust/g' /etc/postgresql/16/main/pg_hba.conf
++    pg_ctlcluster 16 main reload 2>/dev/null || true
++    sleep 1
++fi
++
++
++su - postgres -c "psql -tc \"SELECT 1 FROM pg_roles WHERE rolname='root'\"" | grep -q 1 || \
++    su - postgres -c "psql -c \"CREATE USER root WITH SUPERUSER CREATEDB;\"" 2>/dev/null || true
++
++
++psql -U root -d postgres -tc "SELECT 1 FROM pg_database WHERE datname='chainlink_test'" | grep -q 1 || \
++    psql -U root -d postgres -c "CREATE DATABASE chainlink_test;" 2>/dev/null || true
++
++
++if [ ! -f /testbed/evm-contracts/abi/v0.6/FluxAggregator.json ]; then
++    mkdir -p /testbed/evm-contracts/abi/v0.6
++    cat > /testbed/evm-contracts/abi/v0.6/FluxAggregator.json << 'ABIEOF'
++{
++  "compilerOutput": {
++    "abi": [
++      {
++        "type": "event",
++        "name": "AnswerUpdated",
++        "inputs": [
++          {"name": "current", "type": "int256", "indexed": true},
++          {"name": "roundId", "type": "uint256", "indexed": true},
++          {"name": "updatedAt", "type": "uint256", "indexed": false}
++        ]
++      },
++      {
++        "type": "event",
++        "name": "NewRound",
++        "inputs": [
++          {"name": "roundId", "type": "uint256", "indexed": true},
++          {"name": "startedBy", "type": "address", "indexed": true},
++          {"name": "startedAt", "type": "uint256", "indexed": false}
++        ]
++      },
++      {
++        "type": "function",
++        "name": "roundState",
++        "stateMutability": "view",
++        "inputs": [
++          {"name": "_oracle", "type": "address"},
++          {"name": "_queriedRoundId", "type": "uint32"}
++        ],
++        "outputs": [
++          {"name": "_eligibleToSubmit", "type": "bool"},
++          {"name": "_roundId", "type": "uint32"},
++          {"name": "_latestSubmission", "type": "int256"},
++          {"name": "_startedAt", "type": "uint64"},
++          {"name": "_timeout", "type": "uint64"},
++          {"name": "_availableFunds", "type": "uint128"},
++          {"name": "_oracleCount", "type": "uint8"},
++          {"name": "_paymentAmount", "type": "uint128"}
++        ]
++      }
++    ]
++  }
++}
++ABIEOF
++fi
++
++export DATABASE_URL="postgres://root@localhost:5432/chainlink_test?sslmode=disable"
++
++
++case "${1:-}" in
++  base)
++    go test -v -count=1 -run 'TestMigrate_Migrations' ./core/store/migrations
++    ;;
++  new)
++    go test -v -count=1 -run 'TestNewPeerstorePersistsPeerDataAcrossReconstruction|TestNewPeerstorePersistsProtocolsAcrossReconstruction' ./core/networking && \
++    go test -v -count=1 -run 'TestMigrationsCreateP2PPeerstoreTable' ./core/store/migrations
++    ;;
++  *)
++    echo "usage: $0 base|new"
++    exit 2
++    ;;
++esac

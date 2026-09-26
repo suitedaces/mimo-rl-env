@@ -1,0 +1,297 @@
+diff --git a/pkg/api/postage_test.go b/pkg/api/postage_test.go
+index cc6ec6ec..c3dee5f2 100644
+--- a/pkg/api/postage_test.go
++++ b/pkg/api/postage_test.go
+@@ -8,10 +8,14 @@ import (
+ 	"bytes"
+ 	"context"
+ 	"encoding/hex"
++	"encoding/json"
+ 	"errors"
+ 	"fmt"
+ 	"math/big"
+ 	"net/http"
++	"os"
++	"path/filepath"
++	"strings"
+ 	"testing"
+ 	"time"
+ 
+@@ -26,6 +30,7 @@ import (
+ 	contractMock "github.com/ethersphere/bee/pkg/postage/postagecontract/mock"
+ 	postagetesting "github.com/ethersphere/bee/pkg/postage/testing"
+ 	"github.com/ethersphere/bee/pkg/sctx"
++	"github.com/ethersphere/bee/pkg/storage"
+ )
+ 
+ func TestPostageCreateStamp(t *testing.T) {
+@@ -201,15 +206,15 @@ func TestPostageCreateStamp(t *testing.T) {
+ }
+ 
+ func TestPostageGetStamps(t *testing.T) {
+-	b := postagetesting.MustNewBatch()
+-	b.Value = big.NewInt(20)
++	b := postagetesting.MustNewBatch(postagetesting.WithValue(20))
+ 	si := postage.NewStampIssuer("", "", b.ID, big.NewInt(3), 11, 10, 1000, true)
+ 	mp := mockpost.New(mockpost.WithIssuer(si))
+ 	cs := &postage.ChainState{Block: 10, TotalAmount: big.NewInt(5), CurrentPrice: big.NewInt(2)}
+-	bs := mock.New(mock.WithChainState(cs), mock.WithBatch(b))
+-	ts, _, _, _ := newTestServer(t, testServerOptions{DebugAPI: true, Post: mp, BatchStore: bs, BlockTime: big.NewInt(2)})
+ 
+ 	t.Run("single stamp", func(t *testing.T) {
++		bs := mock.New(mock.WithChainState(cs), mock.WithBatch(b))
++		ts, _, _, _ := newTestServer(t, testServerOptions{DebugAPI: true, Post: mp, BatchStore: bs, BlockTime: big.NewInt(2)})
++
+ 		jsonhttptest.Request(t, ts, http.MethodGet, "/stamps", http.StatusOK,
+ 			jsonhttptest.WithExpectedJSONResponse(&api.PostageStampsResponse{
+ 				Stamps: []api.PostageStampResponse{
+@@ -230,6 +235,211 @@ func TestPostageGetStamps(t *testing.T) {
+ 			}),
+ 		)
+ 	})
++
++	t.Run("expired batch", func(t *testing.T) {
++		bsForNonExistingBatch := newSelectiveBatchStore(cs, nil)
++		tsForNonExistingBatch, _, _, _ := newTestServer(t, testServerOptions{DebugAPI: true, Post: mp, BatchStore: bsForNonExistingBatch, BlockTime: big.NewInt(2)})
++
++		resp := getStampsResponse(t, tsForNonExistingBatch, "/stamps")
++		if len(resp.Stamps) != 0 {
++			t.Fatalf("expected default /stamps response to omit stale stamp %x; got %+v", b.ID, resp.Stamps)
++		}
++
++		staleStamp, ok := findStamp(getStampsResponse(t, tsForNonExistingBatch, "/stamps?all=true"), b.ID)
++		if !ok {
++			t.Fatalf("expected all=true response to include stale stamp %x", b.ID)
++		}
++		if staleStamp.Exists || staleStamp.Usable {
++			t.Fatalf("expected stale stamp %x returned by all=true to be unavailable/non-existing; got %+v", b.ID, staleStamp)
++		}
++	})
++}
++
++func TestPostageGetStamps_FilterStaleByDefault(t *testing.T) {
++	ts, existingID, staleID := newStampsFilteringTestServer(t)
++
++	resp := getStampsResponse(t, ts, "/stamps")
++
++	if !containsStamp(resp, existingID) {
++		t.Fatalf("expected default /stamps response to include stamp backed by an existing batch %x; got %+v", existingID, resp.Stamps)
++	}
++	if containsStamp(resp, staleID) {
++		t.Fatalf("expected default /stamps response to omit stale stamp %x; got %+v", staleID, resp.Stamps)
++	}
++}
++
++func TestPostageGetStamps_AllTrueIncludesStale(t *testing.T) {
++	ts, existingID, staleID := newStampsFilteringTestServer(t)
++
++	resp := getStampsResponse(t, ts, "/stamps?all=true")
++
++	if !containsStamp(resp, existingID) {
++		t.Fatalf("expected all=true response to include stamp backed by an existing batch %x; got %+v", existingID, resp.Stamps)
++	}
++	staleStamp, ok := findStamp(resp, staleID)
++	if !ok {
++		t.Fatalf("expected all=true response to include stale stamp %x; got %+v", staleID, resp.Stamps)
++	}
++	if staleStamp.Exists {
++		t.Fatalf("expected stale stamp %x returned by all=true to have exists=false", staleID)
++	}
++	if staleStamp.Usable {
++		t.Fatalf("expected stale stamp %x returned by all=true to have usable=false", staleID)
++	}
++}
++
++func TestPostageGetStamps_AllQueryParsing(t *testing.T) {
++	ts, _, staleID := newStampsFilteringTestServer(t)
++
++	if !containsStamp(getStampsResponse(t, ts, "/stamps?all=TRUE"), staleID) {
++		t.Fatalf("expected all=TRUE to include stale stamp %x", staleID)
++	}
++
++	for _, path := range []string{"/stamps", "/stamps?all=false", "/stamps?all=yes"} {
++		resp := getStampsResponse(t, ts, path)
++		if containsStamp(resp, staleID) {
++			t.Fatalf("expected %s to filter stale stamp %x; got %+v", path, staleID, resp.Stamps)
++		}
++	}
++}
++
++func TestOpenAPIStampsDocumentsAllParameter(t *testing.T) {
++	for _, name := range []string{"Swarm.yaml", "SwarmDebug.yaml"} {
++		t.Run(name, func(t *testing.T) {
++			body, err := os.ReadFile(filepath.Join("..", "..", "openapi", name))
++			if err != nil {
++				t.Fatal(err)
++			}
++
++			block := openAPIPathBlock(t, string(body), `  "/stamps":`)
++			if !strings.Contains(block, "name: all") || !strings.Contains(block, "in: query") {
++				t.Fatalf("%s /stamps block should document an all query parameter; block:\n%s", name, block)
++			}
++			for _, oldPhrase := range []string{
++				"Get all available stamps for this node",
++				"Returns an array of all available postage batches.",
++			} {
++				if strings.Contains(block, oldPhrase) {
++					t.Fatalf("%s /stamps block still contains stale default-response wording %q; block:\n%s", name, oldPhrase, block)
++				}
++			}
++		})
++	}
++}
++
++func newStampsFilteringTestServer(t *testing.T) (*http.Client, []byte, []byte) {
++	t.Helper()
++
++	existingBatch := postagetesting.MustNewBatch(postagetesting.WithValue(20))
++	staleBatch := postagetesting.MustNewBatch(postagetesting.WithValue(30))
++
++	existingIssuer := postage.NewStampIssuer("", "", existingBatch.ID, big.NewInt(3), 11, 10, 1000, true)
++	staleIssuer := postage.NewStampIssuer("", "", staleBatch.ID, big.NewInt(4), 12, 10, 1001, true)
++	mp := mockpost.New(mockpost.WithIssuer(existingIssuer))
++	if err := mp.Add(staleIssuer); err != nil {
++		t.Fatal(err)
++	}
++
++	cs := &postage.ChainState{Block: 10, TotalAmount: big.NewInt(5), CurrentPrice: big.NewInt(2)}
++	bs := newSelectiveBatchStore(cs, existingBatch)
++	ts, _, _, _ := newTestServer(t, testServerOptions{DebugAPI: true, Post: mp, BatchStore: bs, BlockTime: big.NewInt(2)})
++
++	return ts, existingBatch.ID, staleBatch.ID
++}
++
++type selectiveBatchStore struct {
++	*mock.BatchStore
++	batch *postage.Batch
++}
++
++func newSelectiveBatchStore(cs *postage.ChainState, batch *postage.Batch) *selectiveBatchStore {
++	return &selectiveBatchStore{
++		BatchStore: mock.New(mock.WithChainState(cs)),
++		batch:      batch,
++	}
++}
++
++func (bs *selectiveBatchStore) Get(id []byte) (*postage.Batch, error) {
++	if bs.batch != nil && bytes.Equal(bs.batch.ID, id) {
++		return bs.batch, nil
++	}
++	return nil, storage.ErrNotFound
++}
++
++func (bs *selectiveBatchStore) Exists(id []byte) (bool, error) {
++	return bs.batch != nil && bytes.Equal(bs.batch.ID, id), nil
++}
++
++func (bs *selectiveBatchStore) Iterate(f func(*postage.Batch) (bool, error)) error {
++	if bs.batch == nil {
++		return nil
++	}
++	_, err := f(bs.batch)
++	return err
++}
++
++type observedPostageStampsResponse struct {
++	Stamps []observedPostageStamp `json:"stamps"`
++}
++
++type observedPostageStamp struct {
++	BatchID string `json:"batchID"`
++	Exists  bool   `json:"exists"`
++	Usable  bool   `json:"usable"`
++}
++
++func getStampsResponse(t *testing.T, client *http.Client, path string) observedPostageStampsResponse {
++	t.Helper()
++
++	req, err := http.NewRequest(http.MethodGet, path, nil)
++	if err != nil {
++		t.Fatal(err)
++	}
++	res, err := client.Do(req)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer res.Body.Close()
++
++	if res.StatusCode != http.StatusOK {
++		t.Fatalf("got status %d, want %d", res.StatusCode, http.StatusOK)
++	}
++
++	var out observedPostageStampsResponse
++	if err := json.NewDecoder(res.Body).Decode(&out); err != nil {
++		t.Fatal(err)
++	}
++	return out
++}
++
++func containsStamp(resp observedPostageStampsResponse, batchID []byte) bool {
++	_, ok := findStamp(resp, batchID)
++	return ok
++}
++
++func findStamp(resp observedPostageStampsResponse, batchID []byte) (observedPostageStamp, bool) {
++	want := hex.EncodeToString(batchID)
++	for _, stamp := range resp.Stamps {
++		if stamp.BatchID == want {
++			return stamp, true
++		}
++	}
++	return observedPostageStamp{}, false
++}
++
++func openAPIPathBlock(t *testing.T, body, marker string) string {
++	t.Helper()
++
++	start := strings.Index(body, marker)
++	if start < 0 {
++		t.Fatalf("openapi document does not contain marker %q", marker)
++	}
++	rest := body[start+len(marker):]
++	end := strings.Index(rest, "\n  \"/")
++	if end < 0 {
++		return rest
++	}
++	return rest[:end]
+ }
+ 
+ // TestGetAllBatches tests that the endpoint that returns all living
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,33 @@
++#!/bin/bash
++set -euo pipefail
++
++cd /testbed
++
++prepare_go_env() {
++
++
++  sed -i '/go-msgio v0.0.6/d' go.sum
++  GONOSUMCHECK='*' GONOSUMDB='*' GOFLAGS='-mod=mod' go get golang.org/x/net@v0.33.0 golang.org/x/sys@v0.28.0
++  GONOSUMCHECK='*' GONOSUMDB='*' GOFLAGS='-mod=mod' go mod tidy
++}
++
++run_api_test() {
++  local pattern="$1"
++  GONOSUMCHECK='*' GONOSUMDB='*' GOFLAGS='-mod=mod' go test -v -run "$pattern" -count=1 ./pkg/api/
++}
++
++prepare_go_env
++
++case "${1:-}" in
++  base)
++    run_api_test '^TestPostageGetStamps$/^single_stamp$'
++    ;;
++  new)
++    run_api_test '^TestPostageGetStamps$/^expired_batch$'
++    run_api_test '^(TestPostageGetStamps_FilterStaleByDefault|TestPostageGetStamps_AllTrueIncludesStale|TestPostageGetStamps_AllQueryParsing|TestOpenAPIStampsDocumentsAllParameter)$'
++    ;;
++  *)
++    echo "usage: $0 base|new"
++    exit 2
++    ;;
++esac

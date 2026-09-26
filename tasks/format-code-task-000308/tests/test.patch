@@ -1,0 +1,499 @@
+diff --git a/usercase-test-coderl/batch_exists_test.go b/usercase-test-coderl/batch_exists_test.go
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/batch_exists_test.go
+@@ -0,0 +1,400 @@
++package usercase_test_coderl
++
++import (
++	"crypto/sha1"
++	"encoding/hex"
++	"errors"
++	"fmt"
++	"os"
++	"reflect"
++	"strconv"
++	"strings"
++	"testing"
++	"time"
++
++	as "github.com/aerospike/aerospike-client-go/v8"
++	"github.com/aerospike/aerospike-client-go/v8/types"
++)
++
++const namespace = "test"
++
++func testHost() string {
++	if host := os.Getenv("AEROSPIKE_HOST"); host != "" {
++		return host
++	}
++	return "127.0.0.1"
++}
++
++func testPort() int {
++	if port := os.Getenv("AEROSPIKE_PORT"); port != "" {
++		parsed, err := strconv.Atoi(port)
++		if err == nil {
++			return parsed
++		}
++	}
++	return 3000
++}
++
++func newConnectedClient(t *testing.T) *as.Client {
++	t.Helper()
++
++	policy := as.NewClientPolicy()
++	policy.FailIfNotConnected = true
++	policy.Timeout = 5 * time.Second
++
++	var client *as.Client
++	var err as.Error
++	deadline := time.Now().Add(10 * time.Second)
++	for {
++		client, err = as.NewClientWithPolicy(policy, testHost(), testPort())
++		if err == nil {
++			break
++		}
++		if time.Now().After(deadline) {
++			break
++		}
++		time.Sleep(100 * time.Millisecond)
++	}
++	if err != nil {
++		t.Fatalf("NewClientWithPolicy error = %v, want nil", err)
++	}
++	if client.IsConnected() != true {
++		t.Fatalf("client.IsConnected() = %v, want true", client.IsConnected())
++	}
++	if len(client.GetNodes()) != 1 {
++		t.Fatalf("len(client.GetNodes()) = %d, want 1", len(client.GetNodes()))
++	}
++	return client
++}
++
++func makeKey(t *testing.T, set string, userKey any) *as.Key {
++	t.Helper()
++
++	key, err := as.NewKey(namespace, set, userKey)
++	if err != nil {
++		t.Fatalf("NewKey error = %v, want nil", err)
++	}
++	return key
++}
++
++func writeFixtureRecord(t *testing.T, client *as.Client, key *as.Key, marker int) {
++	t.Helper()
++
++	err := client.Put(nil, key, as.BinMap{"marker": marker, "payload": fmt.Sprintf("payload-%d", marker)})
++	if err != nil {
++		t.Fatalf("Put error = %v, want nil", err)
++	}
++}
++
++func deleteFixtureRecord(t *testing.T, client *as.Client, key *as.Key) {
++	t.Helper()
++
++	_, _ = client.Delete(nil, key)
++}
++
++func uniqueSet(t *testing.T) string {
++	sum := sha1.Sum([]byte(t.Name()))
++	prefix := strings.NewReplacer("/", "_", " ", "_").Replace(t.Name())
++	if len(prefix) > 24 {
++		prefix = prefix[:24]
++	}
++	return "coderl_" + prefix + "_" + hex.EncodeToString(sum[:4])
++}
++
++func assertBoolSlice(t *testing.T, got []bool, want []bool) {
++	t.Helper()
++
++	if !reflect.DeepEqual(got, want) {
++		t.Fatalf("BatchExists result = %#v, want %#v", got, want)
++	}
++}
++
++func assertAerospikeCode(t *testing.T, err error, want types.ResultCode) {
++	t.Helper()
++
++	if err == nil {
++		t.Fatalf("error = nil, want *aerospike.AerospikeError with ResultCode %s", want)
++	}
++	var aerospikeErr *as.AerospikeError
++	if !errors.As(err, &aerospikeErr) {
++		t.Fatalf("error type = %T, want *aerospike.AerospikeError", err)
++	}
++	if aerospikeErr.ResultCode != want {
++		t.Fatalf("AerospikeError.ResultCode = %s, want %s", aerospikeErr.ResultCode, want)
++	}
++}
++
++func metricCount(t *testing.T, stats map[string]any, metricName string) float64 {
++	t.Helper()
++
++	aggregated, ok := stats["cluster-aggregated-stats"].(map[string]any)
++	if !ok {
++		t.Fatalf("stats[cluster-aggregated-stats] type = %T, want map[string]any", stats["cluster-aggregated-stats"])
++	}
++	metric, ok := aggregated[metricName].(map[string]any)
++	if !ok {
++		t.Fatalf("aggregated[%s] type = %T, want map[string]any", metricName, aggregated[metricName])
++	}
++	count, ok := metric["count"].(float64)
++	if !ok {
++		t.Fatalf("aggregated[%s][count] type = %T, want float64", metricName, metric["count"])
++	}
++	return count
++}
++
++func TestBatchExistsMixedExistingAndMissingKeysWithNilPolicy(t *testing.T) {
++
++
++	client := newConnectedClient(t)
++	defer client.Close()
++
++	set := uniqueSet(t)
++	keyA := makeKey(t, set, "A")
++	keyB := makeKey(t, set, "B")
++	keyC := makeKey(t, set, "C")
++	deleteFixtureRecord(t, client, keyA)
++	deleteFixtureRecord(t, client, keyB)
++	deleteFixtureRecord(t, client, keyC)
++	writeFixtureRecord(t, client, keyA, 10)
++	writeFixtureRecord(t, client, keyC, 30)
++
++	exists, err := client.BatchExists(nil, []*as.Key{keyA, keyB, keyC})
++	if err != nil {
++		t.Fatalf("BatchExists error = %v, want nil", err)
++	}
++	assertBoolSlice(t, exists, []bool{true, false, true})
++}
++
++func TestBatchExistsTwoMissingKeysAreFalseNotFailure(t *testing.T) {
++
++
++	client := newConnectedClient(t)
++	defer client.Close()
++
++	set := uniqueSet(t)
++	keyA := makeKey(t, set, "missing-A")
++	keyB := makeKey(t, set, "missing-B")
++	deleteFixtureRecord(t, client, keyA)
++	deleteFixtureRecord(t, client, keyB)
++
++	exists, err := client.BatchExists(nil, []*as.Key{keyA, keyB})
++	if err != nil {
++		t.Fatalf("BatchExists error = %v, want nil", err)
++	}
++	assertBoolSlice(t, exists, []bool{false, false})
++}
++
++func TestBatchExistsPreservesInputOrderForNonPalindromicResults(t *testing.T) {
++
++
++	client := newConnectedClient(t)
++	defer client.Close()
++
++	set := uniqueSet(t)
++	keyA := makeKey(t, set, "A")
++	keyB := makeKey(t, set, "B")
++	keyC := makeKey(t, set, "C")
++	keyD := makeKey(t, set, "D")
++	for _, key := range []*as.Key{keyA, keyB, keyC, keyD} {
++		deleteFixtureRecord(t, client, key)
++	}
++	writeFixtureRecord(t, client, keyA, 10)
++	writeFixtureRecord(t, client, keyC, 30)
++
++	exists, err := client.BatchExists(nil, []*as.Key{keyB, keyA, keyD, keyC})
++	if err != nil {
++		t.Fatalf("BatchExists error = %v, want nil", err)
++	}
++	assertBoolSlice(t, exists, []bool{false, true, false, true})
++}
++
++func TestBatchExistsRecordsAsOneBatchReadOperationNotSingleKeyReads(t *testing.T) {
++
++
++	client := newConnectedClient(t)
++	defer client.Close()
++
++	set := uniqueSet(t)
++	keyA := makeKey(t, set, "A")
++	keyB := makeKey(t, set, "B")
++	deleteFixtureRecord(t, client, keyA)
++	deleteFixtureRecord(t, client, keyB)
++	writeFixtureRecord(t, client, keyA, 10)
++	client.EnableMetrics(nil)
++
++	exists, err := client.BatchExists(nil, []*as.Key{keyA, keyB})
++	if err != nil {
++		t.Fatalf("BatchExists error = %v, want nil", err)
++	}
++	assertBoolSlice(t, exists, []bool{true, false})
++
++	stats, statsErr := client.Stats()
++	if statsErr != nil {
++		t.Fatalf("Stats error = %v, want nil", statsErr)
++	}
++	if metricCount(t, stats, "batch-read-metrics") != 1 {
++		t.Fatalf("batch-read-metrics count = %.0f, want 1", metricCount(t, stats, "batch-read-metrics"))
++	}
++	if metricCount(t, stats, "exists-metrics") != 0 {
++		t.Fatalf("exists-metrics count = %.0f, want 0", metricCount(t, stats, "exists-metrics"))
++	}
++	if metricCount(t, stats, "get-metrics") != 0 {
++		t.Fatalf("get-metrics count = %.0f, want 0", metricCount(t, stats, "get-metrics"))
++	}
++	if metricCount(t, stats, "get-header-metrics") != 0 {
++		t.Fatalf("get-header-metrics count = %.0f, want 0", metricCount(t, stats, "get-header-metrics"))
++	}
++}
++
++func TestBatchExistsNilPolicyUsesClientDefaultBatchPolicyAndReportsFilteredOut(t *testing.T) {
++
++
++	client := newConnectedClient(t)
++	defer client.Close()
++
++	set := uniqueSet(t)
++	keyA := makeKey(t, set, "A")
++	keyC := makeKey(t, set, "C")
++	deleteFixtureRecord(t, client, keyA)
++	deleteFixtureRecord(t, client, keyC)
++	writeFixtureRecord(t, client, keyA, 10)
++	writeFixtureRecord(t, client, keyC, 30)
++
++	defaultBatchPolicy := as.NewBatchPolicy()
++	defaultBatchPolicy.FilterExpression = as.ExpEq(as.ExpIntBin("marker"), as.ExpIntVal(10))
++	client.SetDefaultBatchPolicy(defaultBatchPolicy)
++
++	exists, err := client.BatchExists(nil, []*as.Key{keyA, keyC})
++
++	if exists != nil {
++		assertBoolSlice(t, exists, []bool{true, false})
++	}
++	assertAerospikeCode(t, err, types.FILTERED_OUT)
++
++	withoutFilter := as.NewBatchPolicy()
++	exists, err = client.BatchExists(withoutFilter, []*as.Key{keyA, keyC})
++	if err != nil {
++		t.Fatalf("BatchExists without filter error = %v, want nil", err)
++	}
++	assertBoolSlice(t, exists, []bool{true, true})
++}
++
++func TestBatchExistsUnexpectedPerKeyServerErrorIsReturned(t *testing.T) {
++
++
++	client := newConnectedClient(t)
++	defer client.Close()
++
++	set := uniqueSet(t)
++	keyA := makeKey(t, set, "A")
++	deleteFixtureRecord(t, client, keyA)
++	writeFixtureRecord(t, client, keyA, 10)
++	badKey, err := as.NewKey("missing_namespace_coderl", set, "bad")
++	if err != nil {
++		t.Fatalf("NewKey invalid-namespace fixture error = %v, want nil", err)
++	}
++
++	exists, batchErr := client.BatchExists(nil, []*as.Key{keyA, badKey})
++
++	if batchErr == nil {
++		t.Fatalf("BatchExists error = nil, want non-nil Error for unexpected per-key server error")
++	}
++	if exists != nil {
++		if len(exists) != 2 {
++			t.Fatalf("BatchExists result length = %d, want 2 when a result slice is returned", len(exists))
++		}
++		if exists[1] {
++			t.Fatalf("BatchExists marked unexpected-error key as existing: %#v", exists)
++		}
++	}
++}
++
++func TestBatchExistsWorksFromExistingConnectedClient(t *testing.T) {
++
++
++	client := newConnectedClient(t)
++	defer client.Close()
++
++	set := uniqueSet(t)
++	keyA := makeKey(t, set, "A")
++	deleteFixtureRecord(t, client, keyA)
++	writeFixtureRecord(t, client, keyA, 10)
++
++
++	exists, err := client.BatchExists(nil, []*as.Key{keyA})
++	if err != nil {
++		t.Fatalf("BatchExists error = %v, want nil", err)
++	}
++	assertBoolSlice(t, exists, []bool{true})
++}
++
++func TestBatchExistsReturnsMissingFalseFromConnectedClient(t *testing.T) {
++
++
++	client := newConnectedClient(t)
++	defer client.Close()
++
++	set := uniqueSet(t)
++	keyA := makeKey(t, set, "A")
++	deleteFixtureRecord(t, client, keyA)
++
++
++	exists, err := client.BatchExists(nil, []*as.Key{keyA})
++	if err != nil {
++		t.Fatalf("BatchExists error = %v, want nil", err)
++	}
++	assertBoolSlice(t, exists, []bool{false})
++}
++
++func TestBatchExistsStateIsIndependentAcrossClientInstances(t *testing.T) {
++
++
++	clientA := newConnectedClient(t)
++	defer clientA.Close()
++	clientB := newConnectedClient(t)
++	defer clientB.Close()
++
++	set := uniqueSet(t)
++	keyA := makeKey(t, set, "A")
++	keyB := makeKey(t, set, "B")
++	deleteFixtureRecord(t, clientA, keyA)
++	deleteFixtureRecord(t, clientA, keyB)
++	writeFixtureRecord(t, clientA, keyA, 10)
++
++	existsA, errA := clientA.BatchExists(nil, []*as.Key{keyA, keyB})
++	if errA != nil {
++		t.Fatalf("clientA.BatchExists error = %v, want nil", errA)
++	}
++	assertBoolSlice(t, existsA, []bool{true, false})
++
++	existsB, errB := clientB.BatchExists(nil, []*as.Key{keyB, keyA})
++	if errB != nil {
++		t.Fatalf("clientB.BatchExists error = %v, want nil", errB)
++	}
++	assertBoolSlice(t, existsB, []bool{false, true})
++}
++
++func TestBatchExistsRepeatedConnectedClientsReturnPositionalResults(t *testing.T) {
++
++
++	control := newConnectedClient(t)
++	set := uniqueSet(t)
++	keyA := makeKey(t, set, "A")
++	keyB := makeKey(t, set, "B")
++	deleteFixtureRecord(t, control, keyA)
++	deleteFixtureRecord(t, control, keyB)
++	writeFixtureRecord(t, control, keyA, 10)
++	control.Close()
++
++
++	for i := 0; i < 20; i++ {
++		client := newConnectedClient(t)
++		exists, err := client.BatchExists(nil, []*as.Key{keyB, keyA})
++		if err != nil {
++			client.Close()
++			t.Fatalf("cycle %d BatchExists error = %v, want nil", i, err)
++		}
++		assertBoolSlice(t, exists, []bool{false, true})
++		client.Close()
++	}
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,89 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++
++cd /workspace/repo
++
++export AEROSPIKE_HOST="${AEROSPIKE_HOST:-127.0.0.1}"
++export AEROSPIKE_PORT="${AEROSPIKE_PORT:-3000}"
++export GOPROXY=off
++export GOSUMDB=off
++export GOTOOLCHAIN=local
++export GOFLAGS="-mod=mod"
++unset AEROSPIKE_CLIENT_CONFIG_URL
++
++if ! (exec 3<>"/dev/tcp/${AEROSPIKE_HOST}/${AEROSPIKE_PORT}") >/dev/null 2>&1; then
++  work=/tmp/aerospike-fixture-coderl
++  root=/opt/aerospike-stage3-coderl/root
++  mkdir -p "${work}/work/smd" "${work}/udf/lua"
++
++  if [ ! -x "${root}/usr/bin/asd" ]; then
++    echo "missing staged Aerospike server at ${root}/usr/bin/asd" >&2
++    exit 1
++  fi
++
++  cat > "${work}/aerospike.conf" <<EOF
++service {
++  proto-fd-max 15000
++  cluster-name fixture-coderl
++  work-directory ${work}/work
++}
++logging {
++  file ${work}/aerospike.log {
++    context any warning
++  }
++}
++network {
++  service {
++    address ${AEROSPIKE_HOST}
++    port ${AEROSPIKE_PORT}
++  }
++  heartbeat {
++    mode mesh
++    address ${AEROSPIKE_HOST}
++    port 3002
++    interval 150
++    timeout 10
++  }
++  fabric {
++    address ${AEROSPIKE_HOST}
++    port 3001
++  }
++  admin {
++    address ${AEROSPIKE_HOST}
++    port 3003
++  }
++}
++namespace test {
++  replication-factor 1
++  storage-engine memory {
++    data-size 512M
++  }
++}
++mod-lua {
++  user-path ${work}/udf/lua
++}
++EOF
++
++  "${root}/usr/bin/asd" --foreground --config-file "${work}/aerospike.conf" &
++  asd_pid=$!
++  trap 'kill "${asd_pid}" >/dev/null 2>&1 || true; wait "${asd_pid}" >/dev/null 2>&1 || true' EXIT
++
++  for _ in $(seq 1 100); do
++    if (exec 3<>"/dev/tcp/${AEROSPIKE_HOST}/${AEROSPIKE_PORT}") >/dev/null 2>&1; then
++      break
++    fi
++    sleep 0.2
++  done
++fi
++
++go test -v -count=1 ./usercase-test-coderl/...

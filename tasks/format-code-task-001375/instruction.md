@@ -1,0 +1,7 @@
+I want `Omnitone.createBufferList(context, bufferData, options?) -> Promise<AudioBuffer[]>` so application code can load a list of audio files or embedded Base64 audio payloads into decoded Web Audio buffers with the original list order preserved.
+
+When I call `Omnitone.createBufferList(audioContext, ['/hrir/wy.wav', '/hrir/zx.wav'])` and both URLs return HTTP 200 audio data that decode to `wyBuffer` and `zxBuffer`, the returned promise should resolve to `[wyBuffer, zxBuffer]`; this order should stay the same even if the second request finishes first. Passing `{dataType: 'url'}` should use the same URL-loading behavior explicitly.
+
+When I call `Omnitone.createBufferList(audioContext, [base64A, base64B], {dataType: 'base64'})` and those strings decode through the supplied audio context to `audioBufferA` and `audioBufferB`, the promise should resolve to `[audioBufferA, audioBufferB]`. The Base64 path should convert each string to an `ArrayBuffer` before calling `decodeAudioData`.
+
+If `context` is not an `AudioContext` or `OfflineAudioContext`, the call should throw an `Error`. If any URL request returns a non-200 status, hits a network error, or any decoded payload fails in `decodeAudioData`, the promise should reject instead of resolving with a partial or unusable array. If `options.verbose` is true, successful per-item loads and the final all-loaded state should be logged through the library logger.

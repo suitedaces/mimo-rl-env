@@ -1,0 +1,381 @@
+diff --git a/container_architecture_cli_test.go b/container_architecture_cli_test.go
+new file mode 100644
+index 0000000..ce1dad8
+--- /dev/null
++++ b/container_architecture_cli_test.go
+@@ -0,0 +1,322 @@
++package main
++
++import (
++	"context"
++	"encoding/json"
++	"fmt"
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"runtime"
++	"strings"
++	"sync"
++	"testing"
++	"time"
++)
++
++func TestHelpIncludesContainerArchitecture(t *testing.T) {
++	output, err := runActForTest(t, nil, "--help")
++	if err != nil {
++		t.Fatalf("act --help failed: %v\n%s", err, output)
++	}
++
++	helpText := strings.ToLower(output)
++	if !strings.Contains(helpText, "--container-architecture") {
++		t.Fatalf("help output does not include --container-architecture:\n%s", output)
++	}
++	if !strings.Contains(helpText, "architecture") && !strings.Contains(helpText, "platform") {
++		t.Fatalf("flag help should describe architecture or platform:\n%s", output)
++	}
++	if !strings.Contains(helpText, "default") {
++		t.Fatalf("flag help should describe the default behavior:\n%s", output)
++	}
++	if !strings.Contains(helpText, "machine") && !strings.Contains(helpText, "host") && !strings.Contains(helpText, "current") {
++		t.Fatalf("flag help should say the default is based on the current machine:\n%s", output)
++	}
++	if !strings.Contains(helpText, "linux/") {
++		t.Fatalf("flag help should show the linux/<arch> platform form:\n%s", output)
++	}
++}
++
++func TestReadmeDocumentsContainerArchitecture(t *testing.T) {
++	data, err := os.ReadFile(filepath.Join(repoRootForTest(t), "README.md"))
++	if err != nil {
++		t.Fatal(err)
++	}
++	readme := strings.ToLower(string(data))
++	idx := strings.Index(readme, "--container-architecture")
++	if idx < 0 {
++		t.Fatalf("README flags list does not include --container-architecture")
++	}
++
++	start := idx - 160
++	if start < 0 {
++		start = 0
++	}
++	end := idx + 320
++	if end > len(readme) {
++		end = len(readme)
++	}
++	window := readme[start:end]
++	if !strings.Contains(window, "container") {
++		t.Fatalf("README flag entry should describe container behavior:\n%s", window)
++	}
++	if !strings.Contains(window, "architecture") && !strings.Contains(window, "platform") {
++		t.Fatalf("README flag entry should describe architecture or platform:\n%s", window)
++	}
++}
++
++func TestCLIContainerArchitectureReachesDockerRuntime(t *testing.T) {
++	output, platforms, err := runWorkflowWithFakeDocker(t, "linux/arm64")
++	if err != nil {
++		t.Fatalf("act run failed: %v\n%s", err, output)
++	}
++	if !containsString(platforms, "linux/arm64") {
++		t.Fatalf("expected CLI platform to reach Docker runtime, got %v\n%s", platforms, output)
++	}
++}
++
++func TestCLIContainerArchitectureAcceptsNonExampleValue(t *testing.T) {
++	output, platforms, err := runWorkflowWithFakeDocker(t, "linux/ppc64le")
++	if err != nil {
++		t.Fatalf("act run failed: %v\n%s", err, output)
++	}
++	if !containsString(platforms, "linux/ppc64le") {
++		t.Fatalf("expected non-example platform to reach Docker runtime, got %v\n%s", platforms, output)
++	}
++	for _, platform := range platforms {
++		if platform == "linux/amd64" {
++			t.Fatalf("platform propagation appears hard-coded to linux/amd64, got %v\n%s", platforms, output)
++		}
++	}
++}
++
++func TestDefaultRunUsesCurrentArchitectureWhenPlatformOmitted(t *testing.T) {
++	output, platforms, err := runWorkflowWithFakeDocker(t, "")
++	if err != nil {
++		t.Fatalf("act run failed: %v\n%s", err, output)
++	}
++
++	hostPlatform := "linux/" + runtime.GOARCH
++	for _, platform := range platforms {
++		if platform != hostPlatform {
++			t.Fatalf("default run should omit platform or use current machine architecture %s, got %v\n%s",
++				hostPlatform, platforms, output)
++		}
++	}
++}
++
++func runWorkflowWithFakeDocker(t *testing.T, containerArchitecture string) (string, []string, error) {
++	t.Helper()
++
++	workdir := t.TempDir()
++	workflow := filepath.Join(workdir, ".github", "workflows", "container-architecture.yml")
++	if err := os.MkdirAll(filepath.Dir(workflow), 0o755); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.WriteFile(workflow, []byte(strings.TrimSpace(`
++name: container architecture
++on: push
++jobs:
++  check:
++    runs-on: ubuntu-latest
++    steps: []
++`)+"\n"), 0o644); err != nil {
++		t.Fatal(err)
++	}
++
++	docker := newFakeDocker(t)
++	defer docker.Close()
++
++	args := []string{
++		"-C", workdir,
++		"-W", workflow,
++		"-j", "check",
++		"--bind",
++		"-P", "ubuntu-latest=alpine:3.18",
++	}
++	if containerArchitecture != "" {
++		args = append([]string{"--container-architecture", containerArchitecture}, args...)
++	}
++
++	env := []string{
++		"DOCKER_HOST=" + docker.host,
++		"DOCKER_API_VERSION=1.41",
++		"DOCKER_TLS_VERIFY=",
++		"DOCKER_CERT_PATH=",
++		"HOME=" + t.TempDir(),
++	}
++	output, err := runActForTest(t, env, args...)
++	return output, docker.Platforms(), err
++}
++
++func runActForTest(t *testing.T, env []string, args ...string) (string, error) {
++	t.Helper()
++
++	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
++	defer cancel()
++
++	cmd := exec.CommandContext(ctx, actBinaryForTest(t), args...)
++	cmd.Dir = repoRootForTest(t)
++	cmd.Env = append(os.Environ(), env...)
++	output, err := cmd.CombinedOutput()
++	if ctx.Err() == context.DeadlineExceeded {
++		return string(output), ctx.Err()
++	}
++	return string(output), err
++}
++
++var (
++	actBinaryOnce sync.Once
++	actBinaryPath string
++	actBinaryOut  []byte
++	actBinaryErr  error
++)
++
++func actBinaryForTest(t *testing.T) string {
++	t.Helper()
++
++	actBinaryOnce.Do(func() {
++		dir, err := os.MkdirTemp("", "act-container-architecture-test-")
++		if err != nil {
++			actBinaryErr = err
++			return
++		}
++		actBinaryPath = filepath.Join(dir, "act")
++		cmd := exec.Command("go", "build", "-o", actBinaryPath, ".")
++		cmd.Dir = repoRootForTest(t)
++		actBinaryOut, actBinaryErr = cmd.CombinedOutput()
++	})
++	if actBinaryErr != nil {
++		t.Fatalf("failed to build act test binary: %v\n%s", actBinaryErr, string(actBinaryOut))
++	}
++	return actBinaryPath
++}
++
++func repoRootForTest(t *testing.T) string {
++	t.Helper()
++
++	wd, err := os.Getwd()
++	if err != nil {
++		t.Fatal(err)
++	}
++	return wd
++}
++
++type fakeDocker struct {
++	server *httptest.Server
++	host   string
++
++	mu        sync.Mutex
++	platforms []string
++}
++
++func newFakeDocker(t *testing.T) *fakeDocker {
++	t.Helper()
++
++	fd := &fakeDocker{}
++	fd.server = httptest.NewServer(http.HandlerFunc(fd.handle))
++	fd.host = "tcp://" + strings.TrimPrefix(fd.server.URL, "http://")
++	return fd
++}
++
++func (fd *fakeDocker) Close() {
++	fd.server.Close()
++}
++
++func (fd *fakeDocker) Platforms() []string {
++	fd.mu.Lock()
++	defer fd.mu.Unlock()
++
++	out := make([]string, 0, len(fd.platforms))
++	out = append(out, fd.platforms...)
++	return out
++}
++
++func (fd *fakeDocker) recordPlatform(value string) {
++	if value == "" {
++		return
++	}
++	fd.mu.Lock()
++	defer fd.mu.Unlock()
++	fd.platforms = append(fd.platforms, value)
++}
++
++func (fd *fakeDocker) handle(w http.ResponseWriter, r *http.Request) {
++	path := stripDockerVersion(r.URL.Path)
++	switch {
++	case r.Method == http.MethodGet && path == "/_ping":
++		writeText(w, http.StatusOK, "OK")
++	case r.Method == http.MethodGet && path == "/version":
++		writeJSON(w, http.StatusOK, map[string]string{
++			"ApiVersion":    "1.41",
++			"MinAPIVersion": "1.24",
++			"Version":       "20.10.0",
++		})
++	case r.Method == http.MethodGet && path == "/info":
++		writeJSON(w, http.StatusOK, map[string]string{
++			"OSType":       "linux",
++			"Architecture": runtime.GOARCH,
++		})
++	case r.Method == http.MethodGet && path == "/containers/json":
++		writeJSON(w, http.StatusOK, []map[string]interface{}{})
++	case r.Method == http.MethodGet && path == "/images/json":
++		writeJSON(w, http.StatusOK, []map[string]interface{}{})
++	case r.Method == http.MethodGet && path == "/volumes":
++		writeJSON(w, http.StatusOK, map[string]interface{}{"Volumes": []map[string]interface{}{}})
++	case r.Method == http.MethodPost && path == "/images/create":
++		fd.recordPlatform(r.URL.Query().Get("platform"))
++		writeText(w, http.StatusOK, "{\"status\":\"pulled\"}\n")
++	case r.Method == http.MethodPost && path == "/containers/create":
++		fd.recordPlatform(r.URL.Query().Get("platform"))
++		writeJSON(w, http.StatusCreated, map[string]interface{}{"Id": "fixture-container", "Warnings": []string{}})
++	case r.Method == http.MethodPost && strings.HasSuffix(path, "/start"):
++		w.WriteHeader(http.StatusNoContent)
++	case r.Method == http.MethodPut && strings.HasSuffix(path, "/archive"):
++		_, _ = io.Copy(io.Discard, r.Body)
++		writeText(w, http.StatusOK, "")
++	case r.Method == http.MethodDelete && strings.HasPrefix(path, "/containers/"):
++		w.WriteHeader(http.StatusNoContent)
++	default:
++		writeJSON(w, http.StatusNotFound, map[string]string{
++			"message": fmt.Sprintf("fake docker endpoint not implemented: %s %s", r.Method, r.URL.String()),
++		})
++	}
++}
++
++func stripDockerVersion(path string) string {
++	parts := strings.SplitN(strings.TrimPrefix(path, "/"), "/", 2)
++	if len(parts) == 2 && strings.HasPrefix(parts[0], "v") && strings.Contains(parts[0], ".") {
++		return "/" + parts[1]
++	}
++	return path
++}
++
++func writeJSON(w http.ResponseWriter, status int, payload interface{}) {
++	data, err := json.Marshal(payload)
++	if err != nil {
++		http.Error(w, err.Error(), http.StatusInternalServerError)
++		return
++	}
++	w.Header().Set("Content-Type", "application/json")
++	w.WriteHeader(status)
++	_, _ = w.Write(data)
++}
++
++func writeText(w http.ResponseWriter, status int, payload string) {
++	w.Header().Set("Content-Type", "text/plain")
++	w.WriteHeader(status)
++	_, _ = io.WriteString(w, payload)
++}
++
++func containsString(values []string, want string) bool {
++	for _, value := range values {
++		if value == want {
++			return true
++		}
++	}
++	return false
++}
+diff --git a/pkg/runner/container_architecture_config_test.go b/pkg/runner/container_architecture_config_test.go
+new file mode 100644
+index 0000000..969f6a2
+--- /dev/null
++++ b/pkg/runner/container_architecture_config_test.go
+@@ -0,0 +1,20 @@
++package runner_test
++
++import (
++	"testing"
++
++	"github.com/nektos/act/pkg/runner"
++)
++
++func TestConfigExposesContainerArchitecture(t *testing.T) {
++	const requested = "linux/arm64"
++
++	cfg := &runner.Config{
++		ContainerArchitecture: requested,
++	}
++
++	if cfg.ContainerArchitecture != requested {
++		t.Fatalf("expected runner.Config to preserve requested container architecture %q, got %q",
++			requested, cfg.ContainerArchitecture)
++	}
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,22 @@
++#!/bin/bash
++set -uo pipefail
++cd /testbed
++
++
++
++
++
++
++case "${1:-}" in
++  base)
++    go test -v -short ./pkg/common -run '^TestCartesianProduct$'
++    ;;
++  new)
++    go test -v . -run '^(TestHelpIncludesContainerArchitecture|TestReadmeDocumentsContainerArchitecture|TestCLIContainerArchitectureReachesDockerRuntime|TestCLIContainerArchitectureAcceptsNonExampleValue|TestDefaultRunUsesCurrentArchitectureWhenPlatformOmitted)$' &&
++      go test -v ./pkg/runner -run '^TestConfigExposesContainerArchitecture$'
++    ;;
++  *)
++    echo "usage: $0 base|new"
++    exit 2
++    ;;
++esac

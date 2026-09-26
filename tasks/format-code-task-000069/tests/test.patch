@@ -1,0 +1,247 @@
+diff --git a/mapper/clusterstate_translation_test.go b/mapper/clusterstate_translation_test.go
+new file mode 100644
+index 0000000..b21b049
+--- /dev/null
++++ b/mapper/clusterstate_translation_test.go
+@@ -0,0 +1,221 @@
++package mapper
++
++import (
++	"sort"
++	"strconv"
++	"strings"
++	"testing"
++
++	"github.com/DataDog/kafka-kit/v4/kafkaadmin"
++)
++
++
++
++
++func buildTopicStates() kafkaadmin.TopicStates {
++	ts := kafkaadmin.NewTopicStates()
++
++	specs := map[string]int{
++		"delta": 3,
++		"alpha": 4,
++		"charlie": 2,
++		"bravo": 3,
++	}
++
++	for name, n := range specs {
++		state := kafkaadmin.NewTopicState(name)
++		for p := 0; p < n; p++ {
++			state.PartitionStates[p] = kafkaadmin.PartitionState{
++				ID:       int32(p),
++				Leader:   int32(1000 + p),
++				Replicas: []int32{int32(1000 + p), int32(2000 + p)},
++				ISR:      []int32{int32(1000 + p), int32(2000 + p)},
++			}
++		}
++		state.Partitions = int32(n)
++		state.ReplicationFactor = 2
++		ts[name] = state
++	}
++
++	return ts
++}
++
++func TestPartitionMapFromTopicStatesOrdering(t *testing.T) {
++	ts := buildTopicStates()
++
++	pm, err := PartitionMapFromTopicStates(ts)
++	if err != nil {
++		t.Fatalf("unexpected error: %v", err)
++	}
++	if pm == nil {
++		t.Fatal("expected a non-nil PartitionMap")
++	}
++
++
++
++	type tp struct {
++		topic string
++		id    int
++	}
++	var expected []tp
++	for name, state := range ts {
++		for _, ps := range state.PartitionStates {
++			expected = append(expected, tp{topic: name, id: int(ps.ID)})
++		}
++	}
++	sort.Slice(expected, func(i, j int) bool {
++		if expected[i].topic != expected[j].topic {
++			return expected[i].topic < expected[j].topic
++		}
++		return expected[i].id < expected[j].id
++	})
++
++	if len(pm.Partitions) != len(expected) {
++		t.Fatalf("expected %d partitions, got %d", len(expected), len(pm.Partitions))
++	}
++
++	for i, p := range pm.Partitions {
++		if p.Topic != expected[i].topic || p.Partition != expected[i].id {
++			t.Fatalf("partition at index %d = (%s, %d), want (%s, %d); full order not sorted by (topic, partition)",
++				i, p.Topic, p.Partition, expected[i].topic, expected[i].id)
++		}
++	}
++}
++
++func TestPartitionMapFromTopicStatesReplicaOrderPreserved(t *testing.T) {
++	ts := kafkaadmin.NewTopicStates()
++	state := kafkaadmin.NewTopicState("topic")
++
++	state.PartitionStates[0] = kafkaadmin.PartitionState{
++		ID:       0,
++		Leader:   1003,
++		Replicas: []int32{1003, 1001, 1002},
++		ISR:      []int32{1003, 1001, 1002},
++	}
++	state.Partitions = 1
++	state.ReplicationFactor = 3
++	ts["topic"] = state
++
++	pm, err := PartitionMapFromTopicStates(ts)
++	if err != nil {
++		t.Fatalf("unexpected error: %v", err)
++	}
++	if len(pm.Partitions) != 1 {
++		t.Fatalf("expected 1 partition, got %d", len(pm.Partitions))
++	}
++
++	got := pm.Partitions[0].Replicas
++	want := []int{1003, 1001, 1002}
++	if len(got) != len(want) {
++		t.Fatalf("expected replicas %v, got %v", want, got)
++	}
++	for i := range want {
++		if got[i] != want[i] {
++			t.Fatalf("expected replicas %v (preferred-leader-first), got %v", want, got)
++		}
++	}
++}
++
++func TestPartitionMapFromTopicStatesEmpty(t *testing.T) {
++	for _, ts := range []kafkaadmin.TopicStates{nil, kafkaadmin.NewTopicStates()} {
++		pm, err := PartitionMapFromTopicStates(ts)
++		if err != nil {
++			t.Fatalf("unexpected error: %v", err)
++		}
++		if pm == nil {
++			t.Fatal("expected a non-nil PartitionMap for empty input")
++		}
++		if len(pm.Partitions) != 0 {
++			t.Fatalf("expected 0 partitions for empty input, got %d", len(pm.Partitions))
++		}
++	}
++}
++
++func TestBrokerMetaMapLoadMetricsComplete(t *testing.T) {
++	bmm := BrokerMetaMap{
++		1001: &BrokerMeta{Rack: "a"},
++		1002: &BrokerMeta{Rack: "b"},
++		1003: &BrokerMeta{Rack: "c"},
++	}
++
++	metrics := BrokerMetricsMap{
++		1001: &BrokerMetrics{StorageFree: 2000.00},
++		1002: &BrokerMetrics{StorageFree: 4000.00},
++		1003: &BrokerMetrics{StorageFree: 6000.00},
++
++		9999: &BrokerMetrics{StorageFree: 1.00},
++	}
++
++	errs := bmm.LoadMetrics(metrics)
++	if errs != nil {
++		t.Fatalf("expected no errors, got %v", errs)
++	}
++
++	expected := map[int]float64{1001: 2000.00, 1002: 4000.00, 1003: 6000.00}
++	for id, want := range expected {
++		if bmm[id].StorageFree != want {
++			t.Errorf("broker %d StorageFree = %v, want %v", id, bmm[id].StorageFree, want)
++		}
++		if bmm[id].MetricsIncomplete {
++			t.Errorf("broker %d should not be marked MetricsIncomplete", id)
++		}
++	}
++
++
++	if _, exists := bmm[9999]; exists {
++		t.Error("broker 9999 (metrics-only) should not have been added to the metadata map")
++	}
++}
++
++func TestBrokerMetaMapLoadMetricsMissing(t *testing.T) {
++	bmm := BrokerMetaMap{
++		1004: &BrokerMeta{Rack: "a"},
++		1001: &BrokerMeta{Rack: "b"},
++		1003: &BrokerMeta{Rack: "c"},
++		1002: &BrokerMeta{Rack: "d"},
++	}
++
++
++	metrics := BrokerMetricsMap{
++		1001: &BrokerMetrics{StorageFree: 2000.00},
++		1003: &BrokerMetrics{StorageFree: 6000.00},
++	}
++
++	errs := bmm.LoadMetrics(metrics)
++
++
++	if bmm[1001].StorageFree != 2000.00 || bmm[1001].MetricsIncomplete {
++		t.Errorf("broker 1001 unexpected state: StorageFree=%v Incomplete=%v", bmm[1001].StorageFree, bmm[1001].MetricsIncomplete)
++	}
++	if bmm[1003].StorageFree != 6000.00 || bmm[1003].MetricsIncomplete {
++		t.Errorf("broker 1003 unexpected state: StorageFree=%v Incomplete=%v", bmm[1003].StorageFree, bmm[1003].MetricsIncomplete)
++	}
++
++
++	for _, id := range []int{1002, 1004} {
++		if !bmm[id].MetricsIncomplete {
++			t.Errorf("broker %d should be marked MetricsIncomplete", id)
++		}
++		if bmm[id].StorageFree != 0 {
++			t.Errorf("broker %d StorageFree should be untouched (0), got %v", id, bmm[id].StorageFree)
++		}
++	}
++
++
++	wantMissing := []int{1002, 1004}
++	if len(errs) != len(wantMissing) {
++		t.Fatalf("expected %d errors, got %d (%v)", len(wantMissing), len(errs), errs)
++	}
++	for i, id := range wantMissing {
++		if !strings.Contains(errs[i].Error(), strconv.Itoa(id)) {
++			t.Errorf("error at index %d = %q, expected it to reference broker %d (errors must be ordered ascending by broker ID)", i, errs[i].Error(), id)
++		}
++	}
++}
++
++func TestBrokerMetaMapLoadMetricsEmptyMap(t *testing.T) {
++	bmm := BrokerMetaMap{}
++	if errs := bmm.LoadMetrics(BrokerMetricsMap{1001: &BrokerMetrics{StorageFree: 1.0}}); errs != nil {
++		t.Fatalf("expected no errors for an empty metadata map, got %v", errs)
++	}
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,15 @@
++#!/usr/bin/env bash
++
++
++
++set -euo pipefail
++HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++cd /testbed
++
++
++
++
++go test ./mapper/
++
++
++go test ./mapper/ -run 'TestPartitionMapFromTopicStates|TestBrokerMetaMapLoadMetrics' -v

@@ -1,0 +1,206 @@
+diff --git a/libcentrifugo/engineredis_concurrency_test.go b/libcentrifugo/engineredis_concurrency_test.go
+new file mode 100644
+index 00000000..68ba90e2
+--- /dev/null
++++ b/libcentrifugo/engineredis_concurrency_test.go
+@@ -0,0 +1,161 @@
++package libcentrifugo
++
++import (
++	"fmt"
++	"sync"
++	"testing"
++
++	"github.com/centrifugal/centrifugo/Godeps/_workspace/src/github.com/stretchr/testify/assert"
++)
++
++
++func startConcurrencyEngine(t *testing.T) *RedisEngine {
++	app := testApp()
++	e := testRedisEngine(app)
++	assert.Equal(t, nil, e.run())
++	app.SetEngine(e)
++	return e
++}
++
++
++
++
++func TestRedisEngineConcurrentSubscribe(t *testing.T) {
++	c := dial()
++	defer c.close()
++	e := startConcurrencyEngine(t)
++
++	const n = 100
++	chans := make([]ChannelID, n)
++	for i := 0; i < n; i++ {
++		chans[i] = ChannelID(fmt.Sprintf("concurrent-sub-%d", i))
++	}
++
++	subErrs := make([]error, n)
++	var wg sync.WaitGroup
++	for i := 0; i < n; i++ {
++		wg.Add(1)
++		go func(i int) {
++			defer wg.Done()
++			subErrs[i] = e.subscribe(chans[i])
++		}(i)
++	}
++	wg.Wait()
++
++	for i := 0; i < n; i++ {
++		assert.Nil(t, subErrs[i], "subscribe should not error")
++	}
++
++
++	for i := 0; i < n; i++ {
++		hasSubscribers, err := e.publish(chans[i], []byte("{}"))
++		assert.Equal(t, nil, err)
++		assert.True(t, hasSubscribers, "channel must have active subscriber after subscribe")
++	}
++
++
++	unsubErrs := make([]error, n)
++	for i := 0; i < n; i++ {
++		wg.Add(1)
++		go func(i int) {
++			defer wg.Done()
++			unsubErrs[i] = e.unsubscribe(chans[i])
++		}(i)
++	}
++	wg.Wait()
++
++	for i := 0; i < n; i++ {
++		assert.Nil(t, unsubErrs[i], "unsubscribe should not error")
++	}
++
++	for i := 0; i < n; i++ {
++		hasSubscribers, err := e.publish(chans[i], []byte("{}"))
++		assert.Equal(t, nil, err)
++		assert.False(t, hasSubscribers, "channel must have no subscribers after unsubscribe")
++	}
++}
++
++
++
++
++func TestRedisEngineConcurrentMixed(t *testing.T) {
++	c := dial()
++	defer c.close()
++	e := startConcurrencyEngine(t)
++
++	const n = 60
++	chans := make([]ChannelID, n)
++	for i := 0; i < n; i++ {
++		chans[i] = ChannelID(fmt.Sprintf("concurrent-mixed-%d", i))
++	}
++
++	var wg sync.WaitGroup
++	errs := make([]error, n)
++	for i := 0; i < n; i++ {
++		wg.Add(1)
++
++		go func(i int) {
++			defer wg.Done()
++			if err := e.subscribe(chans[i]); err != nil {
++				errs[i] = err
++				return
++			}
++			if i%2 == 1 {
++				errs[i] = e.unsubscribe(chans[i])
++			}
++		}(i)
++	}
++	wg.Wait()
++
++	for i := 0; i < n; i++ {
++		assert.Nil(t, errs[i])
++	}
++
++	for i := 0; i < n; i++ {
++		hasSubscribers, err := e.publish(chans[i], []byte("{}"))
++		assert.Equal(t, nil, err)
++		if i%2 == 0 {
++			assert.True(t, hasSubscribers, "even channels remain subscribed")
++		} else {
++			assert.False(t, hasSubscribers, "odd channels were unsubscribed")
++		}
++	}
++}
++
++
++
++
++func TestRedisEngineConcurrentSameChannel(t *testing.T) {
++	c := dial()
++	defer c.close()
++	e := startConcurrencyEngine(t)
++
++	chID := ChannelID("concurrent-same-channel")
++
++	const n = 50
++	errs := make([]error, n)
++	var wg sync.WaitGroup
++	for i := 0; i < n; i++ {
++		wg.Add(1)
++		go func(i int) {
++			defer wg.Done()
++			errs[i] = e.subscribe(chID)
++		}(i)
++	}
++	wg.Wait()
++
++	for i := 0; i < n; i++ {
++		assert.Nil(t, errs[i])
++	}
++
++	hasSubscribers, err := e.publish(chID, []byte("{}"))
++	assert.Equal(t, nil, err)
++	assert.True(t, hasSubscribers)
++
++
++	assert.Nil(t, e.unsubscribe(chID))
++
++	hasSubscribers, err = e.publish(chID, []byte("{}"))
++	assert.Equal(t, nil, err)
++	assert.False(t, hasSubscribers)
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,34 @@
++#!/usr/bin/env bash
++
++
++
++set -euo pipefail
++HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++cd /testbed
++
++
++
++
++
++export GO111MODULE=off
++PKG_DIR="/root/go/src/github.com/centrifugal/centrifugo/libcentrifugo"
++
++
++if ! redis-cli ping >/dev/null 2>&1; then
++    redis-server --daemonize yes --save "" --appendonly no >/tmp/redis-grading.log 2>&1
++    for _ in $(seq 1 30); do
++        redis-cli ping >/dev/null 2>&1 && break
++        sleep 0.2
++    done
++fi
++redis-cli -n 9 flushdb >/dev/null 2>&1 || true
++
++cd "$PKG_DIR"
++
++
++go test -run 'TestRedisEngine$' -count=1 -v
++
++redis-cli -n 9 flushdb >/dev/null 2>&1 || true
++
++
++go test -run 'TestRedisEngineConcurrent' -count=1 -v

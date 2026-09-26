@@ -1,0 +1,197 @@
+diff --git a/tests/conftest.py b/tests/conftest.py
+index 139b374..83e3f29 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -9,10 +9,12 @@
+     :license: MIT, see LICENSE for more details.
+ """
+ 
++import json
+ import os
+ import tempfile
+ import time
+ from datetime import datetime
++from functools import wraps
+ 
+ try:
+     from urlparse import urlsplit
+@@ -20,7 +22,7 @@ except ImportError:  # pragma: no cover
+     from urllib.parse import urlsplit
+ 
+ import pytest
+-from flask import Flask, render_template
++from flask import Flask, current_app, render_template
+ from flask import jsonify
+ from flask import request as flask_request
+ from flask.json import JSONEncoder
+@@ -117,6 +119,34 @@ def app(request):
+     def http():
+         return "HTTP Authentication"
+ 
++    def extension_like_json_wrapper(fn):
++        @wraps(fn)
++        def decorated(*args, **kwargs):
++            rv = fn(*args, **kwargs)
++            if isinstance(rv, current_app.response_class):
++                return rv
++            try:
++                payload = json.dumps(rv)
++            except TypeError as e:
++                return current_app.response_class(
++                    str(e), status=500, mimetype="text/plain"
++                )
++            return current_app.response_class(payload, mimetype="application/json")
++
++        return decorated
++
++    @app.route("/http_wrapped")
++    @extension_like_json_wrapper
++    @http_auth_required
++    def http_wrapped():
++        return {"ok": True}
++
++    @app.route("/http_admin_required")
++    @http_auth_required
++    @permissions_required("admin")
++    def http_admin_required():
++        return "HTTP Authentication"
++
+     @app.route("/http_custom_realm")
+     @http_auth_required("My Realm")
+     def http_custom_realm():
+diff --git a/tests/test_json_auth_errors.py b/tests/test_json_auth_errors.py
+new file mode 100644
+index 0000000..ca90305
+--- /dev/null
++++ b/tests/test_json_auth_errors.py
+@@ -0,0 +1,88 @@
++import base64
++
++import pytest
++
++
++DEFAULT_UNAUTHENTICATED_MESSAGE = (
++    "You are not authenticated. Please supply the correct credentials."
++)
++DEFAULT_UNAUTHORIZED_MESSAGE = "You do not have permission to view this resource."
++CUSTOM_UNAUTHENTICATED_MESSAGE = "sentinel-auth-message"
++
++
++def _response_json(response):
++    data = response.get_json(silent=True)
++    if data is None and hasattr(response, "jdata"):
++        data = response.jdata
++    return data
++
++
++def _response_payload(response):
++    data = _response_json(response)
++    assert isinstance(data, dict)
++    assert isinstance(data.get("response"), dict)
++    return data["response"]
++
++
++def _assert_json_error_message(response, message):
++    payload = _response_payload(response)
++    assert payload.get("error") == message
++
++
++def _basic_auth(value):
++    return "Basic %s" % base64.b64encode(value).decode("utf-8")
++
++
++@pytest.mark.settings(backwards_compat_unauthn=False)
++def test_extension_wrapped_unauthenticated_json_request_returns_401(client):
++    response = client.get("/http_wrapped", headers={"Accept": "application/json"})
++    assert response.status_code == 401
++    assert response.is_json
++    assert isinstance(_response_json(response), dict)
++
++
++@pytest.mark.settings(backwards_compat_unauthn=False)
++def test_unauthenticated_json_request_includes_default_message(client):
++    response = client.get("/http", headers={"Accept": "application/json"})
++    assert response.status_code == 401
++    assert response.is_json
++    _assert_json_error_message(response, DEFAULT_UNAUTHENTICATED_MESSAGE)
++
++
++@pytest.mark.settings(backwards_compat_unauthn=False)
++def test_invalid_basic_credentials_json_uses_unauthenticated_message(client):
++    response = client.get(
++        "/http",
++        headers={
++            "Accept": "application/json",
++            "Authorization": _basic_auth(b"bogus:bogus"),
++        },
++    )
++    assert response.status_code == 401
++    assert response.is_json
++    _assert_json_error_message(response, DEFAULT_UNAUTHENTICATED_MESSAGE)
++
++
++def test_unauthorized_json_request_includes_message(client):
++    response = client.get(
++        "/http_admin_required",
++        headers={
++            "Accept": "application/json",
++            "Authorization": _basic_auth(b"joe@lp.com:password"),
++        },
++    )
++    assert response.status_code == 403
++    assert response.is_json
++    _assert_json_error_message(response, DEFAULT_UNAUTHORIZED_MESSAGE)
++
++
++@pytest.mark.settings(
++    backwards_compat_unauthn=False,
++    msg_unauthenticated=(CUSTOM_UNAUTHENTICATED_MESSAGE, "error"),
++)
++def test_unauthenticated_json_request_uses_configured_message(client):
++    response = client.get("/http", headers={"Accept": "application/json"})
++    assert response.status_code == 401
++    assert response.is_json
++    _assert_json_error_message(response, CUSTOM_UNAUTHENTICATED_MESSAGE)
++    assert _response_payload(response)["error"] != DEFAULT_UNAUTHENTICATED_MESSAGE
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,37 @@
++#!/bin/bash
++set -uo pipefail
++cd /testbed
++
++if [ ! -x /testbed/.venv/bin/python3 ] || ! /testbed/.venv/bin/python3 -c "import pytest, flask_security" >/dev/null 2>&1; then
++    python3 -m venv /testbed/.venv
++    /testbed/.venv/bin/pip install "setuptools<81"
++    /testbed/.venv/bin/pip install \
++        "Flask>=1.0.2,<2.0" "WTForms==2.2.1" \
++        "SQLAlchemy>=1.2.6,<1.4" "Flask-SQLAlchemy>=2.3,<3.0" \
++        "sqlalchemy-utils<0.38" \
++        "Werkzeug==1.0.1" "Jinja2==2.11.3" "MarkupSafe==2.0.1" \
++        "itsdangerous==1.1.0" "Flask-WTF==0.15.1" \
++        "Flask-BabelEx==0.9.4" "Flask-Mail==0.9.1" \
++        "Flask-Login==0.4.1" "Flask-Principal==0.4.0" \
++        "passlib==1.7.4" pytest email-validator pytz mock
++    /testbed/.venv/bin/pip install -e /testbed
++fi
++
++PYTEST_BIN=/testbed/.venv/bin/python3
++PYTEST_COMMON_ARGS=(-m pytest -o "addopts=" -v)
++PYTEST_SKIP_EXPR="not test_xlation and not test_form_labels and not test_per_request_xlate and not test_recoverable_json"
++
++case "${1:-}" in
++  base)
++    "$PYTEST_BIN" "${PYTEST_COMMON_ARGS[@]}" \
++      tests/test_common.py tests/test_misc.py tests/test_recoverable.py \
++      -k "$PYTEST_SKIP_EXPR"
++    ;;
++  new)
++    "$PYTEST_BIN" "${PYTEST_COMMON_ARGS[@]}" tests/test_json_auth_errors.py
++    ;;
++  *)
++    echo "usage: $0 base|new"
++    exit 2
++    ;;
++esac

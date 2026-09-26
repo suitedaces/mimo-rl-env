@@ -1,0 +1,356 @@
+diff --git a/usercase-test-coderl/test_scheduler_dryrun_cache_miss.py b/usercase-test-coderl/test_scheduler_dryrun_cache_miss.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/test_scheduler_dryrun_cache_miss.py
+@@ -0,0 +1,322 @@
++
++
++from __future__ import annotations
++
++import re
++from pathlib import Path
++from unittest.mock import patch
++
++import pytest
++
++from redun import Scheduler, task
++from redun.config import Config
++from redun.scheduler import DryRunResult
++
++
++redun_namespace = "usercase.fixture.dryrun"
++
++
++class RecordingLogger:
++    def __init__(self) -> None:
++        self.messages: list[str] = []
++
++    def log(self, level: int, message: str) -> None:
++        self.messages.append(message)
++
++    def warning(self, message: str) -> None:
++        self.messages.append(message)
++
++
++def make_scheduler(db_dir: Path, logger: RecordingLogger | None = None) -> Scheduler:
++    db_dir.mkdir(parents=True, exist_ok=True)
++    scheduler = Scheduler(
++        config=Config(
++            {
++                "scheduler": {"ignore_warnings": "namespace"},
++                "backend": {
++                    "db_uri": f"sqlite:///{db_dir}/redun.db",
++                    "automigrate": "True",
++                },
++            }
++        ),
++        logger=logger,
++    )
++    scheduler.load()
++    return scheduler
++
++
++def miss_messages(logger: RecordingLogger) -> list[str]:
++    return [message for message in logger.messages if message.startswith("Miss")]
++
++
++def normalize_job_id(message: str) -> str:
++    return re.sub(r"Job [0-9a-f]{8}:", "Job <job>:", message)
++
++
++
++
++def assert_spec_miss(
++    logger: RecordingLogger,
++    task_name: str,
++    required_phrases: list[str],
++    *,
++    any_required_phrase: list[str] | None = None,
++    min_hashes: int = 2,
++    requires_hash_change: bool = False,
++) -> None:
++    candidates = [normalize_job_id(message) for message in miss_messages(logger) if task_name in message]
++    assert candidates, f"No Miss line named task {task_name!r}: {logger.messages!r}"
++
++    message = candidates[-1]
++    lower_message = message.lower()
++    assert message.startswith("Miss")
++    for phrase in required_phrases:
++        assert phrase.lower() in lower_message
++    if any_required_phrase:
++        assert any(phrase.lower() in lower_message for phrase in any_required_phrase)
++
++    assert "task" in lower_message
++    assert "args" in lower_message
++    assert "hash" in lower_message
++    hash_tokens = re.findall(r"\b[0-9a-f]{6,40}\b", message)
++    assert len(hash_tokens) >= min_hashes
++    if requires_hash_change:
++        assert re.search(
++            r"\b[0-9a-f]{6,40}\b.{0,80}(?:-->|->|=>|\bto\b|\bfrom\b).{0,80}\b[0-9a-f]{6,40}\b",
++            lower_message,
++        )
++
++
++@task(version="1")
++def fixture_args_value(x: int) -> int:
++    return x + 1
++
++
++@task(version="1")
++def fixture_unknown_reason_value(x: int) -> int:
++    return x * 5
++
++
++@task(version="1")
++def fixture_unrecognized_reason_value(x: int) -> int:
++    return x * 7
++
++
++@task(version="1")
++def fixture_independent_value(x: int) -> int:
++    return x * 3
++
++
++@task(version="1")
++def fixture_leak_floor_value(x: int) -> int:
++    return x + 100
++
++
++def test_dryrun_logs_existing_task_called_with_new_arguments(tmp_path: Path) -> None:
++
++
++
++
++    logger = RecordingLogger()
++    scheduler = make_scheduler(tmp_path, logger)
++
++    assert scheduler.run(fixture_args_value(10)) == 11
++
++    with pytest.raises(DryRunResult):
++        scheduler.run(fixture_args_value(11), dryrun=True)
++
++
++
++    assert_spec_miss(
++        logger,
++        "fixture_args_value",
++        ["called with new arguments"],
++        min_hashes=3,
++        requires_hash_change=True,
++    )
++
++
++def test_dryrun_logs_new_task_with_previous_arguments(tmp_path: Path) -> None:
++
++
++
++
++    logger = RecordingLogger()
++    scheduler = make_scheduler(tmp_path, logger)
++
++    @task(version="1")
++    def fixture_version_only_value(x: int) -> int:
++        return x + 1
++
++    assert scheduler.run(fixture_version_only_value(10)) == 11
++
++    @task(version="2")
++    def fixture_version_only_value(x: int) -> int:
++        return x + 2
++
++    with pytest.raises(DryRunResult):
++        scheduler.run(fixture_version_only_value(10), dryrun=True)
++
++
++
++    assert_spec_miss(
++        logger,
++        "fixture_version_only_value",
++        ["new task"],
++        any_required_phrase=["previous arguments", "reused arguments", "arguments are reused"],
++        min_hashes=3,
++        requires_hash_change=True,
++    )
++
++
++def test_dryrun_logs_new_task_called_with_new_arguments(tmp_path: Path) -> None:
++
++
++
++
++    logger = RecordingLogger()
++    scheduler = make_scheduler(tmp_path, logger)
++
++    @task(version="1")
++    def fixture_version_and_args_value(x: int) -> int:
++        return x + 1
++
++    assert scheduler.run(fixture_version_and_args_value(10)) == 11
++
++    @task(version="2")
++    def fixture_version_and_args_value(x: int) -> int:
++        return x + 2
++
++    with pytest.raises(DryRunResult):
++        scheduler.run(fixture_version_and_args_value(11), dryrun=True)
++
++
++
++    assert_spec_miss(
++        logger,
++        "fixture_version_and_args_value",
++        ["new task", "called with new arguments"],
++        min_hashes=2,
++    )
++
++
++def test_dryrun_logs_when_cache_miss_reason_is_unknown(tmp_path: Path) -> None:
++
++
++
++
++    logger = RecordingLogger()
++    scheduler = make_scheduler(tmp_path, logger)
++
++    with patch.object(scheduler.backend, "explain_cache_miss", return_value=None):
++        with pytest.raises(DryRunResult):
++            scheduler.run(fixture_unknown_reason_value(3), dryrun=True)
++
++
++
++    assert_spec_miss(
++        logger,
++        "fixture_unknown_reason_value",
++        ["cannot determine", "cache miss"],
++        min_hashes=2,
++    )
++
++
++def test_dryrun_fails_for_unrecognized_cache_miss_reason(tmp_path: Path) -> None:
++
++
++
++
++    logger = RecordingLogger()
++    scheduler = make_scheduler(tmp_path, logger)
++
++    with patch.object(scheduler.backend, "explain_cache_miss", return_value={"reason": "future"}):
++        with pytest.raises(NotImplementedError) as error:
++            scheduler.run(fixture_unrecognized_reason_value(4), dryrun=True)
++
++
++    assert error.type is NotImplementedError
++    assert miss_messages(logger) == []
++
++
++def test_scheduler_clear_is_idempotent_after_dryrun(tmp_path: Path) -> None:
++
++
++
++
++    logger = RecordingLogger()
++    scheduler = make_scheduler(tmp_path, logger)
++
++    assert scheduler.run(fixture_args_value(10)) == 11
++    with pytest.raises(DryRunResult):
++        scheduler.run(fixture_args_value(11), dryrun=True)
++
++
++
++    assert_spec_miss(
++        logger,
++        "fixture_args_value",
++        ["called with new arguments"],
++        min_hashes=3,
++        requires_hash_change=True,
++    )
++
++
++def test_two_schedulers_keep_cache_miss_state_independent(tmp_path: Path) -> None:
++
++
++
++
++    logger_a = RecordingLogger()
++    logger_b = RecordingLogger()
++    scheduler_a = make_scheduler(tmp_path / "a", logger_a)
++    scheduler_b = make_scheduler(tmp_path / "b", logger_b)
++
++    assert scheduler_a.run(fixture_independent_value(4)) == 12
++
++    with pytest.raises(DryRunResult):
++        scheduler_a.run(fixture_independent_value(5), dryrun=True)
++
++    with pytest.raises(DryRunResult):
++        scheduler_b.run(fixture_independent_value(4), dryrun=True)
++
++
++
++    assert_spec_miss(
++        logger_a,
++        "fixture_independent_value",
++        ["called with new arguments"],
++        min_hashes=3,
++        requires_hash_change=True,
++    )
++
++
++    assert_spec_miss(
++        logger_b,
++        "fixture_independent_value",
++        ["new task", "called with new arguments"],
++        min_hashes=2,
++    )
++
++
++def test_repeated_scheduler_dryrun_cycles_have_bounded_python_state(tmp_path: Path) -> None:
++
++
++
++
++    logger = RecordingLogger()
++    scheduler = make_scheduler(tmp_path, logger)
++    for index in range(3):
++        assert scheduler.run(fixture_leak_floor_value(index)) == index + 100
++        with pytest.raises(DryRunResult):
++            scheduler.run(fixture_leak_floor_value(index + 1000), dryrun=True)
++
++
++        assert_spec_miss(
++            logger,
++            "fixture_leak_floor_value",
++            ["called with new arguments"],
++            min_hashes=3,
++            requires_hash_change=True,
++        )
++        logger.messages.clear()
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,24 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++cd /workspace/repo
++
++PYTHON=/workspace/repo/.venv/bin/python
++
++if [[ ! -x "$PYTHON" ]]; then
++  echo "Required offline Python environment is missing: $PYTHON" >&2
++  exit 127
++fi
++
++export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
++
++exec "$PYTHON" -m pytest /workspace/repo/usercase-test-coderl/test_scheduler_dryrun_cache_miss.py -v

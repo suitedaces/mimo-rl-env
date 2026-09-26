@@ -1,0 +1,188 @@
+diff --git a/test/builder/clause/with.codespec.test.js b/test/builder/clause/with.codespec.test.js
+new file mode 100644
+index 0000000..85c182a
+--- /dev/null
++++ b/test/builder/clause/with.codespec.test.js
+@@ -0,0 +1,172 @@
++const sqorn = require('../../../packages/sqorn-pg')
++
++describe('common table expressions', () => {
++  const sq = sqorn()
++
++  test('a builder-valued tagged-template CTE precedes a select', () => {
++    const active = sq.from`account`.where`status = ${'active'}`.return`id`
++    const query = sq.with`recent_account as (${active})`.from`recent_account`.return`id`
++
++    expect(query.query).toEqual({
++      text:
++        'with recent_account as (select id from account where (status = $1)) select id from recent_account',
++      args: ['active']
++    })
++  })
++
++  test('direct CTE template values are parameterized', () => {
++    const query = sq.with`chosen(label) as (values (${"Ada"}))`.from`chosen`
++
++    expect(query.query).toEqual({
++      text: 'with chosen(label) as (values ($1)) select * from chosen',
++      args: ['Ada']
++    })
++  })
++
++  test('dollar-prefixed CTE template values stay raw', () => {
++    const query = sq.with`$${'chosen'} as (select 1)`.from`chosen`
++
++    expect(query.query).toEqual({
++      text: 'with chosen as (select 1) select * from chosen',
++      args: []
++    })
++  })
++
++  test('CTE parameters precede main-query parameters regardless of call order', () => {
++    const query = sq
++      .from`recent_account`
++      .where`id > ${40}`
++      .with`recent_account as (select id from account where status = ${'active'})`
++
++    expect(query.query).toEqual({
++      text:
++        'with recent_account as (select id from account where status = $1) select * from recent_account where (id > $2)',
++      args: ['active', 40]
++    })
++  })
++
++  test('multiple definitions retain call order under one WITH keyword', () => {
++    const query = sq
++      .with`first_value as (select ${1} as n)`
++      .with`second_value as (select ${2} as n)`
++      .from`first_value, second_value`
++
++    expect(query.query).toEqual({
++      text:
++        'with first_value as (select $1 as n), second_value as (select $2 as n) select * from first_value, second_value',
++      args: [1, 2]
++    })
++  })
++
++  test('recursive before WITH marks the clause exactly once', () => {
++    const body = sq.l`select ${1} as n union all select n + ${1} from nums where n < ${3}`
++    const query = sq.recursive.with`nums(n) as (${body})`.from`nums`
++
++    expect(query.query).toEqual({
++      text:
++        'with recursive nums(n) as (select $1 as n union all select n + $2 from nums where n < $3) select * from nums',
++      args: [1, 1, 3]
++    })
++  })
++
++  test('recursive after WITH produces the same clause placement', () => {
++    const query = sq.with`nums(n) as (select ${1})`.from`nums`.recursive
++
++    expect(query.query).toEqual({
++      text: 'with recursive nums(n) as (select $1) select * from nums',
++      args: [1]
++    })
++  })
++
++  test('recursive without a CTE emits no stray SQL', () => {
++    expect(sq.recursive.from`book`.query).toEqual({
++      text: 'select * from book',
++      args: []
++    })
++  })
++
++  test('adding a recursive CTE does not mutate its sibling builder', () => {
++    const base = sq.from`book`
++    const recursiveBranch = base.recursive.with`picked as (select ${7} as id)`.from`picked`
++
++    expect(base.query).toEqual({ text: 'select * from book', args: [] })
++    expect(recursiveBranch.query).toEqual({
++      text: 'with recursive picked as (select $1 as id) select * from book, picked',
++      args: [7]
++    })
++  })
++
++  test('nested CTE builders preserve nesting and global SQL-order parameters', () => {
++    const inner = sq.with`seed as (select ${10} as n)`.from`seed`.where`n < ${20}`
++    const query = sq
++      .from`outer_rows`
++      .where`n <> ${15}`
++      .with`outer_rows as (${inner})`
++
++    expect(query.query).toEqual({
++      text:
++        'with outer_rows as (with seed as (select $1 as n) select * from seed where (n < $2)) select * from outer_rows where (n <> $3)',
++      args: [10, 20, 15]
++    })
++  })
++
++  test('WITH composes through extend', () => {
++    const definition = sq.with`eligible as (select id from person where age >= ${18})`
++    const source = sq.from`eligible`.where`id < ${100}`
++    const query = sq.extend(definition, source).return`id`
++
++    expect(query.query).toEqual({
++      text:
++        'with eligible as (select id from person where age >= $1) select id from eligible where (id < $2)',
++      args: [18, 100]
++    })
++  })
++
++  test('extend leaves its source builders unchanged', () => {
++    const definition = sq.with`eligible as (select id from person where age >= ${18})`
++    const source = sq.from`eligible`.where`id < ${100}`
++    sq.extend(definition, source).return`id`.query
++
++    expect(definition.query).toEqual({
++      text: 'with eligible as (select id from person where age >= $1) select *',
++      args: [18]
++    })
++    expect(source.query).toEqual({
++      text: 'select * from eligible where (id < $1)',
++      args: [100]
++    })
++  })
++
++  test('WITH is available to delete query builders', () => {
++    const doomed = sq.from`person`.where`disabled = ${true}`.return`id`
++    expect(
++      sq.with`doomed as (${doomed})`.delete.from`session`.where`person_id in (select id from doomed)`.return`id`.query
++    ).toEqual({
++      text:
++        'with doomed as (select id from person where (disabled = $1)) delete from session where (person_id in (select id from doomed)) returning id',
++      args: [true]
++    })
++  })
++
++  test('WITH is available to insert query builders', () => {
++    const incoming = sq.l`select ${7} as id`
++    expect(
++      sq.with`incoming as (${incoming})`.from`archive`.insert({ id: 9, state: 'new' }).query
++    ).toEqual({
++      text:
++        'with incoming as (select $1 as id) insert into archive (id, state) values ($2, $3)',
++      args: [7, 9, 'new']
++    })
++  })
++
++  test('WITH is available to update query builders', () => {
++    const threshold = sq.l`select ${5} as n`
++    expect(
++      sq.with`threshold as (${threshold})`.from`job`.set`priority = priority + ${1}`.where`priority < (select n from threshold)`.query
++    ).toEqual({
++      text:
++        'with threshold as (select $1 as n) update job set priority = priority + $2 where (priority < (select n from threshold))',
++      args: [5, 1]
++    })
++  })
++})
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,5 @@
++#!/bin/bash
++set -euo pipefail
++
++
++./node_modules/.bin/jest --runInBand test/builder/clause/with.codespec.test.js

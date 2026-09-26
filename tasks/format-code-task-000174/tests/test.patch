@@ -1,0 +1,312 @@
+diff --git a/jsonrpc/server_test.go b/jsonrpc/server_test.go
+index 1b612b87e..35407139f 100644
+--- a/jsonrpc/server_test.go
++++ b/jsonrpc/server_test.go
+@@ -505,3 +505,27 @@ func BenchmarkHandle(b *testing.B) {
+ 		require.NoError(b, err)
+ 	}
+ }
++
++func TestConnFromContextAbsentForNonWebsocketHandle(t *testing.T) {
++	server := jsonrpc.NewServer(1, utils.NewNopZapLogger())
++	require.NoError(t, server.RegisterMethods(jsonrpc.Method{
++		Name: "test_no_conn",
++		Handler: func(ctx context.Context) (int, *jsonrpc.Error) {
++			w, ok := jsonrpc.ConnFromContext(ctx)
++			require.False(t, ok)
++			require.Nil(t, w)
++			return 7, nil
++		},
++	}))
++
++	res, err := server.Handle(context.Background(), []byte(`{"jsonrpc":"2.0","id":1,"method":"test_no_conn"}`))
++	require.NoError(t, err)
++
++	var got struct {
++		Result int `json:"result"`
++		ID     int `json:"id"`
++	}
++	require.NoError(t, json.Unmarshal(res, &got))
++	require.Equal(t, 7, got.Result)
++	require.Equal(t, 1, got.ID)
++}
+diff --git a/jsonrpc/websocket_test.go b/jsonrpc/websocket_test.go
+index c51a3961f..f18da8538 100644
+--- a/jsonrpc/websocket_test.go
++++ b/jsonrpc/websocket_test.go
+@@ -2,9 +2,12 @@ package jsonrpc_test
+ 
+ import (
+ 	"context"
++	"encoding/json"
++	"fmt"
+ 	"net/http"
+ 	"net/http/httptest"
+ 	"testing"
++	"time"
+ 
+ 	"github.com/NethermindEth/juno/jsonrpc"
+ 	"github.com/NethermindEth/juno/utils"
+@@ -13,16 +16,14 @@ import (
+ 	"nhooyr.io/websocket"
+ )
+ 
+-// The caller is responsible for closing the connection.
+-func testConnection(t *testing.T, ctx context.Context, listener jsonrpc.EventListener) *websocket.Conn {
+-	method := jsonrpc.Method{
+-		Name:   "test_echo",
+-		Params: []jsonrpc.Parameter{{Name: "msg"}},
+-		Handler: func(msg string) (string, *jsonrpc.Error) {
+-			return msg, nil
+-		},
+-	}
++type handlerWriteObservation struct {
++	ok  bool
++	n   int
++	err error
++}
+ 
++
++func testConnection(t *testing.T, ctx context.Context, method jsonrpc.Method, listener jsonrpc.EventListener) *websocket.Conn {
+ 	rpc := jsonrpc.NewServer(1, utils.NewNopZapLogger()).WithListener(listener)
+ 	require.NoError(t, rpc.RegisterMethods(method))
+ 
+@@ -41,8 +42,15 @@ func TestHandler(t *testing.T) {
+ 	ctx, cancel := context.WithCancel(context.Background())
+ 	defer cancel()
+ 
++	method := jsonrpc.Method{
++		Name:   "test_echo",
++		Params: []jsonrpc.Parameter{{Name: "msg"}},
++		Handler: func(msg string) (string, *jsonrpc.Error) {
++			return msg, nil
++		},
++	}
+ 	listener := CountingEventListener{}
+-	conn := testConnection(t, ctx, &listener)
++	conn := testConnection(t, ctx, method, &listener)
+ 
+ 	msg := `{"jsonrpc" : "2.0", "method" : "test_echo", "params" : [ "abc123" ], "id" : 1}`
+ 	err := conn.Write(context.Background(), websocket.MessageText, []byte(msg))
+@@ -56,3 +64,79 @@ func TestHandler(t *testing.T) {
+ 
+ 	require.NoError(t, conn.Close(websocket.StatusNormalClosure, ""))
+ }
++
++func TestWebsocketHandlerCanWriteAdditionalMessage(t *testing.T) {
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++
++	observations := make(chan handlerWriteObservation, 2)
++	method := jsonrpc.Method{
++		Name:   "test_push",
++		Params: []jsonrpc.Parameter{{Name: "msg"}},
++		Handler: func(ctx context.Context, msg string) (string, *jsonrpc.Error) {
++			conn, ok := jsonrpc.ConnFromContext(ctx)
++			obs := handlerWriteObservation{ok: ok}
++			if ok {
++				obs.n, obs.err = conn.Write([]byte("ws-event:" + msg))
++			}
++			observations <- obs
++			return "handled:" + msg, nil
++		},
++	}
++	conn := testConnection(t, ctx, method, &CountingEventListener{})
++
++	requests := []struct {
++		id  int
++		msg string
++	}{
++		{id: 1, msg: "alpha-1"},
++		{id: 2, msg: "beta-2"},
++	}
++	for _, tc := range requests {
++		req := fmt.Sprintf(`{"jsonrpc":"2.0","method":"test_push","params":["%s"],"id":%d}`, tc.msg, tc.id)
++		err := conn.Write(context.Background(), websocket.MessageText, []byte(req))
++		require.NoError(t, err)
++
++		pushed := readWebsocketMessage(t, ctx, conn)
++		require.Equal(t, "ws-event:"+tc.msg, string(pushed))
++
++		obs := readHandlerWriteObservation(t, observations)
++		require.True(t, obs.ok)
++		require.NoError(t, obs.err)
++		require.Equal(t, len("ws-event:"+tc.msg), obs.n)
++
++		response := readWebsocketMessage(t, ctx, conn)
++		var got struct {
++			Result string `json:"result"`
++			ID     int    `json:"id"`
++		}
++		require.NoError(t, json.Unmarshal(response, &got))
++		require.Equal(t, "handled:"+tc.msg, got.Result)
++		require.Equal(t, tc.id, got.ID)
++	}
++
++	require.NoError(t, conn.Close(websocket.StatusNormalClosure, ""))
++}
++
++func readWebsocketMessage(t *testing.T, ctx context.Context, conn *websocket.Conn) []byte {
++	t.Helper()
++
++	readCtx, cancel := context.WithTimeout(ctx, time.Second)
++	defer cancel()
++
++	_, msg, err := conn.Read(readCtx)
++	require.NoError(t, err)
++	return msg
++}
++
++func readHandlerWriteObservation(t *testing.T, observations <-chan handlerWriteObservation) handlerWriteObservation {
++	t.Helper()
++
++	select {
++	case obs := <-observations:
++		return obs
++	case <-time.After(time.Second):
++		t.Fatal("handler did not report websocket write result")
++		return handlerWriteObservation{}
++	}
++}
+diff --git a/pubsub/registry_test.go b/pubsub/registry_test.go
+new file mode 100644
+index 000000000..b3a56eab4
+--- /dev/null
++++ b/pubsub/registry_test.go
+@@ -0,0 +1,110 @@
++package pubsub_test
++
++import (
++	"context"
++	"errors"
++	"sync"
++	"testing"
++
++	"github.com/NethermindEth/juno/pubsub"
++	"github.com/NethermindEth/juno/utils"
++	"github.com/stretchr/testify/require"
++)
++
++type fakeSubscription struct {
++	mu    sync.Mutex
++	count int
++	errs  chan error
++}
++
++func newFakeSubscription() *fakeSubscription {
++	return &fakeSubscription{errs: make(chan error)}
++}
++
++func (s *fakeSubscription) Unsubscribe() {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	s.count++
++}
++
++func (s *fakeSubscription) Err() <-chan error {
++	return s.errs
++}
++
++func (s *fakeSubscription) unsubscribeCount() int {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	return s.count
++}
++
++func TestRegistryAddDeleteSubscription(t *testing.T) {
++	registry := pubsub.New(utils.NewNopZapLogger())
++	sub := newFakeSubscription()
++
++	var id uint64 = registry.Add(context.Background(), sub)
++
++	require.NoError(t, registry.Delete(id))
++	require.Equal(t, 1, sub.unsubscribeCount())
++}
++
++func TestRegistryDeleteMissingReturnsErrNotFound(t *testing.T) {
++	registry := pubsub.New(utils.NewNopZapLogger())
++
++	for _, id := range []uint64{0, 12345} {
++		err := registry.Delete(id)
++		require.Error(t, err)
++		require.True(t, errors.Is(err, pubsub.ErrNotFound), "id %d returned %v", id, err)
++	}
++}
++
++func TestRegistryDeleteTwiceReportsNotFound(t *testing.T) {
++	registry := pubsub.New(utils.NewNopZapLogger())
++	sub := newFakeSubscription()
++	id := registry.Add(context.Background(), sub)
++
++	require.NoError(t, registry.Delete(id))
++	err := registry.Delete(id)
++
++	require.Error(t, err)
++	require.True(t, errors.Is(err, pubsub.ErrNotFound), "got %v", err)
++	require.Equal(t, 1, sub.unsubscribeCount())
++}
++
++func TestRegistryConcurrentAddDelete(t *testing.T) {
++	registry := pubsub.New(utils.NewNopZapLogger())
++	const n = 64
++
++	subs := make([]*fakeSubscription, n)
++	ids := make([]uint64, n)
++
++	var addWG sync.WaitGroup
++	addWG.Add(n)
++	for i := 0; i < n; i++ {
++		i := i
++		subs[i] = newFakeSubscription()
++		go func() {
++			defer addWG.Done()
++			ids[i] = registry.Add(context.Background(), subs[i])
++		}()
++	}
++	addWG.Wait()
++
++	var deleteWG sync.WaitGroup
++	deleteWG.Add(n)
++	errs := make([]error, n)
++	for i := 0; i < n; i++ {
++		i := i
++		go func() {
++			defer deleteWG.Done()
++			errs[i] = registry.Delete(ids[i])
++		}()
++	}
++	deleteWG.Wait()
++
++	for i, err := range errs {
++		require.NoError(t, err, "delete %d for id %d", i, ids[i])
++	}
++	for i, sub := range subs {
++		require.Equal(t, 1, sub.unsubscribeCount(), "subscription %d", i)
++	}
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,21 @@
++#!/bin/bash
++set -uo pipefail
++cd /testbed
++
++
++export GOPROXY='https://goproxy.cn,https://proxy.golang.org,direct'
++export GOFLAGS='-mod=mod'
++
++
++case "${1:-}" in
++  base)
++    go test -v -count=1 -timeout=10s ./jsonrpc/ -run '^(TestHTTP|TestServer_RegisterMethod|TestHandle|TestHandler)$'
++    ;;
++  new)
++    go test -v -count=1 -timeout=10s ./jsonrpc/ ./pubsub/ -run '^(TestConnFromContextAbsentForNonWebsocketHandle|TestWebsocketHandlerCanWriteAdditionalMessage|TestRegistryAddDeleteSubscription|TestRegistryDeleteMissingReturnsErrNotFound|TestRegistryDeleteTwiceReportsNotFound|TestRegistryConcurrentAddDelete)$'
++    ;;
++  *)
++    echo "usage: $0 base|new"
++    exit 2
++    ;;
++esac

@@ -1,0 +1,190 @@
+diff --git a/unittests/test_amber_nve.py b/unittests/test_amber_nve.py
+new file mode 100644
+index 000000000..a43645b88
+--- /dev/null
++++ b/unittests/test_amber_nve.py
+@@ -0,0 +1,163 @@
++
++
++
++
++
++import os
++import pytest
++
++import unittests.utility as test_util
++from reframe.core.exceptions import SanityError
++
++from hpctestlib.apps.amber.nve import amber_nve_check
++
++
++
++
++BENCHMARKS = {
++    'Cellulose_production_NVE': (-443246.0, 5.0E-05),
++    'FactorIX_production_NVE': (-234188.0, 1.0E-04),
++    'JAC_production_NVE_4fs': (-44810.0, 1.0E-03),
++    'JAC_production_NVE': (-58138.0, 5.0E-04),
++}
++
++
++@pytest.fixture
++def generic_system(make_exec_ctx_g):
++    yield from make_exec_ctx_g(test_util.TEST_CONFIG_FILE, 'generic')
++
++
++@pytest.fixture
++def local_exec_ctx(generic_system):
++    partition = test_util.partition_by_name('default')
++    environ = test_util.environment_by_name('builtin', partition)
++    yield partition, environ
++
++
++def _all_variants():
++
++    class _T(amber_nve_check):
++        pass
++
++    return [_T(_rfm_use_params=True) for _ in range(len(_T.param_space))]
++
++
++def _variant(benchmark, variant):
++    for t in _all_variants():
++        if t.benchmark == benchmark and t.variant == variant:
++            t.num_tasks = 1
++            t.valid_systems = ['*']
++            t.valid_prog_environs = ['*']
++            return t
++
++    raise AssertionError(f'no variant for {benchmark!r}/{variant!r}')
++
++
++def _write_out(path, etot, perf=42.0, perf_info=True):
++
++
++
++    lines = [
++        " Etot   =    %s   EKtot   =    100.0" % etot,
++        " A V E R A G E S   O V E R",
++        " Etot   =    %s   EKtot   =    100.0" % etot,
++        " R M S   F L U C T U A T I O N S",
++        " Etot   =    %s   EKtot   =    100.0" % (etot + 123456.0),
++    ]
++    if perf_info:
++        lines += [
++            "| Final Performance Info:",
++            "| ns/day = %s   seconds/ns = 100.0" % perf,
++            "| ns/day = %s   seconds/ns = 100.0" % perf,
++        ]
++
++    with open(path, 'w') as f:
++        f.write("\n".join(lines) + "\n")
++
++
++def test_variant_count(generic_system):
++    insts = _all_variants()
++    assert len(insts) == 8
++    keys = {(t.benchmark, t.variant) for t in insts}
++    expected = {(b, v) for b in BENCHMARKS for v in ('mpi', 'cuda')}
++    assert keys == expected
++
++
++def test_run_only(generic_system):
++    import reframe as rfm
++    assert issubclass(amber_nve_check, rfm.RunOnlyRegressionTest)
++
++
++def test_tags(generic_system):
++    for t in _all_variants():
++        assert t.tags == {'sciapp', 'chemistry'}
++
++
++@pytest.mark.parametrize('benchmark', list(BENCHMARKS))
++def test_variant_tooling(generic_system, benchmark):
++    mpi = _variant(benchmark, 'mpi')
++    assert mpi.executable == 'pmemd.MPI'
++    assert mpi.input_file == 'mdin.CPU'
++    assert mpi.output_file == 'amber.out'
++    assert mpi.executable_opts == ['-O', '-i', 'mdin.CPU', '-o', 'amber.out']
++
++    cuda = _variant(benchmark, 'cuda')
++    assert cuda.executable == 'pmemd.cuda.MPI'
++    assert cuda.input_file == 'mdin.GPU'
++    assert cuda.output_file == 'amber.out'
++    assert cuda.executable_opts == ['-O', '-i', 'mdin.GPU', '-o', 'amber.out']
++
++
++def test_num_tasks_required(generic_system):
++    t = _all_variants()[0]
++    with pytest.raises(AttributeError):
++        t.num_tasks
++
++
++@pytest.mark.parametrize('benchmark', list(BENCHMARKS))
++def test_sanity_within_tolerance(local_exec_ctx, benchmark):
++    part, env = local_exec_ctx
++    ref, tol = BENCHMARKS[benchmark]
++    t = _variant(benchmark, 'mpi')
++    t.setup(part, env)
++
++    etot = ref + 0.4 * abs(ref * tol)
++    _write_out(os.path.join(t.stagedir, t.output_file), etot)
++    t.check_sanity()
++
++
++@pytest.mark.parametrize('benchmark', list(BENCHMARKS))
++def test_sanity_outside_tolerance(local_exec_ctx, benchmark):
++    part, env = local_exec_ctx
++    ref, tol = BENCHMARKS[benchmark]
++    t = _variant(benchmark, 'mpi')
++    t.setup(part, env)
++
++    etot = ref + 2.0 * abs(ref * tol)
++    _write_out(os.path.join(t.stagedir, t.output_file), etot)
++    with pytest.raises(SanityError):
++        t.check_sanity()
++
++
++def test_sanity_requires_performance_info(local_exec_ctx):
++    part, env = local_exec_ctx
++    ref, tol = BENCHMARKS['Cellulose_production_NVE']
++    t = _variant('Cellulose_production_NVE', 'mpi')
++    t.setup(part, env)
++
++    _write_out(os.path.join(t.stagedir, t.output_file), ref, perf_info=False)
++    with pytest.raises(SanityError):
++        t.check_sanity()
++
++
++def test_performance_metric(local_exec_ctx):
++    part, env = local_exec_ctx
++    ref, tol = BENCHMARKS['Cellulose_production_NVE']
++    t = _variant('Cellulose_production_NVE', 'mpi')
++    t.setup(part, env)
++    _write_out(os.path.join(t.stagedir, t.output_file), ref, perf=37.5)
++    t.check_performance()
++    vals = dict(t.perfvalues)
++    assert vals, 'no performance variables were recorded'
++    assert any(abs(v[0] - 37.5) < 1e-6 and v[-1] == 'ns/day'
++               for v in vals.values())
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,16 @@
++#!/usr/bin/env bash
++
++
++
++
++set -euo pipefail
++HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++cd /testbed
++
++
++
++
++python -m pytest unittests/test_meta.py -q
++
++
++python -m pytest unittests/test_amber_nve.py -q

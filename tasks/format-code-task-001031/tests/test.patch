@@ -1,0 +1,428 @@
+diff --git a/test/tape/codespec-cte.js b/test/tape/codespec-cte.js
+new file mode 100644
+index 0000000..49b2369
+--- /dev/null
++++ b/test/tape/codespec-cte.js
+@@ -0,0 +1,411 @@
++'use strict';
++
++var test = require('tape');
++var Knex = require('../../knex');
++var Client = require('../../lib/client');
++var PGClient = require('../../lib/dialects/postgres');
++var SQLiteClient = require('../../lib/dialects/sqlite3');
++var MySQLClient = require('../../lib/dialects/mysql');
++var MSSQLClient = require('../../lib/dialects/mssql');
++
++function clients() {
++  return {
++    generic: new Client({}),
++    pg: new PGClient({}),
++    sqlite: new SQLiteClient({useNullAsDefault: true}),
++    mysql: new MySQLClient({}),
++    mssql: new MSSQLClient({})
++  };
++}
++
++function requireMethod(t, target, method) {
++  var available = typeof target[method] === 'function';
++  if (!available) {
++    t.fail('public .' + method + '() method is missing');
++    t.end();
++  }
++  return available;
++}
++
++function compileOrFail(t, factory) {
++  try {
++    return factory().toSQL();
++  } catch (error) {
++    t.fail('CTE query should compile: ' + error.message);
++    return null;
++  }
++}
++
++function expectTypeError(t, callback, messagePattern, label) {
++  try {
++    callback();
++    t.fail(label + ': did not throw');
++  } catch (error) {
++    t.ok(error instanceof TypeError, label + ': throws TypeError');
++    t.ok(messagePattern.test(error.message), label + ': identifies the invalid field');
++  }
++}
++
++test('codespec CTE methods are available on builders and the root knex object', function(t) {
++  var c = clients();
++  var knex = Knex({client: 'pg'});
++
++  t.equal(typeof c.generic.queryBuilder().with, 'function', 'builder exposes .with()');
++  t.equal(typeof c.generic.queryBuilder().withRecursive, 'function', 'builder exposes .withRecursive()');
++  t.equal(typeof knex.with, 'function', 'root knex exposes .with()');
++  t.equal(typeof knex.withRecursive, 'function', 'root knex exposes .withRecursive()');
++
++  if (typeof knex.with === 'function' && typeof knex.withRecursive === 'function') {
++    var compiled = compileOrFail(t, function() {
++      return knex
++        .with('cap', knex.raw('select ? as id', [3]))
++        .withRecursive('seed', ['id'], knex.raw('select ? as id', [1]))
++        .select('id')
++        .from('seed');
++    });
++    if (compiled) {
++      t.equal(compiled.sql, 'with recursive "cap" as (select ? as id), "seed"("id") as (select ? as id) select "id" from "seed"');
++      t.deepEqual(compiled.bindings, [3, 1]);
++    }
++  }
++  t.end();
++});
++
++test('codespec callback CTE quotes aliases and columns and binds before the main query', function(t) {
++  var pg = clients().pg;
++  var callbackThis;
++  var callbackArgument;
++  var builder = pg.queryBuilder();
++  if (!requireMethod(t, builder, 'with')) return;
++
++  var compiled = compileOrFail(t, function() {
++    return builder
++      .with('active_users', ['id', 'display_name'], function(qb) {
++        callbackThis = this;
++        callbackArgument = qb;
++        qb.select('id', 'display_name').from('users').where('active', true);
++      })
++      .select('*')
++      .from('active_users')
++      .where('id', '>', 10);
++  });
++  if (!compiled) return t.end();
++
++  t.equal(callbackThis, callbackArgument, 'callback receives the same builder as this and its argument');
++  t.equal(
++    compiled.sql,
++    'with "active_users"("id", "display_name") as (select "id", "display_name" from "users" where "active" = ?) select * from "active_users" where "id" > ?'
++  );
++  t.deepEqual(compiled.bindings, [true, 10], 'CTE bindings precede outer-query bindings');
++  t.end();
++});
++
++test('codespec raw and query-builder CTE bodies preserve declaration and binding order', function(t) {
++  var pg = clients().pg;
++  var builder = pg.queryBuilder();
++  if (!requireMethod(t, builder, 'with')) return;
++
++  var staff = pg.queryBuilder()
++    .select('id')
++    .from('accounts')
++    .where('kind', 'staff');
++  var compiled = compileOrFail(t, function() {
++    return builder
++      .with('constants', pg.raw('select ? as ??', [7, 'rank']))
++      .with('staff', staff)
++      .select('*')
++      .from('staff')
++      .where('id', '>', 3);
++  });
++  if (!compiled) return t.end();
++
++  t.equal(
++    compiled.sql,
++    'with "constants" as (select ? as "rank"), "staff" as (select "id" from "accounts" where "kind" = ?) select * from "staff" where "id" > ?'
++  );
++  t.deepEqual(compiled.bindings, [7, 'staff', 3]);
++  t.end();
++});
++
++test('codespec recursive CTE uses one recursive prefix on PostgreSQL SQLite and MySQL', function(t) {
++  var c = clients();
++  var cases = [
++    {
++      name: 'postgres',
++      client: c.pg,
++      sql: 'with recursive "cap" as (select ? as n), "walk"("n") as (select ? union all select n + ? from walk where n < ?) select "n" from "walk" where "n" > ?'
++    },
++    {
++      name: 'sqlite',
++      client: c.sqlite,
++      sql: 'with recursive "cap" as (select ? as n), "walk"("n") as (select ? union all select n + ? from walk where n < ?) select "n" from "walk" where "n" > ?'
++    },
++    {
++      name: 'mysql',
++      client: c.mysql,
++      sql: 'with recursive `cap` as (select ? as n), `walk`(`n`) as (select ? union all select n + ? from walk where n < ?) select `n` from `walk` where `n` > ?'
++    }
++  ];
++
++  cases.forEach(function(item) {
++    var builder = item.client.queryBuilder();
++    if (typeof builder.with !== 'function' || typeof builder.withRecursive !== 'function') {
++      t.fail(item.name + ' CTE methods are missing');
++      return;
++    }
++    var compiled = compileOrFail(t, function() {
++      return builder
++        .with('cap', item.client.raw('select ? as n', [4]))
++        .withRecursive(
++          'walk',
++          ['n'],
++          item.client.raw('select ? union all select n + ? from walk where n < ?', [1, 1, 4])
++        )
++        .select('n')
++        .from('walk')
++        .where('n', '>', 0);
++    });
++    if (!compiled) return;
++    t.equal(compiled.sql, item.sql, item.name + ' recursive SQL');
++    t.deepEqual(compiled.bindings, [4, 1, 1, 4, 0], item.name + ' binding order');
++  });
++  t.end();
++});
++
++test('codespec recursive CTE accepts callback and query-builder bodies', function(t) {
++  var pg = clients().pg;
++  var builder = pg.queryBuilder();
++  var callbackThis;
++  var callbackArgument;
++  if (!requireMethod(t, builder, 'withRecursive')) return;
++
++  var bodyBuilder = pg.queryBuilder()
++    .select('id')
++    .from('edges')
++    .where('depth', '<', 3);
++  var compiled = compileOrFail(t, function() {
++    return builder
++      .withRecursive('from_callback', function(qb) {
++        callbackThis = this;
++        callbackArgument = qb;
++        qb.select('id').from('roots').where('enabled', true);
++      })
++      .withRecursive('from_builder', ['id'], bodyBuilder)
++      .select('id')
++      .from('from_builder')
++      .where('id', '>', 1);
++  });
++  if (!compiled) return t.end();
++
++  t.equal(callbackThis, callbackArgument, 'recursive callback receives the body builder');
++  t.equal(
++    compiled.sql,
++    'with recursive "from_callback" as (select "id" from "roots" where "enabled" = ?), "from_builder"("id") as (select "id" from "edges" where "depth" < ?) select "id" from "from_builder" where "id" > ?'
++  );
++  t.deepEqual(compiled.bindings, [true, 3, 1]);
++  t.end();
++});
++
++test('codespec recursive CTE omits the recursive keyword on MSSQL', function(t) {
++  var mssql = clients().mssql;
++  var builder = mssql.queryBuilder();
++  if (!requireMethod(t, builder, 'withRecursive')) return;
++
++  var compiled = compileOrFail(t, function() {
++    return builder
++      .withRecursive('walk', ['n'], mssql.raw('select ? union all select n + ? from walk where n < ?', [1, 1, 4]))
++      .select('n')
++      .from('walk')
++      .where('n', '>', 0);
++  });
++  if (!compiled) return t.end();
++
++  t.equal(
++    compiled.sql,
++    'with [walk]([n]) as (select ? union all select n + ? from walk where n < ?) select [n] from [walk] where [n] > ?'
++  );
++  t.deepEqual(compiled.bindings, [1, 1, 4, 0]);
++  t.end();
++});
++
++test('codespec CTE prefixes PostgreSQL inserts without losing result metadata', function(t) {
++  var pg = clients().pg;
++  var builder = pg.queryBuilder();
++  if (!requireMethod(t, builder, 'with')) return;
++
++  var compiled = compileOrFail(t, function() {
++    return builder
++      .with('source', pg.raw('select ? as id', [9]))
++      .insert({name: 'archived'})
++      .into('archive')
++      .returning('id');
++  });
++  if (!compiled) return t.end();
++
++  t.equal(
++    compiled.sql,
++    'with "source" as (select ? as id) insert into "archive" ("name") values (?) returning "id"'
++  );
++  t.deepEqual(compiled.bindings, [9, 'archived']);
++  t.equal(compiled.returning, 'id', 'dialect result metadata is preserved');
++  t.equal(compiled.method, 'insert');
++  t.end();
++});
++
++test('codespec CTE prefixes updates and orders CTE bindings first', function(t) {
++  var pg = clients().pg;
++  var builder = pg.queryBuilder();
++  if (!requireMethod(t, builder, 'with')) return;
++
++  var compiled = compileOrFail(t, function() {
++    return builder
++      .with('target', pg.raw('select ? as id', [5]))
++      .table('users')
++      .update({flag: true})
++      .whereIn('id', function() {
++        this.select('id').from('target');
++      });
++  });
++  if (!compiled) return t.end();
++
++  t.equal(
++    compiled.sql,
++    'with "target" as (select ? as id) update "users" set "flag" = ? where "id" in (select "id" from "target")'
++  );
++  t.deepEqual(compiled.bindings, [5, true]);
++  t.end();
++});
++
++test('codespec CTE prefixes deletes and orders outer predicates after CTE bindings', function(t) {
++  var sqlite = clients().sqlite;
++  var builder = sqlite.queryBuilder();
++  if (!requireMethod(t, builder, 'with')) return;
++
++  var compiled = compileOrFail(t, function() {
++    return builder
++      .with('doomed', sqlite.raw('select ? as id', [2]))
++      .from('users')
++      .whereIn('id', function() {
++        this.select('id').from('doomed');
++      })
++      .where('status', 'stale')
++      .del();
++  });
++  if (!compiled) return t.end();
++
++  t.equal(
++    compiled.sql,
++    'with "doomed" as (select ? as id) delete from "users" where "id" in (select "id" from "doomed") and "status" = ?'
++  );
++  t.deepEqual(compiled.bindings, [2, 'stale']);
++  t.end();
++});
++
++test('codespec query-builder CTE bodies may contain nested CTEs', function(t) {
++  var pg = clients().pg;
++  var inner = pg.queryBuilder();
++  var outer = pg.queryBuilder();
++  if (!requireMethod(t, inner, 'with')) return;
++  if (!requireMethod(t, outer, 'with')) return;
++
++  inner
++    .with('seed', pg.raw('select ? as id', [1]))
++    .select('id')
++    .from('seed')
++    .where('id', '<', 8);
++  var compiled = compileOrFail(t, function() {
++    return outer
++      .with('nested_values', inner)
++      .select('id')
++      .from('nested_values')
++      .where('id', '>', 2);
++  });
++  if (!compiled) return t.end();
++
++  t.equal(
++    compiled.sql,
++    'with "nested_values" as (with "seed" as (select ? as id) select "id" from "seed" where "id" < ?) select "id" from "nested_values" where "id" > ?'
++  );
++  t.deepEqual(compiled.bindings, [1, 8, 2]);
++  t.end();
++});
++
++test('codespec CTE declarations validate aliases columns and bodies immediately', function(t) {
++  var pg = clients().pg;
++  var builder = pg.queryBuilder();
++  if (!requireMethod(t, builder, 'with')) return;
++  if (!requireMethod(t, builder, 'withRecursive')) return;
++
++  expectTypeError(t, function() { builder.with('', pg.raw('select 1')); }, /CTE alias/i, 'empty alias');
++  expectTypeError(t, function() { builder.with(42, pg.raw('select 1')); }, /CTE alias/i, 'non-string alias');
++  expectTypeError(t, function() { builder.with('x', [], pg.raw('select 1')); }, /CTE columns/i, 'empty column list');
++  expectTypeError(t, function() { builder.with('x', 'id', pg.raw('select 1')); }, /CTE columns/i, 'non-array column list');
++  expectTypeError(t, function() { builder.with('x', ['ok', ''], pg.raw('select 1')); }, /CTE columns/i, 'empty column name');
++  expectTypeError(t, function() { builder.with('x', [1], pg.raw('select 1')); }, /CTE columns/i, 'non-string column name');
++  expectTypeError(t, function() { builder.with('x', 'select 1'); }, /CTE body/i, 'plain-string body');
++  expectTypeError(t, function() { builder.with('x', {}); }, /CTE body/i, 'plain-object body');
++  expectTypeError(t, function() { builder.withRecursive('', pg.raw('select 1')); }, /CTE alias/i, 'recursive alias');
++  expectTypeError(t, function() { builder.withRecursive(42, pg.raw('select 1')); }, /CTE alias/i, 'recursive non-string alias');
++  expectTypeError(t, function() { builder.withRecursive('x', [], pg.raw('select 1')); }, /CTE columns/i, 'recursive column list');
++  expectTypeError(t, function() { builder.withRecursive('x', 'id', pg.raw('select 1')); }, /CTE columns/i, 'recursive non-array column list');
++  expectTypeError(t, function() { builder.withRecursive('x', ['ok', ''], pg.raw('select 1')); }, /CTE columns/i, 'recursive empty column name');
++  expectTypeError(t, function() { builder.withRecursive('x', [1], pg.raw('select 1')); }, /CTE columns/i, 'recursive non-string column name');
++  expectTypeError(t, function() { builder.withRecursive('x', 'select 1'); }, /CTE body/i, 'recursive body');
++  expectTypeError(t, function() { builder.withRecursive('x', {}); }, /CTE body/i, 'recursive plain-object body');
++  t.end();
++});
++
++test('codespec cloned CTE builders keep independent declaration lists', function(t) {
++  var c = clients();
++  var original = c.pg.queryBuilder();
++  if (!requireMethod(t, original, 'with')) return;
++
++  original
++    .with('seed', ['n'], c.pg.raw('select ? as n', [1]))
++    .select('n')
++    .from('seed')
++    .where('n', '>', 0);
++
++  var clone = original.clone();
++  clone.with('extra', c.pg.raw('select ? as n', [2]));
++
++  var cloneCompiled = compileOrFail(t, function() { return clone; });
++  var pgCompiled = compileOrFail(t, function() { return original; });
++  var pgCompiledAgain = compileOrFail(t, function() { return original; });
++  if (!cloneCompiled || !pgCompiled || !pgCompiledAgain) return t.end();
++
++  t.equal(
++    cloneCompiled.sql,
++    'with "seed"("n") as (select ? as n), "extra" as (select ? as n) select "n" from "seed" where "n" > ?'
++  );
++  t.deepEqual(cloneCompiled.bindings, [1, 2, 0]);
++  t.equal(
++    pgCompiled.sql,
++    'with "seed"("n") as (select ? as n) select "n" from "seed" where "n" > ?'
++  );
++  t.deepEqual(pgCompiled.bindings, [1, 0]);
++  t.deepEqual(pgCompiledAgain, pgCompiled, 'repeated compilation is stable');
++  t.end();
++});
++
++test('codespec raw CTE bodies compile with the active enclosing dialect', function(t) {
++  var c = clients();
++  var sharedBody = c.pg.raw('select ? as ??', [1, 'n']);
++  var mysqlBuilder = c.mysql.queryBuilder();
++  var pgBuilder = c.pg.queryBuilder();
++  if (!requireMethod(t, mysqlBuilder, 'with')) return;
++  if (!requireMethod(t, pgBuilder, 'with')) return;
++
++  mysqlBuilder.with('seed', ['n'], sharedBody).select('n').from('seed');
++  pgBuilder.with('seed', ['n'], sharedBody).select('n').from('seed');
++
++  var mysqlCompiled = compileOrFail(t, function() { return mysqlBuilder; });
++  var pgCompiled = compileOrFail(t, function() { return pgBuilder; });
++  if (!mysqlCompiled || !pgCompiled) return t.end();
++
++  t.equal(mysqlCompiled.sql, 'with `seed`(`n`) as (select ? as `n`) select `n` from `seed`');
++  t.deepEqual(mysqlCompiled.bindings, [1]);
++  t.equal(pgCompiled.sql, 'with "seed"("n") as (select ? as "n") select "n" from "seed"');
++  t.deepEqual(pgCompiled.bindings, [1]);
++  t.end();
++});
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,6 @@
++#!/bin/bash
++set -euo pipefail
++
++
++./node_modules/.bin/babel -L -D src/ --out-dir lib/
++node test/tape/codespec-cte.js

@@ -1,0 +1,317 @@
+diff --git a/usercase-test-coderl/usecase.sh b/usercase-test-coderl/usecase.sh
+new file mode 100755
+--- /dev/null
++++ b/usercase-test-coderl/usecase.sh
+@@ -0,0 +1,295 @@
++#!/usr/bin/env bash
++
++set -u
++export LANG=C.UTF-8 LC_ALL=C.UTF-8 TZ=UTC
++export PYTHONPATH=/workspace/repo/Lib
++
++( cd /workspace/repo && python -m compileall -q Lib/fontTools/feaLib Lib/fontTools/__main__.py ) \
++    || { echo "FAIL: build" >&2; exit 1; }
++BIN=/workspace/repo/fonttools
++
++TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
++cd "$TMP" || exit 1
++fail() { echo "FAIL: $*" >&2; exit 1; }
++expect_line() {
++    local line=$1 file=$2 label=$3
++    grep -Fqx "$line" "$file" || fail "$label: $(cat "$file")"
++}
++expect_regex() {
++    local pattern=$1 file=$2 label=$3
++    grep -Eq "$pattern" "$file" || fail "$label: $(cat "$file")"
++}
++assert_success_streams_ok() {
++    local label=$1
++
++    if grep -Eq '^(Traceback \(most recent call last\):|ERROR:)' out err; then
++        fail "$label unexpected error output: $(cat out err)"
++    fi
++}
++
++make_fixture_font() {
++    PYTHONPATH=/workspace/repo/Lib python - <<'PY'
++from fontTools.fontBuilder import FontBuilder
++from fontTools.pens.ttGlyphPen import TTGlyphPen
++
++glyph_order = [".notdef", "space", "a", "b", "A", "Y"]
++fb = FontBuilder(1000, isTTF=True)
++fb.setupGlyphOrder(glyph_order)
++metrics = {glyph: (600, 0) for glyph in glyph_order}
++glyphs = {}
++for glyph in glyph_order:
++    pen = TTGlyphPen(None)
++    if glyph != ".notdef":
++        pen.moveTo((100, 0))
++        pen.lineTo((100, 700))
++        pen.lineTo((500, 700))
++        pen.lineTo((500, 0))
++        pen.closePath()
++    glyphs[glyph] = pen.glyph()
++fb.setupGlyf(glyphs)
++fb.setupHorizontalMetrics(metrics)
++fb.setupHorizontalHeader(ascent=800, descent=-200)
++fb.setupCharacterMap({32: "space", 65: "A", 89: "Y", 97: "a", 98: "b"})
++fb.setupNameTable(
++    {
++        "familyName": "Fixture Fixture",
++        "styleName": "Regular",
++        "uniqueFontIdentifier": "Fixture Fixture Regular",
++        "fullName": "Fixture Fixture Regular",
++        "psName": "FixtureFixture-Regular",
++    }
++)
++fb.setupOS2(sTypoAscender=800, sTypoDescender=-200, usWinAscent=800, usWinDescent=200)
++fb.setupPost()
++fb.save("fixture.ttf")
++PY
++}
++
++inspect_font() {
++    local path=$1
++    PYTHONPATH=/workspace/repo/Lib FONT_PATH="$path" python - <<'PY'
++import json
++import os
++from fontTools.ttLib import TTFont
++
++font = TTFont(os.environ["FONT_PATH"])
++print("tables=" + ",".join(sorted(font.keys())))
++print("has_GSUB=" + str("GSUB" in font))
++print("has_GPOS=" + str("GPOS" in font))
++print("has_Debg=" + str("Debg" in font))
++if "GSUB" in font:
++    gsub = font["GSUB"].table
++    print("GSUB_features=" + repr([(r.FeatureTag, r.Feature.LookupListIndex) for r in gsub.FeatureList.FeatureRecord]))
++    print("GSUB_has_calt=" + str(any(r.FeatureTag == "calt" for r in gsub.FeatureList.FeatureRecord)))
++    has_mapping = False
++    for lookup in gsub.LookupList.Lookup:
++        for subtable in lookup.SubTable:
++            if getattr(subtable, "mapping", {}).get("a") == "b":
++                has_mapping = True
++    print("GSUB_has_a_to_b=" + str(has_mapping))
++if "GPOS" in font:
++    gpos = font["GPOS"].table
++    print("GPOS_features=" + repr([(r.FeatureTag, r.Feature.LookupListIndex) for r in gpos.FeatureList.FeatureRecord]))
++    print("GPOS_has_kern=" + str(any(r.FeatureTag == "kern" for r in gpos.FeatureList.FeatureRecord)))
++    has_pair = False
++    for lookup in gpos.LookupList.Lookup:
++        for subtable in lookup.SubTable:
++            for first, pair_set in zip(getattr(subtable.Coverage, "glyphs", []), getattr(subtable, "PairSet", [])):
++                for record in pair_set.PairValueRecord:
++                    if (
++                        first == "A"
++                        and record.SecondGlyph == "Y"
++                        and getattr(record.Value1, "XAdvance", None) == -100
++                    ):
++                        has_pair = True
++    print("GPOS_has_A_Y_minus100=" + str(has_pair))
++if "Debg" in font:
++    print("Debg_data=" + json.dumps(font["Debg"].data, sort_keys=True))
++PY
++}
++
++assert_single_gsub_mapping() {
++    local label=$1
++
++    expect_line "has_GSUB=True" inspect "$label font inspection"
++    expect_line "has_GPOS=False" inspect "$label font inspection"
++    expect_line "GSUB_has_calt=True" inspect "$label font inspection"
++    expect_line "GSUB_has_a_to_b=True" inspect "$label font inspection"
++}
++
++assert_gpos_pair_font() {
++    local label=$1
++
++    expect_line "has_GSUB=False" inspect "$label font inspection"
++    expect_line "has_GPOS=True" inspect "$label font inspection"
++    expect_line "has_Debg=False" inspect "$label font inspection"
++    expect_line "GPOS_has_kern=True" inspect "$label font inspection"
++    expect_line "GPOS_has_A_Y_minus100=True" inspect "$label font inspection"
++}
++
++assert_no_layout_font() {
++    local label=$1
++
++    expect_line "has_GSUB=False" inspect "$label font inspection"
++    expect_line "has_GPOS=False" inspect "$label font inspection"
++    expect_line "has_Debg=False" inspect "$label font inspection"
++}
++
++cat >single.fea <<'EOF'
++languagesystem DFLT dflt;
++languagesystem latn dflt;
++feature calt {
++    sub a by b;
++} calt;
++EOF
++
++cat >kern.fea <<'EOF'
++languagesystem DFLT dflt;
++languagesystem latn dflt;
++feature kern {
++    pos A Y -100;
++} kern;
++EOF
++
++cat >bad.fea <<'EOF'
++languagesystem DFLT dflt;
++feature calt {
++    sub missingGlyph by b;
++} calt;
++EOF
++
++make_fixture_font
++
++
++
++
++"$BIN" feaLib --help >out 2>err; ec=$?
++[ "$ec" -eq 0 ] || fail "F1 exit $ec; want 0"
++
++[ -s out ] || fail "F1 stdout is empty"
++grep -qi '^usage: .*feaLib' out || fail "F1 missing usage: $(cat out)"
++grep -q 'FEATURES' out || fail "F1 missing FEATURES: $(cat out)"
++grep -q 'INPUT_FONT' out || fail "F1 missing INPUT_FONT: $(cat out)"
++grep -q -- '--output' out || fail "F1 missing --output: $(cat out)"
++grep -q -- '--tables' out || fail "F1 missing --tables: $(cat out)"
++grep -q -- '--debug' out || fail "F1 missing --debug: $(cat out)"
++grep -q -- '--verbose' out || fail "F1 missing --verbose: $(cat out)"
++grep -q -- '--traceback' out || fail "F1 missing --traceback: $(cat out)"
++
++
++
++
++"$BIN" feaLib single.fea fixture.ttf -o explicit.ttf >out 2>err; ec=$?
++[ "$ec" -eq 0 ] || fail "F2 exit $ec; want 0"
++assert_success_streams_ok "F2"
++[ -s explicit.ttf ] || fail "F2 output font missing"
++inspect_font explicit.ttf >inspect
++assert_single_gsub_mapping "F2"
++expect_line "has_Debg=False" inspect "F2 font inspection"
++
++
++
++
++cp fixture.ttf FixtureName.ttf
++"$BIN" feaLib single.fea FixtureName.ttf >out 2>err; ec=$?
++[ "$ec" -eq 0 ] || fail "F3 exit $ec; want 0"
++assert_success_streams_ok "F3"
++[ -s 'FixtureName#1.ttf' ] || fail "F3 expected derived output FixtureName#1.ttf"
++inspect_font 'FixtureName#1.ttf' >inspect
++assert_single_gsub_mapping "F3"
++expect_line "has_Debg=False" inspect "F3 font inspection"
++
++
++
++
++"$BIN" feaLib kern.fea fixture.ttf -t GPOS -o gpos-only.ttf >out 2>err; ec=$?
++[ "$ec" -eq 0 ] || fail "F4 exit $ec; want 0"
++assert_success_streams_ok "F4"
++inspect_font gpos-only.ttf >inspect
++assert_gpos_pair_font "F4"
++
++
++
++
++"$BIN" feaLib kern.fea fixture.ttf -t GSUB -o gsub-selected.ttf >out 2>err; ec=$?
++[ "$ec" -eq 0 ] || fail "F5 exit $ec; want 0"
++assert_success_streams_ok "F5"
++inspect_font gsub-selected.ttf >inspect
++assert_no_layout_font "F5"
++
++
++
++
++"$BIN" feaLib single.fea fixture.ttf -t BOGUS -o rejected.ttf >out 2>err; ec=$?
++[ "$ec" -ne 0 ] || fail "F6 expected non-zero exit"
++
++cat out err >rejected.log
++grep -q 'BOGUS' rejected.log || fail "F6 rejection did not mention tag: $(cat rejected.log)"
++[ ! -e rejected.ttf ] || fail "F6 should not create rejected.ttf"
++
++
++
++
++"$BIN" feaLib --debug single.fea fixture.ttf -o debug.ttf >out 2>err; ec=$?
++[ "$ec" -eq 0 ] || fail "F7 exit $ec; want 0"
++assert_success_streams_ok "F7"
++inspect_font debug.ttf >inspect
++assert_single_gsub_mapping "F7"
++
++expect_line "has_Debg=True" inspect "F7 font inspection"
++expect_regex '^Debg_data=.*single\.fea' inspect "F7 font inspection"
++expect_regex '^Debg_data=.*calt' inspect "F7 font inspection"
++
++
++
++
++"$BIN" feaLib -v single.fea fixture.ttf -o verbose1.ttf >out 2>err; ec=$?
++[ "$ec" -eq 0 ] || fail "F8 exit $ec; want 0"
++
++cat out err >verbose1.log
++[ -s verbose1.log ] || fail "F8 expected informational logging"
++v1_lines=$(wc -l <verbose1.log)
++[ -s verbose1.ttf ] || fail "F8 output font missing"
++
++
++
++
++"$BIN" feaLib -vv single.fea fixture.ttf -o verbose2.ttf >out 2>err; ec=$?
++[ "$ec" -eq 0 ] || fail "F9 exit $ec; want 0"
++
++cat out err >verbose2.log
++[ -s verbose2.log ] || fail "F9 expected debug logging"
++v2_lines=$(wc -l <verbose2.log)
++[ "$v2_lines" -gt "$v1_lines" ] || fail "F9 did not increase verbosity: $(cat verbose2.log)"
++[ -s verbose2.ttf ] || fail "F9 output font missing"
++
++
++
++
++"$BIN" feaLib bad.fea fixture.ttf -o bad.ttf >out 2>err; ec=$?
++[ "$ec" -eq 1 ] || fail "F10 exit $ec; want 1"
++
++cat out err >bad.log
++[ -s bad.log ] || fail "F10 expected logged compiler error"
++grep -q 'missingGlyph' bad.log || fail "F10 did not log compiler error details: $(cat bad.log)"
++if grep -q '^Traceback (most recent call last):$' bad.log; then
++    fail "F10 should convert compiler error to short log: $(cat bad.log)"
++fi
++[ ! -e bad.ttf ] || fail "F10 should not create bad.ttf"
++
++
++
++
++"$BIN" feaLib --traceback bad.fea fixture.ttf -o bad-trace.ttf >out 2>err; ec=$?
++[ "$ec" -ne 0 ] || fail "F11 expected non-zero exit"
++
++cat out err >bad-trace.log
++grep -q '^Traceback (most recent call last):$' bad-trace.log || fail "F11 missing traceback header: $(cat bad-trace.log)"
++grep -q 'missingGlyph' bad-trace.log || fail "F11 missing compiler error details: $(cat bad-trace.log)"
++if grep -q '^ERROR:' bad-trace.log; then
++    fail "F11 traceback mode should not log short ERROR line"
++fi
++[ ! -e bad-trace.ttf ] || fail "F11 should not create bad-trace.ttf"
++
++echo "PASS"
++exit 0
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,12 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++exec bash /workspace/repo/usercase-test-coderl/usecase.sh

@@ -1,0 +1,448 @@
+diff --git a/usercase-test-coderl/test_streaming_responses.py b/usercase-test-coderl/test_streaming_responses.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/test_streaming_responses.py
+@@ -0,0 +1,419 @@
++import asyncio
++import importlib
++import json
++import os
++import threading
++import time
++from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
++
++import pytest
++
++from ollama import AsyncClient, Client, ResponseError
++
++
++
++
++
++
++class _Route:
++  def __init__(self, chunks=None, status=200, body='', close=False):
++    self.chunks = chunks or []
++    self.status = status
++    self.body = body
++    self.close = close
++
++
++class _State:
++  def __init__(self):
++    self.routes = {}
++    self.requests = []
++    self.active_connections = 0
++    self.lock = threading.Lock()
++
++
++class _ThreadingServer(ThreadingHTTPServer):
++  daemon_threads = True
++
++
++class _StreamingHandler(BaseHTTPRequestHandler):
++  protocol_version = 'HTTP/1.1'
++
++  def setup(self):
++    super().setup()
++    with self.server.state.lock:
++      self.server.state.active_connections += 1
++
++  def finish(self):
++    try:
++      super().finish()
++    finally:
++      with self.server.state.lock:
++        self.server.state.active_connections -= 1
++
++  def log_message(self, *_):
++    pass
++
++  def do_POST(self):
++    length = int(self.headers.get('Content-Length', '0'))
++    body = self.rfile.read(length).decode('utf-8')
++    payload = json.loads(body) if body else {}
++    with self.server.state.lock:
++      self.server.state.requests.append((self.path, payload))
++
++    route = self.server.state.routes.get(self.path)
++    if route is None:
++      data = b'no route configured'
++      self.send_response(500)
++      self.send_header('Content-Length', str(len(data)))
++      self.send_header('Connection', 'close')
++      self.end_headers()
++      self.wfile.write(data)
++      return
++
++    if route.status != 200:
++      data = route.body.encode('utf-8')
++      self.send_response(route.status)
++      self.send_header('Content-Type', 'text/plain')
++      self.send_header('Content-Length', str(len(data)))
++      if route.close:
++        self.send_header('Connection', 'close')
++        self.close_connection = True
++      self.end_headers()
++      self.wfile.write(data)
++      return
++
++    self.send_response(200)
++    self.send_header('Content-Type', 'application/x-ndjson')
++    self.send_header('Transfer-Encoding', 'chunked')
++    if route.close:
++      self.send_header('Connection', 'close')
++      self.close_connection = True
++    self.end_headers()
++    for chunk in route.chunks:
++      line = (json.dumps(chunk) + '\n').encode('utf-8')
++      self.wfile.write(f'{len(line):x}\r\n'.encode('ascii'))
++      self.wfile.write(line)
++      self.wfile.write(b'\r\n')
++      self.wfile.flush()
++    self.wfile.write(b'0\r\n\r\n')
++    self.wfile.flush()
++
++
++class StreamingServer:
++  def __init__(self):
++    self.state = _State()
++    self.server = _ThreadingServer(('127.0.0.1', 0), _StreamingHandler)
++    self.server.state = self.state
++    self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
++
++  def __enter__(self):
++    self.thread.start()
++    return self
++
++  def __exit__(self, *_):
++    self.server.shutdown()
++    self.server.server_close()
++
++  @property
++  def url(self):
++    host, port = self.server.server_address
++    return f'http://{host}:{port}'
++
++  def stream(self, path, chunks, *, close=False):
++    self.state.routes[path] = _Route(chunks=chunks, close=close)
++
++  def error(self, path, status, body):
++    self.state.routes[path] = _Route(status=status, body=body)
++
++  def requests(self):
++    with self.state.lock:
++      return list(self.state.requests)
++
++  def active_connections(self):
++    with self.state.lock:
++      return self.state.active_connections
++
++  def wait_for_active_at_most(self, limit):
++    deadline = time.monotonic() + 2
++    while time.monotonic() < deadline:
++      if self.active_connections() <= limit:
++        return self.active_connections()
++      time.sleep(0.01)
++    return self.active_connections()
++
++
++def _dump_parts(parts):
++  return [part.model_dump(exclude_none=True) for part in parts]
++
++
++async def _dump_async_parts(parts):
++  dumped = []
++  async for part in parts:
++    dumped.append(part.model_dump(exclude_none=True))
++  return dumped
++
++
++def _assert_stream_requests(actual, expected):
++  assert len(actual) >= len(expected)
++  for _, payload in actual:
++    assert payload.get('stream') is True
++
++  remaining = iter(actual)
++  for expected_path, expected_payload in expected:
++
++    for actual_path, actual_payload in remaining:
++      if actual_path == expected_path and all(actual_payload.get(key) == value for key, value in expected_payload.items()):
++        break
++    else:
++      pytest.fail(f'missing streamed request for {expected_path}: {expected_payload}')
++
++
++def test_client_generate_streams_typed_fragments_and_sends_stream_true():
++
++
++
++
++  with StreamingServer() as server:
++    server.stream('/api/generate', [{'model': 'dummy', 'response': 'Because '}, {'model': 'dummy', 'response': 'it '}, {'model': 'dummy', 'response': 'is.'}])
++    client = Client(server.url)
++
++    response = client.generate('dummy', 'Why is the sky blue?', stream=True)
++
++    assert _dump_parts(response) == [{'model': 'dummy', 'response': 'Because '}, {'model': 'dummy', 'response': 'it '}, {'model': 'dummy', 'response': 'is.'}]
++    _assert_stream_requests(server.requests(), [('/api/generate', {'model': 'dummy', 'prompt': 'Why is the sky blue?'})])
++    client.close()
++
++
++def test_client_chat_streams_assistant_message_fragments():
++
++
++
++
++  with StreamingServer() as server:
++    server.stream('/api/chat', [{'model': 'dummy', 'message': {'role': 'assistant', 'content': 'I '}}, {'model': 'dummy', 'message': {'role': 'assistant', 'content': 'know.'}}])
++    client = Client(server.url)
++
++    response = client.chat('dummy', messages=[{'role': 'user', 'content': 'Say something'}], stream=True)
++
++    assert _dump_parts(response) == [{'model': 'dummy', 'message': {'role': 'assistant', 'content': 'I '}}, {'model': 'dummy', 'message': {'role': 'assistant', 'content': 'know.'}}]
++    _assert_stream_requests(server.requests(), [('/api/chat', {'model': 'dummy', 'messages': [{'role': 'user', 'content': 'Say something'}]})])
++    client.close()
++
++
++def test_client_progress_methods_stream_status_chunks_in_order():
++
++
++
++
++  with StreamingServer() as server:
++    server.stream('/api/pull', [{'status': 'pulling manifest'}, {'status': 'verifying sha256 digest'}, {'status': 'success'}])
++    server.stream('/api/push', [{'status': 'retrieving manifest'}, {'status': 'pushing manifest'}, {'status': 'success'}])
++    server.stream('/api/create', [{'status': 'reading model metadata'}, {'status': 'creating system layer'}, {'status': 'success'}])
++    client = Client(server.url)
++
++    pull_parts = client.pull('dummy', stream=True)
++    push_parts = client.push('dummy', stream=True)
++    create_parts = client.create('dummy', stream=True)
++
++    assert _dump_parts(pull_parts) == [{'status': 'pulling manifest'}, {'status': 'verifying sha256 digest'}, {'status': 'success'}]
++    assert _dump_parts(push_parts) == [{'status': 'retrieving manifest'}, {'status': 'pushing manifest'}, {'status': 'success'}]
++    assert _dump_parts(create_parts) == [{'status': 'reading model metadata'}, {'status': 'creating system layer'}, {'status': 'success'}]
++    _assert_stream_requests(server.requests(), [('/api/pull', {'model': 'dummy'}), ('/api/push', {'model': 'dummy'}), ('/api/create', {'model': 'dummy'})])
++    client.close()
++
++
++def test_top_level_generate_and_chat_aliases_stream_through_default_client(monkeypatch):
++
++
++
++
++  with StreamingServer() as server:
++    server.stream('/api/generate', [{'model': 'dummy', 'response': 'Because '}, {'model': 'dummy', 'response': 'it '}, {'model': 'dummy', 'response': 'is.'}], close=True)
++    server.stream('/api/chat', [{'model': 'dummy', 'message': {'role': 'assistant', 'content': 'I '}}, {'model': 'dummy', 'message': {'role': 'assistant', 'content': 'know.'}}], close=True)
++    monkeypatch.setenv('OLLAMA_HOST', server.url)
++    ollama = importlib.reload(importlib.import_module('ollama'))
++
++    generate_parts = ollama.generate('dummy', 'Why is the sky blue?', stream=True)
++    chat_parts = ollama.chat('dummy', messages=[{'role': 'user', 'content': 'Say something'}], stream=True)
++
++    assert _dump_parts(generate_parts) == [{'model': 'dummy', 'response': 'Because '}, {'model': 'dummy', 'response': 'it '}, {'model': 'dummy', 'response': 'is.'}]
++    assert _dump_parts(chat_parts) == [{'model': 'dummy', 'message': {'role': 'assistant', 'content': 'I '}}, {'model': 'dummy', 'message': {'role': 'assistant', 'content': 'know.'}}]
++    _assert_stream_requests(server.requests(), [
++      ('/api/generate', {'model': 'dummy', 'prompt': 'Why is the sky blue?'}),
++      ('/api/chat', {'model': 'dummy', 'messages': [{'role': 'user', 'content': 'Say something'}]}),
++    ])
++
++
++def test_async_client_mirrors_streaming_api_for_all_streaming_methods():
++
++
++
++
++
++  async def run():
++    with StreamingServer() as server:
++      server.stream('/api/generate', [{'model': 'dummy', 'response': 'Because '}, {'model': 'dummy', 'response': 'it '}, {'model': 'dummy', 'response': 'is.'}])
++      server.stream('/api/chat', [{'model': 'dummy', 'message': {'role': 'assistant', 'content': 'I '}}, {'model': 'dummy', 'message': {'role': 'assistant', 'content': 'know.'}}])
++      server.stream('/api/pull', [{'status': 'pulling manifest'}, {'status': 'verifying sha256 digest'}, {'status': 'success'}])
++      server.stream('/api/push', [{'status': 'retrieving manifest'}, {'status': 'pushing manifest'}, {'status': 'success'}])
++      server.stream('/api/create', [{'status': 'reading model metadata'}, {'status': 'creating system layer'}, {'status': 'success'}])
++      client = AsyncClient(server.url)
++
++      generate_parts = await client.generate('dummy', 'Why is the sky blue?', stream=True)
++      chat_parts = await client.chat('dummy', messages=[{'role': 'user', 'content': 'Say something'}], stream=True)
++      pull_parts = await client.pull('dummy', stream=True)
++      push_parts = await client.push('dummy', stream=True)
++      create_parts = await client.create('dummy', stream=True)
++
++      assert await _dump_async_parts(generate_parts) == [{'model': 'dummy', 'response': 'Because '}, {'model': 'dummy', 'response': 'it '}, {'model': 'dummy', 'response': 'is.'}]
++      assert await _dump_async_parts(chat_parts) == [{'model': 'dummy', 'message': {'role': 'assistant', 'content': 'I '}}, {'model': 'dummy', 'message': {'role': 'assistant', 'content': 'know.'}}]
++      assert await _dump_async_parts(pull_parts) == [{'status': 'pulling manifest'}, {'status': 'verifying sha256 digest'}, {'status': 'success'}]
++      assert await _dump_async_parts(push_parts) == [{'status': 'retrieving manifest'}, {'status': 'pushing manifest'}, {'status': 'success'}]
++      assert await _dump_async_parts(create_parts) == [{'status': 'reading model metadata'}, {'status': 'creating system layer'}, {'status': 'success'}]
++      _assert_stream_requests(server.requests(), [
++        ('/api/generate', {'model': 'dummy', 'prompt': 'Why is the sky blue?'}),
++        ('/api/chat', {'model': 'dummy', 'messages': [{'role': 'user', 'content': 'Say something'}]}),
++        ('/api/pull', {'model': 'dummy'}),
++        ('/api/push', {'model': 'dummy'}),
++        ('/api/create', {'model': 'dummy'}),
++      ])
++      await client.close()
++
++  asyncio.run(run())
++
++
++def test_http_status_error_before_stream_iteration_raises_response_error():
++
++
++
++
++  with StreamingServer() as server:
++    server.error('/api/generate', 418, 'teapot stream failed')
++    client = Client(server.url)
++    response = client.generate('dummy', 'x', stream=True)
++
++    with pytest.raises(ResponseError) as caught:
++      list(response)
++
++    assert caught.value.error == 'teapot stream failed'
++    assert caught.value.status_code == 418
++
++    assert isinstance(caught.value, ResponseError)
++    _assert_stream_requests(server.requests(), [('/api/generate', {'model': 'dummy', 'prompt': 'x'})])
++    client.close()
++
++
++def test_streamed_error_object_raises_response_error_instead_of_yielding():
++
++
++
++
++  with StreamingServer() as server:
++    server.stream('/api/generate', [{'model': 'dummy', 'response': 'ok'}, {'error': 'stream broke'}])
++    client = Client(server.url)
++    response = iter(client.generate('dummy', 'x', stream=True))
++
++    assert next(response).model_dump(exclude_none=True) == {'model': 'dummy', 'response': 'ok'}
++    with pytest.raises(ResponseError) as caught:
++      next(response)
++
++    assert caught.value.error == 'stream broke'
++
++    assert isinstance(caught.value, ResponseError)
++    _assert_stream_requests(server.requests(), [('/api/generate', {'model': 'dummy', 'prompt': 'x'})])
++    client.close()
++
++
++def test_async_streamed_error_object_raises_response_error_instead_of_yielding():
++
++
++
++
++
++  async def run():
++    with StreamingServer() as server:
++      server.stream('/api/generate', [{'model': 'dummy', 'response': 'ok'}, {'error': 'stream broke'}])
++      client = AsyncClient(server.url)
++      response = await client.generate('dummy', 'x', stream=True)
++      iterator = response.__aiter__()
++
++      assert (await iterator.__anext__()).model_dump(exclude_none=True) == {'model': 'dummy', 'response': 'ok'}
++      with pytest.raises(ResponseError) as caught:
++        await iterator.__anext__()
++
++      assert caught.value.error == 'stream broke'
++
++      assert isinstance(caught.value, ResponseError)
++      _assert_stream_requests(server.requests(), [('/api/generate', {'model': 'dummy', 'prompt': 'x'})])
++      await client.close()
++
++  asyncio.run(run())
++
++
++def test_client_and_async_client_can_close_after_streaming():
++
++
++
++
++
++  async def run_async_close(url):
++    client = AsyncClient(url)
++    parts = await client.generate('dummy', 'x', stream=True)
++    assert await _dump_async_parts(parts) == [{'model': 'dummy', 'response': 'done'}]
++
++    await client.close()
++
++  with StreamingServer() as sync_server:
++    sync_server.stream('/api/generate', [{'model': 'dummy', 'response': 'done'}])
++    client = Client(sync_server.url)
++    assert _dump_parts(client.generate('dummy', 'x', stream=True)) == [{'model': 'dummy', 'response': 'done'}]
++
++    client.close()
++    _assert_stream_requests(sync_server.requests(), [('/api/generate', {'model': 'dummy', 'prompt': 'x'})])
++
++  with StreamingServer() as async_server:
++    async_server.stream('/api/generate', [{'model': 'dummy', 'response': 'done'}])
++    asyncio.run(run_async_close(async_server.url))
++    _assert_stream_requests(async_server.requests(), [('/api/generate', {'model': 'dummy', 'prompt': 'x'})])
++
++
++def test_two_client_instances_keep_hosts_and_stream_state_independent():
++
++
++
++
++  with StreamingServer() as server_a, StreamingServer() as server_b:
++    server_a.stream('/api/generate', [{'model': 'dummy-a', 'response': 'A1'}, {'model': 'dummy-a', 'response': 'A2'}])
++    server_b.stream('/api/chat', [{'model': 'dummy-b', 'message': {'role': 'assistant', 'content': 'B1'}}])
++    client_a = Client(server_a.url)
++    client_b = Client(server_b.url)
++
++    assert _dump_parts(client_a.generate('dummy-a', 'prompt a', stream=True)) == [{'model': 'dummy-a', 'response': 'A1'}, {'model': 'dummy-a', 'response': 'A2'}]
++    assert _dump_parts(client_b.chat('dummy-b', messages=[{'role': 'user', 'content': 'prompt b'}], stream=True)) == [{'model': 'dummy-b', 'message': {'role': 'assistant', 'content': 'B1'}}]
++    _assert_stream_requests(server_a.requests(), [('/api/generate', {'model': 'dummy-a', 'prompt': 'prompt a'})])
++    _assert_stream_requests(server_b.requests(), [('/api/chat', {'model': 'dummy-b', 'messages': [{'role': 'user', 'content': 'prompt b'}]})])
++    client_a.close()
++    client_b.close()
++
++
++def test_multiple_client_cycles_stream_generate_chunks():
++
++
++
++
++  with StreamingServer() as server:
++    server.stream('/api/generate', [{'model': 'dummy', 'response': 'done'}])
++    retained_clients = []
++
++
++    for _ in range(3):
++      client = Client(server.url)
++      assert _dump_parts(client.generate('dummy', 'x', stream=True)) == [{'model': 'dummy', 'response': 'done'}]
++      client.close()
++      retained_clients.append(client)
++
++    _assert_stream_requests(server.requests(), [
++      ('/api/generate', {'model': 'dummy', 'prompt': 'x'}),
++      ('/api/generate', {'model': 'dummy', 'prompt': 'x'}),
++      ('/api/generate', {'model': 'dummy', 'prompt': 'x'}),
++    ])
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,19 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++cd /workspace/repo
++
++export PYTHONPATH="/workspace/repo${PYTHONPATH:+:$PYTHONPATH}"
++export PYTHONDONTWRITEBYTECODE=1
++export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
++
++exec /usr/local/bin/python -m pytest -p no:cacheprovider /workspace/repo/usercase-test-coderl/test_streaming_responses.py -v

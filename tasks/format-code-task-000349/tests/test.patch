@@ -1,0 +1,497 @@
+diff --git a/usercase-test-coderl/fixtures/registry_mock.py b/usercase-test-coderl/fixtures/registry_mock.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/fixtures/registry_mock.py
+@@ -0,0 +1,164 @@
++#!/usr/bin/env python3
++import hashlib
++import http.server
++import json
++import socketserver
++import sys
++
++
++MODE = sys.argv[1]
++LOG_PATH = sys.argv[2]
++
++
++LINUX_MANIFEST = json.dumps(
++    {
++        "schemaVersion": 2,
++        "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
++        "config": {
++            "mediaType": "application/vnd.docker.container.image.v1+json",
++            "size": 2,
++            "digest": "sha256:" + "1" * 64,
++        },
++        "layers": [],
++    },
++    separators=(",", ":"),
++).encode()
++
++WINDOWS_MANIFEST = json.dumps(
++    {
++        "schemaVersion": 2,
++        "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
++        "config": {
++            "mediaType": "application/vnd.docker.container.image.v1+json",
++            "size": 2,
++            "digest": "sha256:" + "2" * 64,
++        },
++        "layers": [],
++    },
++    separators=(",", ":"),
++).encode()
++
++LINUX_DIGEST = "sha256:" + hashlib.sha256(LINUX_MANIFEST).hexdigest()
++WINDOWS_DIGEST = "sha256:" + hashlib.sha256(WINDOWS_MANIFEST).hexdigest()
++
++MANIFEST_LIST = json.dumps(
++    {
++        "schemaVersion": 2,
++        "mediaType": "application/vnd.docker.distribution.manifest.list.v2+json",
++        "manifests": [
++            {
++                "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
++                "size": len(LINUX_MANIFEST),
++                "digest": LINUX_DIGEST,
++                "platform": {"architecture": "amd64", "os": "linux"},
++            },
++            {
++                "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
++                "size": len(WINDOWS_MANIFEST),
++                "digest": WINDOWS_DIGEST,
++                "platform": {"architecture": "arm64", "os": "windows"},
++            },
++        ],
++    },
++    separators=(",", ":"),
++).encode()
++
++
++class Handler(http.server.BaseHTTPRequestHandler):
++    def log_message(self, fmt, *args):
++        pass
++
++    def record(self):
++        with open(LOG_PATH, "a", encoding="utf-8") as f:
++            f.write(
++                f"{self.command} {self.path} AUTH={self.headers.get('Authorization')}\n"
++            )
++
++    def do_GET(self):
++        self.record()
++        if MODE == "auth401":
++            self.send_response(401)
++            self.send_header("WWW-Authenticate", 'Basic realm="mock"')
++            self.end_headers()
++            return
++
++        if self.path in {"/v2/", "/v2"}:
++            self.send_response(200)
++            self.end_headers()
++            return
++
++        if self.path.endswith("/manifests/v1"):
++            self.send_body(
++                MANIFEST_LIST,
++                "application/vnd.docker.distribution.manifest.list.v2+json",
++            )
++            return
++        if self.path.endswith("/manifests/" + LINUX_DIGEST):
++            self.send_body(
++                LINUX_MANIFEST,
++                "application/vnd.docker.distribution.manifest.v2+json",
++            )
++            return
++        if self.path.endswith("/manifests/" + WINDOWS_DIGEST):
++            self.send_body(
++                WINDOWS_MANIFEST,
++                "application/vnd.docker.distribution.manifest.v2+json",
++            )
++            return
++        if "/blobs/" in self.path:
++            self.send_body(b"{}", "application/octet-stream")
++            return
++
++        self.send_response(404)
++        self.end_headers()
++
++    def do_HEAD(self):
++
++        self.record()
++        self.send_response(404)
++        self.end_headers()
++
++    def do_POST(self):
++
++        self.record()
++        self.send_response(202)
++        self.send_header("Location", self.path.rstrip("/") + "/localb-upload")
++        self.send_header("Docker-Upload-UUID", "localb-upload")
++        self.send_header("Range", "0-0")
++        self.end_headers()
++
++    def do_PATCH(self):
++
++        self.record()
++        length = int(self.headers.get("Content-Length", "0"))
++        if length:
++            self.rfile.read(length)
++        self.send_response(202)
++        self.send_header("Location", self.path)
++        self.send_header("Docker-Upload-UUID", "localb-upload")
++        self.send_header("Range", "0-0")
++        self.end_headers()
++
++    def do_PUT(self):
++        self.record()
++        length = int(self.headers.get("Content-Length", "0"))
++        if length:
++            self.rfile.read(length)
++        self.send_response(201)
++        self.end_headers()
++
++    def send_body(self, body, media_type):
++        self.send_response(200)
++        self.send_header("Content-Type", media_type)
++        self.send_header("Content-Length", str(len(body)))
++        self.end_headers()
++        self.wfile.write(body)
++
++
++class ReusableTCPServer(socketserver.TCPServer):
++    allow_reuse_address = True
++
++
++with ReusableTCPServer(("127.0.0.1", 0), Handler) as httpd:
++    print(httpd.server_address[1], flush=True)
++    httpd.serve_forever()
+diff --git a/usercase-test-coderl/usecase.sh b/usercase-test-coderl/usecase.sh
+new file mode 100755
+--- /dev/null
++++ b/usercase-test-coderl/usecase.sh
+@@ -0,0 +1,302 @@
++#!/usr/bin/env bash
++
++set -u
++export LANG=C.UTF-8 LC_ALL=C.UTF-8 TZ=UTC
++
++( cd /workspace/repo && make cmd ) || { echo "FAIL: build" >&2; exit 1; }
++BIN=/workspace/repo/image-syncer
++FIXTURES=/workspace/repo/usercase-test-coderl/fixtures
++
++TMP=$(mktemp -d)
++SERVER_PIDS=()
++cleanup() {
++    for pid in "${SERVER_PIDS[@]}"; do
++        kill "$pid" >/dev/null 2>&1 || true
++    done
++    rm -rf "$TMP"
++}
++trap cleanup EXIT
++cd "$TMP" || exit 1
++
++fail() { echo "FAIL: $*" >&2; exit 1; }
++
++assert_empty() {
++    [ ! -s "$1" ] || fail "$2: expected empty, got $(cat "$1")"
++}
++
++assert_exact() {
++    local file=$1
++    local expected=$2
++    local label=$3
++    local actual
++    actual=$(cat "$file")
++    [ "$actual" = "$expected" ] || fail "$label: got [$actual], want [$expected]"
++}
++
++assert_contains() {
++    local file=$1
++    local needle=$2
++    local label=$3
++    grep -Fq -- "$needle" "$file" || fail "$label: missing [$needle] in $(cat "$file" 2>/dev/null)"
++}
++
++assert_contains_ci() {
++    local file=$1
++    local needle=$2
++    local label=$3
++    grep -Fiq -- "$needle" "$file" || fail "$label: missing case-insensitive [$needle] in $(cat "$file" 2>/dev/null)"
++}
++
++assert_not_contains() {
++    local file=$1
++    local needle=$2
++    local label=$3
++    ! grep -Fq -- "$needle" "$file" || fail "$label: unexpected [$needle] in $(cat "$file" 2>/dev/null)"
++}
++
++assert_count() {
++    local file=$1
++    local needle=$2
++    local expected=$3
++    local label=$4
++    local actual
++    actual=$(grep -F -- "$needle" "$file" | wc -l | tr -d ' ')
++    [ "$actual" = "$expected" ] || fail "$label: count $actual, want $expected for [$needle]"
++}
++
++start_registry() {
++    local mode=$1
++    local log=$2
++    local portfile=$3
++    python3 "$FIXTURES/registry_mock.py" "$mode" "$log" >"$portfile" 2>"$log.stderr" &
++    local pid=$!
++    SERVER_PIDS+=("$pid")
++    for _ in $(seq 1 50); do
++        [ -s "$portfile" ] && return 0
++        sleep 0.1
++    done
++    fail "mock registry did not start"
++}
++
++
++
++
++"$BIN" --help >out 2>err; ec=$?
++[ "$ec" -eq 0 ] || fail "F1 exit $ec; want 0"
++
++cat out err >combined
++assert_contains combined "--config" "F1 --config"
++assert_contains combined "--auth" "F1 --auth"
++assert_contains combined "--images" "F1 --images"
++assert_contains combined "--os" "F1 --os"
++assert_contains combined "--arch" "F1 --arch"
++
++
++
++
++"$BIN" --proc 1 --retries 0 --log no-input.log >out 2>err; ec=$?
++[ "$ec" -ne 0 ] || fail "F2 expected non-zero exit"
++
++cat out err >combined
++assert_contains combined "neither config.json nor images.json is provided" "F2 missing-input error"
++assert_contains_ci combined "init" "F2 initialization error"
++
++
++
++
++printf '{}\n' > rules.txt
++"$BIN" --images rules.txt --proc 1 --retries 0 --log bad-image-ext.log >out 2>err; ec=$?
++[ "$ec" -ne 0 ] || fail "F3 expected non-zero exit"
++
++cat out err >combined
++assert_contains combined "decode image file rules.txt error: only one of yaml/yml/json format is supported" "F3 image extension error"
++assert_contains_ci combined "init" "F3 initialization error"
++
++
++
++
++printf '{}\n' > images.json
++printf '{}\n' > auth.txt
++"$BIN" --images images.json --auth auth.txt --proc 1 --retries 0 --log bad-auth-ext.log >out 2>err; ec=$?
++[ "$ec" -ne 0 ] || fail "F4 expected non-zero exit"
++
++cat out err >combined
++assert_contains combined "auth.txt" "F4 auth path in error"
++assert_contains combined "yaml/yml/json" "F4 supported formats in error"
++
++
++
++
++printf '{"images":{}}\n' > combined.toml
++"$BIN" --config combined.toml --proc 1 --retries 0 --log bad-config-ext.log >out 2>err; ec=$?
++[ "$ec" -ne 0 ] || fail "F5 expected non-zero exit"
++
++cat out err >combined
++assert_contains combined "combined.toml" "F5 config path in error"
++assert_contains combined "yaml/yml/json" "F5 supported formats in error"
++
++
++
++
++printf '{}\n' > images-only.yml
++"$BIN" --images images-only.yml --proc 1 --retries 0 --log images-only.log >out 2>err; ec=$?
++[ "$ec" -eq 0 ] || fail "F6 exit $ec; want 0"
++
++assert_contains_ci images-only.log "warning" "F6 warning level"
++assert_contains images-only.log "config.json" "F6 warning mentions config.json"
++assert_contains images-only.log "auth.json" "F6 warning mentions auth.json"
++
++
++
++
++start_registry manifest-list config-yaml.registry.log config-yaml.port
++PORT=$(cat config-yaml.port)
++cat > config.yaml <<EOF
++auth:
++  127.0.0.1:$PORT/team:
++    username: config-user
++    password: config-pass
++    insecure: true
++images:
++  127.0.0.1:$PORT/team/source:v1: 127.0.0.1:$PORT/team/dest:v1
++EOF
++"$BIN" --config config.yaml --proc 1 --retries 0 --log config-yaml.log >out 2>err; ec=$?
++[ "$ec" -eq 0 ] || fail "F7 exit $ec; want 0"
++
++assert_contains config-yaml.registry.log "/v2/team/source/manifests/v1" "F7 source manifest fetched from combined config"
++
++
++
++
++start_registry manifest-list list-images.registry.log list-images.port
++PORT=$(cat list-images.port)
++cat > list-images.yaml <<EOF
++127.0.0.1:$PORT/team/source:v1:
++  - "\$DEST_A"
++  - "\$DEST_A"
++  - "\$DEST_B"
++EOF
++cat > list-images-auth.json <<EOF
++{"127.0.0.1:$PORT/team":{"username":"u","password":"p","insecure":true},
++ "127.0.0.1:$PORT/ns":{"username":"u","password":"p","insecure":true}}
++EOF
++DEST_A=127.0.0.1:$PORT/ns/one:v1 DEST_B=127.0.0.1:$PORT/ns/two:v1 \
++    "$BIN" --images list-images.yaml --auth list-images-auth.json --proc 1 --retries 0 --force --log list-images.log >out 2>err; ec=$?
++[ "$ec" -eq 0 ] || fail "F8 exit $ec; want 0"
++
++assert_count list-images.registry.log "PUT /v2/ns/one/manifests/v1" 1 "F8 unique expanded first destination"
++assert_count list-images.registry.log "PUT /v2/ns/two/manifests/v1" 1 "F8 unique expanded second destination"
++
++
++
++
++cat > empty-dest-string.json <<'EOF'
++{"registry.example.com/ns/src:v1":""}
++EOF
++"$BIN" --images empty-dest-string.json --proc 1 --retries 0 --log empty-dest-string.log >out 2>err; ec=$?
++[ "$ec" -ne 0 ] || fail "F9 expected non-zero exit"
++
++cat out err >combined
++assert_contains combined "empty destination is not supported for source: registry.example.com/ns/src:v1" "F9 empty destination error"
++
++
++
++
++cat > empty-dest-list.json <<'EOF'
++{"registry.example.com/ns/src:v1":[]}
++EOF
++"$BIN" --images empty-dest-list.json --proc 1 --retries 0 --log empty-dest-list.log >out 2>err; ec=$?
++[ "$ec" -ne 0 ] || fail "F10 expected non-zero exit"
++
++cat out err >combined
++assert_contains combined "empty destination is not supported for source: registry.example.com/ns/src:v1" "F10 empty list error"
++
++
++
++
++cat > non-string-dest.json <<'EOF'
++{"registry.example.com/ns/src:v1":["registry.example.com/ns/dst:v1",42]}
++EOF
++"$BIN" --images non-string-dest.json --proc 1 --retries 0 --log non-string-dest.log >out 2>err; ec=$?
++[ "$ec" -ne 0 ] || fail "F11 expected non-zero exit"
++
++cat out err >combined
++assert_contains combined "registry.example.com/ns/src:v1" "F11 source in non-string destination error"
++assert_contains_ci combined "destination" "F11 destination-context error"
++
++
++
++
++start_registry auth401 auth-longest.registry.log auth-longest.port
++PORT=$(cat auth-longest.port)
++cat > auth-longest-images.json <<EOF
++{"127.0.0.1:$PORT/team/app/source:v1":"127.0.0.1:$PORT/team/dest:v1"}
++EOF
++cat > auth-longest.json <<EOF
++{
++  "127.0.0.1:$PORT/team": {"username":"\$SYNC_USER","password":"\$SYNC_PASS","insecure":true},
++  "127.0.0.1:$PORT/team/app": {"username":"\$SYNC_USER","password":"\$SYNC_PASS","insecure":true}
++}
++EOF
++SYNC_USER=specific-user SYNC_PASS=specific-pass \
++"$BIN" --images auth-longest-images.json --auth auth-longest.json --proc 1 --retries 0 --log auth-longest.log >out 2>err; ec=$?
++[ "$ec" -ne 0 ] || fail "F12 expected non-zero exit from mock auth challenge"
++
++
++assert_contains auth-longest.registry.log "/v2/team/app/source/manifests/v1 AUTH=Basic c3BlY2lmaWMtdXNlcjpzcGVjaWZpYy1wYXNz" "F12 specific expanded auth"
++assert_not_contains auth-longest.log "Auth information not found for 127.0.0.1:$PORT/team/app/source" "F12 source matched auth"
++
++
++
++
++cat > auth-boundary-images.json <<'EOF'
++{"127.0.0.1:1/team/application/source:v1":"127.0.0.1:1/team/dest:v1"}
++EOF
++cat > auth-boundary.json <<'EOF'
++{
++  "127.0.0.1:1/team/app": {"username":"wrong-user","password":"wrong-pass","insecure":true}
++}
++EOF
++"$BIN" --images auth-boundary-images.json --auth auth-boundary.json --proc 1 --retries 0 --log auth-boundary.log >out 2>err; ec=$?
++[ "$ec" -ne 0 ] || fail "F13 expected non-zero exit from unreachable registry"
++
++assert_contains auth-boundary.log "127.0.0.1:1/team/application/source" "F13 source repository logged"
++assert_contains auth-boundary.log "127.0.0.1:1/team/dest" "F13 destination repository logged"
++assert_contains_ci auth-boundary.log "anonymous" "F13 anonymous fallback logged"
++
++
++
++
++start_registry manifest-list filters-empty.registry.log filters-empty.port
++PORT=$(cat filters-empty.port)
++cat > filters-empty-images.json <<EOF
++{"127.0.0.1:$PORT/team/source:v1":"127.0.0.1:$PORT/team/dest:v1"}
++EOF
++cat > filters-empty-auth.json <<EOF
++{"127.0.0.1:$PORT/team":{"username":"u","password":"p","insecure":true}}
++EOF
++"$BIN" --images filters-empty-images.json --auth filters-empty-auth.json --proc 1 --retries 0 --force --os "" --arch "" --log filters-empty.log >out 2>err; ec=$?
++[ "$ec" -eq 0 ] || fail "F14 exit $ec; want 0"
++
++assert_contains filters-empty.registry.log "PUT /v2/team/dest/manifests/sha256:4b4ba550b7333dc29f7b3d1182efd4194e54b82d21e7ba7da8f232a33527757d" "F14 linux manifest copied"
++assert_contains filters-empty.registry.log "PUT /v2/team/dest/manifests/sha256:a2b9eb2c854c6aae675fd9b3a6471ff4933a390c3f53f88c4b03cd77424f16cf" "F14 windows manifest copied"
++
++
++
++
++start_registry manifest-list filters-linux.registry.log filters-linux.port
++PORT=$(cat filters-linux.port)
++cat > filters-linux-images.json <<EOF
++{"127.0.0.1:$PORT/team/source:v1":"127.0.0.1:$PORT/team/dest:v1"}
++EOF
++cat > filters-linux-auth.json <<EOF
++{"127.0.0.1:$PORT/team":{"username":"u","password":"p","insecure":true}}
++EOF
++"$BIN" --images filters-linux-images.json --auth filters-linux-auth.json --proc 1 --retries 0 --force --os "" --os linux --arch "" --arch amd64 --log filters-linux.log >out 2>err; ec=$?
++[ "$ec" -eq 0 ] || fail "F15 exit $ec; want 0"
++
++assert_contains filters-linux.registry.log "PUT /v2/team/dest/manifests/sha256:4b4ba550b7333dc29f7b3d1182efd4194e54b82d21e7ba7da8f232a33527757d" "F15 linux manifest copied"
++assert_not_contains filters-linux.registry.log "PUT /v2/team/dest/manifests/sha256:a2b9eb2c854c6aae675fd9b3a6471ff4933a390c3f53f88c4b03cd77424f16cf" "F15 windows manifest filtered out"
++
++echo "PASS"
++exit 0
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,16 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++export GOTOOLCHAIN=local
++export GOPROXY=off
++export GOSUMDB=off
++export GOFLAGS="${GOFLAGS:-} -mod=readonly"
++set -e
++cd /workspace/repo
++exec bash /workspace/repo/usercase-test-coderl/usecase.sh

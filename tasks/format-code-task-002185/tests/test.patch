@@ -1,0 +1,440 @@
+diff --git a/usercase-test-coderl/test_module_lazy_union.py b/usercase-test-coderl/test_module_lazy_union.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/test_module_lazy_union.py
+@@ -0,0 +1,376 @@
++
++
++
++
++
++
++
++
++
++
++import gc
++import re
++import tracemalloc
++
++import pytest
++
++from pythonopenscad import (
++    Circle,
++    InvalidValueForStr,
++    LazyUnion,
++    Module,
++    RequiredParameterNotProvided,
++    lazy_union,
++    module,
++)
++
++
++LAZY_UNION_TWO_CIRCLES_SCAD = (
++    "// Start: lazy_union\n"
++    "circle(r=10.0);\n"
++    "circle(r=5.0);\n"
++    "// End: lazy_union\n"
++)
++
++LAZY_UNION_TWO_CIRCLES_REPR = (
++    "lazy_union() (\n"
++    "  circle(r=10.0),\n"
++    "  circle(r=5.0)\n"
++    "),\n"
++)
++
++SORTED_MODULES_SCAD = (
++    "// Start: lazy_union\n"
++    "obj2();\n"
++    "obj1();\n"
++    "// End: lazy_union\n"
++    "\n"
++    "// Modules.\n"
++    "\n"
++    "module obj1() {\n"
++    "  circle(r=10.0);\n"
++    "} // end module obj1\n"
++    "\n"
++    "module obj2() {\n"
++    "  circle(r=5.0);\n"
++    "} // end module obj2\n"
++)
++
++ALIAS_MODULES_SCAD = (
++    "// Start: lazy_union\n"
++    "obj1();\n"
++    "obj2();\n"
++    "// End: lazy_union\n"
++    "\n"
++    "// Modules.\n"
++    "\n"
++    "module obj1() {\n"
++    "  circle(r=10.0);\n"
++    "} // end module obj1\n"
++    "\n"
++    "module obj2() {\n"
++    "  circle(r=5.0);\n"
++    "} // end module obj2\n"
++)
++
++CONVENIENCE_MODULE_SCAD = (
++    "// Start: lazy_union\n"
++    "wrapped();\n"
++    "// End: lazy_union\n"
++    "\n"
++    "// Modules.\n"
++    "\n"
++    "module wrapped() {\n"
++    "  circle(r=7.0);\n"
++    "} // end module wrapped\n"
++)
++
++COLLIDING_MODULES_SCAD = (
++    "// Start: lazy_union\n"
++    "colliding_name();\n"
++    "colliding_name_1();\n"
++    "// End: lazy_union\n"
++    "\n"
++    "// Modules.\n"
++    "\n"
++    "module colliding_name() {\n"
++    "  circle(r=10.0);\n"
++    "} // end module colliding_name\n"
++    "\n"
++    "module colliding_name_1() {\n"
++    "  circle(r=5.0);\n"
++    "} // end module colliding_name_1\n"
++)
++
++SHARED_EQUIVALENT_MODULE_SCAD = (
++    "// Start: lazy_union\n"
++    "same();\n"
++    "same();\n"
++    "// End: lazy_union\n"
++    "\n"
++    "// Modules.\n"
++    "\n"
++    "module same() {\n"
++    "  circle(r=10.0);\n"
++    "} // end module same\n"
++)
++
++INSTANCE_A_SCAD = (
++    "// Start: lazy_union\n"
++    "shared();\n"
++    "shared_1();\n"
++    "// End: lazy_union\n"
++    "\n"
++    "// Modules.\n"
++    "\n"
++    "module shared() {\n"
++    "  circle(r=1.0);\n"
++    "} // end module shared\n"
++    "\n"
++    "module shared_1() {\n"
++    "  circle(r=2.0);\n"
++    "} // end module shared_1\n"
++)
++
++INSTANCE_B_SCAD = (
++    "// Start: lazy_union\n"
++    "shared();\n"
++    "// End: lazy_union\n"
++    "\n"
++    "// Modules.\n"
++    "\n"
++    "module shared() {\n"
++    "  circle(r=1.0);\n"
++    "} // end module shared\n"
++)
++
++
++_CALL_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\s*\(\s*\)\s*;$")
++_MODULE_RE = re.compile(r"^module\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(\s*\)\s*(\{)?$")
++
++
++def _nonblank_lines(scad):
++    return [line.strip() for line in scad.splitlines() if line.strip()]
++
++
++def _circle_line(radius, semicolon=True):
++    suffix = r";" if semicolon else ""
++    return re.compile(rf"^circle\s*\(\s*r\s*=\s*{radius}(?:\.0)?\s*\){suffix}$", re.MULTILINE)
++
++
++def _split_lazy_union(scad):
++    lines = _nonblank_lines(scad)
++    assert lines[0] == "// Start: lazy_union"
++    end_index = lines.index("// End: lazy_union")
++    main_lines = lines[1:end_index]
++    module_lines = lines[end_index + 1 :]
++    assert not any(re.match(r"^union\s*\(", line) for line in main_lines)
++    return main_lines, module_lines
++
++
++def _call_names(lines):
++    names = []
++    for line in lines:
++        match = _CALL_RE.match(line)
++        assert match, f"expected module call, got {line!r}"
++        names.append(match.group(1))
++    return names
++
++
++def _module_definitions(scad):
++    _, module_lines = _split_lazy_union(scad)
++    assert module_lines[0] == "// Modules."
++    definitions = []
++    index = 1
++    while index < len(module_lines):
++        match = _MODULE_RE.match(module_lines[index])
++        assert match, f"expected module definition, got {module_lines[index]!r}"
++        name = match.group(1)
++        body = []
++        index += 1
++
++        if match.group(2) is None:
++            assert index < len(module_lines) and module_lines[index] == "{"
++            index += 1
++        while index < len(module_lines) and not module_lines[index].startswith("}"):
++            body.append(module_lines[index])
++            index += 1
++        assert index < len(module_lines), f"module {name!r} was not closed"
++        definitions.append((name, body))
++        index += 1
++    return definitions
++
++
++def _assert_lazy_union_circles(scad, radii):
++    main_lines, module_lines = _split_lazy_union(scad)
++    assert module_lines == []
++    assert len(main_lines) == len(radii)
++    for line, radius in zip(main_lines, radii):
++        assert _circle_line(radius).match(line), line
++
++
++def _assert_modules(scad, expected_calls, expected_bodies):
++    main_lines, _ = _split_lazy_union(scad)
++    assert _call_names(main_lines) == expected_calls
++    definitions = _module_definitions(scad)
++    definition_names = [name for name, _ in definitions]
++    assert definition_names == sorted(definition_names)
++    assert definition_names == list(expected_bodies)
++    for name, body in definitions:
++        assert len(body) == 1
++        assert _circle_line(expected_bodies[name]).match(body[0]), body
++
++
++def test_lazy_union_dumps_children_directly_and_repr_keeps_node_shape():
++
++
++
++    model = LazyUnion()(Circle(r=10), Circle(r=5))
++    alias_model = lazy_union()(Circle(r=10), Circle(r=5))
++
++
++    _assert_lazy_union_circles(str(model), [10, 5])
++
++    _assert_lazy_union_circles(str(alias_model), [10, 5])
++    alias_repr = repr(alias_model)
++
++    assert "lazy_union() (" in alias_repr
++    assert re.search(r"circle\s*\(\s*r\s*=\s*10(?:\.0)?\s*\)", alias_repr)
++    assert re.search(r"circle\s*\(\s*r\s*=\s*5(?:\.0)?\s*\)", alias_repr)
++
++
++def test_module_wrappers_replace_body_with_calls_and_sort_definitions():
++
++
++
++    model = LazyUnion()(Module("obj2")(Circle(r=5)), Module("obj1")(Circle(r=10)))
++
++
++    _assert_modules(str(model), ["obj2", "obj1"], {"obj1": 10, "obj2": 5})
++
++
++def test_generated_aliases_produce_the_same_module_session_output():
++
++
++
++    model = lazy_union()(module("obj1")(Circle(r=10)), module("obj2")(Circle(r=5)))
++
++
++    _assert_modules(str(model), ["obj1", "obj2"], {"obj1": 10, "obj2": 5})
++
++
++def test_any_model_node_can_be_wrapped_with_module_convenience_method():
++
++
++
++    model = lazy_union()(Circle(r=7).module("wrapped"))
++
++
++    _assert_modules(str(model), ["wrapped"], {"wrapped": 7})
++
++
++def test_distinct_bodies_with_same_requested_name_get_deterministic_suffix():
++
++
++
++    model = lazy_union()(
++        module("colliding_name")(Circle(r=10)),
++        module("colliding_name")(Circle(r=5)),
++    )
++
++
++    _assert_modules(
++        str(model),
++        ["colliding_name", "colliding_name_1"],
++        {"colliding_name": 10, "colliding_name_1": 5},
++    )
++
++
++def test_equivalent_bodies_with_same_requested_name_share_one_definition():
++
++
++
++    model = lazy_union()(module("same")(Circle(r=10)), module("same")(Circle(r=10)))
++
++
++    _assert_modules(str(model), ["same", "same"], {"same": 10})
++
++
++def test_invalid_module_name_states_raise_specific_validation_errors():
++
++
++
++    with pytest.raises(RequiredParameterNotProvided):
++        Module(name=None)
++
++    with pytest.raises(InvalidValueForStr):
++        Module(name=123)
++
++
++def test_repeated_dumps_are_idempotent_after_module_name_cleanup():
++
++
++
++    model = lazy_union()(
++        module("colliding_name")(Circle(r=10)),
++        module("colliding_name")(Circle(r=5)),
++    )
++
++    first_dump = str(model)
++    second_dump = str(model)
++
++    assert first_dump == second_dump
++
++    _assert_modules(
++        first_dump,
++        ["colliding_name", "colliding_name_1"],
++        {"colliding_name": 10, "colliding_name_1": 5},
++    )
++
++
++def test_module_name_state_is_independent_between_instances():
++
++
++
++    model_a = lazy_union()(module("shared")(Circle(r=1)), module("shared")(Circle(r=2)))
++    model_b = lazy_union()(module("shared")(Circle(r=1)))
++
++    model_a_first = str(model_a)
++    model_b_dump = str(model_b)
++    model_a_second = str(model_a)
++
++    _assert_modules(model_a_first, ["shared", "shared_1"], {"shared": 1, "shared_1": 2})
++
++    _assert_modules(model_b_dump, ["shared"], {"shared": 1})
++
++    assert model_a_first == model_a_second
++
++
++def test_repeated_construct_dump_cycles_do_not_retain_python_heap():
++
++
++
++    tracemalloc.start()
++    try:
++        gc.collect()
++        before_current, _ = tracemalloc.get_traced_memory()
++
++        dumps = set()
++        for _ in range(150):
++            model = lazy_union()(
++                module("leak")(Circle(r=10)),
++                module("leak")(Circle(r=5)),
++            )
++            dumped = str(model)
++
++            _assert_modules(dumped, ["leak", "leak_1"], {"leak": 10, "leak_1": 5})
++            dumps.add(dumped)
++            del model
++
++        gc.collect()
++        after_current, _ = tracemalloc.get_traced_memory()
++    finally:
++        tracemalloc.stop()
++
++
++    assert len(dumps) == 1
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,54 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++
++cd /workspace/repo
++
++export PIP_NO_INDEX=1
++export PIP_DISABLE_PIP_VERSION_CHECK=1
++export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
++
++export PYTHONPATH="/workspace/repo/src:${PYTHONPATH:-}"
++python - <<'PY'
++import importlib
++
++required = [
++    "pytest",
++    "distributed",
++    "numpy",
++    "manifold3d",
++    "mapbox_earcut",
++    "mapbox",
++    "frozendict",
++    "datatrees",
++    "anchorscad_lib.linear",
++    "stl",
++    "OpenGL",
++    "pyglm",
++    "glm",
++    "HersheyFonts",
++    "fontTools",
++    "PIL",
++    "uharfbuzz",
++]
++
++missing = []
++for module_name in required:
++    try:
++        importlib.import_module(module_name)
++    except ImportError as exc:
++        missing.append(f"{module_name}: {exc}")
++
++if missing:
++    raise SystemExit("Missing offline Python dependencies:\n" + "\n".join(missing))
++PY
++exec python -m pytest /workspace/repo/usercase-test-coderl/test_module_lazy_union.py -v

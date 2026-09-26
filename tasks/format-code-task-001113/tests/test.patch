@@ -1,0 +1,172 @@
+diff --git a/internal/stackql/sqldialect/view_catalog_test.go b/internal/stackql/sqldialect/view_catalog_test.go
+new file mode 100644
+index 0000000..c28e5be
+--- /dev/null
++++ b/internal/stackql/sqldialect/view_catalog_test.go
+@@ -0,0 +1,156 @@
++package sqldialect_test
++
++import (
++	"strings"
++	"testing"
++
++	"github.com/stackql/stackql/internal/stackql/constants"
++	"github.com/stackql/stackql/internal/stackql/dto"
++	"github.com/stackql/stackql/internal/stackql/sqlcontrol"
++	"github.com/stackql/stackql/internal/stackql/sqldialect"
++	"github.com/stackql/stackql/internal/stackql/sqlengine"
++)
++
++func newCatalogDialect(t *testing.T) (sqldialect.SQLDialect, sqlengine.SQLEngine) {
++	t.Helper()
++	attrs := sqlcontrol.GetControlAttributes("standard")
++	cfg := dto.SQLBackendCfg{
++		DbEngine:   constants.DbEngineSQLite3Embedded,
++		DSN:        ":memory:",
++		SQLDialect: constants.SQLDialectSQLite3,
++	}
++	engine, err := sqlengine.NewSQLEngine(cfg, attrs)
++	if err != nil {
++		t.Fatalf("new sqlite engine: %v", err)
++	}
++	dialect, err := sqldialect.NewSQLDialect(engine, "", attrs, cfg)
++	if err != nil {
++		t.Fatalf("new sqlite dialect: %v", err)
++	}
++	return dialect, engine
++}
++
++func queryString(t *testing.T, engine sqlengine.SQLEngine, query string, args ...interface{}) string {
++	t.Helper()
++	var value string
++	if err := engine.QueryRow(query, args...).Scan(&value); err != nil {
++		t.Fatalf("query %q: %v", query, err)
++	}
++	return value
++}
++
++func TestCreateViewRegistersDefinitionsWithoutEagerPhysicalView(t *testing.T) {
++	dialect, engine := newCatalogDialect(t)
++	raw := "select id, label from source_items where id > 0;"
++	translated := `create view "catalog_items" as select id, label from "source_items";`
++
++	if err := dialect.CreateView("catalog_items", raw, translated); err != nil {
++		t.Fatalf("CreateView returned error: %v", err)
++	}
++	view, ok := dialect.GetViewByName("catalog_items")
++	if !ok {
++		t.Fatal("created view was not discoverable")
++	}
++	if got := view.GetRawQuery(); got != raw {
++		t.Fatalf("raw definition = %q, want %q", got, raw)
++	}
++	gotTranslated := queryString(t, engine, `select view_stackql_ddl from "__iql__.views" where view_name = ? and deleted_dttm is null`, "catalog_items")
++	if gotTranslated != translated {
++		t.Fatalf("translated definition = %q, want %q", gotTranslated, translated)
++	}
++	physicalCount := queryString(t, engine, `select cast(count(*) as text) from sqlite_schema where type = 'view' and name = ?`, "catalog_items")
++	if physicalCount != "0" {
++		t.Fatalf("CreateView eagerly created a physical view (count %s)", physicalCount)
++	}
++	seeded, ok := dialect.GetViewByName("stackql_repositories")
++	if !ok || seeded.GetRawQuery() != "select id, name, url from github.repos.repos where org = 'stackql';" {
++		t.Fatalf("existing seeded view was not preserved")
++	}
++}
++
++func TestCreateViewReplacesDefinitionAndEscapesCatalogValues(t *testing.T) {
++	dialect, engine := newCatalogDialect(t)
++	name := "owner's_items"
++	firstRaw := "select 1 as id"
++	firstTranslated := `create view "owners_items" as select 1 as id`
++	secondRaw := "select 2 as id"
++	secondTranslated := `create view "owners_items" as select 2 as id`
++
++	if err := dialect.CreateView(name, firstRaw, firstTranslated); err != nil {
++		t.Fatalf("first CreateView returned error: %v", err)
++	}
++	if err := dialect.CreateView(name, secondRaw, secondTranslated); err != nil {
++		t.Fatalf("replacement CreateView returned error: %v", err)
++	}
++	view, ok := dialect.GetViewByName(name)
++	if !ok {
++		t.Fatal("replacement view was not discoverable")
++	}
++	if got := view.GetRawQuery(); got != secondRaw {
++		t.Fatalf("replacement raw definition = %q, want %q", got, secondRaw)
++	}
++	active := queryString(t, engine, `select cast(count(*) as text) from "__iql__.views" where view_name = ? and deleted_dttm is null`, name)
++	if active != "1" {
++		t.Fatalf("active catalog rows = %s, want 1", active)
++	}
++	stored := queryString(t, engine, `select view_stackql_ddl from "__iql__.views" where view_name = ? and deleted_dttm is null`, name)
++	if stored != secondTranslated {
++		t.Fatalf("replacement translated definition = %q, want %q", stored, secondTranslated)
++	}
++	deleted := queryString(t, engine, `select cast(count(*) as text) from "__iql__.views" where view_name = ? and deleted_dttm is not null`, name)
++	if deleted != "1" {
++		t.Fatalf("superseded catalog rows = %s, want 1", deleted)
++	}
++}
++
++func TestCreateViewRejectsInvalidDefinitionsWithoutCatalogMutation(t *testing.T) {
++	dialect, engine := newCatalogDialect(t)
++	cases := []struct {
++		viewName    string
++		name        string
++		raw         string
++		translated  string
++		wantMessage string
++	}{
++		{viewName: "   ", name: "blank name", raw: "select 1", translated: "select 1", wantMessage: "view"},
++		{viewName: "invalid_blank_raw", name: "blank raw", raw: "", translated: "select 1", wantMessage: "view"},
++		{viewName: "invalid_blank_translated", name: "blank translated", raw: "select 1", translated: "", wantMessage: "view"},
++		{viewName: "invalid_whitespace_raw", name: "whitespace raw", raw: "   ", translated: "select 1", wantMessage: "view"},
++		{viewName: "invalid_whitespace_translated", name: "whitespace translated", raw: "select 1", translated: "   ", wantMessage: "view"},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			name := tc.viewName
++			if name == "" {
++				name = "invalid_" + strings.ReplaceAll(tc.name, "-", "_")
++			}
++			if err := dialect.CreateView(name, tc.raw, tc.translated); err == nil {
++				t.Fatal("CreateView unexpectedly accepted invalid definition")
++			} else if !strings.Contains(strings.ToLower(err.Error()), tc.wantMessage) {
++				t.Fatalf("error %q does not mention %q", err, tc.wantMessage)
++			}
++			if _, ok := dialect.GetViewByName(name); ok {
++				t.Fatal("invalid definition was left in the catalog")
++			}
++		})
++	}
++	var count int
++	if err := engine.QueryRow(`select count(*) from "__iql__.views" where view_name like 'invalid_%'`).Scan(&count); err != nil {
++		t.Fatalf("count invalid catalog rows: %v", err)
++	}
++	if count != 0 {
++		t.Fatalf("invalid catalog rows = %d, want 0", count)
++	}
++
++	const stableName = "atomic_view"
++	if err := dialect.CreateView(stableName, "select 7", "create view atomic_view as select 7"); err != nil {
++		t.Fatalf("seed CreateView returned error: %v", err)
++	}
++	if err := dialect.CreateView(stableName, "select 8", ""); err == nil {
++		t.Fatal("invalid replacement unexpectedly succeeded")
++	}
++	view, ok := dialect.GetViewByName(stableName)
++	if !ok || view.GetRawQuery() != "select 7" {
++		t.Fatalf("invalid replacement changed the active definition")
++	}
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,5 @@
++#!/bin/bash
++set -euo pipefail
++
++
++go test ./internal/stackql/sqldialect -run TestCreateView -count=1

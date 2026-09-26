@@ -1,0 +1,775 @@
+diff --git a/usercase-test-coderl/fixtures/fake_apiserver.go b/usercase-test-coderl/fixtures/fake_apiserver.go
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/fixtures/fake_apiserver.go
+@@ -0,0 +1,387 @@
++package main
++
++import (
++	"encoding/json"
++	"flag"
++	"fmt"
++	"io"
++	"log"
++	"net"
++	"net/http"
++	"net/url"
++	"os"
++	"path/filepath"
++	"strings"
++	"sync"
++)
++
++type serverState struct {
++	scenario string
++	dir      string
++	mu       sync.Mutex
++	patches  map[string]string
++}
++
++func main() {
++	var scenario, dir string
++	flag.StringVar(&scenario, "scenario", "", "fixture scenario")
++	flag.StringVar(&dir, "dir", "", "directory for kubeconfig and records")
++	flag.Parse()
++	if scenario == "" || dir == "" {
++		log.Fatal("scenario and dir are required")
++	}
++
++	ln, err := net.Listen("tcp", "127.0.0.1:0")
++	if err != nil {
++		log.Fatal(err)
++	}
++	st := &serverState{scenario: scenario, dir: dir, patches: map[string]string{}}
++	mux := http.NewServeMux()
++	mux.HandleFunc("/", st.handle)
++
++	if err := os.WriteFile(filepath.Join(dir, "kubeconfig"), []byte(kubeconfig("http://"+ln.Addr().String())), 0644); err != nil {
++		log.Fatal(err)
++	}
++	log.Printf("ready %s", ln.Addr().String())
++	log.Fatal(http.Serve(ln, mux))
++}
++
++func kubeconfig(server string) string {
++	return fmt.Sprintf(`apiVersion: v1
++kind: Config
++clusters:
++- name: fake
++  cluster:
++    server: %s
++users:
++- name: fake
++  user: {}
++contexts:
++- name: fake
++  context:
++    cluster: fake
++    user: fake
++current-context: fake
++`, server)
++}
++
++func (st *serverState) handle(w http.ResponseWriter, r *http.Request) {
++	if r.URL.Path == "/healthz" {
++		io.WriteString(w, "ok")
++		return
++	}
++	if r.URL.Path == "/api/v1" {
++		writeJSON(w, map[string]any{
++			"kind":         "APIResourceList",
++			"apiVersion":   "v1",
++			"groupVersion": "v1",
++			"resources": []map[string]any{
++				{"name": "pods", "kind": "Pod", "namespaced": true, "verbs": []string{"get", "list", "watch", "patch"}},
++				{"name": "pods/ephemeralcontainers", "kind": "Pod", "namespaced": true, "verbs": []string{"get", "patch"}},
++			},
++		})
++		return
++	}
++	if r.Method == http.MethodPatch && strings.HasSuffix(r.URL.Path, "/ephemeralcontainers") {
++		st.patchPod(w, r)
++		return
++	}
++	if r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/api/v1/namespaces/") && strings.Contains(r.URL.RawQuery, "watch=true") {
++		st.watchPod(w, r)
++		return
++	}
++	if r.Method != http.MethodGet {
++		http.NotFound(w, r)
++		return
++	}
++
++	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
++	switch {
++	case len(parts) == 5 && parts[0] == "api" && parts[1] == "v1" && parts[2] == "namespaces" && parts[4] == "pods":
++		st.listPods(w, parts[3], r.URL.Query())
++	case len(parts) == 6 && parts[0] == "api" && parts[1] == "v1" && parts[2] == "namespaces" && parts[4] == "pods":
++		st.getPod(w, parts[3], parts[5])
++	case len(parts) == 7 && parts[0] == "apis" && parts[1] == "apps" && parts[2] == "v1" && parts[3] == "namespaces" && parts[5] == "deployments":
++		st.getDeployment(w, parts[4], parts[6])
++	case len(parts) == 6 && parts[0] == "apis" && parts[1] == "apps" && parts[2] == "v1" && parts[3] == "namespaces" && parts[5] == "replicasets":
++		st.listReplicaSets(w, parts[4])
++	case len(parts) == 7 && parts[0] == "apis" && parts[1] == "apps" && parts[2] == "v1" && parts[3] == "namespaces" && parts[5] == "statefulsets":
++		st.getStatefulSet(w, parts[4], parts[6])
++	case len(parts) == 7 && parts[0] == "apis" && parts[1] == "apps" && parts[2] == "v1" && parts[3] == "namespaces" && parts[5] == "daemonsets":
++		st.getDaemonSet(w, parts[4], parts[6])
++	default:
++		http.NotFound(w, r)
++	}
++}
++
++func (st *serverState) getPod(w http.ResponseWriter, ns, name string) {
++	pod, ok := st.pod(ns, name)
++	if !ok {
++		writeStatus(w, http.StatusNotFound, "pods", name)
++		return
++	}
++	writeJSON(w, pod)
++}
++
++func (st *serverState) listPods(w http.ResponseWriter, ns string, q url.Values) {
++	var pods []any
++	for _, p := range st.allPods(ns) {
++		pods = append(pods, p)
++	}
++	writeJSON(w, map[string]any{"kind": "PodList", "apiVersion": "v1", "items": pods})
++}
++
++func (st *serverState) getDeployment(w http.ResponseWriter, ns, name string) {
++	deploymentScenario := strings.HasPrefix(st.scenario, "tcp_") ||
++		st.scenario == "deployment_no_rs" ||
++		st.scenario == "deployment_no_pod"
++	if name != "api" || ns != "alpha" || !deploymentScenario {
++		writeStatus(w, http.StatusNotFound, "deployments", name)
++		return
++	}
++	writeJSON(w, deployment(ns, name, "dep-api", map[string]string{"app": "api"}))
++}
++
++func (st *serverState) listReplicaSets(w http.ResponseWriter, ns string) {
++	items := []any{}
++	if ns == "alpha" {
++		switch st.scenario {
++		case "tcp_success":
++			items = append(items, replicaSet(ns, "api-rs", "rs-api", "api", "dep-api", 2, map[string]string{"app": "api"}))
++		case "deployment_no_rs":
++			items = append(items, replicaSet(ns, "api-rs-zero", "rs-api-zero", "api", "dep-api", 0, map[string]string{"app": "api"}))
++		case "deployment_no_pod":
++			items = append(items, replicaSet(ns, "api-rs", "rs-api", "api", "dep-api", 1, map[string]string{"app": "api"}))
++		}
++	}
++	writeJSON(w, map[string]any{"kind": "ReplicaSetList", "apiVersion": "apps/v1", "items": items})
++}
++
++func (st *serverState) getStatefulSet(w http.ResponseWriter, ns, name string) {
++	if ns != "alpha" || name != "web" {
++		writeStatus(w, http.StatusNotFound, "statefulsets", name)
++		return
++	}
++	replicas := 1
++	if st.scenario == "statefulset_zero" {
++		replicas = 0
++	}
++	writeJSON(w, statefulSet(ns, name, "ss-web", replicas, map[string]string{"app": "web"}))
++}
++
++func (st *serverState) getDaemonSet(w http.ResponseWriter, ns, name string) {
++	if ns != "beta" || name != "dns" {
++		writeStatus(w, http.StatusNotFound, "daemonsets", name)
++		return
++	}
++	available := 1
++	if st.scenario == "daemonset_zero" {
++		available = 0
++	}
++	writeJSON(w, daemonSet(ns, name, "ds-dns", available, map[string]string{"app": "dns"}))
++}
++
++func (st *serverState) allPods(ns string) []map[string]any {
++	var pods []map[string]any
++	for _, name := range []string{"api-pod", "api-pending", "api-no-ip", "web-0", "dns-node-a", "db", "ghost"} {
++		if pod, ok := st.pod(ns, name); ok {
++			pods = append(pods, pod)
++		}
++	}
++	return pods
++}
++
++func (st *serverState) pod(ns, name string) (map[string]any, bool) {
++	switch st.scenario {
++	case "pod_missing":
++		if ns == "beta" && name == "db" {
++			return pod(ns, name, "pod-db", "Running", "10.2.0.31", map[string]string{"app": "db"}, nil), true
++		}
++		return nil, false
++	case "pod_not_running":
++		if ns == "alpha" && name == "api-pending" {
++			return pod(ns, name, "pod-pending", "Pending", "", map[string]string{"app": "api"}, nil), true
++		}
++	case "pod_no_ip":
++		if ns == "alpha" && name == "api-no-ip" {
++			return pod(ns, name, "pod-no-ip", "Running", "", map[string]string{"app": "api"}, nil), true
++		}
++	case "tcp_success":
++		if ns == "alpha" && name == "api-pod" {
++			return pod(ns, name, "pod-api", "Running", "10.1.0.21", map[string]string{"app": "api"}, owner("ReplicaSet", "api-rs", "rs-api")), true
++		}
++		if ns == "alpha" && name == "api-pending" {
++			return pod(ns, name, "pod-api-pending", "Running", "", map[string]string{"app": "api"}, owner("ReplicaSet", "api-rs", "rs-api")), true
++		}
++		if ns == "beta" && name == "db" {
++			return pod(ns, name, "pod-db", "Running", "10.2.0.31", map[string]string{"app": "db"}, nil), true
++		}
++	case "udp_success":
++		if ns == "alpha" && name == "web-0" {
++			return pod(ns, name, "pod-web-0", "Running", "10.1.0.41", map[string]string{"app": "web"}, owner("StatefulSet", "web", "ss-web")), true
++		}
++		if ns == "beta" && name == "dns-node-a" {
++			return pod(ns, name, "pod-dns-a", "Running", "10.2.0.50", map[string]string{"app": "dns"}, owner("DaemonSet", "dns", "ds-dns")), true
++		}
++	}
++	return nil, false
++}
++
++func (st *serverState) patchPod(w http.ResponseWriter, r *http.Request) {
++	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
++	ns, name := parts[3], parts[5]
++	body, _ := io.ReadAll(r.Body)
++	var patch map[string]any
++	_ = json.Unmarshal(body, &patch)
++	ec := lastEphemeralContainer(patch)
++	ecName, _ := ec["name"].(string)
++	kind := "unknown"
++	fields := []string{fmt.Sprintf("%s/%s", ns, name)}
++	env := envMap(ec)
++	if _, ok := env["TARGET_HOST"]; ok {
++		kind = "scanner"
++		fields = append(fields, "scanner", "target="+env["TARGET_HOST"], "port="+env["TARGET_PORT"], "protocol="+env["PROTOCOL"], "attempts="+env["ATTEMPTS"])
++	} else {
++		kind = "sniffer"
++		fields = append(fields, "sniffer", "protocol="+env["PROTOCOL"], "matches="+env["MATCHES"], "iface="+env["IFACE"], "timeout="+env["TIMEOUT_SECONDS"])
++	}
++
++	st.mu.Lock()
++	st.patches[ns+"/"+name] = ecName
++	f, err := os.OpenFile(filepath.Join(st.dir, "patches.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
++	if err == nil {
++		fmt.Fprintln(f, strings.Join(fields, " "))
++		_ = f.Close()
++	}
++	st.mu.Unlock()
++
++	p, ok := st.pod(ns, name)
++	if !ok {
++		writeStatus(w, http.StatusNotFound, "pods", name)
++		return
++	}
++	spec := p["spec"].(map[string]any)
++	spec["ephemeralContainers"] = []any{map[string]any{"name": ecName, "env": ec["env"]}}
++	_ = kind
++	writeJSON(w, p)
++}
++
++func (st *serverState) watchPod(w http.ResponseWriter, r *http.Request) {
++	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
++	ns := parts[3]
++	name := fieldSelectorValue(r.URL.Query().Get("fieldSelector"), "metadata.name")
++	st.mu.Lock()
++	ecName := st.patches[ns+"/"+name]
++	st.mu.Unlock()
++	p, ok := st.pod(ns, name)
++	if !ok {
++		writeStatus(w, http.StatusNotFound, "pods", name)
++		return
++	}
++	p["status"].(map[string]any)["ephemeralContainerStatuses"] = []any{map[string]any{
++		"name": ecName,
++		"state": map[string]any{"terminated": map[string]any{
++			"exitCode": 0,
++			"reason":   "Completed",
++		}},
++	}}
++	w.Header().Set("Content-Type", "application/json")
++	_ = json.NewEncoder(w).Encode(map[string]any{"type": "MODIFIED", "object": p})
++}
++
++func fieldSelectorValue(selector, key string) string {
++	for _, part := range strings.Split(selector, ",") {
++		pair := strings.SplitN(part, "=", 2)
++		if len(pair) == 2 && pair[0] == key {
++			return pair[1]
++		}
++	}
++	return ""
++}
++
++func lastEphemeralContainer(patch map[string]any) map[string]any {
++	spec, _ := patch["spec"].(map[string]any)
++	ecs, _ := spec["ephemeralContainers"].([]any)
++	if len(ecs) == 0 {
++		return map[string]any{}
++	}
++	ec, _ := ecs[len(ecs)-1].(map[string]any)
++	return ec
++}
++
++func envMap(ec map[string]any) map[string]string {
++	out := map[string]string{}
++	envs, _ := ec["env"].([]any)
++	for _, item := range envs {
++		m, _ := item.(map[string]any)
++		name, _ := m["name"].(string)
++		value, _ := m["value"].(string)
++		out[name] = value
++	}
++	return out
++}
++
++func deployment(ns, name, uid string, labels map[string]string) map[string]any {
++	return map[string]any{
++		"kind": "Deployment", "apiVersion": "apps/v1",
++		"metadata": map[string]any{"name": name, "namespace": ns, "uid": uid},
++		"spec":     map[string]any{"selector": map[string]any{"matchLabels": labels}},
++	}
++}
++
++func replicaSet(ns, name, uid, depName, depUID string, replicas int, labels map[string]string) map[string]any {
++	return map[string]any{
++		"kind": "ReplicaSet", "apiVersion": "apps/v1",
++		"metadata": map[string]any{"name": name, "namespace": ns, "uid": uid, "labels": labels, "ownerReferences": []any{owner("Deployment", depName, depUID)}},
++		"spec":     map[string]any{"replicas": replicas, "selector": map[string]any{"matchLabels": labels}},
++	}
++}
++
++func statefulSet(ns, name, uid string, replicas int, labels map[string]string) map[string]any {
++	return map[string]any{
++		"kind": "StatefulSet", "apiVersion": "apps/v1",
++		"metadata": map[string]any{"name": name, "namespace": ns, "uid": uid},
++		"spec":     map[string]any{"replicas": replicas, "selector": map[string]any{"matchLabels": labels}},
++	}
++}
++
++func daemonSet(ns, name, uid string, available int, labels map[string]string) map[string]any {
++	return map[string]any{
++		"kind": "DaemonSet", "apiVersion": "apps/v1",
++		"metadata": map[string]any{"name": name, "namespace": ns, "uid": uid},
++		"spec":     map[string]any{"selector": map[string]any{"matchLabels": labels}},
++		"status":   map[string]any{"numberAvailable": available},
++	}
++}
++
++func pod(ns, name, uid, phase, ip string, labels map[string]string, ownerRef map[string]any) map[string]any {
++	owners := []any{}
++	if ownerRef != nil {
++		owners = append(owners, ownerRef)
++	}
++	return map[string]any{
++		"kind": "Pod", "apiVersion": "v1",
++		"metadata": map[string]any{"name": name, "namespace": ns, "uid": uid, "labels": labels, "ownerReferences": owners},
++		"spec":     map[string]any{"containers": []any{map[string]any{"name": "app", "image": "example/app:1"}}},
++		"status":   map[string]any{"phase": phase, "podIP": ip},
++	}
++}
++
++func owner(kind, name, uid string) map[string]any {
++	return map[string]any{"apiVersion": "apps/v1", "kind": kind, "name": name, "uid": uid, "controller": true}
++}
++
++func writeStatus(w http.ResponseWriter, code int, resource, name string) {
++	w.WriteHeader(code)
++	writeJSON(w, map[string]any{
++		"kind": "Status", "apiVersion": "v1", "status": "Failure", "reason": "NotFound",
++		"message": fmt.Sprintf("%s %q not found", resource, name),
++		"code":    code,
++		"details": map[string]any{"name": name, "kind": resource},
++	})
++}
++
++func writeJSON(w http.ResponseWriter, v any) {
++	w.Header().Set("Content-Type", "application/json")
++	_ = json.NewEncoder(w).Encode(v)
++}
+diff --git a/usercase-test-coderl/usecase.sh b/usercase-test-coderl/usecase.sh
+new file mode 100755
+--- /dev/null
++++ b/usercase-test-coderl/usecase.sh
+@@ -0,0 +1,356 @@
++#!/usr/bin/env bash
++
++set -u
++export LANG=C.UTF-8 LC_ALL=C.UTF-8 TZ=UTC
++export GOMAXPROCS=2
++
++( cd /workspace/repo && go build -o /tmp/netassert-coderl ./cmd/netassert/cli ) \
++    || { echo "FAIL: build" >&2; exit 1; }
++BIN=/tmp/netassert-coderl
++
++TMP=$(mktemp -d); trap 'cleanup' EXIT
++SERVER_PIDS=""
++cd "$TMP" || exit 1
++fail() { echo "FAIL: $*" >&2; exit 1; }
++cleanup() {
++  for pid in $SERVER_PIDS; do
++    kill "$pid" 2>/dev/null || true
++  done
++  rm -rf "$TMP"
++}
++
++start_server() {
++  scenario=$1
++  dir=$TMP/$scenario
++  mkdir -p "$dir"
++  ( cd /workspace/repo && go run ./usercase-test-coderl/fixtures/fake_apiserver.go -scenario "$scenario" -dir "$dir" >"$dir/server.out" 2>"$dir/server.err" ) &
++  pid=$!
++  SERVER_PIDS="$SERVER_PIDS $pid"
++  for _ in $(seq 1 100); do
++    [ -s "$dir/kubeconfig" ] && break
++    kill -0 "$pid" 2>/dev/null || { cat "$dir/server.err" >&2; fail "$scenario server exited"; }
++    sleep 0.1
++  done
++  [ -s "$dir/kubeconfig" ] || { cat "$dir/server.err" >&2; fail "$scenario server did not write kubeconfig"; }
++}
++
++run_case() {
++  scenario=$1
++  test_yaml=$2
++  start_server "$scenario"
++  dir=$TMP/$scenario
++  printf '%s\n' "$test_yaml" > "$dir/tests.yaml"
++  "$BIN" run --input-file "$dir/tests.yaml" --kubeconfig "$dir/kubeconfig" --tap "$dir/results.tap" --pause-sec 0 --suffix-length 1 --log-level error >"$dir/out" 2>"$dir/err"
++  ec=$?
++}
++
++assert_file_exact() {
++  file=$1
++  expected=$2
++  actual=$(cat "$file")
++  [ "$actual" = "$expected" ] || fail "$file content:
++$actual"
++}
++
++assert_no_patches() {
++  dir=$1
++  [ ! -s "$dir/patches.log" ] || fail "$dir unexpected container launches: $(cat "$dir/patches.log")"
++}
++
++assert_file_line_count() {
++  file=$1
++  expected=$2
++  actual=$(wc -l < "$file" | tr -d ' ')
++  [ "$actual" = "$expected" ] || fail "$file line count $actual; want $expected: $(cat "$file")"
++}
++
++assert_text_contains_all_ci() {
++  label=$1
++  text=$2
++  shift 2
++  lower=$(printf '%s' "$text" | tr '[:upper:]' '[:lower:]')
++  for needle in "$@"; do
++    needle_lower=$(printf '%s' "$needle" | tr '[:upper:]' '[:lower:]')
++    case "$lower" in
++      *"$needle_lower"*) ;;
++      *) fail "$label missing required text '$needle': $text" ;;
++    esac
++  done
++}
++
++assert_file_contains_all_ci() {
++  file=$1
++  shift
++  assert_text_contains_all_ci "$file" "$(cat "$file")" "$@"
++}
++
++assert_file_contains_any_ci() {
++  file=$1
++  shift
++  lower=$(tr '[:upper:]' '[:lower:]' < "$file")
++  for needle in "$@"; do
++    needle_lower=$(printf '%s' "$needle" | tr '[:upper:]' '[:lower:]')
++    case "$lower" in
++      *"$needle_lower"*) return 0 ;;
++    esac
++  done
++  fail "$file missing any required text [$*]: $(cat "$file")"
++}
++
++assert_stderr_runtime_only() {
++  file=$1
++  [ ! -s "$file" ] && return 0
++  grep -Eq '^[0-9]{4}/[0-9]{2}/[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2} maxprocs: ' "$file" \
++    || fail "$file unexpected stderr: $(cat "$file")"
++}
++
++
++
++
++run_case tcp_success '- name: tcp deployment to pod
++  type: k8s
++  protocol: tcp
++  targetPort: 8080
++  timeoutSeconds: 1
++  attempts: 1
++  exitCode: 0
++  src:
++    k8sResource:
++      kind: deployment
++      name: api
++      namespace: alpha
++  dst:
++    k8sResource:
++      kind: pod
++      name: db
++      namespace: beta'
++[ "$ec" -eq 0 ] || fail "F1 exit $ec; want 0"
++assert_stderr_runtime_only "$TMP/tcp_success/err"
++assert_file_exact "$TMP/tcp_success/results.tap" 'TAP version 14
++1..1
++ok 1 - tcp deployment to pod'
++
++assert_file_line_count "$TMP/tcp_success/patches.log" 1
++assert_file_contains_all_ci "$TMP/tcp_success/patches.log" "alpha/api-pod" "scanner" "target=10.2.0.31"
++
++
++
++
++run_case pod_missing '- name: missing pod source
++  type: k8s
++  protocol: tcp
++  targetPort: 8080
++  timeoutSeconds: 1
++  attempts: 1
++  exitCode: 0
++  src:
++    k8sResource:
++      kind: pod
++      name: ghost
++      namespace: alpha
++  dst:
++    k8sResource:
++      kind: pod
++      name: db
++      namespace: beta'
++[ "$ec" -ne 0 ] || fail "F2 want non-zero exit"
++assert_stderr_runtime_only "$TMP/pod_missing/err"
++
++assert_file_contains_all_ci "$TMP/pod_missing/results.tap" "not ok 1 - missing pod source" "reason:" "pod" "ghost" "alpha"
++assert_file_contains_any_ci "$TMP/pod_missing/results.tap" "missing" "not found" "could not find" "unable to find"
++assert_no_patches "$TMP/pod_missing"
++
++
++
++
++run_case pod_not_running '- name: pending pod source
++  type: k8s
++  protocol: tcp
++  targetPort: 8080
++  timeoutSeconds: 1
++  attempts: 1
++  exitCode: 0
++  src:
++    k8sResource:
++      kind: pod
++      name: api-pending
++      namespace: alpha
++  dst:
++    k8sResource:
++      kind: pod
++      name: db
++      namespace: beta'
++[ "$ec" -ne 0 ] || fail "F3 want non-zero exit"
++assert_stderr_runtime_only "$TMP/pod_not_running/err"
++
++assert_file_contains_all_ci "$TMP/pod_not_running/results.tap" "not ok 1 - pending pod source" "reason:" "pod" "api-pending" "alpha" "running"
++assert_file_contains_any_ci "$TMP/pod_not_running/results.tap" "not running" "not in running" "pending"
++assert_no_patches "$TMP/pod_not_running"
++
++
++
++
++run_case pod_no_ip '- name: no ip pod source
++  type: k8s
++  protocol: tcp
++  targetPort: 8080
++  timeoutSeconds: 1
++  attempts: 1
++  exitCode: 0
++  src:
++    k8sResource:
++      kind: pod
++      name: api-no-ip
++      namespace: alpha
++  dst:
++    k8sResource:
++      kind: pod
++      name: db
++      namespace: beta'
++[ "$ec" -ne 0 ] || fail "F4 want non-zero exit"
++assert_stderr_runtime_only "$TMP/pod_no_ip/err"
++
++assert_file_contains_all_ci "$TMP/pod_no_ip/results.tap" "not ok 1 - no ip pod source" "reason:" "pod" "api-no-ip" "alpha" "ip"
++assert_file_contains_any_ci "$TMP/pod_no_ip/results.tap" "no ip" "without ip" "empty pod ip" "does not have an ip"
++assert_no_patches "$TMP/pod_no_ip"
++
++
++
++
++run_case deployment_no_rs '- name: deployment no eligible replicaset
++  type: k8s
++  protocol: tcp
++  targetPort: 8080
++  timeoutSeconds: 1
++  attempts: 1
++  exitCode: 0
++  src:
++    k8sResource:
++      kind: deployment
++      name: api
++      namespace: alpha
++  dst:
++    k8sResource:
++      kind: pod
++      name: db
++      namespace: beta'
++[ "$ec" -ne 0 ] || fail "F5 want non-zero exit"
++assert_stderr_runtime_only "$TMP/deployment_no_rs/err"
++
++assert_file_contains_all_ci "$TMP/deployment_no_rs/results.tap" "not ok 1 - deployment no eligible replicaset" "reason:" "deployment" "api" "alpha" "replica"
++assert_file_contains_any_ci "$TMP/deployment_no_rs/results.tap" "no" "not found" "could not find" "unable to find" "zero"
++assert_no_patches "$TMP/deployment_no_rs"
++
++
++
++
++run_case deployment_no_pod '- name: deployment no eligible pod
++  type: k8s
++  protocol: tcp
++  targetPort: 8080
++  timeoutSeconds: 1
++  attempts: 1
++  exitCode: 0
++  src:
++    k8sResource:
++      kind: deployment
++      name: api
++      namespace: alpha
++  dst:
++    k8sResource:
++      kind: pod
++      name: db
++      namespace: beta'
++[ "$ec" -ne 0 ] || fail "F6 want non-zero exit"
++assert_stderr_runtime_only "$TMP/deployment_no_pod/err"
++
++assert_file_contains_all_ci "$TMP/deployment_no_pod/results.tap" "not ok 1 - deployment no eligible pod" "reason:" "deployment" "api" "alpha" "pod"
++assert_file_contains_any_ci "$TMP/deployment_no_pod/results.tap" "no" "not found" "could not find" "unable to find" "zero"
++assert_no_patches "$TMP/deployment_no_pod"
++
++
++
++
++run_case statefulset_zero '- name: statefulset zero replicas
++  type: k8s
++  protocol: tcp
++  targetPort: 8080
++  timeoutSeconds: 1
++  attempts: 1
++  exitCode: 0
++  src:
++    k8sResource:
++      kind: statefulset
++      name: web
++      namespace: alpha
++  dst:
++    k8sResource:
++      kind: pod
++      name: db
++      namespace: beta'
++[ "$ec" -ne 0 ] || fail "F7 want non-zero exit"
++assert_stderr_runtime_only "$TMP/statefulset_zero/err"
++
++assert_file_contains_all_ci "$TMP/statefulset_zero/results.tap" "not ok 1 - statefulset zero replicas" "reason:" "statefulset" "web" "alpha" "replica"
++assert_file_contains_any_ci "$TMP/statefulset_zero/results.tap" "zero" "no replica" "scaled to zero"
++assert_no_patches "$TMP/statefulset_zero"
++
++
++
++
++run_case daemonset_zero '- name: daemonset zero available
++  type: k8s
++  protocol: tcp
++  targetPort: 8080
++  timeoutSeconds: 1
++  attempts: 1
++  exitCode: 0
++  src:
++    k8sResource:
++      kind: daemonset
++      name: dns
++      namespace: beta
++  dst:
++    k8sResource:
++      kind: pod
++      name: db
++      namespace: beta'
++[ "$ec" -ne 0 ] || fail "F8 want non-zero exit"
++assert_stderr_runtime_only "$TMP/daemonset_zero/err"
++
++assert_file_contains_all_ci "$TMP/daemonset_zero/results.tap" "not ok 1 - daemonset zero available" "reason:" "daemonset" "dns" "available"
++assert_file_contains_any_ci "$TMP/daemonset_zero/results.tap" "zero" "no available" "0 available"
++assert_no_patches "$TMP/daemonset_zero"
++
++
++
++
++run_case udp_success '- name: udp statefulset to daemonset
++  type: k8s
++  protocol: udp
++  targetPort: 5353
++  timeoutSeconds: 1
++  attempts: 2
++  exitCode: 0
++  src:
++    k8sResource:
++      kind: statefulset
++      name: web
++      namespace: alpha
++  dst:
++    k8sResource:
++      kind: daemonset
++      name: dns
++      namespace: beta'
++[ "$ec" -eq 0 ] || fail "F9 exit $ec; want 0"
++assert_stderr_runtime_only "$TMP/udp_success/err"
++assert_file_exact "$TMP/udp_success/results.tap" 'TAP version 14
++1..1
++ok 1 - udp statefulset to daemonset'
++
++assert_file_line_count "$TMP/udp_success/patches.log" 2
++assert_text_contains_all_ci "$TMP/udp_success/patches.log first launch" "$(sed -n '1p' "$TMP/udp_success/patches.log")" "beta/dns-node-a" "sniffer"
++assert_text_contains_all_ci "$TMP/udp_success/patches.log second launch" "$(sed -n '2p' "$TMP/udp_success/patches.log")" "alpha/web-0" "scanner" "target=10.2.0.50"
++
++echo "PASS"
++exit 0
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,17 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++export GOTOOLCHAIN=local
++export GOPROXY=off
++export GOSUMDB=off
++export GOVCS='*:off'
++export GOFLAGS="${GOFLAGS:-} -mod=readonly"
++set -e
++cd /workspace/repo
++exec bash /workspace/repo/usercase-test-coderl/usecase.sh

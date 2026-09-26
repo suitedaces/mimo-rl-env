@@ -1,0 +1,317 @@
+diff --git a/usercase-test-coderl/usecase.sh b/usercase-test-coderl/usecase.sh
+new file mode 100755
+--- /dev/null
++++ b/usercase-test-coderl/usecase.sh
+@@ -0,0 +1,295 @@
++#!/usr/bin/env bash
++
++set -u
++export LANG=C LC_ALL=C TZ=UTC
++
++BUILD_DIR=/tmp/audiowaveform-usecase-build
++rm -rf "$BUILD_DIR"
++( cd /workspace/repo && cmake -S . -B "$BUILD_DIR" -DENABLE_TESTS=0 >/tmp/audiowaveform-usecase-cmake.log && cmake --build "$BUILD_DIR" --target audiowaveform -j2 >/tmp/audiowaveform-usecase-build.log ) \
++    || { echo "FAIL: build" >&2; cat /tmp/audiowaveform-usecase-cmake.log /tmp/audiowaveform-usecase-build.log >&2; exit 1; }
++BIN="$BUILD_DIR/audiowaveform"
++
++TMP=$(mktemp -d)
++trap 'rm -rf "$TMP"' EXIT
++cd "$TMP" || exit 1
++
++fail() { echo "FAIL: $*" >&2; exit 1; }
++
++DATA=/workspace/repo/test/data
++
++python3 - "$TMP/synthetic_stereo.wav" <<'PY'
++import struct
++import sys
++import wave
++
++path = sys.argv[1]
++with wave.open(path, "wb") as wav:
++    wav.setnchannels(2)
++    wav.setsampwidth(2)
++    wav.setframerate(16000)
++    frames = []
++    for i in range(64):
++        frames.append((-10000 + i * 100, 20000 - i * 50))
++    for i in range(64):
++        frames.append((12000 - i * 80, -8000 - i * 30))
++    wav.writeframes(b"".join(struct.pack("<hh", left, right) for left, right in frames))
++PY
++
++assert_common_run() {
++    local label=$1
++    local ec=$2
++    local stdout_path=$3
++    local stderr_path=$4
++    local output_path=$5
++
++    [ "$ec" -eq 0 ] || fail "$label exit $ec; want 0"
++    [ ! -s "$stdout_path" ] || fail "$label stdout should be empty"
++    [ -f "$output_path" ] || fail "$label did not create $output_path"
++
++
++    grep -q 'Generating waveform data' "$stderr_path" || fail "$label did not report waveform generation"
++    grep -q 'Done' "$stderr_path" || fail "$label did not print normal completion progress"
++}
++
++assert_dat_waveform() {
++    local label=$1
++    local path=$2
++    local expected_sample_rate=$3
++    local expected_spp=$4
++    local expected_bits=$5
++    local expected_channels=$6
++    local expected_length=$7
++
++
++    python3 - "$label" "$path" "$expected_sample_rate" "$expected_spp" "$expected_bits" "$expected_channels" "$expected_length" <<'PY'
++import struct
++import sys
++from pathlib import Path
++
++label, path = sys.argv[1], Path(sys.argv[2])
++expected_sample_rate = int(sys.argv[3])
++expected_spp = int(sys.argv[4])
++expected_bits = int(sys.argv[5])
++expected_channels = int(sys.argv[6])
++expected_length = int(sys.argv[7])
++
++data = path.read_bytes()
++if len(data) < 20:
++    raise SystemExit(f"FAIL: {label} dat header too short")
++
++version, flags, sample_rate, spp, length = struct.unpack_from("<iIiiI", data, 0)
++offset = 20
++channels = 1
++if version == 2:
++    if len(data) < 24:
++        raise SystemExit(f"FAIL: {label} dat v2 header too short")
++    channels = struct.unpack_from("<i", data, offset)[0]
++    offset += 4
++elif version != 1:
++    raise SystemExit(f"FAIL: {label} dat version {version}; want 1 or 2")
++
++bits = 8 if (flags & 1) else 16
++if sample_rate != expected_sample_rate:
++    raise SystemExit(f"FAIL: {label} sample_rate {sample_rate}; want {expected_sample_rate}")
++if spp != expected_spp:
++    raise SystemExit(f"FAIL: {label} samples_per_pixel {spp}; want {expected_spp}")
++if bits != expected_bits:
++    raise SystemExit(f"FAIL: {label} bits {bits}; want {expected_bits}")
++if channels != expected_channels:
++    raise SystemExit(f"FAIL: {label} channels {channels}; want {expected_channels}")
++if length != expected_length:
++    raise SystemExit(f"FAIL: {label} length {length}; want {expected_length}")
++
++sample_width = 1 if bits == 8 else 2
++expected_payload = length * channels * 2 * sample_width
++payload = data[offset:]
++if len(payload) != expected_payload:
++    raise SystemExit(f"FAIL: {label} payload bytes {len(payload)}; want {expected_payload}")
++
++fmt = "<" + ("b" if bits == 8 else "h") * (length * channels * 2)
++values = list(struct.unpack(fmt, payload))
++if not any(values):
++    raise SystemExit(f"FAIL: {label} waveform data is all zero")
++for lo, hi in zip(values[0::2], values[1::2]):
++    if lo > hi:
++        raise SystemExit(f"FAIL: {label} has min greater than max")
++PY
++}
++
++assert_dat_payload_equals() {
++    local label=$1
++    local path=$2
++    local expected_csv=$3
++
++
++    python3 - "$label" "$path" "$expected_csv" <<'PY'
++import struct
++import sys
++from pathlib import Path
++
++label, path, expected_csv = sys.argv[1], Path(sys.argv[2]), sys.argv[3]
++expected = [int(value) for value in expected_csv.split(",")]
++data = path.read_bytes()
++version, flags, _sample_rate, _spp, length = struct.unpack_from("<iIiiI", data, 0)
++offset = 20
++channels = 1
++if version == 2:
++    channels = struct.unpack_from("<i", data, offset)[0]
++    offset += 4
++bits = 8 if (flags & 1) else 16
++fmt_char = "b" if bits == 8 else "h"
++actual = list(struct.unpack_from("<" + fmt_char * (length * channels * 2), data, offset))
++if actual != expected:
++    raise SystemExit(f"FAIL: {label} payload {actual}; want {expected}")
++PY
++}
++
++assert_json_waveform() {
++    local label=$1
++    local path=$2
++    local expected_sample_rate=$3
++    local expected_spp=$4
++    local expected_bits=$5
++    local expected_channels=$6
++    local expected_length=$7
++    local min_abs_peak=${8:-1}
++
++
++    python3 - "$label" "$path" "$expected_sample_rate" "$expected_spp" "$expected_bits" "$expected_channels" "$expected_length" "$min_abs_peak" <<'PY'
++import json
++import sys
++from pathlib import Path
++
++label, path = sys.argv[1], Path(sys.argv[2])
++expected_sample_rate = int(sys.argv[3])
++expected_spp = int(sys.argv[4])
++expected_bits = int(sys.argv[5])
++expected_channels = int(sys.argv[6])
++expected_length = int(sys.argv[7])
++min_abs_peak = int(sys.argv[8])
++
++doc = json.loads(path.read_text())
++for key, expected in {
++    "channels": expected_channels,
++    "sample_rate": expected_sample_rate,
++    "samples_per_pixel": expected_spp,
++    "bits": expected_bits,
++    "length": expected_length,
++}.items():
++    actual = doc.get(key)
++    if actual != expected:
++        raise SystemExit(f"FAIL: {label} {key} {actual}; want {expected}")
++
++values = doc.get("data")
++if not isinstance(values, list):
++    raise SystemExit(f"FAIL: {label} data is not a list")
++expected_values = expected_length * expected_channels * 2
++if len(values) != expected_values:
++    raise SystemExit(f"FAIL: {label} data length {len(values)}; want {expected_values}")
++if not all(isinstance(v, int) for v in values):
++    raise SystemExit(f"FAIL: {label} data contains non-integers")
++
++limit = 127 if expected_bits == 8 else 32767
++if any(v < -limit - 1 or v > limit for v in values):
++    raise SystemExit(f"FAIL: {label} data value outside {expected_bits}-bit range")
++if not any(values):
++    raise SystemExit(f"FAIL: {label} waveform data is all zero")
++if max(abs(v) for v in values) < min_abs_peak:
++    raise SystemExit(f"FAIL: {label} peak was not scaled as expected")
++for lo, hi in zip(values[0::2], values[1::2]):
++    if lo > hi:
++        raise SystemExit(f"FAIL: {label} has min greater than max")
++PY
++}
++
++assert_outputs_differ() {
++    local label=$1
++    local left=$2
++    local right=$3
++
++
++    cmp -s "$left" "$right" && fail "$label outputs should differ"
++}
++
++
++
++"$BIN" -i "$TMP/synthetic_stereo.wav" -o synthetic_mono.dat -z 64 -b 8 >out 2>err; ec=$?
++assert_common_run F0 "$ec" out err synthetic_mono.dat
++assert_dat_waveform F0 synthetic_mono.dat 16000 64 8 1 2
++assert_dat_payload_equals F0 synthetic_mono.dat "19,25,-5,7"
++
++"$BIN" -i "$TMP/synthetic_stereo.wav" -o synthetic_split.dat -z 64 -b 8 --split-channels >out 2>err; ec=$?
++assert_common_run F0_split "$ec" out err synthetic_split.dat
++assert_dat_waveform F0_split synthetic_split.dat 16000 64 8 2 2
++assert_dat_payload_equals F0_split synthetic_split.dat "-39,-14,65,78,27,46,-38,-31"
++
++
++
++
++"$BIN" -i "$DATA/test_file_stereo.wav" -o wav_dat.out.dat -z 64 -b 8 >out 2>err; ec=$?
++assert_common_run F1 "$ec" out err wav_dat.out.dat
++assert_dat_waveform F1 wav_dat.out.dat 16000 64 8 1 1774
++
++
++
++
++"$BIN" -i "$DATA/test_file_stereo.mp3" -o mp3_json.out.json -z 64 -b 8 >out 2>err; ec=$?
++assert_common_run F2 "$ec" out err mp3_json.out.json
++assert_json_waveform F2 mp3_json.out.json 16000 64 8 1 1774
++
++
++
++
++"$BIN" -i "$DATA/test_file_stereo.flac" -o flac_dat.out.dat -z 64 -b 8 >out 2>err; ec=$?
++assert_common_run F3 "$ec" out err flac_dat.out.dat
++assert_dat_waveform F3 flac_dat.out.dat 16000 64 8 1 1774
++
++
++
++
++"$BIN" -i "$DATA/test_file_stereo.oga" -o ogg_json.out.json -z 64 -b 8 >out 2>err; ec=$?
++assert_common_run F4 "$ec" out err ogg_json.out.json
++assert_json_waveform F4 ogg_json.out.json 16000 64 8 1 1774
++
++
++
++
++"$BIN" -i "$DATA/test_file_stereo.opus" -o opus_dat.out.dat -z 64 -b 8 >out 2>err; ec=$?
++assert_common_run F5 "$ec" out err opus_dat.out.dat
++assert_dat_waveform F5 opus_dat.out.dat 16000 64 8 1 1775
++
++
++
++
++"$BIN" -i "$DATA/test_file_mono.raw" -o raw_dat.out.dat --input-format raw --raw-samplerate 16000 --raw-channels 1 --raw-format s16le -z 64 -b 8 >out 2>err; ec=$?
++assert_common_run F6 "$ec" out err raw_dat.out.dat
++assert_dat_waveform F6 raw_dat.out.dat 16000 64 8 1 1774
++
++
++
++
++"$BIN" -i "$DATA/test_file_stereo.wav" -o split_dat.out.dat -z 64 -b 8 --split-channels >out 2>err; ec=$?
++assert_common_run F7 "$ec" out err split_dat.out.dat
++assert_dat_waveform F7 split_dat.out.dat 16000 64 8 2 1774
++assert_outputs_differ F7 split_dat.out.dat wav_dat.out.dat
++
++
++
++
++"$BIN" -i "$DATA/test_file_stereo.wav" -o auto_json.out.json -z 64 -b 8 --amplitude-scale auto >out 2>err; ec=$?
++assert_common_run F8 "$ec" out err auto_json.out.json
++assert_json_waveform F8 auto_json.out.json 16000 64 8 1 1774 120
++assert_outputs_differ F8 auto_json.out.json mp3_json.out.json
++
++
++
++
++"$BIN" -i "$TMP/no_such.wav" -o missing.out.dat -z 64 -b 8 >out 2>err; ec=$?
++[ "$ec" -ne 0 ] || fail "F9 exit $ec; want non-zero"
++[ ! -s out ] || fail "F9 stdout should be empty"
++
++[ -s err ] || fail "F9 stderr should describe the failure"
++[ ! -e missing.out.dat ] || fail "F9 should not create output file"
++
++echo "PASS"
++exit 0
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,12 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++exec bash /workspace/repo/usercase-test-coderl/usecase.sh

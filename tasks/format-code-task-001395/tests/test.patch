@@ -1,0 +1,151 @@
+diff --git a/pkg/tanka/load_test.go b/pkg/tanka/load_test.go
+index dc2b59ab3..d7e317fec 100644
+--- a/pkg/tanka/load_test.go
++++ b/pkg/tanka/load_test.go
+@@ -1,6 +1,10 @@
+ package tanka
+ 
+ import (
++	"errors"
++	"io/fs"
++	"os"
++	"reflect"
+ 	"testing"
+ 
+ 	"github.com/grafana/tanka/pkg/kubernetes/manifest"
+@@ -157,11 +161,11 @@ func TestLoadSelectEnvironment(t *testing.T) {
+ 
+ 	// Empty options, match all environments
+ 	_, err = Load("./testdata/cases/multiple-inline-envs", Opts{})
+-	assert.EqualError(t, err, "found multiple Environments in './testdata/cases/multiple-inline-envs'. Use `--name` to select a single one: \n - project1-env1\n - project1-env2\n - project2-env1")
++	assertMultipleEnvsError(t, err, "", "project1-env1", "project1-env2", "project2-env1")
+ 
+ 	// Partial match two environments
+ 	_, err = Load("./testdata/cases/multiple-inline-envs", Opts{Name: "env1"})
+-	assert.EqualError(t, err, "found multiple Environments in './testdata/cases/multiple-inline-envs'. Use `--name` to select a single one: \n - project1-env1\n - project2-env1")
++	assertMultipleEnvsError(t, err, "env1", "project1-env1", "project2-env1")
+ 
+ 	// Partial match
+ 	result, err := Load("./testdata/cases/multiple-inline-envs", Opts{Name: "project2"})
+@@ -174,6 +178,54 @@ func TestLoadSelectEnvironment(t *testing.T) {
+ 	assert.Equal(t, "project1-env1", result.Env.Metadata.Name)
+ }
+ 
++func TestLoadSelectEnvironmentIncludesRequestedNameOnAmbiguousMatch(t *testing.T) {
++	_, err := Load("./testdata/cases/multiple-inline-envs", Opts{Name: "env1"})
++	assertMultipleEnvsError(t, err, "env1", "project1-env1", "project2-env1")
++
++	_, err = Load("./testdata/cases/multiple-inline-envs", Opts{Name: "project1"})
++	assertMultipleEnvsError(t, err, "project1", "project1-env1", "project1-env2")
++}
++
++func TestLoadEnvironmentFallsBackToNameFromCurrentDirectory(t *testing.T) {
++	cwd, err := os.Getwd()
++	require.NoError(t, err)
++
++	require.NoError(t, os.Chdir("./testdata/cases/multiple-inline-envs"))
++	t.Cleanup(func() {
++		require.NoError(t, os.Chdir(cwd))
++	})
++
++	_, err = Load("env1", Opts{})
++	assertMultipleEnvsError(t, err, "env1", "project1-env1", "project2-env1")
++
++	result, err := Load("project2", Opts{})
++	require.NoError(t, err)
++	assert.Equal(t, "project2-env1", result.Env.Metadata.Name)
++
++	result, err = Load("project1-env1", Opts{})
++	require.NoError(t, err)
++	assert.Equal(t, "project1-env1", result.Env.Metadata.Name)
++}
++
++func TestLoadEnvironmentDoesNotFallbackOnNonNotExistStatError(t *testing.T) {
++	cwd, err := os.Getwd()
++	require.NoError(t, err)
++
++	require.NoError(t, os.Chdir("./testdata/cases/multiple-inline-envs"))
++	t.Cleanup(func() {
++		require.NoError(t, os.Chdir(cwd))
++	})
++
++	invalidPath := "not-a-valid\x00path"
++	_, err = Load(invalidPath, Opts{})
++	require.Error(t, err)
++
++	var pathErr *fs.PathError
++	require.Truef(t, errors.As(err, &pathErr), "expected a filesystem path error, got %T: %v", err, err)
++	assert.False(t, os.IsNotExist(err), "invalid path errors must not be treated as missing paths")
++	assert.Equal(t, invalidPath, pathErr.Path)
++}
++
+ func TestLoadSelectEnvironmentFullMatchHasPriority(t *testing.T) {
+ 	// `base` matches both `base` and `base-and-more`
+ 	// However, the full match should win
+@@ -186,3 +238,40 @@ func TestLoadFailsWhenBothSpecAndInline(t *testing.T) {
+ 	_, err := Load("./testdata/cases/static-and-inline", Opts{Name: "inline"})
+ 	assert.EqualError(t, err, "found a tanka Environment resource. Check that you aren't using a spec.json and inline environments simultaneously")
+ }
++
++func assertMultipleEnvsError(t *testing.T, err error, name string, envs ...string) {
++	t.Helper()
++	require.Error(t, err)
++
++	var multiple ErrMultipleEnvs
++	require.Truef(t, errors.As(err, &multiple), "expected ErrMultipleEnvs, got %T: %v", err, err)
++
++	v := reflect.ValueOf(multiple)
++	var gotName string
++	var gotEnvs []string
++	for i := 0; i < v.NumField(); i++ {
++		field := v.Field(i)
++		switch field.Kind() {
++		case reflect.String:
++			s := field.String()
++			if s == name {
++				gotName = s
++			}
++		case reflect.Slice:
++			if field.Type().Elem().Kind() == reflect.String {
++				values := make([]string, field.Len())
++				for i := range values {
++					values[i] = field.Index(i).String()
++				}
++				gotEnvs = values
++			}
++		}
++	}
++
++	if name == "" {
++		assert.Empty(t, gotName)
++	} else {
++		assert.Equal(t, name, gotName)
++	}
++	assert.ElementsMatch(t, envs, gotEnvs)
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,21 @@
++#!/bin/bash
++set -uo pipefail
++cd /testbed
++
++
++
++
++
++
++case "${1:-}" in
++  base)
++    go test -v -run 'TestLoad$|TestLoadFailsWhenBothSpecAndInline$' ./pkg/tanka/
++    ;;
++  new)
++    go test -v -run 'TestLoadSelectEnvironment$|TestLoadSelectEnvironmentIncludesRequestedNameOnAmbiguousMatch$|TestLoadEnvironmentFallsBackToNameFromCurrentDirectory$|TestLoadEnvironmentDoesNotFallbackOnNonNotExistStatError$' ./pkg/tanka/
++    ;;
++  *)
++    echo "usage: $0 base|new"
++    exit 2
++    ;;
++esac

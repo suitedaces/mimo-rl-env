@@ -1,0 +1,259 @@
+diff --git a/usercase-test-coderl/usecase.sh b/usercase-test-coderl/usecase.sh
+new file mode 100755
+--- /dev/null
++++ b/usercase-test-coderl/usecase.sh
+@@ -0,0 +1,230 @@
++#!/usr/bin/env bash
++
++set -u
++export LANG=C.UTF-8 LC_ALL=C.UTF-8 TZ=UTC PYTHONHASHSEED=0
++
++REPO=/workspace/repo
++TMP=$(mktemp -d)
++trap 'rm -rf "$TMP"' EXIT
++
++fail() {
++    echo "FAIL: $*" >&2
++    exit 1
++}
++
++if ! ( cd "$REPO" && python -m py_compile data_gen/gen_bone_data.py && python - <<'PY'
++import numpy
++import tqdm
++PY
++); then
++    fail "build"
++fi
++
++make_runroot() {
++    local name="$1"
++    local root="$TMP/$name"
++    mkdir -p "$root/data"
++    cp -a "$REPO/data_gen" "$root/data_gen" || fail "$name: copy data_gen"
++    printf '%s\n' "$root"
++}
++
++write_joint() {
++    local root="$1"
++    local rel="$2"
++    local n="$3"
++    local c="$4"
++    local t="$5"
++    local v="$6"
++    local m="$7"
++    local factor="$8"
++    local offset="$9"
++    python - "$root" "$rel" "$n" "$c" "$t" "$v" "$m" "$factor" "$offset" <<'PY'
++import os
++import sys
++import numpy as np
++
++root, rel = sys.argv[1], sys.argv[2]
++N, C, T, V, M = map(int, sys.argv[3:8])
++factor = float(sys.argv[8])
++offset = float(sys.argv[9])
++path = os.path.join(root, 'data', rel)
++os.makedirs(os.path.dirname(path), exist_ok=True)
++data = np.zeros((N, C, T, V, M), dtype=np.float32)
++for n in range(N):
++    for c in range(C):
++        for t in range(T):
++            for v in range(V):
++                for m in range(M):
++                    data[n, c, t, v, m] = (
++                        offset + n * 100000 + c * 1000 + t * 100 + v * factor + m * 10
++                    )
++np.save(path, data)
++PY
++}
++
++run_generator() {
++    local root="$1"
++    shift
++    ( cd "$root/data_gen" && python gen_bone_data.py "$@" >"$root/out" 2>"$root/err" )
++    return $?
++}
++
++assert_sorted_stdout() {
++    local root="$1"
++    local expected="$2"
++    local actual
++    actual=$(sort "$root/out")
++    [ "$actual" = "$expected" ] || fail "stdout mismatch: got [$actual]"
++}
++
++assert_no_traceback() {
++    local root="$1"
++    ! grep -q 'Traceback' "$root/err" || fail "unexpected traceback in stderr"
++}
++
++check_array() {
++    local path="$1"
++    local shape="$2"
++    local dtype="$3"
++    local digest="$4"
++    local label="$5"
++    python - "$path" "$shape" "$dtype" "$digest" "$label" <<'PY' || exit 1
++import ast
++import hashlib
++import sys
++import numpy as np
++
++path, shape_text, dtype, expected_digest, label = sys.argv[1:6]
++try:
++    arr = np.load(path, mmap_mode='r')
++except Exception as exc:
++    print(f"FAIL: {label}: cannot load output: {exc}", file=sys.stderr)
++    sys.exit(1)
++
++expected_shape = tuple(ast.literal_eval(shape_text))
++if tuple(arr.shape) != expected_shape:
++    print(f"FAIL: {label}: shape {tuple(arr.shape)}; want {expected_shape}", file=sys.stderr)
++    sys.exit(1)
++if str(arr.dtype) != dtype:
++    print(f"FAIL: {label}: dtype {arr.dtype}; want {dtype}", file=sys.stderr)
++    sys.exit(1)
++
++actual_digest = hashlib.sha256(np.ascontiguousarray(arr).view(np.uint8)).hexdigest()
++if actual_digest != expected_digest:
++    print(f"FAIL: {label}: data sha256 {actual_digest}; want {expected_digest}", file=sys.stderr)
++    sys.exit(1)
++PY
++}
++
++
++
++
++root=$(make_runroot f1_ntu)
++write_joint "$root" ntu/xview/train_data_joint.npy 1 3 2 25 1 1 10000
++write_joint "$root" ntu/xview/val_data_joint.npy 1 3 2 25 1 2 20000
++write_joint "$root" ntu/xsub/train_data_joint.npy 1 3 2 25 1 3 30000
++write_joint "$root" ntu/xsub/val_data_joint.npy 1 3 2 25 1 4 40000
++run_generator "$root" --dataset ntu
++ec=$?
++[ "$ec" -eq 0 ] || fail "F1 exit $ec; want 0"
++assert_sorted_stdout "$root" "ntu/xsub train
++ntu/xsub val
++ntu/xview train
++ntu/xview val"
++assert_no_traceback "$root"
++check_array "$root/data/ntu/xview/train_data_bone.npy" "(1, 3, 2, 25, 1)" float32 9fdf43bc36ff489c4e495f8a30a627416fbb652f469df201c464338d37a97bcd "F1 ntu/xview train"
++check_array "$root/data/ntu/xview/val_data_bone.npy" "(1, 3, 2, 25, 1)" float32 62cb64778fc82314501e192ad5d25636aba06c7535660bbb8555c14400606302 "F1 ntu/xview val"
++check_array "$root/data/ntu/xsub/train_data_bone.npy" "(1, 3, 2, 25, 1)" float32 bde6b05b1038c39ce48cb72841ecf9181b4e4bd08d2e3bd75d8f401b393ee2e1 "F1 ntu/xsub train"
++check_array "$root/data/ntu/xsub/val_data_bone.npy" "(1, 3, 2, 25, 1)" float32 e64afc2b31d6eaf40c79095d311c6e039572dab27364fadb087c9da8a564a156 "F1 ntu/xsub val"
++[ ! -e "$root/data/kinetics/train_data_bone.npy" ] || fail "F1 unexpectedly processed kinetics"
++
++
++
++
++root=$(make_runroot f2_ntu120)
++write_joint "$root" ntu120/xset/train_data_joint.npy 1 3 1 25 2 5 50000
++write_joint "$root" ntu120/xset/val_data_joint.npy 1 3 1 25 2 6 60000
++write_joint "$root" ntu120/xsub/train_data_joint.npy 1 3 1 25 2 7 70000
++write_joint "$root" ntu120/xsub/val_data_joint.npy 1 3 1 25 2 8 80000
++run_generator "$root" --dataset ntu120
++ec=$?
++[ "$ec" -eq 0 ] || fail "F2 exit $ec; want 0"
++assert_sorted_stdout "$root" "ntu120/xset train
++ntu120/xset val
++ntu120/xsub train
++ntu120/xsub val"
++assert_no_traceback "$root"
++check_array "$root/data/ntu120/xset/train_data_bone.npy" "(1, 3, 1, 25, 2)" float32 14f392d868c15213514e7fb6423473775e97608b78516ebeff431ba00ab3f968 "F2 ntu120/xset train"
++check_array "$root/data/ntu120/xset/val_data_bone.npy" "(1, 3, 1, 25, 2)" float32 b479cd4c8a746216958ba4700da53e8d140115599710f4ddfb8ea9e1b58b638d "F2 ntu120/xset val"
++check_array "$root/data/ntu120/xsub/train_data_bone.npy" "(1, 3, 1, 25, 2)" float32 196271f5201bf465167294ce6e73cc28dfe81643dcb4bb6f2017eed6eb252639 "F2 ntu120/xsub train"
++check_array "$root/data/ntu120/xsub/val_data_bone.npy" "(1, 3, 1, 25, 2)" float32 5bbd0df044676cf1d1e20adc323c35a743881bda21688f95fad7fdc69e317451 "F2 ntu120/xsub val"
++
++
++
++
++root=$(make_runroot f3_kinetics)
++write_joint "$root" kinetics/train_data_joint.npy 2 3 1 18 2 11 110000
++write_joint "$root" kinetics/val_data_joint.npy 2 3 1 18 2 12 120000
++run_generator "$root" --dataset kinetics
++ec=$?
++[ "$ec" -eq 0 ] || fail "F3 exit $ec; want 0"
++assert_sorted_stdout "$root" "kinetics train
++kinetics val"
++assert_no_traceback "$root"
++check_array "$root/data/kinetics/train_data_bone.npy" "(2, 3, 1, 18, 2)" float32 e9118aae7dfe1972c4f271454e76cb1a3ad7968474214734fc8d51e64755f38a "F3 kinetics train"
++check_array "$root/data/kinetics/val_data_bone.npy" "(2, 3, 1, 18, 2)" float32 3af830403cc6e19ed38e231285d119f51555967dd859cb53b0fd6363f6eefce4 "F3 kinetics val"
++
++
++
++
++root=$(make_runroot f4_processing_errors)
++write_joint "$root" ntu/xview/val_data_joint.npy 1 3 1 24 1 20 200000
++write_joint "$root" ntu/xsub/train_data_joint.npy 1 3 1 25 1 21 210000
++write_joint "$root" ntu/xsub/val_data_joint.npy 1 3 1 25 1 22 220000
++run_generator "$root" --dataset ntu
++ec=$?
++[ "$ec" -eq 0 ] || fail "F4 exit $ec; want 0 despite per-file errors"
++grep -q '^Run into error:' "$root/out" || fail "F4 missing error report"
++[ "$(grep -c '^Run into error:' "$root/out")" -eq 2 ] || fail "F4 should report two processing errors"
++grep -q '^Skipping (ntu/xview val)$' "$root/out" || fail "F4 missing invalid-shape skip"
++grep -q '^Skipping (ntu/xview train)$' "$root/out" || fail "F4 missing missing-file skip"
++grep -q '^ntu/xsub val$' "$root/out" || fail "F4 did not continue to ntu/xsub val"
++grep -q '^ntu/xsub train$' "$root/out" || fail "F4 did not continue to ntu/xsub train"
++assert_no_traceback "$root"
++check_array "$root/data/ntu/xsub/train_data_bone.npy" "(1, 3, 1, 25, 1)" float32 2c3c69ea85195077a9fc01929056b38b6e74df0675ac978401fa7dbb70e8203e "F4 ntu/xsub train"
++check_array "$root/data/ntu/xsub/val_data_bone.npy" "(1, 3, 1, 25, 1)" float32 63e2e0a99c2f76fd641b77e7c3baa2a4e520ed682cbc13b3eb3c587b30134710 "F4 ntu/xsub val"
++[ ! -e "$root/data/ntu/xview/train_data_bone.npy" ] || fail "F4 should not create output for missing train input"
++
++
++
++
++root=$(make_runroot f5_missing_dataset)
++run_generator "$root"
++ec=$?
++
++[ "$ec" -ne 0 ] || fail "F5 exit $ec; want non-zero argparse failure"
++[ ! -s "$root/out" ] || fail "F5 stdout should be empty"
++
++grep -qi '^usage:' "$root/err" || fail "F5 stderr should contain argparse usage: $(cat "$root/err")"
++grep -q -- '--dataset' "$root/err" || fail "F5 stderr should mention --dataset: $(cat "$root/err")"
++grep -qi 'required' "$root/err" || fail "F5 stderr should report a required argument: $(cat "$root/err")"
++
++
++
++
++root=$(make_runroot f6_invalid_dataset)
++run_generator "$root" --dataset bogus
++ec=$?
++
++[ "$ec" -ne 0 ] || fail "F6 exit $ec; want non-zero argparse failure"
++[ ! -s "$root/out" ] || fail "F6 stdout should be empty"
++
++grep -qi '^usage:' "$root/err" || fail "F6 stderr should contain argparse usage: $(cat "$root/err")"
++grep -q -- '--dataset' "$root/err" || fail "F6 stderr should mention --dataset: $(cat "$root/err")"
++grep -q 'bogus' "$root/err" || fail "F6 stderr should mention invalid value: $(cat "$root/err")"
++grep -Eq '(^|[^[:alnum:]_])ntu([^[:alnum:]_]|$)' "$root/err" || fail "F6 stderr should mention allowed choice ntu: $(cat "$root/err")"
++grep -q 'ntu120' "$root/err" || fail "F6 stderr should mention allowed choice ntu120: $(cat "$root/err")"
++grep -q 'kinetics' "$root/err" || fail "F6 stderr should mention allowed choice kinetics: $(cat "$root/err")"
++
++echo "PASS"
++exit 0
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,19 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++
++
++export PIP_NO_INDEX=1
++export PIP_DISABLE_PIP_VERSION_CHECK=1
++export PYTHONNOUSERSITE=1
++export PYTHON=/usr/local/bin/python
++export PATH="/usr/local/bin:${PATH}"
++set -e
++cd /workspace/repo
++exec bash /workspace/repo/usercase-test-coderl/usecase.sh

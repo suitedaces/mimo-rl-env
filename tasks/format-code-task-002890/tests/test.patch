@@ -1,0 +1,398 @@
+diff --git a/usercase-test-coderl/struct_crud_test.go b/usercase-test-coderl/struct_crud_test.go
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/struct_crud_test.go
+@@ -0,0 +1,369 @@
++package usercase_test_coderl
++
++import (
++	"database/sql"
++	"fmt"
++	"strings"
++	"testing"
++
++	"github.com/DATA-DOG/go-sqlmock"
++	"github.com/twharmon/gosql"
++)
++
++func newMockHandle(t *testing.T) (*gosql.DB, sqlmock.Sqlmock, *sql.DB) {
++	t.Helper()
++	raw, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherEqual))
++	if err != nil {
++		t.Fatalf("sqlmock.New() error = %v", err)
++	}
++	return gosql.New(raw), mock, raw
++}
++
++func assertSQLResult(t *testing.T, result sql.Result, wantLastInsertID int64, wantRowsAffected int64) {
++	t.Helper()
++	if result == nil {
++		t.Fatalf("sql.Result = nil")
++	}
++	lastInsertID, err := result.LastInsertId()
++	if err != nil {
++		t.Fatalf("LastInsertId() error = %v", err)
++	}
++	if lastInsertID != wantLastInsertID {
++		t.Fatalf("LastInsertId() = %d, want %d", lastInsertID, wantLastInsertID)
++	}
++	rowsAffected, err := result.RowsAffected()
++	if err != nil {
++		t.Fatalf("RowsAffected() error = %v", err)
++	}
++	if rowsAffected != wantRowsAffected {
++		t.Fatalf("RowsAffected() = %d, want %d", rowsAffected, wantRowsAffected)
++	}
++}
++
++func assertExpectationsMet(t *testing.T, mock sqlmock.Sqlmock) {
++	t.Helper()
++	if err := mock.ExpectationsWereMet(); err != nil {
++		t.Fatalf("SQL expectations were not met: %v", err)
++	}
++}
++
++func assertValidationErrorContains(t *testing.T, err error, context string, keywords ...string) {
++	t.Helper()
++	if err == nil {
++		t.Fatalf("%s error = nil, want validation error", context)
++	}
++	got := strings.ToLower(err.Error())
++	for _, keyword := range keywords {
++		if !strings.Contains(got, strings.ToLower(keyword)) {
++			t.Fatalf("%s error = %q, want message identifying %q", context, err.Error(), keyword)
++		}
++	}
++}
++
++func TestDBInsertOmitsZeroPrimaryAndIncludesNonZeroPrimary(t *testing.T) {
++
++
++	db, mock, raw := newMockHandle(t)
++	defer raw.Close()
++
++	type User struct {
++		ID   int `idx:"primary"`
++		Name string
++	}
++
++	mock.ExpectExec("insert into user (name) values (?)").
++		WithArgs("Gopher").
++		WillReturnResult(sqlmock.NewResult(101, 1))
++	result, err := db.Insert(&User{Name: "Gopher"})
++	if err != nil {
++		t.Fatalf("Insert zero-primary error = %v", err)
++	}
++	assertSQLResult(t, result, 101, 1)
++
++	mock.ExpectExec("insert into user (id, name) values (?, ?)").
++		WithArgs(5, "Gopher").
++		WillReturnResult(sqlmock.NewResult(102, 1))
++	result, err = db.Insert(&User{ID: 5, Name: "Gopher"})
++	if err != nil {
++		t.Fatalf("Insert nonzero-primary error = %v", err)
++	}
++	assertSQLResult(t, result, 102, 1)
++	assertExpectationsMet(t, mock)
++}
++
++func TestDBUpdateAndDeleteUsePrimaryKeyAfterNonPrimaryValues(t *testing.T) {
++
++
++	db, mock, raw := newMockHandle(t)
++	defer raw.Close()
++
++	type User struct {
++		ID    int `idx:"primary"`
++		Name  string
++		Email string
++	}
++
++	mock.ExpectExec("update user set name = ?, email = ? where id = ?").
++		WithArgs("Gofer", "gofer@example.com", 5).
++		WillReturnResult(sqlmock.NewResult(0, 3))
++	result, err := db.Update(&User{ID: 5, Name: "Gofer", Email: "gofer@example.com"})
++	if err != nil {
++		t.Fatalf("Update error = %v", err)
++	}
++	assertSQLResult(t, result, 0, 3)
++
++	mock.ExpectExec("delete from user where id = ?").
++		WithArgs(5).
++		WillReturnResult(sqlmock.NewResult(0, 4))
++	result, err = db.Delete(&User{ID: 5})
++	if err != nil {
++		t.Fatalf("Delete error = %v", err)
++	}
++	assertSQLResult(t, result, 0, 4)
++	assertExpectationsMet(t, mock)
++}
++
++func TestDBCompositePrimaryUpdateAndDeleteUseAndJoinedWhereClause(t *testing.T) {
++
++
++	db, mock, raw := newMockHandle(t)
++	defer raw.Close()
++
++	type T struct {
++		ID    int `idx:"primary"`
++		Name  string
++		Email string `idx:"primary"`
++	}
++
++	mock.ExpectExec("update t set name = ? where id = ? and email = ?").
++		WithArgs("Gofer", 5, "gofer@example.com").
++		WillReturnResult(sqlmock.NewResult(0, 5))
++	result, err := db.Update(&T{ID: 5, Name: "Gofer", Email: "gofer@example.com"})
++	if err != nil {
++		t.Fatalf("Composite Update error = %v", err)
++	}
++	assertSQLResult(t, result, 0, 5)
++
++	mock.ExpectExec("delete from t where id = ? and email = ?").
++		WithArgs(5, "gofer@example.com").
++		WillReturnResult(sqlmock.NewResult(0, 6))
++	result, err = db.Delete(&T{ID: 5, Email: "gofer@example.com"})
++	if err != nil {
++		t.Fatalf("Composite Delete error = %v", err)
++	}
++	assertSQLResult(t, result, 0, 6)
++	assertExpectationsMet(t, mock)
++}
++
++func TestTxCRUDExecutesThroughActiveTransaction(t *testing.T) {
++
++
++	db, mock, raw := newMockHandle(t)
++	defer raw.Close()
++
++	type User struct {
++		ID    int `idx:"primary"`
++		Name  string
++		Email string
++	}
++
++	mock.ExpectBegin()
++	tx, err := db.Begin()
++	if err != nil {
++		t.Fatalf("Begin error = %v", err)
++	}
++
++	mock.ExpectExec("insert into user (name, email) values (?, ?)").
++		WithArgs("Gopher", "gopher@example.com").
++		WillReturnResult(sqlmock.NewResult(201, 1))
++	result, err := tx.Insert(&User{Name: "Gopher", Email: "gopher@example.com"})
++	if err != nil {
++		t.Fatalf("Tx Insert error = %v", err)
++	}
++	assertSQLResult(t, result, 201, 1)
++
++	mock.ExpectExec("update user set name = ?, email = ? where id = ?").
++		WithArgs("Gofer", "gofer@example.com", 5).
++		WillReturnResult(sqlmock.NewResult(0, 2))
++	result, err = tx.Update(&User{ID: 5, Name: "Gofer", Email: "gofer@example.com"})
++	if err != nil {
++		t.Fatalf("Tx Update error = %v", err)
++	}
++	assertSQLResult(t, result, 0, 2)
++
++	mock.ExpectExec("delete from user where id = ?").
++		WithArgs(5).
++		WillReturnResult(sqlmock.NewResult(0, 3))
++	result, err = tx.Delete(&User{ID: 5})
++	if err != nil {
++		t.Fatalf("Tx Delete error = %v", err)
++	}
++	assertSQLResult(t, result, 0, 3)
++
++	mock.ExpectCommit()
++	if err := tx.Commit(); err != nil {
++		t.Fatalf("Commit error = %v", err)
++	}
++	assertExpectationsMet(t, mock)
++}
++
++func TestCRUDValidationErrorsReturnBeforeExecutingSQL(t *testing.T) {
++
++
++	db, mock, raw := newMockHandle(t)
++	defer raw.Close()
++
++	result, err := db.Insert(42)
++	if result != nil {
++		t.Fatalf("Insert(42) result = %v, want nil", result)
++	}
++
++	assertValidationErrorContains(t, err, "Insert(42)", "pointer", "struct")
++
++	type User struct {
++		ID   int
++		Name string
++	}
++	result, err = db.Update(&User{ID: 5, Name: "Gopher"})
++	if result != nil {
++		t.Fatalf("Update(no-primary) result = %v, want nil", result)
++	}
++
++	assertValidationErrorContains(t, err, "Update(no-primary)", "primary")
++	assertExpectationsMet(t, mock)
++}
++
++func TestTxCRUDValidationErrorsReturnBeforeExecutingSQL(t *testing.T) {
++
++
++	db, mock, raw := newMockHandle(t)
++	defer raw.Close()
++
++	mock.ExpectBegin()
++	tx, err := db.Begin()
++	if err != nil {
++		t.Fatalf("Begin error = %v", err)
++	}
++
++	result, err := tx.Insert(42)
++	if result != nil {
++		t.Fatalf("Tx Insert(42) result = %v, want nil", result)
++	}
++
++	assertValidationErrorContains(t, err, "Tx Insert(42)", "pointer", "struct")
++
++	type User struct {
++		ID   int
++		Name string
++	}
++	result, err = tx.Delete(&User{ID: 5})
++	if result != nil {
++		t.Fatalf("Tx Delete(no-primary) result = %v, want nil", result)
++	}
++
++	assertValidationErrorContains(t, err, "Tx Delete(no-primary)", "primary")
++
++	mock.ExpectRollback()
++	if err := tx.Rollback(); err != nil {
++		t.Fatalf("Rollback error = %v", err)
++	}
++	assertExpectationsMet(t, mock)
++}
++
++func TestNewHandleUsesCallerProvidedExecutorForStructInsert(t *testing.T) {
++
++
++	db, mock, raw := newMockHandle(t)
++	defer raw.Close()
++
++	type User struct {
++		ID   int `idx:"primary"`
++		Name string
++	}
++
++
++	mock.ExpectExec("insert into user (name) values (?)").
++		WithArgs("Gopher").
++		WillReturnResult(sqlmock.NewResult(250, 1))
++	result, err := db.Insert(&User{Name: "Gopher"})
++	if err != nil {
++		t.Fatalf("Insert through New handle error = %v", err)
++	}
++	assertSQLResult(t, result, 250, 1)
++	assertExpectationsMet(t, mock)
++}
++
++func TestIndependentHandlesKeepTheirOwnModelMetadataAndExecutors(t *testing.T) {
++
++
++	dbA, mockA, rawA := newMockHandle(t)
++	defer rawA.Close()
++	dbB, mockB, rawB := newMockHandle(t)
++	defer rawB.Close()
++
++	mockA.ExpectExec("insert into shared_state_model (name) values (?)").
++		WithArgs("alpha").
++		WillReturnResult(sqlmock.NewResult(301, 1))
++	result, err := insertSharedNameModel(dbA, "alpha")
++	if err != nil {
++		t.Fatalf("dbA Insert error = %v", err)
++	}
++	assertSQLResult(t, result, 301, 1)
++
++	mockB.ExpectExec("insert into shared_state_model (email) values (?)").
++		WithArgs("bravo@example.com").
++		WillReturnResult(sqlmock.NewResult(302, 1))
++	result, err = insertSharedEmailModel(dbB, "bravo@example.com")
++	if err != nil {
++		t.Fatalf("dbB Insert error = %v", err)
++	}
++	assertSQLResult(t, result, 302, 1)
++
++	assertExpectationsMet(t, mockA)
++	assertExpectationsMet(t, mockB)
++}
++
++func insertSharedNameModel(db *gosql.DB, name string) (sql.Result, error) {
++	type SharedStateModel struct {
++		ID   int `idx:"primary"`
++		Name string
++	}
++	return db.Insert(&SharedStateModel{Name: name})
++}
++
++func insertSharedEmailModel(db *gosql.DB, email string) (sql.Result, error) {
++	type SharedStateModel struct {
++		ID    int `idx:"primary"`
++		Email string
++	}
++	return db.Insert(&SharedStateModel{Email: email})
++}
++
++func TestRepeatedConstructUseCyclesExecuteThroughEachNewHandle(t *testing.T) {
++
++
++
++	type User struct {
++		ID   int `idx:"primary"`
++		Name string
++	}
++
++
++	for i := 0; i < 12; i++ {
++		db, mock, raw := newMockHandle(t)
++		mock.ExpectExec("insert into user (name) values (?)").
++			WithArgs(fmt.Sprintf("Gopher-%03d", i)).
++			WillReturnResult(sqlmock.NewResult(int64(400+i), 1))
++		result, err := db.Insert(&User{Name: fmt.Sprintf("Gopher-%03d", i)})
++		if err != nil {
++			raw.Close()
++			t.Fatalf("cycle %d Insert error = %v", i, err)
++		}
++		assertSQLResult(t, result, int64(400+i), 1)
++		mock.ExpectClose()
++		if err := raw.Close(); err != nil {
++			t.Fatalf("cycle %d sqlDB.Close() error = %v", i, err)
++		}
++		assertExpectationsMet(t, mock)
++	}
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,19 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++
++cd /workspace/repo
++export GOPROXY=off
++export GOSUMDB=off
++export GOTOOLCHAIN=local
++export GOVCS='*:off'
++exec go test -mod=vendor -buildvcs=false -v -count=1 ./usercase-test-coderl/...

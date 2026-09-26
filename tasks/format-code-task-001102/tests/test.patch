@@ -1,0 +1,318 @@
+diff --git a/pkg/controller/traceflow/validate_contract_test.go b/pkg/controller/traceflow/validate_contract_test.go
+new file mode 100644
+index 000000000..e793edab1
+--- /dev/null
++++ b/pkg/controller/traceflow/validate_contract_test.go
+@@ -0,0 +1,302 @@
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++package traceflow
++
++import (
++    "encoding/json"
++    "strings"
++    "testing"
++
++    "github.com/stretchr/testify/require"
++    admv1 "k8s.io/api/admission/v1"
++    corev1 "k8s.io/api/core/v1"
++    metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++    "k8s.io/apimachinery/pkg/runtime"
++    "k8s.io/apimachinery/pkg/types"
++
++    crdv1beta1 "antrea.io/antrea/pkg/apis/crd/v1beta1"
++)
++
++func TestControllerValidateContractEndpointShapes(t *testing.T) {
++    controller, stopCh := contractValidationController(t)
++    defer close(stopCh)
++
++    valid := contractRegularTraceflow()
++    contractRequireAllowed(t, controller, admv1.Create, nil, valid)
++
++    bothDestinationKinds := valid.DeepCopy()
++    bothDestinationKinds.Spec.Destination.IP = "10.20.0.8"
++    contractRequireDenied(t, controller, admv1.Create, nil, bothDestinationKinds, "destination", "pod", "ip")
++
++    podAndService := valid.DeepCopy()
++    podAndService.Spec.Destination.Service = "api"
++    contractRequireDenied(t, controller, admv1.Create, nil, podAndService, "destination", "pod", "service")
++
++    serviceAndIP := valid.DeepCopy()
++    serviceAndIP.Spec.Destination = crdv1beta1.Destination{Namespace: "work", Service: "api", IP: "10.20.0.8"}
++    contractRequireDenied(t, controller, admv1.Create, nil, serviceAndIP, "destination", "service", "ip")
++
++    bothSourceKinds := contractLiveTraceflow()
++    bothSourceKinds.Spec.Source = crdv1beta1.Source{Namespace: "work", Pod: "src", IP: "10.20.0.9"}
++    contractRequireDenied(t, controller, admv1.Create, nil, bothSourceKinds, "source", "pod", "ip")
++
++    missingNamespace := valid.DeepCopy()
++    missingNamespace.Spec.Destination.Namespace = ""
++    contractRequireDenied(t, controller, admv1.Create, nil, missingNamespace, "destination", "namespace")
++
++    serviceWithoutNamespace := valid.DeepCopy()
++    serviceWithoutNamespace.Spec.Destination = crdv1beta1.Destination{Service: "api"}
++    contractRequireDenied(t, controller, admv1.Create, nil, serviceWithoutNamespace, "destination", "namespace")
++
++    namespaceWithIP := valid.DeepCopy()
++    namespaceWithIP.Spec.Destination = crdv1beta1.Destination{Namespace: "work", IP: "10.20.0.8"}
++    contractRequireDenied(t, controller, admv1.Create, nil, namespaceWithIP, "destination", "namespace")
++}
++
++func TestControllerValidateContractRegularMode(t *testing.T) {
++    controller, stopCh := contractValidationController(t)
++    defer close(stopCh)
++
++    missingDestination := contractRegularTraceflow()
++    missingDestination.Spec.Destination = crdv1beta1.Destination{}
++    contractRequireDenied(t, controller, admv1.Create, nil, missingDestination, "destination")
++
++    ipSource := contractRegularTraceflow()
++    ipSource.Spec.Source = crdv1beta1.Source{IP: "10.20.0.9"}
++    contractRequireDenied(t, controller, admv1.Create, nil, ipSource, "source", "pod")
++
++    missingSource := contractRegularTraceflow()
++    missingSource.Spec.Source = crdv1beta1.Source{}
++    contractRequireDenied(t, controller, admv1.Create, nil, missingSource, "source", "pod")
++
++    unknownSource := contractRegularTraceflow()
++    unknownSource.Spec.Source.Pod = "unknown"
++    contractRequireDenied(t, controller, admv1.Create, nil, unknownSource, "source", "not found")
++
++    hostSource := contractRegularTraceflow()
++    hostSource.Spec.Source.Pod = "host-src"
++    contractRequireDenied(t, controller, admv1.Create, nil, hostSource, "hostnetwork")
++}
++
++func TestControllerValidateContractLiveMode(t *testing.T) {
++    controller, stopCh := contractValidationController(t)
++    defer close(stopCh)
++
++    destinationOnly := contractLiveTraceflow()
++    contractRequireAllowed(t, controller, admv1.Create, nil, destinationOnly)
++
++    sourceIP := destinationOnly.DeepCopy()
++    sourceIP.Spec.Source.IP = "10.20.0.9"
++    contractRequireAllowed(t, controller, admv1.Create, nil, sourceIP)
++
++    sourcePodToService := destinationOnly.DeepCopy()
++    sourcePodToService.Spec.Source = crdv1beta1.Source{Namespace: "work", Pod: "src"}
++    sourcePodToService.Spec.Destination = crdv1beta1.Destination{Namespace: "work", Service: "api"}
++    contractRequireAllowed(t, controller, admv1.Create, nil, sourcePodToService)
++
++    noPodEndpoint := sourcePodToService.DeepCopy()
++    noPodEndpoint.Spec.Source = crdv1beta1.Source{IP: "10.20.0.9"}
++    contractRequireDenied(t, controller, admv1.Create, nil, noPodEndpoint, "pod")
++
++    noEndpoints := destinationOnly.DeepCopy()
++    noEndpoints.Spec.Destination = crdv1beta1.Destination{}
++    contractRequireDenied(t, controller, admv1.Create, nil, noEndpoints, "pod")
++}
++
++func TestControllerValidateContractDroppedOnly(t *testing.T) {
++    controller, stopCh := contractValidationController(t)
++    defer close(stopCh)
++
++    regular := contractRegularTraceflow()
++    regular.Spec.DroppedOnly = true
++    contractRequireDenied(t, controller, admv1.Create, nil, regular, "droppedonly", "livetraffic")
++
++    live := contractLiveTraceflow()
++    live.Spec.DroppedOnly = true
++    contractRequireAllowed(t, controller, admv1.Create, nil, live)
++}
++
++func TestControllerValidateContractIPFamilies(t *testing.T) {
++    controller, stopCh := contractValidationController(t)
++    defer close(stopCh)
++
++    malformedSource := contractLiveTraceflow()
++    malformedSource.Spec.Source.IP = "not-an-ip"
++    contractRequireDenied(t, controller, admv1.Create, nil, malformedSource, "source", "ip")
++
++    malformedDestination := contractRegularTraceflow()
++    malformedDestination.Spec.Destination = crdv1beta1.Destination{IP: "10.20.0.999"}
++    contractRequireDenied(t, controller, admv1.Create, nil, malformedDestination, "destination", "ip")
++
++    v4WithIPv6Header := contractLiveTraceflow()
++    v4WithIPv6Header.Spec.Source.IP = "10.20.0.9"
++    v4WithIPv6Header.Spec.Packet.IPv6Header = &crdv1beta1.IPv6Header{}
++    contractRequireDenied(t, controller, admv1.Create, nil, v4WithIPv6Header, "source", "ip")
++
++    v6WithIPv4Header := contractRegularTraceflow()
++    v6WithIPv4Header.Spec.Destination = crdv1beta1.Destination{IP: "2001:db8::8"}
++    contractRequireDenied(t, controller, admv1.Create, nil, v6WithIPv4Header, "destination", "ip")
++
++    matchingV6 := contractLiveTraceflow()
++    matchingV6.Spec.Source.IP = "2001:db8::9"
++    matchingV6.Spec.Packet.IPv6Header = &crdv1beta1.IPv6Header{}
++    contractRequireAllowed(t, controller, admv1.Create, nil, matchingV6)
++}
++
++func TestControllerValidateContractPacketHeaders(t *testing.T) {
++    controller, stopCh := contractValidationController(t)
++    defer close(stopCh)
++
++    bothFamilies := contractRegularTraceflow()
++    bothFamilies.Spec.Destination = crdv1beta1.Destination{IP: "2001:db8::8"}
++    bothFamilies.Spec.Packet.IPHeader = &crdv1beta1.IPHeader{}
++    bothFamilies.Spec.Packet.IPv6Header = &crdv1beta1.IPv6Header{}
++    contractRequireAllowed(t, controller, admv1.Create, nil, bothFamilies)
++
++    twoTransports := contractRegularTraceflow()
++    twoTransports.Spec.Packet.TransportHeader.TCP = &crdv1beta1.TCPHeader{DstPort: 80}
++    twoTransports.Spec.Packet.TransportHeader.UDP = &crdv1beta1.UDPHeader{DstPort: 53}
++    contractRequireDenied(t, controller, admv1.Create, nil, twoTransports, "transport", "tcp", "udp")
++
++    udpAndICMP := contractRegularTraceflow()
++    udpAndICMP.Spec.Packet.TransportHeader.UDP = &crdv1beta1.UDPHeader{DstPort: 53}
++    udpAndICMP.Spec.Packet.TransportHeader.ICMP = &crdv1beta1.ICMPEchoRequestHeader{}
++    contractRequireDenied(t, controller, admv1.Create, nil, udpAndICMP, "transport", "udp", "icmp")
++
++    mismatchedIPv4Protocol := contractRegularTraceflow()
++    mismatchedIPv4Protocol.Spec.Packet.IPHeader = &crdv1beta1.IPHeader{Protocol: 17}
++    mismatchedIPv4Protocol.Spec.Packet.TransportHeader.TCP = &crdv1beta1.TCPHeader{DstPort: 80}
++    contractRequireDenied(t, controller, admv1.Create, nil, mismatchedIPv4Protocol, "protocol", "tcp")
++
++    mismatchedICMPProtocol := contractRegularTraceflow()
++    mismatchedICMPProtocol.Spec.Packet.IPHeader = &crdv1beta1.IPHeader{Protocol: 6}
++    mismatchedICMPProtocol.Spec.Packet.TransportHeader.ICMP = &crdv1beta1.ICMPEchoRequestHeader{}
++    contractRequireDenied(t, controller, admv1.Create, nil, mismatchedICMPProtocol, "protocol", "icmp")
++
++    nextHeader := int32(6)
++    mismatchedIPv6Protocol := contractRegularTraceflow()
++    mismatchedIPv6Protocol.Spec.Destination = crdv1beta1.Destination{IP: "2001:db8::8"}
++    mismatchedIPv6Protocol.Spec.Packet.IPv6Header = &crdv1beta1.IPv6Header{NextHeader: &nextHeader}
++    mismatchedIPv6Protocol.Spec.Packet.TransportHeader.UDP = &crdv1beta1.UDPHeader{DstPort: 53}
++    contractRequireDenied(t, controller, admv1.Create, nil, mismatchedIPv6Protocol, "nextheader", "udp")
++
++    inferredTCP := contractRegularTraceflow()
++    inferredTCP.Spec.Packet.IPHeader = &crdv1beta1.IPHeader{}
++    inferredTCP.Spec.Packet.TransportHeader.TCP = &crdv1beta1.TCPHeader{DstPort: 80}
++    contractRequireAllowed(t, controller, admv1.Create, nil, inferredTCP)
++
++    customProtocol := contractRegularTraceflow()
++    customProtocol.Spec.Packet.IPHeader = &crdv1beta1.IPHeader{Protocol: 132}
++    contractRequireAllowed(t, controller, admv1.Create, nil, customProtocol)
++}
++
++func TestControllerValidateContractUpdates(t *testing.T) {
++    controller, stopCh := contractValidationController(t)
++    defer close(stopCh)
++
++    oldObject := contractRegularTraceflow()
++    unchanged := oldObject.DeepCopy()
++    contractRequireAllowed(t, controller, admv1.Update, oldObject, unchanged)
++
++    changed := oldObject.DeepCopy()
++    changed.Spec.Timeout = 60
++    contractRequireDenied(t, controller, admv1.Update, oldObject, changed, "spec")
++
++    changedEndpoint := oldObject.DeepCopy()
++    changedEndpoint.Spec.Destination = crdv1beta1.Destination{IP: "10.20.0.8"}
++    contractRequireDenied(t, controller, admv1.Update, oldObject, changedEndpoint, "spec")
++
++    changedPacket := oldObject.DeepCopy()
++    changedPacket.Spec.Packet.TransportHeader.TCP = &crdv1beta1.TCPHeader{DstPort: 80}
++    contractRequireDenied(t, controller, admv1.Update, oldObject, changedPacket, "spec")
++
++    invalidUnchanged := contractLiveTraceflow()
++    invalidUnchanged.Spec.DroppedOnly = true
++    invalidUnchanged.Spec.LiveTraffic = false
++    contractRequireDenied(t, controller, admv1.Update, invalidUnchanged, invalidUnchanged.DeepCopy(), "droppedonly", "livetraffic")
++
++    contractRequireDenied(t, controller, admv1.Update, nil, oldObject.DeepCopy(), "old")
++}
++
++func contractValidationController(t *testing.T) (*Controller, chan struct{}) {
++    t.Helper()
++    pods := []runtime.Object{
++        &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "work", Name: "src"}},
++        &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "work", Name: "dst"}},
++        &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "work", Name: "host-src"}, Spec: corev1.PodSpec{HostNetwork: true}},
++    }
++    wrapped := newController(pods...)
++    stopCh := make(chan struct{})
++    wrapped.informerFactory.Start(stopCh)
++    wrapped.crdInformerFactory.Start(stopCh)
++    wrapped.informerFactory.WaitForCacheSync(stopCh)
++    wrapped.crdInformerFactory.WaitForCacheSync(stopCh)
++    return wrapped.Controller, stopCh
++}
++
++func contractRegularTraceflow() *crdv1beta1.Traceflow {
++    return &crdv1beta1.Traceflow{
++        ObjectMeta: metav1.ObjectMeta{Name: "contract-regular"},
++        Spec: crdv1beta1.TraceflowSpec{
++            Source: crdv1beta1.Source{Namespace: "work", Pod: "src"},
++            Destination: crdv1beta1.Destination{Namespace: "work", Pod: "dst"},
++        },
++    }
++}
++
++func contractLiveTraceflow() *crdv1beta1.Traceflow {
++    return &crdv1beta1.Traceflow{
++        ObjectMeta: metav1.ObjectMeta{Name: "contract-live"},
++        Spec: crdv1beta1.TraceflowSpec{
++            LiveTraffic: true,
++            Destination: crdv1beta1.Destination{Namespace: "work", Pod: "dst"},
++        },
++    }
++}
++
++func contractRequireAllowed(t *testing.T, controller *Controller, operation admv1.Operation, oldObject, object *crdv1beta1.Traceflow) {
++    t.Helper()
++    response := controller.Validate(contractAdmissionReview(t, operation, oldObject, object))
++    require.Equal(t, types.UID("contract-uid"), response.UID)
++    require.True(t, response.Allowed, "unexpected denial: %#v", response.Result)
++}
++
++func contractRequireDenied(t *testing.T, controller *Controller, operation admv1.Operation, oldObject, object *crdv1beta1.Traceflow, messageParts ...string) {
++    t.Helper()
++    response := controller.Validate(contractAdmissionReview(t, operation, oldObject, object))
++    require.Equal(t, types.UID("contract-uid"), response.UID)
++    require.False(t, response.Allowed)
++    require.NotNil(t, response.Result)
++    message := strings.ToLower(response.Result.Message)
++    for _, part := range messageParts {
++        require.Contains(t, message, strings.ToLower(part))
++    }
++}
++
++func contractAdmissionReview(t *testing.T, operation admv1.Operation, oldObject, object *crdv1beta1.Traceflow) *admv1.AdmissionReview {
++    t.Helper()
++    request := &admv1.AdmissionRequest{UID: types.UID("contract-uid"), Operation: operation}
++    if oldObject != nil {
++        raw, err := json.Marshal(oldObject)
++        require.NoError(t, err)
++        request.OldObject = runtime.RawExtension{Raw: raw}
++    }
++    if object != nil {
++        raw, err := json.Marshal(object)
++        require.NoError(t, err)
++        request.Object = runtime.RawExtension{Raw: raw}
++    }
++    return &admv1.AdmissionReview{Request: request}
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,5 @@
++#!/bin/bash
++set -euo pipefail
++
++
++GOPROXY=off go test ./pkg/controller/traceflow -run '^TestControllerValidate' -count=1

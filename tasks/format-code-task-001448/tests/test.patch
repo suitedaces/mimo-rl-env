@@ -1,0 +1,351 @@
+diff --git a/usercase-test-coderl/fixtures/example_bare.json b/usercase-test-coderl/fixtures/example_bare.json
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/fixtures/example_bare.json
+@@ -0,0 +1,1 @@
++{ "ID": "example", "Name": "example", "Type": "service", "Datacenters": ["dc1"], "TaskGroups": [] }
+diff --git a/usercase-test-coderl/fixtures/example_wrapped.json b/usercase-test-coderl/fixtures/example_wrapped.json
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/fixtures/example_wrapped.json
+@@ -0,0 +1,1 @@
++{ "Job": { "ID": "example", "Name": "example", "Type": "service", "Datacenters": ["dc1"], "TaskGroups": [] } }
+diff --git a/usercase-test-coderl/fixtures/hcl_not_json.json b/usercase-test-coderl/fixtures/hcl_not_json.json
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/fixtures/hcl_not_json.json
+@@ -0,0 +1,4 @@
++job "notjson" {
++  type = "service"
++  datacenters = ["dc1"]
++}
+diff --git a/usercase-test-coderl/fixtures/valid_bare.json b/usercase-test-coderl/fixtures/valid_bare.json
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/fixtures/valid_bare.json
+@@ -0,0 +1,1 @@
++{ "ID": "jsonsubmit", "Name": "jsonsubmit", "Type": "service", "Datacenters": ["dc1"], "TaskGroups": [ { "Name": "web", "Count": 1, "Tasks": [ { "Name": "server", "Driver": "raw_exec", "Config": { "command": "/bin/true" }, "Resources": { "CPU": 100, "MemoryMB": 128 } } ] } ] }
+diff --git a/usercase-test-coderl/fixtures/valid_wrapped.json b/usercase-test-coderl/fixtures/valid_wrapped.json
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/fixtures/valid_wrapped.json
+@@ -0,0 +1,1 @@
++{ "Job": { "ID": "jsonsubmit", "Name": "jsonsubmit", "Type": "service", "Datacenters": ["dc1"], "TaskGroups": [ { "Name": "web", "Count": 1, "Tasks": [ { "Name": "server", "Driver": "raw_exec", "Config": { "command": "/bin/true" }, "Resources": { "CPU": 100, "MemoryMB": 128 } } ] } ] } }
+diff --git a/usercase-test-coderl/fixtures/vars.hcl b/usercase-test-coderl/fixtures/vars.hcl
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/fixtures/vars.hcl
+@@ -0,0 +1,1 @@
++foo = "bar"
+diff --git a/usercase-test-coderl/usecase.sh b/usercase-test-coderl/usecase.sh
+new file mode 100755
+--- /dev/null
++++ b/usercase-test-coderl/usecase.sh
+@@ -0,0 +1,282 @@
++#!/usr/bin/env bash
++
++set -u
++export LANG=C LC_ALL=C TZ=UTC CHECKPOINT_DISABLE=1
++
++REPO=/workspace/repo
++FIX="$REPO/usercase-test-coderl/fixtures"
++BIN=/tmp/nomad-fixture-coderl
++
++( cd "$REPO" && go build -trimpath -tags hashicorpmetrics -o "$BIN" . ) \
++    || { echo "FAIL: build" >&2; exit 1; }
++
++TMP=$(mktemp -d)
++AGENT_PID=""
++trap 'if [ -n "$AGENT_PID" ]; then kill "$AGENT_PID" 2>/dev/null || true; wait "$AGENT_PID" 2>/dev/null || true; fi; rm -rf "$TMP"' EXIT
++cd "$TMP" || exit 1
++
++fail() { echo "FAIL: $*" >&2; exit 1; }
++
++assert_empty() {
++    local file=$1 label=$2
++    [ ! -s "$file" ] || fail "$label: expected empty, got: $(cat "$file")"
++}
++
++assert_file_eq() {
++    local want=$1 got=$2 label=$3
++    if ! diff -u "$want" "$got" >"$TMP/diff"; then
++        echo "FAIL: $label" >&2
++        cat "$TMP/diff" >&2
++        exit 1
++    fi
++}
++
++assert_example_job_output() {
++    local label=$1 file=$2
++
++    python3 - "$label" "$file" <<'PY'
++import json
++import sys
++
++label, path = sys.argv[1], sys.argv[2]
++try:
++    with open(path, encoding="utf-8") as fh:
++        payload = json.load(fh)
++except Exception as exc:
++    raise SystemExit(f"{label}: stdout was not valid JSON: {exc}")
++
++job = payload.get("Job", payload) if isinstance(payload, dict) else None
++if not isinstance(job, dict):
++    raise SystemExit(f"{label}: stdout did not contain a JSON job object")
++expected = {
++    "ID": "example",
++    "Name": "example",
++    "Type": "service",
++    "Datacenters": ["dc1"],
++    "TaskGroups": [],
++}
++for key, value in expected.items():
++    if job.get(key) != value:
++        raise SystemExit(f"{label}: {key} was {job.get(key)!r}, want {value!r}")
++PY
++}
++
++assert_plan_output_mentions_json_job() {
++    local label=$1
++
++    grep -Fq 'jsonsubmit' out || fail "$label stdout missing decoded job ID"
++    grep -Fq 'web' out || fail "$label stdout missing decoded task group"
++    grep -Fq 'server' out || fail "$label stdout missing decoded task"
++}
++
++expect_help_json_flag() {
++    local label=$1
++    shift
++    "$BIN" "$@" -help >out 2>err
++    local ec=$?
++    [ "$ec" -eq 0 ] || fail "$label exit $ec; want 0"
++
++    grep -Eq '(^|[[:space:]])-json([^[:alnum:]_-]|$)' out || fail "$label missing -json flag"
++    grep -Eiq 'parse|parses|parsed|decode|decodes|decoded' out || fail "$label missing parse/decode explanation"
++    grep -Fq 'JSON' out || grep -Fq 'json' out || fail "$label missing JSON mention"
++    grep -Fq 'Job' out || fail "$label missing top-level Job mention"
++}
++
++expect_var_reject() {
++    local label=$1 want_ec=$2
++    shift 2
++    "$BIN" "$@" >out 2>err
++    local ec=$?
++    [ "$ec" -eq "$want_ec" ] || fail "$label exit $ec; want $want_ec"
++
++    grep -Fq 'Invalid job options: cannot use variables with JSON files.' err \
++        || fail "$label stderr missing variable rejection: $(cat err)"
++}
++
++start_server_only_agent() {
++    local http rpc serf
++    read -r http rpc serf < <(python3 - <<'PY'
++import socket
++ports = []
++sockets = []
++for _ in range(3):
++    s = socket.socket()
++    s.bind(("127.0.0.1", 0))
++    ports.append(s.getsockname()[1])
++    sockets.append(s)
++print(*ports)
++for s in sockets:
++    s.close()
++PY
++)
++    NOMAD_ADDR_FOR_TEST="http://127.0.0.1:${http}"
++    cat >"$TMP/agent.json" <<EOF
++{"name":"fixture-${http}","data_dir":"$TMP/data","disable_update_check":true,"log_level":"WARN","ports":{"http":$http,"rpc":$rpc,"serf":$serf},"advertise":{"http":"127.0.0.1","rpc":"127.0.0.1","serf":"127.0.0.1"},"server":{"enabled":true,"bootstrap_expect":1},"client":{"enabled":false},"acl":{"enabled":false}}
++EOF
++    "$BIN" agent -config="$TMP/agent.json" >"$TMP/agent.out" 2>"$TMP/agent.err" &
++    AGENT_PID=$!
++
++    local i
++    for i in $(seq 1 120); do
++        if "$BIN" server members -address="$NOMAD_ADDR_FOR_TEST" >"$TMP/server.out" 2>"$TMP/server.err"; then
++            return 0
++        fi
++        if ! kill -0 "$AGENT_PID" 2>/dev/null; then
++            echo "agent stdout:" >&2
++            cat "$TMP/agent.out" >&2
++            echo "agent stderr:" >&2
++            cat "$TMP/agent.err" >&2
++            fail "server-only agent exited before readiness"
++        fi
++        sleep 0.25
++    done
++    echo "last server readiness stderr:" >&2
++    cat "$TMP/server.err" >&2
++    fail "server-only agent did not become ready"
++}
++
++
++
++
++"$BIN" job run -json -output "$FIX/example_wrapped.json" >out 2>err
++ec=$?
++[ "$ec" -eq 0 ] || fail "F1 exit $ec; want 0"
++assert_example_job_output "F1 stdout" out
++
++
++
++
++"$BIN" job run -json -output "$FIX/example_bare.json" >out 2>err
++ec=$?
++[ "$ec" -eq 0 ] || fail "F2 exit $ec; want 0"
++assert_example_job_output "F2 stdout" out
++
++
++
++
++"$BIN" run -json -output "$FIX/example_wrapped.json" >out 2>err
++ec=$?
++[ "$ec" -eq 0 ] || fail "F3 exit $ec; want 0"
++assert_example_job_output "F3 stdout" out
++
++
++
++
++"$BIN" job validate -json "$FIX/valid_wrapped.json" >out 2>err
++ec=$?
++[ "$ec" -eq 0 ] || fail "F4 exit $ec; want 0"
++
++
++
++
++
++"$BIN" validate -json "$FIX/valid_bare.json" >out 2>err
++ec=$?
++[ "$ec" -eq 0 ] || fail "F5 exit $ec; want 0"
++
++
++
++
++
++start_server_only_agent
++"$BIN" job plan -address="$NOMAD_ADDR_FOR_TEST" -json "$FIX/valid_wrapped.json" >out 2>err
++ec=$?
++
++[ "$ec" -eq 0 ] || [ "$ec" -eq 1 ] || fail "F6 exit $ec; want 0 or 1"
++assert_plan_output_mentions_json_job "F6"
++
++
++
++
++"$BIN" plan -address="$NOMAD_ADDR_FOR_TEST" -json "$FIX/valid_bare.json" >out 2>err
++ec=$?
++
++[ "$ec" -eq 0 ] || [ "$ec" -eq 1 ] || fail "F7 exit $ec; want 0 or 1"
++assert_plan_output_mentions_json_job "F7"
++
++
++
++
++"$BIN" job run -address="$NOMAD_ADDR_FOR_TEST" -json -detach "$FIX/valid_wrapped.json" >out 2>err
++ec=$?
++[ "$ec" -eq 0 ] || fail "F8 exit $ec; want 0"
++
++python3 - "$NOMAD_ADDR_FOR_TEST" "$FIX/valid_wrapped.json" >out 2>err <<'PY'
++import json
++import sys
++import urllib.request
++
++addr, path = sys.argv[1], sys.argv[2]
++with urllib.request.urlopen(addr + "/v1/job/jsonsubmit/submission?version=0", timeout=5) as resp:
++    submission = json.loads(resp.read().decode("utf-8"))
++with open(path, encoding="utf-8") as fh:
++    expected_source = fh.read()
++if submission.get("Format") != "json":
++    raise SystemExit(f"Format was {submission.get('Format')!r}")
++if submission.get("Source") != expected_source:
++    raise SystemExit("Source did not exactly match input JSON")
++print("submission metadata ok")
++PY
++ec=$?
++[ "$ec" -eq 0 ] || fail "F8 submission API check failed: $(cat err)"
++printf '%s\n' 'submission metadata ok' >want
++assert_file_eq want out "F8 submission API stdout"
++assert_empty err "F8 submission API stderr"
++
++
++
++
++"$BIN" job validate -json "$FIX/hcl_not_json.json" >out 2>err
++ec=$?
++[ "$ec" -eq 1 ] || fail "F9 exit $ec; want 1"
++
++grep -Fq 'Error getting job struct: Failed to parse JSON job' err \
++    || fail "F9 stderr missing JSON parse error: $(cat err)"
++
++
++
++
++"$BIN" job plan -json "$FIX/hcl_not_json.json" >out 2>err
++ec=$?
++[ "$ec" -eq 255 ] || fail "F10 exit $ec; want 255"
++
++grep -Fq 'Error getting job struct: Failed to parse JSON job' err \
++    || fail "F10 stderr missing JSON parse error: $(cat err)"
++
++
++
++
++expect_var_reject "F11a job run -var" 1 job run -json -var=foo=bar "$FIX/hcl_not_json.json"
++expect_var_reject "F11b run -var" 1 run -json -var=foo=bar "$FIX/hcl_not_json.json"
++
++
++
++
++expect_var_reject "F12a job run -var-file" 1 job run -json -var-file="$FIX/vars.hcl" "$FIX/hcl_not_json.json"
++expect_var_reject "F12b run -var-file" 1 run -json -var-file="$FIX/vars.hcl" "$FIX/hcl_not_json.json"
++
++
++
++
++expect_var_reject "F13a job validate -var" 1 job validate -json -var=foo=bar "$FIX/hcl_not_json.json"
++expect_var_reject "F13b job validate -var-file" 1 job validate -json -var-file="$FIX/vars.hcl" "$FIX/hcl_not_json.json"
++expect_var_reject "F13c validate -var" 1 validate -json -var=foo=bar "$FIX/hcl_not_json.json"
++expect_var_reject "F13d validate -var-file" 1 validate -json -var-file="$FIX/vars.hcl" "$FIX/hcl_not_json.json"
++
++
++
++
++expect_var_reject "F14a job plan -var" 255 job plan -json -var=foo=bar "$FIX/hcl_not_json.json"
++expect_var_reject "F14b job plan -var-file" 255 job plan -json -var-file="$FIX/vars.hcl" "$FIX/hcl_not_json.json"
++expect_var_reject "F14c plan -var" 255 plan -json -var=foo=bar "$FIX/hcl_not_json.json"
++expect_var_reject "F14d plan -var-file" 255 plan -json -var-file="$FIX/vars.hcl" "$FIX/hcl_not_json.json"
++
++
++
++
++expect_help_json_flag "F15a job run help" job run
++expect_help_json_flag "F15b job plan help" job plan
++expect_help_json_flag "F15c job validate help" job validate
++
++echo "PASS"
++exit 0
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,20 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++export CHECKPOINT_DISABLE=1
++
++export GOTOOLCHAIN=local
++export GOPROXY=off
++export GOSUMDB=off
++export GOMODCACHE=/go/pkg/mod
++export GOCACHE=/workspace/repo/.coderl-go-build-cache
++set -e
++mkdir -p "$GOMODCACHE" "$GOCACHE"
++cd /workspace/repo
++exec bash /workspace/repo/usercase-test-coderl/usecase.sh

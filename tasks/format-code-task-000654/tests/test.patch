@@ -1,0 +1,183 @@
+diff --git a/tests/transforms_tests/image_tests/test_resize.py b/tests/transforms_tests/image_tests/test_resize.py
+index ea97754c..ade79164 100644
+--- a/tests/transforms_tests/image_tests/test_resize.py
++++ b/tests/transforms_tests/image_tests/test_resize.py
+@@ -1,3 +1,7 @@
++import os
++import subprocess
++import sys
++import textwrap
+ import unittest
+ 
+ import numpy as np
+@@ -8,12 +12,59 @@ from chainercv.transforms import resize
+ 
+ class TestResize(unittest.TestCase):
+ 
+-    def test_resize(self):
++    def test_resize_color(self):
+         img = np.random.uniform(size=(3, 24, 32))
+-
+         out = resize(img, output_shape=(32, 64))
+-
+         self.assertEqual(out.shape, (3, 32, 64))
+ 
++    def test_resize_grayscale_preserves_channel(self):
++        img = np.arange(1 * 17 * 23, dtype=np.float32).reshape((1, 17, 23))
++        out = resize(img, output_shape=(31, 19))
++        self.assertEqual(out.shape, (1, 31, 19))
++        self.assertGreater(np.ptp(out[0]), 0)
++
++    def test_resize_grayscale_with_cv2_like_backend(self):
++        script = r'''
++import sys
++import types
++import numpy as np
++
++def fake_resize(image, dsize):
++    out_w, out_h = dsize
++    if image.ndim == 3:
++        channels = image.shape[2]
++        if channels == 1:
++            return np.resize(
++                image[:, :, 0], (out_h, out_w)).astype(image.dtype, copy=False)
++        return np.stack([
++            np.resize(image[:, :, channel], (out_h, out_w)).astype(
++                image.dtype, copy=False)
++            for channel in range(channels)
++        ], axis=2)
++    return np.resize(image, (out_h, out_w)).astype(image.dtype, copy=False)
++
++sys.modules['cv2'] = types.SimpleNamespace(resize=fake_resize)
++
++from chainercv.transforms import resize
++
++img = np.arange(1 * 12 * 18, dtype=np.float32).reshape((1, 12, 18))
++out = resize(img, output_shape=(7, 9))
++
++assert out.shape == (1, 7, 9), out.shape
++assert np.ptp(out[0]) > 0
++'''
++        env = os.environ.copy()
++        repo_root = os.getcwd()
++        env['PYTHONPATH'] = os.pathsep.join(
++            [repo_root, env.get('PYTHONPATH', '')]).rstrip(os.pathsep)
++        proc = subprocess.Popen(
++            [sys.executable, '-c', textwrap.dedent(script)],
++            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
++        stdout, stderr = proc.communicate()
++        self.assertEqual(
++            proc.returncode, 0,
++            msg='stdout:\n{}\nstderr:\n{}'.format(
++                stdout.decode('utf-8'), stderr.decode('utf-8')))
++
+ 
+ testing.run_module(__name__, __file__)
+diff --git a/tests/transforms_tests/image_tests/test_resize_no_cv2_fallback.py b/tests/transforms_tests/image_tests/test_resize_no_cv2_fallback.py
+new file mode 100644
+index 00000000..6dea5a46
+--- /dev/null
++++ b/tests/transforms_tests/image_tests/test_resize_no_cv2_fallback.py
+@@ -0,0 +1,71 @@
++import os
++import subprocess
++import sys
++import textwrap
++import unittest
++
++from chainer import testing
++
++
++class TestResizeNoCv2Fallback(unittest.TestCase):
++
++    def _run_no_cv2_case(self, channels, height, width, out_h, out_w):
++        script = r'''
++import builtins
++import numpy as np
++
++real_import = builtins.__import__
++
++def blocked_import(name, globals=None, locals=None, fromlist=(), level=0):
++    if name == 'cv2' or name.startswith('cv2.'):
++        raise ImportError('cv2 blocked by resize fallback test')
++    return real_import(name, globals, locals, fromlist, level)
++
++builtins.__import__ = blocked_import
++
++from chainercv.transforms import resize
++
++channels = {channels}
++height = {height}
++width = {width}
++out_h = {out_h}
++out_w = {out_w}
++
++base = np.arange(height * width, dtype=np.float32).reshape((height, width))
++img = np.stack([base + 1000 * channel for channel in range(channels)])
++out = resize(img, output_shape=(out_h, out_w))
++
++assert out.shape == (channels, out_h, out_w), out.shape
++assert np.ptp(out[-1]) > 0
++if channels > 1:
++    assert not np.allclose(out[0], out[-1])
++'''.format(
++            channels=channels, height=height, width=width,
++            out_h=out_h, out_w=out_w)
++        env = os.environ.copy()
++        repo_root = os.getcwd()
++        env['PYTHONPATH'] = os.pathsep.join(
++            [repo_root, env.get('PYTHONPATH', '')]).rstrip(os.pathsep)
++        proc = subprocess.Popen(
++            [sys.executable, '-c', textwrap.dedent(script)],
++            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
++        stdout, stderr = proc.communicate()
++        self.assertEqual(
++            proc.returncode, 0,
++            msg='stdout:\n{}\nstderr:\n{}'.format(
++                stdout.decode('utf-8'), stderr.decode('utf-8')))
++
++    def test_fallback_preserves_single_channel(self):
++        self._run_no_cv2_case(1, 13, 21, 8, 10)
++
++    def test_fallback_preserves_two_channels(self):
++        self._run_no_cv2_case(2, 10, 14, 6, 11)
++
++    def test_fallback_preserves_four_channels(self):
++        self._run_no_cv2_case(4, 9, 13, 5, 12)
++
++    def test_fallback_preserves_extra_channels(self):
++        self._run_no_cv2_case(5, 11, 15, 7, 9)
++
++
++testing.run_module(__name__, __file__)
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,26 @@
++#!/bin/bash
++set -uo pipefail
++cd /testbed
++
++set +u
++source /testbed/.venv/bin/activate
++set -u
++
++case "${1:-}" in
++  base)
++    python -m pytest \
++      tests/transforms_tests/image_tests/test_resize.py::TestResize::test_resize_color \
++      -v
++    ;;
++  new)
++    python -m pytest \
++      tests/transforms_tests/image_tests/test_resize.py::TestResize::test_resize_grayscale_preserves_channel \
++      tests/transforms_tests/image_tests/test_resize.py::TestResize::test_resize_grayscale_with_cv2_like_backend \
++      tests/transforms_tests/image_tests/test_resize_no_cv2_fallback.py \
++      -v
++    ;;
++  *)
++    echo "usage: $0 base|new"
++    exit 2
++    ;;
++esac

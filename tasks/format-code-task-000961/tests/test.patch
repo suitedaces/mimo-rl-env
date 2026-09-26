@@ -1,0 +1,199 @@
+diff --git a/agent/log_streamer_contract_test.go b/agent/log_streamer_contract_test.go
+new file mode 100644
+index 00000000..d785724c
+--- /dev/null
++++ b/agent/log_streamer_contract_test.go
+@@ -0,0 +1,183 @@
++package agent_test
++
++import (
++	"errors"
++	"sort"
++	"sync"
++	"testing"
++
++	"github.com/buildkite/agent/agent"
++	"github.com/buildkite/agent/logger"
++)
++
++type capturedChunk struct {
++	data   string
++	order  int
++	offset int
++	size   int
++}
++
++func captureChunks() (func(*agent.LogStreamerChunk) error, *[]capturedChunk) {
++	var mu sync.Mutex
++	chunks := []capturedChunk{}
++	return func(chunk *agent.LogStreamerChunk) error {
++		mu.Lock()
++		defer mu.Unlock()
++		chunks = append(chunks, capturedChunk{
++			data: chunk.Data, order: chunk.Order, offset: chunk.Offset, size: chunk.Size,
++		})
++		return nil
++	}, &chunks
++}
++
++func TestLogStreamerRequiresUsableWorkerConfiguration(t *testing.T) {
++	cases := []struct {
++		name string
++		conf agent.LogStreamerConfig
++	}{
++		{name: "zero concurrency", conf: agent.LogStreamerConfig{Concurrency: 0, MaxChunkSizeBytes: 4}},
++		{name: "negative concurrency", conf: agent.LogStreamerConfig{Concurrency: -1, MaxChunkSizeBytes: 4}},
++		{name: "zero chunk size", conf: agent.LogStreamerConfig{Concurrency: 1, MaxChunkSizeBytes: 0}},
++		{name: "negative chunk size", conf: agent.LogStreamerConfig{Concurrency: 1, MaxChunkSizeBytes: -1}},
++	}
++
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			streamer := agent.NewLogStreamer(logger.Discard, func(*agent.LogStreamerChunk) error { return nil }, tc.conf)
++			if err := streamer.Start(); err == nil {
++				t.Fatalf("Start() accepted invalid configuration: %+v", tc.conf)
++			}
++		})
++	}
++}
++
++func TestLogStreamerRejectsRepeatedStart(t *testing.T) {
++	streamer := agent.NewLogStreamer(logger.Discard, func(*agent.LogStreamerChunk) error { return nil }, agent.LogStreamerConfig{
++		Concurrency: 1, MaxChunkSizeBytes: 4,
++	})
++	if err := streamer.Start(); err != nil {
++		t.Fatal(err)
++	}
++	defer streamer.Stop()
++
++	if err := streamer.Start(); err == nil {
++		t.Fatal("Start() should reject being called more than once")
++	}
++}
++
++func TestLogStreamerEmitsNewBytesWithStableMetadata(t *testing.T) {
++	callback, chunks := captureChunks()
++	streamer := agent.NewLogStreamer(logger.Discard, callback, agent.LogStreamerConfig{
++		Concurrency: 2, MaxChunkSizeBytes: 3,
++	})
++	if err := streamer.Start(); err != nil {
++		t.Fatal(err)
++	}
++
++	for _, snapshot := range []string{"abc", "abcdefg"} {
++		if err := streamer.Process(snapshot); err != nil {
++			t.Fatal(err)
++		}
++	}
++	if err := streamer.Stop(); err != nil {
++		t.Fatal(err)
++	}
++
++	sort.Slice(*chunks, func(i, j int) bool { return (*chunks)[i].order < (*chunks)[j].order })
++	expected := []capturedChunk{
++		{data: "abc", order: 1, offset: 0, size: 3},
++		{data: "def", order: 2, offset: 3, size: 3},
++		{data: "g", order: 3, offset: 6, size: 1},
++	}
++	if len(*chunks) != len(expected) {
++		t.Fatalf("got %d chunks, want %d: %#v", len(*chunks), len(expected), *chunks)
++	}
++	for i := range expected {
++		if (*chunks)[i] != expected[i] {
++			t.Errorf("chunk %d = %#v, want %#v", i, (*chunks)[i], expected[i])
++		}
++	}
++}
++
++func TestLogStreamerIgnoresEmptyAndRepeatedSnapshots(t *testing.T) {
++	callback, chunks := captureChunks()
++	streamer := agent.NewLogStreamer(logger.Discard, callback, agent.LogStreamerConfig{
++		Concurrency: 1, MaxChunkSizeBytes: 8,
++	})
++	if err := streamer.Start(); err != nil {
++		t.Fatal(err)
++	}
++	for _, snapshot := range []string{"", "abc", "abc"} {
++		if err := streamer.Process(snapshot); err != nil {
++			t.Fatal(err)
++		}
++	}
++	if err := streamer.Stop(); err != nil {
++		t.Fatal(err)
++	}
++	if len(*chunks) != 1 || (*chunks)[0].data != "abc" {
++		t.Fatalf("empty/repeated snapshots emitted unexpected chunks: %#v", *chunks)
++	}
++}
++
++func TestLogStreamerRejectsShrinkingSnapshotWithoutEmittingMoreData(t *testing.T) {
++	callback, chunks := captureChunks()
++	streamer := agent.NewLogStreamer(logger.Discard, callback, agent.LogStreamerConfig{
++		Concurrency: 1, MaxChunkSizeBytes: 8,
++	})
++	if err := streamer.Start(); err != nil {
++		t.Fatal(err)
++	}
++
++	if err := streamer.Process("abcdef"); err != nil {
++		t.Fatal(err)
++	}
++	var processErr error
++	func() {
++		defer func() {
++			if recovered := recover(); recovered != nil {
++				processErr = errors.New("Process panicked while handling a shrinking snapshot")
++			}
++		}()
++		processErr = streamer.Process("abc")
++	}()
++	if processErr == nil {
++		t.Fatal("Process() should reject a snapshot shorter than previously processed output")
++	}
++	if err := streamer.Stop(); err != nil {
++		t.Fatal(err)
++	}
++	if len(*chunks) != 1 || (*chunks)[0].data != "abcdef" {
++		t.Fatalf("shrinking snapshot emitted unexpected chunks: %#v", *chunks)
++	}
++}
++
++func TestLogStreamerCountsCallbackFailuresAndContinues(t *testing.T) {
++	var mu sync.Mutex
++	orders := []int{}
++	streamer := agent.NewLogStreamer(logger.Discard, func(chunk *agent.LogStreamerChunk) error {
++		mu.Lock()
++		orders = append(orders, chunk.Order)
++		mu.Unlock()
++		if chunk.Order == 1 {
++			return errors.New("upload failed")
++		}
++		return nil
++	}, agent.LogStreamerConfig{Concurrency: 1, MaxChunkSizeBytes: 2})
++	if err := streamer.Start(); err != nil {
++		t.Fatal(err)
++	}
++	if err := streamer.Process("abcd"); err != nil {
++		t.Fatal(err)
++	}
++	if err := streamer.Stop(); err != nil {
++		t.Fatal(err)
++	}
++
++	if streamer.FailedChunks() != 1 {
++		t.Fatalf("FailedChunks() = %d, want 1", streamer.FailedChunks())
++	}
++	if len(orders) != 2 || orders[0] != 1 || orders[1] != 2 {
++		t.Fatalf("callback orders = %#v, want [1 2]", orders)
++	}
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,5 @@
++#!/bin/bash
++set -euo pipefail
++
++
++go test -mod=vendor -vet=off ./agent -run 'TestLogStreamer' -count=1

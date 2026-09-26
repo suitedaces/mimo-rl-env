@@ -1,0 +1,163 @@
+diff --git a/pkg/node/replica_test.go b/pkg/node/replica_test.go
+new file mode 100644
+index 00000000..ab630b12
+--- /dev/null
++++ b/pkg/node/replica_test.go
+@@ -0,0 +1,132 @@
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++package node
++
++import (
++	"testing"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++
++	commonv1 "github.com/apache/skywalking-banyandb/api/proto/banyandb/common/v1"
++	databasev1 "github.com/apache/skywalking-banyandb/api/proto/banyandb/database/v1"
++	"github.com/apache/skywalking-banyandb/banyand/metadata/schema"
++)
++
++var replicaGroupSchema = schema.Metadata{
++	TypeMeta: schema.TypeMeta{
++		Kind: schema.KindGroup,
++	},
++	Spec: &commonv1.Group{
++		Metadata: &commonv1.Metadata{
++			Name: "rgroup",
++		},
++		Catalog: commonv1.Catalog_CATALOG_MEASURE,
++		ResourceOpts: &commonv1.ResourceOpts{
++			ShardNum: 3,
++		},
++	},
++}
++
++func setupReplicaSelector(nodeNames ...string) Selector {
++	selector := NewRoundRobinSelector("test", nil)
++	selector.(*roundRobinSelector).OnAddOrUpdate(replicaGroupSchema)
++	for _, n := range nodeNames {
++		selector.AddNode(&databasev1.Node{Metadata: &commonv1.Metadata{Name: n}})
++	}
++	return selector
++}
++
++
++func TestReplicaOmittedEqualsPrimary(t *testing.T) {
++	selector := setupReplicaSelector("node1", "node2", "node3")
++	for shardID := uint32(0); shardID < 3; shardID++ {
++		primary, err := selector.Pick("rgroup", "", shardID)
++		require.NoError(t, err)
++		explicit, err := selector.Pick("rgroup", "", shardID, 0)
++		require.NoError(t, err)
++		assert.Equal(t, primary, explicit,
++			"picking shard %d without a replica must equal replica 0", shardID)
++	}
++}
++
++
++
++func TestReplicaCopiesAreDistinct(t *testing.T) {
++	nodes := []string{"node1", "node2", "node3"}
++	selector := setupReplicaSelector(nodes...)
++	for shardID := uint32(0); shardID < 3; shardID++ {
++		seen := make(map[string]uint32)
++		for replicaID := uint32(0); replicaID < uint32(len(nodes)); replicaID++ {
++			n, err := selector.Pick("rgroup", "", shardID, replicaID)
++			require.NoError(t, err)
++			assert.Contains(t, nodes, n)
++			if prev, ok := seen[n]; ok {
++				t.Fatalf("shard %d: replica %d and replica %d both mapped to node %s",
++					shardID, prev, replicaID, n)
++			}
++			seen[n] = replicaID
++		}
++		assert.Len(t, seen, len(nodes),
++			"shard %d: expected %d distinct nodes across its copies", shardID, len(nodes))
++	}
++}
++
++
++
++func TestReplicaSelectionIsDeterministic(t *testing.T) {
++	selector := setupReplicaSelector("node1", "node2", "node3")
++
++	want := make(map[[2]uint32]string)
++	for shardID := uint32(0); shardID < 3; shardID++ {
++		for replicaID := uint32(0); replicaID < 3; replicaID++ {
++			n, err := selector.Pick("rgroup", "", shardID, replicaID)
++			require.NoError(t, err)
++			want[[2]uint32{shardID, replicaID}] = n
++		}
++	}
++
++
++	for i := 0; i < 50; i++ {
++		for shardID := int(2); shardID >= 0; shardID-- {
++			for replicaID := int(2); replicaID >= 0; replicaID-- {
++				n, err := selector.Pick("rgroup", "", uint32(shardID), uint32(replicaID))
++				require.NoError(t, err)
++				assert.Equal(t, want[[2]uint32{uint32(shardID), uint32(replicaID)}], n)
++			}
++		}
++	}
++}
++
++
++func TestReplicaErrorBehavior(t *testing.T) {
++
++	empty := setupReplicaSelector()
++	_, err := empty.Pick("rgroup", "", 0, 1)
++	assert.Error(t, err, "no nodes available must error for any replica")
++
++	selector := setupReplicaSelector("node1", "node2", "node3")
++
++
++	_, err = selector.Pick("does-not-exist", "", 0, 1)
++	assert.Error(t, err, "unknown group must error for any replica")
++
++
++	_, err = selector.Pick("rgroup", "", 100, 1)
++	assert.Error(t, err, "unknown shard must error for any replica")
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,20 @@
++#!/usr/bin/env bash
++
++
++
++
++set -euo pipefail
++HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++cd /testbed
++
++
++
++
++
++( cd api && PATH="/testbed/bin:/testbed/api/proto:$PATH" /testbed/bin/buf generate )
++
++
++go test ./pkg/node/ -run 'TestPickEmptySelector|TestPickUnknownGroup|TestPickSingleSelection|TestPickMultipleSelections|TestPickNodeRemoval|TestPickConsistentSelectionAfterRemoval|TestCleanupGroup|TestSortNodeEntries|TestStringer|TestChangeShard|TestMaglevSelector|TestMaglevSelector_EvenDistribution|TestMaglevSelector_DiffNode' -count=1 -v
++
++
++go test ./pkg/node/ -run 'TestReplicaOmittedEqualsPrimary|TestReplicaCopiesAreDistinct|TestReplicaSelectionIsDeterministic|TestReplicaErrorBehavior' -count=1 -v

@@ -1,0 +1,562 @@
+diff --git a/usercase-test-coderl/test_host_connection_lifecycle.py b/usercase-test-coderl/test_host_connection_lifecycle.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/test_host_connection_lifecycle.py
+@@ -0,0 +1,527 @@
++from typing import Any, Dict, List, Optional
++
++import pytest
++
++from nornir.core import Nornir
++from nornir.core.configuration import Config
++from nornir.core.exceptions import ConnectionAlreadyOpen, ConnectionNotOpen
++from nornir.core.inventory import (
++    ConnectionOptions,
++    Defaults,
++    Group,
++    Groups,
++    Host,
++    Hosts,
++    Inventory,
++    ParentGroups,
++)
++from nornir.core.plugins.connections import ConnectionPluginRegister
++from nornir.core.state import GlobalState
++from nornir.core.task import AggregatedResult, Task
++
++
++
++
++
++
++
++
++
++
++class SerialRunner:
++    def run(self, task: Task, hosts: List[Host]) -> AggregatedResult:
++        result = AggregatedResult(task.name)
++        for host in hosts:
++            result[host.name] = task.copy().start(host)
++        return result
++
++
++class TrackingConnectionPlugin:
++    opened_count = 0
++    closed_count = 0
++    active_count = 0
++    open_records: List[Dict[str, Any]] = []
++    closed_payloads: List[Dict[str, Any]] = []
++
++    def open(
++        self,
++        hostname: Optional[str],
++        username: Optional[str],
++        password: Optional[str],
++        port: Optional[int],
++        platform: Optional[str],
++        extras: Optional[Dict[str, Any]] = None,
++        configuration: Optional[Config] = None,
++    ) -> None:
++        type(self).opened_count += 1
++        type(self).active_count += 1
++        self.connection = {
++            "id": type(self).opened_count,
++            "hostname": hostname,
++            "port": port,
++            "username": username,
++            "password": password,
++            "platform": platform,
++            "extras": extras,
++        }
++        self.hostname = hostname
++        self.username = username
++        self.password = password
++        self.port = port
++        self.platform = platform
++        self.extras = extras
++        self.configuration = configuration
++        self.closed = False
++        type(self).open_records.append(dict(self.connection))
++
++    def close(self) -> None:
++        type(self).closed_count += 1
++        type(self).active_count -= 1
++        self.closed = True
++        type(self).closed_payloads.append(dict(self.connection))
++
++
++class SecondaryConnectionPlugin(TrackingConnectionPlugin):
++    opened_count = 0
++    closed_count = 0
++    active_count = 0
++    open_records: List[Dict[str, Any]] = []
++    closed_payloads: List[Dict[str, Any]] = []
++
++
++def reset_plugin_state() -> None:
++    for plugin in (TrackingConnectionPlugin, SecondaryConnectionPlugin):
++        plugin.opened_count = 0
++        plugin.closed_count = 0
++        plugin.active_count = 0
++        plugin.open_records = []
++        plugin.closed_payloads = []
++
++
++@pytest.fixture(autouse=True)
++def registered_tracking_plugins() -> None:
++    ConnectionPluginRegister.deregister_all()
++    ConnectionPluginRegister.register("track", TrackingConnectionPlugin)
++    ConnectionPluginRegister.register("other", SecondaryConnectionPlugin)
++    reset_plugin_state()
++    yield
++    ConnectionPluginRegister.deregister_all()
++    reset_plugin_state()
++
++
++def build_inventory() -> Inventory:
++    defaults = Defaults(
++        hostname="defaults.example.net",
++        port=22,
++        username="default-user",
++        password="default-pass",
++        platform="linux",
++        connection_options={
++            "track": ConnectionOptions(
++                hostname="track-default.example.net",
++                port=10022,
++                username="track-default-user",
++                password=None,
++                platform=None,
++                extras={"origin": "defaults"},
++            ),
++            "other": ConnectionOptions(
++                hostname="other-default.example.net",
++                port=20022,
++                username="other-default-user",
++                password="other-default-pass",
++                platform="other-default-platform",
++                extras={"origin": "other-defaults"},
++            ),
++        },
++    )
++    parent = Group(
++        name="parent",
++        hostname="parent.example.net",
++        username="parent-user",
++        password="parent-pass",
++        platform="ios",
++        connection_options={
++            "track": ConnectionOptions(
++                hostname="track-parent.example.net",
++                port=11022,
++                username=None,
++                password="track-parent-pass",
++                platform="nxos",
++                extras={"origin": "group"},
++            )
++        },
++        defaults=defaults,
++    )
++    child = Group(
++        name="child",
++        port=2222,
++        groups=ParentGroups([parent]),
++        connection_options={
++            "track": ConnectionOptions(
++                hostname=None,
++                port=12022,
++                username="track-child-user",
++                password=None,
++                platform=None,
++                extras=None,
++            )
++        },
++        defaults=defaults,
++    )
++    r1 = Host(
++        name="r1",
++        hostname="host.example.net",
++        port=8022,
++        username="host-user",
++        password="host-pass",
++        platform="eos",
++        groups=ParentGroups([child]),
++        connection_options={
++            "track": ConnectionOptions(
++                hostname="track-host.example.net",
++                port=None,
++                username=None,
++                password="track-host-pass",
++                platform=None,
++                extras={"origin": "host"},
++            )
++        },
++        defaults=defaults,
++    )
++    r2 = Host(
++        name="r2",
++        hostname="second.example.net",
++        port=9022,
++        username="second-user",
++        password="second-pass",
++        platform="junos",
++        defaults=defaults,
++    )
++    return Inventory(
++        hosts=Hosts({"r1": r1, "r2": r2}),
++        groups=Groups({"parent": parent, "child": child}),
++        defaults=defaults,
++    )
++
++
++def test_connection_parameter_resolution_inherits_and_overrides() -> None:
++
++
++
++
++    host = build_inventory().hosts["r1"]
++
++    assert host.get_connection_parameters().dict() == {
++        "extras": {},
++        "hostname": "host.example.net",
++        "port": 8022,
++        "username": "host-user",
++        "password": "host-pass",
++        "platform": "eos",
++    }
++    assert host.get_connection_parameters("track").dict() == {
++        "extras": {"origin": "host"},
++        "hostname": "track-host.example.net",
++        "port": 12022,
++        "username": "track-child-user",
++        "password": "track-host-pass",
++        "platform": "nxos",
++    }
++    assert host.get_connection_parameters("other").dict() == {
++        "extras": {"origin": "other-defaults"},
++        "hostname": "other-default.example.net",
++        "port": 20022,
++        "username": "other-default-user",
++        "password": "other-default-pass",
++        "platform": "other-default-platform",
++    }
++    assert host.get_connection_parameters("missing").dict() == {
++        "extras": {},
++        "hostname": "host.example.net",
++        "port": 8022,
++        "username": "host-user",
++        "password": "host-pass",
++        "platform": "eos",
++    }
++
++
++def test_open_get_reuse_and_close_single_connection() -> None:
++
++
++
++
++    host = build_inventory().hosts["r1"]
++    config = Config()
++
++    assert list(host.connections.keys()) == []
++    assert len(host.connections) == 0
++    plugin = host.open_connection("track", config)
++    assert list(host.connections.keys()) == ["track"]
++    assert len(host.connections) == 1
++    assert plugin.connection == {
++        "id": 1,
++        "hostname": "track-host.example.net",
++        "port": 12022,
++        "username": "track-child-user",
++        "password": "track-host-pass",
++        "platform": "nxos",
++        "extras": {"origin": "host"},
++    }
++    assert TrackingConnectionPlugin.opened_count == 1
++    assert TrackingConnectionPlugin.closed_count == 0
++    assert TrackingConnectionPlugin.active_count == 1
++
++    assert host.get_connection("track", config) == {
++        "id": 1,
++        "hostname": "track-host.example.net",
++        "port": 12022,
++        "username": "track-child-user",
++        "password": "track-host-pass",
++        "platform": "nxos",
++        "extras": {"origin": "host"},
++    }
++    assert len(host.connections) == 1
++    assert TrackingConnectionPlugin.opened_count == 1
++
++    host.close_connection("track")
++    assert list(host.connections.keys()) == []
++    assert len(host.connections) == 0
++    assert plugin.closed is True
++    assert TrackingConnectionPlugin.opened_count == 1
++    assert TrackingConnectionPlugin.closed_count == 1
++    assert TrackingConnectionPlugin.active_count == 0
++
++
++def test_get_connection_auto_opens_when_name_is_not_cached() -> None:
++
++
++
++
++    host = build_inventory().hosts["r1"]
++
++    assert list(host.connections.keys()) == []
++    assert host.get_connection("track", Config()) == {
++        "id": 1,
++        "hostname": "track-host.example.net",
++        "port": 12022,
++        "username": "track-child-user",
++        "password": "track-host-pass",
++        "platform": "nxos",
++        "extras": {"origin": "host"},
++    }
++    assert list(host.connections.keys()) == ["track"]
++    assert len(host.connections) == 1
++    assert TrackingConnectionPlugin.opened_count == 1
++    assert TrackingConnectionPlugin.active_count == 1
++    host.close_connections()
++
++
++def test_open_connection_can_use_explicit_parameters_without_host_defaults() -> None:
++
++
++
++
++    host = build_inventory().hosts["r1"]
++
++    plugin = host.open_connection(
++        "track",
++        Config(),
++        hostname="manual.example.net",
++        username="manual-user",
++        password="manual-pass",
++        port=1234,
++        platform="manual-os",
++        extras={"manual": True},
++        default_to_host_attributes=False,
++    )
++
++    assert plugin.connection == {
++        "id": 1,
++        "hostname": "manual.example.net",
++        "port": 1234,
++        "username": "manual-user",
++        "password": "manual-pass",
++        "platform": "manual-os",
++        "extras": {"manual": True},
++    }
++    assert plugin.hostname == "manual.example.net"
++    assert plugin.username == "manual-user"
++    assert plugin.password == "manual-pass"
++    assert plugin.port == 1234
++    assert plugin.platform == "manual-os"
++    assert plugin.extras == {"manual": True}
++    host.close_connections()
++
++
++def test_opening_already_open_name_raises_specific_exception() -> None:
++
++
++
++
++    host = build_inventory().hosts["r1"]
++
++    host.open_connection("track", Config())
++    with pytest.raises(ConnectionAlreadyOpen) as excinfo:
++        host.open_connection("track", Config())
++
++
++    assert excinfo.type is ConnectionAlreadyOpen
++    assert list(host.connections.keys()) == ["track"]
++    assert TrackingConnectionPlugin.opened_count == 1
++    host.close_connections()
++
++
++def test_closing_not_open_name_raises_specific_exception() -> None:
++
++
++
++
++    host = build_inventory().hosts["r1"]
++
++    assert list(host.connections.keys()) == []
++    with pytest.raises(ConnectionNotOpen) as excinfo:
++        host.close_connection("track")
++
++
++    assert excinfo.type is ConnectionNotOpen
++    assert list(host.connections.keys()) == []
++    assert TrackingConnectionPlugin.closed_count == 0
++
++
++def test_close_connections_is_idempotent_for_empty_host() -> None:
++
++
++
++
++    host = build_inventory().hosts["r1"]
++
++    host.close_connections()
++    assert list(host.connections.keys()) == []
++    assert len(host.connections) == 0
++    assert TrackingConnectionPlugin.closed_count == 0
++    host.close_connections()
++    assert list(host.connections.keys()) == []
++    assert len(host.connections) == 0
++    assert TrackingConnectionPlugin.closed_count == 0
++
++
++def test_two_hosts_keep_independent_connection_state() -> None:
++
++
++
++
++    inventory = build_inventory()
++    first = inventory.hosts["r1"]
++    second = inventory.hosts["r2"]
++
++    first.open_connection("track", Config())
++    assert list(first.connections.keys()) == ["track"]
++    assert len(first.connections) == 1
++    assert list(second.connections.keys()) == []
++    assert len(second.connections) == 0
++
++    second.open_connection("other", Config())
++    assert list(first.connections.keys()) == ["track"]
++    assert len(first.connections) == 1
++    assert list(second.connections.keys()) == ["other"]
++    assert len(second.connections) == 1
++    assert TrackingConnectionPlugin.opened_count == 1
++    assert SecondaryConnectionPlugin.opened_count == 1
++
++    first.close_connections()
++    second.close_connections()
++    assert len(first.connections) == 0
++    assert len(second.connections) == 0
++    assert TrackingConnectionPlugin.active_count == 0
++    assert SecondaryConnectionPlugin.active_count == 0
++
++
++def test_nornir_close_connections_respects_good_and_failed_selection() -> None:
++
++
++
++
++    nornir = Nornir(inventory=build_inventory(), runner=SerialRunner(), data=GlobalState())
++    nornir.inventory.hosts["r1"].open_connection("track", nornir.config)
++    nornir.inventory.hosts["r2"].open_connection("track", nornir.config)
++    nornir.data.failed_hosts.add("r2")
++
++    assert {name: list(host.connections.keys()) for name, host in nornir.inventory.hosts.items()} == {
++        "r1": ["track"],
++        "r2": ["track"],
++    }
++    assert TrackingConnectionPlugin.active_count == 2
++
++    nornir.close_connections(on_good=True, on_failed=False)
++    assert {name: list(host.connections.keys()) for name, host in nornir.inventory.hosts.items()} == {
++        "r1": [],
++        "r2": ["track"],
++    }
++    assert TrackingConnectionPlugin.closed_count == 1
++    assert TrackingConnectionPlugin.active_count == 1
++
++    nornir.close_connections(on_good=False, on_failed=True)
++    assert {name: list(host.connections.keys()) for name, host in nornir.inventory.hosts.items()} == {
++        "r1": [],
++        "r2": [],
++    }
++    assert TrackingConnectionPlugin.closed_count == 2
++    assert TrackingConnectionPlugin.active_count == 0
++
++
++def test_nornir_context_manager_closes_good_and_failed_hosts() -> None:
++
++
++
++
++    nornir = Nornir(inventory=build_inventory(), runner=SerialRunner(), data=GlobalState())
++    nornir.inventory.hosts["r1"].open_connection("track", nornir.config)
++    nornir.inventory.hosts["r2"].open_connection("track", nornir.config)
++    nornir.data.failed_hosts.add("r2")
++
++    assert {name: list(host.connections.keys()) for name, host in nornir.inventory.hosts.items()} == {
++        "r1": ["track"],
++        "r2": ["track"],
++    }
++    with nornir:
++
++        assert TrackingConnectionPlugin.active_count == 2
++
++    assert {name: list(host.connections.keys()) for name, host in nornir.inventory.hosts.items()} == {
++        "r1": [],
++        "r2": [],
++    }
++    assert TrackingConnectionPlugin.closed_count == 2
++    assert TrackingConnectionPlugin.active_count == 0
++
++
++def test_repeated_open_use_cleanup_cycles_leave_no_active_plugin_resources() -> None:
++
++
++
++
++    config = Config()
++
++    for expected_id in range(1, 101):
++        host = build_inventory().hosts["r1"]
++        assert TrackingConnectionPlugin.active_count == 0
++        assert list(host.connections.keys()) == []
++        assert host.get_connection("track", config) == {
++            "id": expected_id,
++            "hostname": "track-host.example.net",
++            "port": 12022,
++            "username": "track-child-user",
++            "password": "track-host-pass",
++            "platform": "nxos",
++            "extras": {"origin": "host"},
++        }
++        assert list(host.connections.keys()) == ["track"]
++        assert TrackingConnectionPlugin.active_count == 1
++        host.close_connections()
++        assert list(host.connections.keys()) == []
++        assert TrackingConnectionPlugin.active_count == 0
++
++    assert TrackingConnectionPlugin.opened_count == 100
++    assert TrackingConnectionPlugin.closed_count == 100
++    assert TrackingConnectionPlugin.active_count == 0
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,25 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++
++cd /workspace/repo
++
++VENV=/opt/nornir-stage4-venv
++if [ ! -x "$VENV/bin/python" ]; then
++  echo "Missing prebuilt offline test venv at $VENV" >&2
++  exit 1
++fi
++
++export PIP_NO_INDEX=1
++export PIP_DISABLE_PIP_VERSION_CHECK=1
++export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
++exec "$VENV/bin/python" -m pytest /workspace/repo/usercase-test-coderl/test_host_connection_lifecycle.py -v

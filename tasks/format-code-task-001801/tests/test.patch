@@ -1,0 +1,359 @@
+diff --git a/tests/conftest.py b/tests/conftest.py
+index 512688a43..1c90f6b26 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -1,5 +1,6 @@
+ import os
+ import pathlib
++import sys
+ from typing import TYPE_CHECKING, Any, AsyncGenerator, Callable, Generator, Union, cast
+ 
+ import fakeredis.aioredis  # type: ignore
+@@ -208,6 +209,25 @@ def session_backend_config(request: pytest.FixtureRequest) -> Union[ServerSideSe
+     return cast("Union[ServerSideSessionConfig, CookieBackendConfig]", request.getfixturevalue(request.param))
+ 
+ 
++@pytest.fixture(
++    params=[
++        pytest.param("cookie_session_backend_config", id="cookie"),
++        pytest.param("memory_session_backend_config", id="memory"),
++        pytest.param("file_session_backend_config", id="file"),
++        pytest.param("redis_session_backend_config", id="redis"),
++        pytest.param("memcached_session_backend_config", id="memcached"),
++        pytest.param("sqlalchemy_session_backend_config", id="sqlalchemy"),
++        pytest.param("async_sqlalchemy_session_backend_config", id="sqlalchemy-async"),
++    ]
++)
++def session_backend_config_async_safe(
++    request: pytest.FixtureRequest,
++) -> Union[ServerSideSessionConfig, CookieBackendConfig]:
++    if sys.version_info < (3, 10) and request.param == "redis_session_backend_config":
++        pytest.skip("fakeredis aioredis support is not stable for this environment")
++    return cast("Union[ServerSideSessionConfig, CookieBackendConfig]", request.getfixturevalue(request.param))
++
++
+ @pytest.fixture(
+     params=[
+         pytest.param("cookie_session_backend", id="cookie"),
+diff --git a/tests/middleware/session/test_middleware.py b/tests/middleware/session/test_middleware.py
+index 71d554c0a..1f7768abd 100644
+--- a/tests/middleware/session/test_middleware.py
++++ b/tests/middleware/session/test_middleware.py
+@@ -1,5 +1,7 @@
+ from typing import TYPE_CHECKING, Any, Dict, Optional, Union
+ 
++from anyio import run as run_async
++
+ from starlette.status import HTTP_201_CREATED, HTTP_500_INTERNAL_SERVER_ERROR
+ 
+ from starlite import (
+@@ -13,10 +15,13 @@ from starlite import (
+     websocket,
+ )
+ from starlite.testing import create_test_client
++from starlite.types import Empty
+ 
+ if TYPE_CHECKING:
+     from starlite.middleware.session.base import BaseBackendConfig
+     from starlite.middleware.session.memory_backend import MemoryBackendConfig
++    from starlite.middleware.session.cookie_backend import CookieBackendConfig
++    from starlite.middleware.session.server_side import ServerSideSessionConfig
+ 
+ 
+ def test_session_middleware_not_installed_raises() -> None:
+@@ -57,6 +62,150 @@ def test_integration(session_backend_config: "BaseBackendConfig") -> None:
+         assert response.json() == {"has_session": False}
+ 
+ 
++def test_set_session_empty_clears_session_across_backends(
++    session_backend_config_async_safe: "BaseBackendConfig",
++) -> None:
++    @post("/create-session")
++    def create_session_handler(request: Request) -> None:
++        request.set_session({"user": "alice", "nonce": "empty-marker"})
++
++    @post("/clear-session")
++    def clear_session_handler(request: Request) -> None:
++        request.set_session(Empty)
++
++    with create_test_client(
++        route_handlers=[create_session_handler, clear_session_handler],
++        middleware=[session_backend_config_async_safe.middleware],
++        session_config=session_backend_config_async_safe,
++    ) as client:
++        assert client.post("/create-session").status_code == HTTP_201_CREATED
++        assert client.get_session_data() == {"user": "alice", "nonce": "empty-marker"}
++
++        response = client.post("/clear-session")
++
++        assert response.status_code == HTTP_201_CREATED
++        assert client.get_session_data() == {}
++
++
++def test_empty_session_removes_server_side_data_for_existing_session_id(
++    memory_session_backend_config: "ServerSideSessionConfig",
++) -> None:
++    @post("/create-session")
++    def create_session_handler(request: Request) -> None:
++        request.set_session({"user": "alice", "nonce": "server-empty"})
++
++    @post("/clear-session")
++    def clear_session_handler(request: Request) -> None:
++        request.set_session(Empty)
++
++    @get("/read-session")
++    def read_session_handler(request: Request) -> Dict[str, Any]:
++        return request.session
++
++    route_handlers = [create_session_handler, clear_session_handler, read_session_handler]
++    with create_test_client(
++        route_handlers=route_handlers,
++        middleware=[memory_session_backend_config.middleware],
++        session_config=memory_session_backend_config,
++    ) as client:
++        assert client.post("/create-session").status_code == HTTP_201_CREATED
++        session_id = client.cookies[memory_session_backend_config.key]
++        assert client.get_session_data() == {"user": "alice", "nonce": "server-empty"}
++        assert client.post("/clear-session").status_code == HTTP_201_CREATED
++        stored_data = run_async(client.session_backend.get, session_id)
++        if stored_data:
++            assert client.session_backend.deserialize_data(stored_data) != {"user": "alice", "nonce": "server-empty"}
++        assert client.get_session_data() == {}
++
++    with create_test_client(
++        route_handlers=route_handlers,
++        middleware=[memory_session_backend_config.middleware],
++        session_config=memory_session_backend_config,
++    ) as client:
++        client.cookies.set(memory_session_backend_config.key, session_id, domain="testserver.local", path="/")
++
++        assert client.get("/read-session").json() == {}
++        assert client.get_session_data() == {}
++
++
++def test_empty_dict_session_removes_server_side_data_for_existing_session_id(
++    memory_session_backend_config: "ServerSideSessionConfig",
++) -> None:
++    @post("/create-session")
++    def create_session_handler(request: Request) -> None:
++        request.set_session({"account": "case2", "nonce": "empty-dict"})
++
++    @post("/clear-session")
++    def clear_session_handler(request: Request) -> None:
++        request.set_session({})
++
++    @get("/read-session")
++    def read_session_handler(request: Request) -> Dict[str, Any]:
++        return request.session
++
++    route_handlers = [create_session_handler, clear_session_handler, read_session_handler]
++    with create_test_client(
++        route_handlers=route_handlers,
++        middleware=[memory_session_backend_config.middleware],
++        session_config=memory_session_backend_config,
++    ) as client:
++        assert client.post("/create-session").status_code == HTTP_201_CREATED
++        session_id = client.cookies[memory_session_backend_config.key]
++        assert client.get_session_data() == {"account": "case2", "nonce": "empty-dict"}
++        assert client.post("/clear-session").status_code == HTTP_201_CREATED
++        stored_data = run_async(client.session_backend.get, session_id)
++        if stored_data:
++            assert client.session_backend.deserialize_data(stored_data) != {"account": "case2", "nonce": "empty-dict"}
++        assert client.get_session_data() == {}
++
++    with create_test_client(
++        route_handlers=route_handlers,
++        middleware=[memory_session_backend_config.middleware],
++        session_config=memory_session_backend_config,
++    ) as client:
++        client.cookies.set(memory_session_backend_config.key, session_id, domain="testserver.local", path="/")
++
++        assert client.get("/read-session").json() == {}
++        assert client.get_session_data() == {}
++
++
++def test_cookie_backend_empty_session_only_emits_clearing_cookie(
++    cookie_session_backend_config: "CookieBackendConfig",
++) -> None:
++    @post("/create-session")
++    def create_session_handler(request: Request) -> None:
++        request.set_session({"user": "alice", "nonce": "cookie-empty"})
++
++    @post("/clear-session")
++    def clear_session_handler(request: Request) -> None:
++        request.set_session(Empty)
++
++    with create_test_client(
++        route_handlers=[create_session_handler, clear_session_handler],
++        middleware=[cookie_session_backend_config.middleware],
++        session_config=cookie_session_backend_config,
++    ) as client:
++        assert client.post("/create-session").status_code == HTTP_201_CREATED
++        assert client.get_session_data() == {"user": "alice", "nonce": "cookie-empty"}
++
++        response = client.post("/clear-session")
++
++    set_cookie_headers = response.headers.get_list("set-cookie")
++    session_cookie_headers = [
++        header
++        for header in set_cookie_headers
++        if header.lower().startswith(f"{cookie_session_backend_config.key.lower()}=")
++        or header.lower().startswith(f"{cookie_session_backend_config.key.lower()}-")
++    ]
++
++    assert any("=null" in header.lower() for header in session_cookie_headers)
++    assert not [
++        header
++        for header in session_cookie_headers
++        if "=null" not in header.lower() and "expires=" not in header.lower() and "max-age=0" not in header.lower()
++    ]
++
++
+ def test_use_of_custom_response_serializer_with_http_handler(session_backend_config: "BaseBackendConfig") -> None:
+     class Obj:
+         inner: str
+diff --git a/tests/testing/test_testing.py b/tests/testing/test_testing.py
+index da954b849..b760ba0d6 100644
+--- a/tests/testing/test_testing.py
++++ b/tests/testing/test_testing.py
+@@ -1,5 +1,6 @@
+ import json
+ import os
++from inspect import signature
+ from typing import TYPE_CHECKING, Any, Callable, Dict, Union, cast
+ 
+ import pytest
+@@ -17,7 +18,9 @@ from starlite import (
+ from starlite.datastructures import Cookie
+ from starlite.enums import ParamType
+ from starlite.middleware.session import SessionCookieConfig
+-from starlite.testing import RequestFactory, TestClient
++from starlite.middleware.session.base import BaseBackendConfig
++from starlite.status_codes import HTTP_201_CREATED
++from starlite.testing import RequestFactory, TestClient, create_test_client
+ from tests import Pet, PetFactory
+ 
+ if TYPE_CHECKING:
+@@ -46,6 +49,18 @@ def session_config(request: pytest.FixtureRequest) -> Union["ServerSideSessionCo
+     return cast("Union[ServerSideSessionConfig, CookieBackendConfig]", request.getfixturevalue(request.param))
+ 
+ 
++def _annotation_accepts_base_backend_config(annotation: object) -> bool:
++    if annotation is Any:
++        return True
++    if annotation is BaseBackendConfig:
++        return True
++    if getattr(annotation, "__forward_arg__", None) == "BaseBackendConfig":
++        return True
++
++    args = getattr(annotation, "__args__", ())
++    return any(_annotation_accepts_base_backend_config(arg) for arg in args if arg is not type(None))
++
++
+ def test_request_factory_no_cookie_header() -> None:
+     headers: Dict[str, str] = {}
+     RequestFactory._create_cookie_header(headers, None)
+@@ -273,3 +288,49 @@ def test_test_client_get_session_data(with_domain: bool, session_config: "BaseBa
+     with TestClient(app=app, session_config=session_config) as client:
+         client.post("/test")
+         assert client.get_session_data() == session_data
++
++
++def test_create_test_client_session_config_annotation_accepts_server_side_backend_config(
++    memory_session_backend_config: BaseBackendConfig,
++) -> None:
++    annotation = signature(create_test_client).parameters["session_config"].annotation
++
++    assert _annotation_accepts_base_backend_config(annotation)
++    assert annotation is Any or annotation is not SessionCookieConfig
++
++    @get("/")
++    def handler() -> Dict[str, bool]:
++        return {"ok": True}
++
++    with create_test_client(
++        route_handlers=[handler],
++        middleware=[memory_session_backend_config.middleware],
++        session_config=memory_session_backend_config,
++    ) as client:
++        assert client.get("/").json() == {"ok": True}
++
++
++def test_get_session_data_returns_empty_dict_for_missing_server_side_session(
++    memory_session_backend_config: "ServerSideSessionConfig",
++) -> None:
++    @post("/create-session")
++    def create_session_handler(request: Request) -> None:
++        request.set_session({"user": "alice", "nonce": "missing-backend-data"})
++
++    @post("/clear-session")
++    def clear_session_handler(request: Request) -> None:
++        request.clear_session()
++
++    with create_test_client(
++        route_handlers=[create_session_handler, clear_session_handler],
++        middleware=[memory_session_backend_config.middleware],
++        session_config=memory_session_backend_config,
++    ) as client:
++        assert client.post("/create-session").status_code == HTTP_201_CREATED
++        session_id = client.cookies[memory_session_backend_config.key]
++        assert client.get_session_data() == {"user": "alice", "nonce": "missing-backend-data"}
++        assert client.post("/clear-session").status_code == HTTP_201_CREATED
++
++        client.cookies.set(memory_session_backend_config.key, session_id, domain="testserver.local", path="/")
++
++        assert client.get_session_data() == {}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,49 @@
++#!/bin/bash
++set -uo pipefail
++cd /testbed
++
++
++dev-switch python3 3.12 2>/dev/null || true
++
++
++python3 -m pip install --no-input --break-system-packages \
++  "pydantic>=1.10,<2.0" \
++  "pydantic-factories>=1.17,<2.0" \
++  "pydantic-openapi-schema>=1.4,<2.0" \
++  "httpx>=0.22,<0.24" \
++  "starlette>=0.21,<0.26" \
++  pytest pytest-asyncio pytest-cov freezegun hypothesis \
++  anyio aiosqlite greenlet sqlalchemy redis fakeredis \
++  aiomcache beautifulsoup4 jinja2 mako cryptography picologging \
++  > /dev/null 2>&1
++
++
++python3 -m pip install --no-input --break-system-packages -e /testbed > /dev/null 2>&1
++
++
++python3 -m pip install --no-input --break-system-packages "pydantic>=1.10,<2.0" > /dev/null 2>&1
++
++
++case "${1:-}" in
++  base)
++    python3 -m pytest \
++      tests/middleware/session/test_middleware.py::test_integration \
++      tests/testing/test_testing.py::test_test_client_set_session_data \
++      tests/testing/test_testing.py::test_test_client_get_session_data \
++      -q
++    ;;
++  new)
++    python3 -m pytest \
++      tests/middleware/session/test_middleware.py::test_set_session_empty_clears_session_across_backends \
++      tests/middleware/session/test_middleware.py::test_empty_session_removes_server_side_data_for_existing_session_id \
++      tests/middleware/session/test_middleware.py::test_empty_dict_session_removes_server_side_data_for_existing_session_id \
++      tests/middleware/session/test_middleware.py::test_cookie_backend_empty_session_only_emits_clearing_cookie \
++      tests/testing/test_testing.py::test_create_test_client_session_config_annotation_accepts_server_side_backend_config \
++      tests/testing/test_testing.py::test_get_session_data_returns_empty_dict_for_missing_server_side_session \
++      -q
++    ;;
++  *)
++    echo "usage: $0 base|new"
++    exit 2
++    ;;
++esac

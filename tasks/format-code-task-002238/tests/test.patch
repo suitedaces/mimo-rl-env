@@ -1,0 +1,520 @@
+diff --git a/usercase-test-coderl/multipool_stateful_test.go b/usercase-test-coderl/multipool_stateful_test.go
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/multipool_stateful_test.go
+@@ -0,0 +1,491 @@
++package usercase_test_coderl
++
++import (
++	"context"
++	"errors"
++	"os"
++	"reflect"
++	"runtime"
++	"sort"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/panjf2000/ants/v2"
++)
++
++
++
++
++
++
++func waitUntil(t *testing.T, label string, condition func() bool) {
++	t.Helper()
++	deadline := time.Now().Add(3 * time.Second)
++	for time.Now().Before(deadline) {
++		if condition() {
++			return
++		}
++		time.Sleep(10 * time.Millisecond)
++	}
++	t.Fatalf("timed out waiting for %s", label)
++}
++
++func requireEqual(t *testing.T, label string, got, want any) {
++	t.Helper()
++	if !reflect.DeepEqual(got, want) {
++		t.Fatalf("%s: got %v, want %v", label, got, want)
++	}
++}
++
++func requireErrorIs(t *testing.T, label string, got error, want error) {
++	t.Helper()
++	if !errors.Is(got, want) {
++		t.Fatalf("%s: got %v, want %v", label, got, want)
++	}
++}
++
++func runningByIndex(t *testing.T, mp interface {
++	RunningByIndex(int) (int, error)
++}, idx int) int {
++	t.Helper()
++	n, err := mp.RunningByIndex(idx)
++	if err != nil {
++		t.Fatalf("RunningByIndex(%d): %v", idx, err)
++	}
++	return n
++}
++
++func freeByIndex(t *testing.T, mp interface {
++	FreeByIndex(int) (int, error)
++}, idx int) int {
++	t.Helper()
++	n, err := mp.FreeByIndex(idx)
++	if err != nil {
++		t.Fatalf("FreeByIndex(%d): %v", idx, err)
++	}
++	return n
++}
++
++func waitingByIndex(t *testing.T, mp interface {
++	WaitingByIndex(int) (int, error)
++}, idx int) int {
++	t.Helper()
++	n, err := mp.WaitingByIndex(idx)
++	if err != nil {
++		t.Fatalf("WaitingByIndex(%d): %v", idx, err)
++	}
++	return n
++}
++
++func countOpenFDs(t *testing.T) int {
++	t.Helper()
++	entries, err := os.ReadDir("/proc/self/fd")
++	if err != nil {
++		t.Fatalf("count open fds: %v", err)
++	}
++	return len(entries)
++}
++
++func TestMultiPoolConstructorValidationUsesPublicErrors(t *testing.T) {
++
++
++	_, err := ants.NewMultiPool(0, 2, ants.RoundRobin)
++	requireErrorIs(t, "raw size 0", err, ants.ErrInvalidMultiPoolSize)
++	_, err = ants.NewMultiPool(2, 2, ants.LoadBalancingStrategy(99))
++	requireErrorIs(t, "raw invalid strategy", err, ants.ErrInvalidLoadBalancingStrategy)
++	_, err = ants.NewMultiPool(2, 2, ants.RoundRobin, ants.WithExpiryDuration(-1))
++	requireErrorIs(t, "raw invalid expiry", err, ants.ErrInvalidPoolExpiry)
++
++	_, err = ants.NewMultiPoolWithFunc(0, 2, func(any) {}, ants.RoundRobin)
++	requireErrorIs(t, "with func size 0", err, ants.ErrInvalidMultiPoolSize)
++	_, err = ants.NewMultiPoolWithFunc(2, 2, func(any) {}, ants.LoadBalancingStrategy(99))
++	requireErrorIs(t, "with func invalid strategy", err, ants.ErrInvalidLoadBalancingStrategy)
++	_, err = ants.NewMultiPoolWithFunc(2, 2, func(any) {}, ants.RoundRobin, ants.WithExpiryDuration(-1))
++	requireErrorIs(t, "with func invalid expiry", err, ants.ErrInvalidPoolExpiry)
++
++	_, err = ants.NewMultiPoolWithFuncGeneric[int](0, 2, func(int) {}, ants.RoundRobin)
++	requireErrorIs(t, "generic size 0", err, ants.ErrInvalidMultiPoolSize)
++	_, err = ants.NewMultiPoolWithFuncGeneric[int](2, 2, func(int) {}, ants.LoadBalancingStrategy(99))
++	requireErrorIs(t, "generic invalid strategy", err, ants.ErrInvalidLoadBalancingStrategy)
++	_, err = ants.NewMultiPoolWithFuncGeneric[int](2, 2, func(int) {}, ants.RoundRobin, ants.WithExpiryDuration(-1))
++	requireErrorIs(t, "generic invalid expiry", err, ants.ErrInvalidPoolExpiry)
++}
++
++func TestRawMultiPoolRoundRobinMetricsPerPoolAndCloseLifecycle(t *testing.T) {
++
++
++	block := make(chan struct{})
++	mp, err := ants.NewMultiPool(10, 5, ants.RoundRobin)
++	if err != nil {
++		t.Fatalf("NewMultiPool: %v", err)
++	}
++
++	requireEqual(t, "fresh Running", mp.Running(), 0)
++	requireEqual(t, "fresh Free", mp.Free(), 50)
++	requireEqual(t, "fresh Waiting", mp.Waiting(), 0)
++	requireEqual(t, "fresh Cap", mp.Cap(), 50)
++	requireEqual(t, "fresh IsClosed", mp.IsClosed(), false)
++
++	for i := 0; i < 50; i++ {
++		if err := mp.Submit(func() { <-block }); err != nil {
++			t.Fatalf("Submit(%d): %v", i, err)
++		}
++	}
++	waitUntil(t, "50 raw workers", func() bool { return mp.Running() == 50 })
++
++	requireEqual(t, "full Running", mp.Running(), 50)
++	requireEqual(t, "full Free", mp.Free(), 0)
++	requireEqual(t, "full Waiting", mp.Waiting(), 0)
++	requireEqual(t, "full Cap", mp.Cap(), 50)
++	requireEqual(t, "full IsClosed", mp.IsClosed(), false)
++	for idx := 0; idx < 10; idx++ {
++		requireEqual(t, "per-pool Running", runningByIndex(t, mp, idx), 5)
++		requireEqual(t, "per-pool Free", freeByIndex(t, mp, idx), 0)
++		requireEqual(t, "per-pool Waiting", waitingByIndex(t, mp, idx), 0)
++	}
++
++	_, err = mp.RunningByIndex(-1)
++	requireErrorIs(t, "RunningByIndex -1", err, ants.ErrInvalidPoolIndex)
++	_, err = mp.FreeByIndex(10)
++	requireErrorIs(t, "FreeByIndex 10", err, ants.ErrInvalidPoolIndex)
++	_, err = mp.WaitingByIndex(10)
++	requireErrorIs(t, "WaitingByIndex 10", err, ants.ErrInvalidPoolIndex)
++
++	close(block)
++	err = mp.ReleaseTimeout(2 * time.Second)
++	requireEqual(t, "first ReleaseTimeout error", err, nil)
++	requireEqual(t, "released Running", mp.Running(), 0)
++	requireEqual(t, "released Waiting", mp.Waiting(), 0)
++
++	releasedFree, releasedCap := mp.Free(), mp.Cap()
++	if releasedFree < 0 || releasedCap < 0 || releasedFree > releasedCap {
++		t.Fatalf("released metrics out of range: Free=%d Cap=%d", releasedFree, releasedCap)
++	}
++	requireEqual(t, "released IsClosed", mp.IsClosed(), true)
++
++	err = mp.ReleaseTimeout(2 * time.Second)
++	requireErrorIs(t, "second ReleaseTimeout", err, ants.ErrPoolClosed)
++	err = mp.Submit(func() {})
++	requireErrorIs(t, "Submit after close", err, ants.ErrPoolClosed)
++}
++
++func TestRoundRobinFallsBackToLeastBusyPoolWhenSelectedPoolIsOverloaded(t *testing.T) {
++
++
++
++	rotateFirstBlock := make(chan struct{})
++	rotateSecondBlock := make(chan struct{})
++	rotateThirdBlock := make(chan struct{})
++	rotateMP, err := ants.NewMultiPool(2, 2, ants.RoundRobin)
++	if err != nil {
++		t.Fatalf("NewMultiPool rotation check: %v", err)
++	}
++	err = rotateMP.Submit(func() { <-rotateFirstBlock })
++	requireEqual(t, "rotation first submit error", err, nil)
++	waitUntil(t, "rotation one pool running", func() bool { return rotateMP.Running() == 1 })
++	rotationFirstCounts := []int{runningByIndex(t, rotateMP, 0), runningByIndex(t, rotateMP, 1)}
++	rotationFirstIdx, rotationSecondIdx := -1, -1
++	for idx, running := range rotationFirstCounts {
++		if running == 1 {
++			rotationFirstIdx = idx
++		} else if running == 0 {
++			rotationSecondIdx = idx
++		}
++	}
++	if rotationFirstIdx < 0 || rotationSecondIdx < 0 {
++		t.Fatalf("rotation first submit: got per-pool running %v, want one busy and one free", rotationFirstCounts)
++	}
++	err = rotateMP.Submit(func() { <-rotateSecondBlock })
++	requireEqual(t, "rotation second submit error", err, nil)
++	waitUntil(t, "rotation second pool running", func() bool { return runningByIndex(t, rotateMP, rotationSecondIdx) == 1 })
++	close(rotateSecondBlock)
++	waitUntil(t, "rotation second pool drained", func() bool { return runningByIndex(t, rotateMP, rotationSecondIdx) == 0 })
++	err = rotateMP.Submit(func() { <-rotateThirdBlock })
++	requireEqual(t, "rotation third submit error", err, nil)
++	waitUntil(t, "rotation first pool reused", func() bool { return runningByIndex(t, rotateMP, rotationFirstIdx) == 2 })
++	requireEqual(t, "rotation first pool running", runningByIndex(t, rotateMP, rotationFirstIdx), 2)
++	requireEqual(t, "rotation second pool running", runningByIndex(t, rotateMP, rotationSecondIdx), 0)
++	close(rotateFirstBlock)
++	close(rotateThirdBlock)
++	requireEqual(t, "rotation ReleaseTimeout", rotateMP.ReleaseTimeout(2*time.Second), nil)
++
++	firstBlock := make(chan struct{})
++	fallbackBlock := make(chan struct{})
++	mp, err := ants.NewMultiPool(2, 1, ants.RoundRobin, ants.WithNonblocking(true), ants.WithExpiryDuration(20*time.Millisecond))
++	if err != nil {
++		t.Fatalf("NewMultiPool: %v", err)
++	}
++
++	err = mp.Submit(func() { <-firstBlock })
++	requireEqual(t, "first submit error", err, nil)
++	waitUntil(t, "one pool running", func() bool { return mp.Running() == 1 })
++	firstPoolRunning := []int{runningByIndex(t, mp, 0), runningByIndex(t, mp, 1)}
++
++	busyIdx, freeIdx := -1, -1
++	for idx, running := range firstPoolRunning {
++		if running == 1 {
++			busyIdx = idx
++		} else if running == 0 {
++			freeIdx = idx
++		}
++	}
++	if busyIdx < 0 || freeIdx < 0 {
++		t.Fatalf("after first submit: got per-pool running %v, want one busy and one free", firstPoolRunning)
++	}
++
++	quickDone := make(chan struct{})
++	err = mp.Submit(func() { close(quickDone) })
++	requireEqual(t, "second submit error", err, nil)
++	<-quickDone
++	waitUntil(t, "non-busy pool purged", func() bool { return runningByIndex(t, mp, freeIdx) == 0 })
++	requireEqual(t, "before fallback busy pool running", runningByIndex(t, mp, busyIdx), 1)
++	requireEqual(t, "before fallback free pool running", runningByIndex(t, mp, freeIdx), 0)
++
++	err = mp.Submit(func() { <-fallbackBlock })
++	requireEqual(t, "fallback submit error", err, nil)
++	waitUntil(t, "fallback pool running", func() bool { return mp.Running() == 2 })
++	requireEqual(t, "after fallback total Running", mp.Running(), 2)
++	requireEqual(t, "after fallback busy pool running", runningByIndex(t, mp, busyIdx), 1)
++	requireEqual(t, "after fallback free pool running", runningByIndex(t, mp, freeIdx), 1)
++
++	close(firstBlock)
++	close(fallbackBlock)
++	requireEqual(t, "ReleaseTimeout", mp.ReleaseTimeout(2*time.Second), nil)
++}
++
++func TestLeastTasksBalancesTowardFewestRunningWorkers(t *testing.T) {
++
++
++	block := make(chan struct{})
++	mp, err := ants.NewMultiPool(3, 2, ants.LeastTasks)
++	if err != nil {
++		t.Fatalf("NewMultiPool: %v", err)
++	}
++
++	for i := 0; i < 5; i++ {
++		if err := mp.Submit(func() { <-block }); err != nil {
++			t.Fatalf("Submit(%d): %v", i, err)
++		}
++		waitUntil(t, "least-tasks running count", func() bool { return mp.Running() == i+1 })
++	}
++
++	requireEqual(t, "least total Running", mp.Running(), 5)
++	requireEqual(t, "least total Free", mp.Free(), 1)
++	requireEqual(t, "least total Waiting", mp.Waiting(), 0)
++	requireEqual(t, "least total Cap", mp.Cap(), 6)
++
++	perPoolRunning := []int{runningByIndex(t, mp, 0), runningByIndex(t, mp, 1), runningByIndex(t, mp, 2)}
++	sort.Ints(perPoolRunning)
++	requireEqual(t, "least per-pool running distribution", perPoolRunning, []int{1, 2, 2})
++
++	close(block)
++	requireEqual(t, "ReleaseTimeout", mp.ReleaseTimeout(2*time.Second), nil)
++}
++
++func TestMultiPoolWithFuncInvokeMetricsAndClosedOrderingError(t *testing.T) {
++
++
++	block := make(chan struct{})
++	mp, err := ants.NewMultiPoolWithFunc(2, 2, func(v any) { <-v.(chan struct{}) }, ants.RoundRobin)
++	if err != nil {
++		t.Fatalf("NewMultiPoolWithFunc: %v", err)
++	}
++
++	requireEqual(t, "fresh Running", mp.Running(), 0)
++	requireEqual(t, "fresh Free", mp.Free(), 4)
++	requireEqual(t, "fresh Waiting", mp.Waiting(), 0)
++	requireEqual(t, "fresh Cap", mp.Cap(), 4)
++	for i := 0; i < 4; i++ {
++		if err := mp.Invoke(block); err != nil {
++			t.Fatalf("Invoke(%d): %v", i, err)
++		}
++	}
++	waitUntil(t, "with-func workers", func() bool { return mp.Running() == 4 })
++
++	requireEqual(t, "full Running", mp.Running(), 4)
++	requireEqual(t, "full Free", mp.Free(), 0)
++	requireEqual(t, "full Waiting", mp.Waiting(), 0)
++	requireEqual(t, "full Cap", mp.Cap(), 4)
++	requireEqual(t, "pool0 running", runningByIndex(t, mp, 0), 2)
++	requireEqual(t, "pool1 running", runningByIndex(t, mp, 1), 2)
++
++	close(block)
++	requireEqual(t, "ReleaseTimeout", mp.ReleaseTimeout(2*time.Second), nil)
++	requireEqual(t, "released Running", mp.Running(), 0)
++	requireEqual(t, "released Waiting", mp.Waiting(), 0)
++
++	releasedFree, releasedCap := mp.Free(), mp.Cap()
++	if releasedFree < 0 || releasedCap < 0 || releasedFree > releasedCap {
++		t.Fatalf("released metrics out of range: Free=%d Cap=%d", releasedFree, releasedCap)
++	}
++	requireEqual(t, "released IsClosed", mp.IsClosed(), true)
++	requireErrorIs(t, "second ReleaseTimeout", mp.ReleaseTimeout(2*time.Second), ants.ErrPoolClosed)
++	requireErrorIs(t, "Invoke after close", mp.Invoke(nil), ants.ErrPoolClosed)
++}
++
++func TestGenericMultiPoolInvokeMetricsAndClosedOrderingError(t *testing.T) {
++
++
++	block := make(chan struct{})
++	mp, err := ants.NewMultiPoolWithFuncGeneric[chan struct{}](2, 2, func(v chan struct{}) { <-v }, ants.RoundRobin)
++	if err != nil {
++		t.Fatalf("NewMultiPoolWithFuncGeneric: %v", err)
++	}
++
++	requireEqual(t, "fresh Running", mp.Running(), 0)
++	requireEqual(t, "fresh Free", mp.Free(), 4)
++	requireEqual(t, "fresh Waiting", mp.Waiting(), 0)
++	requireEqual(t, "fresh Cap", mp.Cap(), 4)
++	for i := 0; i < 4; i++ {
++		if err := mp.Invoke(block); err != nil {
++			t.Fatalf("Invoke(%d): %v", i, err)
++		}
++	}
++	waitUntil(t, "generic workers", func() bool { return mp.Running() == 4 })
++
++	requireEqual(t, "full Running", mp.Running(), 4)
++	requireEqual(t, "full Free", mp.Free(), 0)
++	requireEqual(t, "full Waiting", mp.Waiting(), 0)
++	requireEqual(t, "full Cap", mp.Cap(), 4)
++	requireEqual(t, "pool0 running", runningByIndex(t, mp, 0), 2)
++	requireEqual(t, "pool1 running", runningByIndex(t, mp, 1), 2)
++
++	close(block)
++	requireEqual(t, "ReleaseTimeout", mp.ReleaseTimeout(2*time.Second), nil)
++	requireEqual(t, "released Running", mp.Running(), 0)
++	requireEqual(t, "released Waiting", mp.Waiting(), 0)
++
++	releasedFree, releasedCap := mp.Free(), mp.Cap()
++	if releasedFree < 0 || releasedCap < 0 || releasedFree > releasedCap {
++		t.Fatalf("released metrics out of range: Free=%d Cap=%d", releasedFree, releasedCap)
++	}
++	requireEqual(t, "released IsClosed", mp.IsClosed(), true)
++	requireErrorIs(t, "second ReleaseTimeout", mp.ReleaseTimeout(2*time.Second), ants.ErrPoolClosed)
++	requireErrorIs(t, "Invoke after close", mp.Invoke(nil), ants.ErrPoolClosed)
++}
++
++func TestReleaseContextCanceledReportsPoolIndex(t *testing.T) {
++
++
++	block := make(chan struct{})
++	mp, err := ants.NewMultiPool(1, 1, ants.RoundRobin)
++	if err != nil {
++		t.Fatalf("NewMultiPool: %v", err)
++	}
++	defer close(block)
++
++	err = mp.Submit(func() { <-block })
++	requireEqual(t, "submit error", err, nil)
++	waitUntil(t, "one worker", func() bool { return mp.Running() == 1 })
++
++	ctx, cancel := context.WithCancel(context.Background())
++	cancel()
++	err = mp.ReleaseContext(ctx)
++	if err == nil {
++		t.Fatalf("ReleaseContext canceled: got nil, want error including pool index")
++	}
++
++	if !strings.Contains(err.Error(), "0") {
++		t.Fatalf("ReleaseContext canceled message: got %q, want it to include pool index 0", err.Error())
++	}
++	requireEqual(t, "canceled release IsClosed", mp.IsClosed(), true)
++}
++
++func TestRebootReopensReleasedMultiPoolAndTuneResizesEachPool(t *testing.T) {
++
++
++	mp, err := ants.NewMultiPool(2, 2, ants.RoundRobin)
++	if err != nil {
++		t.Fatalf("NewMultiPool: %v", err)
++	}
++	requireEqual(t, "fresh Cap", mp.Cap(), 4)
++	requireEqual(t, "fresh Free", mp.Free(), 4)
++	requireEqual(t, "fresh IsClosed", mp.IsClosed(), false)
++
++	mp.Tune(3)
++	requireEqual(t, "tuned Cap", mp.Cap(), 6)
++	requireEqual(t, "tuned Free", mp.Free(), 6)
++
++	requireEqual(t, "ReleaseTimeout", mp.ReleaseTimeout(2*time.Second), nil)
++	requireEqual(t, "after release IsClosed", mp.IsClosed(), true)
++	mp.Reboot()
++	requireEqual(t, "after reboot IsClosed", mp.IsClosed(), false)
++	requireEqual(t, "after reboot Cap", mp.Cap(), 6)
++	requireEqual(t, "after reboot Free", mp.Free(), 6)
++
++	done := make(chan struct{})
++	err = mp.Submit(func() { close(done) })
++	requireEqual(t, "submit after reboot", err, nil)
++	<-done
++	requireEqual(t, "final ReleaseTimeout", mp.ReleaseTimeout(2*time.Second), nil)
++}
++
++func TestTwoMultiPoolInstancesKeepIndependentState(t *testing.T) {
++
++
++	block := make(chan struct{})
++	a, err := ants.NewMultiPool(2, 2, ants.RoundRobin)
++	if err != nil {
++		t.Fatalf("NewMultiPool a: %v", err)
++	}
++	b, err := ants.NewMultiPool(2, 2, ants.RoundRobin)
++	if err != nil {
++		t.Fatalf("NewMultiPool b: %v", err)
++	}
++
++	for i := 0; i < 3; i++ {
++		if err := a.Submit(func() { <-block }); err != nil {
++			t.Fatalf("a.Submit(%d): %v", i, err)
++		}
++	}
++	waitUntil(t, "instance a workers", func() bool { return a.Running() == 3 })
++
++	requireEqual(t, "a Running", a.Running(), 3)
++	requireEqual(t, "a Free", a.Free(), 1)
++	requireEqual(t, "a Waiting", a.Waiting(), 0)
++	requireEqual(t, "a Cap", a.Cap(), 4)
++	requireEqual(t, "b Running", b.Running(), 0)
++	requireEqual(t, "b Free", b.Free(), 4)
++	requireEqual(t, "b Waiting", b.Waiting(), 0)
++	requireEqual(t, "b Cap", b.Cap(), 4)
++
++	close(block)
++	requireEqual(t, "a ReleaseTimeout", a.ReleaseTimeout(2*time.Second), nil)
++	requireEqual(t, "b ReleaseTimeout", b.ReleaseTimeout(2*time.Second), nil)
++}
++
++func TestMultiPoolReleaseDoesNotLeakGoroutinesAcrossCycles(t *testing.T) {
++
++
++	runtime.GC()
++	time.Sleep(100 * time.Millisecond)
++	startGoroutines := runtime.NumGoroutine()
++	startFDs := countOpenFDs(t)
++
++	for i := 0; i < 100; i++ {
++		done := make(chan struct{})
++		mp, err := ants.NewMultiPool(3, 1, ants.RoundRobin)
++		if err != nil {
++			t.Fatalf("NewMultiPool(%d): %v", i, err)
++		}
++		if err := mp.Submit(func() { close(done) }); err != nil {
++			t.Fatalf("Submit(%d): %v", i, err)
++		}
++		<-done
++		if err := mp.ReleaseTimeout(2 * time.Second); err != nil {
++			t.Fatalf("ReleaseTimeout(%d): %v", i, err)
++		}
++	}
++
++	runtime.GC()
++	time.Sleep(300 * time.Millisecond)
++	endGoroutines := runtime.NumGoroutine()
++	endFDs := countOpenFDs(t)
++	if endGoroutines > startGoroutines+30 {
++		t.Fatalf("goroutine leak floor: got %d, want at most %d", endGoroutines, startGoroutines+30)
++	}
++	if endFDs > startFDs+5 {
++		t.Fatalf("fd leak floor: got %d, want at most %d", endFDs, startFDs+5)
++	}
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,19 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++
++cd /workspace/repo
++export GOPROXY=off
++export GOSUMDB=off
++export GOTOOLCHAIN=local
++export GOFLAGS="${GOFLAGS:-} -mod=readonly"
++exec go test -v -count=1 ./usercase-test-coderl/...

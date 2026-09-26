@@ -1,0 +1,248 @@
+diff --git a/tests/providers/amazon/aws/test_s3_keys_unchanged_deferrable_contract.py b/tests/providers/amazon/aws/test_s3_keys_unchanged_deferrable_contract.py
+new file mode 100644
+index 0000000000..17a40458e3
+--- /dev/null
++++ b/tests/providers/amazon/aws/test_s3_keys_unchanged_deferrable_contract.py
+@@ -0,0 +1,231 @@
++from __future__ import annotations
++
++import asyncio
++from datetime import datetime
++from unittest import mock
++
++import pytest
++
++from airflow.exceptions import TaskDeferred
++from airflow.providers.amazon.aws.hooks.s3 import S3Hook
++from airflow.providers.amazon.aws.sensors.s3 import S3KeysUnchangedSensor
++from airflow.providers.amazon.aws.triggers.s3 import S3KeysUnchangedTrigger
++from airflow.triggers.base import TriggerEvent
++
++
++def _run(coro):
++    return asyncio.run(coro)
++
++
++class _AsyncPages:
++    def __init__(self, pages):
++        self.pages = pages
++
++    def __aiter__(self):
++        return self._iterate()
++
++    async def _iterate(self):
++        for page in self.pages:
++            yield page
++
++
++class _Paginator:
++    def __init__(self, keys):
++        self.keys = keys
++
++    def paginate(self, **kwargs):
++        return _AsyncPages([{"Contents": [{"Key": key} for key in self.keys]}])
++
++
++class _Client:
++    def __init__(self, keys):
++        self.keys = keys
++
++    def get_paginator(self, name):
++        assert name == "list_objects_v2"
++        return _Paginator(self.keys)
++
++
++def _check_state(hook: S3Hook, current_objects: set[str], **kwargs):
++    async def check():
++        return await hook.is_keys_unchanged_async(
++            client=_Client(sorted(current_objects)),
++            bucket_name="contract-bucket",
++            prefix="incoming/",
++            **kwargs,
++        )
++
++    return _run(check())
++
++
++def test_deferral_preserves_polling_and_connection_configuration():
++    last_activity = datetime(2023, 2, 3, 4, 5, 6)
++    sensor = S3KeysUnchangedSensor(
++        task_id="contract_deferrable_sensor",
++        bucket_name="contract-bucket",
++        prefix="incoming/",
++        inactivity_period=90,
++        min_objects=3,
++        previous_objects={"incoming/old.csv"},
++        allow_delete=False,
++        aws_conn_id="contract-aws",
++        verify=False,
++        poke_interval=17,
++        deferrable=True,
++    )
++    sensor.last_activity_time = last_activity
++    sensor.inactivity_seconds = 11
++
++    with mock.patch.object(sensor, "poke", return_value=False), pytest.raises(TaskDeferred) as raised:
++        sensor.execute(context={})
++
++    trigger = raised.value.trigger
++    classpath, payload = trigger.serialize()
++    assert classpath == "airflow.providers.amazon.aws.triggers.s3.S3KeysUnchangedTrigger"
++    assert payload["polling_period_seconds"] == 17
++    assert payload["previous_objects"] == {"incoming/old.csv"}
++    assert payload["last_activity_time"] == last_activity
++    assert payload["inactivity_seconds"] == 11
++    assert payload["allow_delete"] is False
++    assert payload["aws_conn_id"] == "contract-aws"
++    assert payload["verify"] is False
++
++    reconstructed = S3KeysUnchangedTrigger(**payload)
++    assert reconstructed.serialize()[1]["polling_period_seconds"] == 17
++    assert reconstructed.hook.verify is False
++
++
++def test_trigger_reuses_pending_state_and_configured_poll_interval():
++    first_activity = datetime(2023, 3, 4, 5, 6, 7)
++    hook = mock.MagicMock()
++    hook.async_conn = mock.MagicMock()
++    hook.async_conn.__aenter__ = mock.AsyncMock(return_value=object())
++    hook.async_conn.__aexit__ = mock.AsyncMock(return_value=None)
++    hook.is_keys_unchanged_async = mock.AsyncMock(
++        side_effect=[
++            {
++                "status": "pending",
++                "previous_objects": {"incoming/new.csv"},
++                "last_activity_time": first_activity,
++                "inactivity_seconds": 0,
++            },
++            {"status": "success", "message": "complete"},
++        ]
++    )
++    trigger = S3KeysUnchangedTrigger(
++        bucket_name="contract-bucket",
++        prefix="incoming/",
++        previous_objects={"incoming/old.csv"},
++        inactivity_seconds=8,
++        last_activity_time=datetime(2023, 3, 4, 5, 0, 0),
++        poke_interval=17,
++    )
++    trigger.__dict__["hook"] = hook
++
++    async def run_trigger():
++        with mock.patch(
++            "airflow.providers.amazon.aws.triggers.s3.asyncio.sleep", new=mock.AsyncMock()
++        ) as sleep:
++            event = await trigger.run().__anext__()
++            return event, sleep
++
++    event, sleep = _run(run_trigger())
++    assert event == TriggerEvent({"status": "success", "message": "complete"})
++    assert sleep.await_args_list[0].args == (17,)
++    assert hook.is_keys_unchanged_async.await_count == 2
++    second_poll = hook.is_keys_unchanged_async.await_args_list[1].kwargs
++    assert second_poll["previous_objects"] == {"incoming/new.csv"}
++    assert second_poll["last_activity_time"] == first_activity
++    assert second_poll["inactivity_seconds"] == 0
++
++
++def test_equal_cardinality_replacement_obeys_deletion_policy():
++    hook = S3Hook(aws_conn_id=None)
++    common = {
++        "inactivity_period": 300,
++        "min_objects": 1,
++        "previous_objects": {"incoming/a.csv", "incoming/b.csv"},
++        "inactivity_seconds": 42,
++        "last_activity_time": datetime(2023, 1, 1, 0, 0, 0),
++    }
++
++    allowed = _check_state(
++        hook,
++        {"incoming/a.csv", "incoming/c.csv"},
++        allow_delete=True,
++        **common,
++    )
++    assert allowed["status"] == "pending"
++    assert allowed["previous_objects"] == {"incoming/a.csv", "incoming/c.csv"}
++    assert allowed["inactivity_seconds"] == 0
++
++    rejected = _check_state(
++        hook,
++        {"incoming/a.csv", "incoming/c.csv"},
++        allow_delete=False,
++        **common,
++    )
++    assert rejected["status"] == "error"
++    assert "contract-bucket/incoming/" in rejected["message"]
++
++
++def test_additions_and_allowed_deletions_restart_inactivity_window():
++    hook = S3Hook(aws_conn_id=None)
++    old_activity = datetime(2023, 1, 1, 0, 0, 0)
++
++    addition = _check_state(
++        hook,
++        {"incoming/a.csv", "incoming/b.csv"},
++        inactivity_period=60,
++        min_objects=1,
++        previous_objects={"incoming/a.csv"},
++        inactivity_seconds=120,
++        allow_delete=False,
++        last_activity_time=old_activity,
++    )
++    assert addition["status"] == "pending"
++    assert addition["previous_objects"] == {"incoming/a.csv", "incoming/b.csv"}
++    assert addition["inactivity_seconds"] == 0
++
++    deletion = _check_state(
++        hook,
++        {"incoming/a.csv"},
++        inactivity_period=60,
++        min_objects=1,
++        previous_objects={"incoming/a.csv", "incoming/b.csv"},
++        inactivity_seconds=120,
++        allow_delete=True,
++        last_activity_time=old_activity,
++    )
++    assert deletion["status"] == "pending"
++    assert deletion["previous_objects"] == {"incoming/a.csv"}
++    assert deletion["inactivity_seconds"] == 0
++    assert deletion["last_activity_time"] is not None
++
++
++def test_unchanged_snapshot_applies_inactivity_and_minimum_object_rules():
++    hook = S3Hook(aws_conn_id=None)
++    common = {
++        "inactivity_period": 30,
++        "previous_objects": {"incoming/a.csv", "incoming/b.csv"},
++        "inactivity_seconds": 0,
++        "allow_delete": False,
++        "last_activity_time": datetime(2023, 1, 1, 0, 0, 0),
++    }
++
++    success = _check_state(
++        hook,
++        {"incoming/a.csv", "incoming/b.csv"},
++        min_objects=2,
++        **common,
++    )
++    assert success["status"] == "success"
++
++    insufficient = _check_state(
++        hook,
++        {"incoming/a.csv", "incoming/b.csv"},
++        min_objects=3,
++        **common,
++    )
++    assert insufficient["status"] == "error"
++    assert "not enough objects" in insufficient["message"].lower()
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,6 @@
++#!/bin/bash
++set -euo pipefail
++
++
++./.build_env/venv/bin/pytest -q -o addopts='' \
++  tests/providers/amazon/aws/test_s3_keys_unchanged_deferrable_contract.py

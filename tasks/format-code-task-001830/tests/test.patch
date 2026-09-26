@@ -1,0 +1,180 @@
+diff --git a/backend/module/chaos/experimentation/rtds/rtds_cache_test.go b/backend/module/chaos/experimentation/rtds/rtds_cache_test.go
+index 3b19d9fb..768f2ef0 100644
+--- a/backend/module/chaos/experimentation/rtds/rtds_cache_test.go
++++ b/backend/module/chaos/experimentation/rtds/rtds_cache_test.go
+@@ -5,7 +5,9 @@ import (
+ 	"testing"
+ 
+ 	gcpDiscovery "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v2"
+-	gcpCache "github.com/envoyproxy/go-control-plane/pkg/cache"
++	gcpTypes "github.com/envoyproxy/go-control-plane/pkg/cache/types"
++	gcpCacheV2 "github.com/envoyproxy/go-control-plane/pkg/cache/v2"
++	gcpResourceV2 "github.com/envoyproxy/go-control-plane/pkg/resource/v2"
+ 	pstruct "github.com/golang/protobuf/ptypes/struct"
+ 	"github.com/stretchr/testify/assert"
+ 	"go.uber.org/zap"
+@@ -59,7 +61,7 @@ func mockGenerateFaultData() []*experimentation.Experiment {
+ }
+ 
+ func TestSetSnapshot(t *testing.T) {
+-	testCache := gcpCache.NewSnapshotCache(false, gcpCache.IDHash{}, nil)
++	testCache := gcpCacheV2.NewSnapshotCache(false, gcpCacheV2.IDHash{}, nil)
+ 	testRtdsLayerName := "testRtdsLayerName"
+ 	testUpstreamCluster := "serviceA"
+ 	mockExperimentList := mockGenerateFaultData()
+@@ -90,17 +92,19 @@ func TestSetSnapshot(t *testing.T) {
+ 		t.Errorf("Snapshot not found for cluster %s", testUpstreamCluster)
+ 	}
+ 
+-	resources := snapshot.GetResources(gcpCache.RuntimeType)
++	resources := snapshot.GetResources(gcpResourceV2.RuntimeType)
+ 	if resources == nil {
+ 		t.Errorf("no resources")
+ 	}
++	assert.NotEmpty(t, resources, "expected at least one resource under v2 RuntimeType URL")
+ 
+ 	resource := resources[testRtdsLayerName]
+-	if resources == nil {
++	if resource == nil {
+ 		t.Errorf("no RTDS resources")
+ 	}
+ 
+-	runtime := resource.(*gcpDiscovery.Runtime)
++	runtime, ok := resource.(*gcpDiscovery.Runtime)
++	assert.True(t, ok, "resource should be a *gcpDiscovery.Runtime (v2 service/discovery)")
+ 	fields := runtime.GetLayer().GetFields()
+ 	assert.Equal(t, 4, len(fields))
+ 	assert.EqualValues(t, 10, fields["fault.http.serviceB.abort.abort_percent"].GetNumberValue())
+@@ -109,6 +113,81 @@ func TestSetSnapshot(t *testing.T) {
+ 	assert.EqualValues(t, 100, fields["fault.http.serviceD.delay.fixed_duration_ms"].GetNumberValue())
+ }
+ 
++func TestSetSnapshotWithoutDownstream(t *testing.T) {
++	testCache := gcpCacheV2.NewSnapshotCache(false, gcpCacheV2.IDHash{}, nil)
++	testRtdsLayerName := "testRtdsLayerName"
++	testUpstreamCluster := "serviceC"
++
++	experiments := []*experimentation.Experiment{
++		createAbortExperiment(testUpstreamCluster, "", 20, 504),
++	}
++
++	err := setSnapshot(testCache, testRtdsLayerName, testUpstreamCluster, experiments, zap.NewNop().Sugar())
++	assert.NoError(t, err)
++
++	snapshot, err := testCache.GetSnapshot(testUpstreamCluster)
++	assert.NoError(t, err)
++
++	resources := snapshot.GetResources(gcpResourceV2.RuntimeType)
++	assert.NotNil(t, resources)
++	resource := resources[testRtdsLayerName]
++	assert.NotNil(t, resource)
++	runtime, ok := resource.(*gcpDiscovery.Runtime)
++	assert.True(t, ok)
++	fields := runtime.GetLayer().GetFields()
++	assert.Equal(t, 2, len(fields))
++	assert.EqualValues(t, 20, fields["fault.http.abort.abort_percent"].GetNumberValue())
++	assert.EqualValues(t, 504, fields["fault.http.abort.http_status"].GetNumberValue())
++}
++
++func TestSetSnapshotEmptyExperiments(t *testing.T) {
++	testCache := gcpCacheV2.NewSnapshotCache(false, gcpCacheV2.IDHash{}, nil)
++	testRtdsLayerName := "testRtdsLayerName"
++	testUpstreamCluster := "serviceA"
++
++	err := setSnapshot(testCache, testRtdsLayerName, testUpstreamCluster, []*experimentation.Experiment{}, zap.NewNop().Sugar())
++	assert.NoError(t, err)
++
++	snapshot, err := testCache.GetSnapshot(testUpstreamCluster)
++	assert.NoError(t, err)
++
++	resources := snapshot.GetResources(gcpResourceV2.RuntimeType)
++	assert.NotNil(t, resources)
++	resource := resources[testRtdsLayerName]
++	assert.NotNil(t, resource)
++	runtime, ok := resource.(*gcpDiscovery.Runtime)
++	assert.True(t, ok)
++	fields := runtime.GetLayer().GetFields()
++	assert.Equal(t, 0, len(fields), "with no experiments the runtime layer should have no fields")
++}
++
++func TestSetSnapshotVersionStable(t *testing.T) {
++	testCache := gcpCacheV2.NewSnapshotCache(false, gcpCacheV2.IDHash{}, nil)
++	testRtdsLayerName := "testRtdsLayerName"
++	testUpstreamCluster := "serviceA"
++
++	experiments := []*experimentation.Experiment{
++		createAbortExperiment(testUpstreamCluster, "serviceB", 10, 404),
++	}
++
++	err := setSnapshot(testCache, testRtdsLayerName, testUpstreamCluster, experiments, zap.NewNop().Sugar())
++	assert.NoError(t, err)
++
++	snapshot1, err := testCache.GetSnapshot(testUpstreamCluster)
++	assert.NoError(t, err)
++	version1 := snapshot1.GetVersion(gcpResourceV2.RuntimeType)
++	assert.NotEmpty(t, version1)
++
++
++	err = setSnapshot(testCache, testRtdsLayerName, testUpstreamCluster, experiments, zap.NewNop().Sugar())
++	assert.NoError(t, err)
++
++	snapshot2, err := testCache.GetSnapshot(testUpstreamCluster)
++	assert.NoError(t, err)
++	version2 := snapshot2.GetVersion(gcpResourceV2.RuntimeType)
++	assert.Equal(t, version1, version2)
++}
++
+ func TestCreateRuntimeKeys(t *testing.T) {
+ 	testDataList := mockGenerateFaultData()
+ 	for _, testExperiment := range testDataList {
+@@ -156,7 +235,7 @@ func TestCreateRuntimeKeys(t *testing.T) {
+ func TestComputeVersionReturnValue(t *testing.T) {
+ 	rtdsLayerName := "TestRtdsLayer"
+ 
+-	mockRuntime := []gcpCache.Resource{
++	mockRuntime := []gcpTypes.Resource{
+ 		&gcpDiscovery.Runtime{
+ 			Name: rtdsLayerName,
+ 			Layer: &pstruct.Struct{
+@@ -168,7 +247,7 @@ func TestComputeVersionReturnValue(t *testing.T) {
+ 	checksum, _ := computeChecksum(mockRuntime)
+ 	assert.Equal(t, "4464232557941748628", checksum)
+ 
+-	mockRuntime2 := []gcpCache.Resource{
++	mockRuntime2 := []gcpTypes.Resource{
+ 		&gcpDiscovery.Runtime{
+ 			Name: rtdsLayerName + "foo",
+ 			Layer: &pstruct.Struct{
+@@ -180,3 +259,10 @@ func TestComputeVersionReturnValue(t *testing.T) {
+ 	checksum2, _ := computeChecksum(mockRuntime2)
+ 	assert.NotEqual(t, checksum, checksum2)
+ }
++
++func TestRuntimeTypeURLIsV2(t *testing.T) {
++
++
++
++	assert.Equal(t, "type.googleapis.com/envoy.service.discovery.v2.Runtime", gcpResourceV2.RuntimeType)
++}
+diff --git a/test_commands.json b/test_commands.json
+new file mode 100644
+index 00000000..4f4537d4
+--- /dev/null
++++ b/test_commands.json
+@@ -0,0 +1,3 @@
++{
++  "test_commands": ["cd backend && go test ./module/chaos/experimentation/rtds/ -count=1 -run 'TestSetSnapshot|TestSetSnapshotWithoutDownstream|TestSetSnapshotEmptyExperiments|TestSetSnapshotVersionStable|TestCreateRuntimeKeys|TestComputeVersionReturnValue|TestRuntimeTypeURLIsV2'"]
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,8 @@
++#!/usr/bin/env bash
++
++set -uo pipefail
++cd /testbed
++rc=0
++cd backend && go test ./module/chaos/experimentation/rtds/ -count=1 -run 'TestSetSnapshot|TestSetSnapshotWithoutDownstream|TestSetSnapshotEmptyExperiments|TestSetSnapshotVersionStable|TestCreateRuntimeKeys|TestComputeVersionReturnValue|TestRuntimeTypeURLIsV2'
++rc=$(( rc | $? ))
++exit $rc

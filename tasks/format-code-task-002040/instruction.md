@@ -1,0 +1,5 @@
+I want synchronous Wayland roundtrip waiting for a stateful display connection. The public helper should be `wlclient.DisplayRoundtrip(d *wl.Display) error`: it should call `d.Sync()` to send a `wl_display.sync` request, then wait until the compositor sends the event for that exact callback object, and return `nil` when that callback is reached.
+
+I also need the lower-level method `(*wl.Context).RunTill(cb *wl.Callback) error` for code that already has a callback from `Display.Sync()`. `RunTill` should repeatedly read and process one incoming Wayland event just like `Run`, dispatching unrelated events to their registered proxy handlers while it waits. It should stop based on the identity of the callback object itself, so callers do not need to register a done handler just to make the wait complete.
+
+If `DisplayRoundtrip` cannot send the sync request, it should return that error without entering the wait loop. If `RunTill` encounters the same read, timeout, closed-connection, protocol, undispatched-proxy, or nil-proxy failures that `Run` reports, it should return that error instead of continuing forever.

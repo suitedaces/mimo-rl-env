@@ -1,0 +1,507 @@
+diff --git a/usercase-test-coderl/test_retrieval.py b/usercase-test-coderl/test_retrieval.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/test_retrieval.py
+@@ -0,0 +1,478 @@
++
++
++
++
++
++
++
++
++import builtins
++import copy
++import json
++import os
++import socket
++import subprocess
++import sys
++from pathlib import Path
++
++import numpy as np
++import pandas as pd
++import pytest
++import tifffile
++import torch
++
++from msclip.inference import run_inference_retrieval
++
++
++PIXELS = {
++    "field.tif": 10,
++    "mixed.tif": 128,
++    "snow.tif": 200,
++}
++
++
++class TokenBatch:
++    def __init__(self, queries):
++        mapping = {
++            "green fields": [1.0, 0.0],
++            "snow cover": [0.0, 1.0],
++            "mixed terrain": [1.0, 1.0],
++        }
++        self.tensor = torch.tensor([mapping[query] for query in queries], dtype=torch.float32)
++
++    def to(self, device):
++        return self.tensor.to(device)
++
++
++def deterministic_tokenizer(queries):
++    return TokenBatch(queries)
++
++
++def deterministic_preprocess(image):
++    return torch.tensor([float(image[0, 0, 0])], dtype=torch.float32)
++
++
++class UnitRetrievalModel(torch.nn.Module):
++    channels = 3
++
++    def to(self, device):
++        return self
++
++    def inference_vision(self, image_tensor):
++        rows = []
++        for value in image_tensor.flatten().tolist():
++            if value < 0.2:
++                rows.append([1.0, 0.0])
++            elif value > 0.7:
++                rows.append([0.0, 1.0])
++            else:
++                rows.append([1.0, 1.0])
++        return torch.tensor(rows, dtype=torch.float32)
++
++    def inference_text(self, text_tokens):
++        return text_tokens.float()
++
++
++class ScaledRetrievalModel(UnitRetrievalModel):
++    def inference_vision(self, image_tensor):
++        rows = []
++        for value in image_tensor.flatten().tolist():
++            if value < 0.2:
++                rows.append([3.0, 0.0])
++            elif value > 0.7:
++                rows.append([0.0, 4.0])
++            else:
++                rows.append([5.0, 5.0])
++        return torch.tensor(rows, dtype=torch.float32)
++
++    def inference_text(self, text_tokens):
++        return text_tokens.float() * 2.0
++
++
++@pytest.fixture
++def image_paths(tmp_path):
++    paths = {}
++    for name, pixel in PIXELS.items():
++        path = tmp_path / name
++        tifffile.imwrite(path, np.full((2, 2, 3), pixel, dtype=np.uint8))
++        paths[name] = str(path)
++    return paths
++
++
++def call_retrieval(**kwargs):
++    defaults = {
++        "model": UnitRetrievalModel(),
++        "preprocess": deterministic_preprocess,
++        "tokenizer": deterministic_tokenizer,
++        "device": "cpu",
++        "verbose": False,
++    }
++    defaults.update(kwargs)
++    return run_inference_retrieval(**defaults)
++
++
++def assert_ranked_table(frame, expected_index, expected_records):
++    assert list(frame.index.names) == ["Query", "Rank"]
++    assert list(frame.index) == expected_index
++    assert list(frame.columns) == ["Image", "Similarity"]
++    assert frame.reset_index().to_dict("records") == expected_records
++
++
++def assert_ranked_shape(frame, expected_index):
++    assert list(frame.index.names) == ["Query", "Rank"]
++    assert list(frame.index) == expected_index
++    assert list(frame.columns) == ["Image", "Similarity"]
++
++
++def table_records(frame):
++    return frame.reset_index().to_dict("records")
++
++
++def test_direct_single_query_top_one_from_injected_model(image_paths):
++
++
++
++
++    result = call_retrieval(
++        image_path=[image_paths["field.tif"], image_paths["snow.tif"]],
++        queries=["green fields"],
++        top_k=1,
++    )
++
++    assert_ranked_table(
++        result,
++        [("green fields", 1)],
++        [
++            {"Query": "green fields", "Rank": 1, "Image": "field.tif", "Similarity": 1.0},
++        ],
++    )
++
++
++def test_two_queries_top_two_returns_ranked_rows_per_query(image_paths):
++
++
++
++
++    result = call_retrieval(
++        image_path=[image_paths["field.tif"], image_paths["snow.tif"]],
++        queries=["snow cover", "green fields"],
++        top_k=2,
++    )
++
++    assert_ranked_table(
++        result,
++        [("snow cover", 1), ("snow cover", 2), ("green fields", 1), ("green fields", 2)],
++        [
++            {"Query": "snow cover", "Rank": 1, "Image": "snow.tif", "Similarity": 1.0},
++            {"Query": "snow cover", "Rank": 2, "Image": "field.tif", "Similarity": 0.0},
++            {"Query": "green fields", "Rank": 1, "Image": "field.tif", "Similarity": 1.0},
++            {"Query": "green fields", "Rank": 2, "Image": "snow.tif", "Similarity": 0.0},
++        ],
++    )
++
++
++def test_txt_query_file_and_string_image_list_input(image_paths, tmp_path):
++
++
++
++
++    queries_file = tmp_path / "queries.txt"
++    queries_file.write_text("\n snow cover \n\n green fields\n", encoding="utf-8")
++
++    result = call_retrieval(
++
++        image_path=str(tmp_path),
++        queries_file=str(queries_file),
++        top_k=1,
++    )
++
++    assert_ranked_table(
++        result,
++        [("snow cover", 1), ("green fields", 1)],
++        [
++            {"Query": "snow cover", "Rank": 1, "Image": "snow.tif", "Similarity": 1.0},
++            {"Query": "green fields", "Rank": 1, "Image": "field.tif", "Similarity": 1.0},
++        ],
++    )
++
++
++def test_yaml_query_file_reads_top_level_queries_list(image_paths, tmp_path):
++
++
++
++
++    queries_file = tmp_path / "queries.yaml"
++    queries_file.write_text("queries:\n  - snow cover\n", encoding="utf-8")
++
++    result = call_retrieval(
++        image_path=[image_paths["field.tif"], image_paths["mixed.tif"], image_paths["snow.tif"]],
++        queries_file=str(queries_file),
++        top_k=2,
++    )
++
++    assert_ranked_shape(result, [("snow cover", 1), ("snow cover", 2)])
++    records = table_records(result)
++    assert records[0] == {"Query": "snow cover", "Rank": 1, "Image": "snow.tif", "Similarity": 1.0}
++    assert records[1]["Query"] == "snow cover"
++    assert records[1]["Rank"] == 2
++    assert records[1]["Image"] == "mixed.tif"
++
++    assert records[1]["Similarity"] == pytest.approx(1 / np.sqrt(2), abs=1e-3)
++
++
++def test_yml_query_file_extension_is_supported(image_paths, tmp_path):
++
++
++
++
++    queries_file = tmp_path / "queries.yml"
++    queries_file.write_text("queries:\n  - snow cover\n", encoding="utf-8")
++
++    result = call_retrieval(
++        image_path=[image_paths["field.tif"], image_paths["snow.tif"]],
++        queries_file=str(queries_file),
++        top_k=1,
++    )
++
++    assert_ranked_table(
++        result,
++        [("snow cover", 1)],
++        [
++            {"Query": "snow cover", "Rank": 1, "Image": "snow.tif", "Similarity": 1.0},
++        ],
++    )
++
++
++def test_non_unit_embeddings_are_l2_normalized_before_similarity(image_paths):
++
++
++
++
++    result = call_retrieval(
++        model=ScaledRetrievalModel(),
++        image_path=[image_paths["field.tif"], image_paths["snow.tif"]],
++        queries=["green fields"],
++        top_k=2,
++    )
++
++    assert_ranked_table(
++        result,
++        [("green fields", 1), ("green fields", 2)],
++        [
++            {"Query": "green fields", "Rank": 1, "Image": "field.tif", "Similarity": 1.0},
++            {"Query": "green fields", "Rank": 2, "Image": "snow.tif", "Similarity": 0.0},
++        ],
++    )
++
++
++def test_save_path_writes_same_ranked_table_as_csv_with_suffix(image_paths, tmp_path):
++
++
++
++
++    result = call_retrieval(
++        image_path=[image_paths["field.tif"], image_paths["snow.tif"]],
++        queries=["green fields"],
++        top_k=2,
++        save_path=str(tmp_path / "nested" / "rankings"),
++    )
++
++    assert_ranked_table(
++        result,
++        [("green fields", 1), ("green fields", 2)],
++        [
++            {"Query": "green fields", "Rank": 1, "Image": "field.tif", "Similarity": 1.0},
++            {"Query": "green fields", "Rank": 2, "Image": "snow.tif", "Similarity": 0.0},
++        ],
++    )
++    csv_path = tmp_path / "nested" / "rankings.csv"
++
++    assert csv_path.exists()
++    csv_frame = pd.read_csv(csv_path)
++    assert csv_frame.to_dict("records") == [
++        {"Query": "green fields", "Rank": 1, "Image": "field.tif", "Similarity": 1.0},
++        {"Query": "green fields", "Rank": 2, "Image": "snow.tif", "Similarity": 0.0},
++    ]
++
++
++def test_verbose_prints_heading_table_and_saved_message(image_paths, tmp_path, monkeypatch, capsys):
++
++
++
++
++    monkeypatch.chdir(tmp_path)
++
++    call_retrieval(
++        image_path=[image_paths["field.tif"], image_paths["snow.tif"]],
++        queries=["green fields"],
++        top_k=1,
++        save_path="verbose-results",
++        verbose=True,
++    )
++
++    stdout = capsys.readouterr().out
++
++    assert "retrieval" in stdout.lower()
++    assert "green fields" in stdout
++    assert "field.tif" in stdout
++    assert "Similarity" in stdout
++    assert "saved" in stdout.lower()
++    assert "verbose-results.csv" in stdout
++
++
++def test_missing_queries_and_queries_file_raises_specific_value_error(image_paths):
++
++
++
++
++    with pytest.raises(ValueError) as excinfo:
++        call_retrieval(
++            image_path=[image_paths["field.tif"], image_paths["snow.tif"]],
++            queries=None,
++            queries_file=None,
++            top_k=1,
++        )
++
++    message = str(excinfo.value).lower()
++    assert "quer" in message
++    assert "file" in message
++    assert ("required" in message) or ("provide" in message)
++
++
++def test_unsupported_queries_file_extension_raises_specific_value_error(image_paths, tmp_path):
++
++
++
++
++    queries_file = tmp_path / "queries.json"
++    queries_file.write_text('{"queries": ["green fields"]}', encoding="utf-8")
++
++
++    with pytest.raises(ValueError):
++        call_retrieval(
++            image_path=[image_paths["field.tif"], image_paths["snow.tif"]],
++            queries_file=str(queries_file),
++            top_k=1,
++        )
++
++
++def test_referential_transparency_for_same_arguments(image_paths):
++    first = call_retrieval(
++        image_path=[image_paths["field.tif"], image_paths["snow.tif"]],
++        queries=["snow cover", "green fields"],
++        top_k=2,
++    )
++    second = call_retrieval(
++        image_path=[image_paths["field.tif"], image_paths["snow.tif"]],
++        queries=["snow cover", "green fields"],
++        top_k=2,
++    )
++
++    assert table_records(first) == table_records(second)
++
++
++def test_does_not_mutate_caller_owned_image_or_query_lists(image_paths):
++    image_list = [image_paths["field.tif"], image_paths["snow.tif"]]
++    queries = ["snow cover", "green fields"]
++    original_image_list = copy.deepcopy(image_list)
++    original_queries = copy.deepcopy(queries)
++
++    call_retrieval(image_path=image_list, queries=queries, top_k=2)
++
++    assert image_list == original_image_list
++    assert queries == original_queries
++
++
++def test_same_arguments_match_in_fresh_python_process(image_paths):
++    in_process = table_records(
++        call_retrieval(
++            image_path=[image_paths["field.tif"], image_paths["snow.tif"]],
++            queries=["green fields"],
++            top_k=1,
++        )
++    )
++    script = f"""
++import json
++import sys
++sys.path.insert(0, "/workspace/repo")
++import torch
++from msclip.inference import run_inference_retrieval
++
++class TokenBatch:
++    def __init__(self, queries):
++        mapping = {{"green fields": [1.0, 0.0]}}
++        self.tensor = torch.tensor([mapping[query] for query in queries], dtype=torch.float32)
++    def to(self, device):
++        return self.tensor.to(device)
++
++def tokenizer(queries):
++    return TokenBatch(queries)
++
++def preprocess(image):
++    return torch.tensor([float(image[0, 0, 0])], dtype=torch.float32)
++
++class Model(torch.nn.Module):
++    channels = 3
++    def to(self, device):
++        return self
++    def inference_vision(self, image_tensor):
++        rows = []
++        for value in image_tensor.flatten().tolist():
++            rows.append([1.0, 0.0] if value < 0.2 else [0.0, 1.0])
++        return torch.tensor(rows, dtype=torch.float32)
++    def inference_text(self, text_tokens):
++        return text_tokens.float()
++
++frame = run_inference_retrieval(
++    model=Model(),
++    preprocess=preprocess,
++    tokenizer=tokenizer,
++    image_path={json.dumps([image_paths["field.tif"], image_paths["snow.tif"]])},
++    queries=["green fields"],
++    top_k=1,
++    device="cpu",
++    verbose=False,
++)
++sys.stdout.write(json.dumps(frame.reset_index().to_dict("records"), sort_keys=True))
++"""
++
++    completed = subprocess.run(
++        [sys.executable, "-c", script],
++        check=True,
++        text=True,
++        stdout=subprocess.PIPE,
++        stderr=subprocess.PIPE,
++    )
++
++    assert json.loads(completed.stdout) == in_process
++
++
++def test_no_undeclared_file_writes_or_network_access(image_paths, tmp_path, monkeypatch):
++    cwd = tmp_path / "cwd"
++    cwd.mkdir()
++    monkeypatch.chdir(cwd)
++    before = sorted(path.name for path in cwd.iterdir())
++    open_calls = []
++    original_open = builtins.open
++
++    def recording_open(file, mode="r", *args, **kwargs):
++        open_calls.append((os.path.abspath(os.fspath(file)), mode))
++        return original_open(file, mode, *args, **kwargs)
++
++    def blocked_socket(*args, **kwargs):
++        raise AssertionError("network access is not declared for retrieval over local images")
++
++    monkeypatch.setattr(builtins, "open", recording_open)
++    monkeypatch.setattr(socket, "socket", blocked_socket)
++
++    call_retrieval(
++        image_path=[image_paths["field.tif"], image_paths["snow.tif"]],
++        queries=["green fields"],
++        top_k=1,
++    )
++
++    after = sorted(path.name for path in cwd.iterdir())
++    assert before == []
++    assert after == []
++
++    assert not any(any(flag in str(mode) for flag in ("w", "a", "x", "+")) for _, mode in open_calls)
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,19 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++cd /workspace/repo
++export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
++export HF_HUB_OFFLINE=1
++export TRANSFORMERS_OFFLINE=1
++export HF_DATASETS_OFFLINE=1
++export PIP_NO_INDEX=1
++exec /usr/local/bin/python -m pytest -p no:cacheprovider /workspace/repo/usercase-test-coderl/test_retrieval.py -v

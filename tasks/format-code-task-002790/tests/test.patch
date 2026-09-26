@@ -1,0 +1,410 @@
+diff --git a/usercase-test-coderl/test_trust_lnotab.py b/usercase-test-coderl/test_trust_lnotab.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/test_trust_lnotab.py
+@@ -0,0 +1,380 @@
++import copy
++import json
++import os
++import socket
++import subprocess
++import sys
++from pathlib import Path
++
++import pytest
++
++import pylingual
++
++
++
++
++
++
++
++CONFIG_FILE = Path("/workspace/repo/pyproject.toml")
++
++
++class _Dataset:
++    pass
++
++
++class _FakeTransformers:
++    pipelines = type("Pipelines", (), {"base": type("Base", (), {"Dataset": _Dataset})})
++
++
++class FakeInst:
++    def __init__(self, name, starts_line=None):
++        self.name = name
++        self.starts_line = starts_line
++
++
++class FakeBytecode:
++    def __init__(self, line_groups, name="bc"):
++        self.line_groups = line_groups
++        self.name = name
++        self.codeobj = object()
++
++    def get_lno_insts(self, previously_seen_lines=None, **_):
++        return {line: insts for line, insts in self.line_groups if previously_seen_lines is None or line not in previously_seen_lines}
++
++
++class FakePYC:
++    def __init__(self, bytecodes):
++        self.bytecodes = bytecodes
++        self.version = "3.12"
++        self.pyc_path = None
++
++    def copy(self):
++        return self
++
++    def iter_bytecodes(self):
++        return iter(self.bytecodes)
++
++
++class FakeMasker:
++    def get_model_view(self, inst):
++        return inst.name
++
++
++class FakeSegmenter:
++    def __init__(self):
++        self.calls = []
++
++    def tokenizer(self, instructions):
++        return [[0] for _ in instructions]
++
++    def __call__(self, requests, batch_size=8):
++        del batch_size
++        labels = ["I", "E", "I", "B", "E"]
++        scores = [0.15, 0.35, 0.55, 0.75, 0.95]
++        request_list = list(requests)
++        self.calls.extend(request_list)
++        return [
++            [
++                {"entity": labels[i % len(labels)], "score": scores[i % len(scores)], "word": word}
++                for i, word in enumerate(request.split(_decompiler_module().bytecode_separator))
++            ]
++            for request in request_list
++        ]
++
++
++def _decompiler_module():
++    return sys.modules["pylingual.decompiler"]
++
++
++def _install_fake_pipeline(monkeypatch):
++    import pylingual.utils.tracked_list as tracked_list
++
++    decompiler_module = _decompiler_module()
++    segmenter = FakeSegmenter()
++    monkeypatch.setattr(tracked_list, "transformers", _FakeTransformers)
++    monkeypatch.setattr(decompiler_module, "load_models", lambda *args, **kwargs: (segmenter, object()))
++    monkeypatch.setattr(decompiler_module, "create_global_masker", lambda pyc: FakeMasker())
++    monkeypatch.setattr(decompiler_module.Decompiler, "run_translation", lambda self: None)
++    monkeypatch.setattr(decompiler_module.Decompiler, "unmask_lines", lambda self: None)
++
++    def run_cflow_reconstruction(self):
++        payload = {
++            "labels": [[row["entity"] for row in rows] for rows in self.segmentation_results],
++            "model_calls": segmenter.calls,
++            "scores": [[row["score"] for row in rows] for rows in self.segmentation_results],
++            "starts": [[inst.starts_line for inst in insts] for insts in self.ordered_instructions],
++        }
++        self.source_context = type("Ctx", (), {"__str__": lambda _: json.dumps(payload, sort_keys=True)})()
++
++    monkeypatch.setattr(decompiler_module.Decompiler, "run_cflow_reconstruction", run_cflow_reconstruction)
++    monkeypatch.setattr(decompiler_module.Decompiler, "reconstruct_source", lambda self: setattr(self, "indented_source", str(self.source_context)))
++    monkeypatch.setattr(decompiler_module.Decompiler, "check_reconstruction", lambda self, source: [])
++    monkeypatch.setattr(decompiler_module.Decompiler, "correct_failures", lambda self: None)
++    return segmenter
++
++
++def _pyc_from_counts(codeobject_specs):
++    bytecodes = []
++    for codeobject_index, line_counts in enumerate(codeobject_specs):
++        groups = []
++        for line, count in line_counts:
++            insts = [FakeInst(f"{codeobject_index}:{line}:{inst_index}", line if inst_index == 0 else None) for inst_index in range(count)]
++            groups.append((line, insts))
++        bytecodes.append(FakeBytecode(groups, f"bc{codeobject_index}"))
++    return FakePYC(bytecodes)
++
++
++def _run_fake_decompile(monkeypatch, codeobject_specs, trust_lnotab):
++    _install_fake_pipeline(monkeypatch)
++    result = pylingual.decompile(_pyc_from_counts(codeobject_specs), config_file=CONFIG_FILE, trust_lnotab=trust_lnotab)
++    return json.loads(result.decompiled_source)
++
++
++def _assert_spec_trusted_payload(actual, expected_labels, expected_scores):
++
++    assert actual["labels"] == expected_labels
++    assert actual["model_calls"] == []
++    assert actual["scores"] == expected_scores
++    for labels, starts in zip(actual["labels"], actual["starts"]):
++        assert len(starts) == len(labels)
++        assert all(start is not None for label, start in zip(labels, starts) if label == "B")
++        assert all(start is None for label, start in zip(labels, starts) if label != "B")
++
++
++def _flatten(nested):
++    return [item for group in nested for item in group]
++
++
++def test_trusted_lnotab_one_instruction_and_multi_instruction_lines(monkeypatch):
++
++
++
++
++    actual = _run_fake_decompile(monkeypatch, [[(10, 1), (11, 2), (12, 3)]], trust_lnotab=True)
++
++    _assert_spec_trusted_payload(actual, [["B", "B", "E", "B", "I", "E"]], [[1, 1, 1, 1, 1, 1]])
++
++
++def test_trusted_lnotab_longer_multi_instruction_line(monkeypatch):
++
++
++
++
++    actual = _run_fake_decompile(monkeypatch, [[(21, 4), (22, 1)]], trust_lnotab=True)
++
++    _assert_spec_trusted_payload(actual, [["B", "I", "I", "E", "B"]], [[1, 1, 1, 1, 1]])
++
++
++def test_trusted_lnotab_repeated_line_numbers_are_ignored_later(monkeypatch):
++
++
++
++
++    _install_fake_pipeline(monkeypatch)
++    first = FakeBytecode([(4, [FakeInst("first", 4)])], "first")
++    second_insts = [FakeInst("repeat", 4), FakeInst("new", 5)]
++
++    class LaterBytecode(FakeBytecode):
++        def get_lno_insts(self, previously_seen_lines=None, **_):
++            if previously_seen_lines and 4 in previously_seen_lines:
++                return {5: second_insts}
++            return {4: [second_insts[0]], 5: [second_insts[1]]}
++
++    result = pylingual.decompile(FakePYC([first, LaterBytecode([], "second")]), config_file=CONFIG_FILE, trust_lnotab=True)
++
++    actual = json.loads(result.decompiled_source)
++    _assert_spec_trusted_payload(actual, [["B"], ["B", "E"]], [[1], [1, 1]])
++
++    assert len(actual["labels"][1]) == len(second_insts)
++
++
++def test_default_false_uses_normal_segmentation_model_path(monkeypatch):
++
++
++
++
++    actual = _run_fake_decompile(monkeypatch, [[(30, 3)]], trust_lnotab=False)
++
++
++    assert len(actual["model_calls"]) == 1
++    assert "0:30:0" in actual["model_calls"][0]
++    assert "0:30:1" in actual["model_calls"][0]
++    assert "0:30:2" in actual["model_calls"][0]
++    assert _flatten(actual["labels"]) != ["B", "I", "E"]
++    assert _flatten(actual["scores"]) != [1, 1, 1]
++
++
++def test_empty_trusted_line_group_raises_specific_value_error(monkeypatch):
++
++
++
++
++    _install_fake_pipeline(monkeypatch)
++
++    class EmptyLineBytecode(FakeBytecode):
++        def get_lno_insts(self, previously_seen_lines=None, **_):
++            return {99: []}
++
++
++    with pytest.raises(ValueError):
++        pylingual.decompile(FakePYC([EmptyLineBytecode([], "empty")]), config_file=CONFIG_FILE, trust_lnotab=True)
++
++
++def test_referential_transparency_for_same_trusted_input(monkeypatch):
++    first = _run_fake_decompile(monkeypatch, [[(40, 2), (41, 1)]], trust_lnotab=True)
++    second = _run_fake_decompile(monkeypatch, [[(40, 2), (41, 1)]], trust_lnotab=True)
++
++    assert first == second
++
++
++def test_decompile_does_not_mutate_path_input_or_pyc_file(monkeypatch, tmp_path):
++    _install_fake_pipeline(monkeypatch)
++    pyc_path = tmp_path / "fixture.pyc"
++    pyc_path.write_bytes(b"not a real pyc; PYCFile is stubbed")
++    original_path = copy.deepcopy(pyc_path)
++    original_bytes = pyc_path.read_bytes()
++
++    decompiler_module = _decompiler_module()
++    monkeypatch.setattr(decompiler_module, "PYCFile", lambda path: _pyc_from_counts([[(50, 1), (51, 2)]]))
++
++    pylingual.decompile(pyc_path, config_file=CONFIG_FILE, trust_lnotab=True)
++
++    assert pyc_path == original_path
++    assert pyc_path.read_bytes() == original_bytes
++
++
++def test_no_global_state_matches_fresh_python_process(monkeypatch):
++    in_process = _run_fake_decompile(monkeypatch, [[(60, 1), (61, 3)]], trust_lnotab=True)
++    script = r'''
++import json
++import sys
++from pathlib import Path
++sys.path.insert(0, "/workspace/repo")
++import pylingual
++import pylingual.utils.tracked_list as tracked_list
++decompiler_module = sys.modules["pylingual.decompiler"]
++class Dataset: pass
++class FakeTransformers:
++    pipelines = type("Pipelines", (), {"base": type("Base", (), {"Dataset": Dataset})})
++class FakeInst:
++    def __init__(self, name, starts_line=None):
++        self.name = name
++        self.starts_line = starts_line
++class FakeBytecode:
++    def __init__(self, groups):
++        self.groups = groups
++        self.name = "bc"
++        self.codeobj = object()
++    def get_lno_insts(self, previously_seen_lines=None, **_):
++        return {line: insts for line, insts in self.groups if previously_seen_lines is None or line not in previously_seen_lines}
++class FakePYC:
++    version = "3.12"
++    pyc_path = None
++    def __init__(self, bcs):
++        self.bcs = bcs
++    def copy(self):
++        return self
++    def iter_bytecodes(self):
++        return iter(self.bcs)
++class FakeMasker:
++    def get_model_view(self, inst):
++        return inst.name
++class FakeSegmenter:
++    calls = []
++tracked_list.transformers = FakeTransformers
++decompiler_module.load_models = lambda *args, **kwargs: (FakeSegmenter(), object())
++decompiler_module.create_global_masker = lambda pyc: FakeMasker()
++decompiler_module.Decompiler.run_translation = lambda self: None
++decompiler_module.Decompiler.unmask_lines = lambda self: None
++def run_cflow(self):
++    payload = {
++        "labels": [[row["entity"] for row in rows] for rows in self.segmentation_results],
++        "model_calls": [],
++        "scores": [[row["score"] for row in rows] for rows in self.segmentation_results],
++        "starts": [[inst.starts_line for inst in insts] for insts in self.ordered_instructions],
++    }
++    self.source_context = type("Ctx", (), {"__str__": lambda _: json.dumps(payload, sort_keys=True)})()
++decompiler_module.Decompiler.run_cflow_reconstruction = run_cflow
++decompiler_module.Decompiler.reconstruct_source = lambda self: setattr(self, "indented_source", str(self.source_context))
++decompiler_module.Decompiler.check_reconstruction = lambda self, source: []
++decompiler_module.Decompiler.correct_failures = lambda self: None
++groups = []
++for line, count in [(60, 1), (61, 3)]:
++    groups.append((line, [FakeInst(f"0:{line}:{i}", line if i == 0 else None) for i in range(count)]))
++result = pylingual.decompile(FakePYC([FakeBytecode(groups)]), config_file=Path("/workspace/repo/pyproject.toml"), trust_lnotab=True)
++sys.stdout.write(result.decompiled_source)
++'''
++
++    completed = subprocess.run([sys.executable, "-c", script], check=True, text=True, stdout=subprocess.PIPE)
++
++    assert in_process == json.loads(completed.stdout)
++
++
++def test_no_undeclared_cwd_files_or_network(monkeypatch, tmp_path):
++    _install_fake_pipeline(monkeypatch)
++
++    def blocked_socket(*args, **kwargs):
++        raise AssertionError("network access is not declared for trusted lnotab segmentation")
++
++    monkeypatch.setattr(socket, "socket", blocked_socket)
++    before = set(tmp_path.iterdir())
++    old_cwd = Path.cwd()
++    try:
++        os.chdir(tmp_path)
++        pylingual.decompile(_pyc_from_counts([[(70, 1), (71, 2)]]), config_file=CONFIG_FILE, trust_lnotab=True)
++        after = set(tmp_path.iterdir())
++    finally:
++        os.chdir(old_cwd)
++
++    assert after == before
++
++
++def test_cli_help_lists_trust_lnotab_option():
++
++
++
++
++    from click.testing import CliRunner
++    import pylingual.main as main_module
++
++    result = CliRunner().invoke(main_module.main, ["--help"], terminal_width=160)
++
++    assert result.exit_code == 0
++    assert "--trust-lnotab" in result.output
++
++    help_text = result.output.lower()
++    assert "lnotab" in help_text
++    assert "segmentation" in help_text
++    assert "model" in help_text
++
++
++def test_cli_trust_lnotab_flag_passes_true_to_decompile(monkeypatch, tmp_path):
++
++
++
++
++    from click.testing import CliRunner
++    import pylingual.main as main_module
++
++    pyc_path = tmp_path / "sample.pyc"
++    pyc_path.write_bytes(b"fake")
++    calls = []
++    fake_transformers = type("FakeTransformers", (), {"logging": type("Logging", (), {"disable_default_handler": lambda: None, "add_handler": lambda handler: None})})
++    fake_result = type("Result", (), {"original_pyc": type("Original", (), {"pyc_path": pyc_path})(), "equivalence_results": []})()
++
++    def fake_decompile(**kwargs):
++        calls.append(kwargs)
++        return fake_result
++
++    monkeypatch.setattr(main_module, "print_header", lambda: None)
++    monkeypatch.setattr(main_module, "print_result", lambda title, results: None)
++    monkeypatch.setattr(main_module, "transformers", fake_transformers)
++    monkeypatch.setattr(main_module, "decompile", fake_decompile)
++
++    result = CliRunner().invoke(main_module.main, ["--trust-lnotab", "-q", str(pyc_path)])
++
++    assert result.exit_code == 0
++    assert len(calls) == 1
++    assert calls[0]["pyc"] == pyc_path
++    assert calls[0]["trust_lnotab"] is True
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,20 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++export PIP_NO_INDEX=1
++export HF_HUB_OFFLINE=1
++export TRANSFORMERS_OFFLINE=1
++export DATASETS_OFFLINE=1
++export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
++export PYTHONNOUSERSITE=1
++export PYTHONPATH=/workspace/repo${PYTHONPATH:+:$PYTHONPATH}
++exec python3 -m pytest /workspace/repo/usercase-test-coderl/test_trust_lnotab.py -v

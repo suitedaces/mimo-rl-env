@@ -1,0 +1,471 @@
+diff --git a/usercase-test-coderl/test_skip_gram_training_stateful.py b/usercase-test-coderl/test_skip_gram_training_stateful.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/test_skip_gram_training_stateful.py
+@@ -0,0 +1,442 @@
++import random
++
++import pytest
++import torch
++
++from kor2vec import ContextKor2Vec, Kor2Vec
++
++
++SAMPLED_ROW = "안녕\t나는 반가워\t도라에몽 클로바\n"
++ONE_WORD_SAMPLED_ROW = "안녕\t나는\t도라에몽\n"
++CORPUS_LINE = "안녕 나는 반가워 도라에몽 클로바\n"
++
++
++@pytest.fixture(autouse=True)
++def deterministic_cpu_and_quiet_progress(monkeypatch):
++    torch.set_num_threads(1)
++    monkeypatch.setattr("tqdm.tqdm", lambda iterable=None, *args, **kwargs: iterable)
++
++
++def _write_text(path, text):
++    path.write_text(text, encoding="utf-8")
++    return str(path)
++
++
++def _rounded_embedding_sum(model, sentence="안녕 나는"):
++    with torch.no_grad():
++        return round(float(model.embedding(sentence).sum().item()), 6)
++
++
++def _rounded_parameter_sum(model):
++    with torch.no_grad():
++        total = sum(param.detach().cpu().sum() for param in model.parameters())
++        return round(float(total.item()), 6)
++
++
++def _parameter_snapshot(model):
++    with torch.no_grad():
++        return [param.detach().cpu().clone() for param in model.parameters()]
++
++
++def _parameters_changed(before, model):
++    with torch.no_grad():
++        after = [param.detach().cpu() for param in model.parameters()]
++        if len(before) != len(after):
++            return True
++        return any(not torch.equal(old, new) for old, new in zip(before, after))
++
++
++def _embedding_snapshot(model, sentence="안녕 나는"):
++    with torch.no_grad():
++        return model.embedding(sentence).detach().cpu().clone()
++
++
++def _embedding_changed(before, model, sentence="안녕 나는"):
++    with torch.no_grad():
++        return not torch.equal(before, model.embedding(sentence).detach().cpu())
++
++
++def _assert_embedding_matches(left, right, sentence="안녕 나는"):
++    with torch.no_grad():
++        assert torch.equal(left.embedding(sentence).detach().cpu(), right.embedding(sentence).detach().cpu())
++
++
++def _assert_sample_file_shape(path, positive_sample_count, negative_sample_count, source_words):
++    rows = path.read_text(encoding="utf-8").splitlines()
++    assert rows != []
++    for row in rows:
++        fields = row.split("\t")
++        assert len(fields) == 3
++        center, positive, negative = fields
++        positives = positive.split(" ") if positive else []
++        negatives = negative.split(" ") if negative else []
++        assert center in source_words
++        assert len(positives) == positive_sample_count
++        assert len(negatives) == negative_sample_count
++        assert all(word in source_words for word in positives)
++        assert all(word in source_words for word in negatives)
++
++
++def _load_model(path):
++    try:
++        return torch.load(str(path), map_location={"cuda:0": "cpu"}, weights_only=False)
++    except TypeError:
++        return torch.load(str(path), map_location={"cuda:0": "cpu"})
++
++
++def test_kor2vec_train_from_sample_pre_sequence_updates_same_object_and_checkpoints(tmp_path):
++
++
++
++
++    sample_path = _write_text(tmp_path / "sampled.txt", SAMPLED_ROW)
++    out = tmp_path / "kor2vec.pt"
++
++    torch.manual_seed(1337)
++    model = Kor2Vec(embed_size=8)
++
++    before_params = _parameter_snapshot(model)
++    before_embedding = _embedding_snapshot(model)
++
++    result = model.train(
++        sample_path=sample_path,
++        model_path=str(out),
++        positive_sample_count=2,
++        negative_sample_count=2,
++        batch_size=1,
++        epochs=2,
++        pre_sequence=True,
++    )
++
++    assert result is None
++    assert sorted(path.name for path in tmp_path.iterdir()) == [
++        "kor2vec.pt.ep0",
++        "kor2vec.pt.ep1",
++        "sampled.txt",
++    ]
++
++    assert _parameters_changed(before_params, model)
++    assert _embedding_changed(before_embedding, model)
++
++    manual_save = tmp_path / "kor2vec-after-train.pt"
++    model.save(str(manual_save))
++    loaded = _load_model(manual_save)
++
++    _assert_embedding_matches(loaded, model)
++
++
++def test_kor2vec_train_from_sample_lazy_conversion_matches_eager_state(tmp_path):
++
++
++
++
++    sample_path = _write_text(tmp_path / "sampled.txt", SAMPLED_ROW)
++    out = tmp_path / "kor2vec-lazy.pt"
++
++    torch.manual_seed(1337)
++    model = Kor2Vec(embed_size=8)
++    before_params = _parameter_snapshot(model)
++    before_embedding = _embedding_snapshot(model)
++    result = model.train(
++        sample_path=sample_path,
++        model_path=str(out),
++        positive_sample_count=2,
++        negative_sample_count=2,
++        batch_size=1,
++        epochs=2,
++        pre_sequence=False,
++    )
++
++    assert result is None
++    assert sorted(path.name for path in tmp_path.iterdir()) == [
++        "kor2vec-lazy.pt.ep0",
++        "kor2vec-lazy.pt.ep1",
++        "sampled.txt",
++    ]
++
++    assert _parameters_changed(before_params, model)
++    assert _embedding_changed(before_embedding, model)
++
++
++def test_corpus_path_creates_default_sampled_file_and_uses_sampling_counts(tmp_path):
++
++
++
++
++    corpus = tmp_path / "corpus.txt"
++    _write_text(corpus, CORPUS_LINE)
++    out = tmp_path / "corpus-model.pt"
++
++    random.seed(7)
++    torch.manual_seed(1337)
++    model = Kor2Vec(embed_size=8)
++    before_params = _parameter_snapshot(model)
++    result = model.train(
++        corpus_path=str(corpus),
++        model_path=str(out),
++        window_size=3,
++        positive_sample_count=2,
++        negative_sample_count=2,
++        batch_size=1,
++        epochs=1,
++        pre_sequence=False,
++    )
++
++    assert result is None
++
++    _assert_sample_file_shape(tmp_path / "corpus.txt.sampled", 2, 2, CORPUS_LINE.split())
++    assert sorted(path.name for path in tmp_path.iterdir()) == [
++        "corpus-model.pt.ep0",
++        "corpus.txt",
++        "corpus.txt.sampled",
++    ]
++
++    assert _parameters_changed(before_params, model)
++
++
++def test_corpus_path_honors_custom_sample_output_path(tmp_path):
++
++
++
++
++    corpus = tmp_path / "corpus.txt"
++    sampled = tmp_path / "custom.sampled"
++    out = tmp_path / "custom-corpus-model.pt"
++    _write_text(corpus, CORPUS_LINE)
++
++    random.seed(7)
++    torch.manual_seed(1337)
++    model = Kor2Vec(embed_size=8)
++    result = model.train(
++        corpus_path=str(corpus),
++        sample_output_path=str(sampled),
++        model_path=str(out),
++        window_size=3,
++        positive_sample_count=2,
++        negative_sample_count=2,
++        batch_size=1,
++        epochs=1,
++        pre_sequence=False,
++    )
++
++    assert result is None
++
++    _assert_sample_file_shape(sampled, 2, 2, CORPUS_LINE.split())
++    assert sorted(path.name for path in tmp_path.iterdir()) == [
++        "corpus.txt",
++        "custom-corpus-model.pt.ep0",
++        "custom.sampled",
++    ]
++
++
++def test_context_kor2vec_train_updates_contextual_model_and_checkpoints(tmp_path):
++
++
++
++
++    sample_path = _write_text(tmp_path / "sampled.txt", SAMPLED_ROW)
++    out = tmp_path / "context.pt"
++
++    torch.manual_seed(1337)
++    model = ContextKor2Vec(embed_size=8)
++
++    before_params = _parameter_snapshot(model)
++    before_embedding = _embedding_snapshot(model)
++
++    result = model.train(
++        sample_path=sample_path,
++        model_path=str(out),
++        positive_sample_count=2,
++        negative_sample_count=2,
++        batch_size=1,
++        epochs=2,
++        pre_sequence=True,
++    )
++
++    assert result is None
++    assert sorted(path.name for path in tmp_path.iterdir()) == [
++        "context.pt.ep0",
++        "context.pt.ep1",
++        "sampled.txt",
++    ]
++
++    assert _parameters_changed(before_params, model)
++    assert _embedding_changed(before_embedding, model)
++
++
++def test_missing_sample_file_raises_file_not_found_before_checkpoint(tmp_path):
++
++
++
++
++    missing_sample = tmp_path / "missing.sampled"
++    out = tmp_path / "missing-model.pt"
++
++    torch.manual_seed(1337)
++    model = Kor2Vec(embed_size=8)
++    with pytest.raises(FileNotFoundError):
++        model.train(
++            sample_path=str(missing_sample),
++            model_path=str(out),
++            positive_sample_count=2,
++            negative_sample_count=2,
++            batch_size=1,
++            epochs=1,
++            pre_sequence=True,
++        )
++
++    assert sorted(path.name for path in tmp_path.iterdir()) == []
++
++
++def test_malformed_sampled_row_fails_without_checkpoint_in_eager_mode(tmp_path):
++
++
++
++
++    sample_path = _write_text(tmp_path / "bad.sampled", "안녕\t나는 반가워\n")
++    out = tmp_path / "bad-eager.pt"
++
++    torch.manual_seed(1337)
++    model = Kor2Vec(embed_size=8)
++
++    with pytest.raises(Exception):
++        model.train(
++            sample_path=sample_path,
++            model_path=str(out),
++            positive_sample_count=2,
++            negative_sample_count=2,
++            batch_size=1,
++            epochs=1,
++            pre_sequence=True,
++        )
++
++    assert sorted(path.name for path in tmp_path.iterdir()) == ["bad.sampled"]
++
++
++def test_malformed_sampled_row_fails_without_checkpoint_in_lazy_mode(tmp_path):
++
++
++
++
++    sample_path = _write_text(tmp_path / "bad.sampled", "안녕\t나는 반가워\n")
++    out = tmp_path / "bad-lazy.pt"
++
++    torch.manual_seed(1337)
++    model = Kor2Vec(embed_size=8)
++
++    with pytest.raises(Exception):
++        model.train(
++            sample_path=sample_path,
++            model_path=str(out),
++            positive_sample_count=2,
++            negative_sample_count=2,
++            batch_size=1,
++            epochs=1,
++            pre_sequence=False,
++        )
++
++    assert sorted(path.name for path in tmp_path.iterdir()) == ["bad.sampled"]
++
++
++def test_two_instances_keep_independent_training_state(tmp_path):
++
++
++
++
++    sample_path = _write_text(tmp_path / "sampled.txt", SAMPLED_ROW)
++
++    torch.manual_seed(1337)
++    trained = Kor2Vec(embed_size=8)
++    trained_before = _parameter_snapshot(trained)
++    trained_embedding_before = _embedding_snapshot(trained)
++    torch.manual_seed(1337)
++    fresh = Kor2Vec(embed_size=8)
++    fresh_before = _parameter_snapshot(fresh)
++    fresh_embedding_before = _embedding_snapshot(fresh)
++
++    result = trained.train(
++        sample_path=sample_path,
++        model_path=str(tmp_path / "trained.pt"),
++        positive_sample_count=2,
++        negative_sample_count=2,
++        batch_size=1,
++        epochs=2,
++        pre_sequence=True,
++    )
++
++    assert result is None
++
++    assert _parameters_changed(trained_before, trained)
++    assert _embedding_changed(trained_embedding_before, trained)
++    assert not _parameters_changed(fresh_before, fresh)
++    assert not _embedding_changed(fresh_embedding_before, fresh)
++
++
++def test_second_train_call_on_same_object_updates_from_previous_state(tmp_path):
++
++
++
++
++    sample_path = _write_text(tmp_path / "sampled.txt", SAMPLED_ROW)
++
++    torch.manual_seed(1337)
++    model = Kor2Vec(embed_size=8)
++    before_first = _parameter_snapshot(model)
++    first = model.train(
++        sample_path=sample_path,
++        model_path=str(tmp_path / "first.pt"),
++        positive_sample_count=2,
++        negative_sample_count=2,
++        batch_size=1,
++        epochs=1,
++        pre_sequence=False,
++    )
++    after_first = _parameter_snapshot(model)
++    second = model.train(
++        sample_path=sample_path,
++        model_path=str(tmp_path / "second.pt"),
++        positive_sample_count=2,
++        negative_sample_count=2,
++        batch_size=1,
++        epochs=1,
++        pre_sequence=False,
++    )
++
++    assert first is None
++    assert second is None
++    assert sorted(path.name for path in tmp_path.iterdir()) == [
++        "first.pt.ep0",
++        "sampled.txt",
++        "second.pt.ep0",
++    ]
++
++    assert _parameters_changed(before_first, model)
++    assert _parameters_changed(after_first, model)
++
++
++def test_repeated_training_cycles_keep_resource_counters_bounded(tmp_path):
++
++
++
++
++    sample_path = _write_text(tmp_path / "tiny.sampled", ONE_WORD_SAMPLED_ROW)
++
++
++    for i in range(3):
++        torch.manual_seed(5000 + i)
++        model = Kor2Vec(embed_size=4, char_embed_size=4, filter_sizes=[2, 3])
++        out = tmp_path / f"cycle-{i}.pt"
++        result = model.train(
++            sample_path=sample_path,
++            model_path=str(out),
++            positive_sample_count=1,
++            negative_sample_count=1,
++            batch_size=1,
++            epochs=1,
++            pre_sequence=False,
++        )
++        assert result is None
++        assert (tmp_path / f"cycle-{i}.pt.ep0").exists() is True
++        (tmp_path / f"cycle-{i}.pt.ep0").unlink()
++
++    assert sorted(path.name for path in tmp_path.iterdir()) == ["tiny.sampled"]
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,19 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++
++cd /workspace/repo
++export CUDA_VISIBLE_DEVICES=""
++export PYTHONHASHSEED=0
++export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
++
++exec /usr/local/bin/python -m pytest /workspace/repo/usercase-test-coderl/test_skip_gram_training_stateful.py -v

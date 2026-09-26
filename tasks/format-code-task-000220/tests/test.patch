@@ -1,0 +1,300 @@
+diff --git a/tests/test_usage_manager.py b/tests/test_usage_manager.py
+new file mode 100644
+index 0000000..0f050a5
+--- /dev/null
++++ b/tests/test_usage_manager.py
+@@ -0,0 +1,261 @@
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++"""Tests for usage tracking and the cleanup of stale virtualenvs."""
++
++import importlib
++import os
++import pkgutil
++import tempfile
++import unittest
++from datetime import datetime, timedelta
++
++import fades
++from fades import cache
++
++DATE_FORMAT = "%Y-%m-%dT%H:%M:%S.%f"
++
++
++def get_usage_manager_class():
++    """Locate the UsageManager class wherever it lives in the fades package."""
++    for _, modname, _ in pkgutil.iter_modules(fades.__path__, fades.__name__ + '.'):
++        if modname.rsplit('.', 1)[-1] == '__main__':
++            continue
++        try:
++            module = importlib.import_module(modname)
++        except Exception:
++            continue
++        cls = getattr(module, 'UsageManager', None)
++        if cls is not None:
++            return cls
++    raise AssertionError("Could not find a UsageManager class in the fades package")
++
++
++class BaseTestCase(unittest.TestCase):
++    """Common helpers."""
++
++    def setUp(self):
++        self.UsageManager = get_usage_manager_class()
++
++        self.basedir = tempfile.mkdtemp(prefix="test-fades-base")
++
++        fd, self.cache_path = tempfile.mkstemp(prefix="test-fades-cache")
++        os.close(fd)
++        self.addCleanup(lambda: os.path.exists(self.cache_path) and os.remove(self.cache_path))
++
++        self.stat_path = os.path.join(self.basedir, 'usage_stats')
++        self.venvscache = cache.VEnvsCache(self.cache_path)
++
++    def make_venv(self, uuid, create_dir=True):
++        """Register a venv in the cache (and optionally create its dir on disk)."""
++        env_path = os.path.join(self.basedir, uuid)
++        if create_dir:
++            os.makedirs(env_path, exist_ok=True)
++        metadata = {
++            'env_path': env_path,
++            'env_bin_path': os.path.join(env_path, 'bin'),
++            'pip_installed': True,
++        }
++        self.venvscache.store({}, metadata, 'pythonX.Y', options={})
++        return env_path
++
++    def read_usage_lines(self):
++        with open(self.stat_path, 'rt') as fh:
++            return [line.strip() for line in fh if line.strip()]
++
++    def write_usage(self, records):
++        """Write usage records; records is a list of (uuid, datetime)."""
++        with open(self.stat_path, 'wt') as fh:
++            for uuid, when in records:
++                fh.write('{} {}\n'.format(uuid, datetime.strftime(when, DATE_FORMAT)))
++
++
++class GetVenvsMetadataTestCase(BaseTestCase):
++    """The cache exposes the metadata of every stored venv."""
++
++    def test_empty_cache(self):
++        self.assertEqual(list(self.venvscache.get_venvs_metadata()), [])
++
++    def test_yields_all_metadata(self):
++        p1 = self.make_venv('uuid-1')
++        p2 = self.make_venv('uuid-2')
++        p3 = self.make_venv('uuid-3')
++
++        result = list(self.venvscache.get_venvs_metadata())
++        env_paths = sorted(m['env_path'] for m in result)
++        self.assertEqual(env_paths, sorted([p1, p2, p3]))
++
++        by_path = {m['env_path']: m for m in result}
++        self.assertEqual(by_path[p1]['env_bin_path'], os.path.join(p1, 'bin'))
++
++
++class InitTestCase(BaseTestCase):
++    """Seeding of the usage stats file on construction."""
++
++    def test_seeds_file_when_missing(self):
++        self.make_venv('uuid-1')
++        self.make_venv('uuid-2')
++        self.assertFalse(os.path.exists(self.stat_path))
++
++        before = datetime.utcnow()
++        self.UsageManager(self.stat_path, self.venvscache)
++        after = datetime.utcnow()
++
++        self.assertTrue(os.path.exists(self.stat_path))
++        lines = self.read_usage_lines()
++        self.assertEqual(len(lines), 2)
++        seen = {}
++        for line in lines:
++            uuid, stamp = line.split()
++            seen[uuid] = datetime.strptime(stamp, DATE_FORMAT)
++        self.assertEqual(set(seen), {'uuid-1', 'uuid-2'})
++        for when in seen.values():
++            self.assertTrue(before - timedelta(seconds=5) <= when <= after + timedelta(seconds=5))
++
++    def test_seeds_empty_when_no_venvs(self):
++        self.UsageManager(self.stat_path, self.venvscache)
++        self.assertTrue(os.path.exists(self.stat_path))
++        self.assertEqual(self.read_usage_lines(), [])
++
++    def test_does_not_touch_existing_file(self):
++        self.make_venv('uuid-1')
++        old = datetime.utcnow() - timedelta(days=5)
++        self.write_usage([('some-old-uuid', old)])
++        original = self.read_usage_lines()
++
++        self.UsageManager(self.stat_path, self.venvscache)
++
++        self.assertEqual(self.read_usage_lines(), original)
++
++
++class StoreUsageStatTestCase(BaseTestCase):
++    """Recording usage appends a record."""
++
++    def test_appends_record(self):
++        env_path = self.make_venv('uuid-1')
++        manager = self.UsageManager(self.stat_path, self.venvscache)
++
++        self.assertEqual(len(self.read_usage_lines()), 1)
++
++        before = datetime.utcnow()
++        manager.store_usage_stat({'env_path': env_path})
++        after = datetime.utcnow()
++
++        lines = self.read_usage_lines()
++        self.assertEqual(len(lines), 2)
++        uuid, stamp = lines[-1].split()
++        self.assertEqual(uuid, 'uuid-1')
++        when = datetime.strptime(stamp, DATE_FORMAT)
++        self.assertTrue(before - timedelta(seconds=5) <= when <= after + timedelta(seconds=5))
++
++    def test_appends_without_dropping_others(self):
++        self.make_venv('uuid-1')
++        env_path2 = self.make_venv('uuid-2')
++        manager = self.UsageManager(self.stat_path, self.venvscache)
++        self.assertEqual(len(self.read_usage_lines()), 2)
++
++        manager.store_usage_stat({'env_path': env_path2})
++
++        lines = self.read_usage_lines()
++        uuids = [line.split()[0] for line in lines]
++        self.assertEqual(uuids.count('uuid-1'), 1)
++        self.assertEqual(uuids.count('uuid-2'), 2)
++
++
++class CleanUnusedVenvsTestCase(BaseTestCase):
++    """Removing stale virtualenvs and compacting the usage file."""
++
++    def test_removes_stale_keeps_fresh(self):
++        old_path = self.make_venv('uuid-old')
++        fresh_path = self.make_venv('uuid-fresh')
++        now = datetime.utcnow()
++        self.write_usage([
++            ('uuid-old', now - timedelta(days=100)),
++            ('uuid-fresh', now - timedelta(days=1)),
++        ])
++        manager = self.UsageManager(self.stat_path, self.venvscache)
++
++        manager.clean_unused_venvs(42)
++
++
++        self.assertFalse(os.path.exists(old_path))
++        self.assertTrue(os.path.exists(fresh_path))
++
++        remaining = [m['env_path'] for m in self.venvscache.get_venvs_metadata()]
++        self.assertEqual(remaining, [fresh_path])
++
++        lines = self.read_usage_lines()
++        self.assertEqual([line.split()[0] for line in lines], ['uuid-fresh'])
++
++    def test_day_boundary_is_strict(self):
++        kept_path = self.make_venv('uuid-kept')
++        gone_path = self.make_venv('uuid-gone')
++        now = datetime.utcnow()
++        self.write_usage([
++            ('uuid-kept', now - timedelta(days=42)),
++            ('uuid-gone', now - timedelta(days=43)),
++        ])
++        manager = self.UsageManager(self.stat_path, self.venvscache)
++
++        manager.clean_unused_venvs(42)
++
++        self.assertTrue(os.path.exists(kept_path))
++        self.assertFalse(os.path.exists(gone_path))
++        remaining = [m['env_path'] for m in self.venvscache.get_venvs_metadata()]
++        self.assertEqual(remaining, [kept_path])
++
++    def test_compacts_to_latest_record(self):
++        self.make_venv('uuid-1')
++        now = datetime.utcnow()
++        older = now - timedelta(days=2)
++        newer = now - timedelta(days=1)
++
++        self.write_usage([
++            ('uuid-1', older),
++            ('uuid-1', newer),
++        ])
++        manager = self.UsageManager(self.stat_path, self.venvscache)
++
++        manager.clean_unused_venvs(10000)
++
++        lines = self.read_usage_lines()
++        self.assertEqual(len(lines), 1)
++        uuid, stamp = lines[0].split()
++        self.assertEqual(uuid, 'uuid-1')
++        self.assertEqual(datetime.strptime(stamp, DATE_FORMAT), newer)
++
++    def test_nothing_removed_when_all_fresh(self):
++        p1 = self.make_venv('uuid-1')
++        p2 = self.make_venv('uuid-2')
++        now = datetime.utcnow()
++        self.write_usage([
++            ('uuid-1', now - timedelta(days=1)),
++            ('uuid-2', now - timedelta(days=2)),
++        ])
++        manager = self.UsageManager(self.stat_path, self.venvscache)
++
++        manager.clean_unused_venvs(42)
++
++        self.assertTrue(os.path.exists(p1))
++        self.assertTrue(os.path.exists(p2))
++        remaining = sorted(m['env_path'] for m in self.venvscache.get_venvs_metadata())
++        self.assertEqual(remaining, sorted([p1, p2]))
++        self.assertEqual(sorted(line.split()[0] for line in self.read_usage_lines()),
++                         ['uuid-1', 'uuid-2'])
++
++
++if __name__ == '__main__':
++    unittest.main()
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,28 @@
++#!/usr/bin/env bash
++
++
++
++set -euo pipefail
++HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++cd /testbed
++
++
++
++
++
++export PYTHONPATH="/testbed/.venv/lib/python3.12/site-packages${PYTHONPATH:+:$PYTHONPATH}"
++PY=python3.12
++
++
++
++
++
++"$PY" -m pytest -q \
++    tests/test_cache.py \
++    tests/test_main.py \
++    tests/test_envbuilder.py \
++    --deselect "tests/test_envbuilder.py::EnvDestructionTestCase::test_destroy_env" \
++    --deselect "tests/test_envbuilder.py::EnvDestructionTestCase::test_destroy_venv"
++
++
++"$PY" -m pytest -q tests/test_usage_manager.py

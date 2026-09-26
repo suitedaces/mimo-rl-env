@@ -1,0 +1,474 @@
+diff --git a/usercase-test-coderl/fixtures/preload.js b/usercase-test-coderl/fixtures/preload.js
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/fixtures/preload.js
+@@ -0,0 +1,135 @@
++const fs = require('fs');
++const Module = require('module');
++const stream = require('stream');
++
++const configPath = process.env.MOCK_CONFIG_PATH;
++const callsPath = process.env.MOCK_CALLS_PATH;
++const scenario = process.env.MOCK_SCENARIO || '';
++
++function readJson(file, fallback) {
++    if (!file || !fs.existsSync(file)) {
++        return fallback;
++    }
++    return JSON.parse(fs.readFileSync(file, 'utf8'));
++}
++
++function writeJson(file, value) {
++    fs.writeFileSync(file, JSON.stringify(value, null, 2));
++}
++
++function record(value) {
++    if (callsPath) {
++        fs.appendFileSync(callsPath, JSON.stringify(value) + '\n');
++    }
++}
++
++function configStore() {
++    return {
++        get: function(key) {
++            return readJson(configPath, {})[key];
++        },
++        set: function(key, value) {
++            const data = readJson(configPath, {});
++            data[key] = value;
++            writeJson(configPath, data);
++        },
++        delete: function(key) {
++            const data = readJson(configPath, {});
++            delete data[key];
++            writeJson(configPath, data);
++        }
++    };
++}
++
++function tokenResponse(accessToken, refreshToken) {
++    const body = { access_token: accessToken };
++    if (refreshToken !== undefined) {
++        body.refresh_token = refreshToken;
++    }
++    return { statusCode: 200, body };
++}
++
++let sandboxCalls = 0;
++
++function handleRequest(options, callback) {
++    record({ kind: 'request', uri: options.uri, method: options.method, auth: options.auth, form: options.form });
++
++    if (scenario === 'ocapi_invalid_retry' || scenario === 'ocapi_fault_retry' || scenario === 'ocapi_invalid_no_renew') {
++        sandboxCalls += 1;
++        if (sandboxCalls === 1) {
++            const body = scenario === 'ocapi_fault_retry'
++                ? { fault: { type: 'InvalidAccessTokenException' } }
++
++                : { error: 'invalid_token', error_description: configStore().get('SFCC_CLIENT_TOKEN') };
++            callback(null, { statusCode: 401, body });
++            return;
++        }
++        callback(null, {
++            statusCode: 200,
++            body: {
++                data: [{
++                    id: 'sbx-001',
++                    realm: 'zzzz',
++                    instance: 's01',
++                    versions: { app: '6.0.0' },
++                    state: 'started',
++                    createdAt: '2024-01-02T03:04:05.000Z',
++                    eol: '2024-01-03T03:04:05.000Z',
++                    createdBy: 'tester@example.com',
++                    autoScheduled: false,
++                    resourceProfile: 'medium'
++                }]
++            }
++        });
++        return;
++    }
++
++    callback(null, { statusCode: 200, body: { data: [] } });
++}
++
++handleRequest.post = function(options, callback) {
++    record({ kind: 'post', uri: options.uri, method: options.method, auth: options.auth, form: options.form });
++
++    if (scenario === 'client_auth_renew') {
++        callback(null, tokenResponse('ACCESS_AUTH_RENEW', 'REFRESH_AUTH_RENEW'));
++    } else if (scenario === 'client_auth_no_renew') {
++        callback(null, tokenResponse('ACCESS_AUTH_NO_RENEW', 'REFRESH_SHOULD_BE_CLEARED'));
++    } else if (scenario === 'renew_with_refresh') {
++        callback(null, tokenResponse('ACCESS_RENEWED_FROM_REFRESH', 'REFRESH_ROTATED'));
++    } else if (scenario === 'renew_no_refresh') {
++        callback(null, tokenResponse('ACCESS_RENEWED_FROM_CLIENT_CREDENTIALS'));
++    } else if (scenario === 'renew_failure') {
++        callback(new Error('network down'), { statusCode: 503, body: { error: 'temporarily_unavailable' } });
++    } else if (scenario === 'ocapi_invalid_retry' || scenario === 'ocapi_fault_retry') {
++        callback(null, tokenResponse('ACCESS_AFTER_AUTO_RENEW', 'REFRESH_AFTER_AUTO_RENEW'));
++    } else {
++        callback(null, tokenResponse('ACCESS_DEFAULT'));
++    }
++};
++
++handleRequest.get = handleRequest;
++
++handleRequest.defaults = function() {
++    return handleRequest;
++};
++
++handleRequest.prototype = stream.Writable.prototype;
++
++function openStub(url) {
++    record({ kind: 'open', url });
++    return Promise.resolve();
++}
++
++const originalLoad = Module._load;
++Module._load = function(request, parent, isMain) {
++    if (request === 'request') {
++        return handleRequest;
++    }
++    if (request === 'open') {
++        return openStub;
++    }
++    if (request.endsWith('/lib/config') || request === './config') {
++        return { obtain: configStore };
++    }
++    return originalLoad.apply(this, arguments);
++};
+diff --git a/usercase-test-coderl/usecase.sh b/usercase-test-coderl/usecase.sh
+new file mode 100755
+--- /dev/null
++++ b/usercase-test-coderl/usecase.sh
+@@ -0,0 +1,312 @@
++#!/usr/bin/env bash
++
++set -u
++export LANG=C.UTF-8 LC_ALL=C.UTF-8 TZ=UTC FORCE_COLOR=0 NO_COLOR=1
++
++REPO=/workspace/repo
++PRELOAD="$REPO/usercase-test-coderl/fixtures/preload.js"
++BIN="$REPO/cli.js"
++
++if [ ! -d "$REPO/node_modules" ]; then
++
++    echo "FAIL: missing node_modules" >&2
++    exit 1
++fi
++
++TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
++cd "$TMP" || exit 1
++fail() { echo "FAIL: $*" >&2; exit 1; }
++
++run_cli() {
++    MOCK_SCENARIO="$1" MOCK_CONFIG_PATH="$2" MOCK_CALLS_PATH="$3" \
++        NODE_OPTIONS="--require $PRELOAD" node "$BIN" "${@:4}" >out 2>err
++}
++
++json_get() {
++    node -e "const fs=require('fs'); const data=JSON.parse(fs.readFileSync(process.argv[1],'utf8')); const path=process.argv[2].split('.'); let v=data; for (const p of path) v = v && v[p]; if (v === undefined) process.exit(3); if (typeof v === 'object') console.log(JSON.stringify(v)); else console.log(String(v));" "$1" "$2"
++}
++
++json_has_no_key() {
++    node -e "const fs=require('fs'); const data=JSON.parse(fs.readFileSync(process.argv[1],'utf8')); process.exit(Object.prototype.hasOwnProperty.call(data, process.argv[2]) ? 1 : 0);" "$1" "$2"
++}
++
++json_key_is_cleared() {
++    node -e "const fs=require('fs'); const data=JSON.parse(fs.readFileSync(process.argv[1],'utf8')); process.exit(data[process.argv[2]] ? 1 : 0);" "$1" "$2"
++}
++
++json_path_truthy() {
++    node -e "const fs=require('fs'); const data=JSON.parse(fs.readFileSync(process.argv[1],'utf8')); const path=process.argv[2].split('.'); let v=data; for (const p of path) v = v && v[p]; process.exit(v ? 0 : 1);" "$1" "$2"
++}
++
++json_path_cleared() {
++    node -e "const fs=require('fs'); const data=JSON.parse(fs.readFileSync(process.argv[1],'utf8')); const path=process.argv[2].split('.'); let v=data; for (const p of path) v = v && v[p]; process.exit(v ? 1 : 0);" "$1" "$2"
++}
++
++last_call_get() {
++    node -e "const fs=require('fs'); const lines=fs.readFileSync(process.argv[1],'utf8').trim().split(/\n+/).filter(Boolean).map(JSON.parse); const item=lines.filter(x => x.kind === process.argv[2]).pop(); const path=process.argv[3].split('.'); let v=item; for (const p of path) v = v && v[p]; if (typeof v === 'object') console.log(JSON.stringify(v)); else console.log(String(v));" "$1" "$2" "$3"
++}
++
++last_post_get() {
++    last_call_get "$1" post "$2"
++}
++
++stdout_has_sandbox_id() {
++    node -e "const fs=require('fs'); const lines=fs.readFileSync(process.argv[1],'utf8').trim().split(/\n+/).filter(Boolean); for (let i=lines.length-1;i>=0;i--) { try { const value=JSON.parse(lines[i]); if (Array.isArray(value) && value.some(x => x && x.id === process.argv[2])) process.exit(0); } catch (_) {} } process.exit(1);" "$1" "$2"
++}
++
++text_shows_state() {
++    node -e "const fs=require('fs'); const text=fs.readFileSync(process.argv[1],'utf8').toLowerCase(); const topic=process.argv[2]; const want=process.argv[3]; const lines=text.split(/\n/).filter(l => l.includes(topic)); if (!lines.length) process.exit(1); const joined=lines.join('\n'); const absent=/(not set|no|false|absent|missing|disabled|not configured)/.test(joined); const present=/(^|[^a-z])(set|yes|true|present|configured|enabled)([^a-z]|$)/.test(joined); if (want === 'present') process.exit(present && !absent ? 0 : 2); process.exit(absent ? 0 : 3);" "$1" "$2" "$3"
++}
++
++
++
++
++cfg="$TMP/f1-config.json"; calls="$TMP/f1-calls.jsonl"; : >"$calls"; printf '{}' >"$cfg"
++run_cli client_auth_renew "$cfg" "$calls" client:auth my_client_id my_client_secret --renew; ec=$?
++EXPECTED='Authentication succeeded Auto-renewal enabled.'
++[ "$ec" -eq 0 ] || fail "F1 exit $ec; want 0"
++[ "$(cat out)" = "$EXPECTED" ] || fail "F1 stdout: $(cat out)"
++[ ! -s err ] || fail "F1 unexpected stderr: $(cat err)"
++
++run_cli renew_no_refresh "$cfg" "$calls" client:auth:token; ec=$?
++[ "$ec" -eq 0 ] || fail "F1 token command exit $ec; want 0"
++[ "$(cat out)" = "ACCESS_AUTH_RENEW" ] || fail "F1 access token not stored"
++: >"$calls"
++run_cli renew_with_refresh "$cfg" "$calls" client:auth:renew; ec=$?
++[ "$ec" -eq 0 ] || fail "F1 renewal command exit $ec; want 0"
++[ "$(last_post_get "$calls" auth.user)" = "my_client_id" ] || fail "F1 renewal client credential not stored"
++[ "$(last_post_get "$calls" auth.pass)" = "my_client_secret" ] || fail "F1 renewal secret not stored"
++[ "$(last_post_get "$calls" form.grant_type)" = "refresh_token" ] || fail "F1 stored refresh token was not used"
++[ "$(last_post_get "$calls" form.refresh_token)" = "REFRESH_AUTH_RENEW" ] || fail "F1 refresh token not stored"
++
++
++
++
++cfg="$TMP/f2-config.json"; calls="$TMP/f2-calls.jsonl"; : >"$calls"; printf '{}' >"$cfg"
++
++run_cli client_auth_renew "$cfg" "$calls" client:auth my_client_id my_client_secret --renew; ec=$?
++[ "$ec" -eq 0 ] || fail "F2 setup auth exit $ec; want 0"
++: >"$calls"
++run_cli client_auth_no_renew "$cfg" "$calls" client:auth my_client_id my_client_secret; ec=$?
++EXPECTED='Authentication succeeded'
++[ "$ec" -eq 0 ] || fail "F2 exit $ec; want 0"
++[ "$(cat out)" = "$EXPECTED" ] || fail "F2 stdout: $(cat out)"
++[ ! -s err ] || fail "F2 unexpected stderr: $(cat err)"
++run_cli renew_no_refresh "$cfg" "$calls" client:auth:token; ec=$?
++[ "$ec" -eq 0 ] || fail "F2 token command exit $ec; want 0"
++[ "$(cat out)" = "ACCESS_AUTH_NO_RENEW" ] || fail "F2 access token not replaced"
++run_cli renew_no_refresh "$cfg" "$calls" client:auth:renew; ec=$?
++[ "$ec" -ne 0 ] || fail "F2 renewal still possible after non-renew auth"
++run_cli renew_no_refresh "$cfg" "$calls" instance:list -v -j; ec=$?
++[ "$ec" -eq 0 ] || fail "F2 instance visibility exit $ec; want 0"
++json_path_cleared out auth.refresh_token || fail "F2 refresh token still visible as set"
++json_path_cleared out auth.auto_renew_token || fail "F2 renewal credentials still visible as configured"
++
++
++
++
++cfg="$TMP/f3-config.json"; calls="$TMP/f3-calls.jsonl"; : >"$calls"; printf '{}' >"$cfg"
++
++run_cli client_auth_renew "$cfg" "$calls" client:auth renew_client renew_secret --renew; ec=$?
++[ "$ec" -eq 0 ] || fail "F3 setup auth exit $ec; want 0"
++: >"$calls"
++run_cli renew_with_refresh "$cfg" "$calls" client:auth:renew; ec=$?
++EXPECTED='Authentication renewal succeeded'
++[ "$ec" -eq 0 ] || fail "F3 exit $ec; want 0"
++[ "$(cat out)" = "$EXPECTED" ] || fail "F3 stdout: $(cat out)"
++[ ! -s err ] || fail "F3 unexpected stderr: $(cat err)"
++[ "$(last_call_get "$calls" post uri)" = "https://account.demandware.com/dwsso/oauth2/access_token" ] || fail "F3 token endpoint mismatch"
++[ "$(last_call_get "$calls" post auth.user)" = "renew_client" ] || fail "F3 basic auth user mismatch"
++[ "$(last_call_get "$calls" post auth.pass)" = "renew_secret" ] || fail "F3 basic auth secret mismatch"
++[ "$(last_call_get "$calls" post form.grant_type)" = "refresh_token" ] || fail "F3 grant_type mismatch"
++[ "$(last_call_get "$calls" post form.refresh_token)" = "REFRESH_AUTH_RENEW" ] || fail "F3 refresh form mismatch"
++run_cli renew_no_refresh "$cfg" "$calls" client:auth:token; ec=$?
++[ "$ec" -eq 0 ] || fail "F3 token command exit $ec; want 0"
++[ "$(cat out)" = "ACCESS_RENEWED_FROM_REFRESH" ] || fail "F3 access token not renewed"
++run_cli renew_no_refresh "$cfg" "$calls" instance:list -v -j; ec=$?
++[ "$ec" -eq 0 ] || fail "F3 instance visibility exit $ec; want 0"
++json_path_truthy out auth.refresh_token || fail "F3 refresh token not updated"
++
++
++
++
++cfg="$TMP/f4-config.json"; calls="$TMP/f4-calls.jsonl"; : >"$calls"; printf '{}' >"$cfg"
++
++run_cli renew_no_refresh "$cfg" "$calls" client:auth renew_client renew_secret --renew; ec=$?
++[ "$ec" -eq 0 ] || fail "F4 setup auth exit $ec; want 0"
++: >"$calls"
++run_cli renew_no_refresh "$cfg" "$calls" client:auth:renew; ec=$?
++[ "$ec" -eq 0 ] || fail "F4 exit $ec; want 0"
++[ "$(cat out)" = "Authentication renewal succeeded" ] || fail "F4 stdout: $(cat out)"
++[ ! -s err ] || fail "F4 unexpected stderr: $(cat err)"
++[ "$(last_call_get "$calls" post uri)" = "https://account.demandware.com/dwsso/oauth2/access_token" ] || fail "F4 token endpoint mismatch"
++[ "$(last_call_get "$calls" post auth.user)" = "renew_client" ] || fail "F4 basic auth user mismatch"
++[ "$(last_call_get "$calls" post auth.pass)" = "renew_secret" ] || fail "F4 basic auth secret mismatch"
++[ "$(last_call_get "$calls" post form.grant_type)" = "client_credentials" ] || fail "F4 grant_type mismatch"
++[ "$(last_call_get "$calls" post form.response_type)" = "token" ] || fail "F4 response_type mismatch"
++run_cli renew_no_refresh "$cfg" "$calls" client:auth:token; ec=$?
++[ "$ec" -eq 0 ] || fail "F4 token command exit $ec; want 0"
++[ "$(cat out)" = "ACCESS_RENEWED_FROM_CLIENT_CREDENTIALS" ] || fail "F4 access token not renewed"
++run_cli renew_no_refresh "$cfg" "$calls" instance:list -v -j; ec=$?
++[ "$ec" -eq 0 ] || fail "F4 instance visibility exit $ec; want 0"
++json_path_cleared out auth.refresh_token || fail "F4 unexpected refresh token visible as set"
++
++
++
++
++cfg="$TMP/f5-config.json"; calls="$TMP/f5-calls.jsonl"; : >"$calls"; printf '{}' >"$cfg"
++run_cli renew_no_refresh "$cfg" "$calls" client:auth:renew; ec=$?
++[ "$ec" -ne 0 ] || fail "F5 exit zero; want non-zero"
++[ ! -s out ] || fail "F5 unexpected stdout: $(cat out)"
++
++grep -qx '.*Authentication renewal not possible\. Ensure initial authentication is done with --renew flag\.' err \
++    || fail "F5 stderr: $(cat err)"
++
++
++
++
++cfg="$TMP/f6-config.json"; calls="$TMP/f6-calls.jsonl"; : >"$calls"; printf '{}' >"$cfg"
++
++run_cli client_auth_renew "$cfg" "$calls" client:auth renew_client renew_secret --renew; ec=$?
++[ "$ec" -eq 0 ] || fail "F6 setup auth exit $ec; want 0"
++: >"$calls"
++run_cli renew_failure "$cfg" "$calls" client:auth:renew; ec=$?
++[ "$ec" -ne 0 ] || fail "F6 exit zero; want non-zero"
++[ ! -s out ] || fail "F6 unexpected stdout: $(cat out)"
++
++head -n 1 err | grep -q 'Authentication renewal failed:' \
++    || fail "F6 stderr first line: $(head -n 1 err)"
++grep -q 'network down' err || fail "F6 stderr missing error detail"
++
++
++
++
++cfg="$TMP/f7-config.json"; calls="$TMP/f7-calls.jsonl"; : >"$calls"; printf '{}' >"$cfg"
++
++run_cli client_auth_renew "$cfg" "$calls" client:auth browser_client browser_secret --renew; ec=$?
++[ "$ec" -eq 0 ] || fail "F7 setup auth exit $ec; want 0"
++port=18087
++MOCK_SCENARIO=login_implicit MOCK_CONFIG_PATH="$cfg" MOCK_CALLS_PATH="$calls" SFCC_OAUTH_LOCAL_PORT="$port" \
++    NODE_OPTIONS="--require $PRELOAD" node "$BIN" auth:login browser_client >out 2>err &
++pid=$!
++for _ in $(seq 1 50); do
++    if grep -q 'Waiting for user to authenticate' out 2>/dev/null; then
++        break
++    fi
++    sleep 0.1
++done
++curl -fsS "http://localhost:$port/?access_token=ACCESS_FROM_BROWSER" >/dev/null || fail "F7 browser redirect failed"
++wait "$pid"; ec=$?
++[ "$ec" -eq 0 ] || fail "F7 exit $ec; want 0"
++
++grep -q 'Authentication succeeded' out || fail "F7 did not report a completed browser login"
++[ ! -s err ] || fail "F7 unexpected stderr: $(cat err)"
++run_cli renew_no_refresh "$cfg" "$calls" client:auth:token; ec=$?
++[ "$ec" -eq 0 ] || fail "F7 token command exit $ec; want 0"
++[ "$(cat out)" = "ACCESS_FROM_BROWSER" ] || fail "F7 access token not stored"
++run_cli renew_no_refresh "$cfg" "$calls" client:auth:renew; ec=$?
++[ "$ec" -ne 0 ] || fail "F7 renewal still possible after implicit browser login"
++run_cli renew_no_refresh "$cfg" "$calls" instance:list -v -j; ec=$?
++[ "$ec" -eq 0 ] || fail "F7 instance visibility exit $ec; want 0"
++json_path_cleared out auth.refresh_token || fail "F7 refresh token still visible as set"
++json_path_cleared out auth.auto_renew_token || fail "F7 renewal credentials still visible as configured"
++
++
++
++
++cfg="$TMP/f8-config.json"; calls="$TMP/f8-calls.jsonl"; : >"$calls"; printf '{}' >"$cfg"
++
++run_cli client_auth_renew "$cfg" "$calls" client:auth renew_client renew_secret --renew; ec=$?
++[ "$ec" -eq 0 ] || fail "F8 setup auth exit $ec; want 0"
++: >"$calls"
++run_cli ocapi_invalid_retry "$cfg" "$calls" sandbox:list -j; ec=$?
++EXPECTED_ERR='Warning: Authorization invalid. Auto-renewal enabled. Running authorization...'
++[ "$ec" -eq 0 ] || fail "F8 exit $ec; want 0"
++
++stdout_has_sandbox_id out sbx-001 || fail "F8 stdout did not include retried sandbox result: $(cat out)"
++[ "$(cat err)" = "$EXPECTED_ERR" ] || fail "F8 stderr: $(cat err)"
++run_cli renew_no_refresh "$cfg" "$calls" client:auth:token; ec=$?
++[ "$ec" -eq 0 ] || fail "F8 token command exit $ec; want 0"
++[ "$(cat out)" = "ACCESS_AFTER_AUTO_RENEW" ] || fail "F8 access token not auto-renewed"
++run_cli renew_no_refresh "$cfg" "$calls" instance:list -v -j; ec=$?
++[ "$ec" -eq 0 ] || fail "F8 instance visibility exit $ec; want 0"
++json_path_truthy out auth.refresh_token || fail "F8 refresh token not auto-renewed"
++node -e "const fs=require('fs'); const calls=fs.readFileSync(process.argv[1],'utf8').trim().split(/\n+/).map(JSON.parse); const reqs=calls.filter(c => c.kind === 'request'); if (reqs.length !== 2) process.exit(1); if (reqs[0].auth.bearer !== 'ACCESS_AUTH_RENEW') process.exit(2); if (reqs[1].auth.bearer !== 'ACCESS_AFTER_AUTO_RENEW') process.exit(3);" "$calls" \
++    || fail "F8 did not retry original request with renewed bearer token"
++
++
++
++
++cfg="$TMP/f9-config.json"; calls="$TMP/f9-calls.jsonl"; : >"$calls"; printf '{}' >"$cfg"
++
++run_cli client_auth_renew "$cfg" "$calls" client:auth renew_client renew_secret --renew; ec=$?
++[ "$ec" -eq 0 ] || fail "F9 setup auth exit $ec; want 0"
++: >"$calls"
++run_cli ocapi_fault_retry "$cfg" "$calls" sandbox:list -j; ec=$?
++[ "$ec" -eq 0 ] || fail "F9 exit $ec; want 0"
++stdout_has_sandbox_id out sbx-001 || fail "F9 stdout did not include retried sandbox result: $(cat out)"
++[ "$(cat err)" = "$EXPECTED_ERR" ] || fail "F9 stderr: $(cat err)"
++node -e "const fs=require('fs'); const calls=fs.readFileSync(process.argv[1],'utf8').trim().split(/\n+/).map(JSON.parse); const reqs=calls.filter(c => c.kind === 'request'); if (reqs.length !== 2) process.exit(1); if (reqs[0].auth.bearer !== 'ACCESS_AUTH_RENEW') process.exit(2); if (reqs[1].auth.bearer !== 'ACCESS_AFTER_AUTO_RENEW') process.exit(3);" "$calls" \
++    || fail "F9 did not retry original request with renewed bearer token"
++
++
++
++
++cfg="$TMP/f10-config.json"; calls="$TMP/f10-calls.jsonl"; : >"$calls"; printf '{}' >"$cfg"
++
++run_cli client_auth_no_renew "$cfg" "$calls" client:auth my_client_id my_client_secret; ec=$?
++[ "$ec" -eq 0 ] || fail "F10 setup auth exit $ec; want 0"
++: >"$calls"
++run_cli ocapi_invalid_no_renew "$cfg" "$calls" sandbox:list -j; ec=$?
++[ "$ec" -ne 0 ] || fail "F10 exit zero; want non-zero"
++[ ! -s out ] || fail "F10 unexpected stdout: $(cat out)"
++grep -q 'Authorization missing or invalid' err || fail "F10 missing normal invalid authorization message"
++grep -q 'sfcc-ci client:auth' err || fail "F10 missing client auth guidance"
++! grep -q 'Auto-renewal enabled' err || fail "F10 unexpectedly attempted auto-renewal"
++node -e "const fs=require('fs'); const calls=fs.readFileSync(process.argv[1],'utf8').trim().split(/\n+/).filter(Boolean).map(JSON.parse); if (calls.filter(c => c.kind === 'request').length !== 1) process.exit(1); if (calls.filter(c => c.kind === 'post').length !== 0) process.exit(2);" "$calls" \
++    || fail "F10 made renewal request or retried without renewal credentials"
++
++
++
++
++cfg="$TMP/f11-config.json"; calls="$TMP/f11-calls.jsonl"; : >"$calls"; printf '{}' >"$cfg"
++
++run_cli client_auth_renew "$cfg" "$calls" client:auth visible_client visible_secret --renew; ec=$?
++[ "$ec" -eq 0 ] || fail "F11 setup auth exit $ec; want 0"
++run_cli renew_no_refresh "$cfg" "$calls" instance:list -v -j; ec=$?
++[ "$ec" -eq 0 ] || fail "F11 exit $ec; want 0"
++
++json_path_truthy out auth.refresh_token || fail "F11 JSON missing set auth.refresh_token"
++json_path_truthy out auth.auto_renew_token || fail "F11 JSON missing configured auth.auto_renew_token"
++[ ! -s err ] || fail "F11 unexpected stderr: $(cat err)"
++
++
++
++
++cfg="$TMP/f12-config.json"; calls="$TMP/f12-calls.jsonl"; : >"$calls"; printf '{}' >"$cfg"
++
++run_cli client_auth_renew "$cfg" "$calls" client:auth visible_client visible_secret --renew; ec=$?
++[ "$ec" -eq 0 ] || fail "F12 setup auth exit $ec; want 0"
++run_cli renew_no_refresh "$cfg" "$calls" instance:list -v; ec=$?
++[ "$ec" -eq 0 ] || fail "F12 exit $ec; want 0"
++
++text_shows_state out refresh present || fail "F12 missing refresh token present indicator"
++text_shows_state out renew present || fail "F12 missing auto-renew present indicator"
++[ ! -s err ] || fail "F12 unexpected stderr: $(cat err)"
++
++
++
++
++cfg="$TMP/f13-config.json"; calls="$TMP/f13-calls.jsonl"; : >"$calls"; printf '{}' >"$cfg"
++
++run_cli client_auth_no_renew "$cfg" "$calls" client:auth visible_client visible_secret; ec=$?
++[ "$ec" -eq 0 ] || fail "F13 setup auth exit $ec; want 0"
++run_cli renew_no_refresh "$cfg" "$calls" instance:list -v; ec=$?
++[ "$ec" -eq 0 ] || fail "F13 exit $ec; want 0"
++
++text_shows_state out refresh absent || fail "F13 missing refresh token absent indicator"
++text_shows_state out renew absent || fail "F13 missing auto-renew absent indicator"
++[ ! -s err ] || fail "F13 unexpected stderr: $(cat err)"
++
++echo "PASS"
++exit 0
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,12 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++exec bash /workspace/repo/usercase-test-coderl/usecase.sh

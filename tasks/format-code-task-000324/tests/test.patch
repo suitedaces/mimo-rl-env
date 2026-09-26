@@ -1,0 +1,341 @@
+diff --git a/usercase-test-coderl/test_simple_cookie_storage.py b/usercase-test-coderl/test_simple_cookie_storage.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/test_simple_cookie_storage.py
+@@ -0,0 +1,308 @@
++import json
++from http.cookies import SimpleCookie
++from unittest import mock
++
++import pytest
++from aiohttp import web
++from aiohttp.test_utils import make_mocked_request
++
++import aiohttp_session
++from aiohttp_session import (
++    Session,
++    SimpleCookieStorage,
++    get_session,
++    session_middleware,
++    setup,
++)
++
++
++
++
++
++
++def _cookie_header(values: dict[str, str]) -> str:
++    cookie = SimpleCookie()
++    for name, value in values.items():
++        cookie[name] = value
++    return cookie.output(header="", sep=";").strip()
++
++
++def _request_with_cookies(values: dict[str, str]) -> web.Request:
++    return make_mocked_request("GET", "/", headers={"Cookie": _cookie_header(values)})
++
++
++@pytest.mark.asyncio
++async def test_load_session_absent_cookie_returns_new_empty_session() -> None:
++
++
++
++
++    storage = SimpleCookieStorage(max_age=33)
++
++    session = await storage.load_session(make_mocked_request("GET", "/"))
++
++    assert session.new is True
++    assert session.identity is None
++    assert session.max_age == 33
++    assert session.empty is True
++    assert len(session) == 0
++    assert dict(session) == {}
++
++
++@pytest.mark.asyncio
++async def test_load_session_existing_json_cookie_decodes_mapping() -> None:
++
++
++
++
++    storage = SimpleCookieStorage()
++    request = _request_with_cookies(
++        {
++            "AIOHTTP_SESSION": json.dumps(
++                {"created": 1000, "session": {"a": 1, "b": 2}}
++            )
++        }
++    )
++
++    session = await storage.load_session(request)
++
++    assert session.new is False
++    assert session.identity is None
++    assert session.max_age is None
++    assert session.created == 1000
++    assert session.empty is False
++    assert len(session) == 2
++    assert dict(session) == {"a": 1, "b": 2}
++    assert session["a"] == 1
++    assert session["b"] == 2
++
++
++@pytest.mark.asyncio
++async def test_load_session_malformed_json_propagates_json_decode_error() -> None:
++
++
++
++
++    storage = SimpleCookieStorage()
++    request = _request_with_cookies({"AIOHTTP_SESSION": "{broken-json"})
++
++    with pytest.raises(json.JSONDecodeError):
++        await storage.load_session(request)
++
++
++@pytest.mark.asyncio
++async def test_save_session_changed_mapping_serializes_json_and_cookie_attributes() -> None:
++
++
++
++
++    storage = SimpleCookieStorage(
++        cookie_name="CUSTOM",
++        domain="example.com",
++        max_age=55,
++        path="/app",
++        secure=True,
++        httponly=False,
++        samesite="Lax",
++    )
++    request = _request_with_cookies(
++        {
++            "CUSTOM": json.dumps(
++                {"created": 1000, "session": {"a": 1, "b": 2}}
++            )
++        }
++    )
++    with mock.patch.object(aiohttp_session.time, "time", return_value=1001):
++        session = await storage.load_session(request)
++
++    with mock.patch.object(aiohttp_session.time, "time", return_value=1234567890):
++        session["c"] = 3
++
++    response = web.Response()
++    await storage.save_session(request, response, session)
++
++
++    assert "CUSTOM" in response.cookies
++    morsel = response.cookies["CUSTOM"]
++
++    assert json.loads(morsel.value) == {
++        "created": 1234567890,
++        "session": {"a": 1, "b": 2, "c": 3},
++    }
++    assert morsel["domain"] == "example.com"
++    assert morsel["max-age"] == "55"
++    assert morsel["path"] == "/app"
++    assert morsel["secure"] is True
++    assert morsel["httponly"] is False
++    assert morsel["samesite"] == "Lax"
++
++
++@pytest.mark.asyncio
++async def test_save_session_empty_and_invalidated_write_empty_json_payload() -> None:
++
++
++
++
++    storage = SimpleCookieStorage()
++    request = make_mocked_request("GET", "/")
++
++    empty_session = Session(None, data=None, new=True, max_age=None)
++    empty_session.changed()
++    empty_response = web.Response()
++    await storage.save_session(request, empty_response, empty_session)
++
++
++    assert "AIOHTTP_SESSION" in empty_response.cookies
++    assert empty_response.cookies["AIOHTTP_SESSION"].value == "{}"
++    assert empty_response.cookies["AIOHTTP_SESSION"]["path"] == "/"
++    assert empty_response.cookies["AIOHTTP_SESSION"]["httponly"] is True
++
++    invalidated_session = Session(
++        None, data={"created": 1000, "session": {"a": 1}}, new=False
++    )
++    invalidated_session.invalidate()
++    first_invalidated_response = web.Response()
++    second_invalidated_response = web.Response()
++
++    await storage.save_session(request, first_invalidated_response, invalidated_session)
++    await storage.save_session(request, second_invalidated_response, invalidated_session)
++
++    assert first_invalidated_response.cookies["AIOHTTP_SESSION"].value == "{}"
++    assert first_invalidated_response.cookies["AIOHTTP_SESSION"]["path"] == "/"
++    assert first_invalidated_response.cookies["AIOHTTP_SESSION"]["httponly"] is True
++    assert second_invalidated_response.cookies["AIOHTTP_SESSION"].value == "{}"
++    assert second_invalidated_response.cookies["AIOHTTP_SESSION"]["path"] == "/"
++    assert second_invalidated_response.cookies["AIOHTTP_SESSION"]["httponly"] is True
++
++
++@pytest.mark.asyncio
++async def test_custom_encoder_and_decoder_are_used_for_save_and_load() -> None:
++
++
++
++
++    calls: list[tuple[str, object]] = []
++
++    def encoder(value: object) -> str:
++        calls.append(("encoder", value))
++        return "ENCODED:" + json.dumps(value, sort_keys=True)
++
++    def decoder(value: str) -> object:
++        calls.append(("decoder", value))
++        return {"created": 2000, "session": {"z": 9}}
++
++    storage = SimpleCookieStorage(cookie_name="X", encoder=encoder, decoder=decoder)
++    loaded = await storage.load_session(_request_with_cookies({"X": "payload"}))
++
++    assert dict(loaded) == {"z": 9}
++    assert loaded.created == 2000
++    assert calls == [("decoder", "payload")]
++
++    response = web.Response()
++    session = Session(None, data={"created": 3000, "session": {"q": 4}}, new=False)
++
++    session.changed()
++    await storage.save_session(make_mocked_request("GET", "/"), response, session)
++
++    assert response.cookies["X"].value == (
++        'ENCODED:{"created": 3000, "session": {"q": 4}}'
++    )
++    assert calls == [
++        ("decoder", "payload"),
++        ("encoder", {"created": 3000, "session": {"q": 4}}),
++    ]
++
++
++@pytest.mark.asyncio
++async def test_setup_and_session_middleware_accept_simple_cookie_storage() -> None:
++
++
++
++
++    app = web.Application()
++    setup(app, SimpleCookieStorage(cookie_name="APP"))
++
++    assert len(app.middlewares) == 1
++
++    assert callable(app.middlewares[0])
++
++    async def handler(request: web.Request) -> web.StreamResponse:
++        session = await get_session(request)
++        session["via"] = "middleware"
++        return web.Response(text="OK")
++
++    middleware = session_middleware(SimpleCookieStorage())
++    with mock.patch.object(aiohttp_session.time, "time", return_value=1234567890):
++        response = await middleware(make_mocked_request("GET", "/"), handler)
++
++    assert response.status == 200
++    assert response.text == "OK"
++
++    assert "AIOHTTP_SESSION" in response.cookies
++
++    assert json.loads(response.cookies["AIOHTTP_SESSION"].value) == {
++        "created": 1234567890,
++        "session": {"via": "middleware"},
++    }
++
++
++@pytest.mark.asyncio
++async def test_two_storage_instances_use_independent_cookie_names_and_max_age() -> None:
++
++
++
++
++    first = SimpleCookieStorage(cookie_name="A", max_age=11)
++    second = SimpleCookieStorage(cookie_name="B", max_age=22)
++    request = _request_with_cookies(
++        {
++            "A": json.dumps(
++                {"created": 2000000000, "session": {"left": "A"}}
++            ),
++            "B": json.dumps(
++                {"created": 2000000100, "session": {"right": "B"}}
++            ),
++        }
++    )
++
++    first_session = await first.load_session(request)
++    second_session = await second.load_session(request)
++
++    assert dict(first_session) == {"left": "A"}
++    assert first_session.created == 2000000000
++    assert first_session.max_age == 11
++    assert first_session.new is False
++    assert dict(second_session) == {"right": "B"}
++    assert second_session.created == 2000000100
++    assert second_session.max_age == 22
++    assert second_session.new is False
++
++
++@pytest.mark.asyncio
++async def test_repeated_construct_load_save_cycles_remain_independent() -> None:
++
++
++
++
++    saved_payloads: list[str] = []
++
++    for index in range(150):
++        cookie_name = f"S{index}"
++        storage = SimpleCookieStorage(cookie_name=cookie_name)
++        session = Session(
++            None,
++            data={"created": 2000000000 + index, "session": {"n": index}},
++            new=False,
++        )
++        session.changed()
++        response = web.Response()
++        await storage.save_session(make_mocked_request("GET", "/"), response, session)
++        loaded = await storage.load_session(
++            _request_with_cookies({cookie_name: response.cookies[cookie_name].value})
++        )
++
++        assert dict(loaded) == {"n": index}
++        saved_payloads.append(response.cookies[cookie_name].value)
++
++
++    assert len(saved_payloads) == 150
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,23 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++
++cd /workspace/repo
++
++export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
++
++exec python -m pytest \
++  -p pytest_asyncio.plugin \
++  -o addopts='' \
++  -o asyncio_default_fixture_loop_scope=function \
++  /workspace/repo/usercase-test-coderl/test_simple_cookie_storage.py \
++  -v

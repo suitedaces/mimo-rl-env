@@ -1,0 +1,180 @@
+diff --git a/test/spec/modules/dataController_contract_spec.js b/test/spec/modules/dataController_contract_spec.js
+new file mode 100644
+index 000000000..0a3d481bf
+--- /dev/null
++++ b/test/spec/modules/dataController_contract_spec.js
+@@ -0,0 +1,164 @@
++import {expect} from 'chai';
++import {config} from 'src/config.js';
++import {filterBidData, init} from 'modules/dataControllerModule/index.js';
++
++function applyController(controllerConfig, request) {
++  let observed;
++  init();
++  config.setConfig({dataController: controllerConfig});
++  filterBidData(result => { observed = result; }, request);
++  return observed;
++}
++
++function bid(bidder, sources) {
++  return {
++    bidder,
++    userId: {legacy: `${bidder}-legacy`},
++    userIdAsEids: sources.map(source => ({source, uids: [{id: `${source}-id`}]}))
++  };
++}
++
++function segment(name, tax, id) {
++  return {name, ext: {segtax: tax}, segment: [{id}]};
++}
++
++describe('data controller contract', function () {
++  afterEach(function () {
++    config.resetConfig();
++  });
++
++  it('aggregates EID sources across every bid for a bidder', function () {
++    const first = bid('alpha', ['id5-sync.com']);
++    const second = bid('alpha', ['uid2']);
++    const other = bid('beta', ['other-id']);
++    const request = {
++      adUnits: [{bids: [first]}, {bids: [second]}, {bids: [other]}],
++      ortb2Fragments: {
++        global: {user: {data: [segment('segments.example', 7, 'premium')]}},
++        bidder: {
++          alpha: {user: {data: [segment('segments.example', 7, 'premium')]}},
++          beta: {user: {data: [segment('segments.example', 7, 'basic')]}}
++        }
++      }
++    };
++
++    applyController({filterSDAwhenEID: ['id5-sync.com']}, request);
++
++    expect(request.ortb2Fragments.bidder.alpha.user.data).to.deep.equal([]);
++    expect(request.ortb2Fragments.bidder.beta.user.data).to.deep.equal([segment('segments.example', 7, 'basic')]);
++    expect(request.ortb2Fragments.global.user.data).to.deep.equal([]);
++  });
++
++  it('filters only bidders whose own SDA matches, preserving unrelated bidder data', function () {
++    const request = {
++      adUnits: [{bids: [bid('alpha', ['id5-sync.com']), bid('beta', ['other-id'])]}],
++      ortb2Fragments: {
++        bidder: {
++          alpha: {user: {
++            data: [segment('segments.example', 7, 'premium')],
++            ext: {eids: [{source: 'alpha-id'}]}
++          }},
++          beta: {user: {
++            data: [segment('segments.example', 7, 'basic')],
++            ext: {eids: [{source: 'beta-id'}]}
++          }}
++        }
++      }
++    };
++
++    applyController({filterEIDwhenSDA: ['segments.example:7:premium']}, request);
++
++    expect(request.adUnits[0].bids[0].userIdAsEids).to.deep.equal([]);
++    expect(request.adUnits[0].bids[0].userId).to.deep.equal({});
++    expect(request.adUnits[0].bids[1].userIdAsEids).to.deep.equal([{source: 'other-id', uids: [{id: 'other-id-id'}]}]);
++    expect(request.adUnits[0].bids[1].userId).to.deep.equal({legacy: 'beta-legacy'});
++    expect(request.ortb2Fragments.bidder.alpha.user.ext.eids).to.deep.equal([]);
++    expect(request.ortb2Fragments.bidder.beta.user.ext.eids).to.deep.equal([{source: 'beta-id'}]);
++  });
++
++  it('uses global SDA segments when deciding whether to remove bidder EIDs', function () {
++    const request = {
++      adUnits: [{bids: [bid('alpha', ['id5-sync.com'])]}],
++      ortb2Fragments: {
++        global: {user: {data: [segment('segments.example', 7, 'premium')]}},
++        bidder: {alpha: {user: {data: []}}}
++      }
++    };
++
++    applyController({filterEIDwhenSDA: ['segments.example:7:premium']}, request);
++
++    expect(request.adUnits[0].bids[0].userIdAsEids).to.deep.equal([]);
++  });
++
++  it('applies wildcard EID filtering to all bidders and global EIDs', function () {
++    const request = {
++      adUnits: [{bids: [bid('alpha', ['id5-sync.com']), bid('beta', ['uid2'])]}],
++      ortb2Fragments: {
++        global: {user: {ext: {eids: [{source: 'global-id'}]}}},
++        bidder: {
++          alpha: {user: {ext: {eids: [{source: 'alpha-id'}]}}},
++          beta: {user: {ext: {eids: [{source: 'beta-id'}]}}}
++        }
++      }
++    };
++
++    applyController({filterEIDwhenSDA: ['*']}, request);
++
++    expect(request.adUnits[0].bids[0].userIdAsEids).to.deep.equal([]);
++    expect(request.adUnits[0].bids[1].userIdAsEids).to.deep.equal([]);
++    expect(request.ortb2Fragments.global.user.ext.eids).to.deep.equal([]);
++    expect(request.ortb2Fragments.bidder.alpha.user.ext.eids).to.deep.equal([]);
++    expect(request.ortb2Fragments.bidder.beta.user.ext.eids).to.deep.equal([]);
++  });
++
++  it('ignores malformed SDA records while still using valid segments', function () {
++    const request = {
++      adUnits: [{bids: [bid('alpha', ['id5-sync.com'])]}],
++      ortb2Fragments: {
++        bidder: {
++          alpha: {user: {data: [{name: 'broken'}, segment('segments.example', 7, 'premium')]}}
++        }
++      }
++    };
++
++    expect(() => applyController({filterEIDwhenSDA: ['segments.example:7:premium']}, request)).to.not.throw();
++    expect(request.adUnits[0].bids[0].userIdAsEids).to.deep.equal([]);
++  });
++
++  it('treats missing bidder fragments as an empty SDA map', function () {
++    const request = {
++      adUnits: [{bids: [bid('alpha', ['id5-sync.com'])]}],
++      ortb2Fragments: {global: {user: {data: []}}}
++    };
++
++    expect(() => applyController({filterSDAwhenEID: ['id5-sync.com']}, request)).to.not.throw();
++    expect(request.adUnits[0].bids[0].userIdAsEids).to.have.length(1);
++  });
++
++  it('handles a request with no ORTB fragments under wildcard filtering', function () {
++    const request = {adUnits: [{bids: [bid('alpha', ['id5-sync.com'])]}]};
++
++    expect(() => applyController({filterEIDwhenSDA: ['*']}, request)).to.not.throw();
++    expect(request.adUnits[0].bids[0].userIdAsEids).to.deep.equal([]);
++  });
++
++  it('stops filtering after the data-controller configuration is removed', function () {
++    const request = {
++      adUnits: [{bids: [bid('alpha', ['id5-sync.com'])]}],
++      ortb2Fragments: {
++        bidder: {alpha: {user: {data: [segment('segments.example', 7, 'premium')]}}}
++      }
++    };
++
++    applyController({filterEIDwhenSDA: ['*']}, request);
++    config.resetConfig();
++
++    const second = bid('alpha', ['id5-sync.com']);
++    const nextRequest = {
++      adUnits: [{bids: [second]}],
++      ortb2Fragments: {bidder: {alpha: {user: {data: [segment('segments.example', 7, 'premium')]}}}}
++    };
++    expect(() => filterBidData(result => result, nextRequest)).to.not.throw();
++    expect(second.userIdAsEids).to.have.length(1);
++  });
++});
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,5 @@
++#!/bin/bash
++set -euo pipefail
++
++
++./node_modules/.bin/gulp test-only --file test/spec/modules/dataController_contract_spec.js --nolint

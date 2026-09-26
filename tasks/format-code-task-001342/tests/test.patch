@@ -1,0 +1,231 @@
+diff --git a/tests/optim_test.py b/tests/optim_test.py
+index bc9f548a..380e030e 100644
+--- a/tests/optim_test.py
++++ b/tests/optim_test.py
+@@ -200,10 +200,10 @@ class MultiOptimizerTest(absltest.TestCase):
+     params = {'a': {'x': 0., 'y': 0.}, 'b': {'y': 0, 'z': 0.}}
+     opt_a = optim.GradientDescent(learning_rate=1.)
+     opt_b = optim.GradientDescent(learning_rate=10.)
+-    t_a = optim.ModelParamTraversal(
++    t_a = traverse_util.ModelParamTraversal(
+       lambda path, _: path.endswith('/x') or path.endswith('/y')
+     )
+-    t_b = optim.ModelParamTraversal(
++    t_b = traverse_util.ModelParamTraversal(
+       lambda path, value: value.dtype == jnp.int32 or path.endswith('/z')
+     )
+     optimizer_def = optim.MultiOptimizer((t_a, opt_a), (t_b, opt_b))
+@@ -212,6 +212,34 @@ class MultiOptimizerTest(absltest.TestCase):
+       jax.jit(optimizer_def.init_state)(params)
+ 
+ 
++class ModelParamTraversalCompatTest(absltest.TestCase):
++
++  def test_optim_entry_still_constructs_and_behaves(self):
++    params = {
++        'x': {'scale': 1, 'offset': 2},
++        'y': {'scale': 3, 'offset': 4},
++    }
++    expected = {
++        'x': {'scale': 1, 'offset': 12},
++        'y': {'scale': 3, 'offset': 14},
++    }
++    traversal = optim.ModelParamTraversal(lambda path, _: path.endswith('/offset'))
++
++    self.assertEqual(set(traversal.iterate(params)), {2, 4})
++    self.assertEqual(traversal.update(lambda x: x + 10, params), expected)
++
++    frozen = FrozenDict(params)
++    self.assertEqual(set(traversal.iterate(frozen)), {2, 4})
++    self.assertEqual(traversal.update(lambda x: x + 10, frozen),
++                     FrozenDict(expected))
++
++    model = nn.Model(None, params)
++    expected_model = nn.Model(None, expected)
++    self.assertEqual(set(traversal.iterate(model)), {2, 4})
++    self.assertEqual(traversal.update(lambda x: x + 10, model),
++                     expected_model)
++
++
+ class GradientDescentTest(absltest.TestCase):
+ 
+   def test_init_state(self):
+diff --git a/tests/traverse_util_test.py b/tests/traverse_util_test.py
+index f7cab388..79825c60 100644
+--- a/tests/traverse_util_test.py
++++ b/tests/traverse_util_test.py
+@@ -16,9 +16,12 @@
+ 
+ 
+ import collections
++from pathlib import Path
+ 
+ from absl.testing import absltest
+ 
++from flax.core import FrozenDict
++from flax.nn import Model
+ from flax import traverse_util
+ 
+ import jax
+@@ -187,5 +190,101 @@ class TraversalTest(absltest.TestCase):
+     xs_restore = traverse_util.unflatten_dict(flat_xs)
+     self.assertEqual(xs, xs_restore)
+ 
++
++class ModelParamTraversalTest(absltest.TestCase):
++
++  def test_iterate_and_update_supported_param_trees(self):
++    cases = [
++        (
++            {
++                'x': {
++                    'scale': 1,
++                    'offset': 2,
++                    'y': {
++                        'scale': 3,
++                        'offset': 4,
++                    },
++                    'z': {},
++                },
++            },
++            lambda path, _: 'scale' in path,
++            {1, 3},
++            {
++                'x': {
++                    'scale': 2,
++                    'offset': 2,
++                    'y': {
++                        'scale': 6,
++                        'offset': 4,
++                    },
++                    'z': {},
++                },
++            },
++            {'/x/scale', '/x/offset', '/x/y/scale', '/x/y/offset'},
++        ),
++        (
++            {'root': {'a': 5, 'b': 7, 'child': {'a': 11, 'b': 13}}},
++            lambda path, value: path.endswith('/b') or value == 11,
++            {7, 11, 13},
++            {'root': {'a': 5, 'b': 14, 'child': {'a': 22, 'b': 26}}},
++            {'/root/a', '/root/b', '/root/child/a', '/root/child/b'},
++        ),
++    ]
++
++    for params, filter_fn, expected_values, expected_params, expected_paths in cases:
++      inputs = [params, FrozenDict(params), Model(None, params)]
++      expected_inputs = [
++          expected_params,
++          FrozenDict(expected_params),
++          Model(None, expected_params),
++      ]
++      for inp, expected in zip(inputs, expected_inputs):
++        seen_paths = []
++
++        def tracking_filter(path, value):
++          seen_paths.append(path)
++          return filter_fn(path, value)
++
++        traversal = traverse_util.ModelParamTraversal(tracking_filter)
++        self.assertEqual(set(traversal.iterate(inp)), expected_values)
++        self.assertEqual(set(seen_paths), expected_paths)
++
++        seen_paths = []
++        traversal = traverse_util.ModelParamTraversal(tracking_filter)
++        self.assertEqual(traversal.update(lambda x: x + x, inp), expected)
++        self.assertEqual(set(seen_paths), expected_paths)
++
++  def test_iterate_order_and_larger_tree_are_preserved(self):
++    params = {
++        'z': {'scale': 1},
++        'a': {'scale': 2},
++        'b': {'scale': 3},
++        'c': {'scale': 4},
++        'd': {'scale': 5},
++    }
++    expected = {
++        'z': {'scale': 10},
++        'a': {'scale': 20},
++        'b': {'scale': 30},
++        'c': {'scale': 40},
++        'd': {'scale': 50},
++    }
++    traversal = traverse_util.ModelParamTraversal(
++        lambda path, _: path.endswith('/scale'))
++
++    self.assertEqual(list(traversal.iterate(params)), [2, 3, 4, 5, 1])
++    self.assertEqual(traversal.update(lambda x: x * 10, params), expected)
++
++
++class DocsApiSurfaceTest(absltest.TestCase):
++
++  def test_model_param_traversal_documented_under_traverse_util_not_optim(self):
++    docs_dir = Path(__file__).resolve().parents[1] / 'docs'
++    traverse_docs = (docs_dir / 'flax.traverse_util.rst').read_text()
++    optim_docs = (docs_dir / 'flax.optim.rst').read_text()
++    self.assertIn('ModelParamTraversal', traverse_docs)
++    self.assertNotIn('ModelParamTraversal', optim_docs)
++
++
+ if __name__ == '__main__':
+   absltest.main()
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,55 @@
++#!/bin/bash
++set -uo pipefail
++
++cd /testbed
++
++
++
++dev-switch python3 3.11
++
++
++python3 -m venv /testbed/.venv
++set +u
++source /testbed/.venv/bin/activate
++set -u
++if [ ! -f /testbed/.fixturea_deps_ready ]; then
++  pip install --quiet "numpy<2" "jax==0.4.18" "jaxlib==0.4.18" "optax==0.1.7" "msgpack" "ml-collections" "absl-py" "pytest" "chex==0.1.86"
++  pip install --quiet --no-deps -e /testbed
++  touch /testbed/.fixturea_deps_ready
++fi
++
++
++mkdir -p /tmp/fixturea_pycompat
++cat > /tmp/fixturea_pycompat/sitecustomize.py <<'PY'
++try:
++    import jax
++    if not hasattr(jax, "tree_multimap"):
++        jax.tree_multimap = jax.tree_util.tree_map
++except ImportError:
++    pass
++PY
++
++PYTHONPATH_VALUE="/tmp/fixturea_pycompat:${PYTHONPATH:-}"
++PYTEST_COMMON=(-v -o "filterwarnings=")
++
++case "${1:-}" in
++  base)
++    PYTHONPATH="${PYTHONPATH_VALUE}" python3 -m pytest \
++      tests/traverse_util_test.py tests/optim_test.py \
++      -k "not ModelParamTraversalCompatTest and not DocsApiSurfaceTest and not test_iterate_and_update_supported_param_trees and not test_iterate_order_and_larger_tree_are_preserved and not test_multi_optimizer_multiple_matches" \
++      "${PYTEST_COMMON[@]}"
++    ;;
++  new)
++    PYTHONPATH="${PYTHONPATH_VALUE}" python3 -m pytest \
++      tests/traverse_util_test.py::ModelParamTraversalTest::test_iterate_and_update_supported_param_trees \
++      tests/traverse_util_test.py::ModelParamTraversalTest::test_iterate_order_and_larger_tree_are_preserved \
++      tests/traverse_util_test.py::DocsApiSurfaceTest::test_model_param_traversal_documented_under_traverse_util_not_optim \
++      tests/optim_test.py::ModelParamTraversalCompatTest::test_optim_entry_still_constructs_and_behaves \
++      tests/optim_test.py::MultiOptimizerTest::test_multi_optimizer_multiple_matches \
++      "${PYTEST_COMMON[@]}"
++    ;;
++  *)
++    echo "usage: $0 base|new"
++    exit 2
++    ;;
++esac

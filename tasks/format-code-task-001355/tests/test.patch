@@ -1,0 +1,315 @@
+diff --git a/usercase-test-coderl/test_prediction_modes.py b/usercase-test-coderl/test_prediction_modes.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/test_prediction_modes.py
+@@ -0,0 +1,287 @@
++
++
++from __future__ import annotations
++
++import io
++import json
++import weakref
++from pathlib import Path
++from typing import Dict, List, Tuple
++
++import onnxruntime
++import pytest
++
++from magika import Magika, PredictionMode
++from magika.types import PredictionMode as TypesPredictionMode
++
++
++LABELS = ["python", "png", "unknown", "randomtxt"]
++MODEL_CONFIG = {
++    "beg_size": 8,
++    "mid_size": 0,
++    "end_size": 0,
++    "use_inputs_at_offsets": False,
++    "medium_confidence_threshold": 0.5,
++    "min_file_size_for_dl": 1,
++    "padding_token": 256,
++    "block_size": 16,
++    "target_labels_space": LABELS,
++    "thresholds": {"python": 0.75, "png": 0.8, "randomtxt": 0.7},
++    "overwrite_map": {"randomtxt": "txt"},
++}
++
++
++class _ArrayLike:
++    def __init__(self, rows: List[List[float]]) -> None:
++        self._rows = rows
++
++    def tolist(self) -> List[List[float]]:
++        return self._rows
++
++
++class _FakeInferenceSession:
++    next_predictions: List[Tuple[str, float]] = []
++    live_instances: weakref.WeakSet["_FakeInferenceSession"] = weakref.WeakSet()
++
++    def __init__(self, *_args: object, **_kwargs: object) -> None:
++        _FakeInferenceSession.live_instances.add(self)
++
++    def run(self, _outputs: object, feed: Dict[str, List[List[int]]]) -> List[_ArrayLike]:
++        rows = []
++        for _ in feed["bytes"]:
++            label, score = _FakeInferenceSession.next_predictions.pop(0)
++            row = [0.0] * len(LABELS)
++            row[LABELS.index(label)] = score
++            rows.append(row)
++        return [_ArrayLike(rows)]
++
++
++@pytest.fixture()
++def fake_model_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
++    model_dir = tmp_path / "model"
++    model_dir.mkdir()
++    (model_dir / "config.min.json").write_text(json.dumps(MODEL_CONFIG))
++    (model_dir / "model.onnx").write_bytes(b"fake onnx")
++    _FakeInferenceSession.next_predictions = []
++    _FakeInferenceSession.live_instances = weakref.WeakSet()
++    monkeypatch.setattr(onnxruntime, "InferenceSession", _FakeInferenceSession)
++    return model_dir
++
++
++def _set_next_predictions(*predictions: Tuple[str, float]) -> None:
++    _FakeInferenceSession.next_predictions = list(predictions)
++
++
++def _prediction_snapshot(result: object) -> Dict[str, object]:
++    prediction = result.prediction
++
++
++    return {
++        "dl_label": str(prediction.dl.label),
++        "output_label": str(prediction.output.label),
++        "score": prediction.score,
++        "overwrite_reason": str(prediction.overwrite_reason),
++    }
++
++
++def test_prediction_mode_exports_and_validator_values() -> None:
++
++
++
++    assert PredictionMode is TypesPredictionMode
++    assert str(PredictionMode.BEST_GUESS) == "best_guess"
++    assert str(PredictionMode.MEDIUM_CONFIDENCE) == "medium_confidence"
++    assert str(PredictionMode.HIGH_CONFIDENCE) == "high_confidence"
++
++
++    valid_modes = [str(mode) for mode in PredictionMode.get_valid_prediction_modes()]
++    assert set(valid_modes) == {
++        "best_guess",
++        "medium_confidence",
++        "high_confidence",
++    }
++    assert len(valid_modes) == 3
++
++    with pytest.raises(ValueError):
++        PredictionMode("not_a_mode")
++
++
++def test_best_guess_keeps_low_score_raw_python(fake_model_dir: Path) -> None:
++
++
++
++    _set_next_predictions(("python", 0.01))
++    result = Magika(
++        model_dir=fake_model_dir,
++        prediction_mode=PredictionMode.BEST_GUESS,
++    ).identify_bytes(b"print(42)")
++    assert _prediction_snapshot(result) == {
++        "dl_label": "python",
++        "output_label": "python",
++        "score": 0.01,
++        "overwrite_reason": "none",
++    }
++
++
++def test_medium_confidence_text_low_and_boundary(fake_model_dir: Path) -> None:
++
++
++
++    _set_next_predictions(("python", 0.49), ("python", 0.5))
++    magika = Magika(
++        model_dir=fake_model_dir,
++        prediction_mode=PredictionMode.MEDIUM_CONFIDENCE,
++    )
++    assert _prediction_snapshot(magika.identify_bytes(b"print(42)")) == {
++        "dl_label": "python",
++        "output_label": "txt",
++        "score": 0.49,
++        "overwrite_reason": "low_confidence",
++    }
++    assert _prediction_snapshot(magika.identify_bytes(b"print(43)")) == {
++        "dl_label": "python",
++        "output_label": "python",
++        "score": 0.5,
++        "overwrite_reason": "none",
++    }
++
++
++def test_default_high_confidence_path_and_bytes_boundaries(
++    fake_model_dir: Path, tmp_path: Path
++) -> None:
++
++
++
++    _set_next_predictions(("python", 0.74), ("python", 0.75))
++    magika = Magika(model_dir=fake_model_dir)
++    sample_path = tmp_path / "sample.py"
++    sample_path.write_bytes(b"print(44)")
++
++    assert _prediction_snapshot(magika.identify_path(sample_path)) == {
++        "dl_label": "python",
++        "output_label": "txt",
++        "score": 0.74,
++        "overwrite_reason": "low_confidence",
++    }
++    assert _prediction_snapshot(magika.identify_bytes(b"print(45)")) == {
++        "dl_label": "python",
++        "output_label": "python",
++        "score": 0.75,
++        "overwrite_reason": "none",
++    }
++
++
++def test_high_confidence_binary_fallback_and_same_label_reason(
++    fake_model_dir: Path,
++) -> None:
++
++
++
++    _set_next_predictions(("png", 0.79), ("unknown", 0.01))
++    magika = Magika(
++        model_dir=fake_model_dir,
++        prediction_mode=PredictionMode.HIGH_CONFIDENCE,
++    )
++    assert _prediction_snapshot(magika.identify_bytes(b"\x89PNGxxxx")) == {
++        "dl_label": "png",
++        "output_label": "unknown",
++        "score": 0.79,
++        "overwrite_reason": "low_confidence",
++    }
++    assert _prediction_snapshot(magika.identify_bytes(b"binary??")) == {
++        "dl_label": "unknown",
++        "output_label": "unknown",
++        "score": 0.01,
++        "overwrite_reason": "none",
++    }
++
++
++def test_identify_stream_preserves_position_and_reports_overwrite_map(
++    fake_model_dir: Path,
++) -> None:
++
++
++
++    _set_next_predictions(("randomtxt", 0.7))
++    magika = Magika(
++        model_dir=fake_model_dir,
++        prediction_mode=PredictionMode.HIGH_CONFIDENCE,
++    )
++    stream = io.BytesIO(b"print(45)")
++    stream.seek(3)
++
++
++
++    assert _prediction_snapshot(magika.identify_stream(stream)) == {
++        "dl_label": "randomtxt",
++        "output_label": "txt",
++        "score": 0.7,
++        "overwrite_reason": "overwrite_map",
++    }
++
++
++def test_instances_keep_independent_prediction_modes(fake_model_dir: Path) -> None:
++
++
++
++    best_guess = Magika(
++        model_dir=fake_model_dir,
++        prediction_mode=PredictionMode.BEST_GUESS,
++    )
++    high_confidence = Magika(
++        model_dir=fake_model_dir,
++        prediction_mode=PredictionMode.HIGH_CONFIDENCE,
++    )
++    _set_next_predictions(("python", 0.01), ("python", 0.01))
++
++    assert _prediction_snapshot(best_guess.identify_bytes(b"print(42)")) == {
++        "dl_label": "python",
++        "output_label": "python",
++        "score": 0.01,
++        "overwrite_reason": "none",
++    }
++    assert _prediction_snapshot(high_confidence.identify_bytes(b"print(42)")) == {
++        "dl_label": "python",
++        "output_label": "txt",
++        "score": 0.01,
++        "overwrite_reason": "low_confidence",
++    }
++
++
++def test_identify_stream_uses_selected_prediction_mode(
++    fake_model_dir: Path,
++) -> None:
++
++
++
++    _set_next_predictions(("python", 0.01))
++    magika = Magika(
++        model_dir=fake_model_dir,
++        prediction_mode=PredictionMode.BEST_GUESS,
++    )
++
++
++    assert _prediction_snapshot(magika.identify_stream(io.BytesIO(b"print(42)"))) == {
++        "dl_label": "python",
++        "output_label": "python",
++        "score": 0.01,
++        "overwrite_reason": "none",
++    }
++
++
++def test_construct_identify_uses_default_high_confidence(
++    fake_model_dir: Path,
++) -> None:
++
++
++
++    _set_next_predictions(("python", 0.75))
++    magika = Magika(model_dir=fake_model_dir)
++
++
++    assert _prediction_snapshot(magika.identify_bytes(b"print(42)")) == {
++        "dl_label": "python",
++        "output_label": "python",
++        "score": 0.75,
++        "overwrite_reason": "none",
++    }
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,18 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++
++cd /workspace/repo
++
++
++export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
++exec python -m pytest /workspace/repo/usercase-test-coderl/test_prediction_modes.py -v

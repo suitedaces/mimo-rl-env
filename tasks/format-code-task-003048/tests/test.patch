@@ -1,0 +1,501 @@
+diff --git a/usercase-test-coderl/fixtures/mock_jira_server.py b/usercase-test-coderl/fixtures/mock_jira_server.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/fixtures/mock_jira_server.py
+@@ -0,0 +1,75 @@
++from __future__ import annotations
++
++import base64
++import json
++import sys
++from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
++from pathlib import Path
++
++
++port_file = Path(sys.argv[1])
++log_file = Path(sys.argv[2])
++mode = sys.argv[3]
++
++
++class Handler(BaseHTTPRequestHandler):
++    def log_message(self, fmt: str, *args: object) -> None:
++        return
++
++    def do_POST(self) -> None:
++        length = int(self.headers.get("Content-Length", "0") or "0")
++        raw = self.rfile.read(length)
++        payload = json.loads(raw.decode("utf-8")) if raw else None
++        auth_header = self.headers.get("Authorization", "")
++        basic_user = ""
++        if auth_header.startswith("Basic "):
++            decoded = base64.b64decode(auth_header.split(" ", 1)[1]).decode("utf-8")
++            basic_user = decoded.split(":", 1)[0]
++
++        record = {
++            "authorization": auth_header,
++            "basic_user": basic_user,
++            "content_type": self.headers.get("Content-Type", ""),
++            "path": self.path,
++            "payload": payload,
++        }
++        with log_file.open("a", encoding="utf-8") as f:
++            f.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
++
++        if self.path == "/rest/api/2/issue":
++            if mode == "create_error":
++                self._send(
++                    418,
++                    '{"errorMessages":["teapot create failure"],"errors":{"summary":"short"}}',
++                    "application/json",
++                )
++                return
++            self._send(
++                201,
++                '{"key":"DORIS-4242","self":"https://jira.example/rest/api/2/issue/4242"}',
++                "application/json",
++            )
++            return
++
++        if self.path == "/rest/agile/1.0/epic/DORIS-24979/issue":
++            if mode == "epic_error":
++                self._send(409, "epic closed for linking", "text/plain")
++                return
++            self._send(204, "", "text/plain")
++            return
++
++        self._send(404, "unexpected path", "text/plain")
++
++    def _send(self, status: int, body: str, content_type: str) -> None:
++        data = body.encode("utf-8")
++        self.send_response(status)
++        self.send_header("Content-Type", content_type)
++        self.send_header("Content-Length", str(len(data)))
++        self.end_headers()
++        if data:
++            self.wfile.write(data)
++
++
++server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
++port_file.write_text(str(server.server_address[1]), encoding="utf-8")
++server.serve_forever()
+diff --git a/usercase-test-coderl/fixtures/uv b/usercase-test-coderl/fixtures/uv
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/fixtures/uv
+@@ -0,0 +1,28 @@
++#!/usr/bin/env bash
++set -e
++
++if [ "${1:-}" != "run" ]; then
++  echo "fixture uv supports only: uv run --project <dir> <command>" >&2
++  exit 127
++fi
++shift
++
++while [ "$#" -gt 0 ]; do
++  case "$1" in
++    --project)
++      shift 2
++      ;;
++    --project=*)
++      shift
++      ;;
++    --)
++      shift
++      break
++      ;;
++    *)
++      break
++      ;;
++  esac
++done
++
++exec "$@"
+diff --git a/usercase-test-coderl/usecase.sh b/usercase-test-coderl/usecase.sh
+new file mode 100755
+--- /dev/null
++++ b/usercase-test-coderl/usecase.sh
+@@ -0,0 +1,366 @@
++#!/usr/bin/env bash
++
++set -u
++export LANG=C.UTF-8 LC_ALL=C.UTF-8 TZ=UTC
++
++REPO=/workspace/repo
++SKILL_DIR="$REPO/skills/jira-issue"
++FIXTURES="$REPO/usercase-test-coderl/fixtures"
++
++TMP=$(mktemp -d)
++trap 'jobs -pr | xargs -r kill 2>/dev/null || true; rm -rf "$TMP"' EXIT
++fail() { echo "FAIL: $*" >&2; exit 1; }
++
++
++VENV=/opt/stage4a-coderl-venv
++[ -x "$VENV/bin/python" ] || fail "offline venv missing: $VENV"
++"$VENV/bin/python" - <<'PY' || fail "offline dependencies unavailable"
++import click
++import requests
++PY
++chmod +x "$FIXTURES/uv"
++export PATH="$FIXTURES:$VENV/bin:$PATH"
++
++run_jira() {
++  ( cd "$SKILL_DIR" && uv run --project . python3 scripts/jira_create_issue.py "$@" )
++}
++
++clean_jira_env() {
++  unset JIRA_URL JIRA_TOKEN JIRA_USER JIRA_PROJECT JIRA_ISSUE_TYPE
++  unset MULTI_AGENT_TODO_JIRA_DRY_RUN
++}
++
++assert_stdout_has_line() {
++  file="$1"
++  expected="$2"
++  grep -Fxq "$expected" "$file" || fail "missing stdout line '$expected': $(cat "$file")"
++}
++
++start_server() {
++  mode="$1"
++  port_file="$TMP/server-$mode.port"
++  log_file="$TMP/server-$mode.log"
++  rm -f "$port_file"
++  : >"$log_file"
++  python3 "$FIXTURES/mock_jira_server.py" "$port_file" "$log_file" "$mode" &
++  server_pid=$!
++  for _ in $(seq 1 100); do
++    [ -s "$port_file" ] && break
++    sleep 0.05
++  done
++  [ -s "$port_file" ] || fail "mock server did not start for $mode"
++  SERVER_PID="$server_pid"
++  SERVER_PORT=$(cat "$port_file")
++  SERVER_LOG="$log_file"
++}
++
++stop_server() {
++  kill "$SERVER_PID" 2>/dev/null || true
++  wait "$SERVER_PID" 2>/dev/null || true
++}
++
++
++
++
++clean_jira_env
++run_jira --help >"$TMP/help.out" 2>"$TMP/help.err"; ec=$?
++[ "$ec" -eq 0 ] || fail "F_help exit $ec; want 0"
++[ ! -s "$TMP/help.err" ] || fail "F_help unexpected stderr: $(cat "$TMP/help.err")"
++
++grep -Fiq "usage" "$TMP/help.out" || fail "F_help missing usage"
++for flag in --jira-url --jira-user --jira-token --auth --project-key --issue-type --summary --description-file --label --component --affects-version --fix-version --assignee --priority --epic --print-payload --dry-run --help; do
++  grep -Fq -- "$flag" "$TMP/help.out" || fail "F_help missing $flag"
++done
++
++
++
++
++clean_jira_env
++mkdir -p "$TMP/home-dry"
++printf 'Planner stalls when queue has two reviewers\nSecond line is trimmed.\n' >"$TMP/desc-full.txt"
++HOME="$TMP/home-dry" run_jira \
++  --project-key DORIS \
++  --issue-type Bug \
++  --summary "Planner bug" \
++  --description-file "$TMP/desc-full.txt" \
++  --label DorisExplorer \
++  --label PlannerTag \
++  --component Planner \
++  --component Reviewer \
++  --affects-version 3.1.4 \
++  --fix-version 3.1.5 \
++  --assignee alice \
++  --priority High \
++  --dry-run >"$TMP/dry.out" 2>"$TMP/dry.err"; ec=$?
++[ "$ec" -eq 0 ] || fail "F_dry_full_payload exit $ec; want 0"
++
++python3 - "$TMP/dry.out" "$TMP/desc-full.txt" <<'PY' || fail "F_dry_full_payload payload: $(cat "$TMP/dry.out")"
++import json
++import sys
++from pathlib import Path
++
++payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
++desc = Path(sys.argv[2]).read_text(encoding="utf-8")
++fields = payload["fields"]
++assert fields["project"]["key"] == "DORIS"
++assert fields["summary"] == "Planner bug"
++assert fields["description"] in {desc, desc.rstrip("\n")}
++assert fields["issuetype"]["name"] == "Bug"
++assert set(fields["labels"]) == {"DorisExplorer", "PlannerTag"}
++assert {item["name"] for item in fields["components"]} == {"Planner", "Reviewer"}
++assert {item["name"] for item in fields["versions"]} == {"3.1.4"}
++assert {item["name"] for item in fields["fixVersions"]} == {"3.1.5"}
++assert fields["assignee"]["name"] == "alice"
++assert fields["priority"]["name"] == "High"
++PY
++[ ! -s "$TMP/dry.err" ] || fail "F_dry_full_payload unexpected stderr: $(cat "$TMP/dry.err")"
++
++
++
++
++clean_jira_env
++mkdir -p "$TMP/home-forced"
++printf 'JIRA_PROJECT=CFG\nJIRA_ISSUE_TYPE=Story\n' >"$TMP/home-forced/.env"
++printf 'Regression body\n' >"$TMP/desc-forced.md"
++HOME="$TMP/home-forced" MULTI_AGENT_TODO_JIRA_DRY_RUN=1 run_jira \
++  --summary "Config default issue" \
++  --description-file "$TMP/desc-forced.md" \
++  --label DorisExplorer \
++  --epic CFG-77 >"$TMP/forced.out" 2>"$TMP/forced.err"; ec=$?
++[ "$ec" -eq 0 ] || fail "F_forced_dry_config exit $ec; want 0"
++
++python3 - "$TMP/forced.out" "$TMP/desc-forced.md" <<'PY' || fail "F_forced_dry_config stdout: $(cat "$TMP/forced.out")"
++import json
++import sys
++from pathlib import Path
++
++text = Path(sys.argv[1]).read_text(encoding="utf-8")
++desc = Path(sys.argv[2]).read_text(encoding="utf-8")
++payload, idx = json.JSONDecoder().raw_decode(text)
++fields = payload["fields"]
++assert fields["project"]["key"] == "CFG"
++assert fields["summary"] == "Config default issue"
++assert fields["description"] in {desc, desc.rstrip("\n")}
++assert fields["issuetype"]["name"] == "Story"
++assert fields["labels"] == ["DorisExplorer"]
++records = text[idx:].lstrip("\n").splitlines()
++assert "key=DRYRUN-CFG-1" in records
++assert "self=https://dry-run.invalid/rest/api/2/issue/DRYRUN-CFG-1" in records
++assert "epic_linked=CFG-77" in records
++payload_lines = [line for line in records if line.startswith("payload=")]
++assert len(payload_lines) == 1
++single_line_payload = json.loads(payload_lines[0].split("=", 1)[1])
++assert single_line_payload == payload
++PY
++[ ! -s "$TMP/forced.err" ] || fail "F_forced_dry_config unexpected stderr: $(cat "$TMP/forced.err")"
++
++
++
++
++clean_jira_env
++start_server create_ok
++printf 'Real request body\n' >"$TMP/desc-real.txt"
++HOME="$TMP/home-real" JIRA_URL="http://127.0.0.1:$SERVER_PORT/" JIRA_TOKEN="bearer-token" run_jira \
++  --project-key DORIS \
++  --issue-type Bug \
++  --summary "Real bearer" \
++  --description-file "$TMP/desc-real.txt" \
++  --label DorisExplorer \
++  --component Planner \
++  --priority High \
++  --epic DORIS-24979 >"$TMP/real.out" 2>"$TMP/real.err"; ec=$?
++stop_server
++[ "$ec" -eq 0 ] || fail "F_real_bearer_epic exit $ec; want 0"
++
++assert_stdout_has_line "$TMP/real.out" "key=DORIS-4242"
++assert_stdout_has_line "$TMP/real.out" "self=https://jira.example/rest/api/2/issue/4242"
++assert_stdout_has_line "$TMP/real.out" "epic_linked=DORIS-24979"
++[ ! -s "$TMP/real.err" ] || fail "F_real_bearer_epic unexpected stderr: $(cat "$TMP/real.err")"
++
++python3 - "$SERVER_LOG" <<'PY' || fail "F_real_bearer_epic request log: $(cat "$SERVER_LOG")"
++import json
++import sys
++from pathlib import Path
++
++records = [json.loads(line) for line in Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()]
++assert len(records) == 2
++create, epic = records
++assert create["path"] == "/rest/api/2/issue"
++assert create["authorization"] == "Bearer bearer-token"
++assert create["content_type"].startswith("application/json")
++fields = create["payload"]["fields"]
++assert fields["project"]["key"] == "DORIS"
++assert fields["summary"] == "Real bearer"
++assert fields["description"] in {"Real request body", "Real request body\n"}
++assert fields["issuetype"]["name"] == "Bug"
++assert fields["labels"] == ["DorisExplorer"]
++assert fields["components"] == [{"name": "Planner"}]
++assert fields["priority"]["name"] == "High"
++assert epic["path"] == "/rest/agile/1.0/epic/DORIS-24979/issue"
++assert epic["authorization"] == "Bearer bearer-token"
++assert epic["payload"] == {"issues": ["DORIS-4242"]}
++PY
++
++
++
++
++clean_jira_env
++start_server create_ok
++printf 'Basic body\n' >"$TMP/desc-basic.txt"
++HOME="$TMP/home-basic" \
++JIRA_URL="http://127.0.0.1:$SERVER_PORT" \
++JIRA_TOKEN="basic-token" \
++JIRA_PROJECT="ENVPROJ" \
++JIRA_ISSUE_TYPE="Task" \
++JIRA_USER="bob" run_jira \
++  --auth basic \
++  --summary "Env basic" \
++  --description-file "$TMP/desc-basic.txt" \
++  --print-payload >"$TMP/basic.out" 2>"$TMP/basic.err"; ec=$?
++stop_server
++[ "$ec" -eq 0 ] || fail "F_basic_print_payload_env exit $ec; want 0"
++
++python3 - "$TMP/basic.out" <<'PY' || fail "F_basic_print_payload_env stdout: $(cat "$TMP/basic.out")"
++import json
++import sys
++from pathlib import Path
++
++text = Path(sys.argv[1]).read_text(encoding="utf-8")
++payload, idx = json.JSONDecoder().raw_decode(text)
++fields = payload["fields"]
++assert fields["project"]["key"] == "ENVPROJ"
++assert fields["summary"] == "Env basic"
++assert fields["description"] in {"Basic body", "Basic body\n"}
++assert fields["issuetype"]["name"] == "Task"
++records = text[idx:].lstrip("\n").splitlines()
++assert "key=DORIS-4242" in records
++assert "self=https://jira.example/rest/api/2/issue/4242" in records
++PY
++[ ! -s "$TMP/basic.err" ] || fail "F_basic_print_payload_env unexpected stderr: $(cat "$TMP/basic.err")"
++
++python3 - "$SERVER_LOG" <<'PY' || fail "F_basic_print_payload_env request log: $(cat "$SERVER_LOG")"
++import json
++import sys
++from pathlib import Path
++
++records = [json.loads(line) for line in Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()]
++assert len(records) == 1
++record = records[0]
++assert record["path"] == "/rest/api/2/issue"
++assert record["authorization"] == "Basic Ym9iOmJhc2ljLXRva2Vu"
++assert record["basic_user"] == "bob"
++assert record["content_type"].startswith("application/json")
++fields = record["payload"]["fields"]
++assert fields["project"]["key"] == "ENVPROJ"
++assert fields["summary"] == "Env basic"
++assert fields["description"] in {"Basic body", "Basic body\n"}
++assert fields["issuetype"]["name"] == "Task"
++PY
++
++
++
++
++clean_jira_env
++start_server epic_error
++printf 'Epic failure body\n' >"$TMP/desc-epic-fail.txt"
++HOME="$TMP/home-epic-fail" JIRA_URL="http://127.0.0.1:$SERVER_PORT" JIRA_TOKEN="bearer-token" run_jira \
++  --project-key DORIS \
++  --issue-type Bug \
++  --summary "Epic warning" \
++  --description-file "$TMP/desc-epic-fail.txt" \
++  --epic DORIS-24979 >"$TMP/epic-fail.out" 2>"$TMP/epic-fail.err"; ec=$?
++stop_server
++[ "$ec" -eq 0 ] || fail "F_epic_warning exit $ec; want 0"
++
++assert_stdout_has_line "$TMP/epic-fail.out" "key=DORIS-4242"
++assert_stdout_has_line "$TMP/epic-fail.out" "self=https://jira.example/rest/api/2/issue/4242"
++! grep -Fq "epic_linked=" "$TMP/epic-fail.out" || fail "F_epic_warning incorrectly reported epic success: $(cat "$TMP/epic-fail.out")"
++
++grep -Fiq "warning" "$TMP/epic-fail.err" || fail "F_epic_warning missing warning: $(cat "$TMP/epic-fail.err")"
++grep -Fq "409" "$TMP/epic-fail.err" || fail "F_epic_warning missing status: $(cat "$TMP/epic-fail.err")"
++grep -Fq "epic closed for linking" "$TMP/epic-fail.err" || fail "F_epic_warning missing response body: $(cat "$TMP/epic-fail.err")"
++
++
++
++
++clean_jira_env
++start_server create_error
++printf 'Bad request body\n' >"$TMP/desc-http-error.txt"
++HOME="$TMP/home-http-error" JIRA_URL="http://127.0.0.1:$SERVER_PORT" JIRA_TOKEN="bearer-token" run_jira \
++  --project-key DORIS \
++  --issue-type Bug \
++  --summary "HTTP failure" \
++  --description-file "$TMP/desc-http-error.txt" >"$TMP/http-error.out" 2>"$TMP/http-error.err"; ec=$?
++stop_server
++[ "$ec" -eq 1 ] || fail "F_http_error exit $ec; want 1"
++[ ! -s "$TMP/http-error.out" ] || fail "F_http_error unexpected stdout: $(cat "$TMP/http-error.out")"
++
++grep -Fq "Request failed: 418" "$TMP/http-error.err" || fail "F_http_error missing status: $(cat "$TMP/http-error.err")"
++grep -Fq '{"errorMessages":["teapot create failure"],"errors":{"summary":"short"}}' "$TMP/http-error.err" || fail "F_http_error missing body: $(cat "$TMP/http-error.err")"
++
++
++
++
++clean_jira_env
++printf 'Body\n' >"$TMP/desc-usage.txt"
++HOME="$TMP/home-usage" run_jira \
++  --project-key DORIS \
++  --issue-type Bug \
++  --description-file "$TMP/desc-usage.txt" \
++  --dry-run >"$TMP/missing-summary.out" 2>"$TMP/missing-summary.err"; ec=$?
++
++[ "$ec" -ne 0 ] || fail "F_missing_summary exit $ec; want nonzero"
++[ ! -s "$TMP/missing-summary.out" ] || fail "F_missing_summary unexpected stdout: $(cat "$TMP/missing-summary.out")"
++grep -Fiq "usage" "$TMP/missing-summary.err" || fail "F_missing_summary missing usage: $(cat "$TMP/missing-summary.err")"
++grep -Fiq "error" "$TMP/missing-summary.err" || fail "F_missing_summary missing error: $(cat "$TMP/missing-summary.err")"
++grep -Fq -- "--summary" "$TMP/missing-summary.err" || fail "F_missing_summary missing flag: $(cat "$TMP/missing-summary.err")"
++
++
++
++
++clean_jira_env
++HOME="$TMP/home-usage" run_jira \
++  --project-key DORIS \
++  --issue-type Bug \
++  --summary "Missing desc option" \
++  --dry-run >"$TMP/missing-desc.out" 2>"$TMP/missing-desc.err"; ec=$?
++
++[ "$ec" -ne 0 ] || fail "F_missing_description_option exit $ec; want nonzero"
++[ ! -s "$TMP/missing-desc.out" ] || fail "F_missing_description_option unexpected stdout: $(cat "$TMP/missing-desc.out")"
++grep -Fiq "usage" "$TMP/missing-desc.err" || fail "F_missing_description_option missing usage: $(cat "$TMP/missing-desc.err")"
++grep -Fiq "error" "$TMP/missing-desc.err" || fail "F_missing_description_option missing error: $(cat "$TMP/missing-desc.err")"
++grep -Fq -- "--description-file" "$TMP/missing-desc.err" || fail "F_missing_description_option missing flag: $(cat "$TMP/missing-desc.err")"
++
++
++
++
++clean_jira_env
++HOME="$TMP/home-usage" run_jira \
++  --project-key DORIS \
++  --issue-type Bug \
++  --summary "Missing file" \
++  --description-file no-such-desc.md \
++  --dry-run >"$TMP/missing-file.out" 2>"$TMP/missing-file.err"; ec=$?
++
++[ "$ec" -ne 0 ] || fail "F_missing_description_file exit $ec; want nonzero"
++[ ! -s "$TMP/missing-file.out" ] || fail "F_missing_description_file unexpected stdout: $(cat "$TMP/missing-file.out")"
++grep -Fq "Missing file for --description-file: no-such-desc.md" "$TMP/missing-file.err" || fail "F_missing_description_file stderr: $(cat "$TMP/missing-file.err")"
++
++
++
++
++clean_jira_env
++printf 'Body\n' >"$TMP/desc-basic-no-user.txt"
++HOME="$TMP/home-basic-no-user" JIRA_URL="http://127.0.0.1:1" JIRA_TOKEN="token" run_jira \
++  --auth basic \
++  --project-key DORIS \
++  --issue-type Bug \
++  --summary "No user" \
++  --description-file "$TMP/desc-basic-no-user.txt" >"$TMP/basic-no-user.out" 2>"$TMP/basic-no-user.err"; ec=$?
++
++[ "$ec" -ne 0 ] || fail "F_basic_missing_user exit $ec; want nonzero"
++[ ! -s "$TMP/basic-no-user.out" ] || fail "F_basic_missing_user unexpected stdout: $(cat "$TMP/basic-no-user.out")"
++grep -Fq "Basic auth requires --jira-user or JIRA_USER." "$TMP/basic-no-user.err" || fail "F_basic_missing_user stderr: $(cat "$TMP/basic-no-user.err")"
++
++echo "PASS"
++exit 0
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,12 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++exec bash /workspace/repo/usercase-test-coderl/usecase.sh

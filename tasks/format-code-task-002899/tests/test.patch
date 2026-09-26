@@ -1,0 +1,344 @@
+diff --git a/typesense/api/circuit/circuit_behavior_test.go b/typesense/api/circuit/circuit_behavior_test.go
+new file mode 100644
+index 0000000..45a8aa0
+--- /dev/null
++++ b/typesense/api/circuit/circuit_behavior_test.go
+@@ -0,0 +1,307 @@
++package circuit_test
++
++import (
++	"errors"
++	"net/http"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/v-byte-cpu/typesense-go/typesense/api/circuit"
++)
++
++var errFail = errors.New("boom")
++
++func assertErrorIs(t *testing.T, err, target error) {
++	t.Helper()
++	assert.Truef(t, errors.Is(err, target), "expected error %v to wrap %v", err, target)
++}
++
++
++
++func TestBreakerStartsClosed(t *testing.T) {
++	b := circuit.NewGoBreaker()
++	assert.Equal(t, "closed", b.State().String())
++}
++
++func TestExecutePassesThroughSuccess(t *testing.T) {
++	b := circuit.NewGoBreaker()
++	called := 0
++	err := b.Execute(func() error {
++		called++
++		return nil
++	})
++	assert.NoError(t, err)
++	assert.Equal(t, 1, called)
++	assert.Equal(t, "closed", b.State().String())
++}
++
++func TestExecuteReturnsReqError(t *testing.T) {
++	b := circuit.NewGoBreaker()
++	err := b.Execute(func() error { return errFail })
++	assertErrorIs(t, err, errFail)
++}
++
++func TestCountsTrackOutcomes(t *testing.T) {
++
++	b := circuit.NewGoBreaker(
++		circuit.WithGoBreakerReadyToTrip(func(circuit.Counts) bool { return false }),
++	)
++
++	_ = b.Execute(func() error { return nil })
++	_ = b.Execute(func() error { return nil })
++	_ = b.Execute(func() error { return errFail })
++
++	c := b.Counts()
++	assert.Equal(t, uint32(3), c.Requests)
++	assert.Equal(t, uint32(2), c.TotalSuccesses)
++	assert.Equal(t, uint32(1), c.TotalFailures)
++	assert.Equal(t, uint32(0), c.ConsecutiveSuccesses)
++	assert.Equal(t, uint32(1), c.ConsecutiveFailures)
++
++
++	_ = b.Execute(func() error { return nil })
++	c = b.Counts()
++	assert.Equal(t, uint32(0), c.ConsecutiveFailures)
++	assert.Equal(t, uint32(1), c.ConsecutiveSuccesses)
++	assert.Equal(t, uint32(3), c.TotalSuccesses)
++}
++
++
++
++func TestDefaultPolicyTripsAfterSixConsecutiveFailures(t *testing.T) {
++	b := circuit.NewGoBreaker()
++
++
++	for i := 0; i < 5; i++ {
++		err := b.Execute(func() error { return errFail })
++		assertErrorIs(t, err, errFail)
++	}
++	assert.Equal(t, "closed", b.State().String())
++
++
++
++	err := b.Execute(func() error { return errFail })
++	assertErrorIs(t, err, errFail)
++	assert.Equal(t, "open", b.State().String())
++}
++
++func TestCustomReadyToTripIsUsed(t *testing.T) {
++	b := circuit.NewGoBreaker(
++		circuit.WithGoBreakerReadyToTrip(func(c circuit.Counts) bool {
++			return c.ConsecutiveFailures >= 2
++		}),
++	)
++	_ = b.Execute(func() error { return errFail })
++	assert.Equal(t, "closed", b.State().String())
++	_ = b.Execute(func() error { return errFail })
++	assert.Equal(t, "open", b.State().String())
++}
++
++func TestSuccessInterruptsTripping(t *testing.T) {
++	b := circuit.NewGoBreaker()
++	for i := 0; i < 5; i++ {
++		_ = b.Execute(func() error { return errFail })
++	}
++	_ = b.Execute(func() error { return nil })
++	for i := 0; i < 5; i++ {
++		_ = b.Execute(func() error { return errFail })
++	}
++	assert.Equal(t, "closed", b.State().String())
++}
++
++
++
++func TestOpenStateRejectsWithoutRunning(t *testing.T) {
++	b := circuit.NewGoBreaker(
++		circuit.WithGoBreakerReadyToTrip(func(c circuit.Counts) bool {
++			return c.ConsecutiveFailures >= 1
++		}),
++	)
++
++	_ = b.Execute(func() error { return errFail })
++	assert.Equal(t, "open", b.State().String())
++
++	called := false
++	err := b.Execute(func() error {
++		called = true
++		return nil
++	})
++	assert.False(t, called, "req must not be invoked while open")
++	assertErrorIs(t, err, circuit.ErrOpenState)
++}
++
++
++
++func TestNameOptionAndDefault(t *testing.T) {
++	assert.NotEmpty(t, circuit.NewGoBreaker().Name())
++	assert.Equal(t, "myBreaker",
++		circuit.NewGoBreaker(circuit.WithGoBreakerName("myBreaker")).Name())
++}
++
++func TestOnStateChangeCallback(t *testing.T) {
++	type change struct {
++		name     string
++		from, to string
++	}
++	var changes []change
++	b := circuit.NewGoBreaker(
++		circuit.WithGoBreakerName("cb"),
++		circuit.WithGoBreakerReadyToTrip(func(c circuit.Counts) bool {
++			return c.ConsecutiveFailures >= 1
++		}),
++		circuit.WithGoBreakerOnStateChange(func(name string, from, to circuit.State) {
++			changes = append(changes, change{name, from.String(), to.String()})
++		}),
++	)
++	_ = b.Execute(func() error { return errFail })
++
++	if assert.Len(t, changes, 1) {
++		assert.Equal(t, "cb", changes[0].name)
++		assert.Equal(t, "closed", changes[0].from)
++		assert.Equal(t, "open", changes[0].to)
++	}
++}
++
++func TestCountsResetOnStateChange(t *testing.T) {
++	b := circuit.NewGoBreaker(
++		circuit.WithGoBreakerReadyToTrip(func(c circuit.Counts) bool {
++			return c.ConsecutiveFailures >= 3
++		}),
++	)
++	for i := 0; i < 3; i++ {
++		_ = b.Execute(func() error { return errFail })
++	}
++	assert.Equal(t, "open", b.State().String())
++	c := b.Counts()
++	assert.Equal(t, uint32(0), c.Requests)
++	assert.Equal(t, uint32(0), c.TotalFailures)
++	assert.Equal(t, uint32(0), c.ConsecutiveFailures)
++}
++
++func TestAllOptionsAccepted(t *testing.T) {
++
++	b := circuit.NewGoBreaker(
++		circuit.WithGoBreakerName("full"),
++		circuit.WithGoBreakerMaxRequests(3),
++		circuit.WithGoBreakerInterval(time.Minute),
++		circuit.WithGoBreakerTimeout(30*time.Second),
++		circuit.WithGoBreakerReadyToTrip(func(circuit.Counts) bool { return false }),
++		circuit.WithGoBreakerOnStateChange(func(string, circuit.State, circuit.State) {}),
++	)
++	assert.Equal(t, "full", b.Name())
++	assert.Equal(t, "closed", b.State().String())
++	assert.NoError(t, b.Execute(func() error { return nil }))
++}
++
++func TestStateStringRendering(t *testing.T) {
++
++	b := circuit.NewGoBreaker(
++		circuit.WithGoBreakerReadyToTrip(func(c circuit.Counts) bool {
++			return c.ConsecutiveFailures >= 1
++		}),
++	)
++	assert.Equal(t, "closed", b.State().String())
++	_ = b.Execute(func() error { return errFail })
++	assert.Equal(t, "open", b.State().String())
++}
++
++
++
++type fakeDoer struct {
++	calls int
++	resp  *http.Response
++	err   error
++}
++
++func (f *fakeDoer) Do(*http.Request) (*http.Response, error) {
++	f.calls++
++	return f.resp, f.err
++}
++
++func newRequest(t *testing.T) *http.Request {
++	t.Helper()
++	req, err := http.NewRequest(http.MethodGet, "http://example.com", nil)
++	assert.NoError(t, err)
++	return req
++}
++
++func TestHTTPClientReturnsResponse(t *testing.T) {
++	resp := &http.Response{StatusCode: http.StatusOK}
++	doer := &fakeDoer{resp: resp}
++	client := circuit.NewHTTPClient(
++		circuit.WithHTTPRequestDoer(doer),
++		circuit.WithCircuitBreaker(circuit.NewGoBreaker()),
++	)
++	got, err := client.Do(newRequest(t))
++	assert.NoError(t, err)
++	assert.Equal(t, resp, got)
++	assert.Equal(t, 1, doer.calls)
++}
++
++func TestHTTPClientPropagatesTransportError(t *testing.T) {
++	doer := &fakeDoer{err: errFail}
++	client := circuit.NewHTTPClient(
++		circuit.WithHTTPRequestDoer(doer),
++		circuit.WithCircuitBreaker(circuit.NewGoBreaker()),
++	)
++	_, err := client.Do(newRequest(t))
++	assertErrorIs(t, err, errFail)
++	assert.Equal(t, 1, doer.calls)
++}
++
++func TestHTTPClient5xxIsNotAFailure(t *testing.T) {
++	doer := &fakeDoer{resp: &http.Response{StatusCode: http.StatusInternalServerError}}
++	b := circuit.NewGoBreaker()
++	client := circuit.NewHTTPClient(
++		circuit.WithHTTPRequestDoer(doer),
++		circuit.WithCircuitBreaker(b),
++	)
++
++	for i := 0; i < 20; i++ {
++		resp, err := client.Do(newRequest(t))
++		assert.NoError(t, err)
++		assert.Equal(t, http.StatusInternalServerError, resp.StatusCode)
++	}
++	assert.Equal(t, "closed", b.State().String())
++	c := b.Counts()
++	assert.Equal(t, uint32(0), c.TotalFailures)
++}
++
++func TestHTTPClientTransportErrorsTripAndRejectWithoutCalling(t *testing.T) {
++	doer := &fakeDoer{err: errFail}
++	b := circuit.NewGoBreaker()
++	client := circuit.NewHTTPClient(
++		circuit.WithHTTPRequestDoer(doer),
++		circuit.WithCircuitBreaker(b),
++	)
++
++	for i := 0; i < 6; i++ {
++		_, err := client.Do(newRequest(t))
++		assertErrorIs(t, err, errFail)
++	}
++	assert.Equal(t, "open", b.State().String())
++	assert.Equal(t, 6, doer.calls)
++
++
++	_, err := client.Do(newRequest(t))
++	assertErrorIs(t, err, circuit.ErrOpenState)
++	assert.Equal(t, 6, doer.calls, "doer must not be called while breaker is open")
++}
++
++func TestHTTPClientUsesProvidedBreakerInterface(t *testing.T) {
++
++	doer := &fakeDoer{resp: &http.Response{StatusCode: http.StatusOK}}
++	cb := &rejectingBreaker{}
++	client := circuit.NewHTTPClient(
++		circuit.WithHTTPRequestDoer(doer),
++		circuit.WithCircuitBreaker(cb),
++	)
++	_, err := client.Do(newRequest(t))
++	assertErrorIs(t, err, errFail)
++	assert.Equal(t, 0, doer.calls, "custom breaker prevented the call")
++}
++
++type rejectingBreaker struct{}
++
++func (rejectingBreaker) Execute(func() error) error { return errFail }
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,26 @@
++#!/usr/bin/env bash
++
++
++
++set -euo pipefail
++HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++cd /testbed
++
++
++
++
++
++
++
++export GOFLAGS=-mod=mod
++export GOSUMDB=off
++export GOPROXY="file://$(go env GOMODCACHE)/cache/download"
++if grep -q 'deepmap/oapi-codegen v1.4.1' go.mod; then
++    sed -i 's#deepmap/oapi-codegen v1.4.1#deepmap/oapi-codegen v1.4.2#' go.mod
++fi
++
++
++go test ./typesense/
++
++
++go test ./typesense/api/circuit/

@@ -1,0 +1,9 @@
+I want pure helper methods for inspecting an already parsed Debian dependency model and checking Debian version constraints. The API should include `func (dep *Dependency) GetPossibilities(arch Arch) []Possibility`, `func (dep *Dependency) GetAllPossibilities() []Possibility`, `func (dep *Dependency) GetSubstvars() []Possibility`, and `func (v VersionRelation) SatisfiedBy(ver version.Version) bool`.
+
+`GetPossibilities` should return one concrete, non-substvar possibility per relation: the first alternative whose architecture restrictions match the target architecture. For a dependency model representing `foo, bar | baz` and target `amd64`, it should return possibilities named `foo` and `bar`; for `foo, bar [sparc] | baz` and target `amd64`, it should return `foo` and `baz`.
+
+`GetAllPossibilities` should flatten all concrete, non-substvar possibilities in relation order. For a model representing `${foo:Depends}, foo, bar | baz, ${bar:Depends}`, it should return `foo`, `bar`, and `baz`. `GetSubstvars` should return only the substvar possibilities from that same model, with names `foo:Depends` and `bar:Depends`.
+
+`VersionRelation.SatisfiedBy` should compare a parsed Debian `version.Version` against the relation operator and number. For example, `VersionRelation{Operator: "=", Number: "1.0.0"}` should be satisfied by version `1.0.0` and not by `1.0.1`; `VersionRelation{Operator: "<<", Number: "2.0"}` should be satisfied by `1.0` and not by `3.0`; `VersionRelation{Operator: ">=", Number: "1.0~"}` should be satisfied by `1.0`. If the relation's version number cannot be parsed or the operator is unknown, `SatisfiedBy` should return false rather than panic.
+
+These helpers should be deterministic, should not mutate the receiver or arguments, and should not perform filesystem, network, or global-state side effects.

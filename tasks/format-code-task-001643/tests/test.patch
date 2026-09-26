@@ -1,0 +1,492 @@
+diff --git a/usercase-test-coderl/termux_location_provider_test.go b/usercase-test-coderl/termux_location_provider_test.go
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/termux_location_provider_test.go
+@@ -0,0 +1,463 @@
++package usercase_test_coderl
++
++import (
++	"io"
++	"os"
++	"path/filepath"
++	"runtime"
++	"strings"
++	"syscall"
++	"testing"
++	"time"
++
++	"github.com/jkaberg/byd-hass/internal/location"
++	"github.com/sirupsen/logrus"
++)
++
++
++
++
++
++
++const gpsPath = "/storage/emulated/0/bydhass/gps"
++
++func testLogger() *logrus.Logger {
++	logger := logrus.New()
++	logger.SetOutput(io.Discard)
++	logger.SetLevel(logrus.PanicLevel)
++	return logger
++}
++
++func resetGPSPath(t *testing.T) {
++	t.Helper()
++	if err := os.RemoveAll(filepath.Dir(gpsPath)); err != nil {
++		t.Fatalf("remove gps dir: %v", err)
++	}
++}
++
++func writeGPSFile(t *testing.T, body string, modTime time.Time) {
++	t.Helper()
++	if err := os.MkdirAll(filepath.Dir(gpsPath), 0o755); err != nil {
++		t.Fatalf("mkdir gps dir: %v", err)
++	}
++	if err := os.WriteFile(gpsPath, []byte(body), 0o644); err != nil {
++		t.Fatalf("write gps file: %v", err)
++	}
++	if err := os.Chtimes(gpsPath, modTime, modTime); err != nil {
++		t.Fatalf("chtimes gps file: %v", err)
++	}
++}
++
++func makeGPSFIFO(t *testing.T) {
++	t.Helper()
++	if err := os.MkdirAll(filepath.Dir(gpsPath), 0o755); err != nil {
++		t.Fatalf("mkdir gps dir: %v", err)
++	}
++	if err := syscall.Mkfifo(gpsPath, 0o644); err != nil {
++		t.Fatalf("mkfifo gps file: %v", err)
++	}
++}
++
++func waitForAvailable(t *testing.T, p *location.TermuxLocationProvider) {
++	t.Helper()
++	deadline := time.Now().Add(2 * time.Second)
++	for time.Now().Before(deadline) {
++		if p.IsLocationAvailable() {
++			return
++		}
++		time.Sleep(10 * time.Millisecond)
++	}
++	t.Fatal("provider did not cache a location")
++}
++
++func waitForLatitude(t *testing.T, p *location.TermuxLocationProvider, latitude float64) *location.LocationData {
++	t.Helper()
++	deadline := time.Now().Add(12 * time.Second)
++	var lastErr error
++	for time.Now().Before(deadline) {
++		loc, err := p.GetLocation()
++		if err == nil && loc.Latitude == latitude {
++			return loc
++		}
++		lastErr = err
++		time.Sleep(100 * time.Millisecond)
++	}
++	t.Fatalf("provider did not reach latitude %.4f; last error: %v", latitude, lastErr)
++	return nil
++}
++
++func assertSampleLocation(t *testing.T, loc *location.LocationData) {
++	t.Helper()
++	if loc.Latitude != 57.7089 {
++		t.Fatalf("latitude = %.4f, want 57.7089", loc.Latitude)
++	}
++	if loc.Longitude != 11.9746 {
++		t.Fatalf("longitude = %.4f, want 11.9746", loc.Longitude)
++	}
++	if loc.Speed != 12.5 {
++		t.Fatalf("speed = %.1f, want 12.5", loc.Speed)
++	}
++	if loc.Accuracy != 4.2 {
++		t.Fatalf("accuracy = %.1f, want 4.2", loc.Accuracy)
++	}
++	if loc.Provider != "termux-file" {
++		t.Fatalf("provider = %q, want termux-file", loc.Provider)
++	}
++	if got := loc.Timestamp.UTC().Format(time.RFC3339); got != "2025-10-09T08:53:20Z" {
++		t.Fatalf("timestamp = %q, want 2025-10-09T08:53:20Z", got)
++	}
++}
++
++func assertStaleError(t *testing.T, err error) {
++	t.Helper()
++	if err == nil {
++		t.Fatal("error = <nil>, want stale location error")
++	}
++
++	if msg := strings.ToLower(err.Error()); !strings.Contains(msg, "stale") || !strings.Contains(msg, "location") {
++		t.Fatalf("error message = %q, want explanation that location data is stale", err.Error())
++	}
++}
++
++func TestReadsTimestampedTermuxGPSAndReturnsDefensiveCopy(t *testing.T) {
++
++
++	resetGPSPath(t)
++	writeGPSFile(t, `{"latitude":57.7089,"longitude":11.9746,"speed":12.5,"accuracy":4.2,"timestamp":1760000000}`, time.Unix(1770000000, 0))
++
++	p := location.NewTermuxLocationProvider(testLogger())
++	defer p.Stop()
++	p.SetCacheTTL(400 * 24 * time.Hour)
++	p.SetFetchTimeout(25 * time.Millisecond)
++	waitForAvailable(t, p)
++
++	if available := p.IsLocationAvailable(); available != true {
++		t.Fatalf("IsLocationAvailable() = %v, want true", available)
++	}
++	if zero := p.GetLastFetchTime().IsZero(); zero != false {
++		t.Fatalf("GetLastFetchTime().IsZero() = %v, want false", zero)
++	}
++	loc, err := p.GetLocation()
++	if err != nil {
++		t.Fatalf("GetLocation() error = %v, want nil", err)
++	}
++	assertSampleLocation(t, loc)
++
++	loc.Latitude = 99
++	loc.Longitude = 88
++	loc.Provider = "mutated"
++	loc2, err := p.GetLocation()
++	if err != nil {
++		t.Fatalf("second GetLocation() error = %v, want nil", err)
++	}
++	assertSampleLocation(t, loc2)
++}
++
++func TestMissingTimestampUsesGPSFileModificationTime(t *testing.T) {
++
++
++	resetGPSPath(t)
++	writeGPSFile(t, `{"latitude":12.25,"longitude":34.5,"speed":1.75,"accuracy":8.5}`, time.Unix(1770000123, 0))
++
++	p := location.NewTermuxLocationProvider(testLogger())
++	defer p.Stop()
++	p.SetCacheTTL(400 * 24 * time.Hour)
++	waitForAvailable(t, p)
++
++	loc, err := p.GetLocation()
++	if err != nil {
++		t.Fatalf("GetLocation() error = %v, want nil", err)
++	}
++	if loc.Latitude != 12.25 {
++		t.Fatalf("latitude = %.2f, want 12.25", loc.Latitude)
++	}
++	if loc.Longitude != 34.5 {
++		t.Fatalf("longitude = %.1f, want 34.5", loc.Longitude)
++	}
++	if loc.Speed != 1.75 {
++		t.Fatalf("speed = %.2f, want 1.75", loc.Speed)
++	}
++	if loc.Accuracy != 8.5 {
++		t.Fatalf("accuracy = %.1f, want 8.5", loc.Accuracy)
++	}
++	if loc.Provider != "termux-file" {
++		t.Fatalf("provider = %q, want termux-file", loc.Provider)
++	}
++	if got := loc.Timestamp.UTC().Format(time.RFC3339); got != "2026-02-02T02:42:03Z" {
++		t.Fatalf("timestamp = %q, want 2026-02-02T02:42:03Z", got)
++	}
++}
++
++func TestDefaultLocationIsCachedUntilRealGPSIsReadable(t *testing.T) {
++
++
++	resetGPSPath(t)
++
++	p := location.NewTermuxLocationProvider(testLogger())
++	defer p.Stop()
++	waitForAvailable(t, p)
++
++	if available := p.IsLocationAvailable(); available != true {
++		t.Fatalf("IsLocationAvailable() = %v, want true", available)
++	}
++	loc, err := p.GetLocation()
++	if err != nil {
++		t.Fatalf("GetLocation() error = %v, want nil", err)
++	}
++	if loc.Latitude != 0 {
++		t.Fatalf("latitude = %.1f, want 0", loc.Latitude)
++	}
++	if loc.Longitude != 0 {
++		t.Fatalf("longitude = %.1f, want 0", loc.Longitude)
++	}
++
++	if loc.Provider != "default" {
++		t.Fatalf("provider = %q, want default", loc.Provider)
++	}
++	if zero := loc.Timestamp.IsZero(); zero != false {
++		t.Fatalf("default timestamp IsZero() = %v, want false", zero)
++	}
++	if zero := p.GetLastFetchTime().IsZero(); zero != false {
++		t.Fatalf("GetLastFetchTime().IsZero() = %v, want false", zero)
++	}
++}
++
++func TestUnchangedFileModTimeDoesNotReplaceCacheOrAdvanceLastFetch(t *testing.T) {
++
++
++	resetGPSPath(t)
++	firstMod := time.Unix(1770000200, 0)
++	writeGPSFile(t, `{"latitude":1.1,"longitude":2.2,"speed":3.3,"accuracy":4.4,"timestamp":1770000201}`, firstMod)
++
++	p := location.NewTermuxLocationProvider(testLogger())
++	defer p.Stop()
++	p.SetCacheTTL(400 * 24 * time.Hour)
++	waitForAvailable(t, p)
++
++	first, err := p.GetLocation()
++	if err != nil {
++		t.Fatalf("first GetLocation() error = %v, want nil", err)
++	}
++	if first.Latitude != 1.1 {
++		t.Fatalf("first latitude = %.1f, want 1.1", first.Latitude)
++	}
++	if first.Longitude != 2.2 {
++		t.Fatalf("first longitude = %.1f, want 2.2", first.Longitude)
++	}
++	if first.Speed != 3.3 {
++		t.Fatalf("first speed = %.1f, want 3.3", first.Speed)
++	}
++	if first.Accuracy != 4.4 {
++		t.Fatalf("first accuracy = %.1f, want 4.4", first.Accuracy)
++	}
++	if first.Provider != "termux-file" {
++		t.Fatalf("first provider = %q, want termux-file", first.Provider)
++	}
++	if got := first.Timestamp.UTC().Format(time.RFC3339); got != "2026-02-02T02:43:21Z" {
++		t.Fatalf("first timestamp = %q, want 2026-02-02T02:43:21Z", got)
++	}
++	firstFetch := p.GetLastFetchTime()
++	if zero := firstFetch.IsZero(); zero != false {
++		t.Fatalf("first fetch IsZero() = %v, want false", zero)
++	}
++
++	writeGPSFile(t, `{"latitude":9.9,"longitude":8.8,"speed":7.7,"accuracy":6.6,"timestamp":1770000301}`, firstMod)
++	time.Sleep(11 * time.Second)
++	unchanged, err := p.GetLocation()
++	if err != nil {
++		t.Fatalf("unchanged GetLocation() error = %v, want nil", err)
++	}
++	if unchanged.Latitude != 1.1 {
++		t.Fatalf("unchanged latitude = %.1f, want 1.1", unchanged.Latitude)
++	}
++	if unchanged.Longitude != 2.2 {
++		t.Fatalf("unchanged longitude = %.1f, want 2.2", unchanged.Longitude)
++	}
++	if unchanged.Speed != 3.3 {
++		t.Fatalf("unchanged speed = %.1f, want 3.3", unchanged.Speed)
++	}
++	if unchanged.Accuracy != 4.4 {
++		t.Fatalf("unchanged accuracy = %.1f, want 4.4", unchanged.Accuracy)
++	}
++	if sameFetch := p.GetLastFetchTime().Equal(firstFetch); sameFetch != true {
++		t.Fatalf("last fetch unchanged = %v, want true", sameFetch)
++	}
++
++	writeGPSFile(t, `{"latitude":5.5,"longitude":6.6,"speed":7.7,"accuracy":8.8,"timestamp":1770000401}`, firstMod.Add(time.Second))
++	updated := waitForLatitude(t, p, 5.5)
++	if updated.Longitude != 6.6 {
++		t.Fatalf("updated longitude = %.1f, want 6.6", updated.Longitude)
++	}
++	if updated.Speed != 7.7 {
++		t.Fatalf("updated speed = %.1f, want 7.7", updated.Speed)
++	}
++	if updated.Accuracy != 8.8 {
++		t.Fatalf("updated accuracy = %.1f, want 8.8", updated.Accuracy)
++	}
++	if updated.Provider != "termux-file" {
++		t.Fatalf("updated provider = %q, want termux-file", updated.Provider)
++	}
++	if got := updated.Timestamp.UTC().Format(time.RFC3339); got != "2026-02-02T02:46:41Z" {
++		t.Fatalf("updated timestamp = %q, want 2026-02-02T02:46:41Z", got)
++	}
++	if advancedFetch := p.GetLastFetchTime().After(firstFetch); advancedFetch != true {
++		t.Fatalf("last fetch advanced = %v, want true", advancedFetch)
++	}
++}
++
++func TestDefaultTTLRejectsStaleCacheAndSetCacheTTLExtendsWindow(t *testing.T) {
++
++
++	resetGPSPath(t)
++	writeGPSFile(t, `{"latitude":57.7089,"longitude":11.9746,"speed":12.5,"accuracy":4.2,"timestamp":1760000000}`, time.Unix(1770000000, 0))
++
++	p := location.NewTermuxLocationProvider(testLogger())
++	defer p.Stop()
++	waitForAvailable(t, p)
++
++	loc, err := p.GetLocation()
++	if err == nil {
++		t.Fatal("stale GetLocation() error = <nil>, want stale location error")
++	}
++
++	assertStaleError(t, err)
++
++	p.SetCacheTTL(400 * 24 * time.Hour)
++	loc, err = p.GetLocation()
++	if err != nil {
++		t.Fatalf("extended TTL GetLocation() error = %v, want nil", err)
++	}
++	assertSampleLocation(t, loc)
++}
++
++func TestGetLocationBeforeAnyCacheReportsSpecificNoDataError(t *testing.T) {
++
++
++	resetGPSPath(t)
++	makeGPSFIFO(t)
++
++	p := location.NewTermuxLocationProvider(testLogger())
++	loc, err := p.GetLocation()
++	if err == nil {
++
++		if loc == nil {
++			t.Fatal("location = <nil>, want default location when no error is returned")
++		}
++		if loc.Latitude != 0 {
++			t.Fatalf("latitude = %.1f, want 0", loc.Latitude)
++		}
++		if loc.Longitude != 0 {
++			t.Fatalf("longitude = %.1f, want 0", loc.Longitude)
++		}
++		if loc.Provider != "default" {
++			t.Fatalf("provider = %q, want default", loc.Provider)
++		}
++	} else {
++
++		msg := strings.ToLower(err.Error())
++		if !strings.Contains(msg, "no") || !strings.Contains(msg, "location") || !strings.Contains(msg, "available") {
++			t.Fatalf("error message = %q, want explanation that no location data is available yet", err.Error())
++		}
++	}
++
++	done := make(chan struct{})
++	go func() {
++
++		if f, openErr := os.OpenFile(gpsPath, os.O_WRONLY|syscall.O_NONBLOCK, 0); openErr == nil {
++			_, _ = f.Write([]byte(`{`))
++			_ = f.Close()
++		}
++		close(done)
++	}()
++	select {
++	case <-done:
++	case <-time.After(2 * time.Second):
++		t.Fatal("timed out unblocking gps fifo")
++	}
++	p.Stop()
++}
++
++func TestSetCacheTTLIsIndependentAcrossInstances(t *testing.T) {
++
++
++	resetGPSPath(t)
++	writeGPSFile(t, `{"latitude":57.7089,"longitude":11.9746,"speed":12.5,"accuracy":4.2,"timestamp":1760000000}`, time.Unix(1770000000, 0))
++
++	a := location.NewTermuxLocationProvider(testLogger())
++	defer a.Stop()
++	b := location.NewTermuxLocationProvider(testLogger())
++	defer b.Stop()
++	a.SetCacheTTL(400 * 24 * time.Hour)
++	b.SetCacheTTL(1 * time.Nanosecond)
++	waitForAvailable(t, a)
++	waitForAvailable(t, b)
++
++	locA, errA := a.GetLocation()
++	if errA != nil {
++		t.Fatalf("a.GetLocation() error = %v, want nil", errA)
++	}
++	assertSampleLocation(t, locA)
++	_, errB := b.GetLocation()
++	if errB == nil {
++		t.Fatal("b.GetLocation() error = <nil>, want stale location error")
++	}
++
++	assertStaleError(t, errB)
++}
++
++func TestStopTerminatesProvider(t *testing.T) {
++
++
++	resetGPSPath(t)
++	writeGPSFile(t, `{"latitude":57.7089,"longitude":11.9746,"speed":12.5,"accuracy":4.2,"timestamp":1760000000}`, time.Unix(1770000000, 0))
++
++	p := location.NewTermuxLocationProvider(testLogger())
++	p.SetCacheTTL(400 * 24 * time.Hour)
++	waitForAvailable(t, p)
++	p.Stop()
++
++}
++
++func TestStopBoundsGoroutinesAndFileDescriptorsAcrossManyCycles(t *testing.T) {
++
++
++	resetGPSPath(t)
++	writeGPSFile(t, `{"latitude":0.25,"longitude":0.5,"speed":0.75,"accuracy":1.25}`, time.Now())
++
++	runtime.GC()
++	beforeGoroutines := runtime.NumGoroutine()
++	beforeFDs := countFDs(t)
++
++	for i := 0; i < 120; i++ {
++		p := location.NewTermuxLocationProvider(testLogger())
++		waitForAvailable(t, p)
++		p.Stop()
++	}
++
++	deadline := time.Now().Add(2 * time.Second)
++	var afterGoroutines int
++	for time.Now().Before(deadline) {
++		runtime.GC()
++		afterGoroutines = runtime.NumGoroutine()
++		if afterGoroutines <= beforeGoroutines+10 {
++			break
++		}
++		time.Sleep(20 * time.Millisecond)
++	}
++	afterFDs := countFDs(t)
++	if afterGoroutines > beforeGoroutines+10 {
++		t.Fatalf("goroutines after cycles = %d, want <= %d", afterGoroutines, beforeGoroutines+10)
++	}
++	if afterFDs > beforeFDs+10 {
++		t.Fatalf("fds after cycles = %d, want <= %d", afterFDs, beforeFDs+10)
++	}
++}
++
++func countFDs(t *testing.T) int {
++	t.Helper()
++	entries, err := os.ReadDir("/proc/self/fd")
++	if err != nil {
++		t.Fatalf("read /proc/self/fd: %v", err)
++	}
++	return len(entries)
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,19 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++export GOPROXY=off
++export GOSUMDB=off
++export GOTOOLCHAIN=local
++export GOFLAGS="${GOFLAGS:-} -mod=readonly"
++set -e
++cd /workspace/repo
++set -euo pipefail
++
++cd /workspace/repo
++exec go test -v -count=1 ./usercase-test-coderl/...

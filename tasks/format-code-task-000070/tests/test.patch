@@ -1,0 +1,264 @@
+diff --git a/internal/pin/toolfile/toolfile_test.go b/internal/pin/toolfile/toolfile_test.go
+new file mode 100644
+index 0000000..dbfed5f
+--- /dev/null
++++ b/internal/pin/toolfile/toolfile_test.go
+@@ -0,0 +1,237 @@
++
++
++
++
++
++package toolfile_test
++
++import (
++	"go/parser"
++	"go/token"
++	"os"
++	"path/filepath"
++	"strconv"
++	"strings"
++	"testing"
++
++	"github.com/DataDog/orchestrion/internal/pin/toolfile"
++)
++
++const orchestrionImportPath = "github.com/DataDog/orchestrion"
++
++const goGenerateDirective = "//go:generate go run github.com/DataDog/orchestrion pin"
++
++const toolFileName = "orchestrion.tool.go"
++
++func toolFilePath(dir string) string {
++	return filepath.Join(dir, toolFileName)
++}
++
++
++
++func readFile(t *testing.T, dir string) []byte {
++	t.Helper()
++	data, err := os.ReadFile(toolFilePath(dir))
++	if err != nil {
++		t.Fatalf("reading tool file: %v", err)
++	}
++	return data
++}
++
++
++
++func blankImports(t *testing.T, dir string) []string {
++	t.Helper()
++	data := readFile(t, dir)
++
++	fset := token.NewFileSet()
++	file, err := parser.ParseFile(fset, toolFilePath(dir), data, parser.ParseComments)
++	if err != nil {
++		t.Fatalf("generated file is not valid Go: %v\n%s", err, data)
++	}
++
++	if file.Name.Name != "tools" {
++		t.Fatalf("expected package %q, got %q", "tools", file.Name.Name)
++	}
++
++	var paths []string
++	for _, spec := range file.Imports {
++		if spec.Name == nil || spec.Name.Name != "_" {
++			t.Fatalf("expected blank import, got named import %v", spec.Name)
++		}
++		p, err := strconv.Unquote(spec.Path.Value)
++		if err != nil {
++			t.Fatalf("invalid import path %s: %v", spec.Path.Value, err)
++		}
++		paths = append(paths, p)
++	}
++	return paths
++}
++
++func countString(haystack, needle string) int {
++	return strings.Count(haystack, needle)
++}
++
++func contains(paths []string, want string) bool {
++	for _, p := range paths {
++		if p == want {
++			return true
++		}
++	}
++	return false
++}
++
++func TestUpdateCreatesFile(t *testing.T) {
++	dir := t.TempDir()
++
++	if err := toolfile.Update(dir, toolfile.Options{}); err != nil {
++		t.Fatalf("Update: %v", err)
++	}
++
++	if _, err := os.Stat(toolFilePath(dir)); err != nil {
++		t.Fatalf("tool file was not created: %v", err)
++	}
++
++	data := string(readFile(t, dir))
++	if !strings.Contains(data, "//go:build tools") {
++		t.Errorf("missing `//go:build tools` constraint:\n%s", data)
++	}
++
++	paths := blankImports(t, dir)
++	if !contains(paths, orchestrionImportPath) {
++		t.Errorf("expected blank import of %q, got %v", orchestrionImportPath, paths)
++	}
++
++	if !strings.Contains(data, goGenerateDirective) {
++		t.Errorf("expected the go:generate directive by default:\n%s", data)
++	}
++}
++
++func TestUpdateNoGenerate(t *testing.T) {
++	dir := t.TempDir()
++
++	if err := toolfile.Update(dir, toolfile.Options{NoGenerate: true}); err != nil {
++		t.Fatalf("Update: %v", err)
++	}
++
++	data := string(readFile(t, dir))
++	if strings.Contains(data, "//go:generate") {
++		t.Errorf("did not expect any go:generate directive:\n%s", data)
++	}
++	if !strings.Contains(data, "//go:build tools") {
++		t.Errorf("missing `//go:build tools` constraint:\n%s", data)
++	}
++
++	paths := blankImports(t, dir)
++	if !contains(paths, orchestrionImportPath) {
++		t.Errorf("expected blank import of %q, got %v", orchestrionImportPath, paths)
++	}
++}
++
++func TestUpdateIsIdempotent(t *testing.T) {
++	for _, opts := range []toolfile.Options{{}, {NoGenerate: true}} {
++		opts := opts
++		t.Run(strconv.FormatBool(opts.NoGenerate), func(t *testing.T) {
++			dir := t.TempDir()
++
++			if err := toolfile.Update(dir, opts); err != nil {
++				t.Fatalf("first Update: %v", err)
++			}
++			first := readFile(t, dir)
++
++			if err := toolfile.Update(dir, opts); err != nil {
++				t.Fatalf("second Update: %v", err)
++			}
++			second := readFile(t, dir)
++
++			if string(first) != string(second) {
++				t.Errorf("Update is not idempotent:\n--- first ---\n%s\n--- second ---\n%s", first, second)
++			}
++		})
++	}
++}
++
++func TestUpdatePreservesManualImports(t *testing.T) {
++	dir := t.TempDir()
++
++	manual := "//go:build tools\n\npackage tools\n\nimport (\n\t_ \"example.com/manual/one\"\n\t_ \"example.com/manual/two\"\n)\n"
++	if err := os.WriteFile(toolFilePath(dir), []byte(manual), 0o644); err != nil {
++		t.Fatalf("seeding tool file: %v", err)
++	}
++
++	if err := toolfile.Update(dir, toolfile.Options{}); err != nil {
++		t.Fatalf("Update: %v", err)
++	}
++
++	paths := blankImports(t, dir)
++	for _, want := range []string{"example.com/manual/one", "example.com/manual/two", orchestrionImportPath} {
++		if !contains(paths, want) {
++			t.Errorf("expected import %q to be present, got %v", want, paths)
++		}
++	}
++}
++
++func TestUpdateDoesNotDuplicateImports(t *testing.T) {
++	dir := t.TempDir()
++
++	if err := toolfile.Update(dir, toolfile.Options{}); err != nil {
++		t.Fatalf("first Update: %v", err)
++	}
++	if err := toolfile.Update(dir, toolfile.Options{}); err != nil {
++		t.Fatalf("second Update: %v", err)
++	}
++
++	paths := blankImports(t, dir)
++	count := 0
++	for _, p := range paths {
++		if p == orchestrionImportPath {
++			count++
++		}
++	}
++	if count != 1 {
++		t.Errorf("expected exactly one import of %q, found %d in %v", orchestrionImportPath, count, paths)
++	}
++}
++
++func TestUpdateTogglesDirective(t *testing.T) {
++	dir := t.TempDir()
++
++	if err := toolfile.Update(dir, toolfile.Options{}); err != nil {
++		t.Fatalf("Update with generate: %v", err)
++	}
++	if got := countString(string(readFile(t, dir)), "//go:generate"); got != 1 {
++		t.Fatalf("expected exactly one go:generate directive, found %d", got)
++	}
++
++	if err := toolfile.Update(dir, toolfile.Options{NoGenerate: true}); err != nil {
++		t.Fatalf("Update without generate: %v", err)
++	}
++
++	data := string(readFile(t, dir))
++	if strings.Contains(data, "//go:generate") {
++		t.Errorf("directive should have been removed:\n%s", data)
++	}
++
++
++	if paths := blankImports(t, dir); !contains(paths, orchestrionImportPath) {
++		t.Errorf("expected blank import of %q after toggling, got %v", orchestrionImportPath, paths)
++	}
++}
++
++func TestUpdateRejectsUnparseableFile(t *testing.T) {
++	dir := t.TempDir()
++
++	garbage := []byte("this is definitely not valid go source {{{\n")
++	if err := os.WriteFile(toolFilePath(dir), garbage, 0o644); err != nil {
++		t.Fatalf("seeding tool file: %v", err)
++	}
++
++	if err := toolfile.Update(dir, toolfile.Options{}); err == nil {
++		t.Fatalf("expected an error for an unparseable tool file, got nil")
++	}
++
++	data := readFile(t, dir)
++	if string(data) != string(garbage) {
++		t.Errorf("file should have been left unchanged, got:\n%s", data)
++	}
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,16 @@
++#!/usr/bin/env bash
++
++
++
++set -euo pipefail
++HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++cd /testbed
++
++
++
++
++
++go test ./internal/goenv/
++
++
++go test ./internal/pin/toolfile/

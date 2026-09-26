@@ -1,0 +1,260 @@
+diff --git a/cli/projectlist_test.go b/cli/projectlist_test.go
+new file mode 100644
+index 0000000000..35686e9d28
+--- /dev/null
++++ b/cli/projectlist_test.go
+@@ -0,0 +1,119 @@
++package cli_test
++
++import (
++	"bytes"
++	"strconv"
++	"strings"
++	"testing"
++
++	"github.com/stretchr/testify/require"
++
++	"github.com/coder/coder/cli/clitest"
++	"github.com/coder/coder/coderd"
++	"github.com/coder/coder/coderd/coderdtest"
++	"github.com/coder/coder/codersdk"
++)
++
++func TestProjectList(t *testing.T) {
++	t.Parallel()
++
++	t.Run("EmptyShowsCreateHint", func(t *testing.T) {
++		t.Parallel()
++		client := coderdtest.New(t)
++		coderdtest.CreateInitialUser(t, client)
++
++		output := runProjectListCommand(t, client, "projects", "list")
++
++		require.Contains(t, output, "coder projects create <directory>")
++		require.NotContains(t, output, "Last Updated")
++		require.NotContains(t, output, "Used By")
++	})
++
++	t.Run("ListShowsProjectTable", func(t *testing.T) {
++		t.Parallel()
++		client := coderdtest.New(t)
++		user := coderdtest.CreateInitialUser(t, client)
++		project := createReadyProject(t, client, user.Organization)
++
++		output := runProjectListCommand(t, client, "projects", "list")
++
++		require.Contains(t, output, project.Name)
++		require.Contains(t, output, "Project")
++		require.Contains(t, output, "Source")
++		require.Contains(t, output, "Last Updated")
++		require.Contains(t, output, "Used By")
++	})
++
++	t.Run("AliasShowsProjectTable", func(t *testing.T) {
++		t.Parallel()
++		client := coderdtest.New(t)
++		user := coderdtest.CreateInitialUser(t, client)
++		project := createReadyProject(t, client, user.Organization)
++
++		output := runProjectListCommand(t, client, "projects", "ls")
++
++		require.Contains(t, output, project.Name)
++		require.Contains(t, output, "Project")
++		require.Contains(t, output, "Source")
++		require.Contains(t, output, "Last Updated")
++		require.Contains(t, output, "Used By")
++	})
++
++	t.Run("UsedByPluralization", func(t *testing.T) {
++		t.Parallel()
++		client := coderdtest.New(t)
++		user := coderdtest.CreateInitialUser(t, client)
++		zeroOwnerProject := createReadyProject(t, client, user.Organization)
++		oneOwnerProject := createReadyProject(t, client, user.Organization)
++		_ = coderdtest.CreateWorkspace(t, client, "", oneOwnerProject.ID)
++
++		output := runProjectListCommand(t, client, "projects", "list")
++
++		require.Contains(t, output, zeroOwnerProject.Name)
++		require.Contains(t, output, oneOwnerProject.Name)
++		zeroUsedBy := usedByFields(t, output, zeroOwnerProject.Name)
++		oneUsedBy := usedByFields(t, output, oneOwnerProject.Name)
++		require.Equal(t, strconv.Itoa(0), zeroUsedBy[0])
++		require.Equal(t, strconv.Itoa(1), oneUsedBy[0])
++		require.NotEqual(t, zeroUsedBy[1], oneUsedBy[1])
++	})
++}
++
++func runProjectListCommand(t *testing.T, client *codersdk.Client, args ...string) string {
++	t.Helper()
++
++	cmd, root := clitest.New(t, args...)
++	clitest.SetupConfig(t, client, root)
++
++	var stdout bytes.Buffer
++	cmd.SetOut(&stdout)
++	err := cmd.Execute()
++	require.NoError(t, err)
++	return stdout.String()
++}
++
++func usedByFields(t *testing.T, output string, projectName string) []string {
++	t.Helper()
++
++	for _, line := range strings.Split(output, "\n") {
++		if !strings.Contains(line, projectName) {
++			continue
++		}
++		fields := strings.Fields(line)
++		require.GreaterOrEqual(t, len(fields), 2)
++		return fields[len(fields)-2:]
++	}
++	require.FailNowf(t, "project row not found", "project %q was not present in output:\n%s", projectName, output)
++	return nil
++}
++
++func createReadyProject(t *testing.T, client *codersdk.Client, organization string) coderd.Project {
++	t.Helper()
++
++	daemon := coderdtest.NewProvisionerDaemon(t, client)
++	defer daemon.Close()
++
++	job := coderdtest.CreateProjectImportJob(t, client, organization, nil)
++	coderdtest.AwaitProjectImportJob(t, client, organization, job.ID)
++	return coderdtest.CreateProject(t, client, organization, job.ID)
++}
+diff --git a/coderd/projects_test.go b/coderd/projects_test.go
+index 9ea0cbf87f..6fa5a65490 100644
+--- a/coderd/projects_test.go
++++ b/coderd/projects_test.go
+@@ -2,6 +2,7 @@ package coderd_test
+ 
+ import (
+ 	"context"
++	"encoding/json"
+ 	"net/http"
+ 	"testing"
+ 
+@@ -11,6 +12,7 @@ import (
+ 	"github.com/coder/coder/coderd/coderdtest"
+ 	"github.com/coder/coder/codersdk"
+ 	"github.com/coder/coder/database"
++	"github.com/coder/coder/httpmw"
+ )
+ 
+ func TestProjects(t *testing.T) {
+@@ -36,6 +38,22 @@ func TestProjects(t *testing.T) {
+ 		require.NoError(t, err)
+ 		require.Len(t, projects, 1)
+ 	})
++
++	t.Run("ListWorkspaceOwnerCountDistinctOwners", func(t *testing.T) {
++		t.Parallel()
++		client := coderdtest.New(t)
++		user := coderdtest.CreateInitialUser(t, client)
++
++		noWorkspaceProject := createProjectForUsageCount(t, client, user.Organization)
++		oneOwnerProject := createProjectForUsageCount(t, client, user.Organization)
++		_ = coderdtest.CreateWorkspace(t, client, "", oneOwnerProject.ID)
++		_ = coderdtest.CreateWorkspace(t, client, "", oneOwnerProject.ID)
++
++		counts := projectUsageCountsByName(t, client, "")
++
++		require.Equal(t, float64(0), counts[noWorkspaceProject.Name])
++		require.Equal(t, float64(1), counts[oneOwnerProject.Name])
++	})
+ }
+ 
+ func TestProjectsByOrganization(t *testing.T) {
+@@ -60,6 +78,22 @@ func TestProjectsByOrganization(t *testing.T) {
+ 		require.NoError(t, err)
+ 		require.Len(t, projects, 1)
+ 	})
++
++	t.Run("ListWorkspaceOwnerCountDistinctOwners", func(t *testing.T) {
++		t.Parallel()
++		client := coderdtest.New(t)
++		user := coderdtest.CreateInitialUser(t, client)
++
++		noWorkspaceProject := createProjectForUsageCount(t, client, user.Organization)
++		oneOwnerProject := createProjectForUsageCount(t, client, user.Organization)
++		_ = coderdtest.CreateWorkspace(t, client, "", oneOwnerProject.ID)
++		_ = coderdtest.CreateWorkspace(t, client, "", oneOwnerProject.ID)
++
++		counts := projectUsageCountsByName(t, client, user.Organization)
++
++		require.Equal(t, float64(0), counts[noWorkspaceProject.Name])
++		require.Equal(t, float64(1), counts[oneOwnerProject.Name])
++	})
+ }
+ 
+ func TestPostProjectsByOrganization(t *testing.T) {
+@@ -151,3 +185,47 @@ func TestParametersByProject(t *testing.T) {
+ 		require.Len(t, params, 1)
+ 	})
+ }
++
++func createProjectForUsageCount(t *testing.T, client *codersdk.Client, organization string) coderd.Project {
++	t.Helper()
++
++	daemon := coderdtest.NewProvisionerDaemon(t, client)
++	defer daemon.Close()
++
++	job := coderdtest.CreateProjectImportJob(t, client, organization, nil)
++	coderdtest.AwaitProjectImportJob(t, client, organization, job.ID)
++	return coderdtest.CreateProject(t, client, organization, job.ID)
++}
++
++func projectUsageCountsByName(t *testing.T, client *codersdk.Client, organization string) map[string]float64 {
++	t.Helper()
++
++	route := "/api/v2/projects"
++	if organization != "" {
++		route += "/" + organization
++	}
++	serverURL, err := client.URL.Parse(route)
++	require.NoError(t, err)
++	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, serverURL.String(), nil)
++	require.NoError(t, err)
++	req.AddCookie(&http.Cookie{
++		Name:  httpmw.AuthCookie,
++		Value: client.SessionToken,
++	})
++	res, err := http.DefaultClient.Do(req)
++	require.NoError(t, err)
++	defer res.Body.Close()
++	require.Equal(t, http.StatusOK, res.StatusCode)
++
++	var projects []map[string]interface{}
++	require.NoError(t, json.NewDecoder(res.Body).Decode(&projects))
++	counts := make(map[string]float64, len(projects))
++	for _, project := range projects {
++		name, ok := project["name"].(string)
++		require.True(t, ok)
++		count, ok := project["workspace_owner_count"].(float64)
++		require.True(t, ok)
++		counts[name] = count
++	}
++	return counts
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,16 @@
++#!/bin/bash
++set -uo pipefail
++cd /testbed
++
++case "${1:-}" in
++  base)
++    go test -v -count=1 -run 'TestProject(Create|Plan|Update)' ./cli/
++    ;;
++  new)
++    go test -v -count=1 -run 'TestProjectList|TestProjects/ListWorkspaceOwnerCountDistinctOwners|TestProjectsByOrganization/ListWorkspaceOwnerCountDistinctOwners' ./cli/ ./coderd/
++    ;;
++  *)
++    echo "usage: $0 base|new"
++    exit 2
++    ;;
++esac

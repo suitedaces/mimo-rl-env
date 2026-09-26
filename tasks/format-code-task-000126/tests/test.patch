@@ -1,0 +1,379 @@
+diff --git a/tests/test_conf_branch_pipeline.py b/tests/test_conf_branch_pipeline.py
+new file mode 100644
+index 0000000..a3c0538
+--- /dev/null
++++ b/tests/test_conf_branch_pipeline.py
+@@ -0,0 +1,227 @@
++import math
++import sys
++import types
++from pathlib import Path
++
++import pytest
++import torch
++import torch.nn as nn
++import yaml
++
++
++def _install_optional_dependency_stubs():
++    class Registry:
++        def register_module(self, *args, **kwargs):
++            def decorate(cls):
++                return cls
++
++            return decorate
++
++    mmcls = types.ModuleType("mmcls")
++    mmcls_models = types.ModuleType("mmcls.models")
++    mmcls_apis = types.ModuleType("mmcls.apis")
++    mmcls_models.CLASSIFIERS = Registry()
++    mmcls_models.ImageClassifier = nn.Module
++    mmcls_apis.init_model = lambda *args, **kwargs: None
++    mmcls.models = mmcls_models
++    mmcls.apis = mmcls_apis
++    sys.modules.setdefault("mmcls", mmcls)
++    sys.modules.setdefault("mmcls.models", mmcls_models)
++    sys.modules.setdefault("mmcls.apis", mmcls_apis)
++
++    mmcv = types.ModuleType("mmcv")
++
++    class Config:
++        @classmethod
++        def fromfile(cls, *args, **kwargs):
++            return cls()
++
++    mmcv.Config = Config
++    sys.modules.setdefault("mmcv", mmcv)
++
++    turtle = types.ModuleType("turtle")
++    turtle.forward = lambda *args, **kwargs: None
++    sys.modules.setdefault("turtle", turtle)
++
++    diffdist = types.ModuleType("diffdist")
++    diffdist_functional = types.ModuleType("diffdist.functional")
++    diffdist.functional = diffdist_functional
++    sys.modules.setdefault("diffdist", diffdist)
++    sys.modules.setdefault("diffdist.functional", diffdist_functional)
++
++    sys.modules.setdefault("libmr", types.ModuleType("libmr"))
++    sys.modules.setdefault("faiss", types.ModuleType("faiss"))
++
++
++_install_optional_dependency_stubs()
++
++from openood.networks.conf_branch_net import ConfBranchNet
++from openood.recorders.utils import get_recorder
++
++
++class AttrDict(dict):
++
++
++    def __getattr__(self, name):
++        try:
++            value = self[name]
++        except KeyError as exc:
++            raise AttributeError(name) from exc
++        if isinstance(value, dict):
++            value = AttrDict(value)
++            self[name] = value
++        return value
++
++    def __setattr__(self, name, value):
++        self[name] = value
++
++
++def _to_attrdict(value):
++    if isinstance(value, dict):
++        return AttrDict({key: _to_attrdict(val) for key, val in value.items()})
++    if isinstance(value, list):
++        return [_to_attrdict(item) for item in value]
++    return value
++
++
++class DeterministicBackbone(nn.Module):
++    def __init__(self, num_classes, feature_size):
++        super().__init__()
++        self.num_classes = num_classes
++        self.feature_size = feature_size
++
++    def forward(self, x, *args, **kwargs):
++        batch = x.shape[0]
++        signal = x.reshape(batch, -1).mean(dim=1, keepdim=True)
++        logits = signal.repeat(1, self.num_classes)
++        feature_scale = torch.arange(
++            1, self.feature_size + 1, dtype=x.dtype, device=x.device
++        ).unsqueeze(0)
++        features = signal.repeat(1, self.feature_size) * feature_scale
++        return logits, features
++
++
++@pytest.mark.parametrize(
++    "batch_size,num_classes,feature_size",
++    [(2, 7, 19), (3, 5, 13)],
++)
++def test_conf_branch_forward_accepts_multiple_nontrivial_backbones(
++    batch_size, num_classes, feature_size
++):
++    net = ConfBranchNet(
++        DeterministicBackbone(num_classes=num_classes, feature_size=feature_size),
++        num_classes=num_classes,
++    )
++    x = torch.randn(batch_size, 3, 4, 4)
++
++    pred = net(x)
++
++    assert pred.shape == (batch_size, num_classes)
++
++
++def test_conf_branch_forward_uses_backbone_dependent_signal_for_outputs():
++    net = ConfBranchNet(DeterministicBackbone(num_classes=6, feature_size=17), 6)
++    x_low = torch.zeros(2, 3, 4, 4)
++    x_high = torch.ones(2, 3, 4, 4)
++
++    pred_low, conf_low = net(x_low, return_confidence=True)
++    pred_high, conf_high = net(x_high, return_confidence=True)
++
++    assert pred_low.shape == (2, 6)
++    assert conf_low.shape == (2, 1)
++    assert pred_high.shape == (2, 6)
++    assert conf_high.shape == (2, 1)
++    assert (not torch.allclose(pred_low, pred_high)) or (
++        not torch.allclose(conf_low, conf_high)
++    )
++
++
++def test_train_conf_branch_config_uses_constructible_recorder(tmp_path):
++    config_path = (
++        Path(__file__).resolve().parents[1]
++        / "configs"
++        / "pipelines"
++        / "train"
++        / "train_conf_branch.yml"
++    )
++    config = _to_attrdict(yaml.safe_load(config_path.read_text()))
++    config.output_dir = str(tmp_path)
++
++    recorder = get_recorder(config)
++
++    assert all(hasattr(recorder, name) for name in ("report", "save_model", "summary"))
++
++
++class TinyLoader:
++    def __init__(self, batches):
++        self.batches = batches
++        self._idx = 0
++
++    def __iter__(self):
++        self._idx = 0
++        return self
++
++    def __len__(self):
++        return len(self.batches)
++
++    def __next__(self):
++        if self._idx >= len(self.batches):
++            raise StopIteration
++        batch = self.batches[self._idx]
++        self._idx += 1
++        return batch
++
++
++def test_conf_branch_train_epoch_metrics_include_loss(monkeypatch):
++    from openood.trainers.conf_branch_trainer import ConfBranchTrainer
++
++    monkeypatch.setattr(torch.Tensor, "cuda", lambda self, *args, **kwargs: self)
++    monkeypatch.setattr(nn.Module, "cuda", lambda self, *args, **kwargs: self)
++
++    class TinyConfNet(nn.Module):
++        def __init__(self):
++            super().__init__()
++            self.linear = nn.Linear(4, 3)
++            self.confidence = nn.Linear(4, 1)
++
++        def forward(self, x, return_confidence=False):
++            flat = x.view(x.shape[0], -1)
++            pred = self.linear(flat)
++            confidence = self.confidence(flat)
++            if return_confidence:
++                return pred, confidence
++            return pred
++
++    config = AttrDict(
++        {
++            "baseline": False,
++            "num_classes": 3,
++            "trainer": {"budget": 0.3, "lmbda": 0.1, "eps": 1.0e-12},
++            "optimizer": {
++                "lr": 0.01,
++                "momentum": 0.0,
++                "nesterov": False,
++                "weight_decay": 0.0,
++            },
++            "scheduler": {"milestones": [1], "gamma": 1.0},
++        }
++    )
++    loader = TinyLoader(
++        [
++            {
++                "data": torch.tensor(
++                    [[[[0.0, 1.0], [2.0, 3.0]]], [[[1.0, 0.0], [1.0, 0.0]]]]
++                ),
++                "label": torch.tensor([0, 2]),
++            }
++        ]
++    )
++    trainer = ConfBranchTrainer(TinyConfNet(), loader, config)
++
++    _, metrics = trainer.train_epoch(epoch_idx=11)
++
++    assert isinstance(metrics, dict)
++    assert metrics["epoch_idx"] == 11
++    assert "train_acc" in metrics
++    assert "loss" in metrics
++    assert math.isfinite(float(torch.as_tensor(metrics["loss"]).item()))
+diff --git a/tests/test_opengan_registry.py b/tests/test_opengan_registry.py
+new file mode 100644
+index 0000000..10afecf
+--- /dev/null
++++ b/tests/test_opengan_registry.py
+@@ -0,0 +1,89 @@
++import sys
++import types
++
++import torch
++import torch.nn as nn
++
++
++def _install_optional_dependency_stubs():
++    diffdist = types.ModuleType("diffdist")
++    diffdist_functional = types.ModuleType("diffdist.functional")
++    diffdist.functional = diffdist_functional
++    sys.modules.setdefault("diffdist", diffdist)
++    sys.modules.setdefault("diffdist.functional", diffdist_functional)
++    sys.modules.setdefault("libmr", types.ModuleType("libmr"))
++    sys.modules.setdefault("faiss", types.ModuleType("faiss"))
++
++
++_install_optional_dependency_stubs()
++
++from openood.postprocessors.opengan_postprocessor import OpenGanPostprocessor
++from openood.postprocessors.utils import get_postprocessor
++from openood.trainers.opengan_trainer import OpenGanTrainer
++from openood.trainers.utils import get_trainer
++
++
++class AttrDict(dict):
++    def __getattr__(self, name):
++        try:
++            value = self[name]
++        except KeyError as exc:
++            raise AttributeError(name) from exc
++        if isinstance(value, dict):
++            value = AttrDict(value)
++            self[name] = value
++        return value
++
++    def __setattr__(self, name, value):
++        self[name] = value
++
++
++def test_opengan_postprocessor_registry_accepts_lowercase_name():
++    config = AttrDict(
++        {
++            "postprocessor": {"name": "opengan"},
++            "network": {"name": "opengan"},
++            "dataset": {"name": "cifar10", "num_classes": 10},
++            "num_classes": 10,
++        }
++    )
++
++    postprocessor = get_postprocessor(config)
++
++    assert isinstance(postprocessor, OpenGanPostprocessor)
++
++
++class TinyGenerator(nn.Module):
++    def __init__(self):
++        super().__init__()
++        self.weight = nn.Parameter(torch.ones(1))
++
++    def forward(self, z):
++        return z[:, :1] * self.weight.view(1, 1, 1, 1)
++
++
++class TinyDiscriminator(nn.Module):
++    def __init__(self):
++        super().__init__()
++        self.weight = nn.Parameter(torch.ones(1))
++
++    def forward(self, x):
++        dims = tuple(range(1, x.ndim))
++        return torch.sigmoid(x.mean(dim=dims, keepdim=True) * self.weight)
++
++
++def test_opengan_trainer_registry_accepts_lowercase_name():
++    config = AttrDict(
++        {
++            "trainer": {"name": "opengan"},
++            "optimizer": {"num_epochs": 1, "lr": 0.001, "beta1": 0.5},
++            "dataset": {"num_classes": 10},
++            "network": {"name": "opengan", "nz": 2},
++            "num_classes": 10,
++        }
++    )
++    net = {"netG": TinyGenerator(), "netD": TinyDiscriminator()}
++
++    trainer = get_trainer(net, [], config)
++
++    assert isinstance(trainer, OpenGanTrainer)
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,46 @@
++#!/bin/bash
++set -uo pipefail
++cd /testbed
++
++
++set +u
++source /testbed/.build_env/.venv/bin/activate
++set -u
++
++
++NEW_TESTS=(
++  tests/test_conf_branch_pipeline.py
++  tests/test_opengan_registry.py
++)
++
++case "${1:-}" in
++  base)
++    base_tests=()
++    if [ -d tests ]; then
++      while IFS= read -r test_file; do
++        skip=false
++        for new_test in "${NEW_TESTS[@]}"; do
++          if [ "$test_file" = "$new_test" ]; then
++            skip=true
++            break
++          fi
++        done
++        if [ "$skip" = false ]; then
++          base_tests+=("$test_file")
++        fi
++      done < <(find tests -type f -name 'test*.py' | sort)
++    fi
++    if [ "${#base_tests[@]}" -eq 0 ]; then
++      echo "No pre-existing tests to run for base regression."
++      exit 0
++    fi
++    python -m pytest -q "${base_tests[@]}"
++    ;;
++  new)
++    python -m pytest -q "${NEW_TESTS[@]}"
++    ;;
++  *)
++    echo "usage: $0 base|new"
++    exit 2
++    ;;
++esac

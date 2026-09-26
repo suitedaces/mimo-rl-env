@@ -1,0 +1,213 @@
+diff --git a/pandas/tests/io/test_compression.py b/pandas/tests/io/test_compression.py
+index ce459ab24a..7940fcb7d9 100644
+--- a/pandas/tests/io/test_compression.py
++++ b/pandas/tests/io/test_compression.py
+@@ -1,5 +1,8 @@
+ import contextlib
+ import os
++import subprocess
++import sys
++import textwrap
+ import warnings
+ 
+ import pytest
+@@ -125,3 +128,156 @@ def test_compression_warning(compression_only):
+         with tm.assert_produces_warning(RuntimeWarning, check_stacklevel=False):
+             with f:
+                 df.to_csv(f, compression=compression_only)
++
++
++def test_import_pandas_without_lzma_succeeds_and_warns():
++    code = textwrap.dedent(
++        """
++        import sys
++        import warnings
++
++        sys.modules["lzma"] = None
++
++        with warnings.catch_warnings(record=True) as caught:
++            warnings.simplefilter("always")
++            warnings.simplefilter("ignore", DeprecationWarning)
++            warnings.simplefilter("ignore", FutureWarning)
++            import pandas  # noqa: F401
++
++        assert caught
++        assert all(issubclass(warning.category, Warning) for warning in caught)
++        """
++    )
++    subprocess.check_call([sys.executable, "-c", code])
++
++
++def test_import_pandas_without_lzma_extension_succeeds_and_warns():
++    code = textwrap.dedent(
++        """
++        import builtins
++        import sys
++        import warnings
++
++        sys.modules.pop("lzma", None)
++        sys.modules.pop("_lzma", None)
++        original_import = builtins.__import__
++
++        def missing_lzma_import(name, globals=None, locals=None, fromlist=(), level=0):
++            if name in {"lzma", "_lzma"}:
++                raise ImportError("No module named '_lzma'", name="_lzma")
++            return original_import(name, globals, locals, fromlist, level)
++
++        builtins.__import__ = missing_lzma_import
++        try:
++            with warnings.catch_warnings(record=True) as caught:
++                warnings.simplefilter("always")
++                warnings.simplefilter("ignore", DeprecationWarning)
++                warnings.simplefilter("ignore", FutureWarning)
++                import pandas  # noqa: F401
++        finally:
++            builtins.__import__ = original_import
++
++        assert caught
++        assert all(issubclass(warning.category, Warning) for warning in caught)
++        """
++    )
++    subprocess.check_call([sys.executable, "-c", code])
++
++
++def test_missing_lzma_xz_write_raises_runtimeerror(tmpdir):
++    out_path = str(tmpdir.join("missing_lzma_write.csv.xz"))
++    code = textwrap.dedent(
++        """
++        import sys
++        import warnings
++
++        sys.modules["lzma"] = None
++
++        with warnings.catch_warnings():
++            warnings.simplefilter("ignore")
++            import pandas as pd
++
++        df = pd.DataFrame({{"a": [1, 2], "b": ["x", "y"]}})
++
++        try:
++            df.to_csv({out_path!r}, compression="xz")
++        except RuntimeError:
++            pass
++        else:
++            raise AssertionError("xz write without lzma did not raise RuntimeError")
++        """.format(out_path=out_path)
++    )
++    subprocess.check_call([sys.executable, "-c", code])
++
++
++def test_missing_lzma_xz_write_raises_for_arbitrary_user_path(tmpdir):
++    out_path = str(tmpdir.join("user_supplied_archive.csv.xz"))
++    code = textwrap.dedent(
++        """
++        import sys
++        import warnings
++
++        sys.modules["lzma"] = None
++
++        with warnings.catch_warnings():
++            warnings.simplefilter("ignore")
++            import pandas as pd
++
++        df = pd.DataFrame({{"payload": ["first", "second"]}})
++
++        try:
++            df.to_csv({out_path!r}, compression="xz")
++        except RuntimeError:
++            pass
++        else:
++            raise AssertionError("xz write without lzma did not raise RuntimeError")
++        """.format(out_path=out_path)
++    )
++    subprocess.check_call([sys.executable, "-c", code])
++
++
++def test_missing_lzma_xz_read_raises_runtimeerror_before_non_xz_paths_are_affected(
++    tmpdir,
++):
++    plain_path = str(tmpdir.join("plain.csv"))
++    xz_requested_path = str(tmpdir.join("xz_requested.csv"))
++    code = textwrap.dedent(
++        """
++        import sys
++        import warnings
++
++        sys.modules["lzma"] = None
++
++        with warnings.catch_warnings():
++            warnings.simplefilter("ignore")
++            import pandas as pd
++
++        df = pd.DataFrame({{"value": [10, 20, 30]}})
++        df.to_csv({plain_path!r}, index=False)
++        result = pd.read_csv({plain_path!r})
++        assert result["value"].tolist() == [10, 20, 30]
++
++        with open({xz_requested_path!r}, "w") as handle:
++            handle.write("value\\n1\\n")
++
++        try:
++            pd.read_csv({xz_requested_path!r}, compression="xz")
++        except RuntimeError:
++            pass
++        else:
++            raise AssertionError("xz read without lzma did not raise RuntimeError")
++        """.format(plain_path=plain_path, xz_requested_path=xz_requested_path)
++    )
++    subprocess.check_call([sys.executable, "-c", code])
++
++
++def test_xz_csv_roundtrip_still_works_when_lzma_available(tmpdir):
++    pytest.importorskip("lzma")
++
++    path = str(tmpdir.join("roundtrip.csv.xz"))
++    expected = pd.DataFrame({"a": [1, 2, 3], "b": ["alpha", "beta", "gamma"]})
++
++    expected.to_csv(path, index=False, compression="xz")
++    result = pd.read_csv(path, compression="xz")
++
++    tm.assert_frame_equal(result, expected)
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,38 @@
++#!/bin/bash
++set -uo pipefail
++cd /testbed
++
++
++
++dev-switch python3 3.11
++
++
++python3 -m pip install -q "numpy>=1.23.0,<1.24" "Cython>=0.28.2,<3.0" python-dateutil pytz hypothesis pytest setuptools 2>/dev/null || true
++
++
++CFLAGS="-DNUMPY_IMPORT_ARRAY_RETVAL=0" python3 -m pip install -e /testbed --no-build-isolation --no-input -q 2>/dev/null
++
++
++NEW_TESTS=(
++  "pandas/tests/io/test_compression.py::test_import_pandas_without_lzma_succeeds_and_warns"
++  "pandas/tests/io/test_compression.py::test_import_pandas_without_lzma_extension_succeeds_and_warns"
++  "pandas/tests/io/test_compression.py::test_missing_lzma_xz_write_raises_runtimeerror"
++  "pandas/tests/io/test_compression.py::test_missing_lzma_xz_write_raises_for_arbitrary_user_path"
++  "pandas/tests/io/test_compression.py::test_missing_lzma_xz_read_raises_runtimeerror_before_non_xz_paths_are_affected"
++  "pandas/tests/io/test_compression.py::test_xz_csv_roundtrip_still_works_when_lzma_available"
++)
++
++case "${1:-}" in
++  base)
++    python3 -m pytest pandas/tests/io/test_compression.py pandas/tests/io/test_pickle.py \
++      -k 'not test_import_pandas_without_lzma_succeeds_and_warns and not test_import_pandas_without_lzma_extension_succeeds_and_warns and not test_missing_lzma_xz_write_raises_runtimeerror and not test_missing_lzma_xz_write_raises_for_arbitrary_user_path and not test_missing_lzma_xz_read_raises_runtimeerror_before_non_xz_paths_are_affected and not test_xz_csv_roundtrip_still_works_when_lzma_available' \
++      -v
++    ;;
++  new)
++    python3 -m pytest "${NEW_TESTS[@]}" -v
++    ;;
++  *)
++    echo "usage: $0 base|new"
++    exit 2
++    ;;
++esac

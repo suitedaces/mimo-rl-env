@@ -1,0 +1,422 @@
+diff --git a/usercase-test-coderl/test_auditor_deduplicates_vulnerabilities.py b/usercase-test-coderl/test_auditor_deduplicates_vulnerabilities.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/test_auditor_deduplicates_vulnerabilities.py
+@@ -0,0 +1,393 @@
++
++
++
++
++
++
++
++
++
++
++from collections.abc import Iterator
++
++from packaging.version import Version
++
++from pip_audit._audit import AuditOptions, Auditor
++from pip_audit._dependency_source import DependencySource
++from pip_audit._service import (
++    Dependency,
++    ResolvedDependency,
++    VulnerabilityResult,
++    VulnerabilityService,
++)
++
++
++def _dep(name: str = "demo-pkg", version: str = "1.0.0") -> ResolvedDependency:
++    return ResolvedDependency(name=name, version=Version(version))
++
++
++def _vuln(id_: str, aliases: set[str]) -> VulnerabilityResult:
++    return VulnerabilityResult(
++        id=id_,
++        description=f"desc {id_}",
++        fix_versions=[Version("2.0.0")],
++        aliases=aliases,
++    )
++
++
++class RecordingSource(DependencySource):
++    def __init__(self, deps: list[Dependency]):
++        self.deps = deps
++        self.collect_calls = 0
++
++    def collect(self) -> Iterator[Dependency]:
++        self.collect_calls += 1
++        yield from self.deps
++
++    def fix(self, _fix_version) -> None:
++        raise NotImplementedError
++
++
++class RecordingService(VulnerabilityService):
++    def __init__(self, responses: dict[str, list[VulnerabilityResult]]):
++        self.responses = responses
++        self.query_all_calls = 0
++        self.spec_batches: list[list[Dependency]] = []
++
++    def query(self, spec: Dependency) -> tuple[Dependency, list[VulnerabilityResult]]:
++        return spec, self.responses[spec.name]
++
++    def query_all(
++        self, specs: Iterator[Dependency]
++    ) -> Iterator[tuple[Dependency, list[VulnerabilityResult]]]:
++        self.query_all_calls += 1
++        batch = list(specs)
++        self.spec_batches.append(batch)
++        for dep in batch:
++            yield dep, self.responses[dep.name]
++
++
++def _summary(
++    results: list[tuple[Dependency, list[VulnerabilityResult]]],
++) -> list[tuple[str, str, list[tuple[str, list[str]]]]]:
++
++
++    return sorted(
++        [
++            (
++                dep.name,
++                str(dep.version),
++                sorted(
++                    [
++                        (
++                            vuln.id,
++                            sorted(vuln.aliases),
++                        )
++                        for vuln in vulns
++                    ],
++                    key=lambda item: (item[0], item[1]),
++                ),
++            )
++            for dep, vulns in results
++        ],
++        key=lambda item: (item[0], item[1]),
++    )
++
++
++def _service_batches_summary(
++    service: RecordingService,
++) -> list[set[tuple[str, str]]]:
++
++
++    return [
++        {(dep.name, str(dep.version)) for dep in batch} for batch in service.spec_batches
++    ]
++
++
++def test_audit_collapses_two_records_and_merges_aliases() -> None:
++
++
++
++
++    dep = _dep()
++    source = RecordingSource([dep])
++    service = RecordingService(
++        {
++            "demo-pkg": [
++                _vuln("PYSEC-0", {"CVE-2024-0001"}),
++                _vuln("GHSA-aaaa", {"CVE-2024-0001", "GHSA-aaaa"}),
++            ]
++        }
++    )
++
++    assert source.collect_calls == 0
++    assert service.query_all_calls == 0
++
++    results = list(Auditor(service, options=AuditOptions()).audit(source))
++
++    assert _summary(results) == [
++        (
++            "demo-pkg",
++            "1.0.0",
++            [("PYSEC-0", ["CVE-2024-0001", "GHSA-aaaa"])],
++        )
++    ]
++
++
++    assert source.collect_calls >= 1
++    assert service.query_all_calls >= 1
++    assert _service_batches_summary(service) == [{("demo-pkg", "1.0.0")}]
++
++
++def test_pysec_result_wins_when_provider_returns_it_second() -> None:
++
++
++
++
++    dep = _dep()
++    source = RecordingSource([dep])
++    service = RecordingService(
++        {
++            "demo-pkg": [
++                _vuln("GHSA-aaaa", {"CVE-2024-0001", "GHSA-aaaa"}),
++                _vuln("PYSEC-0", {"CVE-2024-0001"}),
++            ]
++        }
++    )
++
++    results = list(Auditor(service).audit(source))
++
++    assert _summary(results) == [
++        (
++            "demo-pkg",
++            "1.0.0",
++            [("PYSEC-0", ["CVE-2024-0001", "GHSA-aaaa"])],
++        )
++    ]
++
++
++    assert source.collect_calls >= 1
++    assert service.query_all_calls >= 1
++
++
++def test_three_alias_linked_records_collapse_to_one_pysec_result() -> None:
++
++
++
++
++    dep = _dep()
++    source = RecordingSource([dep])
++    service = RecordingService(
++        {
++            "demo-pkg": [
++                _vuln("PYSEC-0", {"CVE-2024-0001"}),
++                _vuln("GHSA-aaaa", {"CVE-2024-0001"}),
++                _vuln("CVE-2024-0001", {"GHSA-aaaa"}),
++            ]
++        }
++    )
++
++    results = list(Auditor(service).audit(source))
++
++    assert _summary(results) == [
++        (
++            "demo-pkg",
++            "1.0.0",
++            [("PYSEC-0", ["CVE-2024-0001", "GHSA-aaaa"])],
++        )
++    ]
++
++
++    assert source.collect_calls >= 1
++    assert service.query_all_calls >= 1
++
++
++def test_audit_deduplicates_each_dependency_independently() -> None:
++
++
++
++
++    first = _dep("demo-pkg", "1.0.0")
++    second = _dep("other-pkg", "4.5.6")
++    source = RecordingSource([first, second])
++    service = RecordingService(
++        {
++            "demo-pkg": [
++                _vuln("PYSEC-0", {"CVE-2024-0001"}),
++                _vuln("GHSA-aaaa", {"CVE-2024-0001", "GHSA-aaaa"}),
++            ],
++            "other-pkg": [
++                _vuln("GHSA-bbbb", {"CVE-2024-0002"}),
++                _vuln("PYSEC-1", {"CVE-2024-0002"}),
++            ],
++        }
++    )
++
++    results = list(Auditor(service).audit(source))
++
++    assert _summary(results) == [
++        (
++            "demo-pkg",
++            "1.0.0",
++            [("PYSEC-0", ["CVE-2024-0001", "GHSA-aaaa"])],
++        ),
++        (
++            "other-pkg",
++            "4.5.6",
++            [("PYSEC-1", ["CVE-2024-0002"])],
++        ),
++    ]
++
++
++    assert source.collect_calls >= 1
++    assert service.query_all_calls >= 1
++    assert _service_batches_summary(service) == [
++        {("demo-pkg", "1.0.0"), ("other-pkg", "4.5.6")}
++    ]
++
++
++def test_audit_preserves_distinct_non_overlapping_vulnerabilities() -> None:
++
++
++
++
++    dep = _dep()
++    source = RecordingSource([dep])
++    service = RecordingService(
++        {
++            "demo-pkg": [
++                _vuln("PYSEC-0", {"CVE-2024-0001"}),
++                _vuln("GHSA-bbbb", {"CVE-2024-0002"}),
++            ]
++        }
++    )
++
++    results = list(Auditor(service).audit(source))
++
++    assert _summary(results) == [
++        (
++            "demo-pkg",
++            "1.0.0",
++            [
++                ("GHSA-bbbb", ["CVE-2024-0002"]),
++                ("PYSEC-0", ["CVE-2024-0001"]),
++            ],
++        )
++    ]
++
++
++    assert source.collect_calls >= 1
++    assert service.query_all_calls >= 1
++
++
++def test_default_options_collects_source_and_queries_service() -> None:
++
++
++
++
++    dep = _dep()
++    source = RecordingSource([dep])
++    service = RecordingService({"demo-pkg": [_vuln("PYSEC-0", {"CVE-2024-0001"})]})
++
++
++
++    results = list(Auditor(service, options=AuditOptions()).audit(source))
++
++    assert _summary(results) == [
++        ("demo-pkg", "1.0.0", [("PYSEC-0", ["CVE-2024-0001"])])
++    ]
++
++
++    assert source.collect_calls >= 1
++    assert service.query_all_calls >= 1
++    assert _service_batches_summary(service) == [{("demo-pkg", "1.0.0")}]
++
++
++def test_same_auditor_uses_current_service_results_on_repeated_audits() -> None:
++
++
++
++
++    dep = _dep()
++    service = RecordingService(
++        {
++            "demo-pkg": [
++                _vuln("PYSEC-0", {"CVE-2024-0001"}),
++                _vuln("GHSA-aaaa", {"CVE-2024-0001"}),
++            ]
++        }
++    )
++    auditor = Auditor(service)
++
++    first_results = list(auditor.audit(RecordingSource([dep])))
++    service.responses = {
++        "demo-pkg": [
++            _vuln("PYSEC-9", {"CVE-2024-0009"}),
++            _vuln("GHSA-zzzz", {"CVE-2024-0009"}),
++        ]
++    }
++    second_results = list(auditor.audit(RecordingSource([dep])))
++
++    assert _summary(first_results) == [
++        (
++            "demo-pkg",
++            "1.0.0",
++            [("PYSEC-0", ["CVE-2024-0001"])],
++        )
++    ]
++    assert _summary(second_results) == [
++        (
++            "demo-pkg",
++            "1.0.0",
++            [("PYSEC-9", ["CVE-2024-0009"])],
++        )
++    ]
++
++
++    assert service.query_all_calls >= 2
++
++
++def test_two_auditor_instances_keep_their_services_independent() -> None:
++
++
++
++
++    dep = _dep()
++    service_a = RecordingService(
++        {
++            "demo-pkg": [
++                _vuln("PYSEC-0", {"CVE-2024-0001"}),
++                _vuln("GHSA-aaaa", {"CVE-2024-0001"}),
++            ]
++        }
++    )
++    service_b = RecordingService(
++        {
++            "demo-pkg": [
++                _vuln("PYSEC-9", {"CVE-2024-0009"}),
++                _vuln("GHSA-zzzz", {"CVE-2024-0009"}),
++            ]
++        }
++    )
++
++    result_a = list(Auditor(service_a).audit(RecordingSource([dep])))
++    result_b = list(Auditor(service_b).audit(RecordingSource([dep])))
++
++    assert _summary(result_a) == [
++        (
++            "demo-pkg",
++            "1.0.0",
++            [("PYSEC-0", ["CVE-2024-0001"])],
++        )
++    ]
++    assert _summary(result_b) == [
++        (
++            "demo-pkg",
++            "1.0.0",
++            [("PYSEC-9", ["CVE-2024-0009"])],
++        )
++    ]
++
++
++    assert service_a.query_all_calls >= 1
++    assert service_b.query_all_calls >= 1
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,19 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++
++cd /workspace/repo
++
++export PYTHONPATH="/workspace/repo${PYTHONPATH:+:${PYTHONPATH}}"
++export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
++
++exec python -m pytest /workspace/repo/usercase-test-coderl/test_auditor_deduplicates_vulnerabilities.py -v

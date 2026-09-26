@@ -1,0 +1,282 @@
+diff --git a/src/darker/tests/test_command_line.py b/src/darker/tests/test_command_line.py
+index 1625238..0d9d464 100644
+--- a/src/darker/tests/test_command_line.py
++++ b/src/darker/tests/test_command_line.py
+@@ -1,10 +1,83 @@
++from pathlib import Path
+ import re
++from subprocess import check_call
+ 
+ import pytest
+ 
++from darker.__main__ import main
+ from darker.command_line import parse_command_line
+ 
+ 
++def _git(cwd, *args):
++    check_call(["git", *args], cwd=str(cwd))
++
++
++def _write(path, contents):
++    path.write_text(contents)
++
++
++def _commit_initial_file(tmpdir, initial_contents, filename="main.py"):
++    root = Path(str(tmpdir))
++    _git(root, "init")
++    _git(root, "config", "user.email", "darker-tests@example.com")
++    _git(root, "config", "user.name", "Darker Tests")
++    src = root / filename
++    _write(src, initial_contents)
++    _git(root, "add", filename)
++    _git(root, "commit", "-m", "initial")
++    return root, src
++
++
++def _run_darker_after_edit(
++    monkeypatch,
++    tmpdir,
++    initial_contents,
++    edited_contents,
++    darker_args,
++    *,
++    config_contents=None,
++    config_name="black.toml",
++):
++    root, src = _commit_initial_file(tmpdir, initial_contents)
++    if config_contents is not None:
++        config_path = root / config_name
++        _write(config_path, config_contents)
++        darker_args = ["-c", str(config_path), *darker_args]
++    _write(src, edited_contents)
++    monkeypatch.chdir(str(root))
++
++    main([*darker_args, str(src)])
++
++    return src.read_text()
++
++
++def _first_assignment_rhs(formatted):
++    lines = formatted.splitlines()
++    for index, line in enumerate(lines):
++        if line.startswith("value = "):
++            if line.rstrip().endswith("("):
++                rhs_parts = []
++                for continuation in lines[index + 1 :]:
++                    stripped = continuation.strip()
++                    if stripped == ")":
++                        break
++                    rhs_parts.append(stripped.rstrip(","))
++                return [
++                    part.strip()
++                    for part in ",".join(rhs_parts).split(",")
++                    if part.strip()
++                ]
++            rhs = line.split("=", 1)[1].strip()
++            args = rhs[rhs.index("(") + 1 : rhs.rindex(")")]
++            return [part.strip() for part in args.split(",")]
++    raise AssertionError(formatted)
++
++
++def _first_string_literal_quote(formatted):
++    rhs = formatted.split("=", 1)[1].lstrip()
++    return rhs[0]
++
++
+ @pytest.fixture
+ def darker_help_output(capsys):
+     with pytest.raises(SystemExit):
+@@ -28,3 +101,139 @@ def test_help_isort_option_without_isort_package(without_isort, darker_help_outp
+ 
+ def test_help_with_isort_package(with_isort, darker_help_output):
+     assert "Please run" not in darker_help_output
++
++
++def test_cli_line_length_short_option_formats_with_wider_limit(monkeypatch, tmpdir):
++    formatted = _run_darker_after_edit(
++        monkeypatch,
++        tmpdir,
++        "value = None\n",
++        "value=call(" + ",".join(["x" * 12] * 8) + ")\n",
++        ["-l", "120"],
++    )
++
++    assert len(_first_assignment_rhs(formatted)) == 8
++    assert formatted.splitlines()[0].startswith("value = ")
++
++
++def test_cli_line_length_long_option_formats_with_narrower_limit(monkeypatch, tmpdir):
++    formatted = _run_darker_after_edit(
++        monkeypatch,
++        tmpdir,
++        "value = None\n",
++        "value=call(" + ",".join(["x" * 12] * 8) + ")\n",
++        ["--line-length", "60"],
++    )
++
++    assert len(_first_assignment_rhs(formatted)) == 8
++    assert len(formatted.splitlines()) > 1
++    assert all(len(line) <= 60 for line in formatted.splitlines())
++
++
++def test_cli_skip_string_normalization_short_option_preserves_quotes(
++    monkeypatch, tmpdir
++):
++    formatted = _run_darker_after_edit(
++        monkeypatch,
++        tmpdir,
++        'message = "old"\n',
++        "message=   'temporary value'\n",
++        ["-S"],
++    )
++
++    assert _first_string_literal_quote(formatted) == "'"
++
++
++def test_cli_skip_string_normalization_preserves_unlisted_single_quotes(
++    monkeypatch, tmpdir
++):
++    formatted = _run_darker_after_edit(
++        monkeypatch,
++        tmpdir,
++        'note = "old"\n',
++        "note=   'another temporary value'\n",
++        ["-S"],
++    )
++
++    assert _first_string_literal_quote(formatted) == "'"
++
++
++def test_cli_skip_string_normalization_long_option_preserves_quotes(
++    monkeypatch, tmpdir
++):
++    formatted = _run_darker_after_edit(
++        monkeypatch,
++        tmpdir,
++        'label = "old"\n',
++        "label=   'temporary value'\n",
++        ["--skip-string-normalization"],
++    )
++
++    assert _first_string_literal_quote(formatted) == "'"
++
++
++def test_cli_line_length_overrides_config(monkeypatch, tmpdir):
++    formatted = _run_darker_after_edit(
++        monkeypatch,
++        tmpdir,
++        "value = None\n",
++        "value=call(" + ",".join(["x" * 15] * 5) + ")\n",
++        ["--line-length", "110"],
++        config_contents="[tool.black]\nline-length = 55\n",
++        config_name="custom_black.toml",
++    )
++
++    assert len(_first_assignment_rhs(formatted)) == 5
++    assert len(formatted.splitlines()) == 1
++    assert len(formatted.splitlines()[0]) > 55
++
++
++def test_cli_skip_string_normalization_overrides_config(monkeypatch, tmpdir):
++    formatted = _run_darker_after_edit(
++        monkeypatch,
++        tmpdir,
++        'title = "old"\n',
++        "title=   'temporary value'\n",
++        ["-S"],
++        config_contents="[tool.black]\nskip-string-normalization = false\n",
++        config_name="custom_black.toml",
++    )
++
++    assert _first_string_literal_quote(formatted) == "'"
++
++
++def test_config_skip_string_normalization_preserves_quotes_without_cli_override(
++    monkeypatch, tmpdir
++):
++    formatted = _run_darker_after_edit(
++        monkeypatch,
++        tmpdir,
++        'name = "old"\n',
++        "name=   'temporary value'\n",
++        [],
++        config_contents="[tool.black]\nskip-string-normalization = true\n",
++        config_name="custom_black.toml",
++    )
++
++    assert _first_string_literal_quote(formatted) == "'"
++
++
++def test_help_lists_black_cli_options(capsys):
++    with pytest.raises(SystemExit) as exc_info:
++        parse_command_line(["--help"])
++
++    assert exc_info.value.code == 0
++    help_output = capsys.readouterr().out
++    assert "-l" in help_output
++    assert "--line-length" in help_output
++    assert "-S" in help_output
++    assert "--skip-string-normalization" in help_output
++
++
++def test_readme_mentions_supported_black_cli_options():
++    readme = Path("README.rst").read_text()
++
++    assert "-l" in readme
++    assert "--line-length" in readme
++    assert "-S" in readme
++    assert "--skip-string-normalization" in readme
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,49 @@
++#!/bin/bash
++set -uo pipefail
++cd /testbed
++
++
++
++dev-switch python3 3.12
++
++
++python3 -m venv /testbed/.venv
++set +u
++source /testbed/.venv/bin/activate
++set -u
++pip install -e ".[test]" py 'black==19.10b0' --no-input 2>&1 | tail -5
++
++
++git config --global user.email "test@test.com"
++git config --global user.name "Test User"
++
++
++case "${1:-}" in
++  base)
++    python3 -m pytest \
++      src/darker/tests/conftest.py \
++      src/darker/tests/test_black_diff.py \
++      src/darker/tests/test_command_line.py::test_help_description_without_isort_package \
++      src/darker/tests/test_command_line.py::test_help_isort_option_without_isort_package \
++      src/darker/tests/test_command_line.py::test_help_with_isort_package \
++      -v
++    ;;
++  new)
++    python3 -m pytest \
++      src/darker/tests/test_command_line.py::test_cli_line_length_short_option_formats_with_wider_limit \
++      src/darker/tests/test_command_line.py::test_cli_line_length_long_option_formats_with_narrower_limit \
++      src/darker/tests/test_command_line.py::test_cli_skip_string_normalization_short_option_preserves_quotes \
++      src/darker/tests/test_command_line.py::test_cli_skip_string_normalization_preserves_unlisted_single_quotes \
++      src/darker/tests/test_command_line.py::test_cli_skip_string_normalization_long_option_preserves_quotes \
++      src/darker/tests/test_command_line.py::test_cli_line_length_overrides_config \
++      src/darker/tests/test_command_line.py::test_cli_skip_string_normalization_overrides_config \
++      src/darker/tests/test_command_line.py::test_config_skip_string_normalization_preserves_quotes_without_cli_override \
++      src/darker/tests/test_command_line.py::test_help_lists_black_cli_options \
++      src/darker/tests/test_command_line.py::test_readme_mentions_supported_black_cli_options \
++      -v
++    ;;
++  *)
++    echo "usage: $0 base|new"
++    exit 2
++    ;;
++esac

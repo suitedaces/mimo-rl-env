@@ -1,0 +1,480 @@
+diff --git a/usercase-test-coderl/alias_batching_test.go b/usercase-test-coderl/alias_batching_test.go
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/alias_batching_test.go
+@@ -0,0 +1,448 @@
++package usercase_test_coderl
++
++import (
++	"context"
++	"encoding/json"
++	"fmt"
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"net/url"
++	"os"
++	"reflect"
++	"runtime"
++	"strings"
++	"testing"
++
++	elastic "github.com/olivere/elastic/v7"
++)
++
++
++
++
++
++
++
++func mustMarshalAction(t *testing.T, action elastic.AliasAction) string {
++	t.Helper()
++	src, err := action.Source()
++	if err != nil {
++		t.Fatalf("Source returned error: %v", err)
++	}
++	b, err := json.Marshal(src)
++	if err != nil {
++		t.Fatalf("marshal Source: %v", err)
++	}
++	return string(b)
++}
++
++func assertJSONEqual(t *testing.T, name string, got string, want string) {
++	t.Helper()
++	var gotValue interface{}
++	if err := json.Unmarshal([]byte(got), &gotValue); err != nil {
++		t.Fatalf("%s: got invalid JSON %q: %v", name, got, err)
++	}
++	var wantValue interface{}
++	if err := json.Unmarshal([]byte(want), &wantValue); err != nil {
++		t.Fatalf("%s: test wanted invalid JSON %q: %v", name, want, err)
++	}
++
++	if !reflect.DeepEqual(gotValue, wantValue) {
++		t.Fatalf("%s: want JSON %s, got %s", name, want, got)
++	}
++}
++
++func assertQueryEqual(t *testing.T, raw string, want url.Values) {
++	t.Helper()
++	got, err := url.ParseQuery(raw)
++	if err != nil {
++		t.Fatalf("rawQuery: invalid query %q: %v", raw, err)
++	}
++
++	if !reflect.DeepEqual(got, want) {
++		t.Fatalf("rawQuery: want %v, got %v from %q", want, got, raw)
++	}
++}
++
++func countFDs(t *testing.T) int {
++	t.Helper()
++	entries, err := os.ReadDir("/proc/self/fd")
++	if err != nil {
++		t.Fatalf("read /proc/self/fd: %v", err)
++	}
++	return len(entries)
++}
++
++func newAliasTestClient(t *testing.T, handler http.HandlerFunc) (*elastic.Client, func()) {
++	t.Helper()
++	ts := httptest.NewServer(handler)
++	client, err := elastic.NewSimpleClient(elastic.SetURL(ts.URL))
++	if err != nil {
++		ts.Close()
++		t.Fatalf("NewSimpleClient: %v", err)
++	}
++	return client, ts.Close
++}
++
++func TestAliasActionBuildersSourceLiterals(t *testing.T) {
++
++
++	cases := []struct {
++		name string
++		got  string
++		want string
++	}{
++		{
++			name: "add single index",
++			got:  mustMarshalAction(t, elastic.NewAliasAddAction("alias1").Index("index1")),
++			want: `{"add":{"alias":"alias1","index":"index1"}}`,
++		},
++		{
++			name: "add two indices",
++			got:  mustMarshalAction(t, elastic.NewAliasAddAction("alias1").Index("index1", "index2")),
++			want: `{"add":{"alias":"alias1","indices":["index1","index2"]}}`,
++		},
++		{
++			name: "add filter",
++			got:  mustMarshalAction(t, elastic.NewAliasAddAction("alias1").Index("index1").Filter(elastic.NewTermQuery("user", "olivere"))),
++			want: `{"add":{"alias":"alias1","filter":{"term":{"user":"olivere"}},"index":"index1"}}`,
++		},
++		{
++			name: "add routing fields",
++			got:  mustMarshalAction(t, elastic.NewAliasAddAction("alias1").Index("index1").Routing("routing1").IndexRouting("indexRouting1").SearchRouting("r1", "r2").IsWriteIndex(false)),
++			want: `{"add":{"alias":"alias1","index":"index1","index_routing":"indexRouting1","is_write_index":false,"routing":"routing1","search_routing":"r1,r2"}}`,
++		},
++		{
++			name: "remove single index",
++			got:  mustMarshalAction(t, elastic.NewAliasRemoveAction("alias1").Index("index1")),
++			want: `{"remove":{"alias":"alias1","index":"index1"}}`,
++		},
++		{
++			name: "remove two indices",
++			got:  mustMarshalAction(t, elastic.NewAliasRemoveAction("alias1").Index("index1", "index2")),
++			want: `{"remove":{"alias":"alias1","indices":["index1","index2"]}}`,
++		},
++		{
++			name: "remove index",
++			got:  mustMarshalAction(t, elastic.NewAliasRemoveIndexAction("index1")),
++			want: `{"remove_index":{"index":"index1"}}`,
++		},
++	}
++	for _, tc := range cases {
++
++		assertJSONEqual(t, tc.name, tc.got, tc.want)
++	}
++}
++
++func TestAliasActionValidationErrors(t *testing.T) {
++
++
++	cases := []struct {
++		name string
++		err  error
++		want string
++	}{
++		{
++			name: "add missing both",
++			err:  elastic.NewAliasAddAction("").Validate(),
++			want: "missing required fields: [Alias Index]",
++		},
++		{
++			name: "add missing index",
++			err:  elastic.NewAliasAddAction("alias1").Validate(),
++			want: "missing required fields: [Index]",
++		},
++		{
++			name: "add missing alias",
++			err:  elastic.NewAliasAddAction("").Index("index1").Validate(),
++			want: "missing required fields: [Alias]",
++		},
++		{
++			name: "add write index with two indices",
++			err:  elastic.NewAliasAddAction("alias1").Index("index1", "index2").IsWriteIndex(true).Validate(),
++			want: "is_write_index",
++		},
++		{
++			name: "remove missing both",
++			err:  elastic.NewAliasRemoveAction("").Validate(),
++			want: "missing required fields: [Alias Index]",
++		},
++		{
++			name: "remove missing index",
++			err:  elastic.NewAliasRemoveAction("alias1").Validate(),
++			want: "missing required fields: [Index]",
++		},
++		{
++			name: "remove index missing index",
++			err:  elastic.NewAliasRemoveIndexAction("").Validate(),
++			want: "missing required field: index",
++		},
++	}
++	for _, tc := range cases {
++		if tc.err == nil {
++			t.Fatalf("%s: expected concrete error %q, got nil", tc.name, tc.want)
++		}
++		got := tc.err.Error()
++		switch tc.name {
++		case "add missing both", "remove missing both":
++
++			if !strings.Contains(got, "Alias") || !strings.Contains(got, "Index") {
++				t.Fatalf("%s: want error mentioning Alias and Index, got %q", tc.name, got)
++			}
++		case "add write index with two indices":
++
++			lower := strings.ToLower(got)
++			if !strings.Contains(lower, "is_write_index") || !strings.Contains(lower, "index") || !(strings.Contains(lower, "more") || strings.Contains(lower, "multiple")) {
++				t.Fatalf("%s: want explanatory is_write_index/multiple-index error, got %q", tc.name, got)
++			}
++		default:
++			if got != tc.want {
++				t.Fatalf("%s: want %q, got %q", tc.name, tc.want, got)
++			}
++		}
++	}
++}
++
++func TestAliasServiceBatchesActionsQueryParamsHeadersAndDecodesResult(t *testing.T) {
++
++
++	var requestCount int
++	var method, path, rawQuery, body string
++	var traceHeader, replaceHeader, opaqueHeader string
++	client, cleanup := newAliasTestClient(t, func(w http.ResponseWriter, r *http.Request) {
++		requestCount++
++		method = r.Method
++		path = r.URL.Path
++		rawQuery = r.URL.RawQuery
++		traceHeader = r.Header.Get("X-Trace")
++		replaceHeader = r.Header.Get("X-Replace")
++		opaqueHeader = r.Header.Get("X-Opaque-Id")
++		data, err := io.ReadAll(r.Body)
++		if err != nil {
++			t.Fatalf("ReadAll body: %v", err)
++		}
++		body = string(data)
++		w.Header().Set("Content-Type", "application/json")
++		fmt.Fprint(w, `{"acknowledged":true,"shards_acknowledged":false,"index":"index-returned"}`)
++	})
++	defer cleanup()
++
++	result, err := client.Alias().
++		Pretty(true).
++		Human(false).
++		ErrorTrace(true).
++		FilterPath("acknowledged", "index").
++		Headers(http.Header{
++			"X-Trace":   []string{"trace-1"},
++			"X-Replace": []string{"replace-1"},
++		}).
++
++		Header("X-Opaque-Id", "opaque-1").
++		Add("index1", "alias1").
++		AddWithFilter("index2", "alias2", elastic.NewTermQuery("user", "olivere")).
++		Remove("index3", "alias3").
++		Action(elastic.NewAliasRemoveIndexAction("index4")).
++		Do(context.Background())
++	if err != nil {
++		t.Fatalf("Do returned error: %v", err)
++	}
++
++	if requestCount != 1 {
++		t.Fatalf("requestCount: want 1, got %d", requestCount)
++	}
++	if method != "POST" {
++		t.Fatalf("method: want POST, got %s", method)
++	}
++	if path != "/_aliases" {
++		t.Fatalf("path: want /_aliases, got %s", path)
++	}
++	assertQueryEqual(t, rawQuery, url.Values{
++		"error_trace": []string{"true"},
++		"filter_path": []string{"acknowledged,index"},
++		"human":       []string{"false"},
++		"pretty":      []string{"true"},
++	})
++	if traceHeader != "trace-1" {
++		t.Fatalf("X-Trace: want trace-1, got %s", traceHeader)
++	}
++	if replaceHeader != "replace-1" {
++		t.Fatalf("X-Replace: want replace-1, got %s", replaceHeader)
++	}
++	if opaqueHeader != "opaque-1" {
++		t.Fatalf("X-Opaque-Id: want opaque-1, got %q", opaqueHeader)
++	}
++	wantBody := `{"actions":[{"add":{"alias":"alias1","index":"index1"}},{"add":{"alias":"alias2","filter":{"term":{"user":"olivere"}},"index":"index2"}},{"remove":{"alias":"alias3","index":"index3"}},{"remove_index":{"index":"index4"}}]}`
++
++	assertJSONEqual(t, "body", body, wantBody)
++	if result.Acknowledged != true {
++		t.Fatalf("Acknowledged: want true, got %v", result.Acknowledged)
++	}
++	if result.ShardsAcknowledged != false {
++		t.Fatalf("ShardsAcknowledged: want false, got %v", result.ShardsAcknowledged)
++	}
++	if result.Index != "index-returned" {
++		t.Fatalf("Index: want index-returned, got %q", result.Index)
++	}
++}
++
++func TestNewAliasServiceAndRepeatedDoAreIdempotent(t *testing.T) {
++
++
++	var bodies []string
++	client, cleanup := newAliasTestClient(t, func(w http.ResponseWriter, r *http.Request) {
++		data, err := io.ReadAll(r.Body)
++		if err != nil {
++			t.Fatalf("ReadAll body: %v", err)
++		}
++		bodies = append(bodies, string(data))
++		w.Header().Set("Content-Type", "application/json")
++		fmt.Fprint(w, `{"acknowledged":false,"shards_acknowledged":true}`)
++	})
++	defer cleanup()
++
++	service := elastic.NewAliasService(client).Add("index1", "alias1")
++	first, err := service.Do(context.Background())
++	if err != nil {
++		t.Fatalf("first Do returned error: %v", err)
++	}
++	second, err := service.Do(context.Background())
++	if err != nil {
++		t.Fatalf("second Do returned error: %v", err)
++	}
++
++	if len(bodies) != 2 {
++		t.Fatalf("bodies length: want 2, got %d", len(bodies))
++	}
++
++	assertJSONEqual(t, "first body", bodies[0], `{"actions":[{"add":{"alias":"alias1","index":"index1"}}]}`)
++	assertJSONEqual(t, "second body", bodies[1], `{"actions":[{"add":{"alias":"alias1","index":"index1"}}]}`)
++	if first.Acknowledged != false {
++		t.Fatalf("first Acknowledged: want false, got %v", first.Acknowledged)
++	}
++	if first.ShardsAcknowledged != true {
++		t.Fatalf("first ShardsAcknowledged: want true, got %v", first.ShardsAcknowledged)
++	}
++	if first.Index != "" {
++		t.Fatalf("first Index: want empty string, got %q", first.Index)
++	}
++	if second.Acknowledged != false {
++		t.Fatalf("second Acknowledged: want false, got %v", second.Acknowledged)
++	}
++	if second.ShardsAcknowledged != true {
++		t.Fatalf("second ShardsAcknowledged: want true, got %v", second.ShardsAcknowledged)
++	}
++	if second.Index != "" {
++		t.Fatalf("second Index: want empty string, got %q", second.Index)
++	}
++	client.Stop()
++	client.Stop()
++}
++
++func TestDoReturnsValidationErrorBeforeHTTPRequest(t *testing.T) {
++
++
++	var requestCount int
++	client, cleanup := newAliasTestClient(t, func(w http.ResponseWriter, r *http.Request) {
++		requestCount++
++		t.Fatalf("unexpected HTTP request %s %s", r.Method, r.URL.String())
++	})
++	defer cleanup()
++
++	result, err := client.Alias().Action(elastic.NewAliasAddAction("alias1")).Do(context.Background())
++	if result != nil {
++		t.Fatalf("result: want nil, got %#v", result)
++	}
++	if err == nil {
++		t.Fatal("expected concrete validation error, got nil")
++	}
++	if got := err.Error(); got != "missing required fields: [Index]" {
++		t.Fatalf("error: want %q, got %q", "missing required fields: [Index]", got)
++	}
++	if requestCount != 0 {
++		t.Fatalf("requestCount: want 0, got %d", requestCount)
++	}
++}
++
++func TestAliasServicesKeepIndependentPendingBatches(t *testing.T) {
++
++
++	var bodies []string
++	client, cleanup := newAliasTestClient(t, func(w http.ResponseWriter, r *http.Request) {
++		data, err := io.ReadAll(r.Body)
++		if err != nil {
++			t.Fatalf("ReadAll body: %v", err)
++		}
++		bodies = append(bodies, string(data))
++		w.Header().Set("Content-Type", "application/json")
++		fmt.Fprint(w, `{"acknowledged":true,"shards_acknowledged":true}`)
++	})
++	defer cleanup()
++
++	a := client.Alias().Add("a-index-1", "a-alias").Remove("a-index-2", "a-alias")
++	b := client.Alias().Add("b-index-1", "b-alias")
++	if _, err := a.Do(context.Background()); err != nil {
++		t.Fatalf("a.Do returned error: %v", err)
++	}
++	if _, err := b.Do(context.Background()); err != nil {
++		t.Fatalf("b.Do returned error: %v", err)
++	}
++
++	if len(bodies) != 2 {
++		t.Fatalf("bodies length: want 2, got %d", len(bodies))
++	}
++
++	assertJSONEqual(t, "service a body", bodies[0], `{"actions":[{"add":{"alias":"a-alias","index":"a-index-1"}},{"remove":{"alias":"a-alias","index":"a-index-2"}}]}`)
++	assertJSONEqual(t, "service b body", bodies[1], `{"actions":[{"add":{"alias":"b-alias","index":"b-index-1"}}]}`)
++}
++
++func TestAliasDoCyclesDoNotLeakFDsOrGoroutines(t *testing.T) {
++
++
++	runtime.GC()
++	startFDs := countFDs(t)
++	startGoroutines := runtime.NumGoroutine()
++
++	for i := 0; i < 150; i++ {
++		client, cleanup := newAliasTestClient(t, func(w http.ResponseWriter, r *http.Request) {
++			if r.Method != "POST" {
++				t.Fatalf("method: want POST, got %s", r.Method)
++			}
++			if r.URL.Path != "/_aliases" {
++				t.Fatalf("path: want /_aliases, got %s", r.URL.Path)
++			}
++			if !strings.Contains(r.URL.RawQuery, "pretty=false") {
++				t.Fatalf("rawQuery: want pretty=false in %q", r.URL.RawQuery)
++			}
++			w.Header().Set("Content-Type", "application/json")
++			fmt.Fprint(w, `{"acknowledged":true,"shards_acknowledged":true}`)
++		})
++		result, err := client.Alias().Pretty(false).Add("index1", "alias1").Do(context.Background())
++		if err != nil {
++			cleanup()
++			t.Fatalf("cycle %d Do returned error: %v", i, err)
++		}
++		if result.Acknowledged != true {
++			cleanup()
++			t.Fatalf("cycle %d Acknowledged: want true, got %v", i, result.Acknowledged)
++		}
++		if result.ShardsAcknowledged != true {
++			cleanup()
++			t.Fatalf("cycle %d ShardsAcknowledged: want true, got %v", i, result.ShardsAcknowledged)
++		}
++		if result.Index != "" {
++			cleanup()
++			t.Fatalf("cycle %d Index: want empty string, got %q", i, result.Index)
++		}
++		cleanup()
++	}
++
++	runtime.GC()
++	endFDs := countFDs(t)
++	endGoroutines := runtime.NumGoroutine()
++	if endFDs > startFDs+10 {
++		t.Fatalf("fd count grew beyond bound: start %d, end %d", startFDs, endFDs)
++	}
++	if endGoroutines > startGoroutines+10 {
++		t.Fatalf("goroutine count grew beyond bound: start %d, end %d", startGoroutines, endGoroutines)
++	}
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,22 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++
++cd /workspace/repo
++
++export GOWORK=off
++export GOPROXY=off
++export GOSUMDB=off
++export GOTOOLCHAIN=local
++
++go list -mod=mod -m all >/dev/null
++exec go test -mod=mod -v -count=1 ./usercase-test-coderl/...

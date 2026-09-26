@@ -1,0 +1,434 @@
+diff --git a/cmd/controllers/app/ttl_cleanup_wiring_test.go b/cmd/controllers/app/ttl_cleanup_wiring_test.go
+new file mode 100644
+index 000000000..3ae7e39d5
+--- /dev/null
++++ b/cmd/controllers/app/ttl_cleanup_wiring_test.go
+@@ -0,0 +1,257 @@
++package app
++
++import (
++	"go/ast"
++	"go/parser"
++	"go/token"
++	"os"
++	"path/filepath"
++	"testing"
++)
++
++func TestControllerManagerStartsTTLCleanup(t *testing.T) {
++	repoRoot := filepath.Join("..", "..", "..")
++	if controllerManagerRunStartsAdditionalWorker(t, "server.go") {
++		return
++	}
++	if jobControllerRunStartsTTLDeletion(t, filepath.Join(repoRoot, "pkg", "controllers", "job")) {
++		return
++	}
++
++	t.Fatalf("standard controller-manager path does not start TTL cleanup")
++}
++
++func controllerManagerRunStartsAdditionalWorker(t *testing.T, path string) bool {
++	file := parseGoFile(t, path)
++	runBody := controllerManagerRunClosure(file)
++	if runBody == nil {
++		t.Fatalf("controller-manager Run does not define its run closure")
++	}
++
++	runGoroutines := 0
++	for _, stmt := range runBody.List {
++		goStmt, ok := stmt.(*ast.GoStmt)
++		if !ok {
++			continue
++		}
++		if hasCtxDoneArgument(goStmt.Call) {
++			runGoroutines++
++		}
++	}
++	return runGoroutines > 2
++}
++
++func controllerManagerRunClosure(file *ast.File) *ast.BlockStmt {
++	for _, decl := range file.Decls {
++		fn, ok := decl.(*ast.FuncDecl)
++		if !ok || fn.Name.Name != "Run" || fn.Body == nil {
++			continue
++		}
++		var body *ast.BlockStmt
++		ast.Inspect(fn.Body, func(n ast.Node) bool {
++			if body != nil {
++				return false
++			}
++			assign, ok := n.(*ast.AssignStmt)
++			if !ok {
++				return true
++			}
++			for i, lhs := range assign.Lhs {
++				name, ok := lhs.(*ast.Ident)
++				if !ok || name.Name != "run" || i >= len(assign.Rhs) {
++					continue
++				}
++				lit, ok := assign.Rhs[i].(*ast.FuncLit)
++				if ok {
++					body = lit.Body
++					return false
++				}
++			}
++			return true
++		})
++		return body
++	}
++	return nil
++}
++
++func hasCtxDoneArgument(call *ast.CallExpr) bool {
++	if call == nil {
++		return false
++	}
++	for _, arg := range call.Args {
++		argCall, ok := arg.(*ast.CallExpr)
++		if !ok {
++			continue
++		}
++		sel, ok := argCall.Fun.(*ast.SelectorExpr)
++		if !ok || sel.Sel.Name != "Done" {
++			continue
++		}
++		ident, ok := sel.X.(*ast.Ident)
++		if ok && ident.Name == "ctx" {
++			return true
++		}
++	}
++	return false
++}
++
++type functionInfo struct {
++	name      string
++	selectors map[string]bool
++	calls     map[string]bool
++}
++
++func jobControllerRunStartsTTLDeletion(t *testing.T, dir string) bool {
++	functions := parseJobPackageFunctions(t, dir)
++	ttlAware := map[string]bool{}
++	for name, fn := range functions {
++		if fn.selectors["TTLSecondsAfterFinished"] && fn.selectors["LastTransitionTime"] {
++			ttlAware[name] = true
++		}
++	}
++	changed := true
++	for changed {
++		changed = false
++		for name, fn := range functions {
++			if ttlAware[name] {
++				continue
++			}
++			for called := range fn.calls {
++				if ttlAware[called] {
++					ttlAware[name] = true
++					changed = true
++					break
++				}
++			}
++		}
++	}
++
++	cleanupFuncs := map[string]bool{}
++	for name, fn := range functions {
++		if fn.selectors["Delete"] && ttlAware[name] {
++			cleanupFuncs[name] = true
++		}
++	}
++	if len(cleanupFuncs) == 0 {
++		return false
++	}
++
++	for _, file := range parseGoFilesInDir(t, dir) {
++		for _, decl := range file.Decls {
++			fn, ok := decl.(*ast.FuncDecl)
++			if !ok || !isControllerRun(fn) || fn.Body == nil {
++				continue
++			}
++			for _, stmt := range fn.Body.List {
++				goStmt, ok := stmt.(*ast.GoStmt)
++				if ok && goStartsCleanup(goStmt.Call, cleanupFuncs) {
++					return true
++				}
++			}
++		}
++	}
++	return false
++}
++
++func parseJobPackageFunctions(t *testing.T, dir string) map[string]functionInfo {
++	functions := map[string]functionInfo{}
++	for _, file := range parseGoFilesInDir(t, dir) {
++		for _, decl := range file.Decls {
++			fn, ok := decl.(*ast.FuncDecl)
++			if !ok || fn.Body == nil {
++				continue
++			}
++			info := functionInfo{
++				name:      fn.Name.Name,
++				selectors: map[string]bool{},
++				calls:     map[string]bool{},
++			}
++			ast.Inspect(fn.Body, func(n ast.Node) bool {
++				switch node := n.(type) {
++				case *ast.SelectorExpr:
++					info.selectors[node.Sel.Name] = true
++				case *ast.CallExpr:
++					recordCalledFunction(node.Fun, info.calls)
++				}
++				return true
++			})
++			functions[info.name] = info
++		}
++	}
++	return functions
++}
++
++func goStartsCleanup(call *ast.CallExpr, cleanupFuncs map[string]bool) bool {
++	if call == nil {
++		return false
++	}
++	if expressionNamesCleanup(call.Fun, cleanupFuncs) {
++		return true
++	}
++	for _, arg := range call.Args {
++		if expressionNamesCleanup(arg, cleanupFuncs) {
++			return true
++		}
++	}
++	return false
++}
++
++func expressionNamesCleanup(expr ast.Expr, cleanupFuncs map[string]bool) bool {
++	switch node := expr.(type) {
++	case *ast.Ident:
++		return cleanupFuncs[node.Name]
++	case *ast.SelectorExpr:
++		return cleanupFuncs[node.Sel.Name]
++	}
++	return false
++}
++
++func recordCalledFunction(expr ast.Expr, calls map[string]bool) {
++	switch fun := expr.(type) {
++	case *ast.Ident:
++		calls[fun.Name] = true
++	case *ast.SelectorExpr:
++		calls[fun.Sel.Name] = true
++	}
++}
++
++func isControllerRun(fn *ast.FuncDecl) bool {
++	if fn.Name.Name != "Run" || fn.Recv == nil || len(fn.Recv.List) == 0 {
++		return false
++	}
++	return receiverTypeName(fn.Recv.List[0].Type) == "Controller"
++}
++
++func receiverTypeName(expr ast.Expr) string {
++	switch node := expr.(type) {
++	case *ast.Ident:
++		return node.Name
++	case *ast.StarExpr:
++		return receiverTypeName(node.X)
++	}
++	return ""
++}
++
++func parseGoFilesInDir(t *testing.T, dir string) []*ast.File {
++	entries, err := os.ReadDir(dir)
++	if err != nil {
++		t.Fatalf("read %s: %v", dir, err)
++	}
++	var files []*ast.File
++	for _, entry := range entries {
++		if entry.IsDir() || filepath.Ext(entry.Name()) != ".go" {
++			continue
++		}
++		files = append(files, parseGoFile(t, filepath.Join(dir, entry.Name())))
++	}
++	return files
++}
++
++func parseGoFile(t *testing.T, path string) *ast.File {
++	t.Helper()
++	file, err := parser.ParseFile(token.NewFileSet(), path, nil, 0)
++	if err != nil {
++		t.Fatalf("parse %s: %v", path, err)
++	}
++	return file
++}
+diff --git a/pkg/apis/batch/v1alpha1/job_ttl_test.go b/pkg/apis/batch/v1alpha1/job_ttl_test.go
+new file mode 100644
+index 000000000..a00a2c2b1
+--- /dev/null
++++ b/pkg/apis/batch/v1alpha1/job_ttl_test.go
+@@ -0,0 +1,102 @@
++package v1alpha1
++
++import (
++	"encoding/json"
++	"testing"
++	"time"
++
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++)
++
++func TestJobTTLFieldRoundTripAndDeepCopy(t *testing.T) {
++	ttl := int32(7)
++	job := &Job{
++		TypeMeta: metav1.TypeMeta{
++			APIVersion: SchemeGroupVersion.String(),
++			Kind:       "Job",
++		},
++		ObjectMeta: metav1.ObjectMeta{
++			Namespace: "default",
++			Name:      "ttl-api-roundtrip",
++		},
++		Spec: JobSpec{
++			TTLSecondsAfterFinished: &ttl,
++		},
++	}
++
++	data, err := json.Marshal(job)
++	if err != nil {
++		t.Fatalf("marshal job: %v", err)
++	}
++
++	var decoded Job
++	if err := json.Unmarshal(data, &decoded); err != nil {
++		t.Fatalf("unmarshal job: %v", err)
++	}
++	if decoded.Spec.TTLSecondsAfterFinished == nil {
++		t.Fatalf("ttlSecondsAfterFinished was not preserved after JSON round trip")
++	}
++	if got := *decoded.Spec.TTLSecondsAfterFinished; got != ttl {
++		t.Fatalf("ttlSecondsAfterFinished = %d, want %d", got, ttl)
++	}
++
++	rawManifest := []byte(`{
++		"apiVersion":"batch.volcano.sh/v1alpha1",
++		"kind":"Job",
++		"metadata":{"namespace":"default","name":"ttl-json-manifest"},
++		"spec":{"ttlSecondsAfterFinished":7}
++	}`)
++	var fromManifest Job
++	if err := json.Unmarshal(rawManifest, &fromManifest); err != nil {
++		t.Fatalf("unmarshal manifest job: %v", err)
++	}
++	if fromManifest.Spec.TTLSecondsAfterFinished == nil {
++		t.Fatalf("ttlSecondsAfterFinished was not accepted from JSON manifest")
++	}
++	if got := *fromManifest.Spec.TTLSecondsAfterFinished; got != ttl {
++		t.Fatalf("manifest ttlSecondsAfterFinished = %d, want %d", got, ttl)
++	}
++
++	copied := decoded.DeepCopy()
++	if copied.Spec.TTLSecondsAfterFinished == nil {
++		t.Fatalf("DeepCopy lost ttlSecondsAfterFinished")
++	}
++	if copied.Spec.TTLSecondsAfterFinished == decoded.Spec.TTLSecondsAfterFinished {
++		t.Fatalf("DeepCopy reused ttlSecondsAfterFinished pointer")
++	}
++	*copied.Spec.TTLSecondsAfterFinished = 13
++	if got := *decoded.Spec.TTLSecondsAfterFinished; got != ttl {
++		t.Fatalf("mutating copied TTL changed original TTL: got %d, want %d", got, ttl)
++	}
++}
++
++func TestJobStateLastTransitionTimeDeepCopy(t *testing.T) {
++	transition := metav1.NewTime(time.Date(2020, 3, 4, 5, 6, 7, 0, time.UTC))
++	job := &Job{
++		ObjectMeta: metav1.ObjectMeta{
++			Namespace: "default",
++			Name:      "transition-time-deepcopy",
++		},
++		Status: JobStatus{
++			State: JobState{
++				Phase:              Completed,
++				LastTransitionTime: transition,
++			},
++		},
++	}
++
++	copied := job.DeepCopy()
++	if !copied.Status.State.LastTransitionTime.Equal(&transition) {
++		t.Fatalf("DeepCopy did not preserve lastTransitionTime: got %v, want %v",
++			copied.Status.State.LastTransitionTime, transition)
++	}
++
++	copied.Status.State.LastTransitionTime = metav1.NewTime(transition.Add(2 * time.Hour))
++	if job.Status.State.LastTransitionTime.Equal(&copied.Status.State.LastTransitionTime) {
++		t.Fatalf("mutating copied lastTransitionTime changed original")
++	}
++	if !job.Status.State.LastTransitionTime.Equal(&transition) {
++		t.Fatalf("original lastTransitionTime changed: got %v, want %v",
++			job.Status.State.LastTransitionTime, transition)
++	}
++}
+diff --git a/test/e2e/util.go b/test/e2e/util.go
+index 0e4bbbe4a..5f9d33d59 100644
+--- a/test/e2e/util.go
++++ b/test/e2e/util.go
+@@ -278,6 +278,7 @@ type jobSpec struct {
+ 	min       int32
+ 	plugins   map[string][]string
+ 	volumes   []vkv1.VolumeSpec
++	ttl       *int32
+ }
+ 
+ func getNS(context *context, job *jobSpec) string {
+@@ -305,9 +306,10 @@ func createJobInner(context *context, jobSpec *jobSpec) (*vkv1.Job, error) {
+ 			Namespace: ns,
+ 		},
+ 		Spec: vkv1.JobSpec{
+-			Policies: jobSpec.policies,
+-			Queue:    jobSpec.queue,
+-			Plugins:  jobSpec.plugins,
++			Policies:                jobSpec.policies,
++			Queue:                   jobSpec.queue,
++			Plugins:                 jobSpec.plugins,
++			TTLSecondsAfterFinished: jobSpec.ttl,
+ 		},
+ 	}
+ 
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,32 @@
++#!/bin/bash
++set -euo pipefail
++
++cd /testbed
++
++
++
++mkdir -p /root/go/src/volcano.sh
++ln -sfn /testbed /root/go/src/volcano.sh/volcano
++
++export GO111MODULE=off
++export GOPATH=/root/go
++
++cd /root/go/src/volcano.sh/volcano
++
++case "${1:-}" in
++  base)
++    go vet ./test/e2e/
++    go test -c -o /dev/null ./test/e2e/
++    go build ./...
++    ;;
++  new)
++    go test ./pkg/apis/batch/v1alpha1 -run 'TestJob(TTLFieldRoundTripAndDeepCopy|StateLastTransitionTimeDeepCopy)$' -count=1
++    go test ./cmd/controllers/app -run 'TestControllerManagerStartsTTLCleanup$' -count=1
++    go build ./...
++    go test -c -o /dev/null ./test/e2e/
++    ;;
++  *)
++    echo "usage: $0 base|new"
++    exit 2
++    ;;
++esac

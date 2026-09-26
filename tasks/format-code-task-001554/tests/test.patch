@@ -1,0 +1,451 @@
+diff --git a/usercase-test-coderl/roundrobin_balance_strategy_test.go b/usercase-test-coderl/roundrobin_balance_strategy_test.go
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/roundrobin_balance_strategy_test.go
+@@ -0,0 +1,423 @@
++package usercase_test_coderl
++
++import (
++	"os"
++	"path/filepath"
++	"reflect"
++	"sort"
++	"strconv"
++	"testing"
++
++	sarama "github.com/IBM/sarama"
++)
++
++
++
++
++
++
++func TestRoundRobinStrategyName(t *testing.T) {
++
++
++	strategy := sarama.NewBalanceStrategyRoundRobin()
++
++	if got := strategy.Name(); got != "roundrobin" {
++		t.Fatalf("Name() = %q, want %q", got, "roundrobin")
++	}
++}
++
++func TestRoundRobinPlanAlternatesAcrossTwoSinglePartitionTopics(t *testing.T) {
++
++
++	members := map[string]sarama.ConsumerGroupMemberMetadata{
++		"M2": {Topics: []string{"T2", "T1"}},
++		"M1": {Topics: []string{"T1", "T2"}},
++	}
++	topics := map[string][]int32{
++		"T2": {0},
++		"T1": {0},
++	}
++	want := sarama.BalanceStrategyPlan{
++		"M1": map[string][]int32{"T1": []int32{0}},
++		"M2": map[string][]int32{"T2": []int32{0}},
++	}
++
++	got, err := sarama.NewBalanceStrategyRoundRobin().Plan(members, topics)
++	if err != nil {
++		t.Fatalf("Plan() error = %v, want nil", err)
++	}
++	assertPlanEqual(t, got, want)
++}
++
++func TestRoundRobinPlanAlternatesAcrossPartitionsOfOneTopic(t *testing.T) {
++
++
++	members := map[string]sarama.ConsumerGroupMemberMetadata{
++		"M2": {Topics: []string{"T1"}},
++		"M1": {Topics: []string{"T1"}},
++	}
++	topics := map[string][]int32{"T1": []int32{0, 1}}
++	want := sarama.BalanceStrategyPlan{
++		"M1": map[string][]int32{"T1": []int32{0}},
++		"M2": map[string][]int32{"T1": []int32{1}},
++	}
++
++	got, err := sarama.NewBalanceStrategyRoundRobin().Plan(members, topics)
++	if err != nil {
++		t.Fatalf("Plan() error = %v, want nil", err)
++	}
++	assertPlanEqual(t, got, want)
++}
++
++func TestRoundRobinPlanOrdersMembersTopicsAndPartitionsDeterministically(t *testing.T) {
++
++
++	strategy := sarama.NewBalanceStrategyRoundRobin()
++	members := map[string]sarama.ConsumerGroupMemberMetadata{
++		"M3": {Topics: []string{"Z", "A"}},
++		"M1": {Topics: []string{"Z", "A"}},
++		"M2": {Topics: []string{"Z", "A"}},
++	}
++	topics := map[string][]int32{
++		"Z": {2, 0, 1},
++		"A": {1, 0},
++	}
++	got, err := strategy.Plan(members, topics)
++	if err != nil {
++		t.Fatalf("Plan() error = %v, want nil", err)
++	}
++	canonical, err := strategy.Plan(
++		map[string]sarama.ConsumerGroupMemberMetadata{
++			"M1": {Topics: []string{"A", "Z"}},
++			"M2": {Topics: []string{"A", "Z"}},
++			"M3": {Topics: []string{"A", "Z"}},
++		},
++		map[string][]int32{
++			"A": {0, 1},
++			"Z": {0, 1, 2},
++		},
++	)
++	if err != nil {
++		t.Fatalf("canonical Plan() error = %v, want nil", err)
++	}
++
++	if !reflect.DeepEqual(got, canonical) {
++		t.Fatalf("Plan() changed when equivalent inputs were already ordered\nunsorted: %#v\nordered:  %#v", got, canonical)
++	}
++	assertPlanCoversTopicPartitionsOnce(t, got, topics)
++	assertPlanMemberLoadsNearlyEven(t, got, []string{"M1", "M2", "M3"}, 5)
++}
++
++func TestRoundRobinPlanSkipsMembersNotSubscribedToPartitionTopic(t *testing.T) {
++
++
++	members := map[string]sarama.ConsumerGroupMemberMetadata{
++		"M1": {Topics: []string{"T1"}},
++		"M2": {Topics: []string{"T2"}},
++		"M3": {Topics: []string{"T1", "T2"}},
++	}
++	topics := map[string][]int32{
++		"T2": {0, 1},
++		"T1": {0, 1},
++	}
++	want := sarama.BalanceStrategyPlan{
++		"M1": map[string][]int32{"T1": []int32{0}},
++		"M2": map[string][]int32{"T2": []int32{0}},
++		"M3": map[string][]int32{"T1": []int32{1}, "T2": []int32{1}},
++	}
++
++	got, err := sarama.NewBalanceStrategyRoundRobin().Plan(members, topics)
++	if err != nil {
++		t.Fatalf("Plan() error = %v, want nil", err)
++	}
++	assertPlanEqual(t, got, want)
++}
++
++func TestRoundRobinPlanRejectsEmptyMemberMap(t *testing.T) {
++
++
++	plan, err := sarama.NewBalanceStrategyRoundRobin().Plan(
++		map[string]sarama.ConsumerGroupMemberMetadata{},
++		map[string][]int32{"T1": []int32{0}},
++	)
++
++	assertEmptyInputError(t, plan, err)
++}
++
++func TestRoundRobinPlanRejectsEmptyTopicMap(t *testing.T) {
++
++
++	plan, err := sarama.NewBalanceStrategyRoundRobin().Plan(
++		map[string]sarama.ConsumerGroupMemberMetadata{"M1": {Topics: []string{"T1"}}},
++		map[string][]int32{},
++	)
++
++	assertEmptyInputError(t, plan, err)
++}
++
++func TestRoundRobinAssignmentDataReturnsNilNil(t *testing.T) {
++
++
++	data, err := sarama.NewBalanceStrategyRoundRobin().AssignmentData(
++		"M1",
++		map[string][]int32{"T1": []int32{0, 1}},
++		42,
++	)
++
++	if err != nil {
++		t.Fatalf("AssignmentData() error = %v, want nil", err)
++	}
++	if data != nil {
++		t.Fatalf("AssignmentData() data = %#v, want nil", data)
++	}
++}
++
++func TestRoundRobinPlanIsReferentiallyTransparentForSameInput(t *testing.T) {
++	members := map[string]sarama.ConsumerGroupMemberMetadata{
++		"M1": {Topics: []string{"T1", "T2"}},
++		"M2": {Topics: []string{"T1", "T2"}},
++	}
++	topics := map[string][]int32{"T1": []int32{0}, "T2": []int32{0}}
++	want := sarama.BalanceStrategyPlan{
++		"M1": map[string][]int32{"T1": []int32{0}},
++		"M2": map[string][]int32{"T2": []int32{0}},
++	}
++	strategy := sarama.NewBalanceStrategyRoundRobin()
++
++	first, err := strategy.Plan(cloneMembers(members), cloneTopics(topics))
++	if err != nil {
++		t.Fatalf("first Plan() error = %v, want nil", err)
++	}
++	second, err := strategy.Plan(cloneMembers(members), cloneTopics(topics))
++	if err != nil {
++		t.Fatalf("second Plan() error = %v, want nil", err)
++	}
++
++	assertPlanEqual(t, first, want)
++	assertPlanEqual(t, second, want)
++	if !reflect.DeepEqual(first, second) {
++		t.Fatalf("Plan() repeated result mismatch\nfirst:  %#v\nsecond: %#v", first, second)
++	}
++}
++
++func TestRoundRobinPlanDoesNotMutateInputs(t *testing.T) {
++	members := map[string]sarama.ConsumerGroupMemberMetadata{
++		"M3": {Topics: []string{"T2", "T1"}},
++		"M1": {Topics: []string{"T1", "T2"}},
++		"M2": {Topics: []string{"T2"}},
++	}
++	topics := map[string][]int32{
++		"T2": {1, 0},
++		"T1": {0},
++	}
++	originalMembers := cloneMembers(members)
++	originalTopics := cloneTopics(topics)
++
++	_, err := sarama.NewBalanceStrategyRoundRobin().Plan(members, topics)
++	if err != nil {
++		t.Fatalf("Plan() error = %v, want nil", err)
++	}
++
++	if !reflect.DeepEqual(members, originalMembers) {
++		t.Fatalf("Plan() mutated members\nbefore: %#v\nafter:  %#v", originalMembers, members)
++	}
++	if !reflect.DeepEqual(topics, originalTopics) {
++		t.Fatalf("Plan() mutated topics\nbefore: %#v\nafter:  %#v", originalTopics, topics)
++	}
++}
++
++func TestRoundRobinPlanDoesNotReuseGlobalStateAcrossDifferentInputs(t *testing.T) {
++	strategy := sarama.NewBalanceStrategyRoundRobin()
++	baseMembers := map[string]sarama.ConsumerGroupMemberMetadata{
++		"M1": {Topics: []string{"T1", "T2"}},
++		"M2": {Topics: []string{"T1", "T2"}},
++	}
++	baseTopics := map[string][]int32{"T1": []int32{0}, "T2": []int32{0}}
++	want := sarama.BalanceStrategyPlan{
++		"M1": map[string][]int32{"T1": []int32{0}},
++		"M2": map[string][]int32{"T2": []int32{0}},
++	}
++
++	first, err := strategy.Plan(cloneMembers(baseMembers), cloneTopics(baseTopics))
++	if err != nil {
++		t.Fatalf("first Plan() error = %v, want nil", err)
++	}
++	assertPlanEqual(t, first, want)
++
++	if _, err := strategy.Plan(
++		map[string]sarama.ConsumerGroupMemberMetadata{
++			"A": {Topics: []string{"X"}},
++			"B": {Topics: []string{"X"}},
++		},
++		map[string][]int32{"X": []int32{0, 1}},
++	); err != nil {
++		t.Fatalf("noise Plan() error = %v, want nil", err)
++	}
++	if _, err := strategy.Plan(
++		map[string]sarama.ConsumerGroupMemberMetadata{
++			"C": {Topics: []string{"Y", "Z"}},
++			"D": {Topics: []string{"Y", "Z"}},
++			"E": {Topics: []string{"Y", "Z"}},
++		},
++		map[string][]int32{"Z": []int32{0}, "Y": []int32{0, 1}},
++	); err != nil {
++		t.Fatalf("second noise Plan() error = %v, want nil", err)
++	}
++
++	again, err := strategy.Plan(cloneMembers(baseMembers), cloneTopics(baseTopics))
++	if err != nil {
++		t.Fatalf("final Plan() error = %v, want nil", err)
++	}
++	assertPlanEqual(t, again, want)
++}
++
++func TestRoundRobinStrategyDoesNotWriteFilesInWorkingDirectory(t *testing.T) {
++	tempDir := t.TempDir()
++	oldDir, err := os.Getwd()
++	if err != nil {
++		t.Fatalf("Getwd() error = %v", err)
++	}
++	if err := os.Chdir(tempDir); err != nil {
++		t.Fatalf("Chdir(%q) error = %v", tempDir, err)
++	}
++	defer func() {
++		if err := os.Chdir(oldDir); err != nil {
++			t.Fatalf("restore Chdir(%q) error = %v", oldDir, err)
++		}
++	}()
++
++	before := snapshotRelativeEntries(t, tempDir)
++	strategy := sarama.NewBalanceStrategyRoundRobin()
++	if _, err := strategy.Plan(
++		map[string]sarama.ConsumerGroupMemberMetadata{
++			"M1": {Topics: []string{"T1", "T2"}},
++			"M2": {Topics: []string{"T1", "T2"}},
++		},
++		map[string][]int32{"T1": []int32{0}, "T2": []int32{0}},
++	); err != nil {
++		t.Fatalf("Plan() error = %v, want nil", err)
++	}
++	if data, err := strategy.AssignmentData("M1", map[string][]int32{"T1": []int32{0}}, 7); err != nil || data != nil {
++		t.Fatalf("AssignmentData() = (%#v, %v), want (nil, nil)", data, err)
++	}
++	after := snapshotRelativeEntries(t, tempDir)
++
++	if !reflect.DeepEqual(after, before) {
++		t.Fatalf("working directory entries changed\nbefore: %#v\nafter:  %#v", before, after)
++	}
++}
++
++func assertPlanEqual(t *testing.T, got, want sarama.BalanceStrategyPlan) {
++	t.Helper()
++	if !reflect.DeepEqual(got, want) {
++		t.Fatalf("Plan() mismatch\n got: %#v\nwant: %#v", got, want)
++	}
++}
++
++func assertEmptyInputError(t *testing.T, plan sarama.BalanceStrategyPlan, err error) {
++	t.Helper()
++	if plan != nil {
++		t.Fatalf("Plan() plan = %#v, want nil", plan)
++	}
++	if err == nil {
++		t.Fatal("Plan() error = nil, want non-nil error")
++	}
++
++}
++
++func assertPlanCoversTopicPartitionsOnce(t *testing.T, got sarama.BalanceStrategyPlan, topics map[string][]int32) {
++	t.Helper()
++	expected := make(map[string]int)
++	for topic, partitions := range topics {
++		for _, partition := range partitions {
++			expected[topicPartitionKey(topic, partition)]++
++		}
++	}
++	seen := make(map[string]int)
++	for memberID, assignment := range got {
++		for topic, partitions := range assignment {
++			for _, partition := range partitions {
++				key := topicPartitionKey(topic, partition)
++				if _, ok := expected[key]; !ok {
++					t.Fatalf("Plan() assigned unexpected partition %s to %s", key, memberID)
++				}
++				seen[key]++
++			}
++		}
++	}
++	if !reflect.DeepEqual(seen, expected) {
++		t.Fatalf("Plan() partition coverage mismatch\n got: %#v\nwant: %#v", seen, expected)
++	}
++}
++
++func assertPlanMemberLoadsNearlyEven(t *testing.T, got sarama.BalanceStrategyPlan, memberIDs []string, totalPartitions int) {
++	t.Helper()
++	minLoad := totalPartitions
++	maxLoad := 0
++	for _, memberID := range memberIDs {
++		load := 0
++		for _, partitions := range got[memberID] {
++			load += len(partitions)
++		}
++		if load < minLoad {
++			minLoad = load
++		}
++		if load > maxLoad {
++			maxLoad = load
++		}
++	}
++	if maxLoad-minLoad > 1 {
++		t.Fatalf("Plan() member loads differ by more than one partition: %#v", got)
++	}
++}
++
++func topicPartitionKey(topic string, partition int32) string {
++	return topic + "/" + strconv.FormatInt(int64(partition), 10)
++}
++
++func cloneMembers(in map[string]sarama.ConsumerGroupMemberMetadata) map[string]sarama.ConsumerGroupMemberMetadata {
++	out := make(map[string]sarama.ConsumerGroupMemberMetadata, len(in))
++	for memberID, metadata := range in {
++		metadata.Topics = append([]string(nil), metadata.Topics...)
++		metadata.UserData = append([]byte(nil), metadata.UserData...)
++		metadata.OwnedPartitions = append([]*sarama.OwnedPartition(nil), metadata.OwnedPartitions...)
++		out[memberID] = metadata
++	}
++	return out
++}
++
++func cloneTopics(in map[string][]int32) map[string][]int32 {
++	out := make(map[string][]int32, len(in))
++	for topic, partitions := range in {
++		out[topic] = append([]int32(nil), partitions...)
++	}
++	return out
++}
++
++func snapshotRelativeEntries(t *testing.T, root string) []string {
++	t.Helper()
++	var entries []string
++	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
++		if err != nil {
++			return err
++		}
++		if path == root {
++			return nil
++		}
++		rel, err := filepath.Rel(root, path)
++		if err != nil {
++			return err
++		}
++		if d.IsDir() {
++			entries = append(entries, rel+"/")
++			return nil
++		}
++		entries = append(entries, rel)
++		return nil
++	})
++	if err != nil {
++		t.Fatalf("snapshot %q error = %v", root, err)
++	}
++	sort.Strings(entries)
++	return entries
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,18 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++cd /workspace/repo
++export GOTOOLCHAIN=local
++export GOPROXY=off
++export GOSUMDB=off
++export GOFLAGS="${GOFLAGS:-} -mod=readonly"
++exec go test -v ./usercase-test-coderl/...

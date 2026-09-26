@@ -1,0 +1,230 @@
+diff --git a/common/yakgrpc/grpc_yaklang_inspect_information_codespec_test.go b/common/yakgrpc/grpc_yaklang_inspect_information_codespec_test.go
+new file mode 100644
+index 0000000..8102cef
+--- /dev/null
++++ b/common/yakgrpc/grpc_yaklang_inspect_information_codespec_test.go
+@@ -0,0 +1,214 @@
++package yakgrpc
++
++import (
++	"context"
++	"encoding/json"
++	"reflect"
++	"testing"
++
++	"github.com/yaklang/yaklang/common/yakgrpc/ypb"
++)
++
++type codespecInspectEntry struct {
++	value  any
++	extern map[string]any
++}
++
++func codespecInspect(t *testing.T, scriptType, code string, selection *ypb.Range) map[string][]codespecInspectEntry {
++	t.Helper()
++	client, err := NewLocalClient()
++	if err != nil {
++		t.Fatalf("create local client: %v", err)
++	}
++	rsp, err := client.YaklangInspectInformation(context.Background(), &ypb.YaklangInspectInformationRequest{
++		YakScriptType: scriptType,
++		YakScriptCode: code,
++		Range:         selection,
++	})
++	if err != nil {
++		t.Fatalf("inspect information: %v", err)
++	}
++
++	result := make(map[string][]codespecInspectEntry)
++	for _, section := range rsp.GetInformation() {
++		entries := make([]codespecInspectEntry, 0, len(section.GetData()))
++		for _, item := range section.GetData() {
++			var value any
++			if err := json.Unmarshal(item.GetValue(), &value); err != nil {
++				t.Fatalf("decode %s value %q: %v", section.GetName(), item.GetValue(), err)
++			}
++			extern := make(map[string]any)
++			for _, field := range item.GetExtern() {
++				var decoded any
++				if err := json.Unmarshal(field.GetValue(), &decoded); err != nil {
++					t.Fatalf("decode %s.%s value %q: %v", section.GetName(), field.GetKey(), field.GetValue(), err)
++				}
++				extern[field.GetKey()] = decoded
++			}
++			entries = append(entries, codespecInspectEntry{value: value, extern: extern})
++		}
++		result[section.GetName()] = entries
++	}
++	return result
++}
++
++func codespecField(t *testing.T, entry codespecInspectEntry, key string) any {
++	t.Helper()
++	value, ok := entry.extern[key]
++	if !ok {
++		t.Fatalf("missing field %q in %#v", key, entry.extern)
++	}
++	return value
++}
++
++func codespecEntryNames(entries []codespecInspectEntry) []string {
++	result := make([]string, 0, len(entries))
++	for _, entry := range entries {
++		result = append(result, entry.value.(string))
++	}
++	return result
++}
++
++func TestCodeSpecInspectCLIUsesSourceOrderAndTypedOptions(t *testing.T) {
++	info := codespecInspect(t, "yak", `cli.Bool("verbose", cli.setDefault(true))
++cli.Bool("dry-run", cli.setDefault(false))
++cli.String("target", cli.setHelp("destination"), cli.setRequired(true), cli.setDefault(""))
++cli.Integer("retries", cli.setDefault(0))
++cli.Float("ratio", cli.setDefault(0.5))
++cli.Urls("origins")
++cli.Hosts("peers")
++cli.FileOrContent("payload")
++cli.StringSlice("tags", cli.setDefault("red,blue"))`, nil)
++
++	cli := info["cli"]
++	wantNames := []string{"verbose", "dry-run", "target", "retries", "ratio", "origins", "peers", "payload", "tags"}
++	if got := codespecEntryNames(cli); !reflect.DeepEqual(got, wantNames) {
++		t.Fatalf("CLI entries must follow source order: got %v, want %v", got, wantNames)
++	}
++	wantTypes := []any{"bool", "bool", "string", "int", "float", "urls", "hosts", "file_or_content", "string-slice"}
++	for i, want := range wantTypes {
++		if got := codespecField(t, cli[i], "Type"); !reflect.DeepEqual(got, want) {
++			t.Fatalf("CLI %q type: got %#v, want %#v", wantNames[i], got, want)
++		}
++	}
++	if got := codespecField(t, cli[0], "Default"); got != true {
++		t.Fatalf("boolean default lost: got %#v", got)
++	}
++	if got := codespecField(t, cli[1], "Default"); got != false {
++		t.Fatalf("explicit false default must be preserved: got %#v", got)
++	}
++	if got := codespecField(t, cli[2], "Help"); got != "destination" {
++		t.Fatalf("help text: got %#v", got)
++	}
++	if got := codespecField(t, cli[2], "Required"); got != true {
++		t.Fatalf("literal required=true must be preserved: got %#v", got)
++	}
++	if got := codespecField(t, cli[2], "Default"); got != "" {
++		t.Fatalf("explicit empty default must be preserved: got %#v", got)
++	}
++	if got := codespecField(t, cli[3], "Default"); got != float64(0) {
++		t.Fatalf("explicit zero default must be preserved: got %#v", got)
++	}
++}
++
++func TestCodeSpecInspectCLIOptionPrecedence(t *testing.T) {
++	info := codespecInspect(t, "yak", `cli.String("mode",
++    cli.setHelp("old"), cli.setHelp("new"),
++    cli.setRequired(false), cli.setRequired(true),
++    cli.setDefault("old"), cli.setDefault(""))`, nil)
++	entry := info["cli"][0]
++	for key, want := range map[string]any{
++		"Help": "new", "Required": true, "Default": "",
++	} {
++		if got := codespecField(t, entry, key); !reflect.DeepEqual(got, want) {
++			t.Fatalf("last %s option must win: got %#v, want %#v", key, got, want)
++		}
++	}
++}
++
++func TestCodeSpecInspectRiskOrderAndNormalization(t *testing.T) {
++	info := codespecInspect(t, "yak", `risk.NewRisk("first",
++    risk.typeVerbose("Explicit XSS"), risk.type("xss"),
++    risk.level("fatal"), risk.cve("CVE-2026-1001"))
++risk.CreateRisk("second",
++    risk.type("sqli"), risk.severity("warn"),
++    risk.typeVerbose("Explicit SQL"), risk.cve("CVE-2026-1002"))`, nil)
++
++	risks := info["risk"]
++	if len(risks) != 2 {
++		t.Fatalf("risk count: got %d, want 2", len(risks))
++	}
++	if got := []any{codespecField(t, risks[0], "CVE"), codespecField(t, risks[1], "CVE")}; !reflect.DeepEqual(got, []any{"CVE-2026-1001", "CVE-2026-1002"}) {
++		t.Fatalf("risks must use source order and unquoted CVEs: got %#v", got)
++	}
++	checks := []map[string]any{
++		{"Level": "critical", "Type": "xss", "TypeVerbose": "Explicit XSS"},
++		{"Level": "warning", "Type": "sqli", "TypeVerbose": "Explicit SQL"},
++	}
++	for i, fields := range checks {
++		for key, want := range fields {
++			if got := codespecField(t, risks[i], key); !reflect.DeepEqual(got, want) {
++				t.Fatalf("risk %d field %s: got %#v, want %#v", i, key, got, want)
++			}
++		}
++	}
++	fallback := codespecInspect(t, "yak", `risk.NewRisk("fallback", risk.type("xss"), risk.severity("info"))`, nil)["risk"]
++	if len(fallback) != 1 || codespecField(t, fallback[0], "TypeVerbose") != "XSS" {
++		t.Fatalf("known risk type must receive its canonical fallback label: %#v", fallback)
++	}
++}
++
++func TestCodeSpecInspectRangeFiltersWholeProgramByCallStartLine(t *testing.T) {
++	code := `helpText = "resolved outside selection"
++cli.String("before")
++if true {
++    cli.String("selected", cli.setHelp(helpText))
++    risk.NewRisk("selected-risk", risk.type("xss"))
++}
++cli.Int("after")`
++	info := codespecInspect(t, "yak", code, &ypb.Range{StartLine: 4, EndLine: 5})
++	cli := info["cli"]
++	if got := codespecEntryNames(cli); !reflect.DeepEqual(got, []string{"selected"}) {
++		t.Fatalf("range must include only CLI calls starting on selected lines: got %v", got)
++	}
++	if got := codespecField(t, cli[0], "Help"); got != "resolved outside selection" {
++		t.Fatalf("range filtering must still analyze the full program: got help %#v", got)
++	}
++	if risks := info["risk"]; len(risks) != 1 || codespecField(t, risks[0], "Type") != "xss" {
++		t.Fatalf("selected risk missing or malformed: %#v", risks)
++	}
++}
++
++func TestCodeSpecInspectNilAndZeroRangesKeepFullDocumentBehavior(t *testing.T) {
++	code := `cli.String("first")
++risk.NewRisk("middle", risk.type("xss"))
++cli.Bool("last")`
++	for _, tc := range []struct {
++		name       string
++		rangeValue *ypb.Range
++	}{
++		{name: "nil", rangeValue: nil},
++		{name: "all-zero", rangeValue: &ypb.Range{}},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			info := codespecInspect(t, "yak", code, tc.rangeValue)
++			if got := codespecEntryNames(info["cli"]); !reflect.DeepEqual(got, []string{"first", "last"}) {
++				t.Fatalf("full-document CLI result: got %v", got)
++			}
++			if len(info["risk"]) != 1 {
++				t.Fatalf("full-document risk count: got %d", len(info["risk"]))
++			}
++		})
++	}
++}
++
++func TestCodeSpecInspectKeepsGenericMetadataForMITM(t *testing.T) {
++	info := codespecInspect(t, "mitm", `cli.String("target")
++risk.NewRisk("flow", risk.type("xss"))`, nil)
++	if got := codespecEntryNames(info["cli"]); !reflect.DeepEqual(got, []string{"target"}) {
++		t.Fatalf("generic CLI metadata missing for mitm: %v", got)
++	}
++	if len(info["risk"]) != 1 || codespecField(t, info["risk"][0], "Type") != "xss" {
++		t.Fatalf("generic risk metadata missing for mitm: %#v", info["risk"])
++	}
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,5 @@
++#!/bin/bash
++set -euo pipefail
++
++
++go test ./common/yakgrpc -run 'CodeSpecInspect' -count=1

@@ -1,0 +1,375 @@
+diff --git a/usercase-test-coderl/fixtures/private.key b/usercase-test-coderl/fixtures/private.key
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/fixtures/private.key
+@@ -0,0 +1,2 @@
++ file-key  
++ c2VjcmV0  
+diff --git a/usercase-test-coderl/test_authenticated_private_api.py b/usercase-test-coderl/test_authenticated_private_api.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/test_authenticated_private_api.py
+@@ -0,0 +1,340 @@
++
++
++import base64
++import hashlib
++import hmac
++import time
++import urllib.parse
++
++import pytest
++
++import krakenex
++
++
++FIXTURES = "/workspace/repo/usercase-test-coderl/fixtures"
++
++
++class RecordingResponse:
++    def __init__(self, payload):
++        self.payload = payload
++        self.status_code = 200
++        self.json_calls = []
++
++    def json(self, **kwargs):
++        self.json_calls.append(dict(kwargs))
++        return self.payload
++
++    def raise_for_status(self):
++        raise AssertionError("raise_for_status should not run for HTTP 200")
++
++
++class RecordingSession:
++    def __init__(self, payload=None):
++        self.payload = {"ok": True, "source": "recording"} if payload is None else payload
++        self.posts = []
++        self.gets = []
++        self.close_count = 0
++
++    def post(self, url, data=None, headers=None, timeout=None):
++        self.posts.append(
++            {
++                "url": url,
++                "data": dict(data),
++                "headers": dict(headers),
++                "timeout": timeout,
++            }
++        )
++        return RecordingResponse(self.payload)
++
++    def get(self, url, params=None, headers=None, timeout=None):
++        self.gets.append(
++            {
++                "url": url,
++                "params": dict(params),
++                "headers": dict(headers),
++                "timeout": timeout,
++            }
++        )
++        raise AssertionError("private query should use POST, not GET")
++
++    def close(self):
++        self.close_count += 1
++        return None
++
++
++class CountingSession(RecordingSession):
++    open_count = 0
++
++    def __init__(self):
++        super().__init__({"ok": True, "source": "counting"})
++        self.closed = False
++        CountingSession.open_count += 1
++
++    def close(self):
++        self.close_count += 1
++        if not self.closed:
++            self.closed = True
++            CountingSession.open_count -= 1
++        return None
++
++
++def expected_kraken_signature(secret, urlpath, params):
++    postdata = urllib.parse.urlencode(params)
++    encoded = (str(params["nonce"]) + postdata).encode()
++    message = urlpath.encode() + hashlib.sha256(encoded).digest()
++    signature = hmac.new(base64.b64decode(secret), message, hashlib.sha512)
++    return base64.b64encode(signature.digest()).decode()
++
++
++def assert_private_post(
++    post,
++    *,
++    method,
++    key,
++    secret,
++    expected_params,
++    timeout,
++    nonce_before_ms,
++    nonce_after_ms,
++):
++
++    urlpath = urllib.parse.urlparse(post["url"]).path
++    assert urlpath == f"/0/private/{method}"
++    assert set(post["data"]) == set(expected_params) | {"nonce"}
++    for name, value in expected_params.items():
++        assert post["data"][name] == value
++
++    nonce = int(post["data"]["nonce"])
++    assert nonce_before_ms <= nonce <= nonce_after_ms
++
++    assert post["headers"]["API-Key"] == key
++
++    assert post["headers"]["API-Sign"] == expected_kraken_signature(
++        secret, urlpath, post["data"]
++    )
++    assert post["timeout"] == timeout
++
++
++def test_constructor_credentials_data_none_signed_post_and_timeout():
++
++
++
++    api = krakenex.API(key="my-key", secret="c2VjcmV0")
++    session = RecordingSession()
++    api.session = session
++
++    nonce_before_ms = int(time.time() * 1000)
++    result = api.query_private("Balance", data=None, timeout=12.5)
++    nonce_after_ms = int(time.time() * 1000)
++
++    assert result == {"ok": True, "source": "recording"}
++    assert len(session.posts) == 1
++
++    assert_private_post(
++        session.posts[0],
++        method="Balance",
++        key="my-key",
++        secret="c2VjcmV0",
++        expected_params={},
++        timeout=12.5,
++        nonce_before_ms=nonce_before_ms,
++        nonce_after_ms=nonce_after_ms,
++    )
++    assert session.gets == []
++
++
++def test_provided_data_is_kept_with_nonce_and_signed():
++
++
++
++    api = krakenex.API(key="my-key", secret="c2VjcmV0")
++    session = RecordingSession()
++    api.session = session
++    data = {"asset": "XXBT"}
++
++    nonce_before_ms = int(time.time() * 1000)
++    result = api.query_private("TradesHistory", data=data, timeout=3)
++    nonce_after_ms = int(time.time() * 1000)
++
++    assert result == {"ok": True, "source": "recording"}
++    assert len(session.posts) == 1
++
++    assert_private_post(
++        session.posts[0],
++        method="TradesHistory",
++        key="my-key",
++        secret="c2VjcmV0",
++        expected_params={"asset": "XXBT"},
++        timeout=3,
++        nonce_before_ms=nonce_before_ms,
++        nonce_after_ms=nonce_after_ms,
++    )
++
++
++def test_load_key_strips_two_lines_then_private_call_uses_loaded_credentials():
++
++
++
++    api = krakenex.API()
++    session = RecordingSession({"ok": True, "source": "loaded"})
++
++
++    api.load_key(f"{FIXTURES}/private.key")
++
++    api.session = session
++    nonce_before_ms = int(time.time() * 1000)
++    result = api.query_private("OpenOrders")
++    nonce_after_ms = int(time.time() * 1000)
++
++    assert result == {"ok": True, "source": "loaded"}
++    assert len(session.posts) == 1
++
++    assert_private_post(
++        session.posts[0],
++        method="OpenOrders",
++        key="file-key",
++        secret="c2VjcmV0",
++        expected_params={},
++        timeout=None,
++        nonce_before_ms=nonce_before_ms,
++        nonce_after_ms=nonce_after_ms,
++    )
++
++
++@pytest.mark.parametrize(
++    ("key", "secret"),
++    [
++        ("", "c2VjcmV0"),
++        ("my-key", ""),
++    ],
++)
++def test_query_private_requires_both_credentials_before_sending_request(key, secret):
++
++
++
++    api = krakenex.API(key=key, secret=secret)
++    session = RecordingSession()
++    api.session = session
++
++    with pytest.raises(Exception) as excinfo:
++        api.query_private("Balance")
++
++    assert excinfo.type is Exception
++    assert str(excinfo.value) == "Either key or secret is not set! (Use `load_key()`."
++    assert session.posts == []
++    assert session.gets == []
++
++
++def test_two_api_instances_keep_credentials_independent():
++
++
++
++    api_a = krakenex.API(key="a-key", secret="c2VjcmV0YQ==")
++    api_b = krakenex.API(key="b-key", secret="c2VjcmV0Yg==")
++    session_a = RecordingSession()
++    session_b = RecordingSession()
++    api_a.session = session_a
++    api_b.session = session_b
++
++
++    api_a.load_key(f"{FIXTURES}/private.key")
++    nonce_a_before_ms = int(time.time() * 1000)
++    api_a.query_private("Balance")
++    nonce_a_after_ms = int(time.time() * 1000)
++    nonce_b_before_ms = int(time.time() * 1000)
++    api_b.query_private("Balance")
++    nonce_b_after_ms = int(time.time() * 1000)
++
++    assert len(session_a.posts) == 1
++    assert_private_post(
++        session_a.posts[0],
++        method="Balance",
++        key="file-key",
++        secret="c2VjcmV0",
++        expected_params={},
++        timeout=None,
++        nonce_before_ms=nonce_a_before_ms,
++        nonce_after_ms=nonce_a_after_ms,
++    )
++    assert len(session_b.posts) == 1
++    assert_private_post(
++        session_b.posts[0],
++        method="Balance",
++        key="b-key",
++        secret="c2VjcmV0Yg==",
++        expected_params={},
++        timeout=None,
++        nonce_before_ms=nonce_b_before_ms,
++        nonce_after_ms=nonce_b_after_ms,
++    )
++
++def test_query_private_uses_assigned_session_object_for_repeated_private_posts():
++
++
++
++    api = krakenex.API(key="my-key", secret="c2VjcmV0")
++    session = RecordingSession()
++    api.session = session
++
++
++    nonce_1_before_ms = int(time.time() * 1000)
++    api.query_private("Balance")
++    nonce_1_after_ms = int(time.time() * 1000)
++    nonce_2_before_ms = int(time.time() * 1000)
++    api.query_private("OpenOrders")
++    nonce_2_after_ms = int(time.time() * 1000)
++
++    assert len(session.posts) == 2
++    assert_private_post(
++        session.posts[0],
++        method="Balance",
++        key="my-key",
++        secret="c2VjcmV0",
++        expected_params={},
++        timeout=None,
++        nonce_before_ms=nonce_1_before_ms,
++        nonce_after_ms=nonce_1_after_ms,
++    )
++    assert_private_post(
++        session.posts[1],
++        method="OpenOrders",
++        key="my-key",
++        secret="c2VjcmV0",
++        expected_params={},
++        timeout=None,
++        nonce_before_ms=nonce_2_before_ms,
++        nonce_after_ms=nonce_2_after_ms,
++    )
++
++
++def test_repeated_construct_query_cycles_keep_requests_on_each_instance_session():
++
++
++
++    retained_sessions = []
++
++
++    for index in range(3):
++        key = f"key-{index}"
++        api = krakenex.API(key=key, secret="c2VjcmV0")
++        session = RecordingSession({"ok": True, "source": f"session-{index}"})
++        retained_sessions.append(session)
++        api.session = session
++        nonce_before_ms = int(time.time() * 1000)
++        result = api.query_private("Balance")
++        nonce_after_ms = int(time.time() * 1000)
++        assert result == {"ok": True, "source": f"session-{index}"}
++        assert len(session.posts) == 1
++        assert_private_post(
++            session.posts[0],
++            method="Balance",
++            key=key,
++            secret="c2VjcmV0",
++            expected_params={},
++            timeout=None,
++            nonce_before_ms=nonce_before_ms,
++            nonce_after_ms=nonce_after_ms,
++        )
++
++    assert len(retained_sessions) == 3
++    assert [len(session.posts) for session in retained_sessions] == [1, 1, 1]
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,18 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++cd /workspace/repo
++
++export PYTHONPATH="/workspace/repo${PYTHONPATH:+:${PYTHONPATH}}"
++export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
++
++exec python -m pytest -p no:cacheprovider /workspace/repo/usercase-test-coderl/test_authenticated_private_api.py -v

@@ -1,0 +1,752 @@
+diff --git a/usercase-test-coderl/test_take_snapshots.py b/usercase-test-coderl/test_take_snapshots.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/test_take_snapshots.py
+@@ -0,0 +1,726 @@
++
++
++
++
++
++from __future__ import annotations
++
++import json
++import subprocess
++import sys
++from typing import Any
++
++import pytest
++
++import nvitop
++import nvitop.api as nvitop_api
++from nvitop import Device, GpuProcess, Snapshot
++
++
++class FakeDevice(Device):
++    def __new__(cls, label: str, role: str, ordinal: int) -> "FakeDevice":
++        return object.__new__(cls)
++
++    def __init__(self, label: str, role: str, ordinal: int) -> None:
++        self.label = label
++        self.role = role
++        self.ordinal = ordinal
++        self._mig_devices: list[FakeDevice] = []
++        self._processes: list[FakeGpuProcess] = []
++        self._ident = (label, role)
++        self._hash = None
++        self.processes_calls = 0
++
++    def __getnewargs__(self) -> tuple[str, str, int]:
++        return (self.label, self.role, self.ordinal)
++
++    def __repr__(self) -> str:
++        return f"FakeDevice({self.label!r})"
++
++    def mig_devices(self) -> list["FakeDevice"]:
++        return list(self._mig_devices)
++
++    def processes(self) -> dict[int, "FakeGpuProcess"]:
++        self.processes_calls += 1
++        return {process.pid: process for process in self._processes}
++
++    def as_snapshot(self) -> Snapshot:
++        return Snapshot(
++            self,
++            kind="device",
++            label=self.label,
++            role=self.role,
++            ordinal=self.ordinal,
++        )
++
++
++class FakeGpuProcess(GpuProcess):
++    def __new__(
++        cls,
++        pid: int,
++        device: FakeDevice,
++        tag: str,
++        sequence: int,
++        *,
++        disappearing: bool = False,
++    ) -> "FakeGpuProcess":
++        return object.__new__(cls)
++
++    def __init__(
++        self,
++        pid: int,
++        device: FakeDevice,
++        tag: str,
++        sequence: int,
++        *,
++        disappearing: bool = False,
++    ) -> None:
++        self._pid = pid
++        self._host = None
++        self._device = device
++        self.tag = tag
++        self.sequence = sequence
++        self.disappearing = disappearing
++        self._ident = (pid, device.label, tag)
++        self._hash = None
++
++    def __getnewargs_ex__(self) -> tuple[tuple[Any, ...], dict[str, Any]]:
++        return ((self.pid, self.device, self.tag, self.sequence), {"disappearing": self.disappearing})
++
++    def __repr__(self) -> str:
++        return f"FakeGpuProcess({self.pid!r}, {self.device.label!r})"
++
++    def as_snapshot(self, *, failsafe: bool = False) -> Snapshot:
++        if self.disappearing and not failsafe:
++            raise RuntimeError("process disappeared")
++        return Snapshot(
++            self,
++            kind="gpu_process",
++            pid=self.pid,
++            device=self.device.label,
++            tag=self.tag,
++            sequence=self.sequence,
++            failsafe=failsafe,
++            state="fallback" if self.disappearing else "live",
++        )
++
++
++def fake_process_take_snapshots(
++    cls: type[GpuProcess],
++    gpu_processes: list[FakeGpuProcess],
++    *,
++    failsafe: bool = False,
++) -> list[Snapshot]:
++    del cls
++    return [process.as_snapshot(failsafe=failsafe) for process in gpu_processes]
++
++
++def make_world(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
++    phys0 = FakeDevice("physical-0", "physical", 0)
++    mig0a = FakeDevice("mig-0a", "mig", 1)
++    mig0b = FakeDevice("mig-0b", "mig", 2)
++    phys1 = FakeDevice("physical-1", "physical", 3)
++    cuda0 = FakeDevice("cuda-0", "cuda", 10)
++    cuda1 = FakeDevice("cuda-1", "cuda", 11)
++
++    phys0._mig_devices = [mig0a, mig0b]
++    phys0._processes = [FakeGpuProcess(9000, phys0, "parent-only-not-leaf", 0)]
++    mig0a._processes = [FakeGpuProcess(1000, mig0a, "mig-a-train", 1)]
++    mig0b._processes = [FakeGpuProcess(1001, mig0b, "mig-b-eval", 2)]
++    phys1._processes = [FakeGpuProcess(1002, phys1, "phys1-render", 3)]
++    cuda0._processes = [
++        FakeGpuProcess(2000, cuda0, "cuda0-worker-a", 4),
++        FakeGpuProcess(2001, cuda0, "cuda0-worker-b", 5),
++    ]
++    cuda1._processes = [FakeGpuProcess(2002, cuda1, "cuda1-worker", 6)]
++
++    p0 = FakeGpuProcess(3000, cuda0, "explicit-0", 7)
++    p1 = FakeGpuProcess(3001, cuda0, "explicit-1", 8)
++    p2 = FakeGpuProcess(3002, cuda1, "explicit-2", 9)
++    gone = FakeGpuProcess(3003, cuda1, "explicit-gone", 12, disappearing=True)
++
++    monkeypatch.setattr(Device, "all", classmethod(lambda cls: [phys0, phys1]))
++    monkeypatch.setattr(GpuProcess, "take_snapshots", classmethod(fake_process_take_snapshots))
++
++    return {
++        "phys0": phys0,
++        "mig0a": mig0a,
++        "mig0b": mig0b,
++        "phys1": phys1,
++        "cuda0": cuda0,
++        "cuda1": cuda1,
++        "p0": p0,
++        "p1": p1,
++        "p2": p2,
++        "gone": gone,
++    }
++
++
++def simplify(result: tuple[list[Snapshot], list[Snapshot]]) -> dict[str, Any]:
++    return {
++        "result_type": type(result).__name__,
++        "fields": list(result._fields),
++        "devices": [dict(snapshot) for snapshot in result.devices],
++        "gpu_processes": [dict(snapshot) for snapshot in result.gpu_processes],
++
++        "device_item_types": [
++            "LIVE_DEVICE" if isinstance(snapshot, Device) else "Snapshot"
++            for snapshot in result.devices
++        ],
++        "process_item_types": [
++            "LIVE_PROCESS" if isinstance(snapshot, GpuProcess) else "Snapshot"
++            for snapshot in result.gpu_processes
++        ],
++    }
++
++
++def test_default_discovers_physical_and_mig_leaf_processes(monkeypatch: pytest.MonkeyPatch) -> None:
++
++
++
++    make_world(monkeypatch)
++
++    assert simplify(nvitop.take_snapshots()) == {
++        "result_type": "SnapshotResult",
++        "fields": ["devices", "gpu_processes"],
++        "devices": [
++            {"kind": "device", "label": "physical-0", "role": "physical", "ordinal": 0},
++            {"kind": "device", "label": "mig-0a", "role": "mig", "ordinal": 1},
++            {"kind": "device", "label": "mig-0b", "role": "mig", "ordinal": 2},
++            {"kind": "device", "label": "physical-1", "role": "physical", "ordinal": 3},
++        ],
++        "gpu_processes": [
++            {
++                "kind": "gpu_process",
++                "pid": 1000,
++                "device": "mig-0a",
++                "tag": "mig-a-train",
++                "sequence": 1,
++                "failsafe": True,
++                "state": "live",
++            },
++            {
++                "kind": "gpu_process",
++                "pid": 1001,
++                "device": "mig-0b",
++                "tag": "mig-b-eval",
++                "sequence": 2,
++                "failsafe": True,
++                "state": "live",
++            },
++            {
++                "kind": "gpu_process",
++                "pid": 1002,
++                "device": "physical-1",
++                "tag": "phys1-render",
++                "sequence": 3,
++                "failsafe": True,
++                "state": "live",
++            },
++        ],
++        "device_item_types": ["Snapshot", "Snapshot", "Snapshot", "Snapshot"],
++        "process_item_types": ["Snapshot", "Snapshot", "Snapshot"],
++    }
++
++
++def test_api_export_snapshots_explicit_device_iterable_in_order(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++
++
++
++    world = make_world(monkeypatch)
++
++    assert simplify(nvitop_api.take_snapshots([world["cuda0"], world["cuda1"]])) == {
++        "result_type": "SnapshotResult",
++        "fields": ["devices", "gpu_processes"],
++        "devices": [
++            {"kind": "device", "label": "cuda-0", "role": "cuda", "ordinal": 10},
++            {"kind": "device", "label": "cuda-1", "role": "cuda", "ordinal": 11},
++        ],
++        "gpu_processes": [
++            {
++                "kind": "gpu_process",
++                "pid": 2000,
++                "device": "cuda-0",
++                "tag": "cuda0-worker-a",
++                "sequence": 4,
++                "failsafe": True,
++                "state": "live",
++            },
++            {
++                "kind": "gpu_process",
++                "pid": 2001,
++                "device": "cuda-0",
++                "tag": "cuda0-worker-b",
++                "sequence": 5,
++                "failsafe": True,
++                "state": "live",
++            },
++            {
++                "kind": "gpu_process",
++                "pid": 2002,
++                "device": "cuda-1",
++                "tag": "cuda1-worker",
++                "sequence": 6,
++                "failsafe": True,
++                "state": "live",
++            },
++        ],
++        "device_item_types": ["Snapshot", "Snapshot"],
++        "process_item_types": ["Snapshot", "Snapshot", "Snapshot"],
++    }
++
++
++def test_gpu_processes_false_returns_physical_devices_and_no_processes(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++
++
++
++    make_world(monkeypatch)
++
++    assert simplify(nvitop.take_snapshots(gpu_processes=False)) == {
++        "result_type": "SnapshotResult",
++        "fields": ["devices", "gpu_processes"],
++        "devices": [
++            {"kind": "device", "label": "physical-0", "role": "physical", "ordinal": 0},
++            {"kind": "device", "label": "physical-1", "role": "physical", "ordinal": 3},
++        ],
++        "gpu_processes": [],
++        "device_item_types": ["Snapshot", "Snapshot"],
++        "process_item_types": [],
++    }
++
++
++def test_explicit_gpu_processes_choose_unique_devices_first_seen(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++
++
++
++    world = make_world(monkeypatch)
++
++    assert simplify(
++        nvitop_api.take_snapshots(gpu_processes=[world["p0"], world["p1"], world["p2"]]),
++    ) == {
++        "result_type": "SnapshotResult",
++        "fields": ["devices", "gpu_processes"],
++        "devices": [
++            {"kind": "device", "label": "cuda-0", "role": "cuda", "ordinal": 10},
++            {"kind": "device", "label": "cuda-1", "role": "cuda", "ordinal": 11},
++        ],
++        "gpu_processes": [
++            {
++                "kind": "gpu_process",
++                "pid": 3000,
++                "device": "cuda-0",
++                "tag": "explicit-0",
++                "sequence": 7,
++                "failsafe": True,
++                "state": "live",
++            },
++            {
++                "kind": "gpu_process",
++                "pid": 3001,
++                "device": "cuda-0",
++                "tag": "explicit-1",
++                "sequence": 8,
++                "failsafe": True,
++                "state": "live",
++            },
++            {
++                "kind": "gpu_process",
++                "pid": 3002,
++                "device": "cuda-1",
++                "tag": "explicit-2",
++                "sequence": 9,
++                "failsafe": True,
++                "state": "live",
++            },
++        ],
++        "device_item_types": ["Snapshot", "Snapshot"],
++        "process_item_types": ["Snapshot", "Snapshot", "Snapshot"],
++    }
++
++
++def test_single_device_behaves_like_one_item_device_list(monkeypatch: pytest.MonkeyPatch) -> None:
++
++
++
++    world = make_world(monkeypatch)
++
++    assert simplify(nvitop.take_snapshots(world["cuda1"])) == {
++        "result_type": "SnapshotResult",
++        "fields": ["devices", "gpu_processes"],
++        "devices": [
++            {"kind": "device", "label": "cuda-1", "role": "cuda", "ordinal": 11},
++        ],
++        "gpu_processes": [
++            {
++                "kind": "gpu_process",
++                "pid": 2002,
++                "device": "cuda-1",
++                "tag": "cuda1-worker",
++                "sequence": 6,
++                "failsafe": True,
++                "state": "live",
++            },
++        ],
++        "device_item_types": ["Snapshot"],
++        "process_item_types": ["Snapshot"],
++    }
++
++
++def test_single_gpu_process_behaves_like_one_item_process_list(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++
++
++
++    world = make_world(monkeypatch)
++
++    assert simplify(nvitop_api.take_snapshots(gpu_processes=world["p2"])) == {
++        "result_type": "SnapshotResult",
++        "fields": ["devices", "gpu_processes"],
++        "devices": [
++            {"kind": "device", "label": "cuda-1", "role": "cuda", "ordinal": 11},
++        ],
++        "gpu_processes": [
++            {
++                "kind": "gpu_process",
++                "pid": 3002,
++                "device": "cuda-1",
++                "tag": "explicit-2",
++                "sequence": 9,
++                "failsafe": True,
++                "state": "live",
++            },
++        ],
++        "device_item_types": ["Snapshot"],
++        "process_item_types": ["Snapshot"],
++    }
++
++
++def test_devices_and_explicit_processes_are_resolved_independently(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++
++
++
++    world = make_world(monkeypatch)
++
++    assert simplify(
++        nvitop.take_snapshots(
++            [world["cuda1"], world["cuda0"]],
++            gpu_processes=[world["p0"], world["p2"]],
++        ),
++    ) == {
++        "result_type": "SnapshotResult",
++        "fields": ["devices", "gpu_processes"],
++        "devices": [
++            {"kind": "device", "label": "cuda-1", "role": "cuda", "ordinal": 11},
++            {"kind": "device", "label": "cuda-0", "role": "cuda", "ordinal": 10},
++        ],
++        "gpu_processes": [
++            {
++                "kind": "gpu_process",
++                "pid": 3000,
++                "device": "cuda-0",
++                "tag": "explicit-0",
++                "sequence": 7,
++                "failsafe": True,
++                "state": "live",
++            },
++            {
++                "kind": "gpu_process",
++                "pid": 3002,
++                "device": "cuda-1",
++                "tag": "explicit-2",
++                "sequence": 9,
++                "failsafe": True,
++                "state": "live",
++            },
++        ],
++        "device_item_types": ["Snapshot", "Snapshot"],
++        "process_item_types": ["Snapshot", "Snapshot"],
++    }
++
++
++def test_disappearing_process_uses_failsafe_snapshot_mode(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++
++
++
++    world = make_world(monkeypatch)
++
++    assert simplify(nvitop_api.take_snapshots(gpu_processes=[world["gone"]])) == {
++        "result_type": "SnapshotResult",
++        "fields": ["devices", "gpu_processes"],
++        "devices": [
++            {"kind": "device", "label": "cuda-1", "role": "cuda", "ordinal": 11},
++        ],
++        "gpu_processes": [
++            {
++                "kind": "gpu_process",
++                "pid": 3003,
++                "device": "cuda-1",
++                "tag": "explicit-gone",
++                "sequence": 12,
++                "failsafe": True,
++                "state": "fallback",
++            },
++        ],
++        "device_item_types": ["Snapshot"],
++        "process_item_types": ["Snapshot"],
++    }
++
++
++def test_invalid_non_iterable_arguments_raise_type_error(monkeypatch: pytest.MonkeyPatch) -> None:
++
++
++
++    make_world(monkeypatch)
++
++
++    with pytest.raises(TypeError):
++        nvitop.take_snapshots(42)
++
++    with pytest.raises(TypeError):
++        nvitop.take_snapshots(gpu_processes=42)
++
++
++def test_referential_transparency_for_same_input(monkeypatch: pytest.MonkeyPatch) -> None:
++    world = make_world(monkeypatch)
++
++    first = simplify(nvitop.take_snapshots([world["cuda0"], world["cuda1"]]))
++    second = simplify(nvitop.take_snapshots([world["cuda0"], world["cuda1"]]))
++
++    expected = {
++        "result_type": "SnapshotResult",
++        "fields": ["devices", "gpu_processes"],
++        "devices": [
++            {"kind": "device", "label": "cuda-0", "role": "cuda", "ordinal": 10},
++            {"kind": "device", "label": "cuda-1", "role": "cuda", "ordinal": 11},
++        ],
++        "gpu_processes": [
++            {
++                "kind": "gpu_process",
++                "pid": 2000,
++                "device": "cuda-0",
++                "tag": "cuda0-worker-a",
++                "sequence": 4,
++                "failsafe": True,
++                "state": "live",
++            },
++            {
++                "kind": "gpu_process",
++                "pid": 2001,
++                "device": "cuda-0",
++                "tag": "cuda0-worker-b",
++                "sequence": 5,
++                "failsafe": True,
++                "state": "live",
++            },
++            {
++                "kind": "gpu_process",
++                "pid": 2002,
++                "device": "cuda-1",
++                "tag": "cuda1-worker",
++                "sequence": 6,
++                "failsafe": True,
++                "state": "live",
++            },
++        ],
++        "device_item_types": ["Snapshot", "Snapshot"],
++        "process_item_types": ["Snapshot", "Snapshot", "Snapshot"],
++    }
++
++    assert first == expected
++    assert second == expected
++
++
++def test_does_not_mutate_caller_device_list(monkeypatch: pytest.MonkeyPatch) -> None:
++    world = make_world(monkeypatch)
++    devices = [world["cuda0"], world["cuda1"]]
++
++    actual = simplify(nvitop.take_snapshots(devices))
++
++
++    assert actual == {
++        "result_type": "SnapshotResult",
++        "fields": ["devices", "gpu_processes"],
++        "devices": [
++            {"kind": "device", "label": "cuda-0", "role": "cuda", "ordinal": 10},
++            {"kind": "device", "label": "cuda-1", "role": "cuda", "ordinal": 11},
++        ],
++        "gpu_processes": [
++            {
++                "kind": "gpu_process",
++                "pid": 2000,
++                "device": "cuda-0",
++                "tag": "cuda0-worker-a",
++                "sequence": 4,
++                "failsafe": True,
++                "state": "live",
++            },
++            {
++                "kind": "gpu_process",
++                "pid": 2001,
++                "device": "cuda-0",
++                "tag": "cuda0-worker-b",
++                "sequence": 5,
++                "failsafe": True,
++                "state": "live",
++            },
++            {
++                "kind": "gpu_process",
++                "pid": 2002,
++                "device": "cuda-1",
++                "tag": "cuda1-worker",
++                "sequence": 6,
++                "failsafe": True,
++                "state": "live",
++            },
++        ],
++        "device_item_types": ["Snapshot", "Snapshot"],
++        "process_item_types": ["Snapshot", "Snapshot", "Snapshot"],
++    }
++
++
++def test_no_global_state_across_fresh_python_process(monkeypatch: pytest.MonkeyPatch) -> None:
++    world = make_world(monkeypatch)
++    in_process = simplify(nvitop.take_snapshots(gpu_processes=world["p2"]))
++    script = r'''
++import json
++import sys
++sys.path.insert(0, "/workspace/repo")
++import nvitop.api as nvitop_api
++from nvitop import Device, GpuProcess, Snapshot
++
++class FakeDevice(Device):
++    def __new__(cls, label, role, ordinal):
++        return object.__new__(cls)
++    def __init__(self, label, role, ordinal):
++        self.label = label
++        self.role = role
++        self.ordinal = ordinal
++        self._mig_devices = []
++        self._processes = []
++        self._ident = (label, role)
++        self._hash = None
++    def processes(self):
++        return {process.pid: process for process in self._processes}
++    def as_snapshot(self):
++        return Snapshot(self, kind="device", label=self.label, role=self.role, ordinal=self.ordinal)
++
++class FakeGpuProcess(GpuProcess):
++    def __new__(cls, pid, device, tag, sequence):
++        return object.__new__(cls)
++    def __init__(self, pid, device, tag, sequence):
++        self._pid = pid
++        self._host = None
++        self._device = device
++        self.tag = tag
++        self.sequence = sequence
++        self._ident = (pid, device.label, tag)
++        self._hash = None
++    def as_snapshot(self, *, failsafe=False):
++        return Snapshot(self, kind="gpu_process", pid=self.pid, device=self.device.label, tag=self.tag, sequence=self.sequence, failsafe=failsafe, state="live")
++
++def fake_process_take_snapshots(cls, gpu_processes, *, failsafe=False):
++    return [process.as_snapshot(failsafe=failsafe) for process in gpu_processes]
++
++def simplify(result):
++    return {
++        "result_type": type(result).__name__,
++        "fields": list(result._fields),
++        "devices": [dict(snapshot) for snapshot in result.devices],
++        "gpu_processes": [dict(snapshot) for snapshot in result.gpu_processes],
++        #
++        "device_item_types": [
++            "LIVE_DEVICE" if isinstance(snapshot, Device) else "Snapshot"
++            for snapshot in result.devices
++        ],
++        "process_item_types": [
++            "LIVE_PROCESS" if isinstance(snapshot, GpuProcess) else "Snapshot"
++            for snapshot in result.gpu_processes
++        ],
++    }
++
++cuda1 = FakeDevice("cuda-1", "cuda", 11)
++p2 = FakeGpuProcess(3002, cuda1, "explicit-2", 9)
++GpuProcess.take_snapshots = classmethod(fake_process_take_snapshots)
++sys.stdout.write(json.dumps(simplify(nvitop_api.take_snapshots(gpu_processes=p2)), sort_keys=True))
++'''
++
++    fresh = json.loads(
++        subprocess.run(
++            [sys.executable, "-c", script],
++            check=True,
++            stdout=subprocess.PIPE,
++            text=True,
++        ).stdout,
++    )
++
++    expected = {
++        "result_type": "SnapshotResult",
++        "fields": ["devices", "gpu_processes"],
++        "devices": [
++            {"kind": "device", "label": "cuda-1", "role": "cuda", "ordinal": 11},
++        ],
++        "gpu_processes": [
++            {
++                "kind": "gpu_process",
++                "pid": 3002,
++                "device": "cuda-1",
++                "tag": "explicit-2",
++                "sequence": 9,
++                "failsafe": True,
++                "state": "live",
++            },
++        ],
++        "device_item_types": ["Snapshot"],
++        "process_item_types": ["Snapshot"],
++    }
++
++    assert in_process == expected
++    assert fresh == expected
++
++
++def test_explicit_device_snapshots_requested_processes(monkeypatch: pytest.MonkeyPatch) -> None:
++    world = make_world(monkeypatch)
++
++    actual = simplify(nvitop.take_snapshots([world["cuda0"]]))
++
++
++    assert actual == {
++        "result_type": "SnapshotResult",
++        "fields": ["devices", "gpu_processes"],
++        "devices": [
++            {"kind": "device", "label": "cuda-0", "role": "cuda", "ordinal": 10},
++        ],
++        "gpu_processes": [
++            {
++                "kind": "gpu_process",
++                "pid": 2000,
++                "device": "cuda-0",
++                "tag": "cuda0-worker-a",
++                "sequence": 4,
++                "failsafe": True,
++                "state": "live",
++            },
++            {
++                "kind": "gpu_process",
++                "pid": 2001,
++                "device": "cuda-0",
++                "tag": "cuda0-worker-b",
++                "sequence": 5,
++                "failsafe": True,
++                "state": "live",
++            },
++        ],
++        "device_item_types": ["Snapshot"],
++        "process_item_types": ["Snapshot", "Snapshot"],
++    }
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,16 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++cd /workspace/repo
++export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
++export PYTHONPATH="/workspace/repo${PYTHONPATH:+:${PYTHONPATH}}"
++exec /usr/bin/python -m pytest /workspace/repo/usercase-test-coderl/test_take_snapshots.py -v

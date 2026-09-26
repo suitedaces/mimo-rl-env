@@ -1,0 +1,421 @@
+diff --git a/usercase-test-coderl/CMakeLists.txt b/usercase-test-coderl/CMakeLists.txt
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/CMakeLists.txt
+@@ -0,0 +1,24 @@
++cmake_minimum_required(VERSION 3.24)
++project(openrct2_usercase_coderl CXX)
++
++set(CMAKE_CXX_STANDARD 20)
++set(CMAKE_CXX_STANDARD_REQUIRED ON)
++
++set(WITH_TESTS OFF CACHE BOOL "" FORCE)
++set(DISABLE_GUI ON CACHE BOOL "" FORCE)
++set(DISABLE_NETWORK ON CACHE BOOL "" FORCE)
++set(DISABLE_HTTP ON CACHE BOOL "" FORCE)
++set(DISABLE_DISCORD_RPC ON CACHE BOOL "" FORCE)
++set(DISABLE_TTF ON CACHE BOOL "" FORCE)
++set(ENABLE_SCRIPTING OFF CACHE BOOL "" FORCE)
++set(DOWNLOAD_OBJECTS OFF CACHE BOOL "" FORCE)
++set(DOWNLOAD_TITLE_SEQUENCES OFF CACHE BOOL "" FORCE)
++set(DOWNLOAD_OPENSFX OFF CACHE BOOL "" FORCE)
++set(DOWNLOAD_OPENMUSIC OFF CACHE BOOL "" FORCE)
++set(DOWNLOAD_REPLAYS OFF CACHE BOOL "" FORCE)
++
++add_subdirectory(/workspace/repo "${CMAKE_BINARY_DIR}/openrct2")
++
++add_executable(object_repository_add_from_file_test object_repository_add_from_file_test.cpp)
++target_include_directories(object_repository_add_from_file_test PRIVATE /workspace/repo/src)
++target_link_libraries(object_repository_add_from_file_test PRIVATE libopenrct2)
+diff --git a/usercase-test-coderl/object_repository_add_from_file_test.cpp b/usercase-test-coderl/object_repository_add_from_file_test.cpp
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/object_repository_add_from_file_test.cpp
+@@ -0,0 +1,357 @@
++
++
++
++
++#include <openrct2/Context.h>
++#include <openrct2/OpenRCT2.h>
++#include <openrct2/PlatformEnvironment.h>
++#include <openrct2/audio/AudioContext.h>
++#include <openrct2/core/EnumUtils.hpp>
++#include <openrct2/core/File.h>
++#include <openrct2/core/MemoryStream.h>
++#include <openrct2/core/Path.hpp>
++#include <openrct2/localisation/Language.h>
++#include <openrct2/object/Object.h>
++#include <openrct2/object/ObjectRepository.h>
++#include <openrct2/sawyer_coding/SawyerChunkWriter.h>
++#include <openrct2/ui/UiContext.h>
++
++#include <algorithm>
++#include <array>
++#include <cstdlib>
++#include <filesystem>
++#include <fstream>
++#include <iostream>
++#include <sstream>
++#include <stdexcept>
++#include <string>
++#include <vector>
++
++using namespace OpenRCT2;
++
++namespace
++{
++    constexpr auto kRuntimeRoot = "/workspace/repo/usercase-test-coderl/runtime";
++
++    void Require(bool condition, const std::string& message)
++    {
++        if (!condition)
++        {
++            throw std::runtime_error(message);
++        }
++    }
++
++    template<typename T, typename U>
++    void RequireEq(const T& actual, const U& expected, const std::string& label)
++    {
++        if (!(actual == expected))
++        {
++            std::ostringstream out;
++            out << label << ": expected [" << expected << "], got [" << actual << "]";
++            throw std::runtime_error(out.str());
++        }
++    }
++
++    std::unique_ptr<IPlatformEnvironment> MakeEnv(const std::string& suffix)
++    {
++        DirBaseValues paths{};
++        const auto base = std::string(kRuntimeRoot) + "/" + suffix;
++        paths[EnumValue(DirBase::openrct2)] = base + "/openrct2";
++        paths[EnumValue(DirBase::user)] = base + "/user";
++        paths[EnumValue(DirBase::config)] = base + "/config";
++        paths[EnumValue(DirBase::cache)] = base + "/cache";
++        paths[EnumValue(DirBase::documentation)] = base + "/docs";
++        return CreatePlatformEnvironment(paths);
++    }
++
++    std::string UserObjectsPath(const IPlatformEnvironment& env)
++    {
++        return env.GetDirectoryPath(DirBase::user, DirId::objects);
++    }
++
++    void WriteObjectJson(const std::string& path, const std::string& id, const std::string& name)
++    {
++        std::filesystem::create_directories(std::filesystem::path(path).parent_path());
++        std::ofstream out(path);
++        out << "{\n"
++            << "  \"id\": \"" << id << "\",\n"
++            << "  \"objectType\": \"scenario_meta\",\n"
++            << "  \"version\": \"1.2.3\",\n"
++            << "  \"authors\": [\"Acceptance Author\"],\n"
++            << "  \"strings\": {\n"
++            << "    \"name\": {\"en-GB\": \"" << name << "\"},\n"
++            << "    \"park_name\": {\"en-GB\": \"Fixture Park\"},\n"
++            << "    \"details\": {\"en-GB\": \"Fixture details\"}\n"
++            << "  },\n"
++            << "  \"images\": []\n"
++            << "}\n";
++    }
++
++    std::vector<uint8_t> MakeParkObjBytes(const std::string& id, const std::string& name)
++    {
++        const auto buildDir = std::string(kRuntimeRoot) + "/parkobj-build";
++        std::filesystem::remove_all(buildDir);
++        std::filesystem::create_directories(buildDir);
++        WriteObjectJson(buildDir + "/object.json", id, name);
++
++        const auto oldCwd = std::filesystem::current_path();
++        std::filesystem::current_path(buildDir);
++        const int rc = std::system("zip -q object.parkobj object.json");
++        std::filesystem::current_path(oldCwd);
++        RequireEq(rc, 0, "zip command exit status");
++        return File::ReadAllBytes(buildDir + "/object.parkobj");
++    }
++
++    std::vector<uint8_t> MakeLegacyDatBytes()
++    {
++        RCTObjectEntry entry{};
++        entry.SetType(ObjectType::parkEntrance);
++        entry.SetName("TSTENTR");
++        entry.flags |= static_cast<uint32_t>(ObjectSourceGame::custom) << 4;
++        entry.checksum = 0x1234ABCD;
++
++        MemoryStream legacy;
++        const std::array<uint8_t, 6> reserved{};
++        legacy.Write(reserved.data(), reserved.size());
++        legacy.WriteValue<uint8_t>(2);
++        legacy.WriteValue<uint8_t>(9);
++        legacy.WriteValue<uint8_t>(static_cast<uint8_t>(RCT2LanguageId::englishUK));
++        const char name[] = "TST Entrance";
++        legacy.Write(name, sizeof(name));
++        legacy.WriteValue<uint8_t>(static_cast<uint8_t>(RCT2LanguageId::end));
++        legacy.WriteValue<uint32_t>(0);
++        legacy.WriteValue<uint32_t>(0);
++
++        MemoryStream dat;
++        dat.Write(&entry, sizeof(entry));
++        SawyerCoding::SawyerChunkWriter writer(&dat);
++        writer.WriteChunk(legacy.GetData(), legacy.GetLength(), SawyerCoding::ChunkEncoding::none);
++
++        const auto* bytes = static_cast<const uint8_t*>(dat.GetData());
++        return std::vector<uint8_t>(bytes, bytes + dat.GetLength());
++    }
++
++    std::vector<std::string> DirectoryFileNames(const std::string& directory)
++    {
++        std::vector<std::string> names;
++        if (!std::filesystem::exists(directory))
++            return names;
++        for (const auto& entry : std::filesystem::directory_iterator(directory))
++        {
++            names.push_back(entry.path().filename().string());
++        }
++        std::sort(names.begin(), names.end());
++        return names;
++    }
++
++    void AssertImportedJsonItem(const ObjectRepositoryItem* item, const std::string& expectedPath)
++    {
++        Require(item != nullptr, "FindObject(\"custom.scenery_pack\") returned null");
++
++        Require(item->Generation == ObjectGeneration::JSON, "json generation");
++        Require(item->Type == ObjectType::scenarioMeta, "json object type");
++        RequireEq(item->Identifier, std::string("custom.scenery_pack"), "json identifier");
++        RequireEq(item->Path, expectedPath, "json path");
++    }
++
++    bool HasFileName(const std::vector<std::string>& files, const std::string& expected)
++    {
++        return std::find(files.begin(), files.end(), expected) != files.end();
++    }
++
++    bool HasUniqueSuffixedParkObjName(const std::vector<std::string>& files)
++    {
++        for (const auto& file : files)
++        {
++            if (file != "custom.scenery_pack.parkobj" && file.starts_with("custom.scenery_pack")
++                && file.ends_with(".parkobj"))
++            {
++                return true;
++            }
++        }
++        return false;
++    }
++
++    bool HasLegacyDatNameForEntry(const std::vector<std::string>& files)
++    {
++        for (const auto& file : files)
++        {
++            if (file.starts_with("TSTENTR") && file.ends_with(".DAT"))
++            {
++                return true;
++            }
++        }
++        return false;
++    }
++
++    void TestJsonImportUpdatesCurrentRepository()
++    {
++
++
++        auto env = MakeEnv("json-import");
++        auto repo = CreateObjectRepository(*env);
++        repo->Construct(LANGUAGE_ENGLISH_UK);
++        RequireEq(repo->GetNumObjects(), static_cast<size_t>(0), "initial object count");
++        Require(repo->FindObject("custom.scenery_pack") == nullptr, "initial FindObject should be null");
++
++        const auto bytes = MakeParkObjBytes("custom.scenery_pack", "Custom Scenery Pack");
++        repo->AddObjectFromFile(ObjectGeneration::JSON, "custom.scenery_pack", bytes.data(), bytes.size());
++
++        RequireEq(repo->GetNumObjects(), static_cast<size_t>(1), "object count after JSON import");
++        const auto expectedPath = UserObjectsPath(*env) + "/custom.scenery_pack.parkobj";
++        AssertImportedJsonItem(repo->FindObject("custom.scenery_pack"), expectedPath);
++        RequireEq(DirectoryFileNames(UserObjectsPath(*env)).size(), static_cast<size_t>(1), "json file count");
++
++        Require(HasFileName(DirectoryFileNames(UserObjectsPath(*env)), "custom.scenery_pack.parkobj"), "json filename");
++    }
++
++    void TestJsonCollisionSuffixDoesNotReplaceLookup()
++    {
++
++
++        auto env = MakeEnv("json-collision");
++        auto repo = CreateObjectRepository(*env);
++        repo->Construct(LANGUAGE_ENGLISH_UK);
++        const auto bytes = MakeParkObjBytes("custom.scenery_pack", "Custom Scenery Pack");
++
++        repo->AddObjectFromFile(ObjectGeneration::JSON, "custom.scenery_pack", bytes.data(), bytes.size());
++        repo->AddObjectFromFile(ObjectGeneration::JSON, "custom.scenery_pack", bytes.data(), bytes.size());
++
++        RequireEq(repo->GetNumObjects(), static_cast<size_t>(1), "count after duplicate JSON import");
++        const auto expectedPath = UserObjectsPath(*env) + "/custom.scenery_pack.parkobj";
++        AssertImportedJsonItem(repo->FindObject("custom.scenery_pack"), expectedPath);
++        const auto files = DirectoryFileNames(UserObjectsPath(*env));
++        RequireEq(files.size(), static_cast<size_t>(2), "json duplicate file count");
++
++        Require(HasFileName(files, "custom.scenery_pack.parkobj"), "json original filename");
++        Require(HasUniqueSuffixedParkObjName(files), "json suffixed filename");
++    }
++
++    void TestDatImportUsesEntryNameAndUpdatesLegacyLookup()
++    {
++
++
++        auto env = MakeEnv("dat-import");
++        auto repo = CreateObjectRepository(*env);
++        repo->Construct(LANGUAGE_ENGLISH_UK);
++        RequireEq(repo->GetNumObjects(), static_cast<size_t>(0), "initial DAT object count");
++        Require(repo->FindObjectLegacy("TSTENTR") == nullptr, "initial FindObjectLegacy should be null");
++
++        const auto bytes = MakeLegacyDatBytes();
++        repo->AddObjectFromFile(ObjectGeneration::DAT, "legacy-object-name-ignored", bytes.data(), bytes.size());
++
++        RequireEq(repo->GetNumObjects(), static_cast<size_t>(1), "object count after DAT import");
++        const auto* item = repo->FindObjectLegacy("TSTENTR");
++        Require(item != nullptr, "FindObjectLegacy(\"TSTENTR\") returned null");
++
++        Require(item->Generation == ObjectGeneration::DAT, "dat generation");
++        Require(item->Type == ObjectType::parkEntrance, "dat object type");
++        Require(item->Path.starts_with(UserObjectsPath(*env) + "/TSTENTR"), "dat path entry name");
++        Require(item->Path.ends_with(".DAT"), "dat path extension");
++        const auto files = DirectoryFileNames(UserObjectsPath(*env));
++        RequireEq(files.size(), static_cast<size_t>(1), "dat file count");
++
++        Require(HasLegacyDatNameForEntry(files), "dat filename");
++    }
++
++    void TestInvalidBytesDoNotThrowOrMutateLookup()
++    {
++
++
++        auto env = MakeEnv("invalid-json");
++        auto repo = CreateObjectRepository(*env);
++        repo->Construct(LANGUAGE_ENGLISH_UK);
++        const std::array<uint8_t, 11> invalid = { 'n', 'o', 't', '-', 'p', 'a', 'r', 'k', 'o', 'b', 'j' };
++
++        repo->AddObjectFromFile(ObjectGeneration::JSON, "custom.scenery_pack", invalid.data(), invalid.size());
++
++        RequireEq(repo->GetNumObjects(), static_cast<size_t>(0), "invalid import object count");
++        Require(repo->FindObject("custom.scenery_pack") == nullptr, "invalid import lookup should be null");
++        const auto files = DirectoryFileNames(UserObjectsPath(*env));
++        RequireEq(files.size(), static_cast<size_t>(1), "invalid import still writes attempted file");
++        RequireEq(files[0], std::string("custom.scenery_pack.parkobj"), "invalid import filename");
++    }
++
++    void TestIndependentRepositoryInstances()
++    {
++
++
++        auto envA = MakeEnv("independent-a");
++        auto envB = MakeEnv("independent-b");
++        auto a = CreateObjectRepository(*envA);
++        auto b = CreateObjectRepository(*envB);
++        a->Construct(LANGUAGE_ENGLISH_UK);
++        b->Construct(LANGUAGE_ENGLISH_UK);
++        const auto bytes = MakeParkObjBytes("custom.scenery_pack", "Custom Scenery Pack");
++
++        a->AddObjectFromFile(ObjectGeneration::JSON, "custom.scenery_pack", bytes.data(), bytes.size());
++
++        RequireEq(a->GetNumObjects(), static_cast<size_t>(1), "instance a count");
++        RequireEq(b->GetNumObjects(), static_cast<size_t>(0), "instance b count");
++        Require(a->FindObject("custom.scenery_pack") != nullptr, "instance a lookup");
++        Require(b->FindObject("custom.scenery_pack") == nullptr, "instance b lookup");
++    }
++
++    void TestRepositoryCanImportAfterAnotherInstanceIsDestroyed()
++    {
++
++
++        auto env = MakeEnv("cleanup-idempotent");
++        {
++            auto repo = CreateObjectRepository(*env);
++            repo->Construct(LANGUAGE_ENGLISH_UK);
++        }
++        auto repo = CreateObjectRepository(*env);
++        repo->Construct(LANGUAGE_ENGLISH_UK);
++        const auto bytes = MakeParkObjBytes("custom.scenery_pack", "Custom Scenery Pack");
++
++        repo->AddObjectFromFile(ObjectGeneration::JSON, "custom.scenery_pack", bytes.data(), bytes.size());
++
++        Require(repo->FindObject("custom.scenery_pack") != nullptr, "post-destruction instance lookup");
++        RequireEq(DirectoryFileNames(UserObjectsPath(*env)).size(), static_cast<size_t>(1), "post-destruction file count");
++    }
++
++    void TestRepeatedImportCyclesUpdateEachRepository()
++    {
++
++
++        const auto bytes = MakeParkObjBytes("custom.scenery_pack", "Custom Scenery Pack");
++        for (int i = 0; i < 3; i++)
++        {
++            auto env = MakeEnv("cycle-" + std::to_string(i));
++            auto repo = CreateObjectRepository(*env);
++            repo->Construct(LANGUAGE_ENGLISH_UK);
++
++            repo->AddObjectFromFile(ObjectGeneration::JSON, "custom.scenery_pack", bytes.data(), bytes.size());
++
++            Require(repo->FindObject("custom.scenery_pack") != nullptr, "cycle lookup");
++            RequireEq(DirectoryFileNames(UserObjectsPath(*env)).size(), static_cast<size_t>(1), "cycle file count");
++        }
++    }
++}
++
++int main()
++{
++    try
++    {
++        std::filesystem::remove_all(kRuntimeRoot);
++        gOpenRCT2NoGraphics = true;
++        auto context = CreateContext(MakeEnv("context"), Audio::CreateDummyAudioContext(), Ui::CreateDummyUiContext());
++
++        TestJsonImportUpdatesCurrentRepository();
++        TestJsonCollisionSuffixDoesNotReplaceLookup();
++        TestDatImportUsesEntryNameAndUpdatesLegacyLookup();
++        TestInvalidBytesDoNotThrowOrMutateLookup();
++        TestIndependentRepositoryInstances();
++        TestRepositoryCanImportAfterAnotherInstanceIsDestroyed();
++        TestRepeatedImportCyclesUpdateEachRepository();
++
++        std::cout << "PASS object_repository_add_from_file_test\n";
++        return 0;
++    }
++    catch (const std::exception& e)
++    {
++        std::cerr << "FAIL object_repository_add_from_file_test: " << e.what() << "\n";
++        return 1;
++    }
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,25 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++
++cd /workspace/repo
++
++cmake -S /workspace/repo/usercase-test-coderl \
++      -B /workspace/repo/build-usercase-coderl-acceptance \
++      -G Ninja \
++      -DCMAKE_BUILD_TYPE=RelWithDebInfo >/dev/null
++
++cmake --build /workspace/repo/build-usercase-coderl-acceptance \
++      --target object_repository_add_from_file_test \
++      -j "${OPENRCT2_USERCASE_JOBS:-2}"
++
++exec /workspace/repo/build-usercase-coderl-acceptance/object_repository_add_from_file_test

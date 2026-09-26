@@ -1,0 +1,338 @@
+diff --git a/usercase-test-coderl/notifier_rate_limit_test.go b/usercase-test-coderl/notifier_rate_limit_test.go
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/notifier_rate_limit_test.go
+@@ -0,0 +1,301 @@
++package usercase_test_coderl
++
++import (
++	"fmt"
++	"os"
++	"path/filepath"
++	"reflect"
++	"sort"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/google/seesaw/engine/config"
++)
++
++func TestNotifierInitialNotificationLimitsLargeStartupBurst(t *testing.T) {
++
++
++	dir := t.TempDir()
++	clusterFile := filepath.Join(dir, "cluster.pb")
++	writeClusterFile(t, clusterFile, names(1, 14), 1000)
++
++	n := newNotifier(t, clusterFile, "initial-limit")
++	defer n.Shutdown()
++
++	note := receiveNotification(t, n.C)
++	assertVserverCount(t, note, 10)
++
++	assertOnlyVserversFrom(t, note, names(1, 14))
++}
++
++func TestNotifierReloadKeepsUnchangedAndLimitsLargeAdditions(t *testing.T) {
++
++
++	dir := t.TempDir()
++	clusterFile := filepath.Join(dir, "cluster.pb")
++	writeClusterFile(t, clusterFile, names(1, 3), 1000)
++
++	n := newNotifier(t, clusterFile, "reload-add")
++	defer n.Shutdown()
++
++	initial := receiveNotification(t, n.C)
++	assertVserverNames(t, initial, []string{"vs-01", "vs-02", "vs-03"})
++
++	writeClusterFile(t, clusterFile, names(1, 14), 2000)
++	n.SetSource(config.SourceDisk)
++	reload := receiveNotification(t, n.C)
++
++	assertVserverCount(t, reload, 13)
++	assertHasVservers(t, reload, []string{"vs-01", "vs-02", "vs-03"})
++
++	assertOnlyVserversFrom(t, reload, names(1, 14))
++}
++
++func TestNotifierReloadDeletionLimitTakesPriorityOverAdditions(t *testing.T) {
++
++
++	dir := t.TempDir()
++	clusterFile := filepath.Join(dir, "cluster.pb")
++	writeClusterFile(t, clusterFile, names(1, 1), 1000)
++
++	n := newNotifier(t, clusterFile, "reload-delete-priority")
++	defer n.Shutdown()
++
++	initial := receiveNotification(t, n.C)
++	assertVserverNames(t, initial, []string{"vs-01"})
++
++	writeClusterFile(t, clusterFile, names(1, 11), 2000)
++	n.SetSource(config.SourceDisk)
++	expanded := receiveNotification(t, n.C)
++	assertVserverCount(t, expanded, 11)
++
++	writeClusterFile(t, clusterFile, []string{"vs-50", "vs-51"}, 3000)
++	requireNoError(t, n.Reload(), "reload after replacing config")
++	reload := receiveNotification(t, n.C)
++
++	assertVserverCount(t, reload, 1)
++	assertMissingVservers(t, reload, []string{"vs-50", "vs-51"})
++}
++
++func TestNotifierReloadFromElevenConfiguredToNoneLeavesOneDeferredDeletion(t *testing.T) {
++
++
++	dir := t.TempDir()
++	clusterFile := filepath.Join(dir, "cluster.pb")
++	writeClusterFile(t, clusterFile, names(1, 1), 1000)
++
++	n := newNotifier(t, clusterFile, "reload-delete")
++	defer n.Shutdown()
++
++	initial := receiveNotification(t, n.C)
++	assertVserverNames(t, initial, []string{"vs-01"})
++
++	writeClusterFile(t, clusterFile, names(1, 11), 2000)
++	n.SetSource(config.SourceDisk)
++	expanded := receiveNotification(t, n.C)
++	assertVserverCount(t, expanded, 11)
++
++	writeClusterFile(t, clusterFile, nil, 3000)
++	requireNoError(t, n.Reload(), "reload after removing all vservers")
++	reload := receiveNotification(t, n.C)
++	assertVserverCount(t, reload, 1)
++}
++
++func TestNotifierReloadAfterEarlierUpdateContinuesToLimitAdditions(t *testing.T) {
++
++
++	dir := t.TempDir()
++	clusterFile := filepath.Join(dir, "cluster.pb")
++	writeClusterFile(t, clusterFile, names(1, 1), 1000)
++
++	n := newNotifier(t, clusterFile, "explicit-reload")
++	defer n.Shutdown()
++	receiveNotification(t, n.C)
++
++	writeClusterFile(t, clusterFile, names(1, 11), 2000)
++	n.SetSource(config.SourceDisk)
++	expanded := receiveNotification(t, n.C)
++	assertVserverNames(t, expanded, names(1, 11))
++
++	writeClusterFile(t, clusterFile, names(1, 22), 3000)
++
++	requireNoError(t, n.Reload(), "explicit reload after expanding config")
++	reload := receiveNotification(t, n.C)
++	assertVserverCount(t, reload, 21)
++	assertHasVservers(t, reload, names(1, 11))
++	assertOnlyVserversFrom(t, reload, names(1, 22))
++}
++
++func TestNotifierInstancesMaintainIndependentReloadState(t *testing.T) {
++
++
++	dirA := t.TempDir()
++	fileA := filepath.Join(dirA, "cluster.pb")
++	writeClusterFile(t, fileA, names(1, 3), 1000)
++	a := newNotifier(t, fileA, "instance-a")
++	defer a.Shutdown()
++	initialA := receiveNotification(t, a.C)
++	assertVserverNames(t, initialA, []string{"vs-01", "vs-02", "vs-03"})
++
++	dirB := t.TempDir()
++	fileB := filepath.Join(dirB, "cluster.pb")
++	writeClusterFile(t, fileB, names(20, 4), 1000)
++	b := newNotifier(t, fileB, "instance-b")
++	defer b.Shutdown()
++	initialB := receiveNotification(t, b.C)
++	assertVserverNames(t, initialB, []string{"vs-20", "vs-21", "vs-22", "vs-23"})
++
++	writeClusterFile(t, fileA, names(1, 14), 2000)
++	a.SetSource(config.SourceDisk)
++	reloadA := receiveNotification(t, a.C)
++	assertVserverCount(t, reloadA, 13)
++	assertHasVservers(t, reloadA, []string{"vs-01", "vs-02", "vs-03"})
++
++	writeClusterFile(t, fileB, names(20, 5), 2000)
++	b.SetSource(config.SourceDisk)
++	reloadB := receiveNotification(t, b.C)
++	assertVserverNames(t, reloadB, []string{"vs-20", "vs-21", "vs-22", "vs-23", "vs-24"})
++}
++
++func TestNotifierLifecycleAppliesStartupLimitAcrossCycles(t *testing.T) {
++
++
++	for i := 0; i < 100; i++ {
++		dir := t.TempDir()
++		clusterFile := filepath.Join(dir, "cluster.pb")
++		writeClusterFile(t, clusterFile, names(1, 14), int64(1000+i))
++		n := newNotifier(t, clusterFile, fmt.Sprintf("leak-floor-%03d", i))
++		note := receiveNotification(t, n.C)
++		assertVserverCount(t, note, 10)
++		n.Shutdown()
++	}
++
++}
++
++func newNotifier(t *testing.T, clusterFile, clusterName string) *config.Notifier {
++	t.Helper()
++	ec := config.DefaultEngineConfig()
++	ec.ClusterFile = clusterFile
++	ec.ClusterName = clusterName
++	ec.ConfigInterval = time.Hour
++
++	ec.ConfigServers = nil
++	ec.ConfigServerPort = 1
++	ec.ConfigServerTimeout = time.Millisecond
++	ec.MaxPeerConfigSyncErrors = 1
++
++	n, err := config.NewNotifier(&ec)
++	requireNoError(t, err, "NewNotifier")
++
++	if n.C == nil {
++		t.Fatalf("NewNotifier returned nil notification channel")
++	}
++	return n
++}
++
++func receiveNotification(t *testing.T, ch <-chan config.Notification) config.Notification {
++	t.Helper()
++	select {
++	case note := <-ch:
++		return note
++	case <-time.After(2 * time.Second):
++		t.Fatal("timed out waiting for config notification")
++	}
++	return config.Notification{}
++}
++
++func writeClusterFile(t *testing.T, path string, vservers []string, lastUpdated int64) {
++	t.Helper()
++	var b strings.Builder
++	fmt.Fprintf(&b, "seesaw_vip <\n  fqdn: %q\n  ipv4: \"192.0.2.10/24\"\n  status: PRODUCTION\n>\n", "seesaw-vip.example.com.")
++	fmt.Fprintf(&b, "metadata <\n  last_updated: %d\n>\n", lastUpdated)
++	for i, name := range vservers {
++		fmt.Fprintf(&b, "vserver <\n")
++		fmt.Fprintf(&b, "  name: %q\n", name)
++		fmt.Fprintf(&b, "  rp: %q\n", "acceptance@example.com")
++		fmt.Fprintf(&b, "  entry_address <\n")
++		fmt.Fprintf(&b, "    fqdn: %q\n", name+".example.com.")
++		fmt.Fprintf(&b, "    ipv4: \"192.0.2.%d/24\"\n", 20+i)
++		fmt.Fprintf(&b, "    status: PRODUCTION\n")
++		fmt.Fprintf(&b, "  >\n")
++		fmt.Fprintf(&b, "  vserver_entry <\n")
++		fmt.Fprintf(&b, "    protocol: TCP\n")
++		fmt.Fprintf(&b, "    port: 80\n")
++		fmt.Fprintf(&b, "  >\n")
++		fmt.Fprintf(&b, ">\n")
++	}
++	if err := os.WriteFile(path, []byte(b.String()), 0644); err != nil {
++		t.Fatalf("WriteFile(%q) failed: %v", path, err)
++	}
++}
++
++func names(start, count int) []string {
++	out := make([]string, 0, count)
++	for i := start; i < start+count; i++ {
++		out = append(out, fmt.Sprintf("vs-%02d", i))
++	}
++	return out
++}
++
++func assertVserverCount(t *testing.T, note config.Notification, want int) {
++	t.Helper()
++	if got := len(note.Cluster.Vservers); got != want {
++		t.Fatalf("notification vserver count = %d, want %d; names=%v", got, want, sortedVserverNames(note))
++	}
++}
++
++func assertVserverNames(t *testing.T, note config.Notification, want []string) {
++	t.Helper()
++	got := sortedVserverNames(note)
++	if !reflect.DeepEqual(got, want) {
++		t.Fatalf("notification vserver names = %v, want %v", got, want)
++	}
++}
++
++func assertHasVservers(t *testing.T, note config.Notification, want []string) {
++	t.Helper()
++	for _, name := range want {
++		if _, ok := note.Cluster.Vservers[name]; !ok {
++			t.Fatalf("notification missing vserver %q; names=%v", name, sortedVserverNames(note))
++		}
++	}
++}
++
++func assertMissingVservers(t *testing.T, note config.Notification, wantMissing []string) {
++	t.Helper()
++	for _, name := range wantMissing {
++		if _, ok := note.Cluster.Vservers[name]; ok {
++			t.Fatalf("notification unexpectedly included vserver %q; names=%v", name, sortedVserverNames(note))
++		}
++	}
++}
++
++func assertOnlyVserversFrom(t *testing.T, note config.Notification, allowed []string) {
++	t.Helper()
++	allowedSet := make(map[string]bool, len(allowed))
++	for _, name := range allowed {
++		allowedSet[name] = true
++	}
++	for name := range note.Cluster.Vservers {
++		if !allowedSet[name] {
++			t.Fatalf("notification included vserver %q outside configured set %v; names=%v", name, allowed, sortedVserverNames(note))
++		}
++	}
++}
++
++func sortedVserverNames(note config.Notification) []string {
++	names := make([]string, 0, len(note.Cluster.Vservers))
++	for name := range note.Cluster.Vservers {
++		names = append(names, name)
++	}
++	sort.Strings(names)
++	return names
++}
++
++func requireNoError(t *testing.T, err error, action string) {
++	t.Helper()
++	if err != nil {
++		t.Fatalf("%s returned error: %v", action, err)
++	}
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,27 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++
++
++set -euo pipefail
++
++cd /workspace/repo
++
++export GOPROXY=off
++export GOSUMDB=off
++export GOTOOLCHAIN=local
++export PATH="/root/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/bin:/root/go/bin:${PATH}"
++command -v protoc >/dev/null
++command -v protoc-gen-go >/dev/null
++test "$(go env GOVERSION)" = "go1.24.0"
++make proto >/dev/null
++
++exec go test -v -count=1 ./usercase-test-coderl/...

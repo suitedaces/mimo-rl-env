@@ -1,0 +1,335 @@
+diff --git a/tests/unit/lib/intrinsic_resolver/test_condition_projection_codespec.py b/tests/unit/lib/intrinsic_resolver/test_condition_projection_codespec.py
+new file mode 100644
+index 000000000..1e0b98a9d
+--- /dev/null
++++ b/tests/unit/lib/intrinsic_resolver/test_condition_projection_codespec.py
+@@ -0,0 +1,317 @@
++from copy import deepcopy
++from unittest import TestCase
++
++from samcli.commands.local.lib.sam_base_provider import SamBaseProvider
++from samcli.lib.intrinsic_resolver.intrinsic_property_resolver import IntrinsicResolver
++from samcli.lib.intrinsic_resolver.intrinsics_symbol_table import IntrinsicsSymbolTable
++from samcli.lib.intrinsic_resolver.invalid_intrinsic_exception import InvalidIntrinsicException
++
++
++class ConditionProjectionContractTest(TestCase):
++    @staticmethod
++    def resolve(template, values=None, ignore_errors=False):
++        symbols = IntrinsicsSymbolTable(template=template, logical_id_translator=values or {})
++        return IntrinsicResolver(template=template, symbol_resolver=symbols).resolve_template(
++            ignore_errors=ignore_errors
++        )
++
++    def test_resource_conditions_filter_before_resolving_resource_bodies(self):
++        template = {
++            "Conditions": {
++                "Enabled": {"Fn::Equals": [{"Ref": "Mode"}, "on"]},
++                "Disabled": {"Fn::Not": [{"Condition": "Enabled"}]},
++            },
++            "Resources": {
++                "Included": {
++                    "Type": "Custom::Thing",
++                    "Condition": "Enabled",
++                    "Properties": {"State": "ready"},
++                },
++                "Excluded": {
++                    "Type": "Custom::Thing",
++                    "Condition": "Disabled",
++                    "Properties": {"Unresolvable": {"Fn::Select": [9, ["invalid"]]}},
++                },
++                "Unconditional": {"Type": "Custom::Thing", "Properties": {"State": "always"}},
++            },
++        }
++
++        result = self.resolve(template, {"Mode": "on"})
++
++        self.assertEqual(set(result["Resources"]), {"Included", "Unconditional"})
++
++    def test_included_resources_do_not_retain_condition_metadata(self):
++        template = {
++            "Conditions": {"Enabled": {"Fn::Equals": [1, 1]}},
++            "Resources": {
++                "Included": {
++                    "Type": "Custom::Thing",
++                    "Condition": "Enabled",
++                    "Properties": {"State": "ready"},
++                }
++            },
++        }
++
++        result = self.resolve(template)
++
++        self.assertNotIn("Condition", result["Resources"]["Included"])
++        self.assertEqual(result["Resources"]["Included"]["Properties"], {"State": "ready"})
++
++    def test_output_conditions_filter_before_resolving_output_values(self):
++        template = {
++            "Conditions": {
++                "Enabled": {"Fn::Equals": [1, 1]},
++                "Disabled": {"Fn::Not": [{"Condition": "Enabled"}]},
++            },
++            "Outputs": {
++                "IncludedOutput": {"Condition": "Enabled", "Value": "visible"},
++                "ExcludedOutput": {
++                    "Condition": "Disabled",
++                    "Value": {"Fn::Select": [9, ["invalid"]]},
++                },
++            },
++        }
++
++        result = self.resolve(template)
++
++        self.assertEqual(set(result["Outputs"]), {"IncludedOutput"})
++        self.assertEqual(result["Outputs"]["IncludedOutput"]["Value"], "visible")
++
++    def test_included_outputs_do_not_retain_condition_metadata(self):
++        template = {
++            "Conditions": {"Enabled": {"Fn::Equals": [1, 1]}},
++            "Outputs": {"IncludedOutput": {"Condition": "Enabled", "Value": "visible"}},
++        }
++
++        result = self.resolve(template)
++
++        self.assertNotIn("Condition", result["Outputs"]["IncludedOutput"])
++
++    def test_fn_if_does_not_resolve_its_false_branch_when_condition_is_true(self):
++        template = {
++            "Conditions": {
++                "UsePrimary": {"Fn::Equals": [{"Ref": "Mode"}, "primary"]},
++            },
++            "Resources": {
++                "Thing": {
++                    "Type": "Custom::Thing",
++                    "Properties": {
++                        "Choice": {
++                            "Fn::If": [
++                                "UsePrimary",
++                                {"Fn::Join": ["-", ["selected", {"Ref": "Mode"}]]},
++                                {"Fn::Select": [8, ["invalid-dead-branch"]]},
++                            ]
++                        }
++                    },
++                }
++            },
++        }
++
++        result = self.resolve(template, {"Mode": "primary"})
++
++        self.assertEqual(result["Resources"]["Thing"]["Properties"]["Choice"], "selected-primary")
++
++    def test_fn_if_does_not_resolve_its_true_branch_when_condition_is_false(self):
++        template = {
++            "Conditions": {
++                "UsePrimary": {"Fn::Equals": [{"Ref": "Mode"}, "primary"]},
++            },
++            "Resources": {
++                "Thing": {
++                    "Type": "Custom::Thing",
++                    "Properties": {
++                        "Choice": {
++                            "Fn::If": [
++                                "UsePrimary",
++                                {"Fn::Select": [8, ["invalid-dead-branch"]]},
++                                {"Fn::Join": ["-", ["selected", {"Ref": "Mode"}]]},
++                            ]
++                        },
++                    },
++                }
++            },
++        }
++
++        result = self.resolve(template, {"Mode": "fallback"})
++
++        self.assertEqual(result["Resources"]["Thing"]["Properties"]["Choice"], "selected-fallback")
++
++    def test_literal_boolean_condition_definitions_gate_entries(self):
++        template = {
++            "Conditions": {"Always": True, "Never": False},
++            "Resources": {
++                "Included": {"Type": "Custom::Thing", "Condition": "Always", "Properties": {}},
++                "Excluded": {"Type": "Custom::Thing", "Condition": "Never", "Properties": {}},
++            },
++        }
++
++        result = self.resolve(template)
++
++        self.assertEqual(set(result["Resources"]), {"Included"})
++
++    def test_no_value_prunes_mapping_members_at_multiple_depths(self):
++        template = {
++            "Conditions": {"Enabled": {"Fn::Equals": ["same", "same"]}},
++            "Resources": {
++                "Thing": {
++                    "Type": "Custom::Thing",
++                    "Properties": {
++                        "RemovedProperty": {"Fn::If": ["Enabled", {"Ref": "AWS::NoValue"}, "kept"]},
++                        "Nested": {
++                            "Keep": "value",
++                            "Drop": {"Fn::If": ["Enabled", {"Ref": "AWS::NoValue"}, "kept"]},
++                        },
++                    },
++                }
++            },
++        }
++
++        result = self.resolve(template)
++        properties = result["Resources"]["Thing"]["Properties"]
++
++        self.assertNotIn("RemovedProperty", properties)
++        self.assertEqual(properties["Nested"], {"Keep": "value"})
++
++    def test_no_value_prunes_list_elements_without_reordering_neighbors(self):
++        template = {
++            "Resources": {
++                "Thing": {
++                    "Type": "Custom::Thing",
++                    "Properties": {"Items": ["first", {"Ref": "AWS::NoValue"}, "last"]},
++                }
++            }
++        }
++
++        result = self.resolve(template)
++
++        self.assertEqual(result["Resources"]["Thing"]["Properties"]["Items"], ["first", "last"])
++
++    def test_literal_null_values_are_not_treated_as_no_value(self):
++        template = {
++            "Conditions": {"Enabled": {"Fn::Equals": [1, 1]}},
++            "Resources": {
++                "Thing": {
++                    "Type": "Custom::Thing",
++                    "Properties": {
++                        "LiteralNull": None,
++                        "ConditionalNull": {"Fn::If": ["Enabled", None, "not-selected"]},
++                        "Items": [None, {"NestedNull": None}],
++                    },
++                }
++            }
++        }
++
++        result = self.resolve(template)
++        properties = result["Resources"]["Thing"]["Properties"]
++
++        self.assertIn("LiteralNull", properties)
++        self.assertIsNone(properties["LiteralNull"])
++        self.assertIn("ConditionalNull", properties)
++        self.assertIsNone(properties["ConditionalNull"])
++        self.assertEqual(properties["Items"], [None, {"NestedNull": None}])
++
++    def test_missing_named_condition_is_a_template_error(self):
++        template = {
++            "Resources": {
++                "Thing": {"Type": "Custom::Thing", "Condition": "Unknown", "Properties": {}}
++            }
++        }
++
++        with self.assertRaises(InvalidIntrinsicException):
++            self.resolve(template)
++
++    def test_non_boolean_named_condition_is_a_template_error(self):
++        template = {
++            "Conditions": {"Bad": {"Fn::Join": ["", ["not", "boolean"]]}},
++            "Resources": {"Thing": {"Type": "Custom::Thing", "Condition": "Bad", "Properties": {}}},
++        }
++
++        with self.assertRaises(InvalidIntrinsicException):
++            self.resolve(template)
++
++    def test_cyclic_condition_references_are_reported_as_template_errors(self):
++        template = {
++            "Conditions": {
++                "First": {"Fn::Not": [{"Condition": "Second"}]},
++                "Second": {"Fn::Not": [{"Condition": "First"}]},
++            },
++            "Resources": {"Thing": {"Type": "Custom::Thing", "Condition": "First", "Properties": {}}},
++        }
++
++        with self.assertRaises(InvalidIntrinsicException):
++            self.resolve(template)
++
++    def test_resolution_does_not_mutate_the_source_template(self):
++        template = {
++            "Conditions": {"Enabled": {"Fn::Equals": [1, 1]}},
++            "Resources": {
++                "Thing": {
++                    "Type": "Custom::Thing",
++                    "Condition": "Enabled",
++                    "Properties": {"Value": {"Fn::If": ["Enabled", "resolved", "other"]}},
++                }
++            },
++        }
++        original = deepcopy(template)
++
++        first = self.resolve(template)
++        second = self.resolve(template)
++
++        self.assertEqual(template, original)
++        self.assertEqual(first, second)
++
++
++class LocalProviderConditionIntegrationContractTest(TestCase):
++    @staticmethod
++    def template():
++        return {
++            "AWSTemplateFormatVersion": "2010-09-09",
++            "Transform": "AWS::Serverless-2016-10-31",
++            "Parameters": {"Mode": {"Type": "String", "Default": "off"}},
++            "Conditions": {"Enabled": {"Fn::Equals": [{"Ref": "Mode"}, "on"]}},
++            "Resources": {
++                "Always": {
++                    "Type": "AWS::Serverless::Function",
++                    "Properties": {
++                        "Runtime": "python3.7",
++                        "Handler": "app.handler",
++                        "CodeUri": ".",
++                        "Environment": {
++                            "Variables": {
++                                "OPTIONAL": {"Fn::If": ["Enabled", "enabled", {"Ref": "AWS::NoValue"}]},
++                                "EXPLICIT_NULL": None,
++                            }
++                        },
++                    },
++                },
++                "Conditional": {
++                    "Type": "AWS::Serverless::Function",
++                    "Condition": "Enabled",
++                    "Properties": {"Runtime": "python3.7", "Handler": "app.handler", "CodeUri": "."},
++                },
++            },
++        }
++
++    def test_parameter_default_controls_condition_gating_and_no_value(self):
++        disabled = SamBaseProvider.get_template(self.template())
++
++        self.assertNotIn("Conditional", disabled["Resources"])
++        disabled_variables = disabled["Resources"]["Always"]["Properties"]["Environment"]["Variables"]
++        self.assertNotIn("OPTIONAL", disabled_variables)
++        self.assertIn("EXPLICIT_NULL", disabled_variables)
++        self.assertIsNone(disabled_variables["EXPLICIT_NULL"])
++
++    def test_parameter_override_controls_condition_gating_and_selected_values(self):
++        enabled = SamBaseProvider.get_template(self.template(), {"Mode": "on"})
++
++        self.assertIn("Conditional", enabled["Resources"])
++        self.assertNotIn("Condition", enabled["Resources"]["Conditional"])
++        enabled_variables = enabled["Resources"]["Always"]["Properties"]["Environment"]["Variables"]
++        self.assertEqual(enabled_variables["OPTIONAL"], "enabled")
++
++
++if __name__ == "__main__":
++    import unittest
++
++    unittest.main()
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,7 @@
++#!/bin/bash
++set -euo pipefail
++
++
++.venv/bin/pytest -q \
++  tests/unit/lib/intrinsic_resolver/test_condition_projection_codespec.py \
++  tests/unit/lib/intrinsic_resolver/test_intrinsic_resolver.py

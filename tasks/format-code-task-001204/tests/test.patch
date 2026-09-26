@@ -1,0 +1,303 @@
+diff --git a/apps/web/lib/airtable/service.test.ts b/apps/web/lib/airtable/service.test.ts
+new file mode 100644
+index 000000000..8b7b05e0e
+--- /dev/null
++++ b/apps/web/lib/airtable/service.test.ts
+@@ -0,0 +1,264 @@
++import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
++
++const { deleteIntegrationMock, storedIntegrations } = vi.hoisted(() => {
++  const integrations = new Map<string, any>();
++  const deleteMock = vi.fn(async (environmentId: string) => {
++    integrations.delete(environmentId);
++  });
++  return { deleteIntegrationMock: deleteMock, storedIntegrations: integrations };
++});
++
++vi.mock("@prisma/client", () => ({
++  Prisma: {
++    PrismaClientKnownRequestError: class PrismaClientKnownRequestError extends Error {},
++  },
++}));
++
++vi.mock("../integration/service", () => ({
++  createOrUpdateIntegration: vi.fn(async (environmentId: string, integration: any) => {
++    storedIntegrations.set(environmentId, integration);
++    return integration;
++  }),
++  deleteIntegration: deleteIntegrationMock,
++  getIntegrationByType: vi.fn(async (environmentId: string, type: string) => {
++    return storedIntegrations.get(environmentId) ?? null;
++  }),
++}));
++
++vi.mock("@formbricks/logger", () => ({
++  logger: {
++    error: vi.fn(),
++    info: vi.fn(),
++    warn: vi.fn(),
++  },
++}));
++
++vi.mock("../constants", () => ({
++  AIRTABLE_CLIENT_ID: "client-id-for-tests",
++  AIRTABLE_MESSAGE_LIMIT: 100000,
++}));
++
++const jsonResponse = (body: any) =>
++  ({
++    ok: true,
++    status: 200,
++    json: vi.fn(async () => body),
++  }) as any;
++
++const configData = {
++  baseId: "base_runtime",
++  tableId: "tbl_runtime",
++} as any;
++
++const credential = {
++  access_token: "airtable-access-token",
++  refresh_token: "airtable-refresh-token",
++  expires_at: Math.floor(Date.now() / 1000) + 3600,
++} as any;
++
++const isSchemaRequest = (url: string) =>
++  url.includes("/meta/bases/") && url.endsWith("/tables");
++const isFieldCreateRequest = (url: string) =>
++  url.includes("/meta/bases/") && url.includes("/tables/") && url.endsWith("/fields");
++const isRecordCreateRequest = (url: string) =>
++  url.includes(`/v0/${configData.baseId}/${configData.tableId}`);
++
++const tableSchema = (tableId: string, fields: string[]) => ({
++  tables: [
++    {
++      id: tableId,
++      name: "Responses",
++      fields: fields.map((name, index) => ({ id: `fld_${index}_${name}`, name })),
++    },
++  ],
++});
++
++async function settleWithFakeTimers<T>(promise: Promise<T>): Promise<T> {
++  let settled = false;
++  promise.finally(() => {
++    settled = true;
++  });
++  for (let i = 0; i < 20 && !settled; i++) {
++    await Promise.resolve();
++    await vi.runOnlyPendingTimersAsync();
++  }
++  return promise;
++}
++
++describe("Airtable service response sync", () => {
++  beforeEach(() => {
++    vi.useFakeTimers();
++    storedIntegrations.clear();
++    deleteIntegrationMock.mockClear();
++  });
++
++  afterEach(() => {
++    vi.useRealTimers();
++    vi.unstubAllGlobals();
++    vi.restoreAllMocks();
++  });
++
++  test("writeData_creates_missing_fields_without_parallel_rate_limit_failure", async () => {
++    const { writeData } = await import("./service");
++    const fields = new Set(["Existing Question"]);
++    const createdFields: string[] = [];
++    const records: any[] = [];
++    let inFlightCreate = 0;
++    let rateLimitViolation = false;
++
++    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo, init?: RequestInit) => {
++      const url = String(input);
++      if (isSchemaRequest(url)) return jsonResponse(tableSchema(configData.tableId, Array.from(fields)));
++      if (isFieldCreateRequest(url)) {
++        inFlightCreate++;
++        if (inFlightCreate > 1) rateLimitViolation = true;
++        await Promise.resolve();
++        const body = JSON.parse(String(init?.body ?? "{}"));
++        inFlightCreate--;
++        if (rateLimitViolation) return jsonResponse({ error: { type: "RATE_LIMIT" } });
++        fields.add(body.name);
++        createdFields.push(body.name);
++        return jsonResponse({ id: `fld_${body.name}`, name: body.name });
++      }
++      if (isRecordCreateRequest(url)) {
++        records.push(JSON.parse(String(init?.body ?? "{}")));
++        return jsonResponse({ records: [{ id: "rec_1" }] });
++      }
++      throw new Error(`unexpected Airtable request ${url}`);
++    }));
++
++    const promise = writeData(credential, configData, [
++      ["old answer", "new answer A", "new answer B"],
++      ["Existing Question", "New Question A", "New Question B"],
++    ] as any);
++    await expect(settleWithFakeTimers(promise)).resolves.toBeUndefined();
++    expect(rateLimitViolation).toBe(false);
++    expect(createdFields).toHaveLength(2);
++    expect(createdFields).toEqual(expect.arrayContaining(["New Question A", "New Question B"]));
++    expect(records).toHaveLength(1);
++    expect(JSON.stringify(records[0])).toContain("new answer A");
++    expect(JSON.stringify(records[0])).toContain("new answer B");
++  });
++
++  test("writeData_aborts_when_field_creation_returns_error", async () => {
++    const { writeData } = await import("./service");
++    const recordCreates: any[] = [];
++    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo) => {
++      const url = String(input);
++      if (isSchemaRequest(url)) return jsonResponse(tableSchema(configData.tableId, ["Existing Question"]));
++      if (isFieldCreateRequest(url)) return jsonResponse({ error: { type: "INVALID_REQUEST", message: "bad field" } });
++      if (isRecordCreateRequest(url)) {
++        recordCreates.push({});
++        return jsonResponse({ records: [{ id: "rec_should_not_exist" }] });
++      }
++      throw new Error(`unexpected Airtable request ${url}`);
++    }));
++
++    await expect(writeData(credential, configData, [["broken answer"], ["Broken Question"]] as any)).rejects.toThrow(
++      Error
++    );
++    expect(recordCreates).toHaveLength(0);
++  });
++
++  test("writeData_waits_for_schema_visibility_before_record_insert", async () => {
++    const { writeData } = await import("./service");
++    const events: string[] = [];
++    const records: any[] = [];
++    let fieldCreateRequested = false;
++    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo, init?: RequestInit) => {
++      const url = String(input);
++      if (isSchemaRequest(url)) {
++        const visible = fieldCreateRequested;
++        events.push(visible ? "schema-visible" : "schema-missing");
++        return jsonResponse(tableSchema(configData.tableId, visible ? ["Delayed Question"] : []));
++      }
++      if (isFieldCreateRequest(url)) {
++        const body = JSON.parse(String(init?.body ?? "{}"));
++        fieldCreateRequested = true;
++        events.push(`create:${body.name}`);
++        return jsonResponse({ id: `fld_${body.name}`, name: body.name });
++      }
++      if (isRecordCreateRequest(url)) {
++        if (!events.includes("schema-visible")) throw new Error("record inserted before schema became visible");
++        events.push("record");
++        records.push(JSON.parse(String(init?.body ?? "{}")));
++        return jsonResponse({ records: [{ id: "rec_1" }] });
++      }
++      throw new Error(`unexpected Airtable request ${url}`);
++    }));
++
++    await settleWithFakeTimers(
++      writeData(credential, configData, [["delayed answer"], ["Delayed Question"]] as any)
++    );
++    expect(events.indexOf("record")).toBeGreaterThan(events.indexOf("schema-visible"));
++    expect(JSON.stringify(records[0])).toContain("delayed answer");
++  });
++
++  test("writeData_times_out_if_created_fields_never_appear", async () => {
++    const { writeData } = await import("./service");
++    const recordCreates: any[] = [];
++    let schemaFetches = 0;
++    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo, init?: RequestInit) => {
++      const url = String(input);
++      if (isSchemaRequest(url)) {
++        schemaFetches++;
++        return jsonResponse(tableSchema(configData.tableId, []));
++      }
++      if (isFieldCreateRequest(url)) {
++        const body = JSON.parse(String(init?.body ?? "{}"));
++        return jsonResponse({ id: `fld_${body.name}`, name: body.name });
++      }
++      if (isRecordCreateRequest(url)) {
++        recordCreates.push({});
++        return jsonResponse({ records: [{ id: "rec_should_not_exist" }] });
++      }
++      throw new Error(`unexpected Airtable request ${url}`);
++    }));
++
++    const promise = writeData(credential, configData, [["missing answer"], ["Never Appears"]] as any);
++    const error = await settleWithFakeTimers(promise.catch((err) => err));
++    expect(error).toBeInstanceOf(Error);
++    expect(schemaFetches).toBeGreaterThan(1);
++    expect(recordCreates).toHaveLength(0);
++  });
++
++  test("writeData_fails_when_configured_table_is_missing", async () => {
++    const { writeData } = await import("./service");
++    const missingConfig = { ...configData, tableId: "tbl_missing_runtime" } as any;
++    const fieldCreates: any[] = [];
++    const recordCreates: any[] = [];
++    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo) => {
++      const url = String(input);
++      if (isSchemaRequest(url)) return jsonResponse(tableSchema("tbl_some_other_table", ["Existing Question"]));
++      if (isFieldCreateRequest(url)) {
++        fieldCreates.push({});
++        return jsonResponse({ id: "fld_should_not_exist" });
++      }
++      if (url.includes(`/v0/${missingConfig.baseId}/${missingConfig.tableId}`)) {
++        recordCreates.push({});
++        return jsonResponse({ records: [{ id: "rec_should_not_exist" }] });
++      }
++      throw new Error(`unexpected Airtable request ${url}`);
++    }));
++
++    await expect(writeData(credential, missingConfig, [["answer"], ["Question"]] as any)).rejects.toThrow(Error);
++    expect(fieldCreates).toHaveLength(0);
++    expect(recordCreates).toHaveLength(0);
++  });
++
++  test("getAirtableToken_failure_preserves_integration", async () => {
++    const { getAirtableToken } = await import("./service");
++    const environmentId = "env_airtable_token_failure";
++    const existingIntegration = {
++      id: "integration_airtable",
++      type: "airtable",
++      environmentId,
++      config: { intentionally: "malformed token config to trigger retrieval failure" },
++    };
++    storedIntegrations.set(environmentId, existingIntegration);
++
++    await expect(getAirtableToken(environmentId)).rejects.toThrow(Error);
++    expect(storedIntegrations.get(environmentId)).toBe(existingIntegration);
++    expect(deleteIntegrationMock).not.toHaveBeenCalled();
++  });
++});
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,28 @@
++#!/bin/bash
++set -uo pipefail
++
++cd /testbed
++export PATH="/opt/node-24/bin:$PATH"
++
++if [ ! -d /testbed/node_modules ] || [ ! -x /testbed/node_modules/.bin/vitest ]; then
++  pnpm install --frozen-lockfile
++fi
++
++cd /testbed/packages/logger && npx vite build 2>&1
++
++cd /testbed/apps/web
++
++case "${1:-}" in
++  base)
++    npx vitest run --reporter=verbose \
++      modules/auth/signup-without-verification-success/page.test.tsx \
++      modules/auth/verification-requested/page.test.tsx
++    ;;
++  new)
++    npx vitest run --reporter=verbose lib/airtable/service.test.ts
++    ;;
++  *)
++    echo "usage: $0 base|new"
++    exit 2
++    ;;
++esac

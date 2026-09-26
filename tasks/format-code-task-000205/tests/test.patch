@@ -1,0 +1,273 @@
+diff --git a/test/cases/plugin-hmr-data.js b/test/cases/plugin-hmr-data.js
+new file mode 100644
+index 0000000..e34f322
+--- /dev/null
++++ b/test/cases/plugin-hmr-data.js
+@@ -0,0 +1,246 @@
++let plugin = require('../../lib/plugin-hmr');
++let { expect } = require('../nollup');
++
++
++
++
++
++
++
++
++
++
++function createEnv (defs, options = {}) {
++    defs = JSON.parse(JSON.stringify(defs));
++    options.bundleId = options.bundleId || '';
++
++    let window = { location: { host: 'example.com' } };
++    let instances = [];
++    let modules = [];
++    let stdout = [];
++    let codeById = defs.map(d => d.code);
++
++    let console = {
++        log: function (...args) {
++            stdout.push(args.join(' '));
++        }
++    };
++
++    let _ws = {
++        onmessage: null,
++        url: null,
++        send: function (data) {
++            if (data.changes) {
++                data.changes.forEach(function (c) {
++                    if (!c.removed) {
++                        codeById[c.id] = c.code;
++                    }
++                });
++            }
++            this.onmessage({ data: JSON.stringify(data) });
++        }
++    };
++
++    let WebSocket = function (url) {
++        _ws.url = url;
++        return _ws;
++    };
++
++    let plugin_instance = plugin(options);
++    eval(plugin_instance.nollupBundleInit());
++
++    let createInstance = function (id) {
++        let module = {
++            id: id,
++            dependencies: defs[id].dependencies.slice(0)
++        };
++
++        eval(plugin_instance.nollupModuleInit());
++        instances[id] = module;
++        eval('(' + codeById[id] + ')()');
++        return module;
++    };
++
++    defs.forEach(function (d, i) {
++        createInstance(i);
++    });
++
++    return {
++        instances,
++        ws: _ws,
++        console,
++        window,
++        stdout,
++        recreate: createInstance
++    };
++}
++
++describe('plugin-hmr hot data', () => {
++    it ('should expose undefined module.hot.data on the first run', () => {
++        let env = createEnv([{
++            dependencies: [],
++            code: `function () {
++                console.log('data=' + String(module.hot.data));
++            }`
++        }]);
++
++        expect(env.stdout.length).to.equal(1);
++        expect(env.stdout[0]).to.equal('data=undefined');
++    });
++
++    it ('should pass a fresh empty object to the dispose callback', () => {
++        let env = createEnv([{
++            dependencies: [1],
++            code: `function () { module.hot.accept(function () {}); }`
++        }, {
++            dependencies: [],
++            code: `function () {
++                module.hot.dispose(function (data) {
++                    console.log('isObject=' + (data !== null && typeof data === 'object'));
++                    console.log('keys=' + Object.keys(data).length);
++                });
++            }`
++        }]);
++
++        env.ws.send({
++            changes: [{
++                id: 1,
++                code: `function () {}`
++            }]
++        });
++
++        expect(env.stdout).to.deep.equal(['isObject=true', 'keys=0']);
++    });
++
++    it ('should make whatever dispose wrote available as module.hot.data on the replacement', () => {
++        let env = createEnv([{
++            dependencies: [1],
++            code: `function () { module.hot.accept(function () {}); }`
++        }, {
++            dependencies: [],
++            code: `function () {
++                module.hot.dispose(function (data) {
++                    data.count = 42;
++                    data.label = 'kept';
++                });
++            }`
++        }]);
++
++        env.ws.send({
++            changes: [{
++                id: 1,
++                code: `function () {
++                    console.log('count=' + module.hot.data.count);
++                    console.log('label=' + module.hot.data.label);
++                }`
++            }]
++        });
++
++        env.recreate(1);
++
++        expect(env.stdout).to.deep.equal(['count=42', 'label=kept']);
++    });
++
++    it ('should give each update its own fresh hand-off object', () => {
++        let env = createEnv([{
++            dependencies: [1],
++            code: `function () { module.hot.accept(function () {}); }`
++        }, {
++            dependencies: [],
++            code: `function () {
++                module.hot.dispose(function (data) {
++                    data.first = true;
++                });
++            }`
++        }]);
++
++
++
++        env.ws.send({
++            changes: [{
++                id: 1,
++                code: `function () {
++                    module.hot.dispose(function (data) {
++                        console.log('hadFirst=' + (data.first === true));
++                        console.log('keys=' + Object.keys(data).length);
++                    });
++                }`
++            }]
++        });
++
++        env.recreate(1);
++
++
++
++        env.ws.send({
++            changes: [{
++                id: 1,
++                code: `function () {}`
++            }]
++        });
++
++        expect(env.stdout).to.deep.equal(['hadFirst=false', 'keys=0']);
++    });
++
++    it ('should let a module carry state forward across several updates', () => {
++        let factory = `function () {
++            var previous = module.hot.data && module.hot.data.count || 0;
++            console.log('count=' + previous);
++            module.hot.dispose(function (data) {
++                data.count = previous + 1;
++            });
++        }`;
++
++        let env = createEnv([{
++            dependencies: [1],
++            code: `function () { module.hot.accept(function () {}); }`
++        }, {
++            dependencies: [],
++            code: factory
++        }]);
++
++        env.ws.send({ changes: [{ id: 1, code: factory }] });
++        env.recreate(1);
++
++        env.ws.send({ changes: [{ id: 1, code: factory }] });
++        env.recreate(1);
++
++        expect(env.stdout).to.deep.equal(['count=0', 'count=1', 'count=2']);
++    });
++
++    it ('should track hot data independently per module', () => {
++        let env = createEnv([{
++            dependencies: [1, 2],
++            code: `function () { module.hot.accept(function () {}); }`
++        }, {
++            dependencies: [],
++            code: `function () {
++                module.hot.dispose(function (data) { data.who = 'one'; });
++            }`
++        }, {
++            dependencies: [],
++            code: `function () {
++                module.hot.dispose(function (data) { data.who = 'two'; });
++            }`
++        }]);
++
++        env.ws.send({
++            changes: [{
++                id: 1,
++                code: `function () { console.log('mod1 sees ' + module.hot.data.who); }`
++            }]
++        });
++        env.recreate(1);
++
++
++        env.ws.send({
++            changes: [{
++                id: 2,
++                code: `function () { console.log('mod2 sees ' + module.hot.data.who); }`
++            }]
++        });
++        env.recreate(2);
++
++        expect(env.stdout).to.deep.equal(['mod1 sees one', 'mod2 sees two']);
++    });
++});
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,16 @@
++#!/usr/bin/env bash
++
++
++
++
++set -euo pipefail
++HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++cd /testbed
++
++
++
++
++./node_modules/.bin/mocha "test/cases/plugin-hmr.js"
++
++
++./node_modules/.bin/mocha "test/cases/plugin-hmr-data.js"

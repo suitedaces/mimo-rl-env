@@ -1,0 +1,269 @@
+diff --git a/test_commands.json b/test_commands.json
+new file mode 100644
+index 0000000000..efe2f08d12
+--- /dev/null
++++ b/test_commands.json
+@@ -0,0 +1,5 @@
++{
++  "test_commands": [
++    "python -m pytest tests/providers/cncf/kubernetes/executors/test_kubernetes_executor.py -k 'test_clear_not_launched_queued_tasks_batched_single_api_call or test_clear_not_launched_queued_tasks_batch_uses_airflow_worker_selector or test_clear_not_launched_queued_tasks_batch_pod_match_keeps_queued or test_clear_not_launched_queued_tasks_batch_mixed_pod_match or test_clear_not_launched_queued_tasks_batch_no_queued_tis_skips_api or test_clear_not_launched_queued_tasks_batch_mapped_task_match'"
++  ]
++}
+diff --git a/tests/providers/cncf/kubernetes/executors/test_kubernetes_executor.py b/tests/providers/cncf/kubernetes/executors/test_kubernetes_executor.py
+index 9fe5b27fe9..f738ff196f 100644
+--- a/tests/providers/cncf/kubernetes/executors/test_kubernetes_executor.py
++++ b/tests/providers/cncf/kubernetes/executors/test_kubernetes_executor.py
+@@ -1189,6 +1189,240 @@ class TestKubernetesExecutor:
+         assert ti0.state == State.SCHEDULED
+         assert ti1.state == State.QUEUED
+ 
++    @pytest.mark.db_test
++    def test_clear_not_launched_queued_tasks_batched_single_api_call(
++        self, dag_maker, create_dummy_dag, session
++    ):
++        """The fix replaces per-TI list_namespaced_pod calls with a single batch call.
++
++        Multiple queued TIs without matching pods must still all be marked SCHEDULED,
++        but the kube API should be called only once total (independent of N).
++        """
++        mock_kube_client = mock.MagicMock()
++        mock_kube_client.list_namespaced_pod.return_value = k8s.V1PodList(items=[])
++
++        create_dummy_dag(dag_id="test_clear_batch_a", task_id="task_a", with_dagrun_type=None)
++        dr_a = dag_maker.create_dagrun(run_id="run_a")
++        create_dummy_dag(dag_id="test_clear_batch_b", task_id="task_b", with_dagrun_type=None)
++        dr_b = dag_maker.create_dagrun(run_id="run_b")
++        create_dummy_dag(dag_id="test_clear_batch_c", task_id="task_c", with_dagrun_type=None)
++        dr_c = dag_maker.create_dagrun(run_id="run_c")
++
++        tis = []
++        for dr in (dr_a, dr_b, dr_c):
++            ti = dr.task_instances[0]
++            ti.state = State.QUEUED
++            ti.queued_by_job_id = 1
++            tis.append(ti)
++        session.flush()
++
++        executor = self.kubernetes_executor
++        executor.job_id = 1
++        executor.kube_client = mock_kube_client
++        executor.clear_not_launched_queued_tasks(session=session)
++
++        for ti in tis:
++            ti.refresh_from_db()
++            assert ti.state == State.SCHEDULED
++
++
++        assert mock_kube_client.list_namespaced_pod.call_count == 1
++
++    @pytest.mark.db_test
++    def test_clear_not_launched_queued_tasks_batch_uses_airflow_worker_selector(
++        self, dag_maker, create_dummy_dag, session
++    ):
++        """The single batch call must scope to airflow-worker={job_id} only.
++
++        The reference fetches all worker pods for this scheduler in one call using
++        only the airflow-worker label, then matches TIs against the result locally.
++        """
++        mock_kube_client = mock.MagicMock()
++        mock_kube_client.list_namespaced_pod.return_value = k8s.V1PodList(items=[])
++
++        create_dummy_dag(dag_id="test_clear_sel_a", task_id="task_a", with_dagrun_type=None)
++        dr_a = dag_maker.create_dagrun(run_id="run_a")
++        create_dummy_dag(dag_id="test_clear_sel_b", task_id="task_b", with_dagrun_type=None)
++        dr_b = dag_maker.create_dagrun(run_id="run_b")
++
++        for dr in (dr_a, dr_b):
++            ti = dr.task_instances[0]
++            ti.state = State.QUEUED
++            ti.queued_by_job_id = 1
++        session.flush()
++
++        executor = self.kubernetes_executor
++        executor.job_id = 1
++        executor.kube_client = mock_kube_client
++        executor.clear_not_launched_queued_tasks(session=session)
++
++
++        assert mock_kube_client.list_namespaced_pod.call_count == 1
++        _, kwargs = mock_kube_client.list_namespaced_pod.call_args_list[0]
++        assert kwargs.get("namespace") == "default"
++        selector = kwargs.get("label_selector") or ""
++        assert "airflow-worker=1" in selector
++
++        assert "dag_id=" not in selector
++        assert "task_id=" not in selector
++        assert "run_id=" not in selector
++
++    @pytest.mark.db_test
++    def test_clear_not_launched_queued_tasks_batch_pod_match_keeps_queued(
++        self, dag_maker, create_dummy_dag, session
++    ):
++        """A pod returned in the batch response that matches a TI's labels must keep the TI QUEUED.
++
++        Reference matches by reconstructing the (dag_id, task_id, airflow-worker, run_id) label
++        string from each pod's metadata.labels and putting it in a set. The TI is matched against
++        that set locally rather than via an additional API call.
++        """
++        matching_pod = k8s.V1Pod(
++            metadata=k8s.V1ObjectMeta(
++                labels={
++                    "dag_id": "test_clear_match",
++                    "task_id": "task1",
++                    "airflow-worker": "1",
++                    "run_id": "test",
++                }
++            )
++        )
++        mock_kube_client = mock.MagicMock()
++        mock_kube_client.list_namespaced_pod.return_value = k8s.V1PodList(items=[matching_pod])
++
++        create_dummy_dag(dag_id="test_clear_match", task_id="task1", with_dagrun_type=None)
++        dag_run = dag_maker.create_dagrun()
++
++        ti = dag_run.task_instances[0]
++        ti.state = State.QUEUED
++        ti.queued_by_job_id = 1
++        session.flush()
++
++        executor = self.kubernetes_executor
++        executor.job_id = 1
++        executor.kube_client = mock_kube_client
++        executor.clear_not_launched_queued_tasks(session=session)
++
++        ti.refresh_from_db()
++        assert ti.state == State.QUEUED
++
++        assert mock_kube_client.list_namespaced_pod.call_count == 1
++
++    @pytest.mark.db_test
++    def test_clear_not_launched_queued_tasks_batch_mixed_pod_match(
++        self, dag_maker, create_dummy_dag, session
++    ):
++        """Batch response with some matching pods: matched TI stays QUEUED, unmatched goes SCHEDULED.
++
++        Verifies the in-memory matching logic is keyed correctly by dag_id+task_id+run_id,
++        not by some other field that happens to coincide.
++        """
++
++
++        pod_for_a = k8s.V1Pod(
++            metadata=k8s.V1ObjectMeta(
++                labels={
++                    "dag_id": "test_clear_mix_a",
++                    "task_id": "task_a",
++                    "airflow-worker": "1",
++                    "run_id": "run_a",
++                }
++            )
++        )
++        mock_kube_client = mock.MagicMock()
++        mock_kube_client.list_namespaced_pod.return_value = k8s.V1PodList(items=[pod_for_a])
++
++        create_dummy_dag(dag_id="test_clear_mix_a", task_id="task_a", with_dagrun_type=None)
++        dr_a = dag_maker.create_dagrun(run_id="run_a")
++        create_dummy_dag(dag_id="test_clear_mix_b", task_id="task_b", with_dagrun_type=None)
++        dr_b = dag_maker.create_dagrun(run_id="run_b")
++
++        ti_a = dr_a.task_instances[0]
++        ti_a.state = State.QUEUED
++        ti_a.queued_by_job_id = 1
++        ti_b = dr_b.task_instances[0]
++        ti_b.state = State.QUEUED
++        ti_b.queued_by_job_id = 1
++        session.flush()
++
++        executor = self.kubernetes_executor
++        executor.job_id = 1
++        executor.kube_client = mock_kube_client
++        executor.clear_not_launched_queued_tasks(session=session)
++
++        ti_a.refresh_from_db()
++        ti_b.refresh_from_db()
++        assert ti_a.state == State.QUEUED
++        assert ti_b.state == State.SCHEDULED
++        assert mock_kube_client.list_namespaced_pod.call_count == 1
++
++    @pytest.mark.db_test
++    def test_clear_not_launched_queued_tasks_batch_no_queued_tis_skips_api(
++        self, dag_maker, create_dummy_dag, session
++    ):
++        """If no queued TIs exist for this job, no kube API call should be made."""
++        mock_kube_client = mock.MagicMock()
++        mock_kube_client.list_namespaced_pod.return_value = k8s.V1PodList(items=[])
++
++
++        create_dummy_dag(dag_id="test_clear_empty", task_id="task1", with_dagrun_type=None)
++        dag_run = dag_maker.create_dagrun()
++        ti = dag_run.task_instances[0]
++        ti.state = State.QUEUED
++        ti.queued_by_job_id = 2
++        session.flush()
++
++        executor = self.kubernetes_executor
++        executor.job_id = 1
++        executor.kube_client = mock_kube_client
++        executor.clear_not_launched_queued_tasks(session=session)
++
++        ti.refresh_from_db()
++        assert ti.state == State.QUEUED
++        assert mock_kube_client.list_namespaced_pod.call_count == 0
++
++    @pytest.mark.db_test
++    def test_clear_not_launched_queued_tasks_batch_mapped_task_match(self, dag_maker, session):
++        """A mapped TI's pod (with map_index label) must match in the batch result."""
++
++        pod = k8s.V1Pod(
++            metadata=k8s.V1ObjectMeta(
++                labels={
++                    "dag_id": "test_clear_mapped",
++                    "task_id": "bash",
++                    "airflow-worker": "1",
++                    "map_index": "0",
++                    "run_id": "test",
++                }
++            )
++        )
++        mock_kube_client = mock.MagicMock()
++        mock_kube_client.list_namespaced_pod.return_value = k8s.V1PodList(items=[pod])
++
++        with dag_maker(dag_id="test_clear_mapped"):
++            op = BashOperator.partial(task_id="bash").expand(bash_command=["echo 0", "echo 1"])
++
++        dag_run = dag_maker.create_dagrun()
++        ti0 = dag_run.get_task_instance(op.task_id, session, map_index=0)
++        ti0.state = State.QUEUED
++        ti0.queued_by_job_id = 1
++        ti1 = dag_run.get_task_instance(op.task_id, session, map_index=1)
++        ti1.state = State.QUEUED
++        ti1.queued_by_job_id = 1
++        session.flush()
++
++        executor = self.kubernetes_executor
++        executor.job_id = 1
++        executor.kube_client = mock_kube_client
++        executor.clear_not_launched_queued_tasks(session=session)
++
++        ti0.refresh_from_db()
++        ti1.refresh_from_db()
++        assert ti0.state == State.QUEUED
++        assert ti1.state == State.SCHEDULED
++
++        assert mock_kube_client.list_namespaced_pod.call_count == 1
++
+     @pytest.mark.db_test
+     @mock.patch("airflow.providers.cncf.kubernetes.kube_client.get_kube_client")
+     def test_get_task_log(self, mock_get_kube_client, create_task_instance_of_operator):
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,8 @@
++#!/usr/bin/env bash
++
++set -uo pipefail
++cd /testbed
++rc=0
++python -m pytest tests/providers/cncf/kubernetes/executors/test_kubernetes_executor.py -k 'test_clear_not_launched_queued_tasks_batched_single_api_call or test_clear_not_launched_queued_tasks_batch_uses_airflow_worker_selector or test_clear_not_launched_queued_tasks_batch_pod_match_keeps_queued or test_clear_not_launched_queued_tasks_batch_mixed_pod_match or test_clear_not_launched_queued_tasks_batch_no_queued_tis_skips_api or test_clear_not_launched_queued_tasks_batch_mapped_task_match'
++rc=$(( rc | $? ))
++exit $rc

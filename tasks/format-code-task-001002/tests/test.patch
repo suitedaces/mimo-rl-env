@@ -1,0 +1,128 @@
+diff --git a/web/tests/draft_synchronization.test.js b/web/tests/draft_synchronization.test.js
+new file mode 100644
+index 0000000000..629e99b77a
+--- /dev/null
++++ b/web/tests/draft_synchronization.test.js
+@@ -0,0 +1,112 @@
++"use strict";
++
++const {strict: assert} = require("assert");
++
++const {mock_esm, set_global, zrequire} = require("./lib/namespace");
++const {run_test} = require("./lib/test");
++const {page_params, user_settings} = require("./lib/zpage_params");
++
++const noop = () => {};
++set_global("addEventListener", noop);
++mock_esm("../src/markdown", {apply_markdown: noop});
++mock_esm("tippy.js", {default: () => [{show: noop, destroy: noop}]});
++mock_esm("../src/ui_util", {update_unread_count_in_dom: noop});
++
++const drafts = zrequire("drafts");
++const dispatch = zrequire("server_events_dispatch");
++const people = zrequire("people");
++
++people.init();
++people.add_active_user({user_id: 1, email: "me@example.com", full_name: "Me"});
++people.add_active_user({user_id: 6, email: "aaron@example.com", full_name: "Aaron"});
++people.add_active_user({user_id: 7, email: "zoe@example.com", full_name: "Zoe"});
++people.initialize_current_user(1);
++
++function reset_state() {
++    window.localStorage.clear();
++    page_params.drafts = [];
++    user_settings.enable_drafts_synchronization = true;
++}
++
++function server_stream_draft(id, timestamp, content = "server body") {
++    return {id, type: "stream", to: [42], topic: "release", content, timestamp};
++}
++
++run_test("initialize hydrates synchronized drafts alongside local state", () => {
++    reset_state();
++    page_params.drafts = [server_stream_draft(17, 1234)];
++    drafts.initialize();
++    const hydrated = drafts.draft_model.getDraft(17);
++    assert.equal(hydrated.id, 17);
++    assert.equal(hydrated.type, "stream");
++    assert.equal(hydrated.stream_id, 42);
++    assert.equal(hydrated.topic, "release");
++    assert.equal(hydrated.content, "server body");
++    assert.equal(hydrated.updatedAt, 1234000);
++});
++
++run_test("disabled synchronization keeps local drafts and avoids hydration", () => {
++    reset_state();
++    user_settings.enable_drafts_synchronization = false;
++    const local_id = drafts.draft_model.addDraft({type: "private", private_message_recipient: "a@example.com", content: "local"});
++    page_params.drafts = [server_stream_draft(18, 1234)];
++    drafts.initialize();
++    assert.ok(drafts.draft_model.getDraft(local_id));
++    assert.equal(drafts.draft_model.getDraft(18), false);
++});
++
++run_test("draft add events merge stream and direct drafts by server ID", () => {
++    reset_state();
++    dispatch.dispatch_normal_event({type: "drafts", op: "add", drafts: [
++        server_stream_draft(21, 2000),
++        server_stream_draft(22, 2001, "second"),
++        {id: 23, type: "private", to: [7, 6], topic: "", content: "hello", timestamp: 2002},
++    ]});
++    assert.equal(drafts.draft_model.getDraft(21).content, "server body");
++    assert.equal(drafts.draft_model.getDraft(22).content, "second");
++    const restored = drafts.restore_message(drafts.draft_model.getDraft(23));
++    assert.equal(restored.type, "private");
++    assert.deepEqual(restored.private_message_recipient.split(",").sort(), ["aaron@example.com", "zoe@example.com"]);
++    assert.equal(restored.content, "hello");
++    assert.equal(Object.keys(drafts.draft_model.get()).length, 3);
++});
++
++run_test("draft update replaces content and recipient without disturbing other drafts", () => {
++    reset_state();
++    dispatch.dispatch_normal_event({type: "drafts", op: "add", drafts: [server_stream_draft(31, 3000), server_stream_draft(32, 3001, "keep")]});
++    dispatch.dispatch_normal_event({type: "drafts", op: "update", draft: {...server_stream_draft(31, 3002, "edited"), to: [77], topic: "new topic"}});
++    const edited = drafts.draft_model.getDraft(31);
++    assert.equal(edited.id, 31);
++    assert.equal(edited.type, "stream");
++    assert.equal(edited.stream_id, 77);
++    assert.equal(edited.topic, "new topic");
++    assert.equal(edited.content, "edited");
++    assert.equal(edited.updatedAt, 3002000);
++    assert.equal(drafts.draft_model.getDraft(32).content, "keep");
++});
++
++run_test("an update for a draft omitted from initial state makes it available", () => {
++    reset_state();
++    dispatch.dispatch_normal_event({type: "drafts", op: "update", draft: server_stream_draft(33, 3003, "newly recent")});
++    assert.equal(drafts.draft_model.getDraft(33).content, "newly recent");
++});
++
++run_test("draft remove events delete the server draft and ignore unknown IDs", () => {
++    reset_state();
++    dispatch.dispatch_normal_event({type: "drafts", op: "add", drafts: [server_stream_draft(41, 4000)]});
++    dispatch.dispatch_normal_event({type: "drafts", op: "remove", draft_id: 999});
++    assert.ok(drafts.draft_model.getDraft(41));
++    dispatch.dispatch_normal_event({type: "drafts", op: "remove", draft_id: 41});
++    assert.equal(drafts.draft_model.getDraft(41), false);
++});
++
++run_test("draft events are ignored when synchronization is disabled", () => {
++    reset_state();
++    dispatch.dispatch_normal_event({type: "drafts", op: "add", drafts: [server_stream_draft(51, 5000)]});
++    user_settings.enable_drafts_synchronization = false;
++    dispatch.dispatch_normal_event({type: "drafts", op: "add", drafts: [server_stream_draft(52, 5001)]});
++    dispatch.dispatch_normal_event({type: "drafts", op: "update", draft: server_stream_draft(51, 5002, "changed")});
++    dispatch.dispatch_normal_event({type: "drafts", op: "remove", draft_id: 51});
++    assert.equal(drafts.draft_model.getDraft(51).content, "server body");
++    assert.equal(drafts.draft_model.getDraft(52), false);
++});
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,5 @@
++#!/bin/bash
++set -euo pipefail
++
++
++node --no-experimental-global-navigator web/tests/lib/index.js ../drafts.test.js ../draft_synchronization.test.js

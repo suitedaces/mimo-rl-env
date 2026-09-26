@@ -1,0 +1,759 @@
+diff --git a/usercase-test-coderl/respond_dispatch_test.go b/usercase-test-coderl/respond_dispatch_test.go
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/respond_dispatch_test.go
+@@ -0,0 +1,730 @@
++package usercase_test_coderl
++
++import (
++	"context"
++	"errors"
++	"reflect"
++	"testing"
++	"time"
++
++	sarah "github.com/oklahomer/go-sarah/v4"
++)
++
++
++
++
++
++var (
++	errCommandFailed = errors.New("command failed")
++	errStorageGet    = errors.New("storage get failed")
++	errStorageSet    = errors.New("storage set failed")
++)
++
++type testInput struct {
++	sender string
++	msg    string
++	reply  sarah.OutputDestination
++}
++
++func (i testInput) SenderKey() string {
++	return i.sender
++}
++
++func (i testInput) Message() string {
++	return i.msg
++}
++
++func (i testInput) SentAt() time.Time {
++	return time.Unix(1700000000, 0).UTC()
++}
++
++func (i testInput) ReplyTo() sarah.OutputDestination {
++	return i.reply
++}
++
++type recordingAdapter struct {
++	botType sarah.BotType
++	sent    []sarah.Output
++}
++
++func (a *recordingAdapter) BotType() sarah.BotType {
++	if a.botType == "" {
++		return sarah.BotType("usercase-bot")
++	}
++	return a.botType
++}
++
++func (a *recordingAdapter) Run(context.Context, func(sarah.Input) error, func(error)) {}
++
++func (a *recordingAdapter) SendMessage(_ context.Context, output sarah.Output) {
++	a.sent = append(a.sent, output)
++}
++
++type scriptedCommand struct {
++	id          string
++	instruction string
++	match       func(sarah.Input) bool
++	execute     func(context.Context, sarah.Input) (*sarah.CommandResponse, error)
++	matchCalls  int
++	execCalls   int
++}
++
++func (c *scriptedCommand) Identifier() string {
++	return c.id
++}
++
++func (c *scriptedCommand) Execute(ctx context.Context, input sarah.Input) (*sarah.CommandResponse, error) {
++	c.execCalls++
++	return c.execute(ctx, input)
++}
++
++func (c *scriptedCommand) Instruction(input *sarah.HelpInput) string {
++	return c.instruction
++}
++
++func (c *scriptedCommand) Match(input sarah.Input) bool {
++	c.matchCalls++
++	return c.match(input)
++}
++
++type recordingStorage struct {
++	contexts map[string]sarah.ContextualFunc
++	getErr   error
++	setErr   error
++	gets     int
++	sets     int
++	deletes  int
++}
++
++func newRecordingStorage() *recordingStorage {
++	return &recordingStorage{contexts: map[string]sarah.ContextualFunc{}}
++}
++
++func (s *recordingStorage) Get(key string) (sarah.ContextualFunc, error) {
++	s.gets++
++	if s.getErr != nil {
++		return nil, s.getErr
++	}
++	return s.contexts[key], nil
++}
++
++func (s *recordingStorage) Set(key string, userContext *sarah.UserContext) error {
++	s.sets++
++	if s.setErr != nil {
++		return s.setErr
++	}
++	s.contexts[key] = userContext.Next
++	return nil
++}
++
++func (s *recordingStorage) Delete(key string) error {
++	s.deletes++
++	delete(s.contexts, key)
++	return nil
++}
++
++func (s *recordingStorage) Flush() error {
++	s.contexts = map[string]sarah.ContextualFunc{}
++	return nil
++}
++
++func (s *recordingStorage) activeContexts() int {
++	return len(s.contexts)
++}
++
++type helpRow struct {
++	Identifier  string
++	Instruction string
++}
++
++func collectHelps(t *testing.T, content interface{}) []helpRow {
++	t.Helper()
++
++	helps, ok := content.(*sarah.CommandHelps)
++	if !ok {
++		t.Fatalf("help content type = %T, want *sarah.CommandHelps", content)
++	}
++
++	rows := make([]helpRow, 0, len(*helps))
++	for _, h := range *helps {
++		rows = append(rows, helpRow{
++			Identifier:  h.Identifier,
++			Instruction: h.Instruction,
++		})
++	}
++	return rows
++}
++
++func TestRespondDispatchesFirstMatchingCommandAndSendsOutput(t *testing.T) {
++
++
++	ctx := context.Background()
++	adapter := &recordingAdapter{}
++	bot := sarah.NewBot(adapter)
++
++	first := &scriptedCommand{
++		id:          "first",
++		instruction: "first help",
++		match: func(input sarah.Input) bool {
++			return input.Message() == "ping"
++		},
++		execute: func(context.Context, sarah.Input) (*sarah.CommandResponse, error) {
++			return &sarah.CommandResponse{Content: "pong"}, nil
++		},
++	}
++	second := &scriptedCommand{
++		id:          "second",
++		instruction: "second help",
++		match: func(input sarah.Input) bool {
++			return input.Message() == "ping"
++		},
++		execute: func(context.Context, sarah.Input) (*sarah.CommandResponse, error) {
++			return &sarah.CommandResponse{Content: "wrong"}, nil
++		},
++	}
++
++	bot.AppendCommand(first)
++	bot.AppendCommand(second)
++
++	err := bot.Respond(ctx, testInput{sender: "alice", msg: "ping", reply: "room-1"})
++	if err != nil {
++		t.Fatalf("Respond error = %v, want nil", err)
++	}
++	if len(adapter.sent) != 1 {
++		t.Fatalf("sent outputs = %d, want 1", len(adapter.sent))
++	}
++	if adapter.sent[0].Destination() != "room-1" {
++		t.Fatalf("output destination = %#v, want %#v", adapter.sent[0].Destination(), "room-1")
++	}
++	if adapter.sent[0].Content() != "pong" {
++		t.Fatalf("output content = %#v, want %#v", adapter.sent[0].Content(), "pong")
++	}
++
++	if first.matchCalls == 0 {
++		t.Fatalf("first match calls = %d, want at least 1", first.matchCalls)
++	}
++	if first.execCalls != 1 {
++		t.Fatalf("first execute calls = %d, want 1", first.execCalls)
++	}
++
++	if second.execCalls != 0 {
++		t.Fatalf("second execute calls = %d, want 0", second.execCalls)
++	}
++}
++
++func TestRespondNoMatchingCommandReturnsNilAndSendsNothing(t *testing.T) {
++
++
++	adapter := &recordingAdapter{}
++	bot := sarah.NewBot(adapter)
++	never := &scriptedCommand{
++		id: "never",
++		match: func(sarah.Input) bool {
++			return false
++		},
++		execute: func(context.Context, sarah.Input) (*sarah.CommandResponse, error) {
++			return &sarah.CommandResponse{Content: "unexpected"}, nil
++		},
++	}
++	bot.AppendCommand(never)
++
++	err := bot.Respond(context.Background(), testInput{sender: "bob", msg: "unknown", reply: "room-2"})
++	if err != nil {
++		t.Fatalf("Respond error = %v, want nil", err)
++	}
++	if len(adapter.sent) != 0 {
++		t.Fatalf("sent outputs = %d, want 0", len(adapter.sent))
++	}
++
++	if never.matchCalls == 0 {
++		t.Fatalf("match calls = %d, want at least 1", never.matchCalls)
++	}
++	if never.execCalls != 0 {
++		t.Fatalf("execute calls = %d, want 0", never.execCalls)
++	}
++}
++
++func TestRespondReturnsMatchedCommandError(t *testing.T) {
++
++
++	adapter := &recordingAdapter{}
++	bot := sarah.NewBot(adapter)
++	bot.AppendCommand(&scriptedCommand{
++		id: "error-command",
++		match: func(sarah.Input) bool {
++			return true
++		},
++		execute: func(context.Context, sarah.Input) (*sarah.CommandResponse, error) {
++			return nil, errCommandFailed
++		},
++	})
++
++	err := bot.Respond(context.Background(), testInput{sender: "cal", msg: "boom", reply: "room-3"})
++	if !errors.Is(err, errCommandFailed) {
++		t.Fatalf("Respond error = %v, want errCommandFailed", err)
++	}
++	if len(adapter.sent) != 0 {
++		t.Fatalf("sent outputs = %d, want 0", len(adapter.sent))
++	}
++}
++
++func TestRespondHelpAggregatesRegisteredCommandInstructions(t *testing.T) {
++
++
++	adapter := &recordingAdapter{}
++	storage := newRecordingStorage()
++	bot := sarah.NewBot(adapter, sarah.BotWithStorage(storage))
++	bot.AppendCommand(&scriptedCommand{id: "alpha", instruction: "alpha usage", match: func(sarah.Input) bool { return false }})
++	bot.AppendCommand(&scriptedCommand{id: "hidden", instruction: "", match: func(sarah.Input) bool { return false }})
++	bot.AppendCommand(&scriptedCommand{id: "gamma", instruction: "gamma usage", match: func(sarah.Input) bool { return false }})
++
++	input := sarah.NewHelpInput(testInput{sender: "helper", msg: "help", reply: "help-room"})
++	err := bot.Respond(context.Background(), input)
++	if err != nil {
++		t.Fatalf("Respond error = %v, want nil", err)
++	}
++
++	if storage.gets == 0 {
++		t.Fatalf("storage gets = %d, want at least 1", storage.gets)
++	}
++	if len(adapter.sent) != 1 {
++		t.Fatalf("sent outputs = %d, want 1", len(adapter.sent))
++	}
++	if adapter.sent[0].Destination() != "help-room" {
++		t.Fatalf("output destination = %#v, want %#v", adapter.sent[0].Destination(), "help-room")
++	}
++	got := collectHelps(t, adapter.sent[0].Content())
++	want := []helpRow{
++		{Identifier: "alpha", Instruction: "alpha usage"},
++		{Identifier: "gamma", Instruction: "gamma usage"},
++	}
++	if !reflect.DeepEqual(got, want) {
++		t.Fatalf("helps = %#v, want %#v", got, want)
++	}
++}
++
++func TestRespondConversationContextTakesPriorityAndRestoresNextStep(t *testing.T) {
++
++
++	adapter := &recordingAdapter{}
++	storage := newRecordingStorage()
++	bot := sarah.NewBot(adapter, sarah.BotWithStorage(storage))
++
++	var firstNextCalls int
++	var secondNextCalls int
++	command := &scriptedCommand{
++		id: "conversation",
++		match: func(sarah.Input) bool {
++			return true
++		},
++		execute: func(context.Context, sarah.Input) (*sarah.CommandResponse, error) {
++			firstNext := func(_ context.Context, input sarah.Input) (*sarah.CommandResponse, error) {
++				firstNextCalls++
++				secondNext := func(_ context.Context, input sarah.Input) (*sarah.CommandResponse, error) {
++					secondNextCalls++
++					return &sarah.CommandResponse{Content: "again:" + input.Message()}, nil
++				}
++				return &sarah.CommandResponse{
++					Content:     "next:" + input.Message(),
++					UserContext: sarah.NewUserContext(secondNext),
++				}, nil
++			}
++			return &sarah.CommandResponse{
++				Content:     "start",
++				UserContext: sarah.NewUserContext(firstNext),
++			}, nil
++		},
++	}
++	bot.AppendCommand(command)
++
++	err := bot.Respond(context.Background(), testInput{sender: "same", msg: "begin", reply: "r1"})
++	if err != nil {
++		t.Fatalf("first Respond error = %v, want nil", err)
++	}
++	if len(adapter.sent) != 1 {
++		t.Fatalf("sent outputs after first response = %d, want 1", len(adapter.sent))
++	}
++	if adapter.sent[0].Content() != "start" {
++		t.Fatalf("first output content = %#v, want %#v", adapter.sent[0].Content(), "start")
++	}
++	if adapter.sent[0].Destination() != "r1" {
++		t.Fatalf("first output destination = %#v, want %#v", adapter.sent[0].Destination(), "r1")
++	}
++
++	if storage.activeContexts() != 1 {
++		t.Fatalf("storage active contexts after first response = %d, want 1", storage.activeContexts())
++	}
++	matchCallsAfterFirst := command.matchCalls
++
++	err = bot.Respond(context.Background(), testInput{sender: "same", msg: "reply", reply: "r2"})
++	if err != nil {
++		t.Fatalf("second Respond error = %v, want nil", err)
++	}
++	if len(adapter.sent) != 2 {
++		t.Fatalf("sent outputs after second response = %d, want 2", len(adapter.sent))
++	}
++	if adapter.sent[1].Content() != "next:reply" {
++		t.Fatalf("second output content = %#v, want %#v", adapter.sent[1].Content(), "next:reply")
++	}
++	if adapter.sent[1].Destination() != "r2" {
++		t.Fatalf("second output destination = %#v, want %#v", adapter.sent[1].Destination(), "r2")
++	}
++
++	if command.matchCalls != matchCallsAfterFirst {
++		t.Fatalf("command match calls changed during context response from %d to %d", matchCallsAfterFirst, command.matchCalls)
++	}
++	if command.execCalls != 1 {
++		t.Fatalf("command execute calls after context response = %d, want 1", command.execCalls)
++	}
++	if firstNextCalls != 1 || secondNextCalls != 0 {
++		t.Fatalf("next calls after second response = first:%d second:%d, want first:1 second:0", firstNextCalls, secondNextCalls)
++	}
++
++	if storage.activeContexts() != 1 {
++		t.Fatalf("storage active contexts after second response = %d, want 1", storage.activeContexts())
++	}
++
++	err = bot.Respond(context.Background(), testInput{sender: "same", msg: "later", reply: "r3"})
++	if err != nil {
++		t.Fatalf("third Respond error = %v, want nil", err)
++	}
++	if len(adapter.sent) != 3 {
++		t.Fatalf("sent outputs after third response = %d, want 3", len(adapter.sent))
++	}
++	if adapter.sent[2].Content() != "again:later" {
++		t.Fatalf("third output content = %#v, want %#v", adapter.sent[2].Content(), "again:later")
++	}
++	if adapter.sent[2].Destination() != "r3" {
++		t.Fatalf("third output destination = %#v, want %#v", adapter.sent[2].Destination(), "r3")
++	}
++	if firstNextCalls != 1 || secondNextCalls != 1 {
++		t.Fatalf("next calls after third response = first:%d second:%d, want first:1 second:1", firstNextCalls, secondNextCalls)
++	}
++
++	if storage.activeContexts() != 0 {
++		t.Fatalf("storage active contexts after third response = %d, want 0", storage.activeContexts())
++	}
++}
++
++func TestRespondAbortDeletesContextWithoutInvokingNextStepAndIsIdempotent(t *testing.T) {
++
++
++	adapter := &recordingAdapter{}
++	storage := newRecordingStorage()
++	var invoked int
++	storage.contexts["same"] = func(context.Context, sarah.Input) (*sarah.CommandResponse, error) {
++		invoked++
++		return &sarah.CommandResponse{Content: "unexpected"}, nil
++	}
++	bot := sarah.NewBot(adapter, sarah.BotWithStorage(storage))
++
++	firstErr := bot.Respond(context.Background(), sarah.NewAbortInput(testInput{sender: "same", msg: "abort", reply: "r1"}))
++	secondErr := bot.Respond(context.Background(), sarah.NewAbortInput(testInput{sender: "same", msg: "abort again", reply: "r2"}))
++	if firstErr != nil {
++		t.Fatalf("first abort error = %v, want nil", firstErr)
++	}
++	if secondErr != nil {
++		t.Fatalf("second abort error = %v, want nil", secondErr)
++	}
++	if invoked != 0 {
++		t.Fatalf("stored next invocations = %d, want 0", invoked)
++	}
++	if len(adapter.sent) != 0 {
++		t.Fatalf("sent outputs = %d, want 0", len(adapter.sent))
++	}
++
++	if storage.activeContexts() != 0 {
++		t.Fatalf("storage active contexts after repeated abort = %d, want 0", storage.activeContexts())
++	}
++}
++
++func TestRespondReturnsStorageGetError(t *testing.T) {
++
++
++	adapter := &recordingAdapter{}
++	storage := newRecordingStorage()
++	storage.getErr = errStorageGet
++	bot := sarah.NewBot(adapter, sarah.BotWithStorage(storage))
++	bot.AppendCommand(&scriptedCommand{
++		id: "would-match",
++		match: func(sarah.Input) bool {
++			return true
++		},
++		execute: func(context.Context, sarah.Input) (*sarah.CommandResponse, error) {
++			return &sarah.CommandResponse{Content: "unexpected"}, nil
++		},
++	})
++
++	err := bot.Respond(context.Background(), testInput{sender: "same", msg: "ping", reply: "r1"})
++	if !errors.Is(err, errStorageGet) {
++		t.Fatalf("Respond error = %v, want errStorageGet", err)
++	}
++	if len(adapter.sent) != 0 {
++		t.Fatalf("sent outputs = %d, want 0", len(adapter.sent))
++	}
++
++	if storage.gets == 0 || storage.sets != 0 || storage.activeContexts() != 0 {
++		t.Fatalf("storage after get error = gets:%d sets:%d active:%d, want get attempted and no active context", storage.gets, storage.sets, storage.activeContexts())
++	}
++}
++
++func TestRespondSendsContentEvenWhenStorageSetFails(t *testing.T) {
++
++
++	adapter := &recordingAdapter{}
++	storage := newRecordingStorage()
++	storage.setErr = errStorageSet
++	bot := sarah.NewBot(adapter, sarah.BotWithStorage(storage))
++	bot.AppendCommand(&scriptedCommand{
++		id: "store-fails",
++		match: func(sarah.Input) bool {
++			return true
++		},
++		execute: func(context.Context, sarah.Input) (*sarah.CommandResponse, error) {
++			next := func(context.Context, sarah.Input) (*sarah.CommandResponse, error) {
++				return &sarah.CommandResponse{Content: "unused"}, nil
++			}
++			return &sarah.CommandResponse{
++				Content:     "start-with-failed-store",
++				UserContext: sarah.NewUserContext(next),
++			}, nil
++		},
++	})
++
++	err := bot.Respond(context.Background(), testInput{sender: "same", msg: "begin", reply: "r1"})
++	if err != nil {
++		t.Fatalf("Respond error = %v, want nil", err)
++	}
++	if len(adapter.sent) != 1 {
++		t.Fatalf("sent outputs = %d, want 1", len(adapter.sent))
++	}
++	if adapter.sent[0].Content() != "start-with-failed-store" {
++		t.Fatalf("output content = %#v, want %#v", adapter.sent[0].Content(), "start-with-failed-store")
++	}
++	if adapter.sent[0].Destination() != "r1" {
++		t.Fatalf("output destination = %#v, want %#v", adapter.sent[0].Destination(), "r1")
++	}
++
++	if storage.sets == 0 || storage.activeContexts() != 0 {
++		t.Fatalf("storage after set error = sets:%d active:%d, want set attempted and no active context", storage.sets, storage.activeContexts())
++	}
++}
++
++func TestBotsMaintainIndependentConversationState(t *testing.T) {
++
++
++	ctx := context.Background()
++	adapterA := &recordingAdapter{botType: "bot-a"}
++	storageA := newRecordingStorage()
++	botA := sarah.NewBot(adapterA, sarah.BotWithStorage(storageA))
++	botA.AppendCommand(&scriptedCommand{
++		id: "begin",
++		match: func(input sarah.Input) bool {
++			return input.Message() == "begin"
++		},
++		execute: func(context.Context, sarah.Input) (*sarah.CommandResponse, error) {
++			next := func(_ context.Context, input sarah.Input) (*sarah.CommandResponse, error) {
++				return &sarah.CommandResponse{Content: "a-next:" + input.Message()}, nil
++			}
++			return &sarah.CommandResponse{Content: "a-start", UserContext: sarah.NewUserContext(next)}, nil
++		},
++	})
++
++	adapterB := &recordingAdapter{botType: "bot-b"}
++	storageB := newRecordingStorage()
++	botB := sarah.NewBot(adapterB, sarah.BotWithStorage(storageB))
++	botB.AppendCommand(&scriptedCommand{
++		id: "begin",
++		match: func(input sarah.Input) bool {
++			return input.Message() == "begin"
++		},
++		execute: func(context.Context, sarah.Input) (*sarah.CommandResponse, error) {
++			next := func(_ context.Context, input sarah.Input) (*sarah.CommandResponse, error) {
++				return &sarah.CommandResponse{Content: "b-next:" + input.Message()}, nil
++			}
++			return &sarah.CommandResponse{Content: "b-start", UserContext: sarah.NewUserContext(next)}, nil
++		},
++	})
++
++	err := botA.Respond(ctx, testInput{sender: "same", msg: "begin", reply: "a-room"})
++	if err != nil {
++		t.Fatalf("bot A first Respond error = %v, want nil", err)
++	}
++	err = botB.Respond(ctx, testInput{sender: "same", msg: "reply", reply: "b-room"})
++	if err != nil {
++		t.Fatalf("bot B Respond error = %v, want nil", err)
++	}
++	err = botA.Respond(ctx, testInput{sender: "same", msg: "reply", reply: "a-room"})
++	if err != nil {
++		t.Fatalf("bot A second Respond error = %v, want nil", err)
++	}
++
++	if len(adapterA.sent) != 2 {
++		t.Fatalf("bot A sent outputs = %d, want 2", len(adapterA.sent))
++	}
++	if adapterA.sent[0].Content() != "a-start" {
++		t.Fatalf("bot A first content = %#v, want %#v", adapterA.sent[0].Content(), "a-start")
++	}
++	if adapterA.sent[1].Content() != "a-next:reply" {
++		t.Fatalf("bot A second content = %#v, want %#v", adapterA.sent[1].Content(), "a-next:reply")
++	}
++	if len(adapterB.sent) != 0 {
++		t.Fatalf("bot B sent outputs = %d, want 0", len(adapterB.sent))
++	}
++
++	if storageA.activeContexts() != 0 {
++		t.Fatalf("storage A active contexts = %d, want 0", storageA.activeContexts())
++	}
++
++	if storageB.activeContexts() != 0 {
++		t.Fatalf("storage B active contexts = %d, want 0", storageB.activeContexts())
++	}
++}
++
++func TestCommandsDispatchHelpersUseFirstMatchAndAggregateHelp(t *testing.T) {
++
++
++	ctx := context.Background()
++	commands := sarah.NewCommands()
++	alpha := &scriptedCommand{
++		id:          "alpha",
++		instruction: "alpha usage",
++		match: func(input sarah.Input) bool {
++			return input.Message() == "go"
++		},
++		execute: func(context.Context, sarah.Input) (*sarah.CommandResponse, error) {
++			return &sarah.CommandResponse{Content: "alpha result"}, nil
++		},
++	}
++	beta := &scriptedCommand{
++		id:          "beta",
++		instruction: "",
++		match: func(input sarah.Input) bool {
++			return input.Message() == "go"
++		},
++		execute: func(context.Context, sarah.Input) (*sarah.CommandResponse, error) {
++			return &sarah.CommandResponse{Content: "beta result"}, nil
++		},
++	}
++	gamma := &scriptedCommand{
++		id:          "gamma",
++		instruction: "gamma usage",
++		match: func(sarah.Input) bool {
++			return false
++		},
++		execute: func(context.Context, sarah.Input) (*sarah.CommandResponse, error) {
++			return &sarah.CommandResponse{Content: "gamma result"}, nil
++		},
++	}
++	commands.Append(alpha)
++	commands.Append(beta)
++	commands.Append(gamma)
++
++	matched := commands.FindFirstMatched(testInput{sender: "sender", msg: "go", reply: "room"})
++	if matched == nil {
++		t.Fatal("FindFirstMatched returned nil, want command alpha")
++	}
++	if matched.Identifier() != "alpha" {
++		t.Fatalf("matched identifier = %#v, want %#v", matched.Identifier(), "alpha")
++	}
++	if commands.FindFirstMatched(testInput{sender: "sender", msg: "stop", reply: "room"}) != nil {
++		t.Fatal("FindFirstMatched no-match result is non-nil, want nil")
++	}
++
++	response, err := commands.ExecuteFirstMatched(ctx, testInput{sender: "sender", msg: "go", reply: "room"})
++	if err != nil {
++		t.Fatalf("ExecuteFirstMatched error = %v, want nil", err)
++	}
++	if response == nil {
++		t.Fatal("ExecuteFirstMatched response = nil, want alpha response")
++	}
++	if response.Content != "alpha result" {
++		t.Fatalf("ExecuteFirstMatched content = %#v, want %#v", response.Content, "alpha result")
++	}
++	if alpha.execCalls != 1 {
++		t.Fatalf("alpha execute calls = %d, want 1", alpha.execCalls)
++	}
++	if beta.execCalls != 0 {
++		t.Fatalf("beta execute calls = %d, want 0", beta.execCalls)
++	}
++
++	response, err = commands.ExecuteFirstMatched(ctx, testInput{sender: "sender", msg: "stop", reply: "room"})
++	if err != nil {
++		t.Fatalf("ExecuteFirstMatched no-match error = %v, want nil", err)
++	}
++	if response != nil {
++		t.Fatalf("ExecuteFirstMatched no-match response = %#v, want nil", response)
++	}
++
++	got := collectHelps(t, commands.Helps(sarah.NewHelpInput(testInput{sender: "sender", msg: "help", reply: "room"})))
++	want := []helpRow{
++		{Identifier: "alpha", Instruction: "alpha usage"},
++		{Identifier: "gamma", Instruction: "gamma usage"},
++	}
++	if !reflect.DeepEqual(got, want) {
++		t.Fatalf("helps = %#v, want %#v", got, want)
++	}
++}
++
++func TestCommandsInstancesAreIndependent(t *testing.T) {
++
++
++	a := sarah.NewCommands()
++	b := sarah.NewCommands()
++	a.Append(&scriptedCommand{
++		id: "alpha",
++		match: func(input sarah.Input) bool {
++			return input.Message() == "go"
++		},
++		execute: func(context.Context, sarah.Input) (*sarah.CommandResponse, error) {
++			return &sarah.CommandResponse{Content: "alpha result"}, nil
++		},
++	})
++
++	matchedA := a.FindFirstMatched(testInput{sender: "sender", msg: "go", reply: "room"})
++	matchedB := b.FindFirstMatched(testInput{sender: "sender", msg: "go", reply: "room"})
++	if matchedA == nil {
++		t.Fatal("commands A matched = nil, want alpha")
++	}
++	if matchedA.Identifier() != "alpha" {
++		t.Fatalf("commands A matched identifier = %#v, want %#v", matchedA.Identifier(), "alpha")
++	}
++	if matchedB != nil {
++		t.Fatalf("commands B matched = %#v, want nil", matchedB)
++	}
++}
++
++func TestRespondAbortCleanupLeakFloor(t *testing.T) {
++
++
++
++	for i := 0; i < 150; i++ {
++		adapter := &recordingAdapter{}
++		storage := newRecordingStorage()
++		bot := sarah.NewBot(adapter, sarah.BotWithStorage(storage))
++		bot.AppendCommand(&scriptedCommand{
++			id: "begin",
++			match: func(input sarah.Input) bool {
++				return input.Message() == "begin"
++			},
++			execute: func(context.Context, sarah.Input) (*sarah.CommandResponse, error) {
++				next := func(context.Context, sarah.Input) (*sarah.CommandResponse, error) {
++					return &sarah.CommandResponse{Content: "unused"}, nil
++				}
++				return &sarah.CommandResponse{Content: "start", UserContext: sarah.NewUserContext(next)}, nil
++			},
++		})
++
++		sender := "sender"
++		if err := bot.Respond(context.Background(), testInput{sender: sender, msg: "begin", reply: "room"}); err != nil {
++			t.Fatalf("cycle %d begin error = %v, want nil", i, err)
++		}
++		if err := bot.Respond(context.Background(), sarah.NewAbortInput(testInput{sender: sender, msg: "abort", reply: "room"})); err != nil {
++			t.Fatalf("cycle %d abort error = %v, want nil", i, err)
++		}
++		if storage.activeContexts() != 0 {
++			t.Fatalf("cycle %d active contexts = %d, want 0", i, storage.activeContexts())
++		}
++	}
++
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,19 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++
++cd /workspace/repo
++export GOTOOLCHAIN=local
++export GOPROXY=off
++export GOSUMDB=off
++export GOVCS='*:off'
++go test -v -count=1 ./usercase-test-coderl/...

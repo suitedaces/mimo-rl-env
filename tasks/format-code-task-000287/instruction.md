@@ -1,0 +1,9 @@
+I want the `stats` package to expose pure readability helpers for article prose: `Words(text string) []string`, `Sentences(text string) []string`, `SyllableCount(word string) int`, and `FleschKincaidEase(text string) float64`.
+
+`Words` should return all word-like tokens made of letters, digits, underscores, and apostrophes. For `Words("the fox jumped over the road. That's pretty cool...\tyup?")`, it should return `[]string{"the", "fox", "jumped", "over", "the", "road", "That's", "pretty", "cool", "yup"}`; for `Words("A_1 isn't 42!")`, it should return `[]string{"A_1", "isn't", "42"}`.
+
+`Sentences` should split text on one or more `.`, `?`, or `!` delimiters, consume surrounding ASCII whitespace around the delimiter, and omit the final empty segment when the text ends with punctuation. For `Sentences("One. Two...\nThree!Four?")`, it should return `[]string{"One", "Two", "Three", "Four"}`; for `Sentences("No final punctuation")`, it should return `[]string{"No final punctuation"}`.
+
+`SyllableCount` should estimate syllables deterministically for a single word: words of length three or less count as one syllable, common silent endings such as `ed`, selected trailing `es`, and selected trailing `e` are ignored, a leading `y` is ignored, and contiguous vowel groups of one or two vowels count as syllables. For example, `SyllableCount("logorrhoea")` should return `4`, `SyllableCount("used")` should return `1`, `SyllableCount("makes")` should return `1`, and `SyllableCount("themselves")` should return `2`.
+
+`FleschKincaidEase` should compute the Flesch Reading Ease score from the helper outputs using `206.835 - 1.015*(words/sentences) - 84.6*(syllables/words)`. These functions should be deterministic, should not mutate their input strings, and should not perform filesystem, network, or global-state side effects.

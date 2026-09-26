@@ -1,0 +1,273 @@
+diff --git a/server/artifacts/artifact_server_test.go b/server/artifacts/artifact_server_test.go
+index 686224bb4..69eaf8e9b 100644
+--- a/server/artifacts/artifact_server_test.go
++++ b/server/artifacts/artifact_server_test.go
+@@ -633,3 +633,246 @@ func TestArtifactServer_httpFromError(t *testing.T) {
+ 	s.httpFromError(err, w)
+ 	assert.Equal(t, http.StatusNotFound, w.StatusCode)
+ }
++
++
++
++
++
++
++func newServerForInlineTest() *ArtifactServer {
++	gatekeeper := &authmocks.Gatekeeper{}
++	kube := kubefake.NewSimpleClientset()
++	instanceId := "my-instanceid"
++	wf := &wfv1.Workflow{
++		ObjectMeta: metav1.ObjectMeta{Namespace: "my-ns", Name: "inline-wf", Labels: map[string]string{
++			common.LabelKeyControllerInstanceID: instanceId,
++		}},
++		Spec: wfv1.WorkflowSpec{
++			Entrypoint: "main",
++			Templates: []wfv1.Template{
++				{
++					Name: "main",
++					Steps: []wfv1.ParallelSteps{
++						{
++							Steps: []wfv1.WorkflowStep{
++								{
++									Name: "a",
++									Inline: &wfv1.Template{
++										Container: nil,
++									},
++								},
++							},
++						},
++					},
++				},
++			},
++		},
++		Status: wfv1.WorkflowStatus{
++			Nodes: wfv1.Nodes{
++
++				"parent-node": wfv1.NodeStatus{
++					ID:           "parent-node",
++					Name:         "inline-wf",
++					DisplayName:  "inline-wf",
++					TemplateName: "main",
++					Type:         wfv1.NodeTypeSteps,
++				},
++
++
++
++
++				"inline-node": wfv1.NodeStatus{
++					ID:           "inline-node",
++					Name:         "inline-wf[0].a",
++					DisplayName:  "a",
++					TemplateName: "",
++					TemplateRef:  nil,
++					BoundaryID:   "parent-node",
++					Type:         wfv1.NodeTypePod,
++					Outputs: &wfv1.Outputs{
++						Artifacts: wfv1.Artifacts{
++							{
++								Name: "my-inline-artifact",
++								ArtifactLocation: wfv1.ArtifactLocation{
++									S3: &wfv1.S3Artifact{
++
++										Key: "inline-wf/inline-node/my-inline-artifact.tgz",
++									},
++								},
++							},
++						},
++					},
++				},
++			},
++		},
++	}
++	argo := fakewfv1.NewSimpleClientset(wf)
++	ctx := context.WithValue(context.WithValue(context.Background(), auth.KubeKey, kube), auth.WfKey, argo)
++	gatekeeper.On("ContextWithRequest", mock.Anything, mock.Anything).Return(ctx, nil)
++	a := &sqldbmocks.WorkflowArchive{}
++
++	driverData := []byte("inline-data")
++	fakeDriverFactory := func(_ context.Context, _ *wfv1.Artifact, _ resource.Interface) (artifactscommon.ArtifactDriver, error) {
++		return &inlineFakeDriver{data: driverData}, nil
++	}
++
++	artifactRepositories := armocks.DummyArtifactRepositories(&wfv1.ArtifactRepository{
++		S3: &wfv1.S3ArtifactRepository{
++			S3Bucket: wfv1.S3Bucket{
++				Endpoint: "my-endpoint",
++				Bucket:   "my-bucket",
++			},
++		},
++	})
++
++	return newArtifactServer(gatekeeper, hydratorfake.Noop, a, instanceid.NewService(instanceId), fakeDriverFactory, artifactRepositories)
++}
++
++
++
++
++
++type inlineFakeDriver struct {
++	artifactscommon.ArtifactDriver
++	data []byte
++}
++
++func (a *inlineFakeDriver) Load(_ *wfv1.Artifact, path string) error {
++	return ioutil.WriteFile(path, a.data, 0o600)
++}
++
++func (a *inlineFakeDriver) OpenStream(_ *wfv1.Artifact) (io.ReadCloser, error) {
++	return io.NopCloser(bytes.NewReader(a.data)), nil
++}
++
++func (a *inlineFakeDriver) IsDirectory(_ *wfv1.Artifact) (bool, error) {
++	return false, nil
++}
++
++func (a *inlineFakeDriver) ListObjects(_ *wfv1.Artifact) ([]string, error) {
++	return []string{}, nil
++}
++
++
++
++
++
++
++func TestArtifactServer_GetOutputArtifact_InlineTemplate(t *testing.T) {
++	s := newServerForInlineTest()
++
++	r := &http.Request{}
++	r.URL = mustParse("/artifacts/my-ns/inline-wf/inline-node/my-inline-artifact")
++	recorder := httptest.NewRecorder()
++
++	s.GetOutputArtifact(recorder, r)
++
++	assert.Equal(t, http.StatusOK, recorder.Result().StatusCode,
++		"inline-template node should not produce Internal Server Error")
++	body, err := io.ReadAll(recorder.Result().Body)
++	assert.NoError(t, err)
++	assert.Equal(t, "inline-data", string(body))
++}
++
++
++
++func TestArtifactServer_GetArtifactFile_InlineTemplate(t *testing.T) {
++	s := newServerForInlineTest()
++
++	r := &http.Request{}
++	r.URL = mustParse("/artifact-files/my-ns/workflows/inline-wf/inline-node/outputs/my-inline-artifact")
++	recorder := httptest.NewRecorder()
++
++	s.GetArtifactFile(recorder, r)
++
++	assert.Equal(t, http.StatusOK, recorder.Result().StatusCode,
++		"inline-template node should serve artifact files, not return 500")
++	body, err := io.ReadAll(recorder.Result().Body)
++	assert.NoError(t, err)
++	assert.Equal(t, "inline-data", string(body))
++}
++
++
++
++
++
++
++func TestArtifactServer_getArtifactAndDriver_InlineTemplate(t *testing.T) {
++	s := newServerForInlineTest()
++
++
++	ctx, err := s.gateKeeping(&http.Request{URL: mustParse("/artifacts/my-ns/inline-wf/inline-node/my-inline-artifact")}, nil)
++	assert.NoError(t, err)
++
++	wf, err := s.getWorkflowAndValidate(ctx, "my-ns", "inline-wf")
++	assert.NoError(t, err)
++
++	art, driver, err := s.getArtifactAndDriver(ctx, "inline-node", "my-inline-artifact", false, wf, nil)
++	assert.NoError(t, err, "inline-template node must not produce a template-not-found error")
++	assert.NotNil(t, art)
++	assert.NotNil(t, driver)
++	if art != nil && art.S3 != nil {
++
++
++
++		assert.Equal(t, "my-bucket", art.S3.Bucket,
++			"bucket must come from the resolved artifact repository when template is inline")
++	}
++}
++
++
++
++
++
++func TestArtifactServer_getArtifactAndDriver_MissingNamedTemplate(t *testing.T) {
++	gatekeeper := &authmocks.Gatekeeper{}
++	kube := kubefake.NewSimpleClientset()
++	instanceId := "my-instanceid"
++	wf := &wfv1.Workflow{
++		ObjectMeta: metav1.ObjectMeta{Namespace: "my-ns", Name: "missing-tmpl-wf", Labels: map[string]string{
++			common.LabelKeyControllerInstanceID: instanceId,
++		}},
++		Spec: wfv1.WorkflowSpec{
++			Templates: []wfv1.Template{},
++		},
++		Status: wfv1.WorkflowStatus{
++			Nodes: wfv1.Nodes{
++				"some-node": wfv1.NodeStatus{
++					ID:           "some-node",
++					Name:         "some-node",
++					TemplateName: "no-such-template",
++					Outputs: &wfv1.Outputs{
++						Artifacts: wfv1.Artifacts{
++							{
++								Name: "art",
++								ArtifactLocation: wfv1.ArtifactLocation{
++									S3: &wfv1.S3Artifact{
++										Key: "k",
++									},
++								},
++							},
++						},
++					},
++				},
++			},
++		},
++	}
++	argo := fakewfv1.NewSimpleClientset(wf)
++	ctx := context.WithValue(context.WithValue(context.Background(), auth.KubeKey, kube), auth.WfKey, argo)
++	gatekeeper.On("ContextWithRequest", mock.Anything, mock.Anything).Return(ctx, nil)
++	a := &sqldbmocks.WorkflowArchive{}
++	fakeDriverFactory := func(_ context.Context, _ *wfv1.Artifact, _ resource.Interface) (artifactscommon.ArtifactDriver, error) {
++		return &inlineFakeDriver{data: []byte("x")}, nil
++	}
++	artifactRepositories := armocks.DummyArtifactRepositories(&wfv1.ArtifactRepository{
++		S3: &wfv1.S3ArtifactRepository{
++			S3Bucket: wfv1.S3Bucket{Endpoint: "my-endpoint", Bucket: "my-bucket"},
++		},
++	})
++	s := newArtifactServer(gatekeeper, hydratorfake.Noop, a, instanceid.NewService(instanceId), fakeDriverFactory, artifactRepositories)
++
++	wf2, err := s.getWorkflowAndValidate(ctx, "my-ns", "missing-tmpl-wf")
++	assert.NoError(t, err)
++	_, _, err = s.getArtifactAndDriver(ctx, "some-node", "art", false, wf2, nil)
++	assert.Error(t, err, "an explicit non-empty TemplateName that does not resolve must still produce an error")
++}
+diff --git a/test_commands.json b/test_commands.json
+new file mode 100644
+index 000000000..6a0d29c9b
+--- /dev/null
++++ b/test_commands.json
+@@ -0,0 +1,3 @@
++{
++  "test_commands": ["go test ./server/artifacts/ -run \"TestArtifactServer_GetOutputArtifact_InlineTemplate|TestArtifactServer_GetArtifactFile_InlineTemplate|TestArtifactServer_getArtifactAndDriver_InlineTemplate|TestArtifactServer_getArtifactAndDriver_MissingNamedTemplate\" -count=1 -v"]
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,8 @@
++#!/usr/bin/env bash
++
++set -uo pipefail
++cd /testbed
++rc=0
++go test ./server/artifacts/ -run "TestArtifactServer_GetOutputArtifact_InlineTemplate|TestArtifactServer_GetArtifactFile_InlineTemplate|TestArtifactServer_getArtifactAndDriver_InlineTemplate|TestArtifactServer_getArtifactAndDriver_MissingNamedTemplate" -count=1 -v
++rc=$(( rc | $? ))
++exit $rc

@@ -1,0 +1,262 @@
+diff --git a/integrations/api_issue_test.go b/integrations/api_issue_test.go
+index 74512cafa3..472c11f4cc 100644
+--- a/integrations/api_issue_test.go
++++ b/integrations/api_issue_test.go
+@@ -5,6 +5,7 @@
+ package integrations
+ 
+ import (
++	"encoding/json"
+ 	"fmt"
+ 	"net/http"
+ 	"net/url"
+@@ -238,6 +239,201 @@ func TestAPISearchIssues(t *testing.T) {
+ 	assert.Len(t, apiIssues, 2)
+ }
+ 
++func searchIssuesWithQuery(t *testing.T, session *TestSession, query url.Values, expectedStatus int) []*api.Issue {
++	t.Helper()
++	query.Set("state", "all")
++	query.Set("limit", "50")
++	req := NewRequest(t, "GET", "/api/v1/repos/issues/search?"+query.Encode())
++	resp := session.MakeRequest(t, req, expectedStatus)
++	var apiIssues []*api.Issue
++	if expectedStatus == http.StatusOK {
++		DecodeJSON(t, resp, &apiIssues)
++	}
++	return apiIssues
++}
++
++func decodeAPIErrorMessage(t *testing.T, body []byte) string {
++	t.Helper()
++	var apiError struct {
++		Message string `json:"message"`
++	}
++	assert.NoError(t, json.Unmarshal(body, &apiError))
++	assert.NotEmpty(t, apiError.Message)
++	return apiError.Message
++}
++
++func assertIssuesOwnedBy(t *testing.T, issues []*api.Issue, owner string) {
++	t.Helper()
++	assert.NotEmpty(t, issues)
++	for _, issue := range issues {
++		if assert.NotNil(t, issue.Repo) {
++			assert.Equal(t, owner, issue.Repo.Owner)
++		}
++	}
++}
++
++func hasIssueOutsideOwner(issues []*api.Issue, owner string) bool {
++	for _, issue := range issues {
++		if issue.Repo != nil && issue.Repo.Owner != owner {
++			return true
++		}
++	}
++	return false
++}
++
++func hasIssueInRepo(issues []*api.Issue, owner, repo string) bool {
++	for _, issue := range issues {
++		if issue.Repo != nil && issue.Repo.Owner == owner && issue.Repo.Name == repo {
++			return true
++		}
++	}
++	return false
++}
++
++func TestAPISearchIssuesOwnerFilter_UserOwner(t *testing.T) {
++	defer prepareTestEnv(t)()
++	session := loginUser(t, "user2")
++
++	unfiltered := searchIssuesWithQuery(t, session, url.Values{}, http.StatusOK)
++	assert.True(t, hasIssueOutsideOwner(unfiltered, "user2"), "fixture must contain a visible issue from another owner")
++
++	issues := searchIssuesWithQuery(t, session, url.Values{"owner": {"user2"}}, http.StatusOK)
++	assertIssuesOwnedBy(t, issues, "user2")
++	assert.False(t, hasIssueOutsideOwner(issues, "user2"))
++
++	additionalOwnerIssues := searchIssuesWithQuery(t, session, url.Values{"owner": {"user12"}}, http.StatusOK)
++	assertIssuesOwnedBy(t, additionalOwnerIssues, "user12")
++	assert.False(t, hasIssueOutsideOwner(additionalOwnerIssues, "user12"))
++}
++
++func TestAPISearchIssuesOwnerFilter_OrgOwner(t *testing.T) {
++	defer prepareTestEnv(t)()
++	session := loginUser(t, "user2")
++
++	unfiltered := searchIssuesWithQuery(t, session, url.Values{}, http.StatusOK)
++	assert.True(t, hasIssueOutsideOwner(unfiltered, "user3"), "fixture must contain a visible issue outside the org owner")
++
++	issues := searchIssuesWithQuery(t, session, url.Values{"owner": {"user3"}}, http.StatusOK)
++	assertIssuesOwnedBy(t, issues, "user3")
++	assert.False(t, hasIssueOutsideOwner(issues, "user3"))
++}
++
++func TestAPISearchIssuesTeamFilterWithinOwner(t *testing.T) {
++	defer prepareTestEnv(t)()
++	session := loginUser(t, "user2")
++
++	ownerIssues := searchIssuesWithQuery(t, session, url.Values{"owner": {"user3"}}, http.StatusOK)
++	if !hasIssueInRepo(ownerIssues, "user3", "repo5") {
++		token := getTokenForLoggedInUser(t, session)
++		req := NewRequestWithJSON(t, "POST", "/api/v1/repos/user3/repo5/issues?token="+token, &api.CreateIssueOption{
++			Title: "issue in org repo outside team1",
++			Body:  "content",
++		})
++		session.MakeRequest(t, req, http.StatusCreated)
++		ownerIssues = searchIssuesWithQuery(t, session, url.Values{"owner": {"user3"}}, http.StatusOK)
++	}
++	assertIssuesOwnedBy(t, ownerIssues, "user3")
++	assert.True(t, hasIssueInRepo(ownerIssues, "user3", "repo5"), "owner-only search should include the controlled non-team repo issue")
++
++	teamIssues := searchIssuesWithQuery(t, session, url.Values{
++		"owner": {"user3"},
++		"team":  {"team1"},
++	}, http.StatusOK)
++	assertIssuesOwnedBy(t, teamIssues, "user3")
++	assert.False(t, hasIssueInRepo(teamIssues, "user3", "repo5"), "team search must exclude same-org repositories outside the team")
++
++	testTeamToken := getTokenForLoggedInUser(t, session)
++	req := NewRequestWithJSON(t, "POST", "/api/v1/repos/user3/repo21/issues?token="+testTeamToken, &api.CreateIssueOption{
++		Title: "issue in org repo for test_team",
++		Body:  "content",
++	})
++	session.MakeRequest(t, req, http.StatusCreated)
++
++	testTeamOwnerIssues := searchIssuesWithQuery(t, session, url.Values{"owner": {"user3"}}, http.StatusOK)
++	assertIssuesOwnedBy(t, testTeamOwnerIssues, "user3")
++	assert.True(t, hasIssueInRepo(testTeamOwnerIssues, "user3", "repo5"), "owner-only search should include the non-test_team repository")
++	assert.True(t, hasIssueInRepo(testTeamOwnerIssues, "user3", "repo21"), "owner-only search should include the test_team repository")
++
++	testTeamIssues := searchIssuesWithQuery(t, session, url.Values{
++		"owner": {"user3"},
++		"team":  {"test_team"},
++	}, http.StatusOK)
++	assertIssuesOwnedBy(t, testTeamIssues, "user3")
++	assert.False(t, hasIssueInRepo(testTeamIssues, "user3", "repo5"), "team search must exclude repositories outside test_team")
++	assert.True(t, hasIssueInRepo(testTeamIssues, "user3", "repo21"), "team search should include repositories associated with test_team")
++}
++
++func TestAPISearchIssuesOwnerNotFound(t *testing.T) {
++	defer prepareTestEnv(t)()
++	session := loginUser(t, "user2")
++
++	req := NewRequest(t, "GET", "/api/v1/repos/issues/search?owner=missing-owner-for-search-test")
++	resp := session.MakeRequest(t, req, http.StatusBadRequest)
++	assert.NotEmpty(t, decodeAPIErrorMessage(t, resp.Body.Bytes()))
++}
++
++func TestAPISearchIssuesTeamRequiresOwner(t *testing.T) {
++	defer prepareTestEnv(t)()
++	session := loginUser(t, "user2")
++
++	req := NewRequest(t, "GET", "/api/v1/repos/issues/search?team=team1")
++	resp := session.MakeRequest(t, req, http.StatusBadRequest)
++	assert.Equal(t, "Owner organisation is required for filtering on team", decodeAPIErrorMessage(t, resp.Body.Bytes()))
++}
++
++func TestAPISearchIssuesTeamNotFound(t *testing.T) {
++	defer prepareTestEnv(t)()
++	session := loginUser(t, "user2")
++
++	req := NewRequest(t, "GET", "/api/v1/repos/issues/search?owner=user3&team=missing-team-for-search-test")
++	resp := session.MakeRequest(t, req, http.StatusBadRequest)
++	assert.NotEmpty(t, decodeAPIErrorMessage(t, resp.Body.Bytes()))
++}
++
++func TestSwaggerSearchIssuesOwnerTeamParameters(t *testing.T) {
++	defer prepareTestEnv(t)()
++
++	req := NewRequest(t, "GET", "/swagger.v1.json")
++	resp := MakeRequest(t, req, http.StatusOK)
++
++	var swagger struct {
++		Paths map[string]map[string]struct {
++			Parameters []swaggerParameter `json:"parameters"`
++		} `json:"paths"`
++	}
++	assert.NoError(t, json.Unmarshal(resp.Body.Bytes(), &swagger))
++
++	searchIssues, ok := swagger.Paths["/repos/issues/search"]["get"]
++	if assert.True(t, ok, "swagger must describe GET /repos/issues/search") {
++		ownerParam := findSwaggerParameter(searchIssues.Parameters, "owner")
++		if assert.NotNil(t, ownerParam, "swagger must expose owner query parameter") {
++			assert.Equal(t, "query", ownerParam.In)
++		}
++
++		teamParam := findSwaggerParameter(searchIssues.Parameters, "team")
++		if assert.NotNil(t, teamParam, "swagger must expose team query parameter") {
++			assert.Equal(t, "query", teamParam.In)
++			assert.Contains(t, teamParam.Description, "team")
++			assert.Contains(t, teamParam.Description, "owner")
++		}
++	}
++}
++
++type swaggerParameter struct {
++	Name        string `json:"name"`
++	In          string `json:"in"`
++	Description string `json:"description"`
++}
++
++func findSwaggerParameter(parameters []swaggerParameter, name string) *swaggerParameter {
++	for i := range parameters {
++		if parameters[i].Name == name {
++			return &parameters[i]
++		}
++	}
++	return nil
++}
++
+ func TestAPISearchIssuesWithLabels(t *testing.T) {
+ 	defer prepareTestEnv(t)()
+ 
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,43 @@
++#!/bin/bash
++set -euo pipefail
++cd /testbed
++
++
++
++export GOROOT=/opt/go-1.22
++export PATH=$GOROOT/bin:$PATH
++
++
++
++
++REFLECT2_CACHE=$(go mod download -json github.com/modern-go/reflect2@v1.0.2 2>/dev/null | awk -F'"' '/"Dir"/ {print $4; exit}') || true
++if [ -z "$REFLECT2_CACHE" ]; then
++    GOFLAGS=-mod=mod go mod download github.com/modern-go/reflect2@v1.0.2
++    REFLECT2_CACHE=$(go mod download -json github.com/modern-go/reflect2@v1.0.2 | awk -F'"' '/"Dir"/ {print $4; exit}')
++fi
++rm -rf vendor/github.com/modern-go/reflect2
++cp -r "$REFLECT2_CACHE" vendor/github.com/modern-go/reflect2
++
++
++REPO_TEST_DIR=$(pwd)/
++sed -e "s|{{REPO_TEST_DIR}}|${REPO_TEST_DIR}|g" integrations/sqlite.ini.tmpl > integrations/sqlite.ini
++
++
++go build -mod=vendor -tags 'sqlite sqlite_unlock_notify' -o gitea
++
++
++go test -mod=vendor -c code.gitea.io/gitea/integrations -o integrations.sqlite.test -tags 'sqlite sqlite_unlock_notify'
++
++
++case "${1:-}" in
++  base)
++    GITEA_ROOT="$(pwd)" GITEA_CONF=integrations/sqlite.ini ./integrations.sqlite.test -test.run '^TestAPIListIssues$' -test.v
++    ;;
++  new)
++    GITEA_ROOT="$(pwd)" GITEA_CONF=integrations/sqlite.ini ./integrations.sqlite.test -test.run '^(TestAPISearchIssuesOwnerFilter_UserOwner|TestAPISearchIssuesOwnerFilter_OrgOwner|TestAPISearchIssuesTeamFilterWithinOwner|TestAPISearchIssuesOwnerNotFound|TestAPISearchIssuesTeamRequiresOwner|TestAPISearchIssuesTeamNotFound|TestSwaggerSearchIssuesOwnerTeamParameters)$' -test.v
++    ;;
++  *)
++    echo "usage: $0 base|new"
++    exit 2
++    ;;
++esac

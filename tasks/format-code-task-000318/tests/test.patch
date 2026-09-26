@@ -1,0 +1,409 @@
+diff --git a/usercase-test-coderl/fixtures/fake_gnomix_model.py b/usercase-test-coderl/fixtures/fake_gnomix_model.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/fixtures/fake_gnomix_model.py
+@@ -0,0 +1,88 @@
++import os
++import numpy as np
++import pandas as pd
++
++
++POP_ORDER = np.array(["AFR", "EUR", "NAT"])
++SNP_POS = np.array([100, 200, 300, 400, 500, 600])
++SNP_REF = np.array(["A", "C", "G", "T", "A", "C"])
++SNP_ALT = np.array(["G", "T", "A", "C", "G", "T"])
++
++LABELS_PRETRAINED = np.array([
++    [0, 0, 1, 1, 1],
++    [0, 1, 0, 1, 0],
++    [2, 2, 2, 2, 2],
++    [1, 0, 0, 2, 2],
++], dtype=int)
++
++LABELS_TRAINED = np.array([
++    [2, 2, 1, 1, 0],
++    [0, 0, 0, 1, 1],
++    [1, 2, 2, 2, 1],
++    [2, 1, 2, 1, 2],
++], dtype=int)
++
++
++def one_hot(labels):
++    proba = np.zeros((labels.shape[0], labels.shape[1], len(POP_ORDER)), dtype=float)
++    for i in range(labels.shape[0]):
++        for j in range(labels.shape[1]):
++            proba[i, j, labels[i, j]] = 1.0
++    return proba
++
++
++class StaticBase:
++    def __init__(self):
++        self.vectorize = False
++
++    def predict_proba(self, X):
++        return X
++
++
++class StaticSmooth:
++    def __init__(self, labels):
++        self.labels = np.asarray(labels, dtype=int)
++        self.calibrate = False
++
++    def predict_proba(self, B):
++        return one_hot(self.labels)
++
++
++class TinyPretrainedModel:
++    def __init__(self):
++        self.snp_pos = SNP_POS
++        self.snp_ref = SNP_REF
++        self.snp_alt = SNP_ALT
++        self.population_order = POP_ORDER
++        self.gen_map_df = pd.DataFrame({
++            "chm": ["1"] * len(SNP_POS),
++            "pos": SNP_POS,
++            "pos_cm": np.array([0.0, 1.0, 2.0, 3.0, 4.0, 5.0]),
++        })
++        self.M = 1
++        self.W = 5
++        self.base = StaticBase()
++        self.smooth = StaticSmooth(LABELS_PRETRAINED)
++        self.n_cores = None
++        self.calibrate = False
++
++
++class TinyTrainedGnomix(TinyPretrainedModel):
++    def __init__(self, *args, **kwargs):
++        super().__init__()
++        self.smooth = StaticSmooth(LABELS_TRAINED)
++        self.Confusion_Matrices = {
++            "train": (np.eye(len(POP_ORDER), dtype=int), np.arange(len(POP_ORDER))),
++        }
++        self.accuracies = {"smooth_train_acc": 100.0}
++
++    def train(self, data=None, retrain_base=False, evaluate=True, verbose=False):
++        return None
++
++    def write_gen_map_df(self, gen_map_df):
++        self.gen_map_df = gen_map_df
++
++    def write_config(self, path):
++        os.makedirs(os.path.dirname(path), exist_ok=True)
++        with open(path, "w") as f:
++            f.write("tiny trained model\n")
+diff --git a/usercase-test-coderl/fixtures/sitecustomize.py b/usercase-test-coderl/fixtures/sitecustomize.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/fixtures/sitecustomize.py
+@@ -0,0 +1,10 @@
++import os
++import sys
++import types
++
++if os.environ.get("GNOMIX_USE_FAKE_SRC_MODEL") == "1":
++    from fake_gnomix_model import TinyTrainedGnomix
++
++    module = types.ModuleType("src.model")
++    module.Gnomix = TinyTrainedGnomix
++    sys.modules["src.model"] = module
+diff --git a/usercase-test-coderl/usecase.sh b/usercase-test-coderl/usecase.sh
+new file mode 100755
+--- /dev/null
++++ b/usercase-test-coderl/usecase.sh
+@@ -0,0 +1,279 @@
++#!/usr/bin/env bash
++# Acceptance test for: inference.bed_file_output BED segment export.
++set -u
++export LANG=C.UTF-8 LC_ALL=C.UTF-8 TZ=UTC
++
++( cd /workspace/repo && python3 -m py_compile gnomix.py src/postprocess.py ) \
++    || { echo "FAIL: build" >&2; exit 1; }
++
++PYTHON=python3
++GNOMIX=/workspace/repo/gnomix.py
++FIXTURES=/workspace/repo/usercase-test-coderl/fixtures
++PYTHONPATH_FOR_TEST="$FIXTURES${PYTHONPATH:+:$PYTHONPATH}"
++
++TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
++cd "$TMP"
++fail() { echo "FAIL: $*" >&2; exit 1; }
++
++write_query_vcf() {
++    cat > "$1" <<'VCF'
++##fileformat=VCFv4.2
++##contig=<ID=1>
++##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">
++#CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO	FORMAT	NA001	NA.002
++1	100	.	A	G	.	PASS	.	GT	0|1	1|0
++1	200	.	C	T	.	PASS	.	GT	0|0	1|1
++1	300	.	G	A	.	PASS	.	GT	1|0	0|1
++1	400	.	T	C	.	PASS	.	GT	1|1	0|0
++1	500	.	A	G	.	PASS	.	GT	0|1	1|0
++1	600	.	C	T	.	PASS	.	GT	0|0	1|1
++VCF
++}
++
++write_pretrained_config() {
++    cat > "$1" <<'YAML'
++model:
++  n_cores:
++  calibrate: False
++inference:
++  bed_file_output: True
++  snp_level_inference: False
++  visualize_inference: False
++YAML
++}
++
++write_training_config() {
++    local path="$1"
++    local data_path="$2"
++    cat > "$path" <<YAML
++verbose: False
++seed: 7
++simulation:
++  run: False
++  path: $data_path
++  rm_data: False
++  splits:
++    ratios:
++      train1: 0.5
++      train2: 0.5
++      val: 0
++    gens:
++      train1: [0]
++      train2: [1]
++      val: []
++model:
++  name: tiny
++  inference: default
++  window_size_cM: 1.0
++  smooth_size: 1
++  context_ratio: 0.5
++  retrain_base: False
++  calibrate: False
++  n_cores:
++inference:
++  bed_file_output: True
++  snp_level_inference: False
++  visualize_inference: False
++YAML
++}
++
++make_pretrained_model() {
++    PYTHONPATH="$PYTHONPATH_FOR_TEST" "$PYTHON" - "$1" <<'PY'
++import pickle
++import sys
++from fake_gnomix_model import TinyPretrainedModel
++pickle.dump(TinyPretrainedModel(), open(sys.argv[1], "wb"))
++PY
++}
++
++make_training_data() {
++    PYTHONPATH="$PYTHONPATH_FOR_TEST" "$PYTHON" - "$1" <<'PY'
++import os
++import pickle
++import sys
++import numpy as np
++import pandas as pd
++from fake_gnomix_model import SNP_POS, SNP_REF, SNP_ALT
++
++root = sys.argv[1]
++for split, gen in [("train1", "0"), ("train2", "1")]:
++    path = os.path.join(root, split, "gen_" + gen)
++    os.makedirs(path, exist_ok=True)
++    np.save(os.path.join(path, "mat_vcf_2d.npy"), np.array([
++        [0, 1, 0, 1, 0, 1],
++        [1, 0, 1, 0, 1, 0],
++        [0, 0, 1, 1, 0, 0],
++        [1, 1, 0, 0, 1, 1],
++    ], dtype=np.int16))
++    np.save(os.path.join(path, "mat_map.npy"), np.array([
++        [0, 0, 0, 1, 1, 1],
++        [1, 1, 0, 0, 2, 2],
++        [2, 2, 2, 2, 2, 2],
++        [0, 1, 0, 1, 0, 1],
++    ], dtype=np.int16))
++
++os.makedirs(root, exist_ok=True)
++pickle.dump({
++    "pos_snps": SNP_POS,
++    "ref_snps": SNP_REF,
++    "alt_snps": SNP_ALT,
++    "num_to_pop": {0: "AFR", 1: "EUR", 2: "NAT"},
++    "morgans": 0.06,
++}, open(os.path.join(root, "metadata.pkl"), "wb"))
++pickle.dump(pd.DataFrame({
++    "chm": ["1"] * len(SNP_POS),
++    "pos": SNP_POS,
++    "pos_cm": [0.0, 1.0, 2.0, 3.0, 4.0, 5.0],
++}), open(os.path.join(root, "gen_map_df.pkl"), "wb"))
++PY
++}
++
++assert_bed_matches() {
++    local actual="$1"
++    local label="$2"
++    #
++    "$PYTHON" - "$actual" expected "$label" <<'PY' || fail "$label content mismatch"
++import csv
++import math
++import sys
++
++actual_path, expected_path, label = sys.argv[1:]
++columns = ["chm", "spos", "epos", "ancestry", "sgpos", "egpos"]
++
++def read(path):
++    with open(path, newline="") as f:
++        reader = csv.DictReader(f, delimiter="\t")
++        if reader.fieldnames != columns:
++            raise AssertionError(f"{label}: columns {reader.fieldnames!r}, want {columns!r}")
++        return list(reader)
++
++def same_intish(actual, expected, field):
++    try:
++        actual_num = float(actual)
++        expected_num = float(expected)
++    except ValueError:
++        raise AssertionError(f"{label}: {field}={actual!r} is not numeric")
++    return actual_num.is_integer() and expected_num.is_integer() and int(actual_num) == int(expected_num)
++
++def same_float(actual, expected, field):
++    try:
++        return math.isclose(float(actual), float(expected), rel_tol=0, abs_tol=1e-9)
++    except ValueError:
++        raise AssertionError(f"{label}: {field}={actual!r} is not numeric")
++
++actual = read(actual_path)
++expected = read(expected_path)
++if len(actual) != len(expected):
++    raise AssertionError(f"{label}: {len(actual)} rows, want {len(expected)}")
++
++for idx, (got, want) in enumerate(zip(actual, expected), start=1):
++    for field in ("chm", "spos", "epos"):
++        if not same_intish(got[field], want[field], field):
++            raise AssertionError(f"{label}: row {idx} {field}={got[field]!r}, want {want[field]!r}")
++    if got["ancestry"] != want["ancestry"]:
++        raise AssertionError(f"{label}: row {idx} ancestry={got['ancestry']!r}, want {want['ancestry']!r}")
++    for field in ("sgpos", "egpos"):
++        if not same_float(got[field], want[field], field):
++            raise AssertionError(f"{label}: row {idx} {field}={got[field]!r}, want {want[field]!r}")
++PY
++}
++
++count_files_in_dir() {
++    "$PYTHON" - "$1" <<'PY'
++import os
++import sys
++root = sys.argv[1]
++print(len([name for name in os.listdir(root) if os.path.isfile(os.path.join(root, name))]))
++PY
++}
++
++
++
++
++mkdir f1
++cd f1
++write_query_vcf query.vcf
++write_pretrained_config config.yaml
++make_pretrained_model tiny_model.pkl
++PYTHONPATH="$PYTHONPATH_FOR_TEST" "$PYTHON" "$GNOMIX" query.vcf out 1 false tiny_model.pkl >out.txt 2>err.txt; ec=$?
++[ "$ec" -eq 0 ] || fail "F1 exit $ec; want 0"
++#
++[ -f out/query_results.msp ] || fail "F1 missing generated MSP source"
++[ -d out/query_results_bed ] || fail "F1 missing query_results_bed directory"
++[ "$(count_files_in_dir out/query_results_bed)" = "4" ] || fail "F1 expected one BED file per haplotype"
++[ -f out/query_results_bed/NA001_0.bed ] || fail "F1 missing NA001_0.bed"
++[ -f out/query_results_bed/NA001_1.bed ] || fail "F1 missing NA001_1.bed"
++[ -f out/query_results_bed/NA_002_0.bed ] || fail "F1 missing NA_002_0.bed"
++
++cat > expected <<'EOF'
++chm	spos	epos	ancestry	sgpos	egpos
++1	100	200	AFR	0.0	1.0
++1	300	600	EUR	2.0	5.0
++EOF
++assert_bed_matches out/query_results_bed/NA001_0.bed "F1 collapsed BED"
++
++cat > expected <<'EOF'
++chm	spos	epos	ancestry	sgpos	egpos
++1	100	100	AFR	0.0	0.0
++1	200	200	EUR	1.0	1.0
++1	300	300	AFR	2.0	2.0
++1	400	400	EUR	3.0	3.0
++1	500	600	AFR	4.0	5.0
++EOF
++assert_bed_matches out/query_results_bed/NA001_1.bed "F1 alternating BED"
++
++cat > expected <<'EOF'
++chm	spos	epos	ancestry	sgpos	egpos
++1	100	600	NAT	0.0	5.0
++EOF
++assert_bed_matches out/query_results_bed/NA_002_0.bed "F1 all-same BED"
++cd "$TMP"
++
++
++
++
++mkdir f2
++cd f2
++write_query_vcf query.vcf
++make_training_data training_data
++write_training_config train_config.yaml "$PWD/training_data"
++touch genetic.map reference.vcf sample.map
++mkdir -p out/query_results_bed
++PYTHONPATH="$PYTHONPATH_FOR_TEST" GNOMIX_USE_FAKE_SRC_MODEL=1 "$PYTHON" "$GNOMIX" query.vcf out 1 false genetic.map reference.vcf sample.map train_config.yaml >out.txt 2>err.txt; ec=$?
++[ "$ec" -eq 0 ] || fail "F2 exit $ec; want 0"
++#
++[ -f out/query_results.msp ] || fail "F2 missing generated MSP source"
++[ "$(count_files_in_dir out/query_results_bed)" = "4" ] || fail "F2 expected one BED file per haplotype"
++
++cat > expected <<'EOF'
++chm	spos	epos	ancestry	sgpos	egpos
++1	100	200	NAT	0.0	1.0
++1	300	400	EUR	2.0	3.0
++1	500	600	AFR	4.0	5.0
++EOF
++assert_bed_matches out/query_results_bed/NA001_0.bed "F2 trained collapsed BED"
++
++cat > expected <<'EOF'
++chm	spos	epos	ancestry	sgpos	egpos
++1	100	300	AFR	0.0	2.0
++1	400	600	EUR	3.0	5.0
++EOF
++assert_bed_matches out/query_results_bed/NA001_1.bed "F2 trained second haplotype BED"
++cd "$TMP"
++
++
++
++
++mkdir f_err
++cd f_err
++write_query_vcf query.vcf
++write_pretrained_config config.yaml
++make_pretrained_model tiny_model.pkl
++mkdir -p out
++printf 'not a directory' > out/query_results_bed
++PYTHONPATH="$PYTHONPATH_FOR_TEST" "$PYTHON" "$GNOMIX" query.vcf out 1 false tiny_model.pkl >out.txt 2>err.txt; ec=$?
++#
++[ "$ec" -ne 0 ] || fail "F_err exit 0; want non-zero"
++
++echo "PASS"
++exit 0
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,12 @@
++#!/usr/bin/env bash
++#
++#
++#
++#
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++exec bash /workspace/repo/usercase-test-coderl/usecase.sh

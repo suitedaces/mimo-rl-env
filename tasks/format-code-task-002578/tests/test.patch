@@ -1,0 +1,451 @@
+diff --git a/usercase-test-coderl/test_remote_changes.py b/usercase-test-coderl/test_remote_changes.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/test_remote_changes.py
+@@ -0,0 +1,420 @@
++import json
++from datetime import datetime, timezone
++import pytest
++import requests
++
++from maestral.client import DropboxClient
++from maestral.core import DeletedMetadata, FileMetadata, FolderMetadata
++from maestral.exceptions import DropboxConnectionError
++
++
++
++
++
++
++class JsonResponse:
++    def __init__(self, status_code: int, payload: str):
++        self.status_code = status_code
++        self.content = payload.encode()
++        self.headers = {
++            "content-type": "application/json",
++            "x-dropbox-request-id": "req-fixture",
++        }
++        self.text = payload
++        self._payload = payload
++
++    def json(self):
++        return json.loads(self._payload)
++
++
++class CountingSession(requests.Session):
++    active_sessions = 0
++    max_active_sessions = 0
++    close_calls = 0
++
++    def __init__(self, responses=()):
++        super().__init__()
++        self.responses = list(responses)
++        self.posts = []
++        self.closed = False
++        CountingSession.active_sessions += 1
++        CountingSession.max_active_sessions = max(
++            CountingSession.max_active_sessions, CountingSession.active_sessions
++        )
++
++    def post(self, url, **kwargs):
++        self.posts.append((url, kwargs))
++        if not self.responses:
++            raise AssertionError(f"no scripted response for {url}")
++        response = self.responses.pop(0)
++        if isinstance(response, BaseException):
++            raise response
++        return response
++
++    def close(self):
++        if not self.closed:
++            CountingSession.active_sessions -= 1
++            self.closed = True
++        CountingSession.close_calls += 1
++        return super().close()
++
++
++class MemoryCredentialStorage:
++    token = None
++
++    def save_creds(self, account_id, refresh_token):
++        self.account_id = account_id
++        self.refresh_token = refresh_token
++
++
++def account_response():
++    return JsonResponse(
++        200,
++        json.dumps(
++            {
++                "account_id": "1" * 40,
++                "name": {
++                    "given_name": "Ada",
++                    "surname": "Lovelace",
++                    "familiar_name": "Ada",
++                    "display_name": "Ada Lovelace",
++                    "abbreviated_name": "AL",
++                },
++                "email": "ada@example.com",
++                "email_verified": True,
++                "disabled": False,
++                "locale": "en",
++                "referral_link": "https://example.com",
++                "is_paired": False,
++                "account_type": {".tag": "basic"},
++                "root_info": {
++                    ".tag": "user",
++                    "root_namespace_id": "123",
++                    "home_namespace_id": "123",
++                },
++            }
++        ),
++    )
++
++
++def response(payload):
++    return JsonResponse(200, json.dumps(payload))
++
++
++def linked_client(extra_responses=(), config_name="usercase-fixture"):
++    session = CountingSession([account_response(), *extra_responses])
++    client = DropboxClient(
++        config_name,
++        MemoryCredentialStorage(),
++        session=session,
++    )
++    assert client.link(access_token="sl.fixture") == 0
++    return client, session
++
++
++def posted_payloads(session: CountingSession, route_suffix: str):
++    values = []
++    for url, kwargs in session.posts:
++        if not url.endswith(route_suffix):
++            continue
++        data = kwargs["data"]
++        raw = data.decode() if isinstance(data, bytes) else data
++        values.append(json.loads(raw))
++    return values
++
++
++PAGE_ONE = {
++    "entries": [
++        {
++            ".tag": "folder",
++            "name": "Projects",
++            "id": "id:folder",
++            "path_lower": "/projects",
++            "path_display": "/Projects",
++        }
++    ],
++    "cursor": "cursor-1",
++    "has_more": True,
++}
++
++PAGE_TWO = {
++    "entries": [
++        {
++            ".tag": "file",
++            "name": "report.txt",
++            "id": "id:file",
++            "client_modified": "2024-01-02T03:04:05Z",
++            "server_modified": "2024-01-02T03:04:06Z",
++            "rev": "abcdef123",
++            "size": 12,
++            "path_lower": "/projects/report.txt",
++            "path_display": "/Projects/report.txt",
++            "is_downloadable": True,
++            "content_hash": "a" * 64,
++        },
++        {
++            ".tag": "deleted",
++            "name": "old.txt",
++            "path_lower": "/old.txt",
++            "path_display": "/old.txt",
++        },
++    ],
++    "cursor": "cursor-2",
++    "has_more": False,
++}
++
++
++def test_wait_for_remote_changes_timeout_boundaries():
++
++
++
++
++    client, session = linked_client()
++
++    with pytest.raises(ValueError) as below:
++        client.wait_for_remote_changes("cursor-0", timeout=29)
++
++    assert isinstance(below.value, ValueError)
++
++    with pytest.raises(ValueError) as above:
++        client.wait_for_remote_changes("cursor-0", timeout=481)
++
++    assert isinstance(above.value, ValueError)
++
++
++    assert posted_payloads(session, "/files/list_folder/longpoll") == []
++
++    client.close()
++
++
++def test_wait_for_remote_changes_returns_changes_and_honours_backoff(monkeypatch):
++
++
++
++
++    client, session = linked_client(
++        [
++            response({"changes": True, "backoff": 2}),
++            response({"changes": False}),
++        ]
++    )
++    sleep_mock = pytest.MonkeyPatch()
++    sleep_calls = []
++
++    def fake_sleep(seconds):
++        sleep_calls.append((len(session.posts), seconds))
++
++    sleep_mock.setattr("maestral.client.time.sleep", fake_sleep)
++    monkeypatch.setattr(
++        "maestral.client.time.time",
++        iter([100.0, 101.0, 102.0]).__next__,
++    )
++    try:
++        assert client.wait_for_remote_changes("cursor-A", timeout=30) is True
++
++        assert client.wait_for_remote_changes("cursor-B", timeout=31) is False
++
++
++        assert any(post_count == 2 and seconds > 0 for post_count, seconds in sleep_calls)
++    finally:
++        sleep_mock.undo()
++        client.close()
++
++
++
++    assert posted_payloads(session, "/files/list_folder/longpoll") == [
++        {"cursor": "cursor-A", "timeout": 30},
++        {"cursor": "cursor-B", "timeout": 31},
++    ]
++
++
++def test_list_remote_changes_iterator_yields_each_converted_page():
++
++
++
++
++    client, session = linked_client([response(PAGE_ONE), response(PAGE_TWO)])
++
++    pages = list(client.list_remote_changes_iterator("cursor-0"))
++    client.close()
++
++    assert len(pages) == 2
++    assert pages[0].cursor == "cursor-1"
++    assert pages[0].has_more is True
++    assert len(pages[0].entries) == 1
++    assert pages[0].entries[0] == FolderMetadata(
++        name="Projects",
++        path_lower="/projects",
++        path_display="/Projects",
++        id="id:folder",
++        shared=False,
++    )
++
++    assert pages[1].cursor == "cursor-2"
++    assert pages[1].has_more is False
++    assert len(pages[1].entries) == 2
++    assert pages[1].entries[0] == FileMetadata(
++        name="report.txt",
++        path_lower="/projects/report.txt",
++        path_display="/Projects/report.txt",
++        id="id:file",
++        client_modified=datetime(2024, 1, 2, 3, 4, 5, tzinfo=timezone.utc),
++        server_modified=datetime(2024, 1, 2, 3, 4, 6, tzinfo=timezone.utc),
++        rev="abcdef123",
++        size=12,
++        symlink_target=None,
++        shared=None,
++        modified_by=None,
++        is_downloadable=True,
++        content_hash="a" * 64,
++    )
++    assert pages[1].entries[1] == DeletedMetadata(
++        name="old.txt",
++        path_lower="/old.txt",
++        path_display="/old.txt",
++    )
++
++
++    assert posted_payloads(session, "/files/list_folder/continue") == [
++        {"cursor": "cursor-0"},
++        {"cursor": "cursor-1"},
++    ]
++
++
++def test_list_remote_changes_flattens_entries_and_uses_final_cursor():
++
++
++
++
++    client, session = linked_client([response(PAGE_ONE), response(PAGE_TWO)])
++
++    result = client.list_remote_changes("cursor-0")
++    client.close()
++
++    assert result.cursor == "cursor-2"
++    assert result.has_more is False
++    assert len(result.entries) == 3
++    assert [type(entry).__name__ for entry in result.entries] == [
++        "FolderMetadata",
++        "FileMetadata",
++        "DeletedMetadata",
++    ]
++    assert result.entries[0].path_display == "/Projects"
++    assert result.entries[1].path_display == "/Projects/report.txt"
++    assert result.entries[2].path_display == "/old.txt"
++
++
++    assert posted_payloads(session, "/files/list_folder/continue") == [
++        {"cursor": "cursor-0"},
++        {"cursor": "cursor-1"},
++    ]
++
++
++def test_remote_change_methods_convert_connection_errors():
++
++
++
++
++    client, _ = linked_client([ConnectionError("network down")])
++
++    with pytest.raises(DropboxConnectionError) as caught:
++        client.wait_for_remote_changes("cursor-0", timeout=30)
++
++
++
++    assert isinstance(caught.value, DropboxConnectionError)
++    client.close()
++
++
++def test_list_remote_changes_iterator_converts_connection_errors():
++
++
++
++
++    client, _ = linked_client([ConnectionError("network down")])
++
++    with pytest.raises(DropboxConnectionError) as caught:
++        list(client.list_remote_changes_iterator("cursor-0"))
++
++
++
++    assert isinstance(caught.value, DropboxConnectionError)
++    client.close()
++
++
++def test_two_clients_keep_remote_poll_state_independent(monkeypatch):
++
++
++
++
++    client_a, session_a = linked_client(
++        [response({"changes": True, "backoff": 2})],
++        config_name="usercase-fixture-a",
++    )
++    client_b, session_b = linked_client(
++        [response({"changes": False})],
++        config_name="usercase-fixture-b",
++    )
++    sleep_calls = []
++
++    monkeypatch.setattr(
++        "maestral.client.time.sleep", lambda seconds: sleep_calls.append(seconds)
++    )
++    monkeypatch.setattr("maestral.client.time.time", iter([100.0, 101.0, 102.0]).__next__)
++
++    assert client_a.wait_for_remote_changes("cursor-A", timeout=30) is True
++    assert client_b.wait_for_remote_changes("cursor-B", timeout=30) is False
++
++    client_a.close()
++    client_b.close()
++
++
++
++    assert not any(seconds > 0 for seconds in sleep_calls)
++
++
++    assert posted_payloads(session_a, "/files/list_folder/longpoll") == [
++        {"cursor": "cursor-A", "timeout": 30},
++    ]
++    assert posted_payloads(session_b, "/files/list_folder/longpoll") == [
++        {"cursor": "cursor-B", "timeout": 30},
++    ]
++
++
++def test_wait_for_remote_changes_uses_default_timeout():
++
++
++
++
++    client, session = linked_client([response({"changes": False})])
++
++    assert client.wait_for_remote_changes("cursor-default") is False
++    client.close()
++
++
++
++    assert posted_payloads(session, "/files/list_folder/longpoll") == [
++        {"cursor": "cursor-default", "timeout": 40},
++    ]
++
++
++def test_list_remote_changes_handles_empty_final_page():
++
++
++
++
++    client, session = linked_client(
++        [response({"entries": [], "cursor": "cursor-final", "has_more": False})]
++    )
++
++    result = client.list_remote_changes("cursor-empty")
++    client.close()
++
++
++
++    assert result.entries == []
++    assert result.cursor == "cursor-final"
++    assert result.has_more is False
++    assert posted_payloads(session, "/files/list_folder/continue") == [
++        {"cursor": "cursor-empty"},
++    ]
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,21 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++cd /workspace/repo
++
++
++export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
++export XDG_CACHE_HOME=/workspace/repo/.coderl-cache
++export XDG_CONFIG_HOME=/workspace/repo/.coderl-config
++export XDG_DATA_HOME=/workspace/repo/.coderl-data
++
++exec /opt/coderl-stage4a-venv/bin/python -m pytest /workspace/repo/usercase-test-coderl/test_remote_changes.py -v

@@ -1,0 +1,950 @@
+diff --git a/usercase-test-coderl/fixtures/test.jpg b/usercase-test-coderl/fixtures/test.jpg
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/fixtures/test.jpg
+@@ -0,0 +1,1 @@
++fixture-upload-image-bytes
+diff --git a/usercase-test-coderl/fixtures/test.pdf b/usercase-test-coderl/fixtures/test.pdf
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/fixtures/test.pdf
+@@ -0,0 +1,3 @@
++%PDF-1.4
++fixture-upload-pdf-bytes
++%%EOF
+diff --git a/usercase-test-coderl/upload_stateful_test.go b/usercase-test-coderl/upload_stateful_test.go
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/upload_stateful_test.go
+@@ -0,0 +1,621 @@
++package usercase_test_coderl
++
++import (
++	"bytes"
++	"crypto/sha256"
++	"encoding/hex"
++	"errors"
++	"image"
++	"image/color"
++	"image/jpeg"
++	"io"
++	"mime"
++	"net/http"
++	"net/http/httptest"
++	"net/url"
++	"os"
++	"runtime"
++	"sort"
++	"strconv"
++	"strings"
++	"sync"
++	"testing"
++
++	lark "github.com/go-lark/lark"
++)
++
++const (
++	fixtureDir        = "/workspace/repo/usercase-test-coderl/fixtures"
++	rootTenantToken   = "root-tenant-token"
++	imagePathKey      = "img-key-path-001"
++	imageObjectKey    = "img-key-object-002"
++	filePathKey       = "file-key-path-001"
++	fileReaderKey     = "file-key-reader-002"
++	fileMP4Key        = "file-key-mp4-003"
++	fileNoDurationKey = "file-key-no-duration-004"
++)
++
++
++
++
++
++
++type uploadRecord struct {
++	Method        string
++	Path          string
++	Authorization string
++	ContentType   string
++	Fields        map[string][]string
++	FileField     string
++	FileName      string
++	FileBytes     string
++	FileSize      int
++	FileSHA256    string
++}
++
++type uploadBackend struct {
++	t      *testing.T
++	server *httptest.Server
++
++	mu      sync.Mutex
++	records []uploadRecord
++	uploads map[string]int
++}
++
++func newUploadBackend(t *testing.T) *uploadBackend {
++	t.Helper()
++	b := &uploadBackend{
++		t:       t,
++		uploads: make(map[string]int),
++	}
++	b.server = httptest.NewServer(http.HandlerFunc(b.handle))
++	t.Cleanup(b.server.Close)
++	return b
++}
++
++func (b *uploadBackend) URL() string {
++	return b.server.URL
++}
++
++func (b *uploadBackend) Records() []uploadRecord {
++	b.mu.Lock()
++	defer b.mu.Unlock()
++	out := make([]uploadRecord, len(b.records))
++	copy(out, b.records)
++	return out
++}
++
++func (b *uploadBackend) handle(w http.ResponseWriter, r *http.Request) {
++	if r.URL.Path == "/open-apis/auth/v3/tenant_access_token/internal/" || r.URL.Path == "/open-apis/auth/v3/tenant_access_token/internal" {
++		w.Header().Set("Content-Type", "application/json")
++		_, _ = io.WriteString(w, `{"code":0,"msg":"ok","tenant_access_token":"`+rootTenantToken+`","expire":7200}`)
++		return
++	}
++
++	if r.URL.Path != "/open-apis/im/v1/images" && r.URL.Path != "/open-apis/im/v1/files" {
++		http.NotFound(w, r)
++		return
++	}
++
++	rec, err := readUploadRecord(r)
++	if err != nil {
++		http.Error(w, err.Error(), http.StatusBadRequest)
++		return
++	}
++	b.mu.Lock()
++	b.records = append(b.records, rec)
++	b.uploads[r.URL.Path]++
++	n := b.uploads[r.URL.Path]
++	b.mu.Unlock()
++
++	w.Header().Set("Content-Type", "application/json")
++	switch r.URL.Path {
++	case "/open-apis/im/v1/images":
++		if n == 1 {
++			_, _ = io.WriteString(w, `{"code":0,"msg":"ok","data":{"image_key":"`+imagePathKey+`"}}`)
++			return
++		}
++		_, _ = io.WriteString(w, `{"code":0,"msg":"ok","data":{"image_key":"`+imageObjectKey+`"}}`)
++	case "/open-apis/im/v1/files":
++		switch n {
++		case 1:
++			_, _ = io.WriteString(w, `{"code":0,"msg":"ok","data":{"file_key":"`+filePathKey+`"}}`)
++		case 2:
++			_, _ = io.WriteString(w, `{"code":0,"msg":"ok","data":{"file_key":"`+fileReaderKey+`"}}`)
++		case 3:
++			_, _ = io.WriteString(w, `{"code":0,"msg":"ok","data":{"file_key":"`+fileMP4Key+`"}}`)
++		default:
++			_, _ = io.WriteString(w, `{"code":0,"msg":"ok","data":{"file_key":"`+fileNoDurationKey+`"}}`)
++		}
++	}
++}
++
++func readUploadRecord(r *http.Request) (uploadRecord, error) {
++	mr, err := r.MultipartReader()
++	if err != nil {
++		return uploadRecord{}, err
++	}
++	rec := uploadRecord{
++		Method:        r.Method,
++		Path:          r.URL.Path,
++		Authorization: r.Header.Get("Authorization"),
++		ContentType:   r.Header.Get("Content-Type"),
++		Fields:        make(map[string][]string),
++	}
++	for {
++		part, err := mr.NextPart()
++		if errors.Is(err, io.EOF) {
++			break
++		}
++		if err != nil {
++			return uploadRecord{}, err
++		}
++		name := part.FormName()
++		payload, err := io.ReadAll(part)
++		if err != nil {
++			return uploadRecord{}, err
++		}
++		if filename := part.FileName(); filename != "" {
++			rec.FileField = name
++			rec.FileName = filename
++			rec.FileBytes = string(payload)
++			rec.FileSize = len(payload)
++			sum := sha256.Sum256(payload)
++			rec.FileSHA256 = hex.EncodeToString(sum[:])
++			continue
++		}
++		rec.Fields[name] = append(rec.Fields[name], string(payload))
++	}
++	for k := range rec.Fields {
++		sort.Strings(rec.Fields[k])
++	}
++	return rec, nil
++}
++
++func configuredRootBot(t *testing.T, backend *uploadBackend) *lark.Bot {
++	t.Helper()
++	bot := lark.NewChatBot("acceptance-app", "acceptance-secret")
++	bot.SetDomain(backend.URL())
++	resp, err := bot.GetTenantAccessTokenInternal(true)
++	if err != nil {
++		t.Fatalf("configure root bot tenant token: %v", err)
++	}
++	if resp.TenantAppAccessToken != rootTenantToken {
++		t.Fatalf("root auth token = %q, want %q", resp.TenantAppAccessToken, rootTenantToken)
++	}
++	return bot
++}
++
++func fixturePath(name string) string {
++	return fixtureDir + "/" + name
++}
++
++func assertFields(t *testing.T, got map[string][]string, want map[string][]string) {
++	t.Helper()
++	if !sameStringSlicesMap(got, want) {
++		t.Fatalf("fields = %#v, want %#v", got, want)
++	}
++}
++
++func sameStringSlicesMap(a, b map[string][]string) bool {
++	if len(a) != len(b) {
++		return false
++	}
++	for k, av := range a {
++		bv, ok := b[k]
++		if !ok || len(av) != len(bv) {
++			return false
++		}
++		for i := range av {
++			if av[i] != bv[i] {
++				return false
++			}
++		}
++	}
++	return true
++}
++
++func assertMultipartContentType(t *testing.T, got string) {
++	t.Helper()
++	if !strings.HasPrefix(got, "multipart/form-data; boundary=") {
++		t.Fatalf("Content-Type = %q, want prefix %q", got, "multipart/form-data; boundary=")
++	}
++	if _, params, err := mime.ParseMediaType(got); err != nil || params["boundary"] == "" {
++		t.Fatalf("Content-Type = %q, parse err = %v, boundary = %q", got, err, params["boundary"])
++	}
++}
++
++func assertNonEmptyFormFilename(t *testing.T, label, got string) {
++	t.Helper()
++
++	if got == "" {
++		t.Fatalf("%s filename is empty, want multipart file part to carry a filename", label)
++	}
++}
++
++func assertJPEGUpload(t *testing.T, label string, payload string, wantBounds image.Rectangle) {
++	t.Helper()
++
++	decoded, err := jpeg.Decode(bytes.NewReader([]byte(payload)))
++	if err != nil {
++		t.Fatalf("%s payload is not decodable JPEG: %v", label, err)
++	}
++	if decoded.Bounds() != wantBounds {
++		t.Fatalf("%s JPEG bounds = %v, want %v", label, decoded.Bounds(), wantBounds)
++	}
++}
++
++func sampleImage() image.Image {
++	img := image.NewRGBA(image.Rect(0, 0, 2, 2))
++	img.Set(0, 0, color.RGBA{R: 255, A: 255})
++	img.Set(1, 0, color.RGBA{G: 255, A: 255})
++	img.Set(0, 1, color.RGBA{B: 255, A: 255})
++	img.Set(1, 1, color.RGBA{R: 255, G: 255, B: 255, A: 255})
++	return img
++}
++
++type tooLargeImage struct{}
++
++func (tooLargeImage) ColorModel() color.Model { return color.RGBAModel }
++func (tooLargeImage) Bounds() image.Rectangle { return image.Rect(0, 0, 1<<16, 1) }
++func (tooLargeImage) At(_, _ int) color.Color { return color.RGBA{} }
++
++type failingReader struct{}
++type readerFailure struct{}
++
++func (readerFailure) Error() string { return "fixture reader copy failure" }
++
++func (failingReader) Read([]byte) (int, error) {
++	return 0, readerFailure{}
++}
++
++func TestRootUploadImageAndFilePathSessionBuildsAuthenticatedMultipart(t *testing.T) {
++
++
++	backend := newUploadBackend(t)
++	bot := configuredRootBot(t, backend)
++
++	imageResp, err := bot.UploadImage(fixturePath("test.jpg"))
++	if err != nil {
++		t.Fatalf("UploadImage error = %v, want nil", err)
++	}
++	if imageResp.Code != 0 {
++		t.Fatalf("UploadImage code = %d, want 0", imageResp.Code)
++	}
++	if imageResp.Data.ImageKey != imagePathKey {
++		t.Fatalf("UploadImage image key = %q, want %q", imageResp.Data.ImageKey, imagePathKey)
++	}
++
++	fileResp, err := bot.UploadFile(lark.UploadFileRequest{
++		FileType: "pdf",
++		FileName: "hello.pdf",
++		Path:     fixturePath("test.pdf"),
++	})
++	if err != nil {
++		t.Fatalf("UploadFile path error = %v, want nil", err)
++	}
++	if fileResp.Code != 0 {
++		t.Fatalf("UploadFile path code = %d, want 0", fileResp.Code)
++	}
++	if fileResp.Data.FileKey != filePathKey {
++		t.Fatalf("UploadFile path file key = %q, want %q", fileResp.Data.FileKey, filePathKey)
++	}
++
++	records := backend.Records()
++	if len(records) != 2 {
++		t.Fatalf("upload request count = %d, want 2", len(records))
++	}
++	imageReq := records[0]
++	if imageReq.Method != "POST" || imageReq.Path != "/open-apis/im/v1/images" {
++		t.Fatalf("image request method/path = %s %s, want POST /open-apis/im/v1/images", imageReq.Method, imageReq.Path)
++	}
++	if imageReq.Authorization != "Bearer "+rootTenantToken {
++		t.Fatalf("image Authorization = %q, want %q", imageReq.Authorization, "Bearer "+rootTenantToken)
++	}
++	assertMultipartContentType(t, imageReq.ContentType)
++	assertFields(t, imageReq.Fields, map[string][]string{"image_type": {"message"}})
++	if imageReq.FileField != "image" {
++		t.Fatalf("image file field = %q, want %q", imageReq.FileField, "image")
++	}
++	assertNonEmptyFormFilename(t, "image path upload", imageReq.FileName)
++	if imageReq.FileBytes != "fixture-upload-image-bytes\n" {
++		t.Fatalf("image bytes = %q, want %q", imageReq.FileBytes, "fixture-upload-image-bytes\n")
++	}
++
++	fileReq := records[1]
++	if fileReq.Method != "POST" || fileReq.Path != "/open-apis/im/v1/files" {
++		t.Fatalf("file request method/path = %s %s, want POST /open-apis/im/v1/files", fileReq.Method, fileReq.Path)
++	}
++	if fileReq.Authorization != "Bearer "+rootTenantToken {
++		t.Fatalf("file Authorization = %q, want %q", fileReq.Authorization, "Bearer "+rootTenantToken)
++	}
++	assertMultipartContentType(t, fileReq.ContentType)
++	assertFields(t, fileReq.Fields, map[string][]string{"file_name": {"hello.pdf"}, "file_type": {"pdf"}})
++	if fileReq.FileField != "file" {
++		t.Fatalf("file field = %q, want %q", fileReq.FileField, "file")
++	}
++	assertNonEmptyFormFilename(t, "file path upload", fileReq.FileName)
++	if fileReq.FileBytes != "%PDF-1.4\nfixture-upload-pdf-bytes\n%%EOF\n" {
++		t.Fatalf("file bytes = %q, want %q", fileReq.FileBytes, "%PDF-1.4\nfixture-upload-pdf-bytes\n%%EOF\n")
++	}
++}
++
++func TestRootUploadFileReaderAndDurationBranches(t *testing.T) {
++
++
++	backend := newUploadBackend(t)
++	bot := configuredRootBot(t, backend)
++
++	readerResp, err := bot.UploadFile(lark.UploadFileRequest{
++		FileType: "stream",
++		FileName: "test-data.csv",
++		Reader:   strings.NewReader("Name,Age\nFoo,25\n"),
++	})
++	if err != nil {
++		t.Fatalf("UploadFile reader error = %v, want nil", err)
++	}
++	if readerResp.Data.FileKey != filePathKey {
++		t.Fatalf("reader upload file key = %q, want %q", readerResp.Data.FileKey, filePathKey)
++	}
++
++	mp4Resp, err := bot.UploadFile(lark.UploadFileRequest{
++		FileType: "mp4",
++		FileName: "clip.mp4",
++		Duration: 17,
++		Reader:   strings.NewReader("mp4-bytes"),
++	})
++	if err != nil {
++		t.Fatalf("UploadFile mp4 error = %v, want nil", err)
++	}
++	if mp4Resp.Data.FileKey != fileReaderKey {
++		t.Fatalf("mp4 upload file key = %q, want %q", mp4Resp.Data.FileKey, fileReaderKey)
++	}
++
++	noDurationResp, err := bot.UploadFile(lark.UploadFileRequest{
++		FileType: "mp4",
++		FileName: "zero-duration.mp4",
++		Duration: 0,
++		Reader:   strings.NewReader("zero-mp4-bytes"),
++	})
++	if err != nil {
++		t.Fatalf("UploadFile zero-duration mp4 error = %v, want nil", err)
++	}
++	if noDurationResp.Data.FileKey != fileMP4Key {
++		t.Fatalf("zero-duration upload file key = %q, want %q", noDurationResp.Data.FileKey, fileMP4Key)
++	}
++
++	records := backend.Records()
++	if len(records) != 3 {
++		t.Fatalf("upload request count = %d, want 3", len(records))
++	}
++	assertFields(t, records[0].Fields, map[string][]string{"file_name": {"test-data.csv"}, "file_type": {"stream"}})
++	if records[0].FileName != "test-data.csv" || records[0].FileBytes != "Name,Age\nFoo,25\n" {
++		t.Fatalf("reader file name/bytes = %q/%q, want %q/%q", records[0].FileName, records[0].FileBytes, "test-data.csv", "Name,Age\nFoo,25\n")
++	}
++	assertFields(t, records[1].Fields, map[string][]string{"duration": {"17"}, "file_name": {"clip.mp4"}, "file_type": {"mp4"}})
++	if records[1].FileName != "clip.mp4" || records[1].FileBytes != "mp4-bytes" {
++		t.Fatalf("mp4 file name/bytes = %q/%q, want %q/%q", records[1].FileName, records[1].FileBytes, "clip.mp4", "mp4-bytes")
++	}
++	assertFields(t, records[2].Fields, map[string][]string{"file_name": {"zero-duration.mp4"}, "file_type": {"mp4"}})
++	if records[2].FileName != "zero-duration.mp4" || records[2].FileBytes != "zero-mp4-bytes" {
++		t.Fatalf("zero-duration file name/bytes = %q/%q, want %q/%q", records[2].FileName, records[2].FileBytes, "zero-duration.mp4", "zero-mp4-bytes")
++	}
++}
++
++func TestRootUploadImageObjectEncodesJPEGPart(t *testing.T) {
++
++
++	backend := newUploadBackend(t)
++	bot := configuredRootBot(t, backend)
++
++	resp, err := bot.UploadImageObject(sampleImage())
++	if err != nil {
++		t.Fatalf("UploadImageObject error = %v, want nil", err)
++	}
++	if resp.Data.ImageKey != imagePathKey {
++		t.Fatalf("UploadImageObject image key = %q, want %q", resp.Data.ImageKey, imagePathKey)
++	}
++
++	records := backend.Records()
++	if len(records) != 1 {
++		t.Fatalf("upload request count = %d, want 1", len(records))
++	}
++	rec := records[0]
++	assertFields(t, rec.Fields, map[string][]string{"image_type": {"message"}})
++	if rec.FileField != "image" {
++		t.Fatalf("image object file field = %q, want %q", rec.FileField, "image")
++	}
++
++	assertNonEmptyFormFilename(t, "image object upload", rec.FileName)
++	assertJPEGUpload(t, "image object upload", rec.FileBytes, sampleImage().Bounds())
++}
++
++func TestRootUploadErrorContractsReturnNilResponseAndSpecificErrors(t *testing.T) {
++
++
++	backend := newUploadBackend(t)
++	bot := configuredRootBot(t, backend)
++
++	missingResp, err := bot.UploadImage(fixturePath("missing.jpg"))
++	if missingResp != nil {
++		t.Fatalf("missing image response = %#v, want nil", missingResp)
++	}
++	var pathErr *os.PathError
++	if !errors.As(err, &pathErr) {
++		t.Fatalf("missing image error type = %T, want *os.PathError", err)
++	}
++
++	if pathErr.Path != fixturePath("missing.jpg") {
++		t.Fatalf("missing image path error path = %q, want %q", pathErr.Path, fixturePath("missing.jpg"))
++	}
++
++	copyResp, err := bot.UploadFile(lark.UploadFileRequest{
++		FileType: "stream",
++		FileName: "broken.csv",
++		Reader:   failingReader{},
++	})
++	if copyResp != nil {
++		t.Fatalf("copy failure response = %#v, want nil", copyResp)
++	}
++	var rf readerFailure
++	if !errors.As(err, &rf) {
++		t.Fatalf("copy failure error type = %T, want readerFailure", err)
++	}
++
++
++	jpegResp, err := bot.UploadImageObject(tooLargeImage{})
++	if jpegResp != nil {
++		t.Fatalf("JPEG failure response = %#v, want nil", jpegResp)
++	}
++
++	if err == nil {
++		t.Fatalf("JPEG failure error = nil, want non-nil JPEG encoding error")
++	}
++	if got := len(backend.Records()); got != 0 {
++		t.Fatalf("JPEG failure backend records = %d, want 0", got)
++	}
++
++	badJSON := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		_, _ = io.WriteString(w, "{")
++	}))
++	defer badJSON.Close()
++	badBot := lark.NewChatBot("acceptance-app", "acceptance-secret")
++	badBot.SetDomain(badJSON.URL)
++	decodeResp, err := badBot.UploadFile(lark.UploadFileRequest{
++		FileType: "stream",
++		FileName: "decode.csv",
++		Reader:   strings.NewReader("decode-bytes"),
++	})
++	if decodeResp != nil {
++		t.Fatalf("decode failure response = %#v, want nil", decodeResp)
++	}
++
++	if err == nil {
++		t.Fatalf("decode failure error = nil, want non-nil response decoding error")
++	}
++}
++
++func TestRootConfiguredBotInstancesKeepUploadStateIndependent(t *testing.T) {
++
++
++	backendA := newUploadBackend(t)
++	backendB := newUploadBackend(t)
++	botA := configuredRootBot(t, backendA)
++	botB := configuredRootBot(t, backendB)
++
++	respA, err := botA.UploadFile(lark.UploadFileRequest{
++		FileType: "stream",
++		FileName: "a.csv",
++		Reader:   strings.NewReader("A,1\n"),
++	})
++	if err != nil {
++		t.Fatalf("bot A UploadFile error = %v, want nil", err)
++	}
++	if respA.Data.FileKey != filePathKey {
++		t.Fatalf("bot A file key = %q, want %q", respA.Data.FileKey, filePathKey)
++	}
++	if len(backendA.Records()) != 1 {
++		t.Fatalf("bot A backend records = %d, want 1", len(backendA.Records()))
++	}
++	if len(backendB.Records()) != 0 {
++		t.Fatalf("bot B backend records before upload = %d, want 0", len(backendB.Records()))
++	}
++
++	respB, err := botB.UploadFile(lark.UploadFileRequest{
++		FileType: "stream",
++		FileName: "b.csv",
++		Reader:   strings.NewReader("B,2\n"),
++	})
++	if err != nil {
++		t.Fatalf("bot B UploadFile error = %v, want nil", err)
++	}
++	if respB.Data.FileKey != filePathKey {
++		t.Fatalf("bot B file key = %q, want %q", respB.Data.FileKey, filePathKey)
++	}
++	if len(backendA.Records()) != 1 {
++		t.Fatalf("bot A backend records after bot B upload = %d, want 1", len(backendA.Records()))
++	}
++	if len(backendB.Records()) != 1 {
++		t.Fatalf("bot B backend records after upload = %d, want 1", len(backendB.Records()))
++	}
++}
++
++func TestUploadInternalCleanupDoesNotLeakFileDescriptorsOrGoroutines(t *testing.T) {
++
++
++	runtime.GC()
++	beforeFDs := countFDs(t)
++	beforeGoroutines := runtime.NumGoroutine()
++
++	backend := newUploadBackend(t)
++	bot := configuredRootBot(t, backend)
++	for i := 0; i < 120; i++ {
++		resp, err := bot.UploadFile(lark.UploadFileRequest{
++			FileType: "stream",
++			FileName: "cycle-" + strconv.Itoa(i) + ".csv",
++			Reader:   strings.NewReader("cycle,ok\n"),
++		})
++		if err != nil {
++			t.Fatalf("cycle %d UploadFile error = %v, want nil", i, err)
++		}
++		wantKey := fileNoDurationKey
++		switch i {
++		case 0:
++			wantKey = filePathKey
++		case 1:
++			wantKey = fileReaderKey
++		case 2:
++			wantKey = fileMP4Key
++		}
++		if resp.Data.FileKey != wantKey {
++			t.Fatalf("cycle %d file key = %q, want %q", i, resp.Data.FileKey, wantKey)
++		}
++	}
++
++	runtime.GC()
++	afterFDs := countFDs(t)
++	afterGoroutines := runtime.NumGoroutine()
++	if afterFDs > beforeFDs+12 {
++		t.Fatalf("fd count after cycles = %d, want <= %d", afterFDs, beforeFDs+12)
++	}
++	if afterGoroutines > beforeGoroutines+12 {
++		t.Fatalf("goroutine count after cycles = %d, want <= %d", afterGoroutines, beforeGoroutines+12)
++	}
++	if len(backend.Records()) != 120 {
++		t.Fatalf("leak floor backend records = %d, want 120", len(backend.Records()))
++	}
++}
++
++func countFDs(t *testing.T) int {
++	t.Helper()
++	entries, err := os.ReadDir("/proc/self/fd")
++	if err != nil {
++		t.Fatalf("read /proc/self/fd: %v", err)
++	}
++	return len(entries)
++}
++
++func TestRootUploadAuthenticatedRequestFailureHasURLPath(t *testing.T) {
++
++
++	bot := lark.NewChatBot("acceptance-app", "acceptance-secret")
++	bot.SetDomain("http://127.0.0.1:1")
++
++	resp, err := bot.UploadFile(lark.UploadFileRequest{
++		FileType: "stream",
++		FileName: "request-fail.csv",
++		Reader:   strings.NewReader("request,fail\n"),
++	})
++	if resp != nil {
++		t.Fatalf("request failure response = %#v, want nil", resp)
++	}
++	var urlErr *url.Error
++	if !errors.As(err, &urlErr) {
++		t.Fatalf("request failure error type = %T, want *url.Error", err)
++	}
++
++	parsed, parseErr := url.Parse(urlErr.URL)
++	if parseErr != nil || parsed.Path != "/open-apis/im/v1/files" {
++		t.Fatalf("request failure URL = %q parseErr=%v, want path %q", urlErr.URL, parseErr, "/open-apis/im/v1/files")
++	}
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,305 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++export GOTOOLCHAIN=local
++export GOPROXY=off
++export GOSUMDB=off
++export GOVCS="*:off"
++export GOTELEMETRY=off
++set -e
++cd /workspace/repo
++set -euo pipefail
++cd /workspace/repo
++
++go test -v -count=1 ./usercase-test-coderl/...
++
++tmpdir="$(mktemp -d)"
++trap 'rm -rf "$tmpdir"' EXIT
++cd "$tmpdir"
++go mod init fixture-v2-upload-test >/dev/null
++go mod edit -require=github.com/go-lark/lark/v2@v2.0.0
++go mod edit -replace=github.com/go-lark/lark/v2=/workspace/repo/v2
++cat > v2_upload_stateful_test.go <<'EOF_GO'
++package fixture_v2_upload_test
++
++import (
++	"bytes"
++	"context"
++	"crypto/sha256"
++	"encoding/hex"
++	"errors"
++	"image"
++	"image/color"
++	"image/jpeg"
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"sort"
++	"strings"
++	"sync"
++	"testing"
++
++	larkv2 "github.com/go-lark/lark/v2"
++)
++
++const (
++	fixtureDir      = "/workspace/repo/usercase-test-coderl/fixtures"
++	v2TenantToken   = "v2-tenant-token"
++	imagePathKey    = "img-key-path-001"
++	imageObjectKey  = "img-key-object-002"
++	filePathKey     = "file-key-path-001"
++)
++
++type uploadRecord struct {
++	Method        string
++	Path          string
++	Authorization string
++	Fields        map[string][]string
++	FileField     string
++	FileName      string
++	FileBytes     string
++	FileSize      int
++	FileSHA256    string
++}
++
++type uploadBackend struct {
++	server *httptest.Server
++	mu      sync.Mutex
++	records []uploadRecord
++	uploads map[string]int
++}
++
++func newUploadBackend(t *testing.T) *uploadBackend {
++	b := &uploadBackend{uploads: make(map[string]int)}
++	b.server = httptest.NewServer(http.HandlerFunc(b.handle))
++	t.Cleanup(b.server.Close)
++	return b
++}
++
++func (b *uploadBackend) handle(w http.ResponseWriter, r *http.Request) {
++	if r.URL.Path != "/open-apis/im/v1/images" && r.URL.Path != "/open-apis/im/v1/files" {
++		http.NotFound(w, r)
++		return
++	}
++	rec, err := readUploadRecord(r)
++	if err != nil {
++		http.Error(w, err.Error(), http.StatusBadRequest)
++		return
++	}
++	b.mu.Lock()
++	b.records = append(b.records, rec)
++	b.uploads[r.URL.Path]++
++	n := b.uploads[r.URL.Path]
++	b.mu.Unlock()
++
++	w.Header().Set("Content-Type", "application/json")
++	if r.URL.Path == "/open-apis/im/v1/images" {
++		if n == 1 {
++			_, _ = io.WriteString(w, `{"code":0,"msg":"ok","data":{"image_key":"`+imagePathKey+`"}}`)
++			return
++		}
++		_, _ = io.WriteString(w, `{"code":0,"msg":"ok","data":{"image_key":"`+imageObjectKey+`"}}`)
++		return
++	}
++	_, _ = io.WriteString(w, `{"code":0,"msg":"ok","data":{"file_key":"`+filePathKey+`"}}`)
++}
++
++func (b *uploadBackend) Records() []uploadRecord {
++	b.mu.Lock()
++	defer b.mu.Unlock()
++	out := make([]uploadRecord, len(b.records))
++	copy(out, b.records)
++	return out
++}
++
++func readUploadRecord(r *http.Request) (uploadRecord, error) {
++	mr, err := r.MultipartReader()
++	if err != nil {
++		return uploadRecord{}, err
++	}
++	rec := uploadRecord{
++		Method:        r.Method,
++		Path:          r.URL.Path,
++		Authorization: r.Header.Get("Authorization"),
++		Fields:        make(map[string][]string),
++	}
++	for {
++		part, err := mr.NextPart()
++		if errors.Is(err, io.EOF) {
++			break
++		}
++		if err != nil {
++			return uploadRecord{}, err
++		}
++		payload, err := io.ReadAll(part)
++		if err != nil {
++			return uploadRecord{}, err
++		}
++		if filename := part.FileName(); filename != "" {
++			rec.FileField = part.FormName()
++			rec.FileName = filename
++			rec.FileBytes = string(payload)
++			rec.FileSize = len(payload)
++			sum := sha256.Sum256(payload)
++			rec.FileSHA256 = hex.EncodeToString(sum[:])
++			continue
++		}
++		rec.Fields[part.FormName()] = append(rec.Fields[part.FormName()], string(payload))
++	}
++	for k := range rec.Fields {
++		sort.Strings(rec.Fields[k])
++	}
++	return rec, nil
++}
++
++func configuredBot(backend *uploadBackend) *larkv2.Bot {
++	return larkv2.NewChatBot(
++		"acceptance-app",
++		"acceptance-secret",
++		larkv2.WithDomain(backend.server.URL),
++		larkv2.WithTenantAccessToken(larkv2.TenantAccessToken{TenantAccessToken: v2TenantToken}),
++	)
++}
++
++func fixturePath(name string) string {
++	return fixtureDir + "/" + name
++}
++
++func sampleImage() image.Image {
++	img := image.NewRGBA(image.Rect(0, 0, 2, 2))
++	img.Set(0, 0, color.RGBA{R: 255, A: 255})
++	img.Set(1, 0, color.RGBA{G: 255, A: 255})
++	img.Set(0, 1, color.RGBA{B: 255, A: 255})
++	img.Set(1, 1, color.RGBA{R: 255, G: 255, B: 255, A: 255})
++	return img
++}
++
++func sameFields(got map[string][]string, want map[string][]string) bool {
++	if len(got) != len(want) {
++		return false
++	}
++	for k, gv := range got {
++		wv, ok := want[k]
++		if !ok || len(gv) != len(wv) {
++			return false
++		}
++		for i := range gv {
++			if gv[i] != wv[i] {
++				return false
++			}
++		}
++	}
++	return true
++}
++
++func assertNonEmptyFormFilename(t *testing.T, label, got string) {
++	t.Helper()
++
++	if got == "" {
++		t.Fatalf("%s filename is empty, want multipart file part to carry a filename", label)
++	}
++}
++
++func assertJPEGUpload(t *testing.T, label string, payload string, wantBounds image.Rectangle) {
++	t.Helper()
++
++	decoded, err := jpeg.Decode(bytes.NewReader([]byte(payload)))
++	if err != nil {
++		t.Fatalf("%s payload is not decodable JPEG: %v", label, err)
++	}
++	if decoded.Bounds() != wantBounds {
++		t.Fatalf("%s JPEG bounds = %v, want %v", label, decoded.Bounds(), wantBounds)
++	}
++}
++
++func TestV2UploadMethodsUseContextAndMultipartRequestShape(t *testing.T) {
++
++
++	backend := newUploadBackend(t)
++	bot := configuredBot(backend)
++	ctx := context.Background()
++
++	imageResp, err := bot.UploadImage(ctx, fixturePath("test.jpg"))
++	if err != nil {
++		t.Fatalf("v2 UploadImage error = %v, want nil", err)
++	}
++	if imageResp.Data.ImageKey != imagePathKey {
++		t.Fatalf("v2 UploadImage image key = %q, want %q", imageResp.Data.ImageKey, imagePathKey)
++	}
++
++	objectResp, err := bot.UploadImageObject(ctx, sampleImage())
++	if err != nil {
++		t.Fatalf("v2 UploadImageObject error = %v, want nil", err)
++	}
++	if objectResp.Data.ImageKey != imageObjectKey {
++		t.Fatalf("v2 UploadImageObject image key = %q, want %q", objectResp.Data.ImageKey, imageObjectKey)
++	}
++
++	fileResp, err := bot.UploadFile(ctx, larkv2.UploadFileRequest{
++		FileType: "stream",
++		FileName: "test-data.csv",
++		Reader:   strings.NewReader("Name,Age\nFoo,25\n"),
++	})
++	if err != nil {
++		t.Fatalf("v2 UploadFile reader error = %v, want nil", err)
++	}
++	if fileResp.Data.FileKey != filePathKey {
++		t.Fatalf("v2 UploadFile file key = %q, want %q", fileResp.Data.FileKey, filePathKey)
++	}
++
++	records := backend.Records()
++	if len(records) != 3 {
++		t.Fatalf("v2 upload request count = %d, want 3", len(records))
++	}
++	if records[0].Method != "POST" || records[0].Path != "/open-apis/im/v1/images" {
++		t.Fatalf("v2 image method/path = %s %s, want POST /open-apis/im/v1/images", records[0].Method, records[0].Path)
++	}
++	if records[0].Authorization != "Bearer "+v2TenantToken {
++		t.Fatalf("v2 image Authorization = %q, want %q", records[0].Authorization, "Bearer "+v2TenantToken)
++	}
++	if !sameFields(records[0].Fields, map[string][]string{"image_type": {"message"}}) {
++		t.Fatalf("v2 image fields = %#v, want image_type=message", records[0].Fields)
++	}
++	assertNonEmptyFormFilename(t, "v2 image path upload", records[0].FileName)
++	if records[0].FileBytes != "fixture-upload-image-bytes\n" {
++		t.Fatalf("v2 image bytes = %q, want %q", records[0].FileBytes, "fixture-upload-image-bytes\n")
++	}
++
++	assertNonEmptyFormFilename(t, "v2 image object upload", records[1].FileName)
++	assertJPEGUpload(t, "v2 image object upload", records[1].FileBytes, sampleImage().Bounds())
++	if !sameFields(records[2].Fields, map[string][]string{"file_name": {"test-data.csv"}, "file_type": {"stream"}}) {
++		t.Fatalf("v2 reader fields = %#v, want file_name and file_type", records[2].Fields)
++	}
++	if records[2].FileName != "test-data.csv" || records[2].FileBytes != "Name,Age\nFoo,25\n" {
++		t.Fatalf("v2 reader file name/bytes = %q/%q, want %q/%q", records[2].FileName, records[2].FileBytes, "test-data.csv", "Name,Age\nFoo,25\n")
++	}
++}
++
++func TestV2CanceledContextReturnsNilResponseAndContextCanceled(t *testing.T) {
++
++
++	backend := newUploadBackend(t)
++	bot := configuredBot(backend)
++	ctx, cancel := context.WithCancel(context.Background())
++	cancel()
++
++	resp, err := bot.UploadImage(ctx, fixturePath("test.jpg"))
++	if resp != nil {
++		t.Fatalf("v2 canceled context response = %#v, want nil", resp)
++	}
++	if !errors.Is(err, context.Canceled) {
++		t.Fatalf("v2 canceled context error = %T %v, want context.Canceled", err, err)
++	}
++	if len(backend.Records()) != 0 {
++		t.Fatalf("v2 canceled backend records = %d, want 0", len(backend.Records()))
++	}
++}
++EOF_GO
++go mod tidy >/dev/null
++go test -v -count=1

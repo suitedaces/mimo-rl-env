@@ -1,0 +1,406 @@
+diff --git a/usercase-test-coderl/fixtures/open-preload.js b/usercase-test-coderl/fixtures/open-preload.js
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/fixtures/open-preload.js
+@@ -0,0 +1,96 @@
++'use strict'
++
++var fs = require('fs')
++var path = require('path')
++var Module = require('module')
++var originalLoad = Module._load
++
++function isNpmCommand(command) {
++  var base = path.basename(String(command || ''))
++  return base === 'npm' || base === 'npm-cli.js' || base === 'npx' || base === 'npx-cli.js'
++}
++
++function blockedSpawn(command, args) {
++  args = Array.isArray(args) ? args : []
++  var err = new Error('isolated: offline - blocked npm fallback for ' + command + ' ' + args.join(' '))
++  err.code = 'ISOLATED_OFFLINE_NETWORK_GUARD'
++  return err
++}
++
++Module._load = function(request, parent, isMain) {
++  if (request === 'open') {
++    return function(url, cb) {
++      if (process.env.OPEN_LOG) {
++        fs.appendFileSync(process.env.OPEN_LOG, url + '\n')
++      }
++
++      var mode = process.env.OPEN_STUB_MODE || 'success-empty'
++      var err = mode === 'fail' ? new Error('forced open failure') : null
++      var stdout = mode === 'success-output' ? 'launcher stdout' : ''
++      var stderr = mode === 'success-output' ? 'launcher stderr' : ''
++
++      if (typeof cb === 'function') {
++        setImmediate(function() {
++          cb(err, stdout, stderr)
++        })
++        return null
++      }
++
++      if (err) return Promise.reject(err)
++      return Promise.resolve({stdout: stdout, stderr: stderr})
++    }
++  }
++
++  var loaded = originalLoad.apply(this, arguments)
++
++  if (request === 'cross-spawn') {
++    var guarded = function(command, args, options) {
++
++
++
++      if (isNpmCommand(command)) {
++        var EventEmitter = require('events').EventEmitter
++        var stream = require('stream')
++        var child = new EventEmitter()
++        child.stdout = new stream.PassThrough()
++        child.stderr = new stream.PassThrough()
++        child.stdin = new stream.PassThrough()
++        var err = blockedSpawn(command, args)
++        process.nextTick(function() {
++          child.stderr.end(err.message + '\n')
++          child.stdout.end()
++          child.emit('close', 126, null)
++          child.emit('exit', 126, null)
++        })
++        return child
++      }
++
++      return loaded.apply(this, arguments)
++    }
++
++    Object.keys(loaded).forEach(function(key) {
++      guarded[key] = loaded[key]
++    })
++    if (typeof loaded.sync === 'function') {
++      guarded.sync = function(command, args, options) {
++        if (isNpmCommand(command)) {
++          var err = blockedSpawn(command, args)
++          return {
++            pid: 0,
++            output: [null, Buffer.alloc(0), Buffer.from(err.message + '\n')],
++            stdout: Buffer.alloc(0),
++            stderr: Buffer.from(err.message + '\n'),
++            status: 126,
++            signal: null,
++            error: err
++          }
++        }
++
++        return loaded.sync.apply(this, arguments)
++      }
++    }
++    return guarded
++  }
++
++  return loaded
++}
+diff --git a/usercase-test-coderl/usecase.sh b/usercase-test-coderl/usecase.sh
+new file mode 100755
+--- /dev/null
++++ b/usercase-test-coderl/usecase.sh
+@@ -0,0 +1,283 @@
++#!/usr/bin/env bash
++
++set -u
++export LANG=C LC_ALL=C TZ=UTC
++export NPM_CONFIG_OFFLINE=true npm_config_offline=true
++export NPM_CONFIG_AUDIT=false npm_config_audit=false
++export NPM_CONFIG_FUND=false npm_config_fund=false
++export NO_UPDATE_NOTIFIER=1
++
++( cd /workspace/repo && node -e "require('./package.json'); require.resolve('cross-spawn')" >/dev/null ) \
++  || { echo "FAIL: dependency check" >&2; exit 1; }
++
++BIN=/workspace/repo/bin/smart-npm.js
++[ -x "$BIN" ] || { echo "FAIL: missing executable $BIN" >&2; exit 1; }
++
++TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
++PRELOAD=/workspace/repo/usercase-test-coderl/fixtures/open-preload.js
++mkdir -p "$TMP/bin"
++ln -s "$BIN" "$TMP/bin/snpm"
++ln -s "$BIN" "$TMP/bin/smart-npm"
++ln -s "$BIN" "$TMP/bin/npm"
++cd "$TMP"
++
++fail() { echo "FAIL: $*" >&2; exit 1; }
++
++expect_file() {
++  local label="$1" file="$2" expected="$3" expfile
++  expfile="$TMP/expected"
++  printf '%s' "$expected" >"$expfile"
++  cmp -s "$file" "$expfile" || {
++    echo "FAIL: $label" >&2
++    echo "--- actual $file ---" >&2
++    sed -n '1,120p' "$file" >&2
++    echo "--- expected ---" >&2
++    sed -n '1,120p' "$expfile" >&2
++    exit 1
++  }
++}
++
++expect_empty() {
++  local label="$1" file="$2"
++  [ ! -s "$file" ] || fail "$label: $(sed -n '1,80p' "$file")"
++}
++
++expect_contains() {
++  local label="$1" file="$2" expected="$3"
++  grep -Fq "$expected" "$file" || {
++    echo "FAIL: $label" >&2
++    echo "--- actual $file ---" >&2
++    sed -n '1,120p' "$file" >&2
++    echo "--- expected substring ---" >&2
++    printf '%s\n' "$expected" >&2
++    exit 1
++  }
++}
++
++expect_lines_unordered() {
++  local label="$1" file="$2" expfile actfile
++  shift 2
++  expfile="$TMP/$label.expected.sorted"
++  actfile="$TMP/$label.actual.sorted"
++  printf '%s\n' "$@" | sort >"$expfile"
++  sed '/^$/d' "$file" | sort >"$actfile"
++  cmp -s "$actfile" "$expfile" || {
++    echo "FAIL: $label" >&2
++    echo "--- actual sorted $file ---" >&2
++    sed -n '1,120p' "$actfile" >&2
++    echo "--- expected sorted ---" >&2
++    sed -n '1,120p' "$expfile" >&2
++    exit 1
++  }
++}
++
++expect_usage_message() {
++  local label="$1" file="$2" usage="$3" normalized
++  normalized="$TMP/$label.normalized"
++  tr -d '\r' <"$file" >"$normalized"
++  grep -Fq "$usage" "$normalized" || {
++    echo "FAIL: $label missing usage text" >&2
++    sed -n '1,120p' "$file" >&2
++    exit 1
++  }
++  awk -v usage="$usage" '
++    function blank(s) { return s ~ /^[[:space:]]*$/ }
++    { lines[NR] = $0 }
++    END {
++      for (i = 1; i <= NR; i++) {
++        if (index(lines[i], usage) && i > 1 && i < NR && blank(lines[i - 1]) && blank(lines[i + 1])) {
++          exit 0
++        }
++      }
++      exit 1
++    }
++  ' "$normalized" || fail "$label usage is not blank-line-padded"
++}
++
++expect_no_browser_failure_message() {
++  local label="$1" combined
++  combined="$TMP/$label.combined"
++  cat out err >"$combined"
++  ! grep -Fq 'Can not open browser, please open your browser to visit:' "$combined" \
++    || fail "$label unexpectedly printed browser failure fallback"
++}
++
++expect_combined_output_contains() {
++  local label="$1" expected="$2" combined
++  combined="$TMP/$label.combined"
++  cat out err >"$combined"
++  expect_contains "$label" "$combined" "$expected"
++}
++
++run_cli() {
++  local launcher_mode="$1" bin_name="$2"
++  shift 2
++  rm -f out err open.log
++  PATH="$TMP/bin:$PATH" \
++    NODE_OPTIONS="${NODE_OPTIONS:-} --require $PRELOAD" \
++    OPEN_LOG="$TMP/open.log" \
++    OPEN_STUB_MODE="$launcher_mode" \
++    "$TMP/bin/$bin_name" "$@" >out 2>err
++  ec=$?
++  [ -f open.log ] || : >open.log
++}
++
++
++
++
++run_cli success-empty snpm stats lodash
++[ "$ec" -eq 0 ] || fail "F1 exit $ec; want 0"
++expect_file F1-open open.log $'http://mora.sinaapp.com/utils/npm-stats.php?months=2&pkg=lodash\n'
++
++expect_no_browser_failure_message F1-output
++
++
++
++
++run_cli success-empty snpm stats lodash express
++[ "$ec" -eq 0 ] || fail "F2 exit $ec; want 0"
++
++expect_lines_unordered F2-open open.log \
++  'http://mora.sinaapp.com/utils/npm-stats.php?months=2&pkg=lodash' \
++  'http://mora.sinaapp.com/utils/npm-stats.php?months=2&pkg=express'
++
++expect_no_browser_failure_message F2-output
++
++
++
++
++run_cli success-empty snpm stats -m3 lodash
++[ "$ec" -eq 0 ] || fail "F3 exit $ec; want 0"
++expect_file F3-open open.log $'http://mora.sinaapp.com/utils/npm-stats.php?months=3&pkg=lodash\n'
++
++expect_no_browser_failure_message F3-output
++
++
++
++
++
++run_cli success-empty snpm stats -m 6 lodash 123 express
++[ "$ec" -eq 0 ] || fail "F4 exit $ec; want 0"
++
++expect_lines_unordered F4-open open.log \
++  'http://mora.sinaapp.com/utils/npm-stats.php?months=6&pkg=lodash' \
++  'http://mora.sinaapp.com/utils/npm-stats.php?months=6&pkg=express'
++
++expect_no_browser_failure_message F4-output
++
++
++
++
++
++run_cli success-empty smart-npm stats --month 7 lodash
++[ "$ec" -eq 0 ] || fail "F5 exit $ec; want 0"
++expect_file F5-open open.log $'http://mora.sinaapp.com/utils/npm-stats.php?months=7&pkg=lodash\n'
++
++expect_no_browser_failure_message F5-output
++
++
++
++
++
++run_cli success-empty npm stats --months 3 lodash
++[ "$ec" -eq 0 ] || fail "F6 exit $ec; want 0"
++expect_file F6-open open.log $'http://mora.sinaapp.com/utils/npm-stats.php?months=3&pkg=lodash\n'
++
++expect_no_browser_failure_message F6-output
++
++
++
++
++run_cli success-empty snpm stats
++[ "$ec" -eq 0 ] || fail "F7 exit $ec; want 0"
++
++expect_usage_message F7-stderr err 'Usage: npm stats [ -m{number} ] {package}'
++
++expect_no_browser_failure_message F7-output
++expect_empty F7-open open.log
++
++
++
++
++run_cli fail snpm stats lodash
++[ "$ec" -eq 0 ] || fail "F8 exit $ec; want 0"
++expect_file F8-open open.log $'http://mora.sinaapp.com/utils/npm-stats.php?months=2&pkg=lodash\n'
++
++expect_contains F8-stdout out 'Can not open browser, please open your browser to visit: http://mora.sinaapp.com/utils/npm-stats.php?months=2&pkg=lodash'
++
++
++
++
++
++run_cli success-output snpm stats lodash
++[ "$ec" -eq 0 ] || fail "F9 exit $ec; want 0"
++expect_file F9-open open.log $'http://mora.sinaapp.com/utils/npm-stats.php?months=2&pkg=lodash\n'
++
++expect_combined_output_contains F9-stdout 'launcher stdout'
++expect_combined_output_contains F9-stderr 'launcher stderr'
++expect_no_browser_failure_message F9-output
++
++
++
++
++run_cli success-empty snpm user zhonglei
++[ "$ec" -eq 0 ] || fail "F10 exit $ec; want 0"
++expect_file F10-open open.log $'https://www.npmjs.com/~zhonglei\n'
++
++expect_no_browser_failure_message F10-output
++
++
++
++
++run_cli success-empty snpm user alice bob
++[ "$ec" -eq 0 ] || fail "F11 exit $ec; want 0"
++
++expect_lines_unordered F11-open open.log \
++  'https://www.npmjs.com/~alice' \
++  'https://www.npmjs.com/~bob'
++
++expect_no_browser_failure_message F11-output
++
++
++
++
++run_cli success-empty snpm user -t zhonglei
++[ "$ec" -eq 0 ] || fail "F12 exit $ec; want 0"
++expect_file F12-open open.log $'https://npm.taobao.org/~zhonglei\n'
++
++expect_no_browser_failure_message F12-output
++
++
++
++
++run_cli success-empty snpm user
++[ "$ec" -eq 0 ] || fail "F13 exit $ec; want 0"
++
++expect_usage_message F13-stderr err 'Usage: npm user [-t] {username}'
++
++expect_no_browser_failure_message F13-output
++expect_empty F13-open open.log
++
++
++
++
++run_cli fail snpm user zhonglei
++[ "$ec" -eq 0 ] || fail "F14 exit $ec; want 0"
++expect_file F14-open open.log $'https://www.npmjs.com/~zhonglei\n'
++
++expect_contains F14-stdout out 'Can not open browser, please open your browser to visit: https://www.npmjs.com/~zhonglei'
++
++
++
++
++
++run_cli success-output snpm user zhonglei
++[ "$ec" -eq 0 ] || fail "F15 exit $ec; want 0"
++expect_file F15-open open.log $'https://www.npmjs.com/~zhonglei\n'
++
++expect_combined_output_contains F15-stdout 'launcher stdout'
++expect_combined_output_contains F15-stderr 'launcher stderr'
++expect_no_browser_failure_message F15-output
++
++echo "PASS"
++exit 0
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,12 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++exec bash /workspace/repo/usercase-test-coderl/usecase.sh

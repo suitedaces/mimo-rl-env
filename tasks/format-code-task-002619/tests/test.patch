@@ -1,0 +1,201 @@
+diff --git a/test_commands.json b/test_commands.json
+new file mode 100644
+index 00000000..7410649a
+--- /dev/null
++++ b/test_commands.json
+@@ -0,0 +1,3 @@
++{
++  "test_commands": ["python -m pytest tests/unit/tabular/test_utils.py -v -k \"omits_batch_size or non_reject_sampling_error_preserves_message or no_warning_when_all_rows_sampled\""]
++}
+diff --git a/tests/unit/tabular/test_utils.py b/tests/unit/tabular/test_utils.py
+index 77510b2e..1b01c940 100644
+--- a/tests/unit/tabular/test_utils.py
++++ b/tests/unit/tabular/test_utils.py
+@@ -1,5 +1,7 @@
+ """Tests for the sdv.models.utils module."""
+ 
++import warnings
++from inspect import signature
+ from unittest.mock import patch
+ 
+ import pytest
+@@ -8,6 +10,23 @@ from sdv.tabular.utils import (
+     _key_order, check_num_rows, flatten_array, flatten_dict, handle_sampling_error, unflatten_dict)
+ 
+ 
++def _call_check_num_rows(num_rows, expected_num_rows, is_reject_sampling,
++                         max_tries_per_batch, batch_size=None):
++    """Helper that calls ``check_num_rows`` regardless of whether the
++    function still accepts the legacy ``batch_size`` parameter.
++    """
++    sig = signature(check_num_rows)
++    kwargs = {
++        'num_rows': num_rows,
++        'expected_num_rows': expected_num_rows,
++        'is_reject_sampling': is_reject_sampling,
++        'max_tries_per_batch': max_tries_per_batch,
++    }
++    if 'batch_size' in sig.parameters:
++        kwargs['batch_size'] = batch_size
++    return check_num_rows(**kwargs)
++
++
+ def test_flatten_array_default():
+     """Test get flatten array."""
+     # Run
+@@ -290,3 +309,142 @@ def test_check_num_rows_valid(warning_mock):
+ 
+     # Assert
+     assert warning_mock.warn.call_count == 0
++
++
++def test_check_num_rows_partial_warning_omits_batch_size():
++    """``check_num_rows`` warning must not mention ``batch_size``.
++
++    The warning emitted when a model is unable to sample all expected rows
++    should only suggest increasing ``max_tries_per_batch``. Mentioning
++    ``batch_size`` (which defaults to None and is capped at ``num_rows``) is
++    not actionable for the user, so the message must NOT contain the literal
++    string ``batch_size``.
++    """
++    with warnings.catch_warnings(record=True) as caught:
++        warnings.simplefilter('always')
++        _call_check_num_rows(
++            num_rows=2,
++            expected_num_rows=5,
++            is_reject_sampling=True,
++            max_tries_per_batch=100,
++            batch_size=None,
++        )
++
++    user_warnings = [w for w in caught if issubclass(w.category, UserWarning)]
++    assert len(user_warnings) == 1
++    msg = str(user_warnings[0].message)
++    assert 'batch_size' not in msg
++    assert 'max_tries_per_batch' in msg
++    assert 'currently: 100' in msg
++    assert 'Only able to sample 2 rows' in msg
++
++
++def test_check_num_rows_partial_warning_omits_batch_size_with_explicit_value():
++    """The warning must not mention ``batch_size`` even when it has a value.
++
++    Using a differential value (max_tries_per_batch=7, batch_size=42) makes
++    sure the test fails if an implementation prints the ``batch_size`` value
++    instead of (or in addition to) ``max_tries_per_batch``.
++    """
++    with warnings.catch_warnings(record=True) as caught:
++        warnings.simplefilter('always')
++        _call_check_num_rows(
++            num_rows=3,
++            expected_num_rows=10,
++            is_reject_sampling=True,
++            max_tries_per_batch=7,
++            batch_size=42,
++        )
++
++    user_warnings = [w for w in caught if issubclass(w.category, UserWarning)]
++    assert len(user_warnings) == 1
++    msg = str(user_warnings[0].message)
++    assert 'batch_size' not in msg
++    assert '42' not in msg
++    assert 'max_tries_per_batch' in msg
++    assert 'currently: 7' in msg
++
++
++def test_check_num_rows_reject_sampling_error_omits_batch_size():
++    """``check_num_rows`` ValueError (reject sampling, 0 rows) must not mention ``batch_size``.
++
++    When num_rows == 0 and reject sampling is used, the raised ValueError
++    should suggest increasing ``max_tries_per_batch`` only and must NOT
++    mention ``batch_size``.
++    """
++    with pytest.raises(ValueError) as exc_info:
++        _call_check_num_rows(
++            num_rows=0,
++            expected_num_rows=5,
++            is_reject_sampling=True,
++            max_tries_per_batch=100,
++            batch_size=None,
++        )
++
++    msg = str(exc_info.value)
++    assert 'Unable to sample any rows for the given conditions.' in msg
++    assert 'batch_size' not in msg
++    assert 'max_tries_per_batch' in msg
++    assert 'currently: 100' in msg
++
++
++def test_check_num_rows_reject_sampling_error_omits_batch_size_explicit_value():
++    """ValueError must not include the ``batch_size`` value either.
++
++    Differential setup: max_tries_per_batch=11, batch_size=999. If a
++    candidate fixes only the warning but leaves the error message buggy,
++    this test will catch it because the error text would contain '999'
++    or 'batch_size'.
++    """
++    with pytest.raises(ValueError) as exc_info:
++        _call_check_num_rows(
++            num_rows=0,
++            expected_num_rows=5,
++            is_reject_sampling=True,
++            max_tries_per_batch=11,
++            batch_size=999,
++        )
++
++    msg = str(exc_info.value)
++    assert 'batch_size' not in msg
++    assert '999' not in msg
++    assert 'max_tries_per_batch' in msg
++    assert 'currently: 11' in msg
++
++
++def test_check_num_rows_non_reject_sampling_error_preserves_message():
++    """Preservation: non-reject-sampling 0-rows error message is unchanged.
++
++    When ``is_reject_sampling`` is False, the ValueError must still mention
++    that values may be out-of-bounds — this branch does not reference
++    ``batch_size`` and should not be affected by the fix.
++    """
++    with pytest.raises(ValueError) as exc_info:
++        _call_check_num_rows(
++            num_rows=0,
++            expected_num_rows=5,
++            is_reject_sampling=False,
++            max_tries_per_batch=1,
++            batch_size=5,
++        )
++
++    msg = str(exc_info.value)
++    assert 'Unable to sample any rows for the given conditions.' in msg
++    assert 'out-of-bounds' in msg
++    assert 'batch_size' not in msg
++
++
++def test_check_num_rows_no_warning_when_all_rows_sampled():
++    """Preservation: no warning fires when num_rows == expected_num_rows."""
++    with warnings.catch_warnings(record=True) as caught:
++        warnings.simplefilter('always')
++        _call_check_num_rows(
++            num_rows=5,
++            expected_num_rows=5,
++            is_reject_sampling=True,
++            max_tries_per_batch=100,
++            batch_size=None,
++        )
++
++    user_warnings = [w for w in caught if issubclass(w.category, UserWarning)]
++    assert len(user_warnings) == 0
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,8 @@
++#!/usr/bin/env bash
++
++set -uo pipefail
++cd /testbed
++rc=0
++python -m pytest tests/unit/tabular/test_utils.py -v -k "omits_batch_size or non_reject_sampling_error_preserves_message or no_warning_when_all_rows_sampled"
++rc=$(( rc | $? ))
++exit $rc

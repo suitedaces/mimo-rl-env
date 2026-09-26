@@ -1,0 +1,286 @@
+diff --git a/usercase-test-coderl/gcs_retriever_stateful_test.go b/usercase-test-coderl/gcs_retriever_stateful_test.go
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/gcs_retriever_stateful_test.go
+@@ -0,0 +1,254 @@
++package usercase_test_coderl
++
++import (
++	"context"
++	"fmt"
++	"net/http"
++	"net/http/httptest"
++	"net/http/httputil"
++	"net/url"
++	"reflect"
++	"strings"
++	"sync/atomic"
++	"testing"
++
++	"github.com/google/bulk_fhir_tools/testhelpers"
++	gcsretriever "github.com/google/cql/retriever/gcs"
++	r4pb "github.com/google/fhir/go/proto/google/fhir/proto/r4/core/resources/bundle_and_contained_resource_go_proto"
++)
++
++const bundleWithPatientEncounterObservation = `{
++	"resourceType": "Bundle",
++	"type": "transaction",
++	"entry": [
++		{"fullUrl": "fullUrl-patient", "resource": {"resourceType": "Patient", "id": "1"}},
++		{"fullUrl": "fullUrl-encounter", "resource": {"resourceType": "Encounter", "id": "1"}},
++		{"fullUrl": "fullUrl-observation", "resource": {"resourceType": "Observation", "id": "1"}}
++	]
++}`
++
++const bundleWithSecondPatientOnly = `{
++	"resourceType": "Bundle",
++	"type": "transaction",
++	"entry": [
++		{"fullUrl": "fullUrl-patient", "resource": {"resourceType": "Patient", "id": "2"}}
++	]
++}`
++
++func TestGCSRetrieverLoadsOnceAndRetrievesRequestedFHIRTypes(t *testing.T) {
++
++
++	ctx := context.Background()
++	server := testhelpers.NewGCSServer(t)
++	server.AddObject("TestBucket", "TestFile", testhelpers.GCSObjectEntry{
++		Data: []byte(bundleWithPatientEncounterObservation),
++	})
++	endpoint, downloads := countingProxy(t, server.URL(), "/TestBucket/TestFile")
++
++	ret, err := gcsretriever.New("gs://TestBucket/TestFile", endpoint)
++	if err != nil {
++		t.Fatalf("New(%q) returned unexpected error: %v", "gs://TestBucket/TestFile", err)
++	}
++
++	assertInt32AtLeast(t, downloads.Load(), 1, "downloads after New")
++	downloadsAfterNew := downloads.Load()
++
++	patients, err := ret.Retrieve(ctx, "Patient")
++	if err != nil {
++		t.Fatalf("Retrieve(ctx, %q) returned unexpected error: %v", "Patient", err)
++	}
++	assertSummary(t, patients, []string{"Patient:1"}, "Patient resources")
++	assertInt32(t, downloads.Load(), downloadsAfterNew, "downloads after Patient retrieve")
++
++	encounters, err := ret.Retrieve(ctx, "Encounter")
++	if err != nil {
++		t.Fatalf("Retrieve(ctx, %q) returned unexpected error: %v", "Encounter", err)
++	}
++	assertSummary(t, encounters, []string{"Encounter:1"}, "Encounter resources")
++	assertInt32(t, downloads.Load(), downloadsAfterNew, "downloads after Encounter retrieve")
++
++	conditions, err := ret.Retrieve(ctx, "Condition")
++	if err != nil {
++		t.Fatalf("Retrieve(ctx, %q) returned unexpected error: %v", "Condition", err)
++	}
++	assertSummary(t, conditions, []string{}, "Condition resources")
++	assertInt32(t, downloads.Load(), downloadsAfterNew, "downloads after Condition retrieve")
++
++	patientsAgain, err := ret.Retrieve(ctx, "Patient")
++	if err != nil {
++		t.Fatalf("second Retrieve(ctx, %q) returned unexpected error: %v", "Patient", err)
++	}
++	assertSummary(t, patientsAgain, []string{"Patient:1"}, "Patient resources on repeated retrieve")
++	assertInt32(t, downloads.Load(), downloadsAfterNew, "downloads after repeated Patient retrieve")
++}
++
++func TestNewRejectsMalformedGCSAccessAndInvalidBundleInputs(t *testing.T) {
++
++
++	server := testhelpers.NewGCSServer(t)
++	server.AddObject("TestBucket", "InvalidFile", testhelpers.GCSObjectEntry{Data: []byte(`not json`)})
++
++	ret, err := gcsretriever.New("not-a-gs-path", server.URL())
++
++	assertNilRetrieverAndErrorIdentifies(t, ret, err, [][]string{{"pars"}, {"path"}}, "malformed path")
++
++	ret, err = gcsretriever.New("gs://TestBucket/TestFile", "://bad-endpoint")
++
++	assertNilRetrieverAndErrorIdentifies(t, ret, err, [][]string{{"gcs", "access", "client", "endpoint"}}, "client creation")
++
++	ret, err = gcsretriever.New("gs://TestBucket/MissingFile", server.URL())
++
++	assertNilRetrieverAndErrorIdentifies(t, ret, err, [][]string{{"gcs", "access", "reader", "object", "file", "missing", "not found"}}, "missing object")
++
++	ret, err = gcsretriever.New("gs://TestBucket/InvalidFile", server.URL())
++
++	assertNilRetrieverAndErrorIdentifies(t, ret, err, [][]string{{"pars", "invalid", "json", "bundle"}}, "invalid bundle")
++}
++
++func TestSeparateRetrieversKeepLoadedBundlesIndependent(t *testing.T) {
++
++
++	ctx := context.Background()
++	server := testhelpers.NewGCSServer(t)
++	server.AddObject("TestBucket", "TestFile", testhelpers.GCSObjectEntry{
++		Data: []byte(bundleWithPatientEncounterObservation),
++	})
++	server.AddObject("OtherBucket", "OtherFile", testhelpers.GCSObjectEntry{
++		Data: []byte(bundleWithSecondPatientOnly),
++	})
++
++	a, err := gcsretriever.New("gs://TestBucket/TestFile", server.URL())
++	if err != nil {
++		t.Fatalf("New(%q) returned unexpected error: %v", "gs://TestBucket/TestFile", err)
++	}
++	b, err := gcsretriever.New("gs://OtherBucket/OtherFile", server.URL())
++	if err != nil {
++		t.Fatalf("New(%q) returned unexpected error: %v", "gs://OtherBucket/OtherFile", err)
++	}
++
++	aPatients, err := a.Retrieve(ctx, "Patient")
++	if err != nil {
++		t.Fatalf("a.Retrieve(ctx, %q) returned unexpected error: %v", "Patient", err)
++	}
++	assertSummary(t, aPatients, []string{"Patient:1"}, "first retriever Patient resources")
++
++	bPatients, err := b.Retrieve(ctx, "Patient")
++	if err != nil {
++		t.Fatalf("b.Retrieve(ctx, %q) returned unexpected error: %v", "Patient", err)
++	}
++	assertSummary(t, bPatients, []string{"Patient:2"}, "second retriever Patient resources")
++
++	aEncounters, err := a.Retrieve(ctx, "Encounter")
++	if err != nil {
++		t.Fatalf("a.Retrieve(ctx, %q) returned unexpected error: %v", "Encounter", err)
++	}
++	assertSummary(t, aEncounters, []string{"Encounter:1"}, "first retriever Encounter resources")
++
++	bEncounters, err := b.Retrieve(ctx, "Encounter")
++	if err != nil {
++		t.Fatalf("b.Retrieve(ctx, %q) returned unexpected error: %v", "Encounter", err)
++	}
++	assertSummary(t, bEncounters, []string{}, "second retriever Encounter resources")
++}
++
++func TestConstructRetrieveCyclesRemainUsable(t *testing.T) {
++
++
++	ctx := context.Background()
++	server := testhelpers.NewGCSServer(t)
++	server.AddObject("TestBucket", "TestFile", testhelpers.GCSObjectEntry{
++		Data: []byte(bundleWithPatientEncounterObservation),
++	})
++
++
++	for i := 0; i < 8; i++ {
++		ret, err := gcsretriever.New("gs://TestBucket/TestFile", server.URL())
++		if err != nil {
++			t.Fatalf("cycle %d: New returned unexpected error: %v", i, err)
++		}
++		patients, err := ret.Retrieve(ctx, "Patient")
++		if err != nil {
++			t.Fatalf("cycle %d: Retrieve(ctx, %q) returned unexpected error: %v", i, "Patient", err)
++		}
++		assertSummary(t, patients, []string{"Patient:1"}, fmt.Sprintf("cycle %d Patient resources", i))
++	}
++}
++
++func countingProxy(t *testing.T, target string, downloadPath string) (string, *atomic.Int32) {
++	t.Helper()
++	targetURL, err := url.Parse(target)
++	if err != nil {
++		t.Fatalf("url.Parse(%q) failed: %v", target, err)
++	}
++	proxy := httputil.NewSingleHostReverseProxy(targetURL)
++	var downloads atomic.Int32
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		if r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, downloadPath) {
++			downloads.Add(1)
++		}
++		proxy.ServeHTTP(w, r)
++	}))
++	t.Cleanup(server.Close)
++	return server.URL, &downloads
++}
++
++func assertSummary(t *testing.T, got []*r4pb.ContainedResource, want []string, label string) {
++	t.Helper()
++	if gotSummary := resourceSummary(got); !reflect.DeepEqual(gotSummary, want) {
++		t.Fatalf("%s summary = %#v, want %#v", label, gotSummary, want)
++	}
++}
++
++func resourceSummary(resources []*r4pb.ContainedResource) []string {
++	out := make([]string, 0, len(resources))
++	for _, r := range resources {
++		switch v := r.GetOneofResource().(type) {
++		case *r4pb.ContainedResource_Patient:
++			out = append(out, "Patient:"+v.Patient.GetId().GetValue())
++		case *r4pb.ContainedResource_Encounter:
++			out = append(out, "Encounter:"+v.Encounter.GetId().GetValue())
++		case *r4pb.ContainedResource_Observation:
++			out = append(out, "Observation:"+v.Observation.GetId().GetValue())
++		default:
++			out = append(out, fmt.Sprintf("%T", v))
++		}
++	}
++	return out
++}
++
++func assertNilRetrieverAndErrorIdentifies(t *testing.T, ret *gcsretriever.Retriever, err error, wantAnyByGroup [][]string, label string) {
++	t.Helper()
++	if ret != nil {
++		t.Fatalf("%s: retriever = %#v, want nil", label, ret)
++	}
++	if err == nil {
++		t.Fatalf("%s: error = nil, want non-nil error identifying %v", label, wantAnyByGroup)
++	}
++	got := strings.ToLower(err.Error())
++	for _, group := range wantAnyByGroup {
++		found := false
++		for _, want := range group {
++			if strings.Contains(got, strings.ToLower(want)) {
++				found = true
++				break
++			}
++		}
++		if !found {
++			t.Fatalf("%s: error = %q, want one of %v", label, err.Error(), group)
++		}
++	}
++}
++
++func assertInt32(t *testing.T, got, want int32, label string) {
++	t.Helper()
++	if got != want {
++		t.Fatalf("%s = %d, want %d", label, got, want)
++	}
++}
++
++func assertInt32AtLeast(t *testing.T, got, wantMin int32, label string) {
++	t.Helper()
++	if got < wantMin {
++		t.Fatalf("%s = %d, want at least %d", label, got, wantMin)
++	}
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,22 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++
++
++set -euo pipefail
++
++cd /workspace/repo
++export GOPATH="${GOPATH:-/root/go}"
++export GOMODCACHE="${GOMODCACHE:-/root/go/pkg/mod}"
++export GOPROXY=off
++export GOSUMDB=off
++export GOTOOLCHAIN=local
++exec go test -v -count=1 ./usercase-test-coderl/...

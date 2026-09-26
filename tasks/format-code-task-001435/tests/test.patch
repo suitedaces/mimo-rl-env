@@ -1,0 +1,520 @@
+diff --git a/usercase-test-coderl/test_method_decorators.py b/usercase-test-coderl/test_method_decorators.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/test_method_decorators.py
+@@ -0,0 +1,491 @@
++import copy
++import json
++import subprocess
++import sys
++import threading
++
++import pytest
++
++import fasteners
++import fasteners.lock as fasteners_lock
++
++
++class EventLock:
++    def __init__(self, name, events, acquire_result=True, release_raises=False):
++        self.name = name
++        self.events = events
++        self.acquire_result = acquire_result
++        self.release_raises = release_raises
++        self.held = False
++
++    def __enter__(self):
++        self.acquire()
++        return self
++
++    def __exit__(self, exc_type, exc_value, exc_tb):
++        self.release()
++
++    def acquire(self):
++        self.events.append("acquire:%s" % self.name)
++        if self.acquire_result:
++            self.held = True
++            return True
++        return False
++
++    def release(self):
++        self.events.append("release:%s" % self.name)
++        if self.release_raises:
++            raise RuntimeError("release failed %s" % self.name)
++        self.held = False
++
++
++class RecordingLogger:
++    def __init__(self):
++        self.events = []
++
++
++
++    def exception(self, msg, *args, **kwargs):
++        self.events.append("exception")
++
++
++def test_locked_exports_are_available_from_package_top_level_and_lock_module():
++
++
++
++
++    assert {
++        "top_locked": callable(getattr(fasteners, "locked", None)),
++        "top_read_locked": callable(getattr(fasteners, "read_locked", None)),
++        "top_write_locked": callable(getattr(fasteners, "write_locked", None)),
++        "module_locked": callable(getattr(fasteners_lock, "locked", None)),
++        "module_read_locked": callable(getattr(fasteners_lock, "read_locked", None)),
++        "module_write_locked": callable(getattr(fasteners_lock, "write_locked", None)),
++    } == {
++        "top_locked": True,
++        "top_read_locked": True,
++        "top_write_locked": True,
++        "module_locked": True,
++        "module_read_locked": True,
++        "module_write_locked": True,
++    }
++
++    class ModuleTarget:
++        def __init__(self):
++            self._lock = threading.Lock()
++            self.rw_lock = fasteners.ReaderWriterLock()
++
++        @fasteners_lock.locked
++        def locked_method(self):
++            return self._lock.locked()
++
++        @fasteners_lock.read_locked(lock="rw_lock")
++        def read_method(self):
++            return self.rw_lock.owner == fasteners.ReaderWriterLock.READER
++
++        @fasteners_lock.write_locked(lock="rw_lock")
++        def write_method(self):
++            return self.rw_lock.owner == fasteners.ReaderWriterLock.WRITER
++
++    target = ModuleTarget()
++
++
++
++    assert [target.locked_method(), target.read_method(), target.write_method()] == [
++        True,
++        True,
++        True,
++    ]
++    assert target._lock.locked() is False
++    assert target.rw_lock.owner is None
++
++
++def test_locked_bare_default_lock_forwards_args_kwargs_and_releases_after_return():
++
++
++    class Target:
++        def __init__(self):
++            self._lock = threading.Lock()
++
++        @fasteners.locked
++        def method(self, first, second=0, *, label=""):
++            return {
++                "args": [first, second],
++                "inside_locked": self._lock.locked(),
++                "label": label,
++            }
++
++    target = Target()
++    actual = target.method(7, second=11, label="alpha")
++
++    assert actual == {
++        "args": [7, 11],
++        "inside_locked": True,
++        "label": "alpha",
++    }
++    assert target._lock.locked() is False
++
++
++def test_locked_parameterized_custom_lock_attribute_releases_after_return():
++
++
++    class Target:
++        def __init__(self):
++            self.custom_attr = threading.Lock()
++
++        @fasteners.locked(lock="custom_attr")
++        def method(self):
++            return ["custom", self.custom_attr.locked()]
++
++    target = Target()
++    actual = target.method()
++
++    assert actual == ["custom", True]
++    assert target.custom_attr.locked() is False
++
++
++def test_locked_releases_single_lock_after_decorated_method_raises():
++
++
++    class Target:
++        def __init__(self):
++            self._lock = threading.Lock()
++
++        @fasteners.locked
++        def method(self):
++            raise LookupError("body exploded")
++
++    target = Target()
++
++    with pytest.raises(LookupError) as excinfo:
++        target.method()
++
++    assert str(excinfo.value) == "body exploded"
++    assert target._lock.locked() is False
++
++
++def test_locked_list_of_ten_threading_locks_all_locked_inside_and_released_after():
++
++
++    class Target:
++        def __init__(self):
++            self._lock = [threading.Lock() for _ in range(10)]
++
++        @fasteners.locked
++        def method(self):
++            return [lock.locked() for lock in self._lock]
++
++    target = Target()
++    actual = target.method()
++
++    assert actual == [True, True, True, True, True, True, True, True, True, True]
++    assert [lock.locked() for lock in target._lock] == [
++        False,
++        False,
++        False,
++        False,
++        False,
++        False,
++        False,
++        False,
++        False,
++        False,
++    ]
++
++
++def test_locked_tuple_collection_acquires_in_order_and_releases_in_reverse_order():
++
++
++    class Target:
++        def __init__(self):
++            self.events = []
++            self.guards = tuple(
++                EventLock(str(index), self.events) for index in range(1, 4)
++            )
++
++        @fasteners.locked(lock="guards")
++        def method(self):
++            return {
++                "events": list(self.events),
++                "held": [lock.held for lock in self.guards],
++            }
++
++    target = Target()
++    actual = target.method()
++
++    assert actual == {
++        "events": ["acquire:1", "acquire:2", "acquire:3"],
++        "held": [True, True, True],
++    }
++    assert target.events == [
++        "acquire:1",
++        "acquire:2",
++        "acquire:3",
++        "release:3",
++        "release:2",
++        "release:1",
++    ]
++    assert [lock.held for lock in target.guards] == [False, False, False]
++
++
++def test_locked_failed_second_acquire_raises_thread_error_and_releases_first():
++
++
++    class Target:
++        def __init__(self):
++            self.events = []
++            self.first = EventLock("first", self.events)
++            self.second = EventLock("second", self.events, acquire_result=False)
++            self._lock = [self.first, self.second]
++
++        @fasteners.locked
++        def method(self):
++            return "unreachable"
++
++    target = Target()
++
++    with pytest.raises(threading.ThreadError) as excinfo:
++        target.method()
++
++
++
++    assert "lock" in str(excinfo.value).lower()
++    assert "2" in str(excinfo.value)
++    assert target.events == ["acquire:first", "acquire:second", "release:first"]
++    assert [target.first.held, target.second.held] == [False, False]
++
++
++def test_locked_release_failure_during_cleanup_logs_exception_to_custom_logger():
++
++
++    logger = RecordingLogger()
++
++    class Target:
++        def __init__(self):
++            self.events = []
++            self.first = EventLock("first", self.events, release_raises=True)
++            self.second = EventLock("second", self.events, acquire_result=False)
++            self._lock = [self.first, self.second]
++
++        @fasteners.locked(logger=logger)
++        def method(self):
++            return "unreachable"
++
++    target = Target()
++
++
++
++    with pytest.raises(threading.ThreadError):
++        target.method()
++
++    assert target.events == ["acquire:first", "acquire:second", "release:first"]
++
++
++    assert "exception" in logger.events
++
++
++    assert target.second.held is False
++
++
++def test_read_locked_bare_default_attribute_uses_reader_context_and_releases():
++
++
++    class Target:
++        def __init__(self):
++            self._lock = fasteners.ReaderWriterLock()
++
++        @fasteners.read_locked
++        def method(self):
++            return [
++                self._lock.owner,
++                fasteners.ReaderWriterLock.READER,
++                self._lock.owner == fasteners.ReaderWriterLock.READER,
++            ]
++
++    target = Target()
++    actual = target.method()
++
++
++
++    assert actual == [
++        fasteners.ReaderWriterLock.READER,
++        fasteners.ReaderWriterLock.READER,
++        True,
++    ]
++    assert target._lock.owner is None
++
++
++def test_write_locked_bare_default_attribute_uses_writer_context_and_releases():
++
++
++    class Target:
++        def __init__(self):
++            self._lock = fasteners.ReaderWriterLock()
++
++        @fasteners.write_locked
++        def method(self):
++            return [
++                self._lock.owner,
++                fasteners.ReaderWriterLock.WRITER,
++                self._lock.owner == fasteners.ReaderWriterLock.WRITER,
++            ]
++
++    target = Target()
++    actual = target.method()
++
++
++
++    assert actual == [
++        fasteners.ReaderWriterLock.WRITER,
++        fasteners.ReaderWriterLock.WRITER,
++        True,
++    ]
++    assert target._lock.owner is None
++
++
++def test_read_locked_parameterized_custom_attribute_uses_reader_context():
++
++
++    class Target:
++        def __init__(self):
++            self._lock = fasteners.ReaderWriterLock()
++            self.custom_attr = fasteners.ReaderWriterLock()
++
++        @fasteners.read_locked(lock="custom_attr")
++        def method(self):
++            return {
++                "custom_owner": self.custom_attr.owner,
++                "default_owner": self._lock.owner,
++            }
++
++    target = Target()
++    actual = target.method()
++
++
++
++    assert actual == {
++        "custom_owner": fasteners.ReaderWriterLock.READER,
++        "default_owner": None,
++    }
++    assert [target.custom_attr.owner, target._lock.owner] == [None, None]
++
++
++def test_write_locked_parameterized_custom_attribute_uses_writer_context():
++
++
++    class Target:
++        def __init__(self):
++            self._lock = fasteners.ReaderWriterLock()
++            self.custom_attr = fasteners.ReaderWriterLock()
++
++        @fasteners.write_locked(lock="custom_attr")
++        def method(self):
++            return {
++                "custom_owner": self.custom_attr.owner,
++                "default_owner": self._lock.owner,
++            }
++
++    target = Target()
++    actual = target.method()
++
++
++
++    assert actual == {
++        "custom_owner": fasteners.ReaderWriterLock.WRITER,
++        "default_owner": None,
++    }
++    assert [target.custom_attr.owner, target._lock.owner] == [None, None]
++
++
++def test_referential_transparency_for_repeated_decorated_method_call():
++    class Target:
++        def __init__(self):
++            self._lock = threading.Lock()
++
++        @fasteners.locked
++        def method(self, value):
++            return {"inside_locked": self._lock.locked(), "value": value}
++
++    target = Target()
++    assert target.method("same") == target.method("same")
++    assert target.method("same") == {"inside_locked": True, "value": "same"}
++
++
++def test_decorators_do_not_mutate_caller_arguments():
++    class Target:
++        def __init__(self):
++            self._lock = threading.Lock()
++
++        @fasteners.locked
++        def method(self, payload):
++            return {"inside_locked": self._lock.locked(), "payload": payload}
++
++    payload = {"items": [{"name": "alpha", "counts": [1, 2, 3]}]}
++    original = copy.deepcopy(payload)
++
++    actual = Target().method(payload)
++
++    assert actual == {
++        "inside_locked": True,
++        "payload": {"items": [{"name": "alpha", "counts": [1, 2, 3]}]},
++    }
++    assert payload == original
++
++
++def test_decorators_do_not_depend_on_process_global_state():
++    class Target:
++        def __init__(self):
++            self._lock = threading.Lock()
++
++        @fasteners.locked
++        def method(self, value):
++            return {"inside_locked": self._lock.locked(), "value": value}
++
++    in_process = Target().method(41)
++    script = """
++import json
++import sys
++import threading
++sys.path.insert(0, '/workspace/repo')
++import fasteners
++
++class Target:
++    def __init__(self):
++        self._lock = threading.Lock()
++
++    @fasteners.locked
++    def method(self, value):
++        return {"inside_locked": self._lock.locked(), "value": value}
++
++sys.stdout.write(json.dumps(Target().method(41), sort_keys=True))
++"""
++
++    fresh_process = subprocess.run(
++        [sys.executable, "-c", script],
++        check=True,
++        stdout=subprocess.PIPE,
++        stderr=subprocess.PIPE,
++        text=True,
++    )
++
++    assert in_process == {"inside_locked": True, "value": 41}
++    assert json.loads(fresh_process.stdout) == {"inside_locked": True, "value": 41}
++    assert in_process == json.loads(fresh_process.stdout)
++
++
++def test_decorators_use_declared_lock_attribute_and_release_after_call():
++    class Target:
++        def __init__(self):
++            self._lock = threading.Lock()
++
++        @fasteners.locked
++        def method(self):
++            return {"inside_locked": self._lock.locked()}
++
++    target = Target()
++    actual = target.method()
++
++
++
++    assert actual == {"inside_locked": True}
++    assert target._lock.locked() is False
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,19 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++cd /workspace/repo
++
++
++export PYTHONPATH="/workspace/repo${PYTHONPATH:+:${PYTHONPATH}}"
++export PYTHONNOUSERSITE=1
++export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
++exec /usr/local/bin/python -m pytest /workspace/repo/usercase-test-coderl/test_method_decorators.py -v

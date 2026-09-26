@@ -1,0 +1,193 @@
+diff --git a/scripts/tests/test_no_import_zds_settings_cli.py b/scripts/tests/test_no_import_zds_settings_cli.py
+new file mode 100644
+index 000000000..516b55ad1
+--- /dev/null
++++ b/scripts/tests/test_no_import_zds_settings_cli.py
+@@ -0,0 +1,178 @@
++import os
++import shutil
++import subprocess
++import tempfile
++import unittest
++
++
++REPOSITORY_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
++CHECKER = os.path.join(REPOSITORY_ROOT, 'scripts', 'no_import_zds_settings.sh')
++MESSAGE = 'direct import of zds.settings is forbidden; import settings from django.conf instead'
++
++
++class NoImportZdsSettingsCliTest(unittest.TestCase):
++    def setUp(self):
++        self.case_root = tempfile.mkdtemp(prefix='.codespec_settings_import_', dir=REPOSITORY_ROOT)
++
++    def tearDown(self):
++        shutil.rmtree(self.case_root)
++
++    def write(self, relative_path, contents):
++        path = os.path.join(self.case_root, relative_path)
++        directory = os.path.dirname(path)
++        if not os.path.isdir(directory):
++            os.makedirs(directory)
++        with open(path, 'w', encoding='utf-8') as output:
++            output.write(contents)
++        return os.path.relpath(path, REPOSITORY_ROOT)
++
++    def run_checker(self, *paths):
++        return subprocess.run(
++            ['bash', CHECKER] + list(paths),
++            cwd=REPOSITORY_ROOT,
++            stdout=subprocess.PIPE,
++            stderr=subprocess.PIPE,
++            universal_newlines=True,
++        )
++
++    def diagnostic(self, path, line):
++        return '{}:{}: {}'.format(path.replace(os.sep, '/'), line, MESSAGE)
++
++    def result_summary(self, result):
++        return 'stdout={!r}, stderr={!r}'.format(result.stdout[:300], result.stderr[:300])
++
++    def assert_exit_code(self, expected, result):
++        self.assertEqual(expected, result.returncode, self.result_summary(result))
++
++    def assert_silent(self, result):
++        if result.stdout or result.stderr:
++            self.fail('expected no process output; {}'.format(self.result_summary(result)))
++
++    def test_absolute_import_forms_report_every_statement(self):
++        package = self.write('absolute/zds/__init__.py', '')
++        consumer = self.write(
++            'absolute/zds/consumer.py',
++            'import zds.settings\n'
++            'import zds.settings as project_settings\n'
++            'import os, zds.settings.dev\n'
++            'from zds import settings\n'
++            'from zds import settings as project_settings\n'
++            'from zds.settings.dev import DATABASES\n'
++            'from zds import (\n'
++            '    settings,\n'
++            '    json_handler,\n'
++            ')\n'
++            'import zds.settings, zds.settings.dev\n',
++        )
++
++        result = self.run_checker(os.path.dirname(package))
++
++        self.assert_exit_code(1, result)
++        self.assertEqual('', result.stdout)
++        self.assertEqual(
++            [self.diagnostic(consumer, line) for line in range(1, 8)]
++            + [self.diagnostic(consumer, 11)],
++            result.stderr.strip().splitlines(),
++        )
++
++    def test_relative_imports_are_resolved_in_the_zds_package(self):
++        package = self.write('relative/zds/__init__.py', '')
++        root_module = self.write(
++            'relative/zds/root_module.py',
++            'from . import settings\n'
++            'from .settings import dev\n',
++        )
++        nested_module = self.write(
++            'relative/zds/feature/nested.py',
++            'def configure():\n'
++            '    from .. import settings\n'
++            '    from ..settings.test import DATABASES\n'
++            'from . import settings\n',
++        )
++        deep_module = self.write(
++            'relative/zds/feature/deeper/check.py',
++            'from ...settings import prod\n',
++        )
++
++        result = self.run_checker(os.path.dirname(package))
++
++        self.assert_exit_code(1, result)
++        self.assertEqual('', result.stdout)
++        self.assertEqual(
++            [
++                self.diagnostic(deep_module, 1),
++                self.diagnostic(nested_module, 2),
++                self.diagnostic(nested_module, 3),
++                self.diagnostic(root_module, 1),
++                self.diagnostic(root_module, 2),
++            ],
++            result.stderr.strip().splitlines(),
++        )
++
++    def test_non_import_text_nearby_modules_and_settings_package_are_allowed(self):
++        package = self.write('allowed/zds/__init__.py', '')
++        self.write(
++            'allowed/zds/consumer.py',
++            '# import zds.settings\n'
++            'EXAMPLE = "from zds import settings"\n'
++            'import zds.settings_helpers\n'
++            'from zds import settings_helpers\n'
++            'from django.conf import settings\n'
++            'from . import settings_helpers\n',
++        )
++        self.write(
++            'allowed/zds/settings/dev.py',
++            'from zds.settings import abstract_base\n'
++            'from .. import settings\n',
++        )
++        self.write('allowed/zds/example.txt', 'import zds.settings\n')
++
++        result = self.run_checker(os.path.dirname(package))
++
++        self.assert_exit_code(0, result)
++        self.assert_silent(result)
++
++    def test_multiple_and_overlapping_inputs_are_deduplicated_and_sorted(self):
++        package = self.write('ordering/zds/__init__.py', '')
++        later = self.write('ordering/zds/z_later.py', '\n\nimport zds.settings\n')
++        earlier = self.write('ordering/zds/a_earlier.py', 'from zds import settings\n')
++        package_dir = os.path.dirname(package)
++
++        result = self.run_checker(package_dir, later, package_dir, earlier)
++
++        self.assert_exit_code(1, result)
++        self.assertEqual('', result.stdout)
++        self.assertEqual(
++            [self.diagnostic(earlier, 1), self.diagnostic(later, 3)],
++            result.stderr.strip().splitlines(),
++        )
++
++    def test_clean_default_repository_scan_is_silent(self):
++        result = self.run_checker()
++
++        self.assert_exit_code(0, result)
++        self.assert_silent(result)
++
++    def test_missing_path_is_an_input_error(self):
++        missing = os.path.relpath(os.path.join(self.case_root, 'missing'), REPOSITORY_ROOT)
++
++        result = self.run_checker(missing)
++
++        self.assert_exit_code(2, result)
++        self.assertEqual('', result.stdout)
++        self.assertIn(missing.replace(os.sep, '/'), result.stderr)
++        self.assertIn('does not exist', result.stderr.lower())
++
++    def test_invalid_python_is_a_parse_error_not_a_clean_scan(self):
++        broken = self.write('invalid/zds/broken.py', 'from zds.settings import (\n')
++
++        result = self.run_checker(broken)
++
++        self.assert_exit_code(2, result)
++        self.assertEqual('', result.stdout)
++        self.assertIn('{}:1:'.format(broken.replace(os.sep, '/')), result.stderr)
++        self.assertIn('cannot parse', result.stderr.lower())
++
++
++if __name__ == '__main__':
++    unittest.main()
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,4 @@
++#!/bin/bash
++set -euo pipefail
++
++python scripts/tests/test_no_import_zds_settings_cli.py

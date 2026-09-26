@@ -1,0 +1,174 @@
+diff --git a/usaspending_api/etl/tests/test_load_submission.py b/usaspending_api/etl/tests/test_load_submission.py
+index 7340c518d..557ba60ca 100644
+--- a/usaspending_api/etl/tests/test_load_submission.py
++++ b/usaspending_api/etl/tests/test_load_submission.py
+@@ -195,6 +195,93 @@ def test_get_submission_attributes():
+         get_submission_attributes(11111, new_submission_data)
+ 
+ 
++def _submission_data(cgac_code, fiscal_year, fiscal_period, is_quarter_format=True, frec_code='0000'):
++    return {
++        'cgac_code': cgac_code,
++        'frec_code': frec_code,
++        'reporting_fiscal_year': fiscal_year,
++        'reporting_fiscal_period': fiscal_period,
++        'is_quarter_format': is_quarter_format,
++        'publishable': False,
++        'number_of_errors': 0,
++        'reporting_start_date': datetime.date(2017, 1, 1),
++        'reporting_end_date': datetime.date(2017, 3, 31),
++        'updated_at': datetime.datetime(2017, 4, 10, 12, 0, 0),
++    }
++
++
++def _submission_record(cgac_code, fiscal_year, fiscal_period, is_quarter_format=True):
++    return SubmissionAttributes.objects.create(
++        broker_submission_id=93000 + fiscal_period,
++        cgac_code=cgac_code,
++        reporting_fiscal_year=fiscal_year,
++        reporting_fiscal_period=fiscal_period,
++        quarter_format_flag=is_quarter_format,
++    )
++
++
++@pytest.mark.django_db
++def test_get_submission_attributes_links_previous_quarter_with_unmatched_optional_fields():
++    earlier = get_submission_attributes(
++        91001,
++        _submission_data(
++            cgac_code='073',
++            fiscal_year=2017,
++            fiscal_period=3,
++            is_quarter_format=True,
++            frec_code='EARLY',
++        ),
++    )
++
++    later = get_submission_attributes(
++        91002,
++        _submission_data(
++            cgac_code='073',
++            fiscal_year=2017,
++            fiscal_period=6,
++            is_quarter_format=True,
++            frec_code='LATER',
++        ),
++    )
++
++    assert later.previous_submission_id == earlier.submission_id
++
++
++@pytest.mark.django_db
++def test_get_submission_attributes_links_previous_quarter_for_another_reporting_series():
++    earlier = get_submission_attributes(
++        93001,
++        _submission_data('020', 2018, 3, True, 'FIRST'),
++    )
++
++    later = get_submission_attributes(
++        93002,
++        _submission_data('020', 2018, 6, True, 'SECOND'),
++    )
++
++    assert later.previous_submission_id == earlier.submission_id
++
++
++@pytest.mark.django_db
++def test_previous_submission_uses_nearest_valid_quarter_in_reporting_sequence():
++    first_quarter = get_submission_attributes(92001, _submission_data('073', 2017, 3, True, 'A001'))
++    expected_previous = get_submission_attributes(92002, _submission_data('073', 2017, 6, True, 'A002'))
++
++    different_agency = _submission_record('097', 2017, 8, True)
++    different_year = _submission_record('073', 2018, 8, True)
++    non_quarter = _submission_record('073', 2017, 8, False)
++    later_period = _submission_record('073', 2017, 12, True)
++
++    target = get_submission_attributes(92007, _submission_data('073', 2017, 9, True, 'A007'))
++
++    assert target.previous_submission_id == expected_previous.submission_id
++    assert target.previous_submission_id != first_quarter.submission_id
++    assert target.previous_submission_id != different_agency.submission_id
++    assert target.previous_submission_id != different_year.submission_id
++    assert target.previous_submission_id != non_quarter.submission_id
++    assert target.previous_submission_id != later_period.submission_id
++
++
+ @pytest.mark.django_db
+ def test_load_submission_command_program_activity_uniqueness(endpoint_data, partially_flushed):
+     """
+diff --git a/usaspending_api/submissions/tests/test_submission_attributes_serializer.py b/usaspending_api/submissions/tests/test_submission_attributes_serializer.py
+new file mode 100644
+index 000000000..a5d16422a
+--- /dev/null
++++ b/usaspending_api/submissions/tests/test_submission_attributes_serializer.py
+@@ -0,0 +1,24 @@
++import pytest
++from model_mommy import mommy
++
++
++@pytest.mark.django_db
++def test_submissions_endpoint_omits_frec_code_from_output(client):
++    mommy.make(
++        'submissions.SubmissionAttributes',
++        cgac_code='073',
++        reporting_fiscal_year=2017,
++        reporting_fiscal_quarter=2,
++    )
++
++    response = client.get('/api/v1/submissions/')
++
++    assert response.status_code == 200
++    assert len(response.data['results']) == 1
++
++    submission = response.data['results'][0]
++    assert 'submission_id' in submission
++    assert submission['cgac_code'] == '073'
++    assert submission['reporting_fiscal_year'] == 2017
++    assert submission['reporting_fiscal_quarter'] == 2
++    assert 'frec_code' not in submission
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,41 @@
++#!/bin/bash
++set -uo pipefail
++
++cd /testbed
++
++
++export PYENV_ROOT="$HOME/.pyenv"
++export PATH="$PYENV_ROOT/bin:$PYENV_ROOT/shims:$PATH"
++eval "$(pyenv init -)"
++
++pg_isready -q 2>/dev/null || pg_ctlcluster 16 main start 2>/dev/null || true
++for i in $(seq 1 10); do
++    pg_isready -q && break
++    sleep 1
++done
++
++su - postgres -c "psql -tc \"SELECT 1 FROM pg_database WHERE datname='usaspending_test'\" | grep -q 1" 2>/dev/null \
++    || su - postgres -c "createdb usaspending_test" 2>/dev/null || true
++
++export DATABASE_URL="postgres://localhost/usaspending_test"
++
++
++case "${1:-}" in
++  base)
++    python3 -m pytest \
++      usaspending_api/submissions/tests/test_submissions.py::test_submissions_list \
++      -v
++    ;;
++  new)
++    python3 -m pytest \
++      usaspending_api/etl/tests/test_load_submission.py::test_get_submission_attributes_links_previous_quarter_with_unmatched_optional_fields \
++      usaspending_api/etl/tests/test_load_submission.py::test_get_submission_attributes_links_previous_quarter_for_another_reporting_series \
++      usaspending_api/etl/tests/test_load_submission.py::test_previous_submission_uses_nearest_valid_quarter_in_reporting_sequence \
++      usaspending_api/submissions/tests/test_submission_attributes_serializer.py::test_submissions_endpoint_omits_frec_code_from_output \
++      -v
++    ;;
++  *)
++    echo "usage: $0 base|new"
++    exit 2
++    ;;
++esac

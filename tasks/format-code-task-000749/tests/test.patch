@@ -1,0 +1,321 @@
+diff --git a/utils/tests/test_scons_mpi_env_exports.py b/utils/tests/test_scons_mpi_env_exports.py
+new file mode 100644
+index 000000000..c224f57be
+--- /dev/null
++++ b/utils/tests/test_scons_mpi_env_exports.py
+@@ -0,0 +1,277 @@
++
++
++import os
++import shutil
++import subprocess
++import tempfile
++import textwrap
++import unittest
++from pathlib import Path
++
++
++REPO_ROOT = Path(__file__).resolve().parents[2]
++SCONSTRUCT = REPO_ROOT / "SConstruct"
++SCONS_BIN = shutil.which("scons") or "scons"
++
++
++def _make_fake_mpicc(tmp_dir, token):
++
++    mpi_bin = tmp_dir / ("fake-mpi-bin-" + token)
++    mpi_bin.mkdir()
++    log_file = tmp_dir / ("mpicc-invoked-" + token + ".log")
++    mpicc = mpi_bin / "mpicc"
++    mpicc.write_text(
++        "#!/bin/sh\n"
++        f"echo {token} >> '{log_file}'\n"
++        "if [ \"$1\" = \"--version\" ]; then\n"
++        "  echo fake mpicc\n"
++        "fi\n"
++        "exit 0\n",
++        encoding="utf-8",
++    )
++    mpicc.chmod(0o755)
++    return mpi_bin, log_file
++
++
++def _make_fake_update_alternatives(mpi_bin):
++
++    update_alternatives = mpi_bin / "update-alternatives"
++    update_alternatives.write_text(
++        "#!/bin/sh\n"
++        "if [ \"$1\" = \"--query\" ] && [ \"$2\" = \"mpi\" ]; then\n"
++        "  echo 'Value: /usr/lib64/mpi/mpicc.mpich'\n"
++        "  exit 0\n"
++        "fi\n"
++        "exit 1\n",
++        encoding="utf-8",
++    )
++    update_alternatives.chmod(0o755)
++
++
++def _stdout_value(stdout, name):
++
++    marker = name + "="
++    return stdout.split(marker, 1)[1].splitlines()[0]
++
++
++def _inject_probe(probe_dir):
++
++    original = SCONSTRUCT.read_text(encoding="utf-8")
++    patched = original
++    probe_path = (probe_dir / "SConscript").resolve()
++    load_defaults = "    prereqs.load_defaults(platform_arm)"
++    if load_defaults in patched:
++        patched = patched.replace(
++            load_defaults,
++            ""
++            "    try:\n"
++            "        prereqs.load_defaults(platform_arm)\n"
++            "    except Exception as exc:  # pylint: disable=broad-except\n"
++            "        print('FIXTURE_PREREQ_BYPASS={}'.format(exc.__class__.__name__))",
++            1,
++        )
++
++    for marker in (
++        "Export('platform_arm', 'conf_dir')",
++        'Export("platform_arm", "conf_dir")',
++    ):
++        if marker in patched:
++            marker_line = next(line for line in patched.splitlines() if marker in line)
++            indent = marker_line[:len(marker_line) - len(marker_line.lstrip())]
++            probe_call = (
++                "\n"
++                f"{indent}# Hidden-test probe for exported SCons environments.\n"
++                f"{indent}SConscript({str(probe_path)!r})\n"
++                f"{indent}Exit(0)"
++            )
++            modified = patched.replace(marker, marker + probe_call, 1)
++            SCONSTRUCT.write_text(modified, encoding="utf-8")
++            return original
++
++    raise AssertionError("Could not find SConstruct Export block for probe injection")
++
++
++def _write_probe(probe_dir):
++
++    probe_dir.mkdir(parents=True, exist_ok=True)
++    (probe_dir / "SConscript").write_text(
++        textwrap.dedent(
++            """
++            import os
++            import subprocess
++
++            Import('base_env', 'base_env_mpi')
++
++            orig_path = os.environ.get('PATH', '')
++            base_path = base_env.get('ENV', {}).get('PATH', '')
++            orig_first = orig_path.split(os.pathsep)[0] if orig_path else ''
++            base_first = base_path.split(os.pathsep)[0] if base_path else ''
++            fake_dir = os.environ.get('DAOS_HIDDEN_FAKE_MPI_DIR', '')
++            base_parts = base_path.split(os.pathsep) if base_path else []
++
++            print('ORIG_PATH_FIRST={}'.format(orig_first))
++            print('BASE_ENV_PATH_FIRST={}'.format(base_first))
++            print('BASE_ENV_HAS_FAKE_MPI_PATH={}'.format(fake_dir in base_parts))
++            print('BASE_ENV_MPI_IS_NONE={}'.format(base_env_mpi is None))
++
++            if base_env_mpi is not None:
++                cc = base_env_mpi.subst('$CC')
++                rc = subprocess.call([cc, '--version'],
++                                     env=base_env_mpi.get('ENV', {}))
++                print('BASE_ENV_MPI_CC_PROBE_RC={}'.format(rc))
++            """
++        ),
++        encoding="utf-8",
++    )
++
++
++def _run_scons_with_probe(tmp_dir, env_updates, scons_args=None):
++
++    probe_dir = tmp_dir / "hidden_scons_probe"
++    _write_probe(probe_dir)
++    original_sconstruct = _inject_probe(probe_dir)
++    try:
++        env = os.environ.copy()
++        env.update(env_updates)
++        command = [SCONS_BIN, "-Q"]
++        if scons_args:
++            command.extend(scons_args)
++        return subprocess.run(
++            command,
++            cwd=str(REPO_ROOT),
++            env=env,
++            text=True,
++            stdout=subprocess.PIPE,
++            stderr=subprocess.STDOUT,
++            timeout=120,
++            check=False,
++        )
++    finally:
++        SCONSTRUCT.write_text(original_sconstruct, encoding="utf-8")
++
++
++class SConsMpiEnvExportTest(unittest.TestCase):
++    def test_scons_exports_base_env_mpi_when_mpi_available(self):
++        with tempfile.TemporaryDirectory() as td:
++            tmp_dir = Path(td)
++            token = "available_one"
++            mpi_bin, log_file = _make_fake_mpicc(tmp_dir, token)
++            path_parts = os.environ.get("PATH", "").split(os.pathsep)
++            self.assertGreater(len(path_parts), 0)
++            env_path = os.pathsep.join([path_parts[0], str(mpi_bin)] + path_parts[1:])
++            result = _run_scons_with_probe(
++                tmp_dir,
++                {
++                    "PATH": env_path,
++                    "DAOS_HIDDEN_FAKE_MPI_DIR": str(mpi_bin),
++                },
++                ["MPI_PKG=fixture_fake_mpi"],
++            )
++
++            self.assertEqual(result.returncode, 0, result.stdout)
++            self.assertIn("BASE_ENV_MPI_IS_NONE=False", result.stdout)
++            self.assertIn("BASE_ENV_PATH_FIRST=", result.stdout)
++            self.assertIn("BASE_ENV_HAS_FAKE_MPI_PATH=False", result.stdout)
++            self.assertIn("BASE_ENV_MPI_CC_PROBE_RC=0", result.stdout)
++            base_first = _stdout_value(result.stdout, "BASE_ENV_PATH_FIRST")
++            self.assertNotEqual(str(mpi_bin), base_first)
++            self.assertTrue(log_file.exists(), result.stdout)
++            self.assertIn(token, log_file.read_text(encoding="utf-8"))
++
++    def test_scons_exports_base_env_mpi_with_different_mpi_pkg(self):
++        with tempfile.TemporaryDirectory() as td:
++            tmp_dir = Path(td)
++            token = "available_pkg_variant"
++            mpi_bin, log_file = _make_fake_mpicc(tmp_dir, token)
++            path_parts = os.environ.get("PATH", "").split(os.pathsep)
++            self.assertGreater(len(path_parts), 0)
++            env_path = os.pathsep.join([path_parts[0], str(mpi_bin)] + path_parts[1:])
++            result = _run_scons_with_probe(
++                tmp_dir,
++                {
++                    "PATH": env_path,
++                    "DAOS_HIDDEN_FAKE_MPI_DIR": str(mpi_bin),
++                },
++                ["MPI_PKG=fixture_fake_mpi_variant"],
++            )
++
++            self.assertEqual(result.returncode, 0, result.stdout)
++            self.assertIn("BASE_ENV_MPI_IS_NONE=False", result.stdout)
++            self.assertIn("BASE_ENV_HAS_FAKE_MPI_PATH=False", result.stdout)
++            self.assertIn("BASE_ENV_MPI_CC_PROBE_RC=0", result.stdout)
++            self.assertTrue(log_file.exists(), result.stdout)
++            self.assertIn(token, log_file.read_text(encoding="utf-8"))
++
++    def test_scons_exports_base_env_mpi_with_default_mpi_discovery(self):
++        with tempfile.TemporaryDirectory() as td:
++            tmp_dir = Path(td)
++            token = "available_default"
++            mpi_bin, log_file = _make_fake_mpicc(tmp_dir, token)
++            _make_fake_update_alternatives(mpi_bin)
++            env_path = str(mpi_bin) + os.pathsep + os.environ.get("PATH", "")
++            result = _run_scons_with_probe(
++                tmp_dir,
++                {
++                    "PATH": env_path,
++                    "DAOS_HIDDEN_FAKE_MPI_DIR": str(mpi_bin),
++                    "MODULEPATH": "",
++                },
++                ["MPI_PKG="],
++            )
++
++            self.assertEqual(result.returncode, 0, result.stdout)
++            self.assertIn("BASE_ENV_MPI_IS_NONE=False", result.stdout)
++            self.assertIn("BASE_ENV_HAS_FAKE_MPI_PATH=False", result.stdout)
++            self.assertIn("BASE_ENV_MPI_CC_PROBE_RC=0", result.stdout)
++            self.assertTrue(log_file.exists(), result.stdout)
++            self.assertIn(token, log_file.read_text(encoding="utf-8"))
++
++    def test_scons_mpi_missing_prints_skip_message_and_exports_none(self):
++        with tempfile.TemporaryDirectory() as td:
++            tmp_dir = Path(td)
++            result = _run_scons_with_probe(
++                tmp_dir,
++                {
++                    "PATH": os.environ.get("PATH", ""),
++                    "MODULEPATH": "",
++                },
++                ["MPI_PKG="],
++            )
++
++            self.assertEqual(result.returncode, 0, result.stdout)
++
++            self.assertIn("Skipping compilation for tests that need MPI", result.stdout)
++
++            self.assertIn("Install and load mpich or openmpi", result.stdout)
++            self.assertIn("BASE_ENV_MPI_IS_NONE=True", result.stdout)
++
++    def test_scons_base_env_stays_clean_with_second_fake_mpi_location(self):
++        with tempfile.TemporaryDirectory() as td:
++            tmp_dir = Path(td)
++            token = "available_two"
++            mpi_bin, log_file = _make_fake_mpicc(tmp_dir, token)
++            path_parts = os.environ.get("PATH", "").split(os.pathsep)
++            self.assertGreater(len(path_parts), 0)
++            env_path = os.pathsep.join([path_parts[0], str(mpi_bin)] + path_parts[1:])
++            result = _run_scons_with_probe(
++                tmp_dir,
++                {
++                    "PATH": env_path,
++                    "DAOS_HIDDEN_FAKE_MPI_DIR": str(mpi_bin),
++                },
++                ["MPI_PKG=fixture_fake_mpi"],
++            )
++
++            self.assertEqual(result.returncode, 0, result.stdout)
++            self.assertIn("BASE_ENV_MPI_IS_NONE=False", result.stdout)
++            self.assertIn("BASE_ENV_PATH_FIRST=", result.stdout)
++            self.assertIn("BASE_ENV_HAS_FAKE_MPI_PATH=False", result.stdout)
++            self.assertIn("BASE_ENV_MPI_CC_PROBE_RC=0", result.stdout)
++            base_first = _stdout_value(result.stdout, "BASE_ENV_PATH_FIRST")
++            self.assertNotEqual(str(mpi_bin), base_first)
++            self.assertTrue(log_file.exists(), result.stdout)
++            self.assertIn(token, log_file.read_text(encoding="utf-8"))
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,33 @@
++#!/bin/bash
++set -uo pipefail
++
++cd /testbed
++
++if ! command -v scons >/dev/null 2>&1; then
++    echo "scons is required but is not available in PATH" >&2
++    exit 127
++fi
++
++case "${1:-}" in
++    base)
++        if [ ! -f src/rdb/raft/SConscript ]; then
++            git submodule update --init src/rdb/raft 2>/dev/null || true
++        fi
++        scons_log="$(mktemp)"
++        scons --debug=sconscript --help > "${scons_log}" 2>&1 || true
++        if grep -q "done reading SConscript files" "${scons_log}"; then
++            rm -f "${scons_log}"
++            exit 0
++        fi
++        tail -100 "${scons_log}"
++        rm -f "${scons_log}"
++        exit 1
++        ;;
++    new)
++        python3 utils/tests/test_scons_mpi_env_exports.py -v
++        ;;
++    *)
++        echo "usage: $0 base|new" >&2
++        exit 2
++        ;;
++esac

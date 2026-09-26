@@ -1,0 +1,209 @@
+diff --git a/all/approximation/approximation_test.py b/all/approximation/approximation_test.py
+new file mode 100644
+index 0000000..81528dd
+--- /dev/null
++++ b/all/approximation/approximation_test.py
+@@ -0,0 +1,66 @@
++import unittest
++
++import torch
++
++from all.approximation import Approximation
++
++
++class ApproximationClipGradTest(unittest.TestCase):
++
++    def _make_approximation(self):
++        torch.manual_seed(0)
++        model = torch.nn.Linear(2, 1, bias=False)
++        optimizer = torch.optim.SGD(model.parameters(), lr=0.25)
++        approximation = Approximation(
++            model,
++            optimizer,
++            name='clip_grad_test',
++            clip_grad=1.0
++        )
++        return approximation, model
++
++    def _parameter_clone(self, model):
++        return [parameter.detach().clone() for parameter in model.parameters()]
++
++    def _set_gradient(self, model, value):
++        for parameter in model.parameters():
++            parameter.grad = torch.full_like(parameter, value)
++
++    def test_clip_grad_raises_on_infinite_norm(self):
++        approximation, model = self._make_approximation()
++        before = self._parameter_clone(model)
++        self._set_gradient(model, float('inf'))
++
++        with self.assertRaises(RuntimeError):
++            approximation.step()
++
++        for expected, actual in zip(before, model.parameters()):
++            self.assertTrue(torch.allclose(expected, actual.detach()))
++
++    def test_clip_grad_raises_on_nan_norm(self):
++        approximation, model = self._make_approximation()
++        before = self._parameter_clone(model)
++        self._set_gradient(model, float('nan'))
++
++        with self.assertRaises(RuntimeError):
++            approximation.step()
++
++        for expected, actual in zip(before, model.parameters()):
++            self.assertTrue(torch.allclose(expected, actual.detach()))
++
++    def test_clip_grad_allows_finite_gradients(self):
++        approximation, model = self._make_approximation()
++        before = self._parameter_clone(model)
++        self._set_gradient(model, 0.5)
++
++        result = approximation.step()
++
++        self.assertIs(result, approximation)
++        self.assertFalse(all(torch.allclose(expected, actual.detach())
++                             for expected, actual in zip(before, model.parameters())))
++        self.assertTrue(all(parameter.grad is None or torch.all(parameter.grad == 0)
++                            for parameter in model.parameters()))
++
++
++if __name__ == '__main__':
++    unittest.main()
+diff --git a/all/policies/soft_deterministic_test.py b/all/policies/soft_deterministic_test.py
+index 135bd69..cd4a1ec 100644
+--- a/all/policies/soft_deterministic_test.py
++++ b/all/policies/soft_deterministic_test.py
+@@ -56,16 +56,27 @@ class TestSoftDeterministic(unittest.TestCase):
+         self.assertLess(loss, 0.2)
+ 
+     def test_scaling(self):
+-        self.space = Box(np.array([-10, -5, 100]), np.array([10, -2, 200]))
+-        self.policy = SoftDeterministicPolicy(
++        action1, log_prob1 = self._sample_with_space(np.array([1., 1., 1.]))
++
++        scales = np.array([2., 1., 1.])
++        action2, log_prob2 = self._sample_with_space(scales)
++        tt.assert_allclose(action1 * torch.tensor(scales, dtype=action1.dtype), action2)
++        tt.assert_allclose(log_prob1 - np.log(scales).sum(), log_prob2)
++
++        scales = np.array([3., 0.5, 4.])
++        action3, log_prob3 = self._sample_with_space(scales)
++        tt.assert_allclose(action1 * torch.tensor(scales, dtype=action1.dtype), action3)
++        tt.assert_allclose(log_prob1 - np.log(scales).sum(), log_prob3)
++
++    def _sample_with_space(self, scales):
++        torch.manual_seed(0)
++        state = State(torch.randn(1, STATE_DIM))
++        policy = SoftDeterministicPolicy(
+             self.model,
+             self.optimizer,
+-            self.space
++            Box(-scales, scales)
+         )
+-        state = State(torch.randn(1, STATE_DIM))
+-        action, log_prob = self.policy(state)
+-        tt.assert_allclose(action, torch.tensor([[-3.09055, -4.752777, 188.98222]]))
+-        tt.assert_allclose(log_prob, torch.tensor([-0.397002]), rtol=1e-4)
++        return policy(state)
+ 
+ 
+ if __name__ == '__main__':
+diff --git a/setup_config_test.py b/setup_config_test.py
+new file mode 100644
+index 0000000..c95f8df
+--- /dev/null
++++ b/setup_config_test.py
+@@ -0,0 +1,61 @@
++import ast
++import pathlib
++import re
++import unittest
++
++
++class SetupConfigTest(unittest.TestCase):
++
++    def _repo_root(self):
++        return pathlib.Path(__file__).resolve().parent
++
++    def _setup_call_keywords(self):
++        setup_path = self._repo_root() / 'setup.py'
++        module = ast.parse(setup_path.read_text())
++        for node in ast.walk(module):
++            if isinstance(node, ast.Call) and getattr(node.func, 'id', None) == 'setup':
++                return {
++                    keyword.arg: keyword.value
++                    for keyword in node.keywords
++                    if keyword.arg is not None
++                }
++        self.fail('setup.py does not contain a setup() call')
++
++    def _docs_release(self):
++        conf_path = self._repo_root() / 'docs' / 'source' / 'conf.py'
++        module = ast.parse(conf_path.read_text())
++        for node in module.body:
++            if isinstance(node, ast.Assign):
++                for target in node.targets:
++                    if isinstance(target, ast.Name) and target.id == 'release':
++                        return ast.literal_eval(node.value)
++        self.fail('docs/source/conf.py does not assign release')
++
++    def _install_requires(self):
++        keywords = self._setup_call_keywords()
++        self.assertIn('install_requires', keywords)
++        return ast.literal_eval(keywords['install_requires'])
++
++    def test_package_and_docs_versions_are_072(self):
++        keywords = self._setup_call_keywords()
++        self.assertIn('version', keywords)
++
++
++        self.assertEqual(ast.literal_eval(keywords['version']), '0.7.2')
++        self.assertEqual(self._docs_release(), '0.7.2')
++
++    def test_torch_dependency_targets_19(self):
++        install_requires = self._install_requires()
++
++        self.assertIn('torch~=1.9.0', install_requires)
++
++        workflow = (self._repo_root() / '.github' / 'workflows' / 'python-package.yml').read_text()
++
++        self.assertRegex(
++            workflow,
++            r'pip\s+install\s+torch==1\.9\.0\+cpu(?:\s|$)'
++        )
++
++
++if __name__ == '__main__':
++    unittest.main()
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,26 @@
++#!/bin/bash
++set -uo pipefail
++cd /testbed
++
++
++cd /testbed
++
++
++case "$1" in
++  base)
++    python3 -m pytest -q \
++      all/policies/soft_deterministic_test.py::TestSoftDeterministic::test_output_shape \
++      all/policies/soft_deterministic_test.py::TestSoftDeterministic::test_step_one \
++      all/policies/soft_deterministic_test.py::TestSoftDeterministic::test_converge
++    ;;
++  new)
++    python3 -m pytest -q \
++      all/policies/soft_deterministic_test.py::TestSoftDeterministic::test_scaling \
++      all/approximation/approximation_test.py::ApproximationClipGradTest \
++      setup_config_test.py::SetupConfigTest
++    ;;
++  *)
++    echo "usage: $0 base|new"
++    exit 2
++    ;;
++esac

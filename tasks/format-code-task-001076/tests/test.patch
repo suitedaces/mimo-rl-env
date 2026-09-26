@@ -1,0 +1,246 @@
+diff --git a/glazier/lib/config/synthesis_builder_safety_test.py b/glazier/lib/config/synthesis_builder_safety_test.py
+new file mode 100644
+index 0000000..5e07bc2
+--- /dev/null
++++ b/glazier/lib/config/synthesis_builder_safety_test.py
+@@ -0,0 +1,230 @@
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++import os
++import sys
++import tempfile
++from unittest import mock
++
++from absl.testing import absltest
++import yaml
++
++
++
++sys.modules.setdefault('tkinter', mock.MagicMock())
++
++from glazier.lib import buildinfo  # pylint: disable=g-import-not-at-top
++from glazier.lib.config import builder  # pylint: disable=g-import-not-at-top
++
++
++class ConfigBuilderSafetyContractTest(absltest.TestCase):
++
++  def setUp(self):
++    super().setUp()
++    self._temp_dir = tempfile.TemporaryDirectory()
++    self.addCleanup(self._temp_dir.cleanup)
++    self.root = self._temp_dir.name
++    self.old_root = os.path.join(self.root, 'old')
++    self.output = os.path.join(self.root, 'compiled.yaml')
++    os.makedirs(self.old_root)
++    self.build_info = buildinfo.BuildInfo()
++    self.build_info.ConfigServer(set_to=self.old_root)
++    self.build_info.ReleasePath = lambda: self.build_info.ConfigServer() + '/'
++    self.compiler = builder.ConfigBuilder(self.build_info)
++
++  def _write_yaml(self, relative_path, value, root=None):
++    base = root or self.old_root
++    path = os.path.join(base, relative_path)
++    os.makedirs(os.path.dirname(path), exist_ok=True)
++    with open(path, 'w', encoding='utf-8') as handle:
++      yaml.safe_dump(value, handle, sort_keys=False)
++
++  def _compile(self):
++    self.compiler.Start(self.output, '', 'build.yaml')
++    with open(self.output, encoding='utf-8') as handle:
++      return yaml.safe_load(handle)
++
++  def _trace(self, compiled):
++    trace = []
++    for task in compiled:
++      name, args = next(iter(task['data'].items()))
++      trace.append((name, args, task['path'], task['server']))
++    return trace
++
++  def _public_error(self, name):
++    error_type = getattr(builder, name, None)
++    self.assertIsNotNone(error_type, f'builder.{name} must be public')
++    return error_type
++
++  def test_success_preserves_depth_first_order_and_allows_repeat_include(self):
++    self._write_yaml('build.yaml', {
++        'controls': [{
++            'Sleep': [0]
++        }, {
++            'include': [['sub', 'child.yaml'], ['sub', 'child.yaml']]
++        }, {
++            'Sleep': [3]
++        }]
++    })
++    self._write_yaml('sub/child.yaml', {'controls': [{'Sleep': [1]}]})
++
++    trace = self._trace(self._compile())
++
++    self.assertEqual(
++        [(name, args) for name, args, _, _ in trace],
++        [('SetTimer', ['start__build.yaml']), ('Sleep', [0]),
++         ('SetTimer', ['start_sub_child.yaml']), ('Sleep', [1]),
++         ('SetTimer', ['stop_sub_child.yaml']),
++         ('SetTimer', ['start_sub_child.yaml']), ('Sleep', [1]),
++         ('SetTimer', ['stop_sub_child.yaml']), ('Sleep', [3]),
++         ('SetTimer', ['stop__build.yaml'])])
++    self.assertEqual([path for _, _, path, _ in trace if path],
++                     [['sub'], ['sub'], ['sub'], ['sub'], ['sub'], ['sub']])
++    self.assertTrue(all(server == self.old_root for *_, server in trace))
++    self.assertEqual(self.build_info.ActiveConfigPath(), [])
++
++  def test_include_cycle_reports_resolved_closed_chain(self):
++    self._write_yaml('build.yaml', {
++        'controls': [{'include': [['sub', 'child.yaml']]}]
++    })
++    self._write_yaml('sub/child.yaml', {
++        'controls': [{'include': [['..', 'build.yaml']]}]
++    })
++
++    with self.assertRaises(self._public_error('ConfigCycleError')) as raised:
++      self._compile()
++
++    message = str(raised.exception).lower()
++    self.assertIn('cycle', message)
++    self.assertLess(message.find('build.yaml'), message.find('child.yaml'))
++    self.assertLess(message.find('child.yaml'), message.rfind('build.yaml'))
++    self.assertEqual(self.build_info.ActiveConfigPath(), [])
++    self.assertFalse(os.path.exists(self.output))
++
++  def test_template_cycle_reports_the_reference_chain(self):
++    self._write_yaml('build.yaml', {
++        'templates': {
++            'prepare': {'template': ['install']},
++            'install': {'template': ['prepare']},
++        },
++        'controls': [{'template': ['prepare']}],
++    })
++
++    with self.assertRaises(self._public_error('ConfigCycleError')) as raised:
++      self._compile()
++
++    message = str(raised.exception).lower()
++    self.assertIn('template', message)
++    self.assertLess(message.find('prepare'), message.rfind('prepare'))
++    self.assertIn('install', message)
++    self.assertEqual(self.build_info.ActiveConfigPath(), [])
++
++  def test_invalid_document_shapes_are_source_aware_and_non_destructive(self):
++    invalid_documents = [
++        None,
++        {},
++        {'controls': {}},
++        {'controls': [[]]},
++        {'controls': [], 'templates': []},
++        {'controls': [{'template': ['bad']}], 'templates': {'bad': []}},
++    ]
++    marker = 'existing compiled task list\n'
++    for invalid in invalid_documents:
++      with self.subTest(invalid=invalid):
++        self._write_yaml('build.yaml', invalid)
++        with open(self.output, 'w', encoding='utf-8') as handle:
++          handle.write(marker)
++
++        with self.assertRaises(self._public_error('InvalidConfigError')) as raised:
++          self.compiler.Start(self.output, '', 'build.yaml')
++
++        self.assertIn('build.yaml', str(raised.exception))
++        with open(self.output, encoding='utf-8') as handle:
++          self.assertEqual(handle.read(), marker)
++        self.assertEqual(self.build_info.ActiveConfigPath(), [])
++
++  def test_invalid_references_are_rejected_at_the_containing_source(self):
++    invalid_controls = [
++        {'include': 'sub/child.yaml'},
++        {'include': [['sub']]},
++        {'include': [[1, 'child.yaml']]},
++        {'template': 'missing'},
++        {'template': ['missing']},
++        {'template': [1]},
++    ]
++    for control in invalid_controls:
++      with self.subTest(control=control):
++        self._write_yaml('build.yaml', {
++            'templates': {},
++            'controls': [control],
++        })
++
++        with self.assertRaises(self._public_error('InvalidConfigError')) as raised:
++          self.compiler.Start(self.output, '', 'build.yaml')
++
++        self.assertIn('build.yaml', str(raised.exception))
++        self.assertEqual(self.build_info.ActiveConfigPath(), [])
++
++  def test_failed_include_restores_state_and_same_instance_can_retry(self):
++    self.build_info.ActiveConfigPath(set_to=['caller'])
++    self._write_yaml('caller/build.yaml', {
++        'controls': [{'include': [['sub', 'missing.yaml']]}]
++    })
++    with open(self.output, 'w', encoding='utf-8') as handle:
++      handle.write('keep me\n')
++
++    with self.assertRaises(builder.ConfigBuilderError):
++      self.compiler.Start(self.output, '', 'build.yaml')
++
++    self.assertEqual(self.build_info.ActiveConfigPath(), ['caller'])
++    with open(self.output, encoding='utf-8') as handle:
++      self.assertEqual(handle.read(), 'keep me\n')
++
++    self._write_yaml('caller/build.yaml', {'controls': [{'Sleep': [7]}]})
++    trace = self._trace(self._compile())
++    self.assertIn(('Sleep', [7], ['caller'], self.old_root), trace)
++    self.assertEqual(self.build_info.ActiveConfigPath(), ['caller'])
++
++  def test_server_change_restarts_transactionally_at_normalized_new_root(self):
++    new_root = os.path.join(self.root, 'new')
++    os.makedirs(new_root)
++    self._write_yaml('build.yaml', {
++        'controls': [
++            {'Sleep': [1]},
++            {'ChangeServer': [new_root, '/replacement/root/']},
++            {'Sleep': [99]},
++        ]
++    })
++    self._write_yaml(
++        'replacement/root/build.yaml',
++        {'controls': [{'Sleep': [2]}]},
++        root=new_root)
++
++    try:
++      trace = self._trace(self._compile())
++    except builder.ConfigBuilderError as error:
++      self.fail(f'server-change recompilation failed: {error}')
++
++    self.assertEqual([args for name, args, _, _ in trace if name == 'Sleep'],
++                     [[2]])
++    self.assertTrue(all(server == new_root for *_, server in trace))
++    self.assertTrue(all(path == ['replacement', 'root']
++                        for _, _, path, _ in trace))
++    self.assertEqual(self.build_info.ConfigServer(), new_root)
++    self.assertEqual(self.build_info.ActiveConfigPath(), [])
++
++
++if __name__ == '__main__':
++  absltest.main()
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,5 @@
++#!/bin/bash
++set -euo pipefail
++
++python -m glazier.lib.config.synthesis_builder_safety_test
++python -m glazier.lib.buildinfo_test

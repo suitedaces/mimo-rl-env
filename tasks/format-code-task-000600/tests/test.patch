@@ -1,0 +1,467 @@
+diff --git a/hidden/config_cli_test.go b/hidden/config_cli_test.go
+new file mode 100644
+index 00000000..4fb024c3
+--- /dev/null
++++ b/hidden/config_cli_test.go
+@@ -0,0 +1,431 @@
++package hidden
++
++import (
++	"encoding/json"
++	"io/ioutil"
++	"net/http"
++	"net/http/httptest"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"strings"
++	"sync"
++	"testing"
++
++	"github.com/docker/docker/api/types"
++	"github.com/docker/docker/api/types/container"
++)
++
++type packResult struct {
++	stdout string
++	stderr string
++	err    error
++}
++
++var (
++	packBuildOnce sync.Once
++	packBuildPath string
++	packBuildErr  error
++)
++
++func repoRoot(t *testing.T) string {
++	t.Helper()
++
++	dir, err := os.Getwd()
++	if err != nil {
++		t.Fatalf("getting working directory: %v", err)
++	}
++	for {
++		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
++			return dir
++		}
++		next := filepath.Dir(dir)
++		if next == dir {
++			t.Fatalf("could not find repo root from %s", dir)
++		}
++		dir = next
++	}
++}
++
++func packBinary(t *testing.T) string {
++	t.Helper()
++
++	packBuildOnce.Do(func() {
++		tmpDir, err := ioutil.TempDir("", "pack-hidden-bin")
++		if err != nil {
++			packBuildErr = err
++			return
++		}
++		packBuildPath = filepath.Join(tmpDir, "pack")
++		cmd := exec.Command("go", "build", "-buildvcs=false", "-o", packBuildPath, "./cmd/pack")
++		cmd.Dir = repoRoot(t)
++		out, err := cmd.CombinedOutput()
++		if err != nil {
++			packBuildErr = &commandError{err: err, output: string(out)}
++		}
++	})
++
++	if packBuildErr != nil {
++		t.Fatalf("building pack CLI: %v", packBuildErr)
++	}
++	return packBuildPath
++}
++
++type commandError struct {
++	err    error
++	output string
++}
++
++func (e *commandError) Error() string {
++	return e.err.Error() + "\n" + e.output
++}
++
++func runPack(t *testing.T, packHome string, extraEnv []string, args ...string) packResult {
++	t.Helper()
++
++	cmdArgs := append([]string{"--no-color"}, args...)
++	cmd := exec.Command(packBinary(t), cmdArgs...)
++	cmd.Dir = repoRoot(t)
++	cmd.Env = append(os.Environ(), "PACK_HOME="+packHome)
++	cmd.Env = append(cmd.Env, extraEnv...)
++
++	out, err := cmd.CombinedOutput()
++	output := string(out)
++	return packResult{
++		stdout: output,
++		stderr: output,
++		err:    err,
++	}
++}
++
++func writeConfig(t *testing.T, packHome, body string) {
++	t.Helper()
++
++	if err := os.MkdirAll(packHome, 0755); err != nil {
++		t.Fatalf("creating PACK_HOME: %v", err)
++	}
++	if err := ioutil.WriteFile(filepath.Join(packHome, "config.toml"), []byte(body), 0644); err != nil {
++		t.Fatalf("writing config: %v", err)
++	}
++}
++
++func assertContains(t *testing.T, got, want string) {
++	t.Helper()
++	if !strings.Contains(got, want) {
++		t.Fatalf("expected output to contain %q, got:\n%s", want, got)
++	}
++}
++
++func assertNotContains(t *testing.T, got, unwanted string) {
++	t.Helper()
++	if strings.Contains(got, unwanted) {
++		t.Fatalf("expected output not to contain %q, got:\n%s", unwanted, got)
++	}
++}
++
++func assertOutputNotEmpty(t *testing.T, got string) {
++	t.Helper()
++	if strings.TrimSpace(got) == "" {
++		t.Fatalf("expected command to produce output")
++	}
++}
++
++func readConfigFile(t *testing.T, packHome string) string {
++	t.Helper()
++
++	body, err := ioutil.ReadFile(filepath.Join(packHome, "config.toml"))
++	if os.IsNotExist(err) {
++		return ""
++	}
++	if err != nil {
++		t.Fatalf("reading config: %v", err)
++	}
++	return string(body)
++}
++
++func newPackHome(t *testing.T) string {
++	t.Helper()
++
++	dir, err := ioutil.TempDir("", "pack-home")
++	if err != nil {
++		t.Fatalf("creating temporary PACK_HOME: %v", err)
++	}
++	t.Cleanup(func() {
++		_ = os.RemoveAll(dir)
++	})
++	return dir
++}
++
++func fakeDockerHost(t *testing.T, found bool) string {
++	t.Helper()
++
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		switch {
++		case strings.HasSuffix(r.URL.Path, "/info"):
++			_ = json.NewEncoder(w).Encode(types.Info{OSType: "linux"})
++		case strings.Contains(r.URL.Path, "/images/") && strings.HasSuffix(r.URL.Path, "/json"):
++			if !found {
++				http.NotFound(w, r)
++				return
++			}
++			_ = json.NewEncoder(w).Encode(types.ImageInspect{
++				ID:           "sha256:1111111111111111111111111111111111111111111111111111111111111111",
++				Architecture: "amd64",
++				Os:           "linux",
++				Config: &container.Config{Labels: map[string]string{
++					"io.buildpacks.builder.metadata": `{"description":"hidden local builder","buildpacks":[],"stack":{"runImage":{"image":"example.com/run-image","mirrors":[]}},"lifecycle":{"version":"0.0.1","api":{"buildpack":"0.2","platform":"0.3"}}}`,
++					"io.buildpacks.stack.id":         "hidden.stack.id",
++					"io.buildpacks.stack.mixins":     "[]",
++					"io.buildpacks.buildpack.order":  "[]",
++					"io.buildpacks.buildpack.layers": "{}",
++				}},
++				RootFS: types.RootFS{Type: "layers"},
++			})
++		default:
++			http.NotFound(w, r)
++		}
++	}))
++	t.Cleanup(server.Close)
++	return "tcp://" + strings.TrimPrefix(server.URL, "http://")
++}
++
++func fakeMissingRegistry(t *testing.T) string {
++	t.Helper()
++
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		if r.URL.Path == "/v2/" || r.URL.Path == "/v2" {
++			w.WriteHeader(http.StatusOK)
++			return
++		}
++		http.NotFound(w, r)
++	}))
++	t.Cleanup(server.Close)
++	return strings.TrimPrefix(server.URL, "http://")
++}
++
++func TestConfigDefaultBuilderCLI_ListShowsExistingDefault(t *testing.T) {
++	packHome := newPackHome(t)
++	builder := "example.com/hidden/list-builder:one"
++	writeConfig(t, packHome, "default-builder-image = \""+builder+"\"\n")
++
++	result := runPack(t, packHome, nil, "config", "default-builder")
++	if result.err != nil {
++		t.Fatalf("pack config default-builder failed: %v\n%s", result.err, result.stderr)
++	}
++
++	assertContains(t, result.stdout, builder)
++}
++
++func TestConfigDefaultBuilderCLI_ListWhenUnsetShowsGuidance(t *testing.T) {
++	packHome := newPackHome(t)
++
++	result := runPack(t, packHome, nil, "config", "default-builder")
++	if result.err != nil {
++		t.Fatalf("pack config default-builder failed: %v\n%s", result.err, result.stderr)
++	}
++
++	assertOutputNotEmpty(t, result.stdout)
++}
++
++func TestConfigDefaultBuilderCLI_SetPersistsWhenBuilderExistsLocally(t *testing.T) {
++	packHome := newPackHome(t)
++	builder := "example.com/hidden/local-builder:one"
++	env := []string{"DOCKER_HOST=" + fakeDockerHost(t, true)}
++
++	result := runPack(t, packHome, env, "config", "default-builder", builder)
++	if result.err != nil {
++		t.Fatalf("pack config default-builder %s failed: %v\n%s", builder, result.err, result.stderr)
++	}
++	list := runPack(t, packHome, nil, "config", "default-builder")
++	if list.err != nil {
++		t.Fatalf("listing default builder after set failed: %v\n%s", list.err, list.stderr)
++	}
++	assertContains(t, list.stdout, builder)
++}
++
++func TestConfigDefaultBuilderCLI_MissingBuilderFailsWithoutChangingExistingDefault(t *testing.T) {
++	packHome := newPackHome(t)
++	originalBuilder := "example.com/hidden/original-builder:one"
++	missingBuilder := fakeMissingRegistry(t) + "/hidden/missing-builder:one"
++	writeConfig(t, packHome, "default-builder-image = \""+originalBuilder+"\"\n")
++
++	env := []string{"DOCKER_HOST=" + fakeDockerHost(t, false)}
++	result := runPack(t, packHome, env, "config", "default-builder", missingBuilder)
++	if result.err == nil {
++		t.Fatalf("expected setting a missing builder to fail, got success:\n%s", result.stdout)
++	}
++
++	list := runPack(t, packHome, nil, "config", "default-builder")
++	if list.err != nil {
++		t.Fatalf("listing default builder after failed set failed: %v\n%s", list.err, list.stderr)
++	}
++	assertContains(t, list.stdout, originalBuilder)
++	assertNotContains(t, list.stdout, missingBuilder)
++}
++
++func TestConfigDefaultBuilderCLI_UnsetClearsExistingDefaultWithLongAndShortFlags(t *testing.T) {
++	for _, flag := range []string{"--unset", "-u"} {
++		t.Run(flag, func(t *testing.T) {
++			packHome := newPackHome(t)
++			builder := "example.com/hidden/unset-builder-" + strings.TrimLeft(flag, "-") + ":one"
++			writeConfig(t, packHome, "default-builder-image = \""+builder+"\"\n")
++
++			result := runPack(t, packHome, nil, "config", "default-builder", flag)
++			if result.err != nil {
++				t.Fatalf("pack config default-builder %s failed: %v\n%s", flag, result.err, result.stderr)
++			}
++
++			assertOutputNotEmpty(t, result.stdout)
++			assertNotContains(t, readConfigFile(t, packHome), builder)
++
++			list := runPack(t, packHome, nil, "config", "default-builder")
++			if list.err != nil {
++				t.Fatalf("listing after unset failed: %v\n%s", list.err, list.stderr)
++			}
++			assertOutputNotEmpty(t, list.stdout)
++			assertNotContains(t, list.stdout, builder)
++		})
++	}
++}
++
++func TestConfigDefaultBuilderCLI_UnsetWhenEmptyReportsNoop(t *testing.T) {
++	packHome := newPackHome(t)
++
++	result := runPack(t, packHome, nil, "config", "default-builder", "--unset")
++	if result.err != nil {
++		t.Fatalf("pack config default-builder --unset failed: %v\n%s", result.err, result.stderr)
++	}
++
++	assertOutputNotEmpty(t, result.stdout)
++
++	list := runPack(t, packHome, nil, "config", "default-builder")
++	if list.err != nil {
++		t.Fatalf("listing after empty unset failed: %v\n%s", list.err, list.stderr)
++	}
++	assertOutputNotEmpty(t, list.stdout)
++}
++
++func newCustomPackHome(t *testing.T, pattern string) string {
++	t.Helper()
++
++	dir, err := ioutil.TempDir("", pattern)
++	if err != nil {
++		t.Fatalf("creating custom temporary PACK_HOME: %v", err)
++	}
++	t.Cleanup(func() {
++		_ = os.RemoveAll(dir)
++	})
++	return dir
++}
++
++func TestConfigDefaultBuilderCLI_ListWhenUnsetShowsGuidanceOutsidePackHomePath(t *testing.T) {
++	packHome := newCustomPackHome(t, "config-home")
++
++	result := runPack(t, packHome, nil, "config", "default-builder")
++	if result.err != nil {
++		t.Fatalf("pack config default-builder failed: %v\n%s", result.err, result.stderr)
++	}
++
++	assertOutputNotEmpty(t, result.stdout)
++}
++
++func TestConfigDefaultBuilderCLI_SetPersistsDifferentValidBuilder(t *testing.T) {
++	packHome := newPackHome(t)
++	builder := "example.com/hidden/alternate-local-builder:two"
++	env := []string{"DOCKER_HOST=" + fakeDockerHost(t, true)}
++
++	result := runPack(t, packHome, env, "config", "default-builder", builder)
++	if result.err != nil {
++		t.Fatalf("pack config default-builder %s failed: %v\n%s", builder, result.err, result.stderr)
++	}
++
++	list := runPack(t, packHome, nil, "config", "default-builder")
++	if list.err != nil {
++		t.Fatalf("listing default builder after set failed: %v\n%s", list.err, list.stderr)
++	}
++	assertContains(t, list.stdout, builder)
++}
++
++func TestConfigDefaultBuilderCLI_MissingDifferentBuilderFailsWithoutChangingExistingDefault(t *testing.T) {
++	packHome := newPackHome(t)
++	originalBuilder := "example.com/hidden/original-builder:two"
++	missingBuilder := fakeMissingRegistry(t) + "/other/missing-builder:two"
++	writeConfig(t, packHome, "default-builder-image = \""+originalBuilder+"\"\n")
++
++	env := []string{"DOCKER_HOST=" + fakeDockerHost(t, false)}
++	result := runPack(t, packHome, env, "config", "default-builder", missingBuilder)
++	if result.err == nil {
++		t.Fatalf("expected setting a missing builder to fail, got success:\n%s", result.stdout)
++	}
++
++	list := runPack(t, packHome, nil, "config", "default-builder")
++	if list.err != nil {
++		t.Fatalf("listing default builder after failed set failed: %v\n%s", list.err, list.stderr)
++	}
++	assertContains(t, list.stdout, originalBuilder)
++	assertNotContains(t, list.stdout, missingBuilder)
++}
++
++func TestConfigDefaultBuilderCLI_UnsetClearsDifferentExistingDefault(t *testing.T) {
++	packHome := newPackHome(t)
++	builder := "example.com/hidden/clear-me-different:one"
++	writeConfig(t, packHome, "default-builder-image = \""+builder+"\"\n")
++
++	result := runPack(t, packHome, nil, "config", "default-builder", "--unset")
++	if result.err != nil {
++		t.Fatalf("pack config default-builder --unset failed: %v\n%s", result.err, result.stderr)
++	}
++	assertOutputNotEmpty(t, result.stdout)
++	assertNotContains(t, readConfigFile(t, packHome), builder)
++
++	list := runPack(t, packHome, nil, "config", "default-builder")
++	if list.err != nil {
++		t.Fatalf("listing after unset failed: %v\n%s", list.err, list.stderr)
++	}
++	assertOutputNotEmpty(t, list.stdout)
++	assertNotContains(t, list.stdout, builder)
++}
++
++func TestConfigDefaultBuilderCLI_UnsetWhenEmptyReportsNoopOutsidePackHomePath(t *testing.T) {
++	packHome := newCustomPackHome(t, "config-home")
++
++	result := runPack(t, packHome, nil, "config", "default-builder", "--unset")
++	if result.err != nil {
++		t.Fatalf("pack config default-builder --unset failed: %v\n%s", result.err, result.stderr)
++	}
++
++	assertOutputNotEmpty(t, result.stdout)
++}
++
++func TestConfigTrustedBuildersCLI_AliasesCoverListAndMutatingSubcommands(t *testing.T) {
++	packHome := newPackHome(t)
++	builder := "example.com/hidden/trusted-alias-builder:one"
++
++	add := runPack(t, packHome, nil, "config", "trust-builder", "add", builder)
++	if add.err != nil {
++		t.Fatalf("trust-builder add failed: %v\n%s", add.err, add.stderr)
++	}
++
++	listAfterAdd := runPack(t, packHome, nil, "config", "trusted-builders")
++	if listAfterAdd.err != nil {
++		t.Fatalf("trusted-builders list after alias add failed: %v\n%s", listAfterAdd.err, listAfterAdd.stderr)
++	}
++	assertContains(t, listAfterAdd.stdout, builder)
++
++	aliasList := runPack(t, packHome, nil, "config", "trust-builders")
++	if aliasList.err != nil {
++		t.Fatalf("trust-builders list failed: %v\n%s", aliasList.err, aliasList.stderr)
++	}
++	assertContains(t, aliasList.stdout, builder)
++
++	remove := runPack(t, packHome, nil, "config", "trust-builders", "remove", builder)
++	if remove.err != nil {
++		t.Fatalf("trust-builders remove failed: %v\n%s", remove.err, remove.stderr)
++	}
++
++	listAfterRemove := runPack(t, packHome, nil, "config", "trusted-builders")
++	if listAfterRemove.err != nil {
++		t.Fatalf("trusted-builders list after alias remove failed: %v\n%s", listAfterRemove.err, listAfterRemove.stderr)
++	}
++	assertNotContains(t, listAfterRemove.stdout, builder)
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,25 @@
++#!/bin/bash
++set -uo pipefail
++cd /testbed
++
++
++if ! id testuser >/dev/null 2>&1; then
++    useradd -m testuser
++fi
++
++chmod -R a+rwX /root/go/pkg/mod 2>/dev/null || true
++chmod -R a+rwX /testbed 2>/dev/null || true
++
++
++case "${1:-}" in
++  base)
++    go test -v -count=1 ./cmd
++    ;;
++  new)
++    go test -v -count=1 ./hidden
++    ;;
++  *)
++    echo "usage: $0 base|new"
++    exit 2
++    ;;
++esac

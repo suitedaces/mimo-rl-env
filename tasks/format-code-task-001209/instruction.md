@@ -1,0 +1,5 @@
+I want the `Multimeter` class to provide a `measure_resistance(self) -> float` method for measuring a resistor connected between the PSLab `RES` pin and `GND`. In a normal session, I should be able to create `meter = Multimeter(device)` and call `meter.measure_resistance()` to get the resistance in ohms as a numeric float.
+
+The method should read the voltage on the `RES` input, treat the circuit as a divider with a 5.1 kOhm pull-up to the top of the `RES` input range, and compute `resistance = measured_voltage / current`, where `current = (top_of_res_range - measured_voltage) / 5100`. For example, if the `RES` reading is 2.2 V on a 0 to 3.3 V range, the method should return approximately 10200 ohms. If the `RES` reading is 1.65 V on the same range, it should return approximately 5100 ohms.
+
+For an open circuit or saturated reading, when the measured voltage is within one ADC count of the top of the `RES` range, `measure_resistance()` should return positive infinity instead of raising or dividing by zero. Calling it repeatedly on the same `Multimeter` instance should perform a fresh measurement each time and return the value for the current hardware state.

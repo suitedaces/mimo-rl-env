@@ -1,0 +1,451 @@
+diff --git a/tests/scripts/post_delete_hook_mock.sh b/tests/scripts/post_delete_hook_mock.sh
+new file mode 100644
+index 0000000..65ab214
+--- /dev/null
++++ b/tests/scripts/post_delete_hook_mock.sh
+@@ -0,0 +1,198 @@
++#!/bin/bash
++set -u
++
++tool="${0##*/}"
++: "${MOCK_LOG:?}"
++: "${MOCK_CASE:?}"
++
++{
++  printf '%s' "${tool}"
++  printf '\t%s' "$@"
++  printf '\n'
++} >> "${MOCK_LOG}"
++
++argument_after() {
++  local wanted="$1"
++  shift
++  local previous=""
++  local argument
++  for argument in "$@"; do
++    if [[ "${previous}" == "${wanted}" ]]; then
++      printf '%s' "${argument}"
++      return
++    fi
++    previous="${argument}"
++  done
++}
++
++namespace_from_args() {
++  local namespace
++  namespace="$(argument_after -n "$@")"
++  if [[ -z "${namespace}" ]]; then
++    namespace="$(argument_after --namespace "$@")"
++  fi
++  local argument
++  for argument in "$@"; do
++    if [[ "${argument}" == --namespace=* ]]; then
++      namespace="${argument#--namespace=}"
++    fi
++    if [[ "${argument}" == -n=* ]]; then
++      namespace="${argument#-n=}"
++    fi
++  done
++  printf '%s' "${namespace}"
++}
++
++release_from_args() {
++  local seen_uninstall=false
++  local skip_next=false
++  local argument
++  for argument in "$@"; do
++    if [[ "${skip_next}" == true ]]; then
++      skip_next=false
++      continue
++    fi
++    if [[ "${seen_uninstall}" == false ]]; then
++      [[ "${argument}" == uninstall ]] && seen_uninstall=true
++      continue
++    fi
++    case "${argument}" in
++      -n|--namespace) skip_next=true ;;
++      -*) ;;
++      *) printf '%s' "${argument}"; return ;;
++    esac
++  done
++}
++
++app_from_args() {
++  local selector=""
++  selector="$(argument_after --selector "$@")"
++  if [[ -z "${selector}" ]]; then
++    selector="$(argument_after -l "$@")"
++  fi
++  local argument
++  for argument in "$@"; do
++    case "${argument}" in
++      --selector=*|-l=*) selector="${argument#*=}" ;;
++    esac
++  done
++  printf '%s' "${selector#app=}"
++}
++
++has_argument() {
++  local wanted="$1"
++  shift
++  local argument
++  for argument in "$@"; do
++    [[ "${argument}" == "${wanted}" ]] && return 0
++  done
++  return 1
++}
++
++emit_pods() {
++  local count="$1"
++  shift
++  local joined=" $* "
++  if [[ "${joined}" == *"jsonpath"* ]]; then
++    printf '%s' "${count}"
++  elif has_argument json "$@" || [[ "${joined}" == *" json"* ]]; then
++    if [[ "${count}" -eq 0 ]]; then
++      printf '{"items":[]}'
++    else
++      printf '{"items":[{"metadata":{"name":"remaining"}}]}'
++    fi
++  elif [[ "${count}" -gt 0 ]]; then
++    printf 'pod/remaining\n'
++  fi
++}
++
++case "${tool}" in
++  helm)
++    command="${1:-}"
++    if [[ "${command}" == list ]]; then
++      namespace="$(namespace_from_args "$@")"
++      if [[ "${MOCK_CASE}" == list-error && "${namespace}" == alpha ]]; then
++        printf 'repository unavailable\n' >&2
++        exit 11
++      fi
++      case "${MOCK_CASE}:${namespace}" in
++        success:alpha) printf 'ready\naddon.crd\n' ;;
++        success:beta) printf 'steady\n' ;;
++        uninstall-error:alpha|poll-error:alpha) printf 'broken\nready\n' ;;
++        timeout:alpha) printf 'stuck\nready\n' ;;
++        list-error:beta|ops-list:alpha|ops-delete:alpha|bootstrap-error:alpha|validation:alpha) printf 'ready\n' ;;
++      esac
++      exit 0
++    fi
++    if [[ "${command}" == uninstall ]]; then
++      release="$(release_from_args "$@")"
++      if [[ "${MOCK_CASE}" == uninstall-error && "${release}" == broken ]]; then
++        printf 'uninstall refused\n'
++        exit 17
++      fi
++      exit 0
++    fi
++    printf 'unexpected helm invocation\n' >&2
++    exit 90
++    ;;
++  kubectl)
++    joined=" $* "
++    if [[ "${joined}" == *" delete "* && "${joined}" == *" secret "* && "${joined}" == *" bootstrap-secret "* ]]; then
++      if [[ "${MOCK_CASE}" == bootstrap-error ]]; then
++        printf 'bootstrap delete denied\n' >&2
++        exit 15
++      fi
++      exit 0
++    fi
++    if [[ "${joined}" == *" delete "* && "${joined}" == *"helm-operation-fail"* ]]; then
++      printf 'operation pod delete denied\n' >&2
++      exit 14
++    fi
++    if [[ "${joined}" == *" delete "* ]]; then
++      exit 0
++    fi
++    if [[ "${joined}" == *" wait "* ]]; then
++      app="$(app_from_args "$@")"
++      if [[ "${MOCK_CASE}" == timeout && "${app}" == stuck ]]; then
++        exit 1
++      fi
++      if [[ "${MOCK_CASE}" == poll-error && "${app}" == broken ]]; then
++        exit 12
++      fi
++      exit 0
++    fi
++    if [[ "${joined}" == *" get pod "* || "${joined}" == *" get pods "* ]]; then
++      app="$(app_from_args "$@")"
++      if [[ -n "${app}" ]]; then
++        if [[ "${MOCK_CASE}" == poll-error && "${app}" == broken ]]; then
++          printf 'pod lookup failed\n' >&2
++          exit 12
++        fi
++        if [[ "${MOCK_CASE}" == timeout && "${app}" == stuck ]]; then
++          emit_pods 1 "$@"
++        else
++          emit_pods 0 "$@"
++        fi
++        exit 0
++      fi
++      if [[ "${MOCK_CASE}" == ops-list ]]; then
++        printf 'operation pod list denied\n' >&2
++        exit 13
++      fi
++      if [[ "${MOCK_CASE}" == ops-delete ]]; then
++        printf 'pod/helm-operation-fail\n'
++      else
++        printf 'pod/helm-operation-old\n'
++      fi
++      exit 0
++    fi
++    printf 'unexpected kubectl invocation\n' >&2
++    exit 91
++    ;;
++  sleep)
++    exit 0
++    ;;
++esac
++
++printf 'unexpected mock tool %s\n' "${tool}" >&2
++exit 92
+diff --git a/tests/scripts/post_delete_hook_contract_test.sh b/tests/scripts/post_delete_hook_contract_test.sh
+new file mode 100644
+index 0000000..aa24c55
+--- /dev/null
++++ b/tests/scripts/post_delete_hook_contract_test.sh
+@@ -0,0 +1,228 @@
++#!/bin/bash
++set -euo pipefail
++
++repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
++hook="${repo_root}/chart/scripts/post-delete-hook.sh"
++scratch="$(mktemp -d)"
++mock_bin="${scratch}/bin"
++mock_log="${scratch}/commands.log"
++last_output="${scratch}/output.log"
++last_status=0
++failures=0
++mkdir -p "${mock_bin}"
++trap 'rm -rf "${scratch}"' EXIT
++
++cp "${repo_root}/tests/scripts/post_delete_hook_mock.sh" "${mock_bin}/mock-tool"
++chmod +x "${mock_bin}/mock-tool"
++ln -s mock-tool "${mock_bin}/helm"
++ln -s mock-tool "${mock_bin}/kubectl"
++ln -s mock-tool "${mock_bin}/sleep"
++
++fail() {
++  printf 'FAIL: %s\n' "$*" >&2
++  failures=$((failures + 1))
++}
++
++assert_status() {
++  local expected="$1"
++  local label="$2"
++  if [[ "${last_status}" -ne "${expected}" ]]; then
++    fail "${label}: expected status ${expected}, got ${last_status}; output: $(tr '\n' ' ' < "${last_output}")"
++  fi
++}
++
++assert_log_matches() {
++  local pattern="$1"
++  local label="$2"
++  if ! grep -Eq "${pattern}" "${mock_log}"; then
++    fail "${label}: command log did not match ${pattern}"
++  fi
++}
++
++assert_log_not_matches() {
++  local pattern="$1"
++  local label="$2"
++  if grep -Eq "${pattern}" "${mock_log}"; then
++    fail "${label}: command log unexpectedly matched ${pattern}"
++  fi
++}
++
++assert_log_match_count() {
++  local expected="$1"
++  local pattern="$2"
++  local label="$3"
++  local count
++  count="$(grep -Ec "${pattern}" "${mock_log}" || true)"
++  if [[ "${count}" -ne "${expected}" ]]; then
++    fail "${label}: expected ${expected} matching commands, got ${count}"
++  fi
++}
++
++assert_output_matches() {
++  local pattern="$1"
++  local label="$2"
++  if ! grep -Eqi "${pattern}" "${last_output}"; then
++    fail "${label}: output did not match ${pattern}"
++  fi
++}
++
++reset_run() {
++  : > "${mock_log}"
++  : > "${last_output}"
++  last_status=0
++}
++
++run_hook() {
++  local scenario="$1"
++  local namespaces="$2"
++  local timeout="$3"
++  local ignore_timeout="$4"
++  reset_run
++  set +e
++  env PATH="${mock_bin}:${PATH}" \
++    MOCK_CASE="${scenario}" MOCK_LOG="${mock_log}" \
++    NAMESPACES="${namespaces}" RANCHER_NAMESPACE="cattle-system" \
++    TIMEOUT="${timeout}" IGNORETIMEOUTERROR="${ignore_timeout}" \
++    bash "${hook}" > "${last_output}" 2>&1
++  last_status=$?
++  set -e
++}
++
++run_without_required_input() {
++  local omitted="$1"
++  reset_run
++  set +e
++  (
++    export PATH="${mock_bin}:${PATH}"
++    export MOCK_CASE=validation MOCK_LOG="${mock_log}"
++    export NAMESPACES=alpha RANCHER_NAMESPACE=cattle-system
++    export TIMEOUT=10 IGNORETIMEOUTERROR=false
++    unset "${omitted}"
++    bash "${hook}"
++  ) > "${last_output}" 2>&1
++  last_status=$?
++  set -e
++}
++
++printf 'case: input validation\n'
++for omitted in NAMESPACES RANCHER_NAMESPACE TIMEOUT IGNORETIMEOUTERROR; do
++  run_without_required_input "${omitted}"
++  if [[ "${last_status}" -eq 0 ]]; then
++    fail "missing ${omitted} must be rejected"
++  fi
++  if [[ -s "${mock_log}" ]]; then
++    fail "tools were invoked before ${omitted} validation completed"
++  fi
++  assert_output_matches "${omitted}|namespace|timeout|ignore" "missing ${omitted} diagnostic"
++done
++
++run_hook validation '   ' 10 false
++if [[ "${last_status}" -eq 0 ]]; then
++  fail "whitespace-only NAMESPACES must be rejected"
++fi
++if [[ -s "${mock_log}" ]]; then
++  fail "tools were invoked for whitespace-only NAMESPACES"
++fi
++
++run_hook validation alpha twelve false
++if [[ "${last_status}" -eq 0 ]]; then
++  fail "non-integer TIMEOUT must be rejected"
++fi
++if [[ -s "${mock_log}" ]]; then
++  fail "tools were invoked before TIMEOUT validation completed"
++fi
++assert_output_matches 'timeout' 'invalid TIMEOUT diagnostic'
++
++run_hook validation alpha -1 false
++if [[ "${last_status}" -eq 0 ]]; then
++  fail "negative TIMEOUT must be rejected"
++fi
++if [[ -s "${mock_log}" ]]; then
++  fail "tools were invoked before negative TIMEOUT validation completed"
++fi
++
++run_hook validation alpha 10 yes
++if [[ "${last_status}" -eq 0 ]]; then
++  fail "IGNORETIMEOUTERROR other than true or false must be rejected"
++fi
++if [[ -s "${mock_log}" ]]; then
++  fail "tools were invoked before IGNORETIMEOUTERROR validation completed"
++fi
++assert_output_matches 'ignore|true|false' 'invalid IGNORETIMEOUTERROR diagnostic'
++
++printf 'case: successful aggregate cleanup and namespace deduplication\n'
++run_hook success 'alpha alpha beta' 10 false
++assert_status 0 'successful cleanup'
++assert_log_match_count 1 '^helm.*list.*alpha' 'alpha namespace is processed once'
++assert_log_match_count 1 '^helm.*list.*beta' 'beta namespace is processed once'
++assert_log_matches '^helm.*uninstall.*ready' 'ready release uninstall'
++assert_log_matches '^helm.*uninstall.*steady' 'steady release uninstall'
++assert_log_not_matches '^helm.*uninstall.*addon\.crd' 'CRD release skip'
++assert_log_matches '^kubectl.*delete.*helm-operation-old' 'helm operation pod cleanup'
++assert_log_matches 'kubectl.*delete.*secret.*bootstrap-secret' 'bootstrap secret cleanup'
++assert_output_matches 'success|finished' 'successful summary'
++
++printf 'case: namespace listing failure is isolated\n'
++run_hook list-error 'alpha beta' 10 false
++assert_status 2 'list failure aggregate status'
++assert_log_matches '^helm.*list.*beta' 'later namespace listed after list failure'
++assert_log_matches '^helm.*uninstall.*ready' 'later namespace release uninstalled'
++assert_log_matches 'kubectl.*delete.*secret.*bootstrap-secret' 'bootstrap cleanup after list failure'
++assert_output_matches 'alpha.*list|list.*alpha' 'list failure summary identity and reason'
++
++printf 'case: uninstall failure is hard and does not block later work\n'
++run_hook uninstall-error alpha 10 true
++assert_status 2 'uninstall failure remains hard when timeout errors are ignored'
++assert_log_matches '^helm.*uninstall.*broken' 'failing uninstall attempted'
++assert_log_matches '^helm.*uninstall.*ready' 'later uninstall attempted'
++assert_log_not_matches 'kubectl.*(selector|-l).*app=broken' 'failed uninstall is not polled'
++assert_log_matches 'kubectl.*delete.*secret.*bootstrap-secret' 'bootstrap cleanup after uninstall failure'
++assert_output_matches 'broken.*uninstall|uninstall.*broken' 'uninstall failure summary identity and reason'
++
++printf 'case: timeout policy applies only to timeouts\n'
++run_hook timeout alpha 0 false
++assert_status 2 'non-ignored timeout status'
++assert_log_matches 'kubectl.*(selector|-l).*app=stuck' 'one immediate pod check at zero timeout'
++assert_log_not_matches '^sleep' 'zero timeout does not sleep'
++assert_log_matches '^helm.*uninstall.*ready' 'later release continues after timeout'
++assert_log_matches 'kubectl.*delete.*secret.*bootstrap-secret' 'bootstrap cleanup after timeout'
++assert_output_matches 'stuck.*timeout|timeout.*stuck' 'timeout summary identity and reason'
++
++run_hook timeout alpha 0 true
++assert_status 0 'ignored timeout status'
++assert_log_matches '^helm.*uninstall.*ready' 'later release continues after ignored timeout'
++assert_log_matches 'kubectl.*delete.*secret.*bootstrap-secret' 'bootstrap cleanup after ignored timeout'
++
++printf 'case: pod inspection failure is isolated and hard\n'
++run_hook poll-error alpha 10 true
++assert_status 2 'pod inspection aggregate status'
++assert_log_matches '^helm.*uninstall.*ready' 'later release continues after pod lookup failure'
++assert_log_matches 'kubectl.*delete.*secret.*bootstrap-secret' 'bootstrap cleanup after pod lookup failure'
++assert_output_matches 'broken.*pod|pod.*broken' 'pod lookup failure summary identity and reason'
++
++printf 'case: operation pod listing failure still finalizes\n'
++run_hook ops-list alpha 10 true
++assert_status 2 'operation pod list aggregate status'
++assert_log_matches 'kubectl.*get.*pods' 'operation pod list attempted'
++assert_log_matches 'kubectl.*delete.*secret.*bootstrap-secret' 'bootstrap cleanup after operation pod list failure'
++assert_output_matches 'operation.*pod.*list|list.*operation.*pod' 'operation pod list failure summary'
++
++printf 'case: operation pod deletion failure still finalizes\n'
++run_hook ops-delete alpha 10 true
++assert_status 2 'operation pod delete aggregate status'
++assert_log_matches 'kubectl.*delete.*helm-operation-fail' 'operation pod delete attempted'
++assert_log_matches 'kubectl.*delete.*secret.*bootstrap-secret' 'bootstrap cleanup after operation pod delete failure'
++assert_output_matches 'helm-operation-fail|operation pod' 'operation pod failure summary'
++
++printf 'case: bootstrap secret failure is aggregated\n'
++run_hook bootstrap-error alpha 10 true
++assert_status 2 'bootstrap secret aggregate status'
++assert_log_matches 'kubectl.*delete.*secret.*bootstrap-secret' 'bootstrap secret delete attempted'
++assert_output_matches 'bootstrap' 'bootstrap failure summary'
++
++if [[ "${failures}" -ne 0 ]]; then
++  printf '%d contract assertion(s) failed\n' "${failures}" >&2
++  exit 1
++fi
++
++printf 'post-delete hook contract checks passed\n'
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,8 @@
++#!/bin/bash
++set -euo pipefail
++
++
++bash -n chart/scripts/post-delete-hook.sh
++bash -n tests/scripts/post_delete_hook_mock.sh
++bash -n tests/scripts/post_delete_hook_contract_test.sh
++bash tests/scripts/post_delete_hook_contract_test.sh

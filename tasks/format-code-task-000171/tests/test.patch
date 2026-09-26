@@ -1,0 +1,276 @@
+diff --git a/tests/test_comment_report.py b/tests/test_comment_report.py
+new file mode 100644
+index 00000000..6f2f6005
+--- /dev/null
++++ b/tests/test_comment_report.py
+@@ -0,0 +1,222 @@
++from enum import Enum
++
++import pytest
++
++from bilibili_api import comment
++from bilibili_api.exceptions import ArgsException
++from bilibili_api.utils import network
++from bilibili_api.utils.credential import Credential
++
++
++class ReportRequestRecorder:
++    calls = []
++    responses = []
++
++
++@pytest.fixture(autouse=True)
++def record_report_requests(monkeypatch):
++    ReportRequestRecorder.calls = []
++    ReportRequestRecorder.responses = []
++
++    async def fake_request(self, **kwargs):
++        if self.verify:
++            self.credential.raise_for_no_sessdata()
++        if self.method != "GET" and not self.no_csrf:
++            self.credential.raise_for_no_bili_jct()
++
++        ReportRequestRecorder.calls.append(
++            {
++                "method": self.method,
++                "url": self.url,
++                "data": dict(self.data),
++                "params": dict(self.params),
++            }
++        )
++        if ReportRequestRecorder.responses:
++            return ReportRequestRecorder.responses.pop(0)
++        return {"ok": True}
++
++
++
++    monkeypatch.setattr(network.Api, "request", fake_request)
++    yield ReportRequestRecorder
++
++
++def credential_with_session():
++    return Credential(sessdata="sessdata", bili_jct="csrf-token", buvid3="buvid")
++
++
++def make_comment(resource_id, comment_id, resource_type=None, credential=None):
++    if resource_type is None:
++        resource_type = comment.CommentResourceType.VIDEO
++    return comment.Comment(
++        resource_id,
++        resource_type,
++        comment_id,
++        credential=credential or credential_with_session(),
++    )
++
++
++def submitted_payload(call):
++    return call["data"] if call["data"] else call["params"]
++
++
++REPORT_REASON_VALUES = {
++    "other": 0,
++    "spam": 1,
++    "porn": 2,
++    "spoilers": 5,
++}
++
++
++def reason_for(category):
++    return comment.ReportReason(REPORT_REASON_VALUES[category])
++
++
++def assert_payload_values(call, *expected_values):
++    payload_values = list(submitted_payload(call).values())
++    for expected_value in expected_values:
++        assert expected_value in payload_values
++
++
++@pytest.mark.asyncio
++async def test_report_submits_for_this_comment_and_returns_dict(record_report_requests):
++    record_report_requests.responses = [{"ok": True, "case_id": "report-a"}]
++    cmt = make_comment(24680, 13579)
++    reason = reason_for("spam")
++
++    result = await cmt.report(reason)
++
++    assert result == {"ok": True, "case_id": "report-a"}
++    assert len(record_report_requests.calls) == 1
++    assert_payload_values(
++        record_report_requests.calls[0],
++        24680,
++        13579,
++        comment.CommentResourceType.VIDEO.value,
++        reason.value,
++    )
++
++
++@pytest.mark.asyncio
++async def test_report_uses_different_comment_identity_and_reason_values(
++    record_report_requests,
++):
++    record_report_requests.responses = [
++        {"ok": True, "case_id": "one"},
++        {"ok": True, "case_id": "two"},
++    ]
++    first = make_comment(111, 222)
++    second = make_comment(333, 444)
++    spoilers_reason = reason_for("spoilers")
++    porn_reason = reason_for("porn")
++
++    first_result = await first.report(spoilers_reason)
++    second_result = await second.report(porn_reason)
++
++    assert first_result == {"ok": True, "case_id": "one"}
++    assert second_result == {"ok": True, "case_id": "two"}
++    assert len(record_report_requests.calls) == 2
++    first_payload = submitted_payload(record_report_requests.calls[0])
++    second_payload = submitted_payload(record_report_requests.calls[1])
++    assert_payload_values(record_report_requests.calls[0], 111, 222, spoilers_reason.value)
++    assert_payload_values(record_report_requests.calls[1], 333, 444, porn_reason.value)
++    assert first_payload != second_payload
++
++
++@pytest.mark.asyncio
++async def test_report_preserves_non_video_comment_identity(record_report_requests):
++    record_report_requests.responses = [{"ok": True, "case_id": "article"}]
++    cmt = make_comment(
++        424242,
++        313131,
++        resource_type=comment.CommentResourceType.ARTICLE,
++    )
++    reason = reason_for("porn")
++
++    result = await cmt.report(reason)
++
++    assert result == {"ok": True, "case_id": "article"}
++    assert len(record_report_requests.calls) == 1
++    assert_payload_values(
++        record_report_requests.calls[0],
++        424242,
++        313131,
++        comment.CommentResourceType.ARTICLE.value,
++        reason.value,
++    )
++
++
++def test_enum_supports_documented_service_values():
++    assert issubclass(comment.ReportReason, Enum)
++
++    representative_reasons = [reason_for(category) for category in REPORT_REASON_VALUES]
++    assert len({reason.value for reason in representative_reasons}) == len(
++        representative_reasons
++    )
++    for reason in representative_reasons:
++        assert isinstance(reason, comment.ReportReason)
++        assert isinstance(reason.value, int)
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize(
++    ("category", "extra_text"),
++    [
++        ("spam", "contains repeated promotion links"),
++        ("porn", "explicit screenshot reference"),
++        ("spoilers", "spoiler detail supplied for non-other reason"),
++    ],
++)
++async def test_report_rejects_extra_text_for_non_other_reason(
++    record_report_requests, category, extra_text
++):
++    cmt = make_comment(555, 666)
++
++    with pytest.raises(ArgsException):
++        await cmt.report(reason_for(category), extra_text)
++    assert record_report_requests.calls == []
++
++
++@pytest.mark.asyncio
++async def test_report_allows_extra_text_for_other_reason(record_report_requests):
++    record_report_requests.responses = [{"ok": True, "case_id": "custom"}]
++    cmt = make_comment(777, 888)
++    reason = reason_for("other")
++
++    result = await cmt.report(reason, "custom reason from user")
++
++    assert result == {"ok": True, "case_id": "custom"}
++    assert_payload_values(
++        record_report_requests.calls[0], reason.value, "custom reason from user"
++    )
++
++
++@pytest.mark.asyncio
++async def test_report_requires_logged_in_credential_before_submission(
++    record_report_requests,
++):
++    credential_without_session = Credential(bili_jct="csrf-token", buvid3="buvid")
++    cmt = make_comment(999, 1000, credential=credential_without_session)
++
++    with pytest.raises(Exception) as exc_info:
++        await cmt.report(reason_for("porn"))
++
++    exception_name = type(exc_info.value).__name__.lower()
++    assert "sess" in exception_name or "login" in exception_name
++    assert record_report_requests.calls == []
++
++
++@pytest.mark.asyncio
++async def test_report_requires_session_for_every_reason_without_submission(
++    record_report_requests,
++):
++    credential_without_session = Credential(bili_jct="csrf-token", buvid3="buvid")
++    cmt = make_comment(1010, 2020, credential=credential_without_session)
++
++    with pytest.raises(Exception) as exc_info:
++        await cmt.report(reason_for("spam"))
++
++    exception_name = type(exc_info.value).__name__.lower()
++    assert "sess" in exception_name or "login" in exception_name
++    assert record_report_requests.calls == []
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,43 @@
++#!/bin/bash
++set -uo pipefail
++cd /testbed
++
++
++
++dev-switch python3 3.11
++
++
++set +u
++source /testbed/.build_env/venv/bin/activate
++set -u
++
++
++if [ ! -f /testbed/github.txt ]; then
++    echo "1.0.0|dev" > /testbed/github.txt
++fi
++
++
++pip install --no-input -e /testbed 2>/dev/null || true
++
++
++
++export BILI_SESSDATA="dummy_sessdata"
++export BILI_CSRF="dummy_csrf"
++export BILI_BUVID3="dummy_buvid3"
++export BILI_DEDEUSERID="dummy_dedeuserid"
++
++
++export PYTHONPATH="/testbed/.build_env:/testbed:${PYTHONPATH:-}"
++
++case "${1:-}" in
++  base)
++    python -m pytest -q tests/test_comment.py --collect-only
++    ;;
++  new)
++    python -m pytest -q tests/test_comment_report.py
++    ;;
++  *)
++    echo "usage: $0 base|new"
++    exit 2
++    ;;
++esac

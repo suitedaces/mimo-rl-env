@@ -1,0 +1,225 @@
+diff --git a/codespec_tar_archive_test.py b/codespec_tar_archive_test.py
+new file mode 100644
+index 000000000..77f7c80f2
+--- /dev/null
++++ b/codespec_tar_archive_test.py
+@@ -0,0 +1,208 @@
++import copy
++import gzip
++import json
++import os
++import shutil
++import tarfile
++import tempfile
++from StringIO import StringIO
++
++from configman.dotdict import DotDict
++from mock import Mock
++from nose.tools import assert_raises, eq_
++
++from socorro.external.crashstorage_base import CrashIDNotFound, Redactor
++from socorro.external.fs.crashstorage import (
++    TarFileSequentialReadingCrashStore,
++    TarFileWritingCrashStore,
++)
++
++
++def _config(path, forbidden_keys=''):
++    config = DotDict()
++    config.logger = Mock()
++    config.tarball_name = path
++    config.tarfile_module = tarfile
++    config.gzip_module = gzip
++    config.redactor_class = Redactor
++    config.forbidden_keys = forbidden_keys
++    return config
++
++
++def _read_member(archive, name):
++    compressed = archive.extractfile(name)
++    stream = gzip.GzipFile(fileobj=compressed)
++    try:
++        return json.loads(stream.read())
++    finally:
++        stream.close()
++
++
++def _add_jsonz(archive, name, value):
++    compressed = StringIO()
++    stream = gzip.GzipFile(fileobj=compressed, mode='w')
++    stream.write(json.dumps(value))
++    stream.close()
++    compressed.seek(0)
++    info = tarfile.TarInfo(name)
++    info.size = len(compressed.getvalue())
++    archive.addfile(info, compressed)
++
++
++def test_writer_accepts_canonical_and_legacy_identifiers_without_mutation():
++    root = tempfile.mkdtemp(prefix='codespec-tar-writer-')
++    path = os.path.join(root, 'processed.tar')
++    try:
++        records = [
++            {'uuid': 'canonical-id', 'payload': {'value': 1}},
++            {'crash_id': 'legacy-id', 'payload': {'value': 2}},
++            {
++                'uuid': 'matching-id',
++                'crash_id': 'matching-id',
++                'payload': {'value': 3},
++            },
++        ]
++        originals = copy.deepcopy(records)
++        writer = TarFileWritingCrashStore(_config(path))
++        try:
++            for record in records:
++                writer.save_processed(record)
++        finally:
++            writer.close()
++
++        eq_(records, originals)
++        archive = tarfile.open(path, 'r')
++        try:
++            eq_(archive.getnames(), [
++                'canonical-id.jsonz',
++                'legacy-id.jsonz',
++                'matching-id.jsonz',
++            ])
++            eq_(_read_member(archive, 'canonical-id.jsonz'), records[0])
++            eq_(_read_member(archive, 'legacy-id.jsonz'), records[1])
++            eq_(_read_member(archive, 'matching-id.jsonz'), records[2])
++        finally:
++            archive.close()
++    finally:
++        shutil.rmtree(root)
++
++
++def test_writer_rejects_missing_or_conflicting_identifiers():
++    root = tempfile.mkdtemp(prefix='codespec-tar-invalid-')
++    path = os.path.join(root, 'processed.tar')
++    try:
++        writer = TarFileWritingCrashStore(_config(path))
++        try:
++            assert_raises(KeyError, writer.save_processed, {'payload': 1})
++            assert_raises(
++                ValueError,
++                writer.save_processed,
++                {'uuid': 'one', 'crash_id': 'two', 'payload': 2},
++            )
++        finally:
++            writer.close()
++
++        archive = tarfile.open(path, 'r')
++        try:
++            eq_(archive.getnames(), [])
++        finally:
++            archive.close()
++    finally:
++        shutil.rmtree(root)
++
++
++def test_reader_fetches_requested_id_repeatedly_and_reports_missing():
++    root = tempfile.mkdtemp(prefix='codespec-tar-reader-')
++    path = os.path.join(root, 'processed.tar')
++    try:
++        records = [
++            {'crash_id': 'first-id', 'payload': 'first'},
++            {'crash_id': 'second-id', 'payload': 'second'},
++            {'crash_id': 'third-id', 'payload': 'third'},
++        ]
++        writer = TarFileWritingCrashStore(_config(path))
++        try:
++            for record in records:
++                writer.save_processed(record)
++        finally:
++            writer.close()
++
++        reader = TarFileSequentialReadingCrashStore(_config(path))
++        try:
++            eq_(reader.get_unredacted_processed('third-id'), records[2])
++            eq_(reader.get_unredacted_processed('first-id'), records[0])
++            eq_(reader.get_unredacted_processed('third-id'), records[2])
++            assert_raises(
++                CrashIDNotFound,
++                reader.get_unredacted_processed,
++                'absent-id',
++            )
++            eq_(reader.get_unredacted_processed('second-id'), records[1])
++        finally:
++            reader.close()
++    finally:
++        shutil.rmtree(root)
++
++
++def test_new_crashes_lists_only_root_processed_members_in_archive_order():
++    root = tempfile.mkdtemp(prefix='codespec-tar-list-')
++    path = os.path.join(root, 'processed.tar')
++    try:
++        archive = tarfile.open(path, 'w')
++        try:
++            directory = tarfile.TarInfo('nested')
++            directory.type = tarfile.DIRTYPE
++            archive.addfile(directory)
++            _add_jsonz(archive, 'bravo.jsonz', {'crash_id': 'bravo'})
++            _add_jsonz(archive, 'notes.txt', {'ignored': True})
++            _add_jsonz(
++                archive,
++                'nested/hidden.jsonz',
++                {'crash_id': 'hidden'},
++            )
++            _add_jsonz(archive, 'alpha.jsonz', {'crash_id': 'alpha'})
++        finally:
++            archive.close()
++
++        reader = TarFileSequentialReadingCrashStore(_config(path))
++        try:
++            eq_(list(reader.new_crashes()), ['bravo', 'alpha'])
++            eq_(list(reader.new_crashes()), ['bravo', 'alpha'])
++        finally:
++            reader.close()
++    finally:
++        shutil.rmtree(root)
++
++
++def test_redacted_reads_do_not_change_later_unredacted_reads():
++    root = tempfile.mkdtemp(prefix='codespec-tar-redaction-')
++    path = os.path.join(root, 'processed.tar')
++    try:
++        record = {
++            'uuid': 'private-id',
++            'email': 'private@example.invalid',
++            'nested': {'secret': 'classified', 'public': 'visible'},
++        }
++        writer = TarFileWritingCrashStore(_config(path))
++        try:
++            writer.save_processed(record)
++        finally:
++            writer.close()
++
++        reader = TarFileSequentialReadingCrashStore(
++            _config(path, 'email, nested.secret')
++        )
++        try:
++            eq_(reader.get_processed('private-id'), {
++                'uuid': 'private-id',
++                'nested': {'public': 'visible'},
++            })
++            eq_(reader.get_unredacted_processed('private-id'), record)
++            eq_(reader.get_processed('private-id'), {
++                'uuid': 'private-id',
++                'nested': {'public': 'visible'},
++            })
++        finally:
++            reader.close()
++    finally:
++        shutil.rmtree(root)
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,6 @@
++#!/bin/bash
++set -euo pipefail
++
++
++nosetests -s codespec_tar_archive_test.py \
++  socorro/unittest/external/fs/test_tar_crashstore.py:TestTarFileWritingCrashStorage

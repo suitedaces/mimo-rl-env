@@ -1,0 +1,106 @@
+diff --git a/internal/extproc/translator/safety_settings_contract_test.go b/internal/extproc/translator/safety_settings_contract_test.go
+new file mode 100644
+index 00000000..8d639927
+--- /dev/null
++++ b/internal/extproc/translator/safety_settings_contract_test.go
+@@ -0,0 +1,90 @@
++
++
++
++
++
++package translator
++
++import (
++	"encoding/json"
++	"testing"
++
++	extprocv3 "github.com/envoyproxy/go-control-plane/envoy/service/ext_proc/v3"
++	"github.com/stretchr/testify/require"
++	"github.com/tidwall/gjson"
++
++	"github.com/envoyproxy/ai-gateway/internal/apischema/openai"
++)
++
++func translatedVertexBody(t *testing.T, request string) (map[string]any, string) {
++	t.Helper()
++	var input openai.ChatCompletionRequest
++	require.NoError(t, json.Unmarshal([]byte(request), &input))
++	header, body, err := NewChatCompletionOpenAIToGCPVertexAITranslator("").RequestBody(nil, &input, false)
++	require.NoError(t, err)
++	require.NotNil(t, header)
++	require.NotNil(t, body)
++	var payload map[string]any
++	require.NoError(t, json.Unmarshal(body.GetMutation().(*extprocv3.BodyMutation_Body).Body, &payload))
++	path := ""
++	for _, h := range header.SetHeaders {
++		if h.Header.Key == ":path" {
++			path = string(h.Header.RawValue)
++		}
++	}
++	return payload, path
++}
++
++func TestVertexSafetySettingsForwardingContract(t *testing.T) {
++	payload, path := translatedVertexBody(t, `{
++		"model": "gemini-2.0-flash",
++		"temperature": 0.4,
++		"max_tokens": 256,
++		"messages": [{"role": "user", "content": "classify this"}],
++		"generationConfig": {"thinkingConfig": {"includeThoughts": true, "thinkingBudget": 128}},
++		"safetySettings": [
++			{"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_LOW_AND_ABOVE"},
++			{"method": "SEVERITY", "category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_ONLY_HIGH"}
++		]
++	}`)
++	require.Equal(t, "publishers/google/models/gemini-2.0-flash:generateContent", path)
++	bodyJSON := string(mustJSON(t, payload))
++	require.Equal(t, float64(0.4), gjson.Get(bodyJSON, "generation_config.temperature").Float())
++	require.Equal(t, float64(256), gjson.Get(bodyJSON, "generation_config.maxOutputTokens").Float())
++	require.True(t, gjson.Get(bodyJSON, "generation_config.thinkingConfig.includeThoughts").Bool())
++	safety := gjson.Get(bodyJSON, "safetySettings")
++	require.Len(t, safety.Array(), 2)
++	require.Equal(t, "HARM_CATEGORY_HATE_SPEECH", safety.Get("0.category").String())
++	require.Equal(t, "BLOCK_LOW_AND_ABOVE", safety.Get("0.threshold").String())
++	require.Equal(t, "SEVERITY", safety.Get("1.method").String())
++	require.Equal(t, "HARM_CATEGORY_DANGEROUS_CONTENT", safety.Get("1.category").String())
++	require.Equal(t, "BLOCK_ONLY_HIGH", safety.Get("1.threshold").String())
++}
++
++func TestVertexSafetySettingsStreamingContract(t *testing.T) {
++	payload, path := translatedVertexBody(t, `{
++		"model": "gemini-2.0-flash",
++		"stream": true,
++		"messages": [{"role": "user", "content": "stream this"}],
++		"safetySettings": [{"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"}]
++	}`)
++	require.Equal(t, "publishers/google/models/gemini-2.0-flash:streamGenerateContent?alt=sse", path)
++	bodyJSON := string(mustJSON(t, payload))
++	require.Equal(t, "HARM_CATEGORY_HARASSMENT", gjson.Get(bodyJSON, "safetySettings.0.category").String())
++	require.Equal(t, "BLOCK_MEDIUM_AND_ABOVE", gjson.Get(bodyJSON, "safetySettings.0.threshold").String())
++}
++
++func TestVertexSafetySettingsOmissionContract(t *testing.T) {
++	withoutVendor, _ := translatedVertexBody(t, `{
++		"model": "gemini-2.0-flash",
++		"messages": [{"role": "user", "content": "ordinary request"}]
++	}`)
++	require.False(t, gjson.Get(string(mustJSON(t, withoutVendor)), "safetySettings").Exists())
++}
++
++func mustJSON(t *testing.T, value map[string]any) []byte {
++	t.Helper()
++	b, err := json.Marshal(value)
++	require.NoError(t, err)
++	return b
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,5 @@
++#!/bin/bash
++set -euo pipefail
++
++
++go test ./internal/extproc/translator -run 'TestVertexSafetySettings(Forwarding|Streaming|Omission)Contract' -count=1

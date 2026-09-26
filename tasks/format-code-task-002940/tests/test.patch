@@ -1,0 +1,357 @@
+diff --git a/usercase-test-coderl/fixtures/sitecustomize.py b/usercase-test-coderl/fixtures/sitecustomize.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/fixtures/sitecustomize.py
+@@ -0,0 +1,141 @@
++import builtins
++import json
++import os
++from json import JSONDecodeError
++
++
++if os.environ.get("KRAKENEX_ACCEPTANCE_MODE"):
++    _original_open = builtins.open
++
++    def _log_path():
++        return os.environ["KRAKENEX_ACCEPTANCE_LOG"]
++
++    def _append_log(line):
++        with _original_open(_log_path(), "a", encoding="utf-8") as fd:
++            fd.write(line + "\n")
++
++    def _open(path, mode="r", *args, **kwargs):
++        try:
++            path_text = os.fspath(path)
++        except TypeError:
++            path_text = path
++        if path_text == "/path/to/export-data.key" and "r" in mode:
++            _append_log("OPEN_KEY /path/to/export-data.key")
++        return _original_open(path, mode, *args, **kwargs)
++
++    builtins.open = _open
++
++    import requests
++    import socket
++    import time
++
++    _not_ready_remaining = int(os.environ.get("KRAKENEX_ACCEPTANCE_NOT_READY", "0"))
++    _retrieve_kind = os.environ.get("KRAKENEX_ACCEPTANCE_RETRIEVE", "zip")
++    _report_id = os.environ.get("KRAKENEX_ACCEPTANCE_REPORT_ID", "RID-acceptance")
++    _zip_bytes = bytes.fromhex(os.environ.get("KRAKENEX_ACCEPTANCE_ZIP_HEX", "504b0304"))
++
++    class _FakeResponse:
++        status_code = 200
++
++        def __init__(self, method, payload):
++            self.method = method
++            self.payload = payload
++            self.content = _zip_bytes if method == "RetrieveExport" and _retrieve_kind == "zip" else b""
++
++        def raise_for_status(self):
++            return None
++
++        def json(self, **kwargs):
++            global _not_ready_remaining
++            if self.method == "AddExport":
++                return {"error": [], "result": {"id": _report_id}}
++            if self.method == "ExportStatus":
++                if _not_ready_remaining > 0:
++                    _not_ready_remaining -= 1
++                    return {"error": ["EExport:Not ready"]}
++                return {"error": [], "result": [{"id": _report_id, "status": "Processed"}]}
++            if self.method == "RetrieveExport":
++                if _retrieve_kind == "json":
++                    return {"error": [], "result": {"id": _report_id, "status": "available"}}
++                raise JSONDecodeError("Expecting value", "PK", 0)
++            return {"error": ["unexpected method"]}
++
++    def _method_from_url(url):
++        return url.rstrip("/").rsplit("/", 1)[-1]
++
++    def _log_post(method, data, headers):
++        api_key = headers.get("API-Key", "")
++        sign = headers.get("API-Sign", "")
++        common = "nonce=%s api_key=%s sign=%s" % (
++            "yes" if "nonce" in data else "no",
++            api_key,
++            "yes" if sign else "no",
++        )
++        if method == "AddExport":
++            line = (
++                "POST AddExport description=%s format=%s report=%s %s"
++                % (data.get("description"), data.get("format"), data.get("report"), common)
++            )
++        elif method == "ExportStatus":
++            line = "POST ExportStatus report=%s %s" % (data.get("report"), common)
++        elif method == "RetrieveExport":
++            line = "POST RetrieveExport id=%s %s" % (data.get("id"), common)
++        else:
++            line = "POST %s data=%s %s" % (method, json.dumps(data, sort_keys=True), common)
++        _append_log(line)
++
++    def _post(self, url, data=None, headers=None, timeout=None):
++        method = _method_from_url(url)
++        data = {} if data is None else dict(data)
++        headers = {} if headers is None else dict(headers)
++        _log_post(method, data, headers)
++        return _FakeResponse(method, data)
++
++    def _module_post(url, data=None, headers=None, timeout=None, **kwargs):
++
++        return _post(None, url, data=data, headers=headers, timeout=timeout)
++
++    def _module_request(method, url, *args, **kwargs):
++        if str(method).upper() == "POST":
++            return _module_post(url, *args, **kwargs)
++        raise RuntimeError("isolated offline guard blocked %s %s" % (method, url))
++
++    def _blocked_request(self, method, url, *args, **kwargs):
++
++        raise RuntimeError("isolated offline guard blocked %s %s" % (method, url))
++
++    def _blocked_get(self, url, *args, **kwargs):
++
++        raise RuntimeError("isolated offline guard blocked GET %s" % url)
++
++    def _sleep(seconds):
++        _append_log("SLEEP %s" % seconds)
++
++    _original_getaddrinfo = socket.getaddrinfo
++    _original_socket_connect = socket.socket.connect
++
++    def _is_local_address(host):
++        return host in ("localhost", "127.0.0.1", "::1", "0.0.0.0") or str(host).startswith("127.")
++
++    def _getaddrinfo(host, *args, **kwargs):
++
++        if not _is_local_address(host):
++            raise RuntimeError("isolated offline guard blocked DNS for %s" % host)
++        return _original_getaddrinfo(host, *args, **kwargs)
++
++    def _connect(self, address):
++
++        host = address[0] if isinstance(address, tuple) and address else address
++        if not _is_local_address(host):
++            raise RuntimeError("isolated offline guard blocked socket connect to %s" % (host,))
++        return _original_socket_connect(self, address)
++
++    requests.sessions.Session.post = _post
++    requests.sessions.Session.get = _blocked_get
++    requests.sessions.Session.request = _blocked_request
++    requests.post = _module_post
++    requests.request = _module_request
++    requests.get = lambda url, *args, **kwargs: _blocked_get(None, url, *args, **kwargs)
++    socket.getaddrinfo = _getaddrinfo
++    socket.socket.connect = _connect
++    time.sleep = _sleep
+diff --git a/usercase-test-coderl/usecase.sh b/usercase-test-coderl/usecase.sh
+new file mode 100755
+--- /dev/null
++++ b/usercase-test-coderl/usecase.sh
+@@ -0,0 +1,187 @@
++#!/usr/bin/env bash
++
++set -u
++export LANG=C.UTF-8 LC_ALL=C.UTF-8 TZ=UTC
++
++PYTHON=${PYTHON:-python3}
++REPO=/workspace/repo
++FIXTURES="$REPO/usercase-test-coderl/fixtures"
++
++( cd "$REPO" && "$PYTHON" -m py_compile krakenex/api.py examples/retrieve-csv-report.py ) \
++    || { echo "FAIL: build" >&2; exit 1; }
++
++TMP=$(mktemp -d)
++trap 'rm -rf "$TMP"; rm -f /path/to/export-data.key' EXIT
++fail() { echo "FAIL: $*" >&2; exit 1; }
++
++mkdir -p /path/to
++
++assert_call_flow() {
++    local label=$1
++    local log=$2
++    local report_id=$3
++    local not_ready=$4
++    python - "$label" "$log" "$report_id" "$not_ready" <<'PY' || exit 1
++import sys
++
++label, log_path, report_id, not_ready_text = sys.argv[1:]
++not_ready = int(not_ready_text)
++with open(log_path, encoding="utf-8") as fd:
++    lines = [line.rstrip("\n") for line in fd]
++
++def fail(message):
++    print(f"FAIL: {label} calls: {message}: {lines}", file=sys.stderr)
++    sys.exit(1)
++
++posts = [line for line in lines if line.startswith("POST ")]
++sleeps = [line for line in lines if line.startswith("SLEEP ")]
++
++expected_posts = [
++    "POST AddExport description=reporting format=CSV report=ledgers nonce=yes api_key=acceptance-key sign=yes",
++    *["POST ExportStatus report=ledgers nonce=yes api_key=acceptance-key sign=yes"] * (not_ready + 1),
++    f"POST RetrieveExport id={report_id} nonce=yes api_key=acceptance-key sign=yes",
++]
++if lines[:1] != ["OPEN_KEY /path/to/export-data.key"]:
++    fail("did not load the configured key path first")
++if posts != expected_posts:
++    fail("private endpoint sequence or payloads differ from the spec")
++if any(line != "SLEEP 10" for line in sleeps):
++    fail("poll sleeps must be 10 seconds")
++
++
++if not_ready <= len(sleeps) <= not_ready + 1:
++    sys.exit(0)
++fail("sleep count does not match 10-second polling")
++PY
++}
++
++assert_json_stdout() {
++    local label=$1
++    local out=$2
++    local report_id=$3
++    python - "$label" "$out" "$report_id" <<'PY' || exit 1
++import ast
++import json
++import sys
++
++label, out_path, report_id = sys.argv[1:]
++with open(out_path, encoding="utf-8") as fd:
++    text = fd.read()
++
++prefix = "Waiting for export to be ready...\n"
++if not text.startswith(prefix):
++    print(f"FAIL: {label} stdout missing waiting line/newline: {text!r}", file=sys.stderr)
++    sys.exit(1)
++
++body = text[len(prefix):].strip()
++if not body:
++    print(f"FAIL: {label} stdout missing JSON response", file=sys.stderr)
++    sys.exit(1)
++
++
++try:
++    parsed = ast.literal_eval(body)
++except Exception:
++    try:
++        parsed = json.loads(body)
++    except Exception as exc:
++        print(f"FAIL: {label} stdout response is not parseable JSON/Python data: {exc}: {body!r}", file=sys.stderr)
++        sys.exit(1)
++
++expected = {"error": [], "result": {"id": report_id, "status": "available"}}
++if parsed != expected:
++    print(f"FAIL: {label} stdout did not print the RetrieveExport JSON response: {parsed!r}", file=sys.stderr)
++    sys.exit(1)
++PY
++}
++
++write_key() {
++    printf 'acceptance-key\nYWNjZXB0YW5jZS1zZWNyZXQ=\n' > /path/to/export-data.key
++}
++
++run_example() {
++    local mode=$1
++    local not_ready=$2
++    local retrieve=$3
++    local report_id=$4
++    local workdir=$5
++    local log=$6
++    ln -s "$REPO/examples" "$workdir/examples"
++    (
++        cd "$workdir" || exit 99
++        PYTHONPATH="$FIXTURES:$REPO${PYTHONPATH:+:$PYTHONPATH}" \
++        KRAKENEX_ACCEPTANCE_MODE="$mode" \
++        KRAKENEX_ACCEPTANCE_NOT_READY="$not_ready" \
++        KRAKENEX_ACCEPTANCE_RETRIEVE="$retrieve" \
++        KRAKENEX_ACCEPTANCE_REPORT_ID="$report_id" \
++        KRAKENEX_ACCEPTANCE_ZIP_HEX="504b0304616363657074616e6365007a69702d62797465732dff0a" \
++        KRAKENEX_ACCEPTANCE_LOG="$log" \
++        "$PYTHON" -u examples/retrieve-csv-report.py
++    )
++}
++
++
++
++
++write_key
++case_dir="$TMP/f1"; mkdir "$case_dir"; : > "$case_dir/calls.log"
++run_example f1 2 zip RID-zip-many "$case_dir" "$case_dir/calls.log" >"$case_dir/out" 2>"$case_dir/err"; ec=$?
++EXPECTED_OUT=$'Waiting for export to be ready.....\nDone! Written as: ledgers.csv.zip\n'
++EXPECTED_ZIP_SHA=70121d10a614c746c2837a8605da417e8376facc15f32e1f5b6a68472a2804dd
++[ "$ec" -eq 0 ] || fail "F1 exit $ec; want 0"
++[ "$(cat "$case_dir/out")"$'\n' = "$EXPECTED_OUT" ] || fail "F1 stdout: $(cat "$case_dir/out")"
++[ ! -s "$case_dir/err" ] || fail "F1 unexpected stderr: $(cat "$case_dir/err")"
++assert_call_flow F1 "$case_dir/calls.log" RID-zip-many 2
++[ -f "$case_dir/ledgers.csv.zip" ] || fail "F1 missing ledgers.csv.zip"
++[ "$(sha256sum "$case_dir/ledgers.csv.zip" | awk '{print $1}')" = "$EXPECTED_ZIP_SHA" ] || fail "F1 zip sha mismatch"
++
++
++
++
++write_key
++case_dir="$TMP/f2"; mkdir "$case_dir"; : > "$case_dir/calls.log"
++run_example f2 1 zip RID-zip-one "$case_dir" "$case_dir/calls.log" >"$case_dir/out" 2>"$case_dir/err"; ec=$?
++EXPECTED_OUT=$'Waiting for export to be ready....\nDone! Written as: ledgers.csv.zip\n'
++[ "$ec" -eq 0 ] || fail "F2 exit $ec; want 0"
++[ "$(cat "$case_dir/out")"$'\n' = "$EXPECTED_OUT" ] || fail "F2 stdout: $(cat "$case_dir/out")"
++[ ! -s "$case_dir/err" ] || fail "F2 unexpected stderr: $(cat "$case_dir/err")"
++assert_call_flow F2 "$case_dir/calls.log" RID-zip-one 1
++[ "$(sha256sum "$case_dir/ledgers.csv.zip" | awk '{print $1}')" = "$EXPECTED_ZIP_SHA" ] || fail "F2 zip sha mismatch"
++
++
++
++
++write_key
++case_dir="$TMP/f3"; mkdir "$case_dir"; : > "$case_dir/calls.log"
++run_example f3 0 json RID-json-zero "$case_dir" "$case_dir/calls.log" >"$case_dir/out" 2>"$case_dir/err"; ec=$?
++[ "$ec" -eq 0 ] || fail "F3 exit $ec; want 0"
++assert_json_stdout F3 "$case_dir/out" RID-json-zero
++[ ! -s "$case_dir/err" ] || fail "F3 unexpected stderr: $(cat "$case_dir/err")"
++assert_call_flow F3 "$case_dir/calls.log" RID-json-zero 0
++[ ! -e "$case_dir/ledgers.csv.zip" ] || fail "F3 should not write ZIP for JSON response"
++
++
++
++
++write_key
++case_dir="$TMP/f4"; mkdir "$case_dir"; : > "$case_dir/calls.log"
++run_example f4 0 zip RID-distinct-42 "$case_dir" "$case_dir/calls.log" >"$case_dir/out" 2>"$case_dir/err"; ec=$?
++EXPECTED_OUT=$'Waiting for export to be ready...\nDone! Written as: ledgers.csv.zip\n'
++[ "$ec" -eq 0 ] || fail "F4 exit $ec; want 0"
++[ "$(cat "$case_dir/out")"$'\n' = "$EXPECTED_OUT" ] || fail "F4 stdout: $(cat "$case_dir/out")"
++[ ! -s "$case_dir/err" ] || fail "F4 unexpected stderr: $(cat "$case_dir/err")"
++assert_call_flow F4 "$case_dir/calls.log" RID-distinct-42 0
++
++
++
++
++rm -f /path/to/export-data.key
++case_dir="$TMP/ferr"; mkdir "$case_dir"; : > "$case_dir/calls.log"
++run_example ferr 0 zip RID-error "$case_dir" "$case_dir/calls.log" >"$case_dir/out" 2>"$case_dir/err"; ec=$?
++[ "$ec" -ne 0 ] || fail "F_err exit $ec; want non-zero"
++
++EXPECTED_LOG=$'OPEN_KEY /path/to/export-data.key\n'
++[ "$(cat "$case_dir/calls.log")"$'\n' = "$EXPECTED_LOG" ] || fail "F_err calls: $(cat "$case_dir/calls.log")"
++
++echo "PASS"
++exit 0
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,14 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++export PYTHON=/usr/local/bin/python3
++export PYTHONNOUSERSITE=1
++set -e
++cd /workspace/repo
++exec bash /workspace/repo/usercase-test-coderl/usecase.sh

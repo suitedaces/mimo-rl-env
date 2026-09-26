@@ -1,0 +1,224 @@
+diff --git a/packages/create-module-federation/__tests__/renderTemplate.spec.ts b/packages/create-module-federation/__tests__/renderTemplate.spec.ts
+new file mode 100644
+index 000000000..b400c6081
+--- /dev/null
++++ b/packages/create-module-federation/__tests__/renderTemplate.spec.ts
+@@ -0,0 +1,183 @@
++import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync } from 'fs';
++import { tmpdir } from 'os';
++import path from 'path';
++import { renderProject } from '../src';
++
++function makeTmp(prefix: string): string {
++  return mkdtempSync(path.join(tmpdir(), prefix));
++}
++
++function write(root: string, rel: string, content: string): void {
++  const full = path.join(root, rel);
++  mkdirSync(path.dirname(full), { recursive: true });
++  writeFileSync(full, content);
++}
++
++function read(root: string, rel: string): string {
++  return readFileSync(path.join(root, rel), 'utf-8');
++}
++
++describe('renderProject', () => {
++  let templateDir: string;
++  let targetDir: string;
++
++  beforeEach(() => {
++    templateDir = makeTmp('cmf-tpl-');
++    targetDir = path.join(makeTmp('cmf-out-'), 'project');
++  });
++
++  it('copies a nested directory tree into the target preserving structure', async () => {
++    write(templateDir, 'src/index.ts', 'console.log(1);');
++    write(templateDir, 'src/routes/page.tsx', 'export default 1;');
++    write(templateDir, 'README.md', '# hello');
++
++    const result = await renderProject({ templateDir, targetDir });
++
++    expect(read(targetDir, 'src/index.ts')).toBe('console.log(1);');
++    expect(read(targetDir, 'src/routes/page.tsx')).toBe('export default 1;');
++    expect(read(targetDir, 'README.md')).toBe('# hello');
++    expect([...result.written].sort()).toEqual(
++      ['README.md', 'src/index.ts', 'src/routes/page.tsx'].sort(),
++    );
++    expect(result.skipped).toEqual([]);
++  });
++
++  it('creates the target directory when it does not exist', async () => {
++    write(templateDir, 'a.txt', 'a');
++    expect(existsSync(targetDir)).toBe(false);
++
++    await renderProject({ templateDir, targetDir });
++
++    expect(existsSync(targetDir)).toBe(true);
++    expect(read(targetDir, 'a.txt')).toBe('a');
++  });
++
++  it('includes dotfiles, hidden directories and empty files', async () => {
++    write(templateDir, '.gitignore', 'node_modules\n');
++    write(templateDir, '.npmrc', 'registry=x\n');
++    write(templateDir, '.vscode/settings.json', '{}');
++    write(templateDir, 'public/.gitkeep', '');
++
++    const result = await renderProject({ templateDir, targetDir });
++
++    expect(read(targetDir, '.gitignore')).toBe('node_modules\n');
++    expect(read(targetDir, '.npmrc')).toBe('registry=x\n');
++    expect(read(targetDir, '.vscode/settings.json')).toBe('{}');
++    expect(read(targetDir, 'public/.gitkeep')).toBe('');
++    expect([...result.written].sort()).toEqual(
++      ['.gitignore', '.npmrc', '.vscode/settings.json', 'public/.gitkeep'].sort(),
++    );
++  });
++
++  it('renders .handlebars templates and strips only the final .handlebars segment', async () => {
++    write(templateDir, 'package.json.handlebars', '{ "name": "{{ name }}" }');
++    write(
++      templateDir,
++      'module-federation.config.ts.handlebars',
++      'export const name = "{{name}}";',
++    );
++    write(templateDir, 'foo.handlebars', 'value={{ value }}');
++
++    const result = await renderProject({
++      templateDir,
++      targetDir,
++      data: { name: 'mf_app', value: 'v' },
++    });
++
++    expect(read(targetDir, 'package.json')).toBe('{ "name": "mf_app" }');
++    expect(read(targetDir, 'module-federation.config.ts')).toBe(
++      'export const name = "mf_app";',
++    );
++    expect(read(targetDir, 'foo')).toBe('value=v');
++    expect(existsSync(path.join(targetDir, 'package.json.handlebars'))).toBe(false);
++    expect([...result.written].sort()).toEqual(
++      ['foo', 'module-federation.config.ts', 'package.json'].sort(),
++    );
++  });
++
++  it('tolerates whitespace inside braces, repeats, and dot-path / non-string values', async () => {
++    write(
++      templateDir,
++      't.txt.handlebars',
++      '{{name}}-{{ name }}-{{  name  }}|{{ meta.role }}|{{ port }}|{{ flag }}',
++    );
++
++    await renderProject({
++      templateDir,
++      targetDir,
++      data: { name: 'app', meta: { role: 'provider' }, port: 3001, flag: false },
++    });
++
++    expect(read(targetDir, 't.txt')).toBe('app-app-app|provider|3001|false');
++  });
++
++  it('does not interpret placeholder-looking text in non-template files', async () => {
++    write(templateDir, 'raw.txt', 'literal {{ name }} stays');
++
++    await renderProject({ templateDir, targetDir, data: { name: 'app' } });
++
++    expect(read(targetDir, 'raw.txt')).toBe('literal {{ name }} stays');
++  });
++
++  it('rejects when a template placeholder cannot be resolved, naming the expression', async () => {
++    write(templateDir, 'a.txt.handlebars', 'hello {{ missingKey }}');
++
++    await expect(
++      renderProject({ templateDir, targetDir, data: { name: 'app' } }),
++    ).rejects.toThrow(/missingKey/);
++  });
++
++  it('rejects when data is omitted but a template has placeholders', async () => {
++    write(templateDir, 'a.txt.handlebars', 'hi {{ name }}');
++
++    await expect(renderProject({ templateDir, targetDir })).rejects.toThrow(/name/);
++  });
++
++  it('rejects when a nested dot path cannot be resolved, naming the path', async () => {
++    write(templateDir, 'a.txt.handlebars', '{{ meta.unknown }}');
++
++    await expect(
++      renderProject({ templateDir, targetDir, data: { meta: { role: 'p' } } }),
++    ).rejects.toThrow(/meta\.unknown/);
++  });
++
++  it('skips existing files by default and reports them in skipped', async () => {
++    write(templateDir, 'package.json.handlebars', '{ "name": "{{ name }}" }');
++    write(templateDir, 'new.txt', 'fresh');
++    write(targetDir, 'package.json', 'OLD');
++
++    const result = await renderProject({
++      templateDir,
++      targetDir,
++      data: { name: 'mf_app' },
++    });
++
++    expect(read(targetDir, 'package.json')).toBe('OLD');
++    expect(read(targetDir, 'new.txt')).toBe('fresh');
++    expect(result.skipped).toEqual(['package.json']);
++    expect([...result.written].sort()).toEqual(['new.txt'].sort());
++  });
++
++  it('overwrites existing files when override is set and reports them in written', async () => {
++    write(templateDir, 'package.json.handlebars', '{ "name": "{{ name }}" }');
++    write(targetDir, 'package.json', 'OLD');
++
++    const result = await renderProject({
++      templateDir,
++      targetDir,
++      data: { name: 'mf_app' },
++      override: true,
++    });
++
++    expect(read(targetDir, 'package.json')).toBe('{ "name": "mf_app" }');
++    expect(result.skipped).toEqual([]);
++    expect([...result.written].sort()).toEqual(['package.json'].sort());
++  });
++
++  it('returns empty lists for an empty template directory and still creates the target', async () => {
++    const result = await renderProject({ templateDir, targetDir });
++
++    expect(result).toEqual({ written: [], skipped: [] });
++    expect(existsSync(targetDir)).toBe(true);
++  });
++});
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,30 @@
++#!/usr/bin/env bash
++
++
++
++set -euo pipefail
++HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++cd /testbed
++
++
++
++
++
++CMF_CONFIG="$(mktemp /tmp/cmf-jest.XXXXXX.js)"
++trap 'rm -f "$CMF_CONFIG"' EXIT
++cat > "$CMF_CONFIG" <<'EOF'
++const swc = require.resolve('@swc/jest', { paths: ['/testbed/node_modules'] });
++module.exports = {
++  rootDir: '/testbed/packages/create-module-federation',
++  testEnvironment: 'node',
++  transform: { '^.+\\.(t|j)sx?$': [swc, { jsc: { parser: { syntax: 'typescript' } } }] },
++  testMatch: ['<rootDir>/__tests__/**/*.spec.ts'],
++  moduleFileExtensions: ['ts', 'tsx', 'js', 'jsx', 'json'],
++};
++EOF
++
++
++npx jest --config packages/sdk/jest.config.js
++
++
++npx jest --config "$CMF_CONFIG"

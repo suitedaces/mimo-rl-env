@@ -1,0 +1,161 @@
+diff --git a/tests/tracking/test_log_table_modes_codespec.py b/tests/tracking/test_log_table_modes_codespec.py
+new file mode 100644
+index 000000000..5f272c48b
+--- /dev/null
++++ b/tests/tracking/test_log_table_modes_codespec.py
+@@ -0,0 +1,142 @@
++import json
++
++import pandas as pd
++import pytest
++
++import mlflow
++from mlflow import MlflowClient
++from mlflow.exceptions import MlflowException
++from mlflow.protos.databricks_pb2 import INVALID_PARAMETER_VALUE, ErrorCode
++from mlflow.utils.mlflow_tags import MLFLOW_LOGGED_ARTIFACTS
++
++
++ARTIFACT_FILE = "reports/evaluation.json"
++
++
++def _load_persisted_table(run_id):
++    path = mlflow.artifacts.download_artifacts(run_id=run_id, artifact_path=ARTIFACT_FILE)
++    return pd.read_json(path, orient="split")
++
++
++def _logged_artifacts(run_id):
++    value = mlflow.get_run(run_id).data.tags.get(MLFLOW_LOGGED_ARTIFACTS, "[]")
++    return json.loads(value)
++
++
++def _assert_invalid_parameter(exc_info):
++    assert exc_info.value.error_code == ErrorCode.Name(INVALID_PARAMETER_VALUE)
++
++
++def test_default_append_aligns_columns_and_keeps_one_table_tag():
++    first = pd.DataFrame({"feature": ["a", "b"], "score": [1, 2]})
++    reordered = pd.DataFrame({"score": [3], "feature": ["c"]})
++    explicit = {"score": [4], "feature": ["d"]}
++
++    with mlflow.start_run() as run:
++        mlflow.log_table(first, ARTIFACT_FILE)
++        mlflow.log_table(reordered, ARTIFACT_FILE)
++        mlflow.log_table(explicit, ARTIFACT_FILE, mode="append")
++
++    expected = pd.DataFrame({"feature": ["a", "b", "c", "d"], "score": [1, 2, 3, 4]})
++    pd.testing.assert_frame_equal(_load_persisted_table(run.info.run_id), expected)
++    assert _logged_artifacts(run.info.run_id) == [
++        {"path": ARTIFACT_FILE, "type": "table"}
++    ]
++
++
++@pytest.mark.parametrize(
++    "incompatible",
++    [
++        pd.DataFrame({"feature": ["c"]}),
++        pd.DataFrame({"feature": ["c"], "score": [3], "note": ["new"]}),
++    ],
++    ids=["missing-column", "extra-column"],
++)
++def test_append_schema_mismatch_is_atomic(incompatible):
++    original = pd.DataFrame({"feature": ["a"], "score": [1]})
++
++    with mlflow.start_run() as run:
++        mlflow.log_table(original, ARTIFACT_FILE)
++        tags_before = _logged_artifacts(run.info.run_id)
++        with pytest.raises(MlflowException, match="(?i)column|schema") as exc_info:
++            mlflow.log_table(incompatible, ARTIFACT_FILE, mode="append")
++
++    _assert_invalid_parameter(exc_info)
++    pd.testing.assert_frame_equal(_load_persisted_table(run.info.run_id), original)
++    assert _logged_artifacts(run.info.run_id) == tags_before
++
++
++def test_overwrite_replaces_rows_and_schema_through_fluent_api():
++    with mlflow.start_run() as run:
++        mlflow.log_table(
++            pd.DataFrame({"feature": ["old"], "score": [1]}),
++            ARTIFACT_FILE,
++        )
++        replacement = pd.DataFrame({"replacement": [True, False], "rank": [9, 10]})
++        mlflow.log_table(replacement, ARTIFACT_FILE, mode="overwrite")
++
++    pd.testing.assert_frame_equal(_load_persisted_table(run.info.run_id), replacement)
++    assert _logged_artifacts(run.info.run_id) == [
++        {"path": ARTIFACT_FILE, "type": "table"}
++    ]
++
++
++def test_error_if_exists_preserves_artifact_through_client_api():
++    client = MlflowClient()
++    run = client.create_run("0")
++    original = pd.DataFrame({"feature": ["existing"], "score": [4]})
++    client.log_table(run.info.run_id, original, ARTIFACT_FILE)
++    tags_before = _logged_artifacts(run.info.run_id)
++
++    with pytest.raises(MlflowException, match="(?i)exist") as exc_info:
++        client.log_table(
++            run.info.run_id,
++            pd.DataFrame({"feature": ["new"], "score": [5]}),
++            ARTIFACT_FILE,
++            mode="error_if_exists",
++        )
++
++    _assert_invalid_parameter(exc_info)
++    pd.testing.assert_frame_equal(_load_persisted_table(run.info.run_id), original)
++    assert _logged_artifacts(run.info.run_id) == tags_before
++
++
++@pytest.mark.parametrize("mode", ["append", "overwrite", "error_if_exists"])
++def test_each_mode_creates_a_new_table_when_artifact_is_absent(mode):
++    client = MlflowClient()
++    run = client.create_run("0")
++    table = {"mode": [mode], "value": [0]}
++
++    client.log_table(run.info.run_id, table, ARTIFACT_FILE, mode=mode)
++
++    pd.testing.assert_frame_equal(_load_persisted_table(run.info.run_id), pd.DataFrame(table))
++    assert _logged_artifacts(run.info.run_id) == [
++        {"path": ARTIFACT_FILE, "type": "table"}
++    ]
++
++
++@pytest.mark.parametrize("mode", ["append", "overwrite", "error_if_exists"])
++def test_fluent_api_accepts_each_mode_for_a_new_table(mode):
++    table = {"mode": [mode], "value": [1]}
++
++    with mlflow.start_run() as run:
++        mlflow.log_table(table, ARTIFACT_FILE, mode=mode)
++
++    pd.testing.assert_frame_equal(_load_persisted_table(run.info.run_id), pd.DataFrame(table))
++
++
++def test_invalid_mode_fails_before_artifact_or_tag_creation():
++    client = MlflowClient()
++    run = client.create_run("0")
++
++    with pytest.raises(MlflowException, match="(?i)mode") as exc_info:
++        client.log_table(
++            run.info.run_id,
++            pd.DataFrame({"feature": ["a"]}),
++            ARTIFACT_FILE,
++            mode="replace",
++        )
++
++    _assert_invalid_parameter(exc_info)
++    assert client.list_artifacts(run.info.run_id) == []
++    assert MLFLOW_LOGGED_ARTIFACTS not in mlflow.get_run(run.info.run_id).data.tags
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,8 @@
++#!/bin/bash
++set -euo pipefail
++
++
++.venv/bin/pytest -q \
++  tests/tracking/test_log_table_modes_codespec.py \
++  tests/tracking/test_tracking.py::test_log_table \
++  tests/tracking/test_tracking.py::test_log_table_with_subdirectory

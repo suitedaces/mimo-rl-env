@@ -1,0 +1,631 @@
+diff --git a/internal/binder/function/funcs_array_context_test.go b/internal/binder/function/funcs_array_context_test.go
+new file mode 100644
+index 00000000..2945b2cb
+--- /dev/null
++++ b/internal/binder/function/funcs_array_context_test.go
+@@ -0,0 +1,78 @@
++package function
++
++import (
++	"strings"
++	"testing"
++
++	"github.com/lf-edge/ekuiper/internal/conf"
++	kctx "github.com/lf-edge/ekuiper/internal/topo/context"
++	"github.com/lf-edge/ekuiper/internal/topo/state"
++	"github.com/lf-edge/ekuiper/pkg/api"
++)
++
++type namedFunctionExecutorForContextTest interface {
++
++	ExecWithName(args []interface{}, ctx api.FunctionContext, name string) (interface{}, bool)
++}
++
++func executeArrayFunctionForContextTest(t *testing.T, name string, args []interface{}) string {
++	t.Helper()
++
++	contextLogger := conf.Log.WithField("rule", "testExec")
++	ctx := kctx.WithValue(kctx.Background(), kctx.LoggerKey, contextLogger)
++	tempStore, _ := state.CreateStore("contextRule", api.AtMostOnce)
++	fctx := kctx.NewDefaultFuncContext(ctx.WithMeta("contextRule", "test", tempStore), 2)
++
++	fn, err := Function(name)
++	if err != nil {
++		t.Fatalf("Function(%q) returned error: %v", name, err)
++	}
++	named, ok := fn.(namedFunctionExecutorForContextTest)
++	if !ok {
++		t.Fatalf("Function(%q) does not support named execution", name)
++	}
++	result, ok := named.ExecWithName(args, fctx, name)
++	if ok {
++		t.Fatalf("%s(%v) succeeded with result %#v; want validation error", name, args, result)
++	}
++	errResult, ok := result.(error)
++	if !ok {
++		t.Fatalf("%s(%v) returned %#v; want error result", name, args, result)
++	}
++	return errResult.Error()
++}
++
++func assertArrayValidationNamesCallback(t *testing.T, got, callback string) {
++	t.Helper()
++	const oldGeneric = "validate function arguments failed."
++
++	if got == oldGeneric {
++		t.Fatalf("error is still the old generic-only message: %q", got)
++	}
++	if !strings.Contains(got, callback) {
++		t.Fatalf("error %q does not identify failing callback function %q", got, callback)
++	}
++}
++
++func TestArrayFunctionArgumentValidationErrorIncludesFunctionName(t *testing.T) {
++	tests := []struct {
++		callback string
++		args     []interface{}
++	}{
++		{
++			callback: "pow",
++			args:     []interface{}{"pow", []interface{}{0, -0.4, 1.2}},
++		},
++		{
++			callback: "power",
++			args:     []interface{}{"power", []interface{}{1, 2, 3}},
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.callback, func(t *testing.T) {
++			got := executeArrayFunctionForContextTest(t, "array_map", tt.args)
++			assertArrayValidationNamesCallback(t, got, tt.callback)
++		})
++	}
++}
+diff --git a/internal/binder/function/funcs_array_test.go b/internal/binder/function/funcs_array_test.go
+index 7a547989..c9e71323 100644
+--- a/internal/binder/function/funcs_array_test.go
++++ b/internal/binder/function/funcs_array_test.go
+@@ -18,6 +18,7 @@ import (
+ 	"errors"
+ 	"fmt"
+ 	"reflect"
++	"strings"
+ 	"testing"
+ 
+ 	"github.com/stretchr/testify/assert"
+@@ -797,11 +798,41 @@ func TestArrayCommonFunctions(t *testing.T) {
+ 	for _, tt := range tests {
+ 		t.Run(tt.name, func(t *testing.T) {
+ 			result, _ := fe.ExecWithName(tt.args, fctx, tt.name)
++			if assertArrayMapCallbackValidationForContext(t, tt.name, tt.args, tt.result, result) {
++				return
++			}
+ 			assert.Equal(t, tt.result, result)
+ 		})
+ 	}
+ }
+ 
++func assertArrayMapCallbackValidationForContext(t *testing.T, name string, args []interface{}, expected, actual interface{}) bool {
++	t.Helper()
++	if name != "array_map" {
++		return false
++	}
++	expectedErr, ok := expected.(error)
++	if !ok || expectedErr.Error() != "validate function arguments failed." {
++		return false
++	}
++	actualErr, ok := actual.(error)
++	if !ok {
++		t.Fatalf("array_map(%v) returned %#v; want validation error", args, actual)
++	}
++	callback, ok := args[0].(string)
++	if !ok {
++		return false
++	}
++	got := actualErr.Error()
++	if got == expectedErr.Error() {
++		return true
++	}
++	if !strings.Contains(got, callback) {
++		t.Fatalf("array_map(%v) error %q does not identify callback function %q", args, got, callback)
++	}
++	return true
++}
++
+ func TestArrayShuffle(t *testing.T) {
+ 	contextLogger := conf.Log.WithField("rule", "testExec")
+ 	ctx := kctx.WithValue(kctx.Background(), kctx.LoggerKey, contextLogger)
+diff --git a/internal/topo/planner/analyzer_context_test.go b/internal/topo/planner/analyzer_context_test.go
+new file mode 100644
+index 00000000..6b4d9c14
+--- /dev/null
++++ b/internal/topo/planner/analyzer_context_test.go
+@@ -0,0 +1,80 @@
++package planner
++
++import (
++	"encoding/json"
++	"strings"
++	"testing"
++
++	"github.com/lf-edge/ekuiper/internal/pkg/store"
++	"github.com/lf-edge/ekuiper/internal/xsql"
++	"github.com/lf-edge/ekuiper/pkg/api"
++	"github.com/lf-edge/ekuiper/pkg/ast"
++)
++
++func analyzeSQLForContextTest(t *testing.T, sql string) string {
++	t.Helper()
++
++
++	streamStore, err := store.GetKV("stream")
++	if err != nil {
++		t.Fatalf("get stream store: %v", err)
++	}
++	streamSQL := `CREATE STREAM src1 (
++		id1 BIGINT,
++		temp BIGINT,
++		name string,
++		next STRUCT(NAME STRING, NID BIGINT)
++	) WITH (DATASOURCE="src1", FORMAT="json", KEY="ts");`
++	streamInfo, err := json.Marshal(&xsql.StreamInfo{
++		StreamType: ast.TypeStream,
++		Statement:  streamSQL,
++	})
++	if err != nil {
++		t.Fatalf("marshal stream info: %v", err)
++	}
++	if err := streamStore.Set("src1", string(streamInfo)); err != nil {
++		t.Fatalf("set stream info: %v", err)
++	}
++
++	_, err = PlanSQLWithSourcesAndSinks(&api.Rule{
++		Id:  "context_validation_rule",
++		Sql: sql,
++		Options: &api.RuleOption{
++			SendError: true,
++		},
++	}, nil, nil)
++	if err == nil {
++		t.Fatalf("PlanSQLWithSourcesAndSinks(%q) succeeded; want validation error", sql)
++	}
++	return err.Error()
++}
++
++func assertHavingContext(t *testing.T, got string, tokens ...string) {
++	t.Helper()
++	const oldGeneric = "Not allowed to call non-aggregate functions in HAVING clause."
++
++	if got == oldGeneric {
++		t.Fatalf("error is still the old generic-only message: %q", got)
++	}
++	for _, token := range tokens {
++		if !strings.Contains(got, token) {
++			t.Fatalf("error %q does not include HAVING expression token %q", got, token)
++		}
++	}
++}
++
++func TestAnalyzerValidationErrorIncludesHavingExpressionContext(t *testing.T) {
++	t.Run("simple having expression", func(t *testing.T) {
++		got := analyzeSQLForContextTest(t,
++			`SELECT count(*) FROM src1 HAVING sin(temp) > 0.3`,
++		)
++		assertHavingContext(t, got, "sin", "temp")
++	})
++
++	t.Run("compound having expression", func(t *testing.T) {
++		got := analyzeSQLForContextTest(t,
++			`SELECT sum(temp) FROM src1 HAVING sum(temp) > 10 OR cos(temp) > 0`,
++		)
++		assertHavingContext(t, got, "cos", "temp")
++	})
++}
+diff --git a/internal/topo/planner/analyzer_test.go b/internal/topo/planner/analyzer_test.go
+index 02ff3008..2a3ed979 100644
+--- a/internal/topo/planner/analyzer_test.go
++++ b/internal/topo/planner/analyzer_test.go
+@@ -60,6 +60,101 @@ func (e *errorStruct) Serr() string {
+ 	return e.err
+ }
+ 
++func plannerValidationErrorMatches(expected, actual, sql string) bool {
++	if expected == actual {
++		return true
++	}
++	if expected == "" || actual == "" {
++		return false
++	}
++	if plannerGenericClause(expected) != "" {
++		return plannerValidationErrorHasSQLContext(actual, sql, expected)
++	}
++	return false
++}
++
++func plannerGenericClause(expected string) string {
++	switch expected {
++	case "Not allowed to call aggregate functions in WHERE clause.":
++		return "WHERE"
++	case "Not allowed to call aggregate functions in GROUP BY clause.":
++		return "GROUP BY"
++	case "Not allowed to call non-aggregate functions in HAVING clause.":
++		return "HAVING"
++	default:
++		return ""
++	}
++}
++
++func plannerValidationErrorHasSQLContext(actual, sql, expected string) bool {
++	tokens := plannerClauseTokens(sql, plannerGenericClause(expected))
++	if len(tokens) == 0 {
++		return false
++	}
++	needed := 2
++	if len(tokens) < needed {
++		needed = len(tokens)
++	}
++	found := 0
++	actualLower := strings.ToLower(actual)
++	for _, token := range tokens {
++		if strings.Contains(actualLower, strings.ToLower(token)) {
++			found++
++		}
++	}
++	return found >= needed
++}
++
++func plannerClauseTokens(sql, clause string) []string {
++	expr := plannerClauseExpression(sql, clause)
++	return plannerSignificantTokens(expr)
++}
++
++func plannerClauseExpression(sql, clause string) string {
++	upper := strings.ToUpper(sql)
++	idx := strings.Index(upper, clause)
++	if idx < 0 {
++		return ""
++	}
++	start := idx + len(clause)
++	end := len(sql)
++	for _, marker := range []string{" WHERE ", " GROUP BY ", " HAVING ", " ORDER BY ", " LIMIT "} {
++		next := strings.Index(upper[start:], marker)
++		if next >= 0 && start+next < end {
++			end = start + next
++		}
++	}
++	return sql[start:end]
++}
++
++func plannerSignificantTokens(expr string) []string {
++	seen := map[string]bool{}
++	var tokens []string
++	for _, token := range strings.FieldsFunc(expr, func(r rune) bool {
++		return !(r == '_' || r >= '0' && r <= '9' || r >= 'A' && r <= 'Z' || r >= 'a' && r <= 'z')
++	}) {
++		if token == "" || plannerAllDigits(token) {
++			continue
++		}
++		lower := strings.ToLower(token)
++		if seen[lower] || lower == "and" || lower == "or" || lower == "true" || lower == "false" || lower == "as" {
++			continue
++		}
++		seen[lower] = true
++		tokens = append(tokens, token)
++	}
++	return tokens
++}
++
++func plannerAllDigits(s string) bool {
++	for _, r := range s {
++		if r < '0' || r > '9' {
++			return false
++		}
++	}
++	return s != ""
++}
++
+ var tests = []struct {
+ 	sql string
+ 	r   *errorStruct
+@@ -261,7 +356,10 @@ func Test_validation(t *testing.T) {
+ 			CheckpointInterval: 0,
+ 			SendError:          true,
+ 		}, store)
+-		assert.Equal(t, tt.r.err, testx.Errstring(err), tt.sql)
++		actual := testx.Errstring(err)
++		if !plannerValidationErrorMatches(tt.r.err, actual, tt.sql) {
++			assert.Equal(t, tt.r.err, actual, tt.sql)
++		}
+ 	}
+ }
+ 
+@@ -321,7 +419,10 @@ func Test_validationSchemaless(t *testing.T) {
+ 		if tt.sql == "SELECT sum(temp) as temp1, count(temp) as temp FROM src1" {
+ 			serr = ""
+ 		}
+-		require.Equal(t, serr, testx.Errstring(err))
++		actual := testx.Errstring(err)
++		if !plannerValidationErrorMatches(serr, actual, tt.sql) {
++			require.Equal(t, serr, actual)
++		}
+ 	}
+ }
+ 
+diff --git a/internal/xsql/func_invoker_test.go b/internal/xsql/func_invoker_test.go
+index c5ea8509..e9832af7 100644
+--- a/internal/xsql/func_invoker_test.go
++++ b/internal/xsql/func_invoker_test.go
+@@ -29,7 +29,8 @@ func TestInvoke(t *testing.T) {
+ 		return
+ 	}
+ 	err = validateFuncs("sum", []ast.Expr{})
+-	if err == nil || err.Error() != "Expect 1 arguments but found 0." {
++
++	if err == nil || !validationErrorMatchesContext("Expect 1 arguments but found 0.", err.Error(), "SELECT sum() FROM tbl") {
+ 		t.Error(err)
+ 	}
+ 	err = validateFuncs("window_start", []ast.Expr{})
+diff --git a/internal/xsql/funcs_validator_test.go b/internal/xsql/funcs_validator_test.go
+index 098921cb..adfc1a00 100644
+--- a/internal/xsql/funcs_validator_test.go
++++ b/internal/xsql/funcs_validator_test.go
+@@ -509,7 +509,8 @@ func TestFuncValidator(t *testing.T) {
+ 	for i, tt := range tests {
+ 		// fmt.Printf("Parsing SQL %q.\n", tt.s)
+ 		stmt, err := NewParser(strings.NewReader(tt.s)).Parse()
+-		if !reflect.DeepEqual(tt.err, testx.Errstring(err)) {
++		gotErr := testx.Errstring(err)
++		if !validationErrorMatchesContext(tt.err, gotErr, tt.s) {
+ 			t.Errorf("%d. %q: error mismatch:\n  exp=%s\n  got=%s\n\n", i, tt.s, tt.err, err)
+ 		} else if tt.err == "" && !reflect.DeepEqual(tt.stmt, stmt) {
+ 			t.Errorf("%d. %q\n\nstmt mismatch:\n\nexp=%#v\n\ngot=%#v\n\n", i, tt.s, tt.stmt, stmt)
+diff --git a/internal/xsql/parser_test.go b/internal/xsql/parser_test.go
+index 8773edcb..153c7ce6 100644
+--- a/internal/xsql/parser_test.go
++++ b/internal/xsql/parser_test.go
+@@ -3301,7 +3301,8 @@ func TestParser_ParseStatement(t *testing.T) {
+ 	for i, tt := range tests {
+ 		// fmt.Printf("Parsing SQL %q.\n", tt.s)
+ 		stmt, err := NewParser(strings.NewReader(tt.s)).Parse()
+-		if !reflect.DeepEqual(tt.err, testx.Errstring(err)) {
++		gotErr := testx.Errstring(err)
++		if !validationErrorMatchesContext(tt.err, gotErr, tt.s) {
+ 			t.Errorf("%d. %q: error mismatch:\n  exp=%s\n  got=%s\n\n", i, tt.s, tt.err, err)
+ 		} else if tt.err == "" && !reflect.DeepEqual(tt.stmt, stmt) {
+ 			t.Errorf("%d. %q\n\nstmt mismatch:\n\nexp=%#v\n\ngot=%#v\n\n", i, tt.s, tt.stmt, stmt)
+diff --git a/internal/xsql/sqlValidator_context_test.go b/internal/xsql/sqlValidator_context_test.go
+new file mode 100644
+index 00000000..f535607e
+--- /dev/null
++++ b/internal/xsql/sqlValidator_context_test.go
+@@ -0,0 +1,194 @@
++package xsql
++
++import (
++	"regexp"
++	"strings"
++	"testing"
++)
++
++var validationFunctionCallRE = regexp.MustCompile(`(?is)\bselect\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\(`)
++
++func validationErrorMatchesContext(expected, actual, sql string) bool {
++	if expected == actual {
++		return true
++	}
++	if expected == "" || actual == "" {
++		return false
++	}
++	if validationGenericClause(expected) != "" {
++		return validationErrorHasSQLContext(actual, sql, expected)
++	}
++	if strings.Contains(actual, expected) {
++		name := firstValidationFunctionName(sql)
++		return name == "" || strings.Contains(strings.ToLower(actual), strings.ToLower(name))
++	}
++	return false
++}
++
++func validationGenericClause(expected string) string {
++	switch expected {
++	case "Not allowed to call aggregate functions in WHERE clause.":
++		return "WHERE"
++	case "Not allowed to call aggregate functions in GROUP BY clause.":
++		return "GROUP BY"
++	default:
++		return ""
++	}
++}
++
++func validationErrorHasSQLContext(actual, sql, expected string) bool {
++	tokens := validationClauseTokens(sql, validationGenericClause(expected))
++	if len(tokens) == 0 {
++		return false
++	}
++	needed := 2
++	if len(tokens) < needed {
++		needed = len(tokens)
++	}
++	found := 0
++	actualLower := strings.ToLower(actual)
++	for _, token := range tokens {
++		if strings.Contains(actualLower, strings.ToLower(token)) {
++			found++
++		}
++	}
++	return found >= needed
++}
++
++func validationClauseTokens(sql, clause string) []string {
++	expr := validationClauseExpression(sql, clause)
++	return validationSignificantTokens(expr)
++}
++
++func validationClauseExpression(sql, clause string) string {
++	upper := strings.ToUpper(sql)
++	idx := strings.Index(upper, clause)
++	if idx < 0 {
++		return ""
++	}
++	start := idx + len(clause)
++	end := len(sql)
++	for _, marker := range []string{" WHERE ", " GROUP BY ", " HAVING ", " ORDER BY ", " LIMIT "} {
++		next := strings.Index(upper[start:], marker)
++		if next >= 0 && start+next < end {
++			end = start + next
++		}
++	}
++	return sql[start:end]
++}
++
++func validationSignificantTokens(expr string) []string {
++	seen := map[string]bool{}
++	var tokens []string
++	for _, token := range strings.FieldsFunc(expr, func(r rune) bool {
++		return !(r == '_' || r >= '0' && r <= '9' || r >= 'A' && r <= 'Z' || r >= 'a' && r <= 'z')
++	}) {
++		if token == "" || validationAllDigits(token) {
++			continue
++		}
++		lower := strings.ToLower(token)
++		if seen[lower] || lower == "and" || lower == "or" || lower == "true" || lower == "false" || lower == "as" {
++			continue
++		}
++		seen[lower] = true
++		tokens = append(tokens, token)
++	}
++	return tokens
++}
++
++func validationAllDigits(s string) bool {
++	for _, r := range s {
++		if r < '0' || r > '9' {
++			return false
++		}
++	}
++	return s != ""
++}
++
++func firstValidationFunctionName(sql string) string {
++	matches := validationFunctionCallRE.FindStringSubmatch(sql)
++	if len(matches) < 2 {
++		return ""
++	}
++	return matches[1]
++}
++
++func validateSQLForContextTest(t *testing.T, sql string) string {
++	t.Helper()
++	parser := NewParser(strings.NewReader(sql))
++	_, err := parser.Parse()
++	if err == nil {
++		t.Fatalf("Parse(%q) succeeded; want validation error", sql)
++	}
++	return err.Error()
++}
++
++func assertContextualValidationError(t *testing.T, got, oldGeneric string, tokens ...string) {
++	t.Helper()
++	if got == oldGeneric {
++		t.Fatalf("error is still the old generic-only message: %q", got)
++	}
++	for _, token := range tokens {
++		if !strings.Contains(got, token) {
++			t.Fatalf("error %q does not include offending-expression token %q", got, token)
++		}
++	}
++}
++
++func TestValidationErrorIncludesWhereExpressionContext(t *testing.T) {
++	got := validateSQLForContextTest(t,
++		`SELECT temp FROM src1 WHERE sum(temp) > 10 AND device = "demo"`,
++	)
++
++	assertContextualValidationError(t, got,
++		"Not allowed to call aggregate functions in WHERE clause.",
++		"sum", "temp",
++	)
++}
++
++func TestValidationErrorIncludesGroupByExpressionContext(t *testing.T) {
++	got := validateSQLForContextTest(t,
++		`SELECT temp FROM src1 GROUP BY max(temp + 1)`,
++	)
++
++	assertContextualValidationError(t, got,
++		"Not allowed to call aggregate functions in GROUP BY clause.",
++		"max", "temp",
++	)
++}
++
++func parseSQLFunctionValidationErrorForContextTest(t *testing.T, sql string) string {
++	t.Helper()
++	_, err := NewParser(strings.NewReader(sql)).Parse()
++	if err == nil {
++		t.Fatalf("Parse(%q) succeeded; want validation error", sql)
++	}
++	return err.Error()
++}
++
++func assertFunctionValidationContext(t *testing.T, got, functionName string, reasonTokens ...string) {
++	t.Helper()
++	if !strings.Contains(got, functionName) {
++		t.Fatalf("error %q does not identify function %q", got, functionName)
++	}
++	for _, token := range reasonTokens {
++		if !strings.Contains(got, token) {
++			t.Fatalf("error %q does not preserve underlying reason token %q", got, token)
++		}
++	}
++}
++
++func TestFunctionValidationErrorIncludesNameAndUnderlyingReason(t *testing.T) {
++	got := parseSQLFunctionValidationErrorForContextTest(t, `SELECT sum() FROM tbl`)
++	assertFunctionValidationContext(t, got,
++		"sum",
++		"Expect 1 arguments but found 0.",
++	)
++
++	got = parseSQLFunctionValidationErrorForContextTest(t, `SELECT abs(true) FROM tbl`)
++	assertFunctionValidationContext(t, got,
++		"abs",
++		"Expect number",
++		"parameter 1",
++	)
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,30 @@
++#!/bin/bash
++set -uo pipefail
++cd /testbed
++
++
++mkdir -p /tmp/kuiper_base/{etc,data,log,plugins}
++cp -r /testbed/etc/* /tmp/kuiper_base/etc/ 2>/dev/null || true
++export KuiperBaseKey=/tmp/kuiper_base
++
++
++packages=(
++  ./internal/binder/function/
++  ./internal/topo/planner/
++  ./internal/xsql/
++)
++
++case "${1:-}" in
++  base)
++    go test -v -count=1 "${packages[@]}" \
++      -run '^TestArrayCommonFunctions$|^Test_validation$|^TestInvoke$|^TestFuncValidator$|^TestParser_ParseStatement$'
++    ;;
++  new)
++    go test -v -count=1 "${packages[@]}" \
++      -run '^TestArrayFunctionArgumentValidationErrorIncludesFunctionName$|^TestAnalyzerValidationErrorIncludesHavingExpressionContext$|^TestValidationErrorIncludesWhereExpressionContext$|^TestValidationErrorIncludesGroupByExpressionContext$|^TestFunctionValidationErrorIncludesNameAndUnderlyingReason$'
++    ;;
++  *)
++    echo "usage: $0 base|new"
++    exit 2
++    ;;
++esac

@@ -1,0 +1,257 @@
+diff --git a/test/hook-gateway-replace-schema.test.js b/test/hook-gateway-replace-schema.test.js
+new file mode 100644
+index 0000000..f3c496b
+--- /dev/null
++++ b/test/hook-gateway-replace-schema.test.js
+@@ -0,0 +1,229 @@
++'use strict'
++
++const { test } = require('tap')
++const { promisify } = require('util')
++const FakeTimers = require('@sinonjs/fake-timers')
++const Fastify = require('fastify')
++const mercurius = require('mercurius')
++const mercuriusGateway = require('@mercuriusjs/gateway')
++const { mercuriusFederationPlugin, buildFederationSchema } = require('@mercuriusjs/federation')
++const { buildSchema } = require('graphql')
++const cache = require('..')
++
++const immediate = promisify(setImmediate)
++
++test('cache plugin loads without error on plain mercurius (no gateway)', async (t) => {
++  const app = Fastify()
++  t.teardown(() => app.close())
++
++  app.register(mercurius, {
++    schema: 'type Query { hello: String }',
++    resolvers: { Query: { hello: () => 'world' } }
++  })
++
++  app.register(cache, {
++    ttl: 4242,
++    policy: { Query: { hello: true } }
++  })
++
++  await t.resolves(app.ready(), 'plugin should not throw MER_ERR_HOOK_UNSUPPORTED_HOOK')
++})
++
++test('cache plugin exposes app.graphql.cache API on plain mercurius', async (t) => {
++  const app = Fastify()
++  t.teardown(() => app.close())
++
++  app.register(mercurius, {
++    schema: 'type Query { hello: String }',
++    resolvers: { Query: { hello: () => 'world' } }
++  })
++
++  app.register(cache, {
++    ttl: 4242,
++    policy: { Query: { hello: true } }
++  })
++
++  await app.ready()
++  t.equal(typeof app.graphql.cache.refresh, 'function')
++  t.equal(typeof app.graphql.cache.invalidate, 'function')
++  t.equal(typeof app.graphql.cache.clear, 'function')
++})
++
++test('cache works correctly on plain mercurius (preservation)', async (t) => {
++  let callCount = 0
++  const app = Fastify()
++  t.teardown(() => app.close())
++
++  app.register(mercurius, {
++    schema: 'type Query { add(x: Int, y: Int): Int }',
++    resolvers: {
++      Query: {
++        add: (_, { x, y }) => { callCount++; return x + y }
++      }
++    }
++  })
++
++  let hits = 0
++  let misses = 0
++  app.register(cache, {
++    ttl: 4242,
++    policy: { Query: { add: true } },
++    onHit: () => { hits++ },
++    onMiss: () => { misses++ }
++  })
++
++  await app.ready()
++
++  const q = '{ add(x: 2, y: 2) }'
++  const r1 = await app.inject({ method: 'POST', url: '/graphql', body: { query: q } })
++  const r2 = await app.inject({ method: 'POST', url: '/graphql', body: { query: q } })
++
++  t.same(r1.json(), { data: { add: 4 } })
++  t.same(r2.json(), { data: { add: 4 } })
++  t.equal(callCount, 1, 'resolver should run once due to caching')
++  t.equal(misses, 1)
++  t.equal(hits, 1)
++})
++
++test('cache plugin loads without error on a gateway', async (t) => {
++  const service = Fastify()
++  service.register(mercuriusFederationPlugin, {
++    schema: 'extend type Query { hello: String }',
++    resolvers: { Query: { hello: () => 'world' } }
++  })
++  await service.listen({ port: 0 })
++  const port = service.server.address().port
++
++  const gateway = Fastify()
++  t.teardown(async () => {
++    await gateway.close()
++    await service.close()
++  })
++
++  gateway.register(mercuriusGateway, {
++    gateway: { services: [{ name: 'svc', url: `http://localhost:${port}/graphql` }] }
++  })
++
++  gateway.register(cache, {
++    ttl: 4242,
++    policy: { Query: { hello: true } }
++  })
++
++  await t.resolves(gateway.ready(), 'plugin should not throw when registered on a gateway')
++})
++
++test('cache rewraps resolvers when gateway schema is refreshed via polling', async (t) => {
++  const clock = FakeTimers.install({ shouldAdvanceTime: true, advanceTimeDelta: 40 })
++  t.teardown(() => clock.uninstall())
++
++  const user = { id: 'u1', name: 'John', lastName: 'Doe' }
++  const resolvers = { Query: { me: () => user } }
++
++  const userService = Fastify()
++  userService.register(mercuriusFederationPlugin, {
++    schema: `
++      extend type Query { me: User }
++      type User @key(fields: "id") { id: ID! name: String }
++    `,
++    resolvers
++  })
++  await userService.listen({ port: 0 })
++  const port = userService.server.address().port
++
++  const gateway = Fastify({ logger: { level: 'error' } })
++  t.teardown(async () => {
++    await gateway.close()
++    await userService.close()
++  })
++
++  let misses = 0
++  gateway.register(mercuriusGateway, {
++    gateway: {
++      services: [{ name: 'svc', url: `http://localhost:${port}/graphql` }],
++      pollingInterval: 2000
++    }
++  })
++  gateway.register(cache, {
++    ttl: 4242,
++    policy: { Query: { me: true } },
++    onMiss: () => { misses++ }
++  })
++  await gateway.ready()
++
++  await gateway.inject({
++    method: 'POST',
++    url: '/graphql',
++    body: { query: '{ me { id name } }' }
++  })
++  t.equal(misses, 1, 'first query causes a cache miss (initial wrapping)')
++
++
++  userService.graphql.replaceSchema(buildFederationSchema(`
++    extend type Query { me: User }
++    type User @key(fields: "id") { id: ID! name: String lastName: String }
++  `))
++  userService.graphql.defineResolvers(resolvers)
++
++
++  await clock.tickAsync(2000)
++  await immediate()
++  await immediate()
++
++  await gateway.inject({
++    method: 'POST',
++    url: '/graphql',
++    body: { query: '{ me { id name lastName } }' }
++  })
++
++  t.equal(misses, 2, 'after gateway schema refresh, the new schema resolvers must be re-wrapped so the cache fires onMiss again')
++})
++
++test('cache supports manual refresh after replaceSchema on plain mercurius (preservation)', async (t) => {
++  const app = Fastify()
++  t.teardown(() => app.close())
++
++  const resolvers = {
++    Query: { hello: () => 'world' }
++  }
++
++  app.register(mercurius, {
++    schema: 'type Query { hello: String }',
++    resolvers
++  })
++
++  app.register(cache, {
++    ttl: 4242,
++    policy: { Query: { hello: true } }
++  })
++
++  await app.ready()
++
++
++
++
++  app.graphql.replaceSchema(buildSchema(`
++    type Query {
++      hello: String
++      goodbye: String
++    }
++  `))
++  app.graphql.defineResolvers({
++    Query: {
++      hello: () => 'world',
++      goodbye: () => 'bye'
++    }
++  })
++
++
++  await t.resolves(
++    Promise.resolve().then(() => app.graphql.cache.refresh()),
++    'manual cache.refresh() must succeed after a user-initiated replaceSchema'
++  )
++
++  const res = await app.inject({
++    method: 'POST',
++    url: '/graphql',
++    body: { query: '{ hello goodbye }' }
++  })
++  t.same(res.json(), { data: { hello: 'world', goodbye: 'bye' } })
++})
+diff --git a/test_commands.json b/test_commands.json
+new file mode 100644
+index 0000000..5ccab54
+--- /dev/null
++++ b/test_commands.json
+@@ -0,0 +1,3 @@
++{
++  "test_commands": ["npx tap test/hook-gateway-replace-schema.test.js --no-coverage"]
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,8 @@
++#!/usr/bin/env bash
++
++set -uo pipefail
++cd /testbed
++rc=0
++npx tap test/hook-gateway-replace-schema.test.js --no-coverage
++rc=$(( rc | $? ))
++exit $rc

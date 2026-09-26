@@ -1,0 +1,642 @@
+diff --git a/usercase-test-coderl/a2a_client_test.go b/usercase-test-coderl/a2a_client_test.go
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/a2a_client_test.go
+@@ -0,0 +1,605 @@
++package usercase_test_coderl
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io"
++	"mime"
++	"net/http"
++	"net/http/httptest"
++	"os"
++	"runtime"
++	"slices"
++	"strings"
++	"sync"
++	"testing"
++	"time"
++
++	"go-micro.dev/v6/gateway/a2a"
++)
++
++
++
++
++
++
++
++
++type roundTripFunc func(*http.Request) (*http.Response, error)
++
++func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {
++	return f(r)
++}
++
++func TestWithHTTPClientNilAndNonNilArePerInstance(t *testing.T) {
++
++
++
++
++	ctx := context.Background()
++	requests := 0
++	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
++		requests++
++		if r.Method != http.MethodGet {
++			t.Fatalf("method = %q, want %q", r.Method, http.MethodGet)
++		}
++		if r.URL.String() != "http://agent.example/rpc/.well-known/agent.json" {
++			t.Fatalf("url = %q, want %q", r.URL.String(), "http://agent.example/rpc/.well-known/agent.json")
++		}
++		return jsonResponse(200, `{"name":"alpha","url":"http://agent.example/rpc","version":"1.0.0","protocolVersion":"0.3.0","capabilities":{"streaming":false,"pushNotifications":false},"defaultInputModes":["text/plain"],"defaultOutputModes":["text/plain"],"skills":[{"id":"chat","name":"Chat"}]}`), nil
++	})
++
++	client := a2a.NewClient("http://agent.example/rpc")
++	chained := client.WithHTTPClient(&http.Client{Transport: transport})
++	if (chained == client) != true {
++		t.Fatalf("WithHTTPClient(non-nil) returned same pointer = %t, want %t", chained == client, true)
++	}
++	chainedAgain := client.WithHTTPClient(nil)
++	if (chainedAgain == client) != true {
++		t.Fatalf("WithHTTPClient(nil) returned same pointer = %t, want %t", chainedAgain == client, true)
++	}
++
++	card, err := client.Card(ctx)
++	if err != nil {
++		t.Fatalf("Card error = %v, want nil", err)
++	}
++	if requests != 1 {
++		t.Fatalf("transport requests = %d, want %d", requests, 1)
++	}
++	if card.Name != "alpha" {
++		t.Fatalf("card name = %q, want %q", card.Name, "alpha")
++	}
++	if card.URL != "http://agent.example/rpc" {
++		t.Fatalf("card url = %q, want %q", card.URL, "http://agent.example/rpc")
++	}
++	if card.ProtocolVersion != "0.3.0" {
++		t.Fatalf("card protocolVersion = %q, want %q", card.ProtocolVersion, "0.3.0")
++	}
++}
++
++func TestCardFetchesWellKnownAgentJSONAndReportsStatus(t *testing.T) {
++
++
++
++
++	var paths []string
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		paths = append(paths, r.Method+" "+r.URL.Path)
++		switch r.URL.Path {
++		case "/missing/.well-known/agent.json":
++			http.Error(w, "not found", http.StatusNotFound)
++		default:
++			writeJSON(w, 200, a2a.AgentCard{
++				Name:               "echo",
++				Description:        "card fixture",
++				URL:                serverURLFromRequest(r),
++				Version:            "1.0.0",
++				ProtocolVersion:    "0.3.0",
++				Capabilities:       a2a.Capabilities{Streaming: false, PushNotifications: false},
++				DefaultInputModes:  []string{"text/plain"},
++				DefaultOutputModes: []string{"text/plain"},
++				Skills:             []a2a.Skill{{ID: "chat", Name: "Chat", Tags: []string{"ops"}}},
++			})
++		}
++	}))
++	defer server.Close()
++
++	card, err := a2a.NewClient(server.URL).Card(context.Background())
++	if err != nil {
++		t.Fatalf("Card error = %v, want nil", err)
++	}
++	if card.Name != "echo" {
++		t.Fatalf("card name = %q, want %q", card.Name, "echo")
++	}
++	if card.Description != "card fixture" {
++		t.Fatalf("card description = %q, want %q", card.Description, "card fixture")
++	}
++	if card.URL != server.URL {
++		t.Fatalf("card url = %q, want %q", card.URL, server.URL)
++	}
++	if card.DefaultInputModes[0] != "text/plain" {
++		t.Fatalf("card defaultInputModes[0] = %q, want %q", card.DefaultInputModes[0], "text/plain")
++	}
++	if card.Skills[0].Tags[0] != "ops" {
++		t.Fatalf("card skill tag = %q, want %q", card.Skills[0].Tags[0], "ops")
++	}
++
++	_, err = a2a.NewClient(server.URL + "/missing").Card(context.Background())
++	if err == nil {
++		t.Fatalf("Card 404 error = nil, want %q", "agent card: status 404")
++	}
++
++	if !strings.Contains(err.Error(), "agent card") || !strings.Contains(err.Error(), "404") {
++		t.Fatalf("Card 404 error = %q, want agent card context and status 404", err.Error())
++	}
++
++	if !slices.Contains(paths, "GET /.well-known/agent.json") || !slices.Contains(paths, "GET /missing/.well-known/agent.json") {
++		t.Fatalf("card request paths = %q, want both well-known agent card fetches", strings.Join(paths, ","))
++	}
++}
++
++func TestSendPostsUserTextAndReturnsMessageTextParts(t *testing.T) {
++
++
++
++
++	var captured normalizedSendRequest
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		if r.Method != http.MethodPost {
++			t.Fatalf("method = %q, want %q", r.Method, http.MethodPost)
++		}
++		if r.URL.Path != "/" {
++			t.Fatalf("path = %q, want %q", r.URL.Path, "/")
++		}
++		contentType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
++		if err != nil || contentType != "application/json" {
++
++			t.Fatalf("content-type = %q, want JSON media type", r.Header.Get("Content-Type"))
++		}
++		captured = decodeSendRequest(t, r.Body)
++		writeRPCResult(w, map[string]any{
++			"kind": "message",
++			"role": "agent",
++			"parts": []map[string]string{
++				{"kind": "text", "text": "hel"},
++				{"kind": "text", "text": "lo"},
++			},
++		})
++	}))
++	defer server.Close()
++
++	text, err := a2a.NewClient(server.URL).Send(context.Background(), "hi")
++	if err != nil {
++		t.Fatalf("Send error = %v, want nil", err)
++	}
++	if text != "hello" {
++		t.Fatalf("Send text = %q, want %q", text, "hello")
++	}
++	want := normalizedSendRequest{
++		JSONRPC:     "2.0",
++		Method:      "message/send",
++		MessageRole: "user",
++		MessageKind: "message",
++		PartKind:    "text",
++		PartText:    "hi",
++	}
++	if captured != want {
++		t.Fatalf("normalized request = %+v, want %+v", captured, want)
++	}
++}
++
++func TestSendReturnsCompletedTaskArtifactText(t *testing.T) {
++
++
++
++
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		req := decodeRPCRequest(t, r.Body)
++		if req.Method != "message/send" {
++			t.Fatalf("method = %q, want %q", req.Method, "message/send")
++		}
++		writeRPCResult(w, completedTask("task-completed", "po", "ng"))
++	}))
++	defer server.Close()
++
++	text, err := a2a.NewClient(server.URL).Send(context.Background(), "ping")
++	if err != nil {
++		t.Fatalf("Send error = %v, want nil", err)
++	}
++	if text != "pong" {
++		t.Fatalf("Send text = %q, want %q", text, "pong")
++	}
++}
++
++func TestSendPollsPendingTaskUntilCompleted(t *testing.T) {
++
++
++
++
++	var mu sync.Mutex
++	var methods []string
++	var getID string
++	var sendAt, getAt time.Time
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		req := decodeRPCRequest(t, r.Body)
++		mu.Lock()
++		methods = append(methods, req.Method)
++		switch req.Method {
++		case "message/send":
++			sendAt = time.Now()
++			mu.Unlock()
++			writeRPCResult(w, map[string]any{
++				"kind":      "task",
++				"id":        "task-pending",
++				"contextId": "ctx-pending",
++				"status": map[string]string{
++					"state":     "working",
++					"timestamp": "2026-06-29T00:00:00Z",
++				},
++			})
++		case "tasks/get":
++			getAt = time.Now()
++			getID = taskGetID(t, req.Params)
++			mu.Unlock()
++			writeRPCResult(w, completedTask("task-pending", "done"))
++		default:
++			mu.Unlock()
++			t.Fatalf("method = %q, want %q or %q", req.Method, "message/send", "tasks/get")
++		}
++	}))
++	defer server.Close()
++
++	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
++	defer cancel()
++	text, err := a2a.NewClient(server.URL).Send(ctx, "wait")
++	if err != nil {
++		t.Fatalf("Send error = %v, want nil", err)
++	}
++	if text != "done" {
++		t.Fatalf("Send text = %q, want %q", text, "done")
++	}
++	if strings.Join(methods, ",") != "message/send,tasks/get" {
++		t.Fatalf("methods = %q, want %q", strings.Join(methods, ","), "message/send,tasks/get")
++	}
++	if getID != "task-pending" {
++		t.Fatalf("tasks/get id = %q, want %q", getID, "task-pending")
++	}
++	delay := getAt.Sub(sendAt)
++
++	if delay < 200*time.Millisecond || delay > 750*time.Millisecond {
++		t.Fatalf("poll delay = %s, want about 300ms", delay)
++	}
++}
++
++func TestSendTerminalFailureStatesReturnSpecificErrors(t *testing.T) {
++
++
++
++
++	cases := []struct {
++		state string
++		want  string
++	}{
++		{state: "failed", want: "remote task task-failed ended in state \"failed\""},
++		{state: "canceled", want: "remote task task-canceled ended in state \"canceled\""},
++		{state: "rejected", want: "remote task task-rejected ended in state \"rejected\""},
++	}
++	for _, tc := range cases {
++		t.Run(tc.state, func(t *testing.T) {
++			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++				writeRPCResult(w, terminalTask("task-"+tc.state, tc.state))
++			}))
++			defer server.Close()
++
++			text, err := a2a.NewClient(server.URL).Send(context.Background(), "stop")
++			if text != "" {
++				t.Fatalf("Send text = %q, want %q", text, "")
++			}
++			if err == nil {
++				t.Fatalf("Send error = nil, want %q", tc.want)
++			}
++
++			if !strings.Contains(err.Error(), "task-"+tc.state) || !strings.Contains(err.Error(), tc.state) {
++				t.Fatalf("Send error = %q, want task id and terminal state %q", err.Error(), tc.state)
++			}
++		})
++	}
++}
++
++func TestSendJSONRPCErrorIncludesMethodMessageAndCode(t *testing.T) {
++
++
++
++
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		req := decodeRPCRequest(t, r.Body)
++		writeJSON(w, 200, map[string]any{
++			"jsonrpc": "2.0",
++			"id":      req.ID,
++			"error": map[string]any{
++				"code":    -32602,
++				"message": "bad request",
++			},
++		})
++	}))
++	defer server.Close()
++
++	text, err := a2a.NewClient(server.URL).Send(context.Background(), "bad")
++	if text != "" {
++		t.Fatalf("Send text = %q, want %q", text, "")
++	}
++	if err == nil {
++		t.Fatalf("Send error = nil, want %q", "a2a message/send: bad request (-32602)")
++	}
++
++	if !strings.Contains(err.Error(), "message/send") || !strings.Contains(err.Error(), "bad request") || !strings.Contains(err.Error(), "-32602") {
++		t.Fatalf("Send error = %q, want method, remote message, and numeric code", err.Error())
++	}
++}
++
++func TestSendStopsPollingWhenContextIsDone(t *testing.T) {
++
++
++
++
++	var methods []string
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		req := decodeRPCRequest(t, r.Body)
++		methods = append(methods, req.Method)
++		writeRPCResult(w, map[string]any{
++			"kind":      "task",
++			"id":        "task-timeout",
++			"contextId": "ctx-timeout",
++			"status": map[string]string{
++				"state":     "working",
++				"timestamp": "2026-06-29T00:00:00Z",
++			},
++		})
++	}))
++	defer server.Close()
++
++	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
++	defer cancel()
++	text, err := a2a.NewClient(server.URL).Send(ctx, "wait")
++	if text != "" {
++		t.Fatalf("Send text = %q, want %q", text, "")
++	}
++	if (errors.Is(err, context.DeadlineExceeded)) != true {
++		t.Fatalf("errors.Is(deadline exceeded) = %t, want %t (err %v)", errors.Is(err, context.DeadlineExceeded), true, err)
++	}
++	if strings.Join(methods, ",") != "message/send" {
++		t.Fatalf("methods = %q, want %q", strings.Join(methods, ","), "message/send")
++	}
++}
++
++func TestTwoClientsKeepIndependentURLsAndTransports(t *testing.T) {
++
++
++
++
++	aRequests := 0
++	aTransport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
++		aRequests++
++		if r.URL.String() != "http://alpha.invalid/rpc/.well-known/agent.json" {
++			t.Fatalf("client A url = %q, want %q", r.URL.String(), "http://alpha.invalid/rpc/.well-known/agent.json")
++		}
++		return jsonResponse(200, `{"name":"alpha","url":"http://alpha.invalid/rpc","version":"1.0.0","protocolVersion":"0.3.0","capabilities":{"streaming":false,"pushNotifications":false},"defaultInputModes":["text/plain"],"defaultOutputModes":["text/plain"],"skills":[{"id":"chat","name":"Chat"}]}`), nil
++	})
++	bRequests := 0
++	bServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		bRequests++
++		if r.URL.Path != "/.well-known/agent.json" {
++			t.Fatalf("client B path = %q, want %q", r.URL.Path, "/.well-known/agent.json")
++		}
++		writeJSON(w, 200, a2a.AgentCard{
++			Name:               "bravo",
++			URL:                bServerURL(r),
++			Version:            "1.0.0",
++			ProtocolVersion:    "0.3.0",
++			Capabilities:       a2a.Capabilities{Streaming: false, PushNotifications: false},
++			DefaultInputModes:  []string{"text/plain"},
++			DefaultOutputModes: []string{"text/plain"},
++			Skills:             []a2a.Skill{{ID: "chat", Name: "Chat"}},
++		})
++	}))
++	defer bServer.Close()
++
++	aClient := a2a.NewClient("http://alpha.invalid/rpc").WithHTTPClient(&http.Client{Transport: aTransport})
++	bClient := a2a.NewClient(bServer.URL)
++
++	aCard, err := aClient.Card(context.Background())
++	if err != nil {
++		t.Fatalf("client A Card error = %v, want nil", err)
++	}
++	bCard, err := bClient.Card(context.Background())
++	if err != nil {
++		t.Fatalf("client B Card error = %v, want nil", err)
++	}
++	if aCard.Name != "alpha" {
++		t.Fatalf("client A card name = %q, want %q", aCard.Name, "alpha")
++	}
++	if bCard.Name != "bravo" {
++		t.Fatalf("client B card name = %q, want %q", bCard.Name, "bravo")
++	}
++	if aRequests != 1 {
++		t.Fatalf("client A transport requests = %d, want %d", aRequests, 1)
++	}
++	if bRequests != 1 {
++		t.Fatalf("client B server requests = %d, want %d", bRequests, 1)
++	}
++}
++
++func TestRepeatedConstructUseCyclesKeepFDsAndGoroutinesBounded(t *testing.T) {
++
++
++
++
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		writeRPCResult(w, completedTask("task-leak", "ok"))
++	}))
++	defer server.Close()
++
++	runtime.GC()
++	time.Sleep(50 * time.Millisecond)
++	baseFDs := openFDs(t)
++	baseGoroutines := runtime.NumGoroutine()
++
++	for i := 0; i < 120; i++ {
++		text, err := a2a.NewClient(server.URL).Send(context.Background(), "cycle")
++		if err != nil {
++			t.Fatalf("cycle %d Send error = %v, want nil", i, err)
++		}
++		if text != "ok" {
++			t.Fatalf("cycle %d Send text = %q, want %q", i, text, "ok")
++		}
++	}
++
++	runtime.GC()
++	time.Sleep(200 * time.Millisecond)
++	afterFDs := openFDs(t)
++	afterGoroutines := runtime.NumGoroutine()
++
++	if (afterFDs-baseFDs <= 40) != true {
++		t.Fatalf("fd delta <= 40 = %t, want %t (before %d after %d)", afterFDs-baseFDs <= 40, true, baseFDs, afterFDs)
++	}
++
++	if (afterGoroutines-baseGoroutines <= 60) != true {
++		t.Fatalf("goroutine delta <= 60 = %t, want %t (before %d after %d)", afterGoroutines-baseGoroutines <= 60, true, baseGoroutines, afterGoroutines)
++	}
++}
++
++type rpcRequest struct {
++	JSONRPC string          `json:"jsonrpc"`
++	ID      json.RawMessage `json:"id"`
++	Method  string          `json:"method"`
++	Params  json.RawMessage `json:"params"`
++}
++
++type normalizedSendRequest struct {
++	JSONRPC     string
++	Method      string
++	MessageRole string
++	MessageKind string
++	PartKind    string
++	PartText    string
++}
++
++func decodeSendRequest(t *testing.T, body io.Reader) normalizedSendRequest {
++	t.Helper()
++	req := decodeRPCRequest(t, body)
++	var params struct {
++		Message struct {
++			Role  string `json:"role"`
++			Kind  string `json:"kind"`
++			Parts []struct {
++				Kind string `json:"kind"`
++				Text string `json:"text"`
++			} `json:"parts"`
++		} `json:"message"`
++	}
++	if err := json.Unmarshal(req.Params, &params); err != nil {
++		t.Fatalf("decode params: %v", err)
++	}
++	return normalizedSendRequest{
++		JSONRPC:     req.JSONRPC,
++		Method:      req.Method,
++		MessageRole: params.Message.Role,
++		MessageKind: params.Message.Kind,
++		PartKind:    params.Message.Parts[0].Kind,
++		PartText:    params.Message.Parts[0].Text,
++	}
++}
++
++func decodeRPCRequest(t *testing.T, body io.Reader) rpcRequest {
++	t.Helper()
++	var req rpcRequest
++	if err := json.NewDecoder(body).Decode(&req); err != nil {
++		t.Fatalf("decode rpc request: %v", err)
++	}
++	return req
++}
++
++func taskGetID(t *testing.T, raw json.RawMessage) string {
++	t.Helper()
++	var params struct {
++		ID string `json:"id"`
++	}
++	if err := json.Unmarshal(raw, &params); err != nil {
++		t.Fatalf("decode tasks/get params: %v", err)
++	}
++	return params.ID
++}
++
++func completedTask(id string, parts ...string) map[string]any {
++	textParts := make([]map[string]string, 0, len(parts))
++	for _, part := range parts {
++		textParts = append(textParts, map[string]string{"kind": "text", "text": part})
++	}
++	return map[string]any{
++		"kind":      "task",
++		"id":        id,
++		"contextId": "ctx-" + id,
++		"status": map[string]string{
++			"state":     "completed",
++			"timestamp": "2026-06-29T00:00:00Z",
++		},
++		"artifacts": []map[string]any{{
++			"artifactId": "artifact-" + id,
++			"parts":      textParts,
++		}},
++	}
++}
++
++func terminalTask(id, state string) map[string]any {
++	return map[string]any{
++		"kind":      "task",
++		"id":        id,
++		"contextId": "ctx-" + id,
++		"status": map[string]string{
++			"state":     state,
++			"timestamp": "2026-06-29T00:00:00Z",
++		},
++	}
++}
++
++func writeRPCResult(w http.ResponseWriter, result any) {
++	writeJSON(w, 200, map[string]any{
++		"jsonrpc": "2.0",
++		"id":      "response-id",
++		"result":  result,
++	})
++}
++
++func writeJSON(w http.ResponseWriter, status int, v any) {
++	w.Header().Set("Content-Type", "application/json")
++	w.WriteHeader(status)
++	_ = json.NewEncoder(w).Encode(v)
++}
++
++func jsonResponse(status int, body string) *http.Response {
++	return &http.Response{
++		StatusCode: status,
++		Header:     make(http.Header),
++		Body:       io.NopCloser(bytes.NewBufferString(body)),
++	}
++}
++
++func openFDs(t *testing.T) int {
++	t.Helper()
++	entries, err := os.ReadDir("/proc/self/fd")
++	if err != nil {
++		t.Fatalf("read /proc/self/fd: %v", err)
++	}
++	return len(entries)
++}
++
++func serverURLFromRequest(r *http.Request) string {
++	return fmt.Sprintf("http://%s", r.Host)
++}
++
++func bServerURL(r *http.Request) string {
++	return fmt.Sprintf("http://%s", r.Host)
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,27 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++
++cd /workspace/repo
++export GOTOOLCHAIN=local
++export GOPROXY=off
++export GOSUMDB=off
++export GOVCS='*:off'
++export GOFLAGS="${GOFLAGS:-} -mod=readonly"
++
++GO124=/root/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.1.linux-amd64/bin/go
++if [ ! -x "$GO124" ]; then
++  echo "cached Go 1.24.1 toolchain missing at $GO124" >&2
++  exit 1
++fi
++
++exec "$GO124" test -v -count=1 ./usercase-test-coderl/...

@@ -1,0 +1,220 @@
+diff --git a/rest/adminapitest/admin_api_audit_config_test.go b/rest/adminapitest/admin_api_audit_config_test.go
+new file mode 100644
+index 000000000..981ffd0a8
+--- /dev/null
++++ b/rest/adminapitest/admin_api_audit_config_test.go
+@@ -0,0 +1,193 @@
++package adminapitest
++
++import (
++	"encoding/json"
++	"fmt"
++	"net/http"
++	"testing"
++
++	"github.com/couchbase/sync_gateway/base"
++	"github.com/couchbase/sync_gateway/rest"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++)
++
++const unknownAuditEventIDForConfigAPITest = "999999999"
++
++type auditConfigResponse struct {
++	Enabled bool           `json:"enabled"`
++	Events  map[string]any `json:"events"`
++}
++
++func requireAuditConfig(t *testing.T, rt *rest.RestTester) (auditConfigResponse, string) {
++	t.Helper()
++	resp := rt.SendAdminRequest(http.MethodGet, "/db/_config/audit", "")
++	rest.RequireStatus(t, resp, http.StatusOK)
++	var body auditConfigResponse
++	require.NoError(t, json.Unmarshal(resp.Body.Bytes(), &body))
++	require.NotNil(t, body.Events)
++	return body, resp.Header().Get("ETag")
++}
++
++func requireAuditEventBool(t *testing.T, body auditConfigResponse, id base.AuditID) bool {
++	t.Helper()
++	raw, ok := body.Events[id.String()]
++	require.Truef(t, ok, "expected audit event %s in response", id.String())
++	val, ok := raw.(bool)
++	require.Truef(t, ok, "expected audit event %s value to be a bool, got %T", id.String(), raw)
++	return val
++}
++
++func requireDBConfigAuditEvents(t *testing.T, rt *rest.RestTester) map[string]bool {
++	t.Helper()
++	resp := rt.SendAdminRequest(http.MethodGet, "/db/_config", "")
++	rest.RequireStatus(t, resp, http.StatusOK)
++	var cfg map[string]any
++	require.NoError(t, json.Unmarshal(resp.Body.Bytes(), &cfg))
++	logging, ok := cfg["logging"].(map[string]any)
++	require.True(t, ok, "expected logging object in database config")
++	audit, ok := logging["audit"].(map[string]any)
++	require.True(t, ok, "expected logging.audit object in database config")
++	events := make(map[string]bool)
++	if rawEvents, ok := audit["enabled_events"].([]any); ok {
++		for _, raw := range rawEvents {
++			switch v := raw.(type) {
++			case float64:
++				events[fmt.Sprintf("%.0f", v)] = true
++			case string:
++				events[v] = true
++			}
++		}
++	}
++	return events
++}
++
++func TestDatabaseConfigAuditAPIGetShapeDefaultsAndETag(t *testing.T) {
++	rt := rest.NewRestTesterPersistentConfig(t)
++	defer rt.Close()
++
++	body, auditETag := requireAuditConfig(t, rt)
++	assert.IsType(t, false, body.Enabled)
++	require.NotEmpty(t, body.Events)
++	assert.Contains(t, body.Events, base.AuditIDPublicUserAuthenticated.String())
++	_, ok := body.Events[base.AuditIDPublicUserAuthenticated.String()].(bool)
++	assert.True(t, ok, "non-verbose audit event values should be booleans")
++	require.NotEmpty(t, auditETag)
++	cfgResp := rt.SendAdminRequest(http.MethodGet, "/db/_config", "")
++	rest.RequireStatus(t, cfgResp, http.StatusOK)
++	assert.Equal(t, cfgResp.Header().Get("ETag"), auditETag)
++
++	putBody := fmt.Sprintf(`{"enabled":true,"events":{"%s":true}}`, base.AuditIDPublicUserAuthenticated)
++	resp := rt.SendAdminRequest(http.MethodPut, "/db/_config/audit", putBody)
++	rest.RequireStatus(t, resp, http.StatusOK)
++	_, updatedETag := requireAuditConfig(t, rt)
++	require.NotEmpty(t, updatedETag)
++	assert.NotEqual(t, auditETag, updatedETag)
++	cfgResp = rt.SendAdminRequest(http.MethodGet, "/db/_config", "")
++	rest.RequireStatus(t, cfgResp, http.StatusOK)
++	assert.Equal(t, cfgResp.Header().Get("ETag"), updatedETag)
++}
++
++func TestDatabaseConfigAuditAPIPostPatchPersistsAndGetReflects(t *testing.T) {
++	rt := rest.NewRestTesterPersistentConfig(t)
++	defer rt.Close()
++
++	eventA := base.AuditIDAuditEnabled
++	eventB := base.AuditIDPublicUserAuthenticated
++	resp := rt.SendAdminRequest(http.MethodPut, "/db/_config/audit", fmt.Sprintf(`{"enabled":true,"events":{"%s":true,"%s":true}}`, eventA, eventB))
++	rest.RequireStatus(t, resp, http.StatusOK)
++
++	resp = rt.SendAdminRequest(http.MethodPost, "/db/_config/audit", fmt.Sprintf(`{"events":{"%s":false}}`, eventA))
++	rest.RequireStatus(t, resp, http.StatusOK)
++	body, _ := requireAuditConfig(t, rt)
++	assert.False(t, requireAuditEventBool(t, body, eventA), "POST false should remove the specified enabled event")
++	assert.True(t, requireAuditEventBool(t, body, eventB), "POST should preserve omitted enabled events")
++
++	persistedEvents := requireDBConfigAuditEvents(t, rt)
++	assert.NotContains(t, persistedEvents, eventA.String())
++	assert.Contains(t, persistedEvents, eventB.String())
++
++	resp = rt.SendAdminRequest(http.MethodPost, "/db/_config/audit", fmt.Sprintf(`{"enabled":false,"events":{"%s":true}}`, eventA))
++	rest.RequireStatus(t, resp, http.StatusOK)
++	body, _ = requireAuditConfig(t, rt)
++	assert.False(t, body.Enabled)
++	assert.True(t, requireAuditEventBool(t, body, eventA))
++	assert.True(t, requireAuditEventBool(t, body, eventB), "POST should still preserve omitted events on later patches")
++}
++
++func TestDatabaseConfigAuditAPIPutReplacesEvents(t *testing.T) {
++	rt := rest.NewRestTesterPersistentConfig(t)
++	defer rt.Close()
++
++	eventA := base.AuditIDAuditEnabled
++	eventB := base.AuditIDPublicUserAuthenticated
++	resp := rt.SendAdminRequest(http.MethodPut, "/db/_config/audit", fmt.Sprintf(`{"enabled":true,"events":{"%s":true,"%s":true}}`, eventA, eventB))
++	rest.RequireStatus(t, resp, http.StatusOK)
++
++	resp = rt.SendAdminRequest(http.MethodPut, "/db/_config/audit", fmt.Sprintf(`{"enabled":false,"events":{"%s":true}}`, eventA))
++	rest.RequireStatus(t, resp, http.StatusOK)
++	body, _ := requireAuditConfig(t, rt)
++	assert.True(t, requireAuditEventBool(t, body, eventA))
++	assert.False(t, requireAuditEventBool(t, body, eventB), "PUT should disable previously enabled events omitted from the replacement body")
++
++	persistedEvents := requireDBConfigAuditEvents(t, rt)
++	assert.Contains(t, persistedEvents, eventA.String())
++	assert.NotContains(t, persistedEvents, eventB.String())
++}
++
++func TestDatabaseConfigAuditAPIVerboseShape(t *testing.T) {
++	rt := rest.NewRestTesterPersistentConfig(t)
++	defer rt.Close()
++
++	resp := rt.SendAdminRequest(http.MethodGet, "/db/_config/audit?verbose=true", "")
++	rest.RequireStatus(t, resp, http.StatusOK)
++	var body map[string]any
++	require.NoError(t, json.Unmarshal(resp.Body.Bytes(), &body))
++	assert.IsType(t, false, body["enabled"])
++	events, ok := body["events"].(map[string]any)
++	require.True(t, ok, "expected verbose response to include an events object")
++	event, ok := events[base.AuditIDPublicUserAuthenticated.String()].(map[string]any)
++	require.True(t, ok, "expected verbose event entry to be an object")
++	assert.IsType(t, false, event["enabled"])
++	assert.IsType(t, false, event["filterable"])
++	if name, ok := event["name"]; ok {
++		assert.IsType(t, "", name)
++	}
++	if description, ok := event["description"]; ok {
++		assert.IsType(t, "", description)
++	}
++}
++
++func TestDatabaseConfigAuditAPINonPersistentUnavailable(t *testing.T) {
++	rt := rest.NewRestTester(t, nil)
++	defer rt.Close()
++
++	resp := rt.SendAdminRequest(http.MethodGet, "/db/_config/audit", "")
++	rest.RequireStatus(t, resp, http.StatusServiceUnavailable)
++	require.NotEmpty(t, resp.BodyString())
++}
++
++func TestDatabaseConfigAuditAPIRejectsInvalidEventIDs(t *testing.T) {
++	rt := rest.NewRestTesterPersistentConfig(t)
++	defer rt.Close()
++
++	eventA := base.AuditIDPublicUserAuthenticated
++	resp := rt.SendAdminRequest(http.MethodPut, "/db/_config/audit", fmt.Sprintf(`{"enabled":true,"events":{"%s":true}}`, eventA))
++	rest.RequireStatus(t, resp, http.StatusOK)
++	before, _ := requireAuditConfig(t, rt)
++
++	resp = rt.SendAdminRequest(http.MethodPut, "/db/_config/audit", `{"events":{"not-a-number":true}}`)
++	rest.RequireStatus(t, resp, http.StatusBadRequest)
++	invalidErrorBody := resp.BodyString()
++	require.NotEmpty(t, invalidErrorBody)
++
++	resp = rt.SendAdminRequest(http.MethodPost, "/db/_config/audit", fmt.Sprintf(`{"events":{"%s":true}}`, unknownAuditEventIDForConfigAPITest))
++	rest.RequireStatus(t, resp, http.StatusBadRequest)
++	unknownErrorBody := resp.BodyString()
++	require.NotEmpty(t, unknownErrorBody)
++	assert.NotEqual(t, invalidErrorBody, unknownErrorBody, "malformed and unknown event ID errors should be distinguishable")
++
++	after, _ := requireAuditConfig(t, rt)
++	assert.Equal(t, before.Enabled, after.Enabled)
++	assert.Equal(t, requireAuditEventBool(t, before, eventA), requireAuditEventBool(t, after, eventA))
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,16 @@
++#!/bin/bash
++set -uo pipefail
++cd /testbed
++
++case "${1:-}" in
++  base)
++    go test -v -count=1 ./rest/adminapitest/ -run 'TestPersistentConfigConcurrency'
++    ;;
++  new)
++    go test -v -count=1 ./rest/adminapitest/ -run 'TestDatabaseConfigAuditAPI'
++    ;;
++  *)
++    echo "usage: $0 base|new"
++    exit 2
++    ;;
++esac

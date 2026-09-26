@@ -1,0 +1,250 @@
+diff --git a/go/libraries/doltcore/migrate/commit_mapping_test.go b/go/libraries/doltcore/migrate/commit_mapping_test.go
+new file mode 100644
+index 0000000000..09d01e5a1a
+--- /dev/null
++++ b/go/libraries/doltcore/migrate/commit_mapping_test.go
+@@ -0,0 +1,207 @@
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++package migrate_test
++
++import (
++	"context"
++	"fmt"
++	"strings"
++	"testing"
++
++	"github.com/dolthub/go-mysql-server/sql"
++	"github.com/stretchr/testify/require"
++
++	"github.com/dolthub/dolt/go/libraries/doltcore/env"
++	"github.com/dolthub/dolt/go/libraries/doltcore/sqle"
++	"github.com/dolthub/dolt/go/store/types"
++)
++
++const (
++	migratedCommitsBranch = "dolt_migrated_commits"
++	commitMappingTable    = "dolt_commit_mapping"
++)
++
++
++func queryInt64(t *testing.T, dEnv *env.DoltEnv, query string) int64 {
++	ctx := context.Background()
++	root, err := dEnv.WorkingRoot(ctx)
++	require.NoError(t, err)
++	rows, err := sqle.ExecuteSelect(dEnv, root, query)
++	require.NoError(t, err, "query failed: %s", query)
++	require.Len(t, rows, 1, "expected single row for: %s", query)
++	require.Len(t, rows[0], 1, "expected single column for: %s", query)
++	n, ok := rows[0][0].(int64)
++	require.True(t, ok, "expected int64 result for: %s, got %T", query, rows[0][0])
++	return n
++}
++
++func queryRows(t *testing.T, dEnv *env.DoltEnv, query string) []sql.Row {
++	ctx := context.Background()
++	root, err := dEnv.WorkingRoot(ctx)
++	require.NoError(t, err)
++	rows, err := sqle.ExecuteSelect(dEnv, root, query)
++	require.NoError(t, err, "query failed: %s", query)
++	return rows
++}
++
++
++func querySet(t *testing.T, dEnv *env.DoltEnv, query string) map[string]bool {
++	out := make(map[string]bool)
++	for _, r := range queryRows(t, dEnv, query) {
++		require.Len(t, r, 1, "expected single column for: %s", query)
++		s, ok := r[0].(string)
++		require.True(t, ok, "expected string result for: %s, got %T", query, r[0])
++		out[s] = true
++	}
++	return out
++}
++
++
++
++
++func TestMigratedCommitMapping(t *testing.T) {
++	if types.Format_Default != types.Format_LD_1 {
++		t.Skip()
++	}
++
++	mappingTable := fmt.Sprintf("`dolt/%s`.%s", migratedCommitsBranch, commitMappingTable)
++
++	tests := []struct {
++		name  string
++		setup []string
++
++		commits int64
++	}{
++		{
++			name: "single user commit",
++			setup: []string{
++				"CREATE TABLE test (pk int primary key)",
++				"INSERT INTO test VALUES (1),(2),(3)",
++				"CALL dolt_commit('-Am', 'new table')",
++			},
++			commits: 2,
++		},
++		{
++			name: "several user commits",
++			setup: []string{
++				"CREATE TABLE test (pk int primary key)",
++				"INSERT INTO test VALUES (1),(2),(3)",
++				"CALL dolt_commit('-Am', 'new table')",
++				"INSERT INTO test VALUES (4)",
++				"CALL dolt_commit('-am', 'added row 4')",
++				"INSERT INTO test VALUES (5)",
++				"CALL dolt_commit('-am', 'added row 5')",
++			},
++			commits: 4,
++		},
++	}
++
++	for _, test := range tests {
++		t.Run(test.name, func(t *testing.T) {
++			ctx := context.Background()
++			preEnv := setupMigrationTest(t, ctx, migrationTest{name: test.name, setup: test.setup})
++			postEnv := runMigration(t, ctx, preEnv)
++
++
++			branches := queryInt64(t, postEnv,
++				fmt.Sprintf("SELECT count(*) FROM dolt_branches WHERE name = '%s'", migratedCommitsBranch))
++			require.Equal(t, int64(1), branches, "expected branch %s to exist", migratedCommitsBranch)
++
++			logCount := queryInt64(t, postEnv, "SELECT count(*) FROM dolt_log")
++			require.Equal(t, test.commits, logCount)
++
++
++			mapCount := queryInt64(t, postEnv, "SELECT count(*) FROM "+mappingTable)
++			require.Equal(t, logCount, mapCount)
++
++
++			valid := queryInt64(t, postEnv,
++				"SELECT count(*) FROM "+mappingTable+
++					" WHERE new_commit_hash IN (SELECT commit_hash FROM dolt_log)")
++			require.Equal(t, logCount, valid)
++
++			invalid := queryInt64(t, postEnv,
++				"SELECT count(*) FROM "+mappingTable+
++					" WHERE new_commit_hash NOT IN (SELECT commit_hash FROM dolt_log)")
++			require.Equal(t, int64(0), invalid)
++
++
++			nullOld := queryInt64(t, postEnv,
++				"SELECT count(*) FROM "+mappingTable+" WHERE old_commit_hash IS NULL")
++			require.Equal(t, int64(0), nullOld)
++
++
++
++			oldInLog := queryInt64(t, postEnv,
++				"SELECT count(*) FROM "+mappingTable+
++					" WHERE old_commit_hash IN (SELECT commit_hash FROM dolt_log)")
++			require.Equal(t, int64(0), oldInLog)
++
++
++			distinctOld := queryInt64(t, postEnv,
++				"SELECT count(DISTINCT old_commit_hash) FROM "+mappingTable)
++			require.Equal(t, mapCount, distinctOld)
++
++
++
++			preHashes := querySet(t, preEnv, "SELECT commit_hash FROM dolt_log")
++			oldHashes := querySet(t, postEnv, "SELECT old_commit_hash FROM "+mappingTable)
++			require.Equal(t, preHashes, oldHashes)
++		})
++	}
++}
++
++
++
++func TestMigratedCommitMappingSchema(t *testing.T) {
++	if types.Format_Default != types.Format_LD_1 {
++		t.Skip()
++	}
++
++	ctx := context.Background()
++	preEnv := setupMigrationTest(t, ctx, migrationTest{
++		name: "schema",
++		setup: []string{
++			"CREATE TABLE test (pk int primary key)",
++			"INSERT INTO test VALUES (1)",
++			"CALL dolt_commit('-Am', 'new table')",
++		},
++	})
++	postEnv := runMigration(t, ctx, preEnv)
++
++	rows := queryRows(t, postEnv,
++		fmt.Sprintf("DESCRIBE `dolt/%s`.%s", migratedCommitsBranch, commitMappingTable))
++	require.Len(t, rows, 2, "expected exactly two columns")
++
++	cols := make(map[string]sql.Row)
++	for _, r := range rows {
++		name, ok := r[0].(string)
++		require.True(t, ok)
++		cols[name] = r
++	}
++
++	old, ok := cols["old_commit_hash"]
++	require.True(t, ok, "missing old_commit_hash column")
++	require.True(t, strings.HasPrefix(strings.ToLower(old[1].(string)), "varchar"),
++		"old_commit_hash should be a varchar, got %v", old[1])
++	require.Equal(t, "NO", old[2], "old_commit_hash should be NOT NULL")
++	require.Equal(t, "PRI", old[3], "old_commit_hash should be the primary key")
++
++	new, ok := cols["new_commit_hash"]
++	require.True(t, ok, "missing new_commit_hash column")
++	require.True(t, strings.HasPrefix(strings.ToLower(new[1].(string)), "varchar"),
++		"new_commit_hash should be a varchar, got %v", new[1])
++	require.NotEqual(t, "PRI", new[3], "new_commit_hash should not be part of the primary key")
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,32 @@
++#!/usr/bin/env bash
++
++
++
++
++set -euo pipefail
++HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++cd /testbed
++
++
++
++
++
++
++
++
++
++cd /testbed/go
++sed -i \
++  -e 's#go-mysql-server v0.14.1-0.20230218000648-8448267c2200#go-mysql-server v0.14.1-0.20230305092430-66a7ff930728#' \
++  -e 's#vitess v0.0.0-20230216234925-189ffe819e56#vitess v0.0.0-20230305090714-6a280b0893da#' \
++  go.mod
++export GOFLAGS=-mod=mod
++export GOPROXY=off
++export GOSUMDB=off
++export DOLT_DEFAULT_BIN_FORMAT=__LD_1__
++
++
++go test ./libraries/doltcore/migrate/ -run 'TestMigration$' -count=1
++
++
++go test ./libraries/doltcore/migrate/ -run 'TestMigratedCommitMapping|TestMigratedCommitMappingSchema' -count=1

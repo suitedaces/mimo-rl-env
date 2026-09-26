@@ -1,0 +1,435 @@
+diff --git a/usercase-test-coderl/offline-network-guard.mjs b/usercase-test-coderl/offline-network-guard.mjs
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/offline-network-guard.mjs
+@@ -0,0 +1,115 @@
++
++import dns from "node:dns";
++import http from "node:http";
++import https from "node:https";
++import net from "node:net";
++import tls from "node:tls";
++
++const LOCAL_HOSTS = new Set(["", "localhost", "127.0.0.1", "::1", "0.0.0.0", "[::1]"]);
++
++function normalizeHost(host) {
++    return String(host ?? "").toLowerCase().replace(/^\[(.*)\]$/, "$1");
++}
++
++function isLocalHost(host) {
++    return LOCAL_HOSTS.has(normalizeHost(host));
++}
++
++function blocked(kind, host) {
++    throw new Error(`local offline network blocked: ${kind} ${host ?? ""}`.trim());
++}
++
++function hostFromConnectArgs(args) {
++    const first = args[0];
++    if (first && typeof first === "object") {
++        if (first.path) return "";
++        return first.host ?? first.hostname ?? "localhost";
++    }
++    if (typeof first === "string" && Number.isNaN(Number(first))) {
++        return first;
++    }
++    return args[1] ?? "localhost";
++}
++
++function hostFromRequestArgs(args) {
++    const first = args[0];
++    const second = args[1];
++    if (first instanceof URL) {
++        return first.hostname;
++    }
++    if (typeof first === "string") {
++        try {
++            return new URL(first).hostname;
++        } catch {
++            return second?.host ?? second?.hostname ?? "localhost";
++        }
++    }
++    if (first && typeof first === "object") {
++        return first.host ?? first.hostname ?? "localhost";
++    }
++    return "localhost";
++}
++
++function wrapConnect(object, method, kind) {
++    const original = object[method];
++    object[method] = function guardedConnect(...args) {
++        const host = hostFromConnectArgs(args);
++        if (!isLocalHost(host)) blocked(kind, host);
++        return original.apply(this, args);
++    };
++}
++
++function wrapRequest(object, method, kind) {
++    const original = object[method];
++    object[method] = function guardedRequest(...args) {
++        const host = hostFromRequestArgs(args);
++        if (!isLocalHost(host)) blocked(kind, host);
++        return original.apply(this, args);
++    };
++}
++
++wrapConnect(net, "connect", "net.connect");
++wrapConnect(net, "createConnection", "net.createConnection");
++wrapConnect(net.Socket.prototype, "connect", "net.Socket.connect");
++wrapConnect(tls, "connect", "tls.connect");
++wrapRequest(http, "request", "http.request");
++wrapRequest(http, "get", "http.get");
++wrapRequest(https, "request", "https.request");
++wrapRequest(https, "get", "https.get");
++
++const originalLookup = dns.lookup;
++dns.lookup = function guardedLookup(hostname, ...args) {
++    if (!isLocalHost(hostname)) blocked("dns.lookup", hostname);
++    return originalLookup.call(this, hostname, ...args);
++};
++
++for (const name of ["resolve", "resolve4", "resolve6", "resolveCname", "resolveMx", "resolveTxt", "resolveSrv", "reverse"]) {
++    const original = dns[name];
++    if (typeof original === "function") {
++        dns[name] = function guardedResolve(hostname, ...args) {
++            if (!isLocalHost(hostname)) blocked(`dns.${name}`, hostname);
++            return original.call(this, hostname, ...args);
++        };
++    }
++}
++
++if (globalThis.fetch) {
++    const originalFetch = globalThis.fetch;
++    globalThis.fetch = function guardedFetch(input, init) {
++        const url = input instanceof Request ? input.url : input;
++        const host = new URL(url).hostname;
++        if (!isLocalHost(host)) blocked("fetch", host);
++        return originalFetch(input, init);
++    };
++}
++
++if (globalThis.WebSocket) {
++    const OriginalWebSocket = globalThis.WebSocket;
++    globalThis.WebSocket = class GuardedWebSocket extends OriginalWebSocket {
++        constructor(url, protocols) {
++            const host = new URL(url).hostname;
++            if (!isLocalHost(host)) blocked("WebSocket", host);
++            super(url, protocols);
++        }
++    };
++}
+diff --git a/usercase-test-coderl/pair-anchors-and-footnotes.test.js b/usercase-test-coderl/pair-anchors-and-footnotes.test.js
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/pair-anchors-and-footnotes.test.js
+@@ -0,0 +1,290 @@
++
++
++
++
++import assert from "node:assert/strict";
++import { execFileSync } from "node:child_process";
++import fs from "node:fs";
++import os from "node:os";
++import path from "node:path";
++import process from "node:process";
++import test from "node:test";
++
++import * as CONFIG_CONST from "../client/app/config/constants.js";
++import { pairAnchorsAndFootnotes } from "../client/app/utils/base.js";
++
++
++const NOT_FOUND = CONFIG_CONST.CONST_FOOTNOTE.NOTFOUND;
++
++function cloneJson(value) {
++    return JSON.parse(JSON.stringify(value));
++}
++
++function assertLookupEntry(result, markerCode, index, expected) {
++    assert.equal(result?.[markerCode]?.[index], expected);
++}
++
++function assertEmptyLookup(result) {
++    assert.ok(result && typeof result === "object");
++    assert.equal(Array.isArray(result), false);
++    assert.deepStrictEqual(Object.keys(result), []);
++}
++
++test("pairs one anchor with the following matching footnote", () => {
++
++
++
++
++    const timeline = [
++        { type: "anchor", markerCode: "9312", index: 0 },
++        { type: "footnote", markerCode: "9312", content: "first note" },
++    ];
++
++
++    assertLookupEntry(pairAnchorsAndFootnotes(timeline), "9312", 0, "first note");
++});
++
++test("pairs repeated markers in reading order", () => {
++
++
++
++
++    const timeline = [
++        { type: "anchor", markerCode: "9312", index: 0 },
++        { type: "anchor", markerCode: "9312", index: 1 },
++        { type: "footnote", markerCode: "9312", content: "first" },
++        { type: "footnote", markerCode: "9312", content: "second" },
++    ];
++
++    const result = pairAnchorsAndFootnotes(timeline);
++
++    assertLookupEntry(result, "9312", 0, "first");
++    assertLookupEntry(result, "9312", 1, "second");
++});
++
++test("matches by marker code while preserving each anchor index", () => {
++
++
++
++
++    const timeline = [
++        { type: "anchor", markerCode: "9312", index: 0 },
++        { type: "anchor", markerCode: "9313", index: 2 },
++        { type: "footnote", markerCode: "9313", content: "beta" },
++        { type: "footnote", markerCode: "9312", content: "alpha" },
++    ];
++
++    const result = pairAnchorsAndFootnotes(timeline);
++
++    assertLookupEntry(result, "9312", 0, "alpha");
++    assertLookupEntry(result, "9313", 2, "beta");
++});
++
++test("fills queued anchors with the placeholder when a new anchor group starts", () => {
++
++
++
++
++    const timeline = [
++        { type: "anchor", markerCode: "9312", index: 0 },
++        { type: "footnote", markerCode: "9313", content: "orphan" },
++        { type: "anchor", markerCode: "9312", index: 1 },
++        { type: "footnote", markerCode: "9312", content: "later" },
++    ];
++
++    const result = pairAnchorsAndFootnotes(timeline);
++
++    assertLookupEntry(result, "9312", 0, NOT_FOUND);
++    assertLookupEntry(result, "9312", 1, "later");
++});
++
++test("fills leftover anchors with the placeholder at the end of the timeline", () => {
++
++
++
++
++    const timeline = [{ type: "anchor", markerCode: "9314", index: 3 }];
++
++
++    assertLookupEntry(pairAnchorsAndFootnotes(timeline), "9314", 3, NOT_FOUND);
++});
++
++test("ignores footnote events with no queued matching anchor", () => {
++
++
++
++
++    const timeline = [
++        { type: "footnote", markerCode: "9312", content: "lonely" },
++        { type: "anchor", markerCode: "9312", index: 0 },
++        { type: "footnote", markerCode: "9312", content: "matched" },
++    ];
++
++
++    assertLookupEntry(pairAnchorsAndFootnotes(timeline), "9312", 0, "matched");
++});
++
++test("returns an empty object for non-array and empty timeline inputs", () => {
++
++
++
++
++
++    assertEmptyLookup(pairAnchorsAndFootnotes(null));
++    assertEmptyLookup(pairAnchorsAndFootnotes({ type: "anchor", markerCode: "9312", index: 0 }));
++    assertEmptyLookup(pairAnchorsAndFootnotes([]));
++});
++
++test("is referentially transparent for the same input value", () => {
++    const timeline = [
++        { type: "anchor", markerCode: "9312", index: 0 },
++        { type: "anchor", markerCode: "9312", index: 1 },
++        { type: "footnote", markerCode: "9312", content: "first" },
++        { type: "footnote", markerCode: "9312", content: "second" },
++    ];
++
++
++    const first = pairAnchorsAndFootnotes(timeline);
++    const second = pairAnchorsAndFootnotes(timeline);
++    assertLookupEntry(first, "9312", 0, "first");
++    assertLookupEntry(first, "9312", 1, "second");
++    assertLookupEntry(second, "9312", 0, "first");
++    assertLookupEntry(second, "9312", 1, "second");
++});
++
++test("does not mutate the caller's timeline", () => {
++    const timeline = [
++        { type: "anchor", markerCode: "9312", index: 0 },
++        { type: "anchor", markerCode: "9313", index: 2 },
++        { type: "footnote", markerCode: "9313", content: "beta" },
++        { type: "footnote", markerCode: "9312", content: "alpha" },
++    ];
++    const before = cloneJson(timeline);
++
++    pairAnchorsAndFootnotes(timeline);
++
++    assert.deepStrictEqual(timeline, before);
++});
++
++test("does not depend on hidden process-local cache state", () => {
++    const stableTimeline = [
++        { type: "anchor", markerCode: "9312", index: 0 },
++        { type: "footnote", markerCode: "9312", content: "first note" },
++    ];
++    const expectedContent = "first note";
++
++
++    assertLookupEntry(pairAnchorsAndFootnotes(stableTimeline), "9312", 0, expectedContent);
++    pairAnchorsAndFootnotes([{ type: "anchor", markerCode: "9314", index: 3 }]);
++    pairAnchorsAndFootnotes([
++        { type: "anchor", markerCode: "9312", index: 0 },
++        { type: "anchor", markerCode: "9312", index: 1 },
++        { type: "footnote", markerCode: "9312", content: "first" },
++        { type: "footnote", markerCode: "9312", content: "second" },
++    ]);
++
++    assertLookupEntry(pairAnchorsAndFootnotes(stableTimeline), "9312", 0, expectedContent);
++
++    const script = `
++        import { pairAnchorsAndFootnotes } from "/workspace/repo/client/app/utils/base.js";
++        const out = pairAnchorsAndFootnotes([
++            { type: "anchor", markerCode: "9312", index: 0 },
++            { type: "footnote", markerCode: "9312", content: "first note" }
++        ]);
++        process.stdout.write(JSON.stringify(out));
++    `;
++    const freshProcessOutput = execFileSync(process.execPath, ["--input-type=module", "-e", script], {
++        encoding: "utf8",
++    });
++
++
++    assertLookupEntry(JSON.parse(freshProcessOutput), "9312", 0, expectedContent);
++});
++
++test("does not use undeclared filesystem, network, or DOM side effects", async () => {
++    const timeline = [
++        { type: "anchor", markerCode: "9312", index: 0 },
++        { type: "footnote", markerCode: "9312", content: "first note" },
++    ];
++    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "pair-footnotes-"));
++    const originalCwd = process.cwd();
++    const originalFetch = globalThis.fetch;
++    const originalWindow = globalThis.window;
++    const originalDocument = globalThis.document;
++    const originalXMLHttpRequest = globalThis.XMLHttpRequest;
++    const originalWebSocket = globalThis.WebSocket;
++    const originalFs = {
++        readFileSync: fs.readFileSync,
++        writeFileSync: fs.writeFileSync,
++        appendFileSync: fs.appendFileSync,
++        openSync: fs.openSync,
++    };
++    const blocked = [];
++    const throwBlocked = (name) =>
++        function blockedSideEffect(...args) {
++            blocked.push([name, String(args[0] ?? "")]);
++            throw new Error(`blocked side effect: ${name}`);
++        };
++    const throwingDom = new Proxy(
++        {},
++        {
++            get(_target, prop) {
++                throw new Error(`blocked DOM access: ${String(prop)}`);
++            },
++            set(_target, prop) {
++                throw new Error(`blocked DOM mutation: ${String(prop)}`);
++            },
++        }
++    );
++
++    try {
++        process.chdir(tempDir);
++        fs.readFileSync = throwBlocked("fs.readFileSync");
++        fs.writeFileSync = throwBlocked("fs.writeFileSync");
++        fs.appendFileSync = throwBlocked("fs.appendFileSync");
++        fs.openSync = throwBlocked("fs.openSync");
++        globalThis.fetch = throwBlocked("fetch");
++        globalThis.XMLHttpRequest = throwBlocked("XMLHttpRequest");
++        globalThis.WebSocket = throwBlocked("WebSocket");
++        globalThis.window = throwingDom;
++        globalThis.document = throwingDom;
++
++
++        assertLookupEntry(pairAnchorsAndFootnotes(timeline), "9312", 0, "first note");
++    } finally {
++        fs.readFileSync = originalFs.readFileSync;
++        fs.writeFileSync = originalFs.writeFileSync;
++        fs.appendFileSync = originalFs.appendFileSync;
++        fs.openSync = originalFs.openSync;
++        if (originalFetch === undefined) {
++            delete globalThis.fetch;
++        } else {
++            globalThis.fetch = originalFetch;
++        }
++        if (originalWindow === undefined) {
++            delete globalThis.window;
++        } else {
++            globalThis.window = originalWindow;
++        }
++        if (originalDocument === undefined) {
++            delete globalThis.document;
++        } else {
++            globalThis.document = originalDocument;
++        }
++        if (originalXMLHttpRequest === undefined) {
++            delete globalThis.XMLHttpRequest;
++        } else {
++            globalThis.XMLHttpRequest = originalXMLHttpRequest;
++        }
++        if (originalWebSocket === undefined) {
++            delete globalThis.WebSocket;
++        } else {
++            globalThis.WebSocket = originalWebSocket;
++        }
++        process.chdir(originalCwd);
++    }
++
++    assert.deepStrictEqual(blocked, []);
++    assert.deepStrictEqual(fs.readdirSync(tempDir), []);
++    fs.rmSync(tempDir, { recursive: true, force: true });
++});
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,15 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export NODE_OPTIONS="${NODE_OPTIONS} --import /workspace/repo/usercase-test-coderl/offline-network-guard.mjs"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++cd /workspace/repo
++exec node --test /workspace/repo/usercase-test-coderl/pair-anchors-and-footnotes.test.js

@@ -1,0 +1,9 @@
+I want PythonOpenScad to support reusable named OpenSCAD module nodes together with a top-level lazy union node. The public API should let me build this as `result = LazyUnion()(Module("obj1")(Circle(r=10)), Module("obj2")(Circle(r=5)))`, or with the generated aliases `lazy_union()` and `module(name)`, and any model node should also offer `.module(name: str)` as a convenience wrapper around that node.
+
+When I call `str(LazyUnion()(Circle(r=10), Circle(r=5)))`, the OpenSCAD output should dump the children directly between `// Start: lazy_union` and `// End: lazy_union`, without wrapping them in a normal `union()` block. The Python representation should still show the retained node shape, for example `repr(lazy_union()(Circle(r=10), Circle(r=5)))` should contain `lazy_union() (` with the two circle calls as children.
+
+When a `Module("obj1")` is placed in a dumped model, the body at that location should be replaced by `obj1();`, and the actual `module obj1() { ... }` definition should be emitted after the main model body under a `// Modules.` section. Module definitions should be ordered deterministically by their generated names, and dumping the same model tree multiple times should produce the same names each time.
+
+If two different module bodies request the same name, the first should keep the requested name and the later distinct body should get a deterministic suffix such as `_1`, so calls and definitions line up as `colliding_name();` and `colliding_name_1();`. If two module wrappers have the same requested name and equivalent child bodies, they should share one generated module name and emit only one module definition even if there are multiple calls.
+
+`Module(name: str)` should validate its required name like the other PythonOpenScad nodes: omitting the name should raise `RequiredParameterNotProvided`, and passing a non-string name should raise `InvalidValueForStr`.

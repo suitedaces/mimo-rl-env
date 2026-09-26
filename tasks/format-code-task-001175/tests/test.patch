@@ -1,0 +1,188 @@
+diff --git a/codespec_sdk_resource_pagination.py b/codespec_sdk_resource_pagination.py
+new file mode 100644
+index 000000000..56bf93521
+--- /dev/null
++++ b/codespec_sdk_resource_pagination.py
+@@ -0,0 +1,171 @@
++import httpx
++import pytest
++
++from nucliadb_sdk import NucliaDB, NucliaDBAsync, Region, exceptions
++
++
++def _page(ids, page, size, last):
++    return {
++        "resources": [{"id": rid} for rid in ids],
++        "pagination": {"page": page, "size": size, "last": last},
++    }
++
++
++def test_sync_iter_resources_is_lazy_and_preserves_query_params():
++    seen = []
++    pages = {
++        2: _page([], 2, 7, False),
++        3: _page(["r-3a", "r-3b"], 3, 7, False),
++        4: _page(["r-4"], 4, 7, True),
++    }
++
++    def handler(request):
++        params = request.url.params
++        seen.append((request.url.path, dict(params)))
++        return httpx.Response(200, json=pages[int(params["page"])])
++
++    sdk = NucliaDB(region=Region.ON_PREM, url="http://test/api")
++    sdk.session.close()
++    sdk.session = httpx.Client(transport=httpx.MockTransport(handler))
++    query_params = {"size": 99, "show": "basic", "sort": "title"}
++
++    iterator = sdk.iter_resources(kbid="kb-1", page=2, page_size=7, query_params=query_params)
++    assert seen == []
++    assert [resource.id for resource in iterator] == ["r-3a", "r-3b", "r-4"]
++
++    assert [int(params["page"]) for _, params in seen] == [2, 3, 4]
++    assert all(path == "/api/v1/kb/kb-1/resources" for path, _ in seen)
++    assert all(
++        params["size"] == "7" and params["show"] == "basic" and params["sort"] == "title"
++        for _, params in seen
++    )
++    assert query_params == {"size": 99, "show": "basic", "sort": "title"}
++    sdk.session.close()
++
++
++@pytest.mark.asyncio
++async def test_async_iter_resources_matches_sync_and_page_size_wins():
++    seen = []
++    pages = {
++        0: _page(["a"], 0, 3, False),
++        1: _page(["b", "c"], 1, 3, True),
++    }
++
++    def handler(request):
++        params = request.url.params
++        seen.append(dict(params))
++        return httpx.Response(200, json=pages[int(params["page"])])
++
++    sdk = NucliaDBAsync(region=Region.ON_PREM, url="http://test/api")
++    await sdk.session.aclose()
++    sdk.session = httpx.AsyncClient(transport=httpx.MockTransport(handler))
++    query_params = {"filter": "tag:blue", "size": 99, "page": 8}
++
++    result = []
++    async for resource in sdk.iter_resources(
++        kbid="kb-2", page=0, page_size=3, query_params=query_params
++    ):
++        result.append(resource.id)
++
++    assert result == ["a", "b", "c"]
++    assert seen == [
++        {"filter": "tag:blue", "size": "3", "page": "0"},
++        {"filter": "tag:blue", "size": "3", "page": "1"},
++    ]
++    assert query_params == {"filter": "tag:blue", "size": 99, "page": 8}
++    await sdk.session.aclose()
++
++
++@pytest.mark.parametrize(
++    "kwargs",
++    [
++        {"page_size": 0},
++        {"page_size": -1},
++        {"page": -1},
++    ],
++)
++def test_iter_resources_rejects_invalid_paging_before_request(kwargs):
++    def handler(request):
++        pytest.fail(f"invalid paging made a request to {request.url}")
++
++    sdk = NucliaDB(region=Region.ON_PREM, url="http://test/api")
++    sdk.session.close()
++    sdk.session = httpx.Client(transport=httpx.MockTransport(handler))
++
++    with pytest.raises(ValueError):
++        list(sdk.iter_resources(kbid="kb", **kwargs))
++    sdk.session.close()
++
++
++@pytest.mark.asyncio
++async def test_async_iter_resources_rejects_invalid_paging_before_request():
++    def handler(request):
++        pytest.fail(f"invalid paging made a request to {request.url}")
++
++    sdk = NucliaDBAsync(region=Region.ON_PREM, url="http://test/api")
++    await sdk.session.aclose()
++    sdk.session = httpx.AsyncClient(transport=httpx.MockTransport(handler))
++
++    with pytest.raises(ValueError):
++        async for _ in sdk.iter_resources(kbid="kb", page_size=0):
++            pass
++    await sdk.session.aclose()
++
++
++def test_iter_resources_propagates_page_errors_and_stops():
++    pages_seen = []
++
++    def handler(request):
++        page = int(request.url.params["page"])
++        pages_seen.append(page)
++        if page == 1:
++            return httpx.Response(503, text="backend unavailable")
++        return httpx.Response(200, json=_page(["first"], page, 20, False))
++
++    sdk = NucliaDB(region=Region.ON_PREM, url="http://test/api")
++    sdk.session.close()
++    sdk.session = httpx.Client(transport=httpx.MockTransport(handler))
++    iterator = sdk.iter_resources(kbid="kb")
++
++    assert next(iterator).id == "first"
++    with pytest.raises(exceptions.UnknownError, match="503.*backend unavailable"):
++        next(iterator)
++    assert pages_seen == [0, 1]
++    sdk.session.close()
++
++
++def test_list_resources_still_returns_one_page():
++    requests = []
++
++    def handler(request):
++        requests.append(request)
++        return httpx.Response(200, json=_page(["only"], 5, 1, False))
++
++    sdk = NucliaDB(region=Region.ON_PREM, url="http://test/api")
++    sdk.session.close()
++    sdk.session = httpx.Client(transport=httpx.MockTransport(handler))
++
++    page = sdk.list_resources(kbid="kb", query_params={"page": 5, "size": 1})
++    assert [resource.id for resource in page.resources] == ["only"]
++    assert page.pagination.page == 5 and page.pagination.last is False
++    assert len(requests) == 1
++    sdk.session.close()
++
++
++@pytest.mark.asyncio
++async def test_async_list_resources_still_returns_one_page():
++    requests = []
++
++    def handler(request):
++        requests.append(request)
++        return httpx.Response(200, json=_page(["only-async"], 5, 1, False))
++
++    sdk = NucliaDBAsync(region=Region.ON_PREM, url="http://test/api")
++    await sdk.session.aclose()
++    sdk.session = httpx.AsyncClient(transport=httpx.MockTransport(handler))
++
++    page = await sdk.list_resources(kbid="kb", query_params={"page": 5, "size": 1})
++    assert [resource.id for resource in page.resources] == ["only-async"]
++    assert page.pagination.page == 5 and page.pagination.last is False
++    assert len(requests) == 1
++    await sdk.session.aclose()
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,6 @@
++#!/bin/bash
++set -euo pipefail
++
++
++PYTHONPATH="${PWD}/nucliadb_sdk:${PWD}/nucliadb_models:${PWD}/nucliadb_protos/python:${PWD}/nucliadb_utils:${PWD}/nucliadb_telemetry:${PWD}/nucliadb_client:${PWD}/.venv/lib/python3.12/site-packages" \
++  /usr/bin/python3.12 -m pytest -q codespec_sdk_resource_pagination.py

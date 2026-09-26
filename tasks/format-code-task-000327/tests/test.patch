@@ -1,0 +1,189 @@
+diff --git a/airbyte-integrations/connectors/source-hubspot/unit_tests/test_property_request_urls.py b/airbyte-integrations/connectors/source-hubspot/unit_tests/test_property_request_urls.py
+new file mode 100644
+index 0000000000000..79b754bf39416
+--- /dev/null
++++ b/airbyte-integrations/connectors/source-hubspot/unit_tests/test_property_request_urls.py
+@@ -0,0 +1,99 @@
++
++
++
++
++import urllib.parse
++from collections import Counter
++from unittest.mock import MagicMock
++
++from airbyte_cdk.models import SyncMode
++from source_hubspot.streams import Companies
++
++
++MAX_SAFE_QUERY_LENGTH = 15000
++
++
++def _install_properties(monkeypatch, properties):
++    property_map = {property_name: {"type": ["null", "string"]} for property_name in properties}
++    monkeypatch.setattr(Companies, "properties", property(lambda _self: property_map))
++
++
++def _response_for_properties(properties):
++    response = MagicMock()
++    response.json.return_value = {
++        "results": [
++            {
++                "id": "company-1",
++                "createdAt": "2020-12-10T07:58:09.554Z",
++                "updatedAt": "2021-07-31T08:18:58.954Z",
++                "archived": False,
++                "properties": {property_name: "fake_data" for property_name in properties},
++            }
++        ],
++        "paging": {},
++    }
++    return response
++
++
++def _record_property_requests(monkeypatch, stream):
++    requests = []
++
++    def handle_request(*, params=None, **_kwargs):
++        properties = list((params or {}).get("property", []))
++        requests.append(properties)
++        return _response_for_properties(properties)
++
++    monkeypatch.setattr(stream, "handle_request", handle_request)
++    return requests
++
++
++def _read_companies(common_params, monkeypatch, properties):
++    stream = Companies(**common_params)
++    stream.set_sync(SyncMode.full_refresh)
++    _install_properties(monkeypatch, properties)
++    requests = _record_property_requests(monkeypatch, stream)
++    records = list(stream.read_records(sync_mode=SyncMode.full_refresh))
++    return records, requests
++
++
++def _assert_requested_properties_are_complete(properties, property_requests):
++    requested = [property_name for request in property_requests for property_name in request]
++    assert Counter(requested) == Counter(properties)
++
++
++def _assert_property_query_strings_are_safe(property_requests):
++    assert property_requests
++    for properties in property_requests:
++        query = urllib.parse.urlencode({"property": properties}, doseq=True)
++        assert len(query) <= MAX_SAFE_QUERY_LENGTH
++
++
++def test_large_property_sets_are_split_into_safe_complete_stream_requests(monkeypatch, common_params):
++    properties = [f"generated_custom_property_{index:03d}_" + ("x" * 80) for index in range(130)]
++
++    records, property_requests = _read_companies(common_params, monkeypatch, properties)
++
++    assert len(property_requests) > 1
++    assert records
++    assert Counter(records[0]["properties"].keys()) == Counter(properties)
++    _assert_requested_properties_are_complete(properties, property_requests)
++    _assert_property_query_strings_are_safe(property_requests)
++
++
++def test_non_simple_property_names_are_split_by_real_request_url_size(monkeypatch, common_params):
++    properties = []
++    raw_estimate = 0
++    encoded_estimate = 0
++    index = 0
++    while encoded_estimate <= MAX_SAFE_QUERY_LENGTH:
++        property_name = f"custom property {index} & value = 100% ? marker # {index}"
++        raw_estimate += len(property_name) + len(urllib.parse.quote(","))
++        encoded_estimate += len(urllib.parse.quote(f"property={property_name}&"))
++        properties.append(property_name)
++        index += 1
++
++    assert raw_estimate < MAX_SAFE_QUERY_LENGTH
++    assert encoded_estimate > MAX_SAFE_QUERY_LENGTH
++
++    records, property_requests = _read_companies(common_params, monkeypatch, properties)
++
++    assert len(property_requests) > 1
++    assert records
++    assert Counter(records[0]["properties"].keys()) == Counter(properties)
++    _assert_requested_properties_are_complete(properties, property_requests)
++    _assert_property_query_strings_are_safe(property_requests)
+diff --git a/airbyte-integrations/connectors/source-hubspot/unit_tests/test_version_metadata.py b/airbyte-integrations/connectors/source-hubspot/unit_tests/test_version_metadata.py
+new file mode 100644
+index 0000000000000..a7e9a4f2b6d3
+--- /dev/null
++++ b/airbyte-integrations/connectors/source-hubspot/unit_tests/test_version_metadata.py
+@@ -0,0 +1,43 @@
++import re
++from pathlib import Path
++
++
++def _repo_root():
++    current = Path(__file__).resolve()
++    for parent in current.parents:
++        if (parent / "airbyte-config").is_dir() and (parent / "airbyte-integrations").is_dir():
++            return parent
++    raise AssertionError("Could not locate repository root")
++
++
++def _read_repo_file(*parts):
++    return (_repo_root().joinpath(*parts)).read_text()
++
++
++def _hubspot_seed_block():
++    text = _read_repo_file("airbyte-config", "init", "src", "main", "resources", "seed", "source_definitions.yaml")
++    match = re.search(r"- name: HubSpot\n(?P<block>(?:  .*\n)+)", text)
++    assert match, "HubSpot source definition block not found"
++    return match.group("block")
++
++
++def test_hubspot_seed_definition_uses_fixed_version():
++    block = _hubspot_seed_block()
++    assert "dockerRepository: airbyte/source-hubspot" in block
++    tag = re.search(r"^\s+dockerImageTag:\s*(?P<tag>\S+)\s*$", block, re.MULTILINE)
++    assert tag, "HubSpot dockerImageTag not found"
++    assert tag.group("tag") == "0.1.69"
++
++
++def test_hubspot_spec_uses_fixed_version():
++    text = _read_repo_file("airbyte-config", "init", "src", "main", "resources", "seed", "source_specs.yaml")
++    match = re.search(r'- dockerImage:\s*"(?P<image>airbyte/source-hubspot:[^"]+)"', text)
++    assert match, "HubSpot source spec dockerImage not found"
++    assert match.group("image") == "airbyte/source-hubspot:0.1.69"
++
++
++def test_hubspot_docker_label_uses_fixed_version():
++    text = _read_repo_file("airbyte-integrations", "connectors", "source-hubspot", "Dockerfile")
++    match = re.search(r"^LABEL io\.airbyte\.version=(?P<version>\S+)\s*$", text, re.MULTILINE)
++    assert match, "HubSpot Dockerfile version label not found"
++    assert match.group("version") == "0.1.69"
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,25 @@
++#!/bin/bash
++set -euo pipefail
++cd /testbed
++
++
++set +u
++source /testbed/.build_env/venv/bin/activate
++set -u
++
++
++case "${1:-}" in
++  base)
++    python -m pytest -q -o addopts="" /testbed/airbyte-integrations/connectors/source-hubspot/unit_tests/test_field_type_converting.py
++    ;;
++  new)
++    python -m pytest -q -o addopts="" \
++      /testbed/airbyte-integrations/connectors/source-hubspot/unit_tests/test_property_request_urls.py \
++      /testbed/airbyte-integrations/connectors/source-hubspot/unit_tests/test_version_metadata.py \
++      -q
++    ;;
++  *)
++    echo "usage: $0 base|new"
++    exit 2
++    ;;
++esac

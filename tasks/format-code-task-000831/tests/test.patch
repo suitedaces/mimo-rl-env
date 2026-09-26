@@ -1,0 +1,608 @@
+diff --git a/usercase-test-coderl/test_afc_rename.py b/usercase-test-coderl/test_afc_rename.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/test_afc_rename.py
+@@ -0,0 +1,577 @@
++from __future__ import annotations
++
++import asyncio
++import datetime
++import pathlib
++import posixpath
++import struct
++from collections import deque
++
++import pytest
++
++from pymobiledevice3.exceptions import AfcException, AfcFileNotFoundError
++from pymobiledevice3.lockdown_service_provider import LockdownServiceProvider
++from pymobiledevice3.services.afc import AfcError, AfcService
++
++
++pytestmark = pytest.mark.asyncio
++
++
++
++
++
++
++
++AFC_MAGIC = b"CFA6LPAA"
++HEADER_SIZE = 40
++
++OP_STATUS = 0x01
++OP_DATA = 0x02
++OP_READ_DIR = 0x03
++OP_REMOVE_PATH = 0x08
++OP_MAKE_DIR = 0x09
++OP_GET_FILE_INFO = 0x0A
++OP_FILE_OPEN = 0x0D
++OP_FILE_OPEN_RES = 0x0E
++OP_READ = 0x0F
++OP_WRITE = 0x10
++OP_FILE_CLOSE = 0x14
++OP_RENAME_PATH = 0x18
++
++STATUS_SUCCESS = 0
++STATUS_READ_ERROR = 4
++STATUS_INVALID_ARG = 7
++STATUS_OBJECT_NOT_FOUND = 8
++STATUS_OBJECT_EXISTS = 16
++
++MODE_RDONLY = 1
++MODE_WRONLY = 3
++MODE_WR = 4
++
++
++def _packet(packet_num: int, operation: int, payload: bytes) -> bytes:
++    return struct.pack(
++        "<8sQQQQ",
++        AFC_MAGIC,
++        HEADER_SIZE + len(payload),
++        HEADER_SIZE + len(payload),
++        packet_num,
++        operation,
++    ) + payload
++
++
++def _status_packet(packet_num: int, status: int) -> bytes:
++    return _packet(packet_num, OP_STATUS, struct.pack("<Q", status))
++
++
++def _data_packet(packet_num: int, payload: bytes) -> bytes:
++    return _packet(packet_num, OP_DATA, payload)
++
++
++def _cstring(value: str) -> bytes:
++    return value.encode("utf-8") + b"\x00"
++
++
++def _parse_strings(payload: bytes) -> list[str]:
++    return payload.decode("utf-8").split("\x00")[:-1]
++
++
++def _afc_listing(values: list[str]) -> bytes:
++    return b"".join(_cstring(value) for value in values)
++
++
++def _active_afc_reader_tasks() -> int:
++    return sum(1 for task in asyncio.all_tasks() if task.get_name() == "afc-reader" and not task.done())
++
++
++class _InProcessAfcConnection:
++    def __init__(self) -> None:
++        self.files: dict[str, bytes] = {}
++        self.dirs: set[str] = {""}
++        self.handles: dict[int, dict[str, object]] = {}
++        self.next_handle = 100
++        self.close_count = 0
++        self._responses: asyncio.Queue[bytes] = asyncio.Queue()
++        self._buffer = bytearray()
++
++    async def sendall(self, data: bytes) -> None:
++        magic, entire_length, _, packet_num, operation = struct.unpack("<8sQQQQ", data[:HEADER_SIZE])
++        assert magic == AFC_MAGIC
++        payload = data[HEADER_SIZE:entire_length]
++        status, response = self._handle(operation, payload)
++        if status == STATUS_SUCCESS:
++            await self._responses.put(_data_packet(packet_num, response))
++        else:
++            await self._responses.put(_status_packet(packet_num, status))
++
++    async def recvall(self, size: int) -> bytes:
++        while len(self._buffer) < size:
++            self._buffer.extend(await self._responses.get())
++        result = bytes(self._buffer[:size])
++        del self._buffer[:size]
++        return result
++
++    async def close(self) -> None:
++        self.close_count += 1
++
++    def _handle(self, operation: int, payload: bytes) -> tuple[int, bytes]:
++        if operation == OP_MAKE_DIR:
++            return self._mkdir(_parse_strings(payload)[0]), b""
++        if operation == OP_GET_FILE_INFO:
++            return self._stat(_parse_strings(payload)[0])
++        if operation == OP_READ_DIR:
++            return self._listdir(_parse_strings(payload)[0])
++        if operation == OP_REMOVE_PATH:
++            return self._remove(_parse_strings(payload)[0]), b""
++        if operation == OP_FILE_OPEN:
++            mode = struct.unpack("<Q", payload[:8])[0]
++            filename = _parse_strings(payload[8:])[0]
++            return self._open(filename, mode)
++        if operation == OP_WRITE:
++            handle = struct.unpack("<Q", payload[:8])[0]
++            return self._write(handle, payload[8:]), b""
++        if operation == OP_READ:
++            handle, size = struct.unpack("<QQ", payload)
++            return self._read(handle, size)
++        if operation == OP_FILE_CLOSE:
++            handle = struct.unpack("<Q", payload)[0]
++            return self._close_handle(handle), b""
++        if operation == OP_RENAME_PATH:
++            source, target = _parse_strings(payload)
++            return self._rename(source, target), b""
++        return STATUS_INVALID_ARG, b""
++
++    def _normalize(self, path: str) -> str:
++        normalized = posixpath.normpath("/" + path).lstrip("/")
++        return "" if normalized == "." else normalized
++
++    def _parent(self, path: str) -> str:
++        parent = posixpath.dirname(path)
++        return "" if parent == "." else parent
++
++    def _children(self, directory: str) -> list[str]:
++        prefix = f"{directory}/" if directory else ""
++        names = set()
++        for path in self.dirs | set(self.files):
++            if path == directory or not path.startswith(prefix):
++                continue
++            rest = path[len(prefix) :]
++            if rest:
++                names.add(rest.split("/", 1)[0])
++        return sorted(names)
++
++    def _path_kind(self, path: str) -> str | None:
++        if path in self.files:
++            return "file"
++        if path in self.dirs:
++            return "dir"
++        return None
++
++    def _has_file_ancestor(self, path: str) -> bool:
++        parts = pathlib.PurePosixPath(path).parts
++        for index in range(1, len(parts)):
++            if "/".join(parts[:index]) in self.files:
++                return True
++        return False
++
++    def _mkdir(self, path: str) -> int:
++        current = ""
++        for part in pathlib.PurePosixPath(self._normalize(path)).parts:
++            current = part if not current else f"{current}/{part}"
++            if current in self.files:
++                return STATUS_OBJECT_EXISTS
++            self.dirs.add(current)
++        return STATUS_SUCCESS
++
++    def _stat(self, path: str) -> tuple[int, bytes]:
++        path = self._normalize(path)
++        if path in self.files:
++            size = len(self.files[path])
++            ifmt = "S_IFREG"
++            blocks = 1
++        elif path in self.dirs:
++            size = 64
++            ifmt = "S_IFDIR"
++            blocks = 0
++        else:
++            return STATUS_READ_ERROR, b""
++
++        timestamp_ns = 1_700_000_000_000_000_000
++        return STATUS_SUCCESS, _afc_listing(
++            [
++                "st_size",
++                str(size),
++                "st_blocks",
++                str(blocks),
++                "st_mtime",
++                str(timestamp_ns),
++                "st_birthtime",
++                str(timestamp_ns),
++                "st_nlink",
++                "1",
++                "st_ifmt",
++                ifmt,
++            ]
++        )
++
++    def _listdir(self, path: str) -> tuple[int, bytes]:
++        path = self._normalize(path)
++        if path not in self.dirs:
++            return STATUS_READ_ERROR, b""
++        return STATUS_SUCCESS, _afc_listing([".", "..", *self._children(path)])
++
++    def _remove(self, path: str) -> int:
++        path = self._normalize(path)
++        if path in self.files:
++            del self.files[path]
++            return STATUS_SUCCESS
++        if path in self.dirs and path:
++            if self._children(path):
++                return STATUS_OBJECT_EXISTS
++            self.dirs.remove(path)
++            return STATUS_SUCCESS
++        return STATUS_OBJECT_NOT_FOUND
++
++    def _open(self, path: str, mode: int) -> tuple[int, bytes]:
++        path = self._normalize(path)
++        parent = self._parent(path)
++        if mode == MODE_RDONLY and path not in self.files:
++            return STATUS_OBJECT_NOT_FOUND, b""
++        if mode in (MODE_WRONLY, MODE_WR):
++            if parent not in self.dirs or self._has_file_ancestor(path):
++                return STATUS_OBJECT_NOT_FOUND, b""
++            self.files[path] = b""
++        handle = self.next_handle
++        self.next_handle += 1
++        self.handles[handle] = {"path": path, "offset": 0}
++        return STATUS_SUCCESS, struct.pack("<Q", handle)
++
++    def _write(self, handle: int, data: bytes) -> int:
++        if handle not in self.handles:
++            return STATUS_INVALID_ARG
++        path = self.handles[handle]["path"]
++        self.files[path] = self.files.get(path, b"") + data
++        return STATUS_SUCCESS
++
++    def _read(self, handle: int, size: int) -> tuple[int, bytes]:
++        if handle not in self.handles:
++            return STATUS_INVALID_ARG, b""
++        entry = self.handles[handle]
++        path = entry["path"]
++        offset = entry["offset"]
++        data = self.files[path][offset : offset + size]
++        entry["offset"] = offset + len(data)
++        return STATUS_SUCCESS, data
++
++    def _close_handle(self, handle: int) -> int:
++        if handle not in self.handles:
++            return STATUS_INVALID_ARG
++        del self.handles[handle]
++        return STATUS_SUCCESS
++
++    def _rename(self, source: str, target: str) -> int:
++        source = self._normalize(source)
++        target = self._normalize(target)
++        source_kind = self._path_kind(source)
++        if source_kind is None:
++            return STATUS_OBJECT_NOT_FOUND
++        if source == target:
++            return STATUS_SUCCESS
++        if self._parent(target) not in self.dirs or self._has_file_ancestor(target):
++            return STATUS_INVALID_ARG
++        if self._path_kind(target) is not None:
++            return STATUS_OBJECT_EXISTS
++        if source_kind == "file":
++            self.files[target] = self.files.pop(source)
++            return STATUS_SUCCESS
++
++        moved_dirs = {path for path in self.dirs if path == source or path.startswith(f"{source}/")}
++        moved_files = {path: data for path, data in self.files.items() if path.startswith(f"{source}/")}
++        for path in moved_dirs:
++            self.dirs.remove(path)
++        for path in moved_files:
++            del self.files[path]
++        for path in moved_dirs:
++            suffix = path[len(source) :]
++            self.dirs.add(f"{target}{suffix}")
++        for path, data in moved_files.items():
++            suffix = path[len(source) :]
++            self.files[f"{target}{suffix}"] = data
++        return STATUS_SUCCESS
++
++
++class _InProcessLockdownProvider(LockdownServiceProvider):
++    def __init__(self) -> None:
++        super().__init__()
++        self.connections: deque[_InProcessAfcConnection] = deque()
++
++    @property
++    def product_version(self) -> str:
++        return "17.0"
++
++    @property
++    def product_build_version(self) -> str:
++        return "21A000"
++
++    @property
++    def ecid(self) -> int:
++        return 1234
++
++    async def get_developer_mode_status(self) -> bool:
++        return True
++
++    async def get_date(self) -> datetime.datetime:
++        return datetime.datetime.fromtimestamp(1_700_000_000)
++
++    async def set_language(self, language: str) -> None:
++        return None
++
++    async def get_language(self) -> str:
++        return "en"
++
++    async def set_locale(self, locale: str) -> None:
++        return None
++
++    async def get_locale(self) -> str:
++        return "en_US"
++
++    async def set_assistive_touch(self, value: bool) -> None:
++        return None
++
++    async def get_assistive_touch(self) -> bool:
++        return False
++
++    async def set_voice_over(self, value: bool) -> None:
++        return None
++
++    async def get_voice_over(self) -> bool:
++        return False
++
++    async def set_invert_display(self, value: bool) -> None:
++        return None
++
++    async def get_invert_display(self) -> bool:
++        return False
++
++    async def set_enable_wifi_connections(self, value: bool) -> None:
++        return None
++
++    async def get_enable_wifi_connections(self) -> bool:
++        return False
++
++    async def set_timezone(self, timezone: str) -> None:
++        return None
++
++    async def set_uses24h_clock(self, value: bool) -> None:
++        return None
++
++    async def start_lockdown_service(self, name: str, include_escrow_bag: bool = False) -> _InProcessAfcConnection:
++        connection = _InProcessAfcConnection()
++        self.connections.append(connection)
++        return connection
++
++    async def get_service_connection_attributes(self, name: str, include_escrow_bag: bool = False) -> dict:
++        return {"Port": 1234}
++
++    async def create_service_connection(self, port: int) -> _InProcessAfcConnection:
++        connection = _InProcessAfcConnection()
++        self.connections.append(connection)
++        return connection
++
++    async def get_value(self, domain: str | None = None, key: str | None = None):
++        if key == "TimeIntervalSince1970":
++            return 1_700_000_000
++        return None
++
++    async def set_value(self, value, domain: str | None = None, key: str | None = None) -> dict:
++        return {}
++
++    async def remove_value(self, domain: str | None = None, key: str | None = None) -> dict:
++        return {}
++
++
++async def _new_afc() -> tuple[_InProcessLockdownProvider, AfcService]:
++    lockdown = _InProcessLockdownProvider()
++    afc = AfcService(lockdown)
++    return lockdown, afc
++
++
++async def test_rename_file_moves_bytes_and_removes_source() -> None:
++
++
++
++
++    _, afc = await _new_afc()
++    try:
++        await afc.set_file_contents("source.txt", b"data")
++        assert await afc.get_file_contents("source.txt") == b"data"
++        assert await afc.rename("source.txt", "dest.txt") is None
++        assert await afc.get_file_contents("dest.txt") == b"data"
++        with pytest.raises(AfcFileNotFoundError) as exc:
++            await afc.get_file_contents("source.txt")
++
++        assert isinstance(exc.value, AfcFileNotFoundError)
++    finally:
++        await afc.aclose()
++
++
++async def test_rename_file_between_existing_folders() -> None:
++
++
++
++
++    _, afc = await _new_afc()
++    try:
++        await afc.makedirs("dir_a/dir_b")
++        await afc.set_file_contents("dir_a/dir_b/source.txt", b"nested-data")
++        assert await afc.rename("dir_a/dir_b/source.txt", "dir_a/dest.txt") is None
++        assert await afc.get_file_contents("dir_a/dest.txt") == b"nested-data"
++        with pytest.raises(AfcFileNotFoundError) as exc:
++            await afc.get_file_contents("dir_a/dir_b/source.txt")
++
++        assert isinstance(exc.value, AfcFileNotFoundError)
++    finally:
++        await afc.aclose()
++
++
++async def test_rename_directory_moves_tree() -> None:
++
++
++
++
++    _, afc = await _new_afc()
++    try:
++        await afc.makedirs("folder_src/nested")
++        await afc.set_file_contents("folder_src/nested/file.txt", b"dir-data")
++        assert await afc.rename("folder_src", "folder_dest") is None
++        assert await afc.get_file_contents("folder_dest/nested/file.txt") == b"dir-data"
++        with pytest.raises(AfcFileNotFoundError) as exc:
++            await afc.get_file_contents("folder_src/nested/file.txt")
++
++        assert isinstance(exc.value, AfcFileNotFoundError)
++    finally:
++        await afc.aclose()
++
++
++async def test_rename_to_self_is_successful_noop() -> None:
++
++
++
++
++    _, afc = await _new_afc()
++    try:
++        await afc.set_file_contents("same.txt", b"same-data")
++        assert await afc.rename("same.txt", "same.txt") is None
++        assert await afc.get_file_contents("same.txt") == b"same-data"
++    finally:
++        await afc.aclose()
++
++
++async def test_rename_missing_source_raises_specific_not_found() -> None:
++
++
++
++
++    _, afc = await _new_afc()
++    try:
++        with pytest.raises(AfcFileNotFoundError) as exc:
++            await afc.rename("missing.txt", "dest.txt")
++
++        assert isinstance(exc.value, AfcFileNotFoundError)
++    finally:
++        await afc.aclose()
++
++
++async def test_rename_target_rejection_surfaces_original_afc_error() -> None:
++
++
++
++
++    _, afc = await _new_afc()
++    try:
++        await afc.set_file_contents("source.txt", b"data")
++        await afc.set_file_contents("not_a_dir", b"blocker")
++        with pytest.raises(AfcException) as exc:
++            await afc.rename("source.txt", "not_a_dir/dest.txt")
++
++        assert isinstance(exc.value, AfcException)
++        assert not isinstance(exc.value, AfcFileNotFoundError)
++
++        assert exc.value.status == AfcError.INVALID_ARG
++        assert await afc.get_file_contents("source.txt") == b"data"
++    finally:
++        await afc.aclose()
++
++
++async def test_rename_accepts_path_like_values() -> None:
++
++
++
++
++    _, afc = await _new_afc()
++    try:
++        await afc.makedirs(pathlib.Path("pathlike"))
++        await afc.set_file_contents(pathlib.Path("pathlike/source.txt"), b"pathlike-data")
++        assert (
++            await afc.rename(
++                pathlib.Path("pathlike/source.txt"),
++                pathlib.Path("pathlike/dest.txt"),
++            )
++            is None
++        )
++        assert await afc.get_file_contents(pathlib.Path("pathlike/dest.txt")) == b"pathlike-data"
++    finally:
++        await afc.aclose()
++
++
++async def test_two_afc_instances_keep_independent_filesystems() -> None:
++
++
++
++
++    _, afc_a = await _new_afc()
++    _, afc_b = await _new_afc()
++    try:
++        await afc_a.set_file_contents("source.txt", b"left-data")
++        await afc_b.set_file_contents("source.txt", b"right-data")
++        assert await afc_a.rename("source.txt", "dest.txt") is None
++        assert await afc_a.get_file_contents("dest.txt") == b"left-data"
++        assert await afc_b.get_file_contents("source.txt") == b"right-data"
++        with pytest.raises(AfcFileNotFoundError) as exc:
++            await afc_b.get_file_contents("dest.txt")
++
++        assert isinstance(exc.value, AfcFileNotFoundError)
++    finally:
++        await afc_a.aclose()
++        await afc_b.aclose()
++
++
++async def test_aclose_is_idempotent_and_closes_connection_once() -> None:
++
++
++
++
++    _, afc = await _new_afc()
++    await afc.set_file_contents("source.txt", b"data")
++    assert await afc.rename("source.txt", "dest.txt") is None
++
++    assert await afc.get_file_contents("dest.txt") == b"data"
++    await afc.aclose()
++    await afc.aclose()
++
++
++async def test_repeated_sessions_do_not_leave_afc_reader_tasks() -> None:
++
++
++
++
++
++    for index in range(100):
++        _, afc = await _new_afc()
++        async with afc:
++            source = f"source-{index}.txt"
++            dest = f"dest-{index}.txt"
++            await afc.set_file_contents(source, b"cycle-data")
++            assert await afc.rename(source, dest) is None
++            assert await afc.get_file_contents(dest) == b"cycle-data"
++    await asyncio.sleep(0)
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,21 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++
++
++set -euo pipefail
++
++cd /workspace/repo
++
++export PYTHONPATH="/workspace/repo${PYTHONPATH:+:${PYTHONPATH}}"
++export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
++
++exec /opt/coderl_venv/bin/python -m pytest -p pytest_asyncio.plugin /workspace/repo/usercase-test-coderl/test_afc_rename.py -v

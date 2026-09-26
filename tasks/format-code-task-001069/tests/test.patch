@@ -1,0 +1,207 @@
+diff --git a/tests/unit/tracing/test_message_history_projection.py b/tests/unit/tracing/test_message_history_projection.py
+new file mode 100644
+--- /dev/null
++++ b/tests/unit/tracing/test_message_history_projection.py
+@@ -0,0 +1,191 @@
++import json
++
++from any_agent.tracing.agent_trace import AgentSpan, AgentTrace
++from any_agent.tracing.otel_types import Resource, SpanContext, SpanKind, Status
++
++
++def _span(operation: str, **attributes: object) -> AgentSpan:
++    attrs = {"gen_ai.operation.name": operation, **attributes}
++    return AgentSpan(
++        name=operation,
++        kind=SpanKind.INTERNAL,
++        status=Status(),
++        context=SpanContext(),
++        attributes=attrs,
++        links=[],
++        events=[],
++        resource=Resource(),
++    )
++
++
++def _llm(inputs: list[dict[str, str]], output: str) -> AgentSpan:
++    return _span(
++        "call_llm",
++        **{
++            "gen_ai.input.messages": json.dumps(inputs),
++            "gen_ai.output": output,
++        },
++    )
++
++
++def test_message_projection_uses_snapshot_suffix_and_keeps_repeated_turns() -> None:
++    first = _llm(
++        [
++            {"role": "system", "content": "You are concise."},
++            {"role": "user", "content": "ping"},
++        ],
++        "pong",
++    )
++    second = _llm(
++        [
++            {"role": "system", "content": "You are concise."},
++            {"role": "user", "content": "ping"},
++            {"role": "assistant", "content": "pong"},
++            {"role": "user", "content": "ping"},
++        ],
++        "pong",
++    )
++
++    messages = AgentTrace(spans=[first, second]).spans_to_messages()
++
++    assert [(message.role, message.content) for message in messages] == [
++        ("system", "You are concise."),
++        ("user", "ping"),
++        ("assistant", "pong"),
++        ("user", "ping"),
++        ("assistant", "pong"),
++    ]
++
++
++def test_message_projection_appends_unmatched_suffix_after_snapshot_divergence() -> None:
++    trace = AgentTrace(
++        spans=[
++            _llm([{"role": "user", "content": "first"}], "old answer"),
++            _llm(
++                [
++                    {"role": "user", "content": "first"},
++                    {"role": "assistant", "content": "revised answer"},
++                    {"role": "user", "content": "next"},
++                ],
++                "final",
++            ),
++        ]
++    )
++
++    messages = trace.spans_to_messages()
++
++    assert [(message.role, message.content) for message in messages] == [
++        ("user", "first"),
++        ("assistant", "old answer"),
++        ("assistant", "revised answer"),
++        ("user", "next"),
++        ("assistant", "final"),
++    ]
++
++
++def test_message_projection_excludes_invocation_and_can_filter_system_messages() -> None:
++    trace = AgentTrace(
++        spans=[
++            _span("invoke_agent", **{"gen_ai.output": "ignored"}),
++            _llm(
++                [
++                    {"role": "system", "content": "rules"},
++                    {"role": "user", "content": "hello"},
++                ],
++                "hi",
++            ),
++        ]
++    )
++
++    messages = trace.spans_to_messages(include_system=False)
++
++    assert [(message.role, message.content) for message in messages] == [
++        ("user", "hello"),
++        ("assistant", "hi"),
++    ]
++
++
++def test_system_filter_does_not_break_cumulative_snapshot_reconciliation() -> None:
++    trace = AgentTrace(
++        spans=[
++            _llm(
++                [
++                    {"role": "system", "content": "rules"},
++                    {"role": "user", "content": "first"},
++                ],
++                "answer",
++            ),
++            _llm(
++                [
++                    {"role": "system", "content": "rules"},
++                    {"role": "user", "content": "first"},
++                    {"role": "assistant", "content": "answer"},
++                    {"role": "user", "content": "second"},
++                ],
++                "done",
++            ),
++        ]
++    )
++
++    messages = trace.spans_to_messages(include_system=False)
++
++    assert [(message.role, message.content) for message in messages] == [
++        ("user", "first"),
++        ("assistant", "answer"),
++        ("user", "second"),
++        ("assistant", "done"),
++    ]
++
++
++def test_tool_results_are_tool_messages_and_missing_metadata_is_safe() -> None:
++    trace = AgentTrace(
++        spans=[
++            _span(
++                "execute_tool",
++                **{"gen_ai.output": "42"},
++            ),
++            _llm([{"role": "user", "content": "what?"}], "done"),
++        ]
++    )
++
++    messages = trace.spans_to_messages()
++
++    assert [(message.role, message.content) for message in messages] == [
++        ("tool", "42"),
++        ("user", "what?"),
++        ("assistant", "done"),
++    ]
++
++
++def test_tool_results_can_be_omitted_without_affecting_llm_history() -> None:
++    trace = AgentTrace(
++        spans=[
++            _llm([{"role": "user", "content": "calculate"}], "calling tool"),
++            _span(
++                "execute_tool",
++                **{
++                    "gen_ai.tool.name": "calculator",
++                    "gen_ai.tool.args": '{"x": 2}',
++                    "gen_ai.output": "4",
++                },
++            ),
++        ]
++    )
++
++    messages = trace.spans_to_messages(include_tools=False)
++
++    assert [(message.role, message.content) for message in messages] == [
++        ("user", "calculate"),
++        ("assistant", "calling tool"),
++    ]
++
++
++def test_unknown_operations_are_ignored() -> None:
++    trace = AgentTrace(
++        spans=[
++            _span("custom", **{"gen_ai.output": "do not expose"}),
++            _llm([{"role": "user", "content": "ok"}], "yes"),
++        ]
++    )
++
++    assert [message.content for message in trace.spans_to_messages()] == ["ok", "yes"]
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,6 @@
++#!/bin/bash
++set -euo pipefail
++
++
++PYTEST="${PYTEST:-.venv/bin/pytest}"
++"${PYTEST}" -q tests/unit/tracing/test_message_history_projection.py

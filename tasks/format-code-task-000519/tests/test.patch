@@ -1,0 +1,395 @@
+diff --git a/usercase-test-coderl/fixtures/rastervision/acceptance_local_runner/__init__.py b/usercase-test-coderl/fixtures/rastervision/acceptance_local_runner/__init__.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/fixtures/rastervision/acceptance_local_runner/__init__.py
+@@ -0,0 +1,6 @@
++def register_plugin(registry):
++    registry.set_plugin_version('rastervision.acceptance_local_runner', 0)
++
++
++import rastervision.pipeline  # noqa
++import rastervision.acceptance_local_runner.pipeline  # noqa
+diff --git a/usercase-test-coderl/fixtures/rastervision/acceptance_local_runner/config.py b/usercase-test-coderl/fixtures/rastervision/acceptance_local_runner/config.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/fixtures/rastervision/acceptance_local_runner/config.py
+@@ -0,0 +1,7 @@
++from rastervision.acceptance_local_runner.pipeline import (
++    AcceptancePipelineConfig)
++
++
++def get_config(runner, root_uri, fail_command=''):
++    return AcceptancePipelineConfig(
++        root_uri=root_uri, fail_command=fail_command)
+diff --git a/usercase-test-coderl/fixtures/rastervision/acceptance_local_runner/pipeline.py b/usercase-test-coderl/fixtures/rastervision/acceptance_local_runner/pipeline.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/fixtures/rastervision/acceptance_local_runner/pipeline.py
+@@ -0,0 +1,48 @@
++from os.path import join
++import os
++
++from rastervision.pipeline.config import register_config
++from rastervision.pipeline.pipeline import Pipeline
++from rastervision.pipeline.pipeline_config import PipelineConfig
++
++
++@register_config(
++    'acceptance_local_runner.pipeline',
++    plugin='rastervision.acceptance_local_runner')
++class AcceptancePipelineConfig(PipelineConfig):
++    event_log_uri: str | None = None
++    fail_command: str = ''
++
++    def update(self):
++        if self.event_log_uri is None:
++            self.event_log_uri = join(self.root_uri, 'events.log')
++
++    def build(self, tmp_dir):
++        return AcceptancePipeline(self, tmp_dir)
++
++
++class AcceptancePipeline(Pipeline):
++    commands = ['chip', 'train', 'predict', 'package']
++    split_commands = ['chip', 'predict']
++    gpu_commands = []
++
++    def _record(self, command, split_ind=0, num_splits=1):
++        if self.config.fail_command == command:
++            raise RuntimeError(f'intentional failure in {command}')
++
++        os.makedirs(os.path.dirname(self.config.event_log_uri), exist_ok=True)
++        with open(self.config.event_log_uri, 'a') as f:
++            f.write(f'{command}|{split_ind}|{num_splits}\n')
++        print(f'event {command} {split_ind}/{num_splits}')
++
++    def chip(self, split_ind=0, num_splits=1):
++        self._record('chip', split_ind, num_splits)
++
++    def train(self):
++        self._record('train')
++
++    def predict(self, split_ind=0, num_splits=1):
++        self._record('predict', split_ind, num_splits)
++
++    def package(self):
++        self._record('package')
+diff --git a/usercase-test-coderl/usecase.sh b/usercase-test-coderl/usecase.sh
+new file mode 100755
+--- /dev/null
++++ b/usercase-test-coderl/usecase.sh
+@@ -0,0 +1,294 @@
++#!/usr/bin/env bash
++
++set -u
++set -o pipefail
++export LANG=C.UTF-8 LC_ALL=C.UTF-8 TZ=UTC
++export PYTHONDONTWRITEBYTECODE=1
++export PYTHONPATH="/workspace/repo/usercase-test-coderl/fixtures:/workspace/repo/rastervision_pipeline${PYTHONPATH:+:$PYTHONPATH}"
++
++fail() { echo "FAIL: $*" >&2; exit 1; }
++
++( cd /workspace/repo && python - <<'PY'
++import rastervision.pipeline.cli
++PY
++) || fail "build"
++
++REAL_MAKE=$(command -v make) || fail "make not found"
++RUN_ROOT=/tmp/rv-local-runner-acceptance-coderl
++rm -rf "$RUN_ROOT"
++mkdir -p "$RUN_ROOT/bin"
++trap 'rm -rf "$RUN_ROOT"' EXIT
++
++cat > "$RUN_ROOT/bin/make" <<'EOF'
++#!/usr/bin/env bash
++{
++    printf 'argc=%s\n' "$#"
++    i=0
++    for arg in "$@"; do
++        printf 'arg%d=%s\n' "$i" "$arg"
++        i=$((i + 1))
++    done
++} >> "$ACCEPTANCE_MAKE_LOG"
++
++if [ "${ACCEPTANCE_FORCE_MAKE_FAIL:-}" != "" ]; then
++    echo "forced make failure $ACCEPTANCE_FORCE_MAKE_FAIL" >&2
++    exit "$ACCEPTANCE_FORCE_MAKE_FAIL"
++fi
++
++exec "$ACCEPTANCE_REAL_MAKE" "$@"
++EOF
++chmod +x "$RUN_ROOT/bin/make"
++
++export PATH="$RUN_ROOT/bin:$PATH"
++export ACCEPTANCE_REAL_MAKE="$REAL_MAKE"
++
++run_rv() {
++    python -m rastervision.pipeline.cli --tmpdir "$RUN_ROOT/tmp" "$@"
++}
++
++assert_file_eq() {
++    local actual=$1
++    local expected=$2
++    cmp -s "$actual" "$expected" || {
++        echo "FAIL: $actual differs from expected" >&2
++        echo "--- actual ---" >&2
++        sed -n '1,240p' "$actual" >&2
++        echo "--- expected ---" >&2
++        sed -n '1,240p' "$expected" >&2
++        exit 1
++    }
++}
++
++assert_makefile_shape() {
++    local makefile=$1
++    local scenario=$2
++    local cfg_json_uri=$3
++    python - "$makefile" "$scenario" "$cfg_json_uri" <<'PY'
++import sys
++
++makefile, scenario, cfg_json_uri = sys.argv[1:4]
++
++with open(makefile) as f:
++    lines = [line.rstrip('\n') for line in f]
++
++phony = None
++all_targets = None
++targets = {}
++i = 0
++while i < len(lines):
++    line = lines[i]
++    if line.startswith('.PHONY:'):
++        phony = line.split(':', 1)[1].split()
++        i += 1
++        continue
++    if line.startswith('all:'):
++        all_targets = line.split(':', 1)[1].split()
++        i += 1
++        continue
++    if ':' in line and not line.startswith('\t') and line.strip():
++        target, deps = line.split(':', 1)
++        recipe = None
++        j = i + 1
++        while j < len(lines):
++            if lines[j].startswith('\t'):
++                recipe = lines[j][1:]
++                break
++            if lines[j].strip() and ':' in lines[j] and not lines[j].startswith('\t'):
++                break
++            j += 1
++        targets[target.strip()] = {
++            'deps': deps.split(),
++            'recipe': recipe,
++        }
++        i = j + 1
++        continue
++    i += 1
++
++expected_by_scenario = {
++    'f1': [
++        ('chip', [], {'--num-splits': '2', '--split-ind': '0'}),
++        ('chip', [], {'--num-splits': '2', '--split-ind': '1'}),
++        ('train', ['chip:0', 'chip:1'], {}),
++        ('predict', ['train'], {'--num-splits': '2', '--split-ind': '0'}),
++        ('predict', ['train'], {'--num-splits': '2', '--split-ind': '1'}),
++    ],
++    'f2': [
++        ('chip', [], {}),
++        ('train', ['chip'], {}),
++        ('predict', ['train'], {}),
++        ('package', ['predict'], {}),
++    ],
++    'f3': [
++        ('package', [], {}),
++    ],
++}
++
++expected = expected_by_scenario[scenario]
++target_names = set(targets)
++if phony is None:
++    raise SystemExit('missing .PHONY target list')
++if all_targets is None:
++    raise SystemExit('missing all target')
++if set(phony) != target_names:
++    raise SystemExit(f'.PHONY does not list exactly the numeric job targets: {phony} vs {sorted(target_names)}')
++if set(all_targets) != target_names:
++    raise SystemExit(f'all target does not depend on every job target: {all_targets} vs {sorted(target_names)}')
++if len(targets) != len(expected):
++    raise SystemExit(f'expected {len(expected)} job targets, found {len(targets)}')
++if any(not target.isdigit() for target in targets):
++    raise SystemExit(f'all job targets must be numeric, found {sorted(targets)}')
++
++def parse_recipe(recipe):
++    if recipe is None:
++        raise SystemExit('target missing recipe')
++    prefix = f'python -m rastervision.pipeline.cli run_command {cfg_json_uri} '
++    if not recipe.startswith(prefix):
++        raise SystemExit(f'recipe has wrong run_command shape: {recipe}')
++    parts = recipe[len(prefix):].split()
++    if not parts:
++        raise SystemExit(f'recipe missing command: {recipe}')
++    command = parts[0]
++    opts = {}
++    rest = parts[1:]
++    if len(rest) % 2 != 0:
++        raise SystemExit(f'recipe has malformed options: {recipe}')
++    for opt, value in zip(rest[::2], rest[1::2]):
++        opts[opt] = value
++    return command, opts
++
++recipe_to_target = {}
++command_targets = {}
++for target, data in targets.items():
++    command, opts = parse_recipe(data['recipe'])
++    split_key = opts.get('--split-ind')
++    key = f'{command}:{split_key}' if split_key is not None else command
++    if key in recipe_to_target:
++        raise SystemExit(f'duplicate recipe for {key}')
++    recipe_to_target[key] = target
++    command_targets.setdefault(command, []).append(target)
++
++expected_keys = {
++    f'{command}:{opts["--split-ind"]}' if '--split-ind' in opts else command
++    for command, _deps, opts in expected
++}
++if set(recipe_to_target) != expected_keys:
++    raise SystemExit(f'recipes do not match expected command jobs: {sorted(recipe_to_target)} vs {sorted(expected_keys)}')
++
++for command, dep_specs, opts in expected:
++    key = f'{command}:{opts["--split-ind"]}' if '--split-ind' in opts else command
++    target = recipe_to_target[key]
++    actual_command, actual_opts = parse_recipe(targets[target]['recipe'])
++    if actual_command != command or actual_opts != opts:
++        raise SystemExit(f'{key} recipe options mismatch: {actual_command} {actual_opts} vs {opts}')
++
++    expected_deps = set()
++    for dep_spec in dep_specs:
++        if ':' in dep_spec:
++            expected_deps.add(recipe_to_target[dep_spec])
++        else:
++            expected_deps.update(command_targets[dep_spec])
++    actual_deps = set(targets[target]['deps'])
++    if actual_deps != expected_deps:
++        raise SystemExit(f'{key} dependency mismatch: {actual_deps} vs {expected_deps}')
++PY
++}
++
++cd "$RUN_ROOT"
++
++
++
++
++mkdir -p f1
++export ACCEPTANCE_MAKE_LOG="$RUN_ROOT/f1/make.log"
++unset ACCEPTANCE_FORCE_MAKE_FAIL
++run_rv run local rastervision.acceptance_local_runner.config chip train predict \
++    --splits 2 -a root_uri "$RUN_ROOT/f1/out" >f1/out.txt 2>f1/err.txt
++ec=$?
++[ "$ec" -eq 0 ] || fail "F1 exit $ec; want 0"
++[ -f "$RUN_ROOT/f1/out/pipeline-config.json" ] || fail "F1 missing serialized pipeline config"
++[ -f "$RUN_ROOT/f1/out/Makefile" ] || fail "F1 missing Makefile next to serialized config"
++
++
++assert_makefile_shape "$RUN_ROOT/f1/out/Makefile" f1 "$RUN_ROOT/f1/out/pipeline-config.json"
++
++cat > f1/expected_make_log <<'EOF'
++argc=3
++arg0=-j
++arg1=-f
++arg2=/tmp/rv-local-runner-acceptance-coderl/f1/out/Makefile
++EOF
++assert_file_eq "$ACCEPTANCE_MAKE_LOG" f1/expected_make_log
++
++sort "$RUN_ROOT/f1/out/events.log" > f1/events.sorted
++cat > f1/expected_events <<'EOF'
++chip|0|2
++chip|1|2
++predict|0|2
++predict|1|2
++train|0|1
++EOF
++assert_file_eq f1/events.sorted f1/expected_events
++
++grep -Fq 'train|0|1' f1/events.sorted \
++    || fail "F1 selected non-split stage did not run"
++
++
++
++
++mkdir -p f2
++export ACCEPTANCE_MAKE_LOG="$RUN_ROOT/f2/make.log"
++unset ACCEPTANCE_FORCE_MAKE_FAIL
++run_rv run local rastervision.acceptance_local_runner.config chip train predict package \
++    --splits 1 -a root_uri "$RUN_ROOT/f2/out" >f2/out.txt 2>f2/err.txt
++ec=$?
++[ "$ec" -eq 0 ] || fail "F2 exit $ec; want 0"
++
++
++assert_makefile_shape "$RUN_ROOT/f2/out/Makefile" f2 "$RUN_ROOT/f2/out/pipeline-config.json"
++
++cat > f2/expected_make_log <<'EOF'
++argc=3
++arg0=-j
++arg1=-f
++arg2=/tmp/rv-local-runner-acceptance-coderl/f2/out/Makefile
++EOF
++assert_file_eq "$ACCEPTANCE_MAKE_LOG" f2/expected_make_log
++
++sort "$RUN_ROOT/f2/out/events.log" > f2/events.sorted
++cat > f2/expected_events <<'EOF'
++chip|0|1
++package|0|1
++predict|0|1
++train|0|1
++EOF
++assert_file_eq f2/events.sorted f2/expected_events
++
++grep -Fq 'package|0|1' f2/events.sorted \
++    || fail "F2 package command did not run"
++
++
++
++
++mkdir -p f3
++export ACCEPTANCE_MAKE_LOG="$RUN_ROOT/f3/make.log"
++export ACCEPTANCE_FORCE_MAKE_FAIL=17
++run_rv run local rastervision.acceptance_local_runner.config package \
++    --splits 1 -a root_uri "$RUN_ROOT/f3/out" >f3/out.txt 2>f3/err.txt
++ec=$?
++[ "$ec" -eq 17 ] || fail "F3 exit $ec; want propagated make exit 17"
++
++
++
++assert_makefile_shape "$RUN_ROOT/f3/out/Makefile" f3 "$RUN_ROOT/f3/out/pipeline-config.json"
++
++cat > f3/expected_make_log <<'EOF'
++argc=3
++arg0=-j
++arg1=-f
++arg2=/tmp/rv-local-runner-acceptance-coderl/f3/out/Makefile
++EOF
++assert_file_eq "$ACCEPTANCE_MAKE_LOG" f3/expected_make_log
++[ ! -e "$RUN_ROOT/f3/out/events.log" ] || fail "F3 should not run package after forced make failure"
++
++echo "PASS"
++exit 0
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,15 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++export PATH="/opt/stage4a_rv_venv/bin:$PATH"
++export PYTHONNOUSERSITE=1
++unset PYTHONPATH
++set -e
++cd /workspace/repo
++exec bash /workspace/repo/usercase-test-coderl/usecase.sh

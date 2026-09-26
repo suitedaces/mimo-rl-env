@@ -1,0 +1,176 @@
+diff --git a/tests/store/model_registry/test_timestamp_contract.py b/tests/store/model_registry/test_timestamp_contract.py
+new file mode 100644
+index 000000000..756cce463
+--- /dev/null
++++ b/tests/store/model_registry/test_timestamp_contract.py
+@@ -0,0 +1,156 @@
++import os
++import tempfile
++import unittest
++from unittest import mock
++
++import mlflow
++import mlflow.store.db.base_sql_model
++from mlflow.entities.model_registry import ModelVersionTag, RegisteredModelTag
++from mlflow.exceptions import MlflowException
++from mlflow.store.model_registry.sqlalchemy_store import SqlAlchemyStore
++
++
++class TestModelRegistryTimestampContract(unittest.TestCase):
++    def setUp(self):
++        fd, self.db_file = tempfile.mkstemp()
++        os.close(fd)
++        self.store = SqlAlchemyStore("sqlite:///" + self.db_file)
++
++    def tearDown(self):
++        mlflow.store.db.base_sql_model.Base.metadata.drop_all(self.store.engine)
++        os.remove(self.db_file)
++
++    def _names(self, order_by, page_token=None, max_results=20):
++        result = self.store.search_registered_models(
++            filter_string="name LIKE 'contract_%'",
++            order_by=[order_by],
++            page_token=page_token,
++            max_results=max_results,
++        )
++        return [model.name for model in result], result.token
++
++    def test_timestamp_orders_by_creation_and_update_columns(self):
++        with mock.patch("mlflow.store.model_registry.sqlalchemy_store.now", return_value=100):
++            self.store.create_registered_model("contract_alpha")
++        with mock.patch("mlflow.store.model_registry.sqlalchemy_store.now", return_value=200):
++            self.store.create_registered_model("contract_beta")
++
++        with mock.patch("mlflow.store.model_registry.sqlalchemy_store.now", return_value=300):
++            self.store.update_registered_model("contract_alpha", "updated")
++
++        alpha = self.store.get_registered_model("contract_alpha")
++        self.assertEqual(alpha.creation_timestamp, 100)
++        self.assertEqual(alpha.last_updated_timestamp, 300)
++        self.assertEqual(self._names("timestamp ASC")[0], ["contract_alpha", "contract_beta"])
++        self.assertEqual(self._names("timestamp DESC")[0], ["contract_beta", "contract_alpha"])
++        self.assertEqual(
++            self._names("last_updated_timestamp ASC")[0],
++            ["contract_beta", "contract_alpha"],
++        )
++        self.assertEqual(
++            self._names("last_updated_timestamp DESC")[0],
++            ["contract_alpha", "contract_beta"],
++        )
++
++    def test_stage_archive_and_delete_refresh_related_timestamps(self):
++        with mock.patch("mlflow.store.model_registry.sqlalchemy_store.now", return_value=100):
++            self.store.create_registered_model("contract_model")
++        with mock.patch("mlflow.store.model_registry.sqlalchemy_store.now", return_value=200):
++            self.store.create_model_version("contract_model", "source-1", "run-1")
++        with mock.patch("mlflow.store.model_registry.sqlalchemy_store.now", return_value=300):
++            self.store.create_model_version("contract_model", "source-2", "run-2")
++
++        with mock.patch("mlflow.store.model_registry.sqlalchemy_store.now", return_value=400):
++            self.store.transition_model_version_stage("contract_model", 1, "Staging", False)
++        self.assertEqual(self.store.get_model_version("contract_model", 1).last_updated_timestamp, 400)
++        self.assertEqual(self.store.get_registered_model("contract_model").last_updated_timestamp, 400)
++
++        with mock.patch("mlflow.store.model_registry.sqlalchemy_store.now", return_value=500):
++            self.store.transition_model_version_stage("contract_model", 2, "Staging", True)
++        self.assertEqual(self.store.get_model_version("contract_model", 1).current_stage, "Archived")
++        self.assertEqual(self.store.get_model_version("contract_model", 1).last_updated_timestamp, 500)
++        self.assertEqual(self.store.get_registered_model("contract_model").last_updated_timestamp, 500)
++
++        with mock.patch("mlflow.store.model_registry.sqlalchemy_store.now", return_value=600):
++            self.store.delete_model_version("contract_model", 2)
++        self.assertEqual(self.store.get_registered_model("contract_model").last_updated_timestamp, 600)
++        with self.assertRaises(MlflowException):
++            self.store.get_model_version("contract_model", 2)
++
++    def test_timestamp_pagination_uses_name_tiebreaker(self):
++        for name in ["contract_beta", "contract_alpha"]:
++            with mock.patch("mlflow.store.model_registry.sqlalchemy_store.now", return_value=100):
++                self.store.create_registered_model(name)
++        with mock.patch("mlflow.store.model_registry.sqlalchemy_store.now", return_value=200):
++            self.store.create_registered_model("contract_gamma")
++
++        names = []
++        page, token = self._names("timestamp ASC", max_results=1)
++        names.extend(page)
++        while token:
++            page, token = self._names("timestamp ASC", page_token=token, max_results=1)
++            names.extend(page)
++        self.assertEqual(names, ["contract_alpha", "contract_beta", "contract_gamma"])
++
++    def test_registered_model_tag_set_refreshes_timestamp(self):
++        with mock.patch("mlflow.store.model_registry.sqlalchemy_store.now", return_value=100):
++            self.store.create_registered_model("contract_model")
++        with mock.patch("mlflow.store.model_registry.sqlalchemy_store.now", return_value=200):
++            self.store.set_registered_model_tag(
++                "contract_model", RegisteredModelTag("owner", "team")
++            )
++        model = self.store.get_registered_model("contract_model")
++        self.assertEqual(model.last_updated_timestamp, 200)
++        self.assertEqual(model.tags, {"owner": "team"})
++
++    def test_registered_model_tag_delete_refreshes_timestamp(self):
++        with mock.patch("mlflow.store.model_registry.sqlalchemy_store.now", return_value=100):
++            self.store.create_registered_model(
++                "contract_model", [RegisteredModelTag("owner", "team")]
++            )
++        with mock.patch("mlflow.store.model_registry.sqlalchemy_store.now", return_value=200):
++            self.store.delete_registered_model_tag("contract_model", "owner")
++        model = self.store.get_registered_model("contract_model")
++        self.assertEqual(model.last_updated_timestamp, 200)
++        self.assertEqual(model.tags, {})
++
++    def test_model_version_update_refreshes_parent_timestamp(self):
++        with mock.patch("mlflow.store.model_registry.sqlalchemy_store.now", return_value=100):
++            self.store.create_registered_model("contract_model")
++        with mock.patch("mlflow.store.model_registry.sqlalchemy_store.now", return_value=200):
++            self.store.create_model_version("contract_model", "source", "run")
++        with mock.patch("mlflow.store.model_registry.sqlalchemy_store.now", return_value=300):
++            self.store.update_model_version("contract_model", 1, "description")
++        self.assertEqual(self.store.get_model_version("contract_model", 1).last_updated_timestamp, 300)
++        self.assertEqual(self.store.get_registered_model("contract_model").last_updated_timestamp, 300)
++
++    def test_model_version_tag_set_refreshes_parent_and_version(self):
++        with mock.patch("mlflow.store.model_registry.sqlalchemy_store.now", return_value=100):
++            self.store.create_registered_model("contract_model")
++        with mock.patch("mlflow.store.model_registry.sqlalchemy_store.now", return_value=200):
++            self.store.create_model_version("contract_model", "source", "run")
++        with mock.patch("mlflow.store.model_registry.sqlalchemy_store.now", return_value=300):
++            self.store.set_model_version_tag("contract_model", 1, ModelVersionTag("owner", "team"))
++        self.assertEqual(self.store.get_model_version("contract_model", 1).last_updated_timestamp, 300)
++        self.assertEqual(self.store.get_registered_model("contract_model").last_updated_timestamp, 300)
++
++    def test_model_version_tag_delete_refreshes_parent_and_version(self):
++        with mock.patch("mlflow.store.model_registry.sqlalchemy_store.now", return_value=100):
++            self.store.create_registered_model("contract_model")
++        with mock.patch("mlflow.store.model_registry.sqlalchemy_store.now", return_value=200):
++            self.store.create_model_version("contract_model", "source", "run", [ModelVersionTag("owner", "team")])
++        with mock.patch("mlflow.store.model_registry.sqlalchemy_store.now", return_value=300):
++            self.store.delete_model_version_tag("contract_model", 1, "owner")
++        self.assertEqual(self.store.get_model_version("contract_model", 1).last_updated_timestamp, 300)
++        self.assertEqual(self.store.get_registered_model("contract_model").last_updated_timestamp, 300)
++
++    def test_model_version_delete_refreshes_parent_timestamp(self):
++        with mock.patch("mlflow.store.model_registry.sqlalchemy_store.now", return_value=100):
++            self.store.create_registered_model("contract_model")
++        with mock.patch("mlflow.store.model_registry.sqlalchemy_store.now", return_value=200):
++            self.store.create_model_version("contract_model", "source", "run")
++        with mock.patch("mlflow.store.model_registry.sqlalchemy_store.now", return_value=300):
++            self.store.delete_model_version("contract_model", 1)
++        self.assertEqual(self.store.get_registered_model("contract_model").last_updated_timestamp, 300)
++        with self.assertRaises(MlflowException):
++            self.store.get_model_version("contract_model", 1)
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,9 @@
++#!/bin/bash
++set -euo pipefail
++
++
++if [[ -x ".venv/bin/pytest" ]]; then
++  .venv/bin/pytest -q tests/store/model_registry/test_timestamp_contract.py
++else
++  pytest -q tests/store/model_registry/test_timestamp_contract.py
++fi

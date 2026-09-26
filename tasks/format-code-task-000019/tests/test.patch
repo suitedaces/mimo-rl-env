@@ -1,0 +1,252 @@
+diff --git a/covalent_ui/api/v1/tests/delete_all_dispatches_test.py b/covalent_ui/api/v1/tests/delete_all_dispatches_test.py
+new file mode 100644
+index 00000000..9b7dfac5
+--- /dev/null
++++ b/covalent_ui/api/v1/tests/delete_all_dispatches_test.py
+@@ -0,0 +1,225 @@
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++import datetime
++import uuid
++
++import pytest
++from sqlalchemy import create_engine
++from sqlalchemy.orm import Session
++
++from covalent._data_store.models import Base as ModelsBase
++from covalent_ui.api.v1.data_layer.summary_dal import Summary
++from covalent_ui.api.v1.database.config.db import Base as UIBase
++from covalent_ui.api.v1.database.schema.electron import Electron
++from covalent_ui.api.v1.database.schema.lattices import Lattice
++from covalent_ui.api.v1.models.dispatch_model import DeleteAllDispatchesRequest
++from covalent_ui.api.v1.utils.status import Status
++
++NOW = datetime.datetime(2022, 1, 1, 0, 0, 0)
++
++
++@pytest.fixture
++def session():
++
++    engine = create_engine("sqlite+pysqlite:///:memory:")
++    UIBase.metadata.create_all(engine)
++
++    ModelsBase.metadata.tables["electron_dependency"].create(engine)
++    with Session(engine) as sess:
++        yield sess
++
++
++def _add_dispatch(sess, status, name=None, dispatch_id=None, is_active=True):
++    dispatch_id = dispatch_id or str(uuid.uuid4())
++    name = name or f"workflow_{status.lower()}"
++    lattice = Lattice(
++        dispatch_id=dispatch_id,
++        name=name,
++        status=status,
++        electron_num=1,
++        completed_electron_num=1,
++        is_active=is_active,
++        started_at=NOW,
++        completed_at=NOW,
++        electron_id=None,
++    )
++    sess.add(lattice)
++    sess.flush()
++    sess.add(
++        Electron(
++            parent_lattice_id=lattice.id,
++            transport_graph_node_id=0,
++            type="function",
++            name=f"node_{status.lower()}",
++            status=status,
++            is_active=is_active,
++        )
++    )
++    sess.commit()
++    return dispatch_id
++
++
++def _active_status_map(sess):
++    return {row.status: row.is_active for row in sess.query(Lattice).all()}
++
++
++def _active_electron_map(sess):
++    return {row.status: row.is_active for row in sess.query(Electron).all()}
++
++
++def test_delete_all_with_all_filter_removes_every_active_dispatch(session):
++    ids = {
++        st: _add_dispatch(session, st)
++        for st in ["RUNNING", "COMPLETED", "FAILED", "CANCELLED"]
++    }
++
++    resp = Summary(session).delete_all_dispatches(
++        DeleteAllDispatchesRequest(status_filter=Status.ALL)
++    )
++
++    assert {uuid.UUID(d) for d in ids.values()} == set(resp.success_items)
++    assert resp.message == "Dispatch(es) have been deleted successfully!"
++
++    assert all(active is False for active in _active_status_map(session).values())
++
++
++def test_completed_filter_includes_postprocessing_states(session):
++    grouped = ["COMPLETED", "POSTPROCESSING", "POSTPROCESSING_FAILED", "PENDING_POSTPROCESSING"]
++    untouched = ["RUNNING", "FAILED", "CANCELLED", "NEW_OBJECT"]
++    for st in grouped + untouched:
++        _add_dispatch(session, st)
++
++    resp = Summary(session).delete_all_dispatches(
++        DeleteAllDispatchesRequest(status_filter=Status.COMPLETED)
++    )
++
++    status_active = _active_status_map(session)
++    for st in grouped:
++        assert status_active[st] is False, f"{st} should have been deleted"
++    for st in untouched:
++        assert status_active[st] is True, f"{st} should be untouched"
++    assert len(resp.success_items) == len(grouped)
++
++
++def test_specific_status_filter_deletes_only_that_status(session):
++    for st in ["RUNNING", "COMPLETED", "FAILED"]:
++        _add_dispatch(session, st)
++
++    resp = Summary(session).delete_all_dispatches(
++        DeleteAllDispatchesRequest(status_filter=Status.FAILED)
++    )
++
++    status_active = _active_status_map(session)
++    assert status_active["FAILED"] is False
++    assert status_active["RUNNING"] is True
++    assert status_active["COMPLETED"] is True
++    assert len(resp.success_items) == 1
++
++
++def test_completed_postprocessing_only_does_not_touch_running_or_failed(session):
++
++    _add_dispatch(session, "POSTPROCESSING")
++    _add_dispatch(session, "RUNNING")
++
++    Summary(session).delete_all_dispatches(
++        DeleteAllDispatchesRequest(status_filter=Status.COMPLETED)
++    )
++
++    status_active = _active_status_map(session)
++    assert status_active["POSTPROCESSING"] is False
++    assert status_active["RUNNING"] is True
++
++
++def test_deletion_cascades_to_electrons(session):
++    _add_dispatch(session, "COMPLETED")
++    _add_dispatch(session, "RUNNING")
++
++    Summary(session).delete_all_dispatches(
++        DeleteAllDispatchesRequest(status_filter=Status.COMPLETED)
++    )
++
++    electron_active = _active_electron_map(session)
++    assert electron_active["COMPLETED"] is False
++    assert electron_active["RUNNING"] is True
++
++
++def test_search_string_narrows_selection(session):
++    keep = _add_dispatch(session, "COMPLETED", name="alpha_pipeline")
++    _add_dispatch(session, "COMPLETED", name="beta_pipeline")
++
++    resp = Summary(session).delete_all_dispatches(
++        DeleteAllDispatchesRequest(status_filter=Status.ALL, search_string="alpha")
++    )
++
++    assert set(resp.success_items) == {uuid.UUID(keep)}
++    status_for = {row.dispatch_id: row.is_active for row in session.query(Lattice).all()}
++    assert status_for[keep] is False
++
++    assert all(
++        active is True for did, active in status_for.items() if did != keep
++    )
++
++
++def test_search_string_matches_dispatch_id(session):
++    target = _add_dispatch(session, "COMPLETED")
++    _add_dispatch(session, "COMPLETED")
++
++    resp = Summary(session).delete_all_dispatches(
++        DeleteAllDispatchesRequest(status_filter=Status.ALL, search_string=target)
++    )
++
++    assert set(resp.success_items) == {uuid.UUID(target)}
++
++
++def test_no_matching_dispatches_reports_nothing_deleted(session):
++    _add_dispatch(session, "RUNNING")
++
++    resp = Summary(session).delete_all_dispatches(
++        DeleteAllDispatchesRequest(status_filter=Status.FAILED)
++    )
++
++    assert list(resp.success_items) == []
++    assert resp.message == "No dispatches were deleted"
++    assert _active_status_map(session)["RUNNING"] is True
++
++
++def test_already_inactive_dispatches_are_excluded(session):
++    active = _add_dispatch(session, "COMPLETED", name="active_one")
++    _add_dispatch(session, "COMPLETED", name="already_gone", is_active=False)
++
++    resp = Summary(session).delete_all_dispatches(
++        DeleteAllDispatchesRequest(status_filter=Status.ALL)
++    )
++
++    assert set(resp.success_items) == {uuid.UUID(active)}
++
++
++def test_defaults_select_all_active_dispatches(session):
++    for st in ["RUNNING", "COMPLETED", "FAILED"]:
++        _add_dispatch(session, st)
++
++
++    resp = Summary(session).delete_all_dispatches(DeleteAllDispatchesRequest())
++
++    assert len(resp.success_items) == 3
++    assert all(active is False for active in _active_status_map(session).values())
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,16 @@
++#!/usr/bin/env bash
++
++
++
++
++set -euo pipefail
++HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++cd /testbed
++
++
++
++
++python -m pytest tests/covalent_tests/data_store/data_store_test.py -q
++
++
++python -m pytest covalent_ui/api/v1/tests/delete_all_dispatches_test.py -q

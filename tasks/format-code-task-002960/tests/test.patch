@@ -1,0 +1,325 @@
+diff --git a/tests/unittests/geojson_contract_tests.py b/tests/unittests/geojson_contract_tests.py
+new file mode 100644
+index 0000000000..f53e115534
+--- /dev/null
++++ b/tests/unittests/geojson_contract_tests.py
+@@ -0,0 +1,308 @@
++import json
++import os
++
++import pytest
++
++import fiftyone.core.labels as fol
++import fiftyone.core.sample as fos
++from fiftyone.utils.geojson import GeoJSONImageDatasetExporter
++from fiftyone.utils.geojson import GeoJSONImageDatasetImporter
++
++
++def _write_json(path, value):
++    with open(path, "w") as f:
++        json.dump(value, f)
++
++
++def _feature(filename, geometry, **properties):
++    return {
++        "type": "Feature",
++        "geometry": geometry,
++        "properties": {"filename": filename, **properties},
++    }
++
++
++def _point(x, y):
++    return {"type": "Point", "coordinates": [x, y]}
++
++
++def test_importer_handles_null_geometry(tmp_path):
++    data_dir = tmp_path / "data"
++    data_dir.mkdir()
++    (data_dir / "empty.jpg").write_bytes(b"image")
++    labels = {
++        "type": "FeatureCollection",
++        "features": [_feature("empty.jpg", None, raw="keep")],
++    }
++    _write_json(tmp_path / "labels.json", labels)
++
++    importer = GeoJSONImageDatasetImporter(str(tmp_path))
++    importer.setup()
++    samples = list(importer)
++    assert len(samples) == 1
++    assert samples[0].raw == "keep"
++    assert samples[0].location is None
++
++
++def test_importer_applies_only_configured_property_parsers(tmp_path):
++    data_dir = tmp_path / "data"
++    data_dir.mkdir()
++    (data_dir / "labeled.jpg").write_bytes(b"image")
++    labels = {
++        "type": "FeatureCollection",
++        "features": [
++            _feature("labeled.jpg", _point(1, 2), score="7", raw="keep")
++        ],
++    }
++    _write_json(tmp_path / "labels.json", labels)
++
++    importer = GeoJSONImageDatasetImporter(
++        str(tmp_path), property_parsers={"score": int}
++    )
++    importer.setup()
++    samples = list(importer)
++    assert samples[0].score == 7
++    assert samples[0].raw == "keep"
++    assert samples[0].location.point == [1, 2]
++
++
++def _write_duplicate_features(tmp_path, second_source="shared"):
++    data_dir = tmp_path / "data"
++    data_dir.mkdir()
++    (data_dir / "same.jpg").write_bytes(b"image")
++    labels = {
++        "type": "FeatureCollection",
++        "features": [
++            _feature(
++                "same.jpg", _point(1, 2), source="shared", first="one"
++            ),
++            _feature(
++                "same.jpg", _point(3, 4), source=second_source, second="two"
++            ),
++        ],
++    }
++    _write_json(tmp_path / "labels.json", labels)
++
++
++def test_importer_aggregates_duplicate_features_in_multi_mode(tmp_path):
++    _write_duplicate_features(tmp_path)
++    importer = GeoJSONImageDatasetImporter(str(tmp_path), multi_location=True)
++    importer.setup()
++    samples = list(importer)
++    assert len(samples) == 1
++    assert samples[0].location.points == [[1, 2], [3, 4]]
++    assert samples[0].source == "shared"
++    assert samples[0].first == "one"
++    assert samples[0].second == "two"
++
++
++def test_importer_rejects_duplicate_features_in_single_mode(tmp_path):
++    _write_duplicate_features(tmp_path)
++    importer = GeoJSONImageDatasetImporter(str(tmp_path), multi_location=False)
++    with pytest.raises(ValueError, match="multiple features"):
++        importer.setup()
++        list(importer)
++
++
++def test_importer_rejects_conflicting_duplicate_properties(tmp_path):
++    _write_duplicate_features(tmp_path, second_source="conflict")
++    importer = GeoJSONImageDatasetImporter(str(tmp_path), multi_location=True)
++    with pytest.raises(ValueError, match="source"):
++        importer.setup()
++        list(importer)
++
++
++def test_importer_order_is_deterministic(tmp_path):
++    data_dir = tmp_path / "data"
++    data_dir.mkdir()
++    for name in ("z.jpg", "a.jpg", "unlisted.jpg"):
++        (data_dir / name).write_bytes(b"image")
++    labels = {
++        "type": "FeatureCollection",
++        "features": [
++            _feature("z.jpg", _point(0, 0)),
++            _feature("a.jpg", _point(1, 1)),
++        ],
++    }
++    _write_json(tmp_path / "labels.json", labels)
++
++    importer = GeoJSONImageDatasetImporter(str(tmp_path))
++    importer.setup()
++    assert [os.path.basename(s.filepath) for s in importer] == [
++        "z.jpg",
++        "a.jpg",
++        "unlisted.jpg",
++    ]
++
++
++def test_skip_unlabeled_ignores_null_geometry_and_media_only_files(tmp_path):
++    data_dir = tmp_path / "data"
++    data_dir.mkdir()
++    for name in ("z.jpg", "null.jpg", "unlisted.jpg"):
++        (data_dir / name).write_bytes(b"image")
++    labels = {
++        "type": "FeatureCollection",
++        "features": [
++            _feature("z.jpg", _point(0, 0)),
++            _feature("null.jpg", None),
++        ],
++    }
++    _write_json(tmp_path / "labels.json", labels)
++
++    importer = GeoJSONImageDatasetImporter(str(tmp_path), skip_unlabeled=True)
++    importer.setup()
++    assert [os.path.basename(s.filepath) for s in importer] == ["z.jpg"]
++
++
++def test_importer_resolves_relative_and_absolute_filepath_properties(tmp_path):
++    data_dir = tmp_path / "data"
++    data_dir.mkdir()
++    (data_dir / "named.jpg").write_bytes(b"image")
++    external_dir = tmp_path / "external"
++    external_dir.mkdir()
++    relative = external_dir / "relative.jpg"
++    absolute = external_dir / "absolute.jpg"
++    relative.write_bytes(b"image")
++    absolute.write_bytes(b"image")
++    labels = {
++        "type": "FeatureCollection",
++        "features": [
++            _feature("named.jpg", _point(0, 0)),
++            {
++                "type": "Feature",
++                "geometry": _point(1, 1),
++                "properties": {"filepath": "external/relative.jpg"},
++            },
++            {
++                "type": "Feature",
++                "geometry": _point(2, 2),
++                "properties": {"filepath": str(absolute)},
++            },
++        ],
++    }
++    _write_json(tmp_path / "labels.json", labels)
++
++    importer = GeoJSONImageDatasetImporter(str(tmp_path), skip_unlabeled=True)
++    importer.setup()
++    assert [s.filepath for s in importer] == [
++        str(data_dir / "named.jpg"),
++        str(relative),
++        str(absolute),
++    ]
++
++
++def test_exporter_default_mode_and_media_modes_remain_compatible(tmp_path):
++    image1 = tmp_path / "one.jpg"
++    image2 = tmp_path / "two.jpg"
++    image1.write_bytes(b"one")
++    image2.write_bytes(b"two")
++    samples = [
++        fos.Sample(
++            filepath=str(image1),
++            location=fol.GeoLocations(points=[[1, 2], [3, 4]]),
++            keep="yes",
++            omit=None,
++        ),
++        fos.Sample(filepath=str(image2), location=None, keep="no", omit=None),
++    ]
++
++    copied_dir = tmp_path / "copied"
++    exporter = GeoJSONImageDatasetExporter(
++        str(copied_dir),
++        location_field="location",
++        property_makers={
++            "keep": lambda value: value,
++            "omit": lambda value: value,
++        },
++        copy_media=True,
++    )
++    exporter.setup()
++    for sample in samples:
++        exporter.export_sample(sample)
++    exporter.close()
++    exported = json.load(open(copied_dir / "labels.json"))
++    assert len(exported["features"]) == 2
++    assert [f["properties"]["filename"] for f in exported["features"]] == [
++        "one.jpg",
++        "two.jpg",
++    ]
++    assert exported["features"][0]["geometry"]["type"] == "GeometryCollection"
++    assert exported["features"][0]["properties"]["keep"] == "yes"
++    assert "omit" not in exported["features"][0]["properties"]
++    assert exported["features"][1]["geometry"] is None
++    assert (copied_dir / "data" / "one.jpg").read_bytes() == b"one"
++
++    referenced_dir = tmp_path / "referenced"
++    exporter = GeoJSONImageDatasetExporter(
++        str(referenced_dir), location_field="location", copy_media=False
++    )
++    exporter.setup()
++    exporter.export_sample(samples[0])
++    exporter.close()
++    exported = json.load(open(referenced_dir / "labels.json"))
++    assert exported["features"][0]["properties"]["filepath"] == str(image1)
++    assert "filename" not in exported["features"][0]["properties"]
++
++
++def test_flattened_export_round_trips_multi_locations(tmp_path):
++    image = tmp_path / "source.jpg"
++    empty_image = tmp_path / "empty.jpg"
++    image.write_bytes(b"image")
++    empty_image.write_bytes(b"empty")
++    sample = fos.Sample(
++        filepath=str(image),
++        location=fol.GeoLocations(
++            points=[[1, 2], [3, 4]],
++            lines=[[[5, 6], [7, 8]]],
++            polygons=[[[[0, 0], [1, 0], [1, 1], [0, 0]]]],
++        ),
++        source="survey",
++    )
++    export_dir = tmp_path / "flat"
++    exporter = GeoJSONImageDatasetExporter(
++        str(export_dir),
++        location_field="location",
++        property_makers={"source": lambda value: value},
++        flatten_locations=True,
++    )
++    exporter.setup()
++    exporter.export_sample(sample)
++    exporter.export_sample(
++        fos.Sample(filepath=str(empty_image), location=None, source="empty")
++    )
++    exporter.close()
++
++    exported = json.load(open(export_dir / "labels.json"))
++    assert [
++        f["geometry"]["type"] if f["geometry"] is not None else None
++        for f in exported["features"]
++    ] == [
++        "Point",
++        "Point",
++        "LineString",
++        "Polygon",
++        None,
++    ]
++    assert [
++        f["properties"]["filename"] for f in exported["features"][:4]
++    ] == ["source.jpg"] * 4
++    assert [
++        f["properties"]["source"] for f in exported["features"][:4]
++    ] == ["survey"] * 4
++    assert exported["features"][4]["properties"] == {
++        "source": "empty",
++        "filename": "empty.jpg",
++    }
++
++    importer = GeoJSONImageDatasetImporter(
++        str(export_dir), multi_location=True, skip_unlabeled=True
++    )
++    importer.setup()
++    samples = list(importer)
++    assert len(samples) == 1
++    assert samples[0].source == "survey"
++    assert samples[0].location.points == [[1, 2], [3, 4]]
++    assert samples[0].location.lines == [[[5, 6], [7, 8]]]
++    assert samples[0].location.polygons == [
++        [[[0, 0], [1, 0], [1, 1], [0, 0]]]
++    ]
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,6 @@
++#!/bin/bash
++set -euo pipefail
++
++
++export FIFTYONE_DISABLE_SERVICES=1
++python -m pytest -q tests/unittests/geojson_contract_tests.py

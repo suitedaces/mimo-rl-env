@@ -1,0 +1,519 @@
+diff --git a/pkg/controller/rbacdefinition/reliability_contract_test.go b/pkg/controller/rbacdefinition/reliability_contract_test.go
+new file mode 100644
+index 0000000..17a350b
+--- /dev/null
++++ b/pkg/controller/rbacdefinition/reliability_contract_test.go
+@@ -0,0 +1,498 @@
++package rbacdefinition
++
++import (
++	"errors"
++	"reflect"
++	"testing"
++
++	rbacmanagerv1beta1 "github.com/reactiveops/rbac-manager/pkg/apis/rbacmanager/v1beta1"
++	corev1 "k8s.io/api/core/v1"
++	rbacv1 "k8s.io/api/rbac/v1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/runtime"
++	"k8s.io/apimachinery/pkg/runtime/schema"
++	"k8s.io/apimachinery/pkg/types"
++	"k8s.io/client-go/kubernetes/fake"
++	k8stesting "k8s.io/client-go/testing"
++	clientfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
++	"sigs.k8s.io/controller-runtime/pkg/reconcile"
++)
++
++const reliabilityAPIGroup = "rbac.authorization.k8s.io"
++
++func reliabilityDefinition(name string) *rbacmanagerv1beta1.RBACDefinition {
++	return &rbacmanagerv1beta1.RBACDefinition{
++		ObjectMeta: metav1.ObjectMeta{Name: name, UID: types.UID(name + "-uid")},
++		RBACBindings: []rbacmanagerv1beta1.RBACBinding{{
++			Name: "operators",
++			Subjects: []rbacv1.Subject{
++				{Kind: rbacv1.UserKind, APIGroup: reliabilityAPIGroup, Name: "alice"},
++				{Kind: rbacv1.GroupKind, APIGroup: reliabilityAPIGroup, Name: "platform"},
++			},
++			ClusterRoleBindings: []rbacmanagerv1beta1.ClusterRoleBinding{{ClusterRole: "admin"}},
++			RoleBindings: []rbacmanagerv1beta1.RoleBinding{
++				{Namespace: "apps", ClusterRole: "edit"},
++				{Namespace: "ops", ClusterRole: "view"},
++			},
++		}},
++	}
++}
++
++func reliabilityOwnerRefs(def *rbacmanagerv1beta1.RBACDefinition) []metav1.OwnerReference {
++	return []metav1.OwnerReference{*metav1.NewControllerRef(def, schema.GroupVersionKind{
++		Group: rbacmanagerv1beta1.SchemeGroupVersion.Group, Version: rbacmanagerv1beta1.SchemeGroupVersion.Version, Kind: "RBACDefinition",
++	})}
++}
++
++func reliabilityRoleBinding(def *rbacmanagerv1beta1.RBACDefinition, namespace, role string, subjects []rbacv1.Subject) *rbacv1.RoleBinding {
++	return &rbacv1.RoleBinding{
++		ObjectMeta: metav1.ObjectMeta{
++			Name: def.Name + "-operators-" + role, Namespace: namespace,
++			Labels: Labels, OwnerReferences: reliabilityOwnerRefs(def),
++		},
++		RoleRef:  rbacv1.RoleRef{Kind: "ClusterRole", Name: role},
++		Subjects: subjects,
++	}
++}
++
++func reliabilityClusterRoleBinding(def *rbacmanagerv1beta1.RBACDefinition, role string) *rbacv1.ClusterRoleBinding {
++	return &rbacv1.ClusterRoleBinding{
++		ObjectMeta: metav1.ObjectMeta{Name: def.Name + "-operators-" + role, Labels: Labels, OwnerReferences: reliabilityOwnerRefs(def)},
++		RoleRef:    rbacv1.RoleRef{Kind: "ClusterRole", Name: role},
++		Subjects:   append([]rbacv1.Subject(nil), def.RBACBindings[0].Subjects...),
++	}
++}
++
++func reliabilityMutationActions(client *fake.Clientset) []k8stesting.Action {
++	var mutations []k8stesting.Action
++	for _, action := range client.Actions() {
++		if action.GetVerb() == "create" || action.GetVerb() == "delete" || action.GetVerb() == "update" || action.GetVerb() == "patch" {
++			mutations = append(mutations, action)
++		}
++	}
++	return mutations
++}
++
++func reliabilityActionsForResource(client *fake.Clientset, resource string) []k8stesting.Action {
++	var matches []k8stesting.Action
++	for _, action := range client.Actions() {
++		if action.GetResource().Resource == resource {
++			matches = append(matches, action)
++		}
++	}
++	return matches
++}
++
++func TestReliabilityContractSubjectOrderIsIdempotent(t *testing.T) {
++	def := reliabilityDefinition("stable-order")
++	reversed := append([]rbacv1.Subject(nil), def.RBACBindings[0].Subjects...)
++	reversed[0], reversed[1] = reversed[1], reversed[0]
++	existing := reliabilityRoleBinding(def, "apps", "edit", reversed)
++	def.RBACBindings[0].ClusterRoleBindings = nil
++	def.RBACBindings[0].RoleBindings = def.RBACBindings[0].RoleBindings[:1]
++	client := fake.NewSimpleClientset(existing)
++
++	r := Reconciler{Clientset: client}
++	if err := r.Reconcile(def); err != nil {
++		t.Fatalf("reconcile reordered subjects: %v", err)
++	}
++	if got := reliabilityMutationActions(client); len(got) != 0 {
++		t.Fatalf("subject reordering caused API mutations: %#v", got)
++	}
++	client.ClearActions()
++	if err := r.Reconcile(def); err != nil {
++		t.Fatalf("repeat reconcile: %v", err)
++	}
++	if got := reliabilityMutationActions(client); len(got) != 0 {
++		t.Fatalf("repeat reconcile was not idempotent: %#v", got)
++	}
++}
++
++func TestReliabilityContractSubjectAPIGroupDriftIsReconciled(t *testing.T) {
++	def := reliabilityDefinition("subject-drift")
++	def.RBACBindings[0].ClusterRoleBindings = nil
++	def.RBACBindings[0].RoleBindings = def.RBACBindings[0].RoleBindings[:1]
++	driftedSubjects := append([]rbacv1.Subject(nil), def.RBACBindings[0].Subjects...)
++	driftedSubjects[0].APIGroup = "legacy.example.test"
++	client := fake.NewSimpleClientset(reliabilityRoleBinding(def, "apps", "edit", driftedSubjects))
++
++	if err := (&Reconciler{Clientset: client}).Reconcile(def); err != nil {
++		t.Fatalf("reconcile subject APIGroup drift: %v", err)
++	}
++	got, err := client.RbacV1().RoleBindings("apps").Get(def.Name+"-operators-edit", metav1.GetOptions{})
++	if err != nil {
++		t.Fatal(err)
++	}
++	if !reflect.DeepEqual(got.Subjects, def.RBACBindings[0].Subjects) {
++		t.Fatalf("subject drift remains: got %#v, want %#v", got.Subjects, def.RBACBindings[0].Subjects)
++	}
++}
++
++func TestReliabilityContractClusterBindingSubjectOrderIsIdempotent(t *testing.T) {
++	def := reliabilityDefinition("stable-cluster-order")
++	reversed := append([]rbacv1.Subject(nil), def.RBACBindings[0].Subjects...)
++	reversed[0], reversed[1] = reversed[1], reversed[0]
++	existing := reliabilityClusterRoleBinding(def, "admin")
++	existing.Subjects = reversed
++	def.RBACBindings[0].RoleBindings = nil
++	client := fake.NewSimpleClientset(existing)
++
++	if err := (&Reconciler{Clientset: client}).Reconcile(def); err != nil {
++		t.Fatalf("reconcile reordered cluster binding subjects: %v", err)
++	}
++	if got := reliabilityMutationActions(client); len(got) != 0 {
++		t.Fatalf("cluster binding subject reordering caused API mutations: %#v", got)
++	}
++}
++
++func TestReliabilityContractClusterBindingSubjectAPIGroupDriftIsReconciled(t *testing.T) {
++	def := reliabilityDefinition("cluster-subject-drift")
++	def.RBACBindings[0].RoleBindings = nil
++	existing := reliabilityClusterRoleBinding(def, "admin")
++	existing.Subjects[0].APIGroup = "legacy.example.test"
++	client := fake.NewSimpleClientset(existing)
++
++	if err := (&Reconciler{Clientset: client}).Reconcile(def); err != nil {
++		t.Fatalf("reconcile cluster binding subject APIGroup drift: %v", err)
++	}
++	got, err := client.RbacV1().ClusterRoleBindings().Get(existing.Name, metav1.GetOptions{})
++	if err != nil {
++		t.Fatal(err)
++	}
++	if !reflect.DeepEqual(got.Subjects, def.RBACBindings[0].Subjects) {
++		t.Fatalf("cluster binding subject drift remains: got %#v, want %#v", got.Subjects, def.RBACBindings[0].Subjects)
++	}
++}
++
++func TestReliabilityContractRoleRefAPIGroupDriftIsReconciled(t *testing.T) {
++	def := reliabilityDefinition("roleref-drift")
++	def.RBACBindings[0].ClusterRoleBindings = nil
++	def.RBACBindings[0].RoleBindings = def.RBACBindings[0].RoleBindings[:1]
++	existing := reliabilityRoleBinding(def, "apps", "edit", def.RBACBindings[0].Subjects)
++	existing.RoleRef.APIGroup = "legacy.example.test"
++	client := fake.NewSimpleClientset(existing)
++
++	if err := (&Reconciler{Clientset: client}).Reconcile(def); err != nil {
++		t.Fatalf("reconcile RoleRef APIGroup drift: %v", err)
++	}
++	got, err := client.RbacV1().RoleBindings("apps").Get(existing.Name, metav1.GetOptions{})
++	if err != nil {
++		t.Fatal(err)
++	}
++	if got.RoleRef.APIGroup != "" {
++		t.Fatalf("RoleRef APIGroup drift remains: got %q", got.RoleRef.APIGroup)
++	}
++}
++
++func TestReliabilityContractClusterRoleRefAPIGroupDriftIsReconciled(t *testing.T) {
++	def := reliabilityDefinition("cluster-roleref-drift")
++	def.RBACBindings[0].RoleBindings = nil
++	existing := reliabilityClusterRoleBinding(def, "admin")
++	existing.RoleRef.APIGroup = "legacy.example.test"
++	client := fake.NewSimpleClientset(existing)
++
++	if err := (&Reconciler{Clientset: client}).Reconcile(def); err != nil {
++		t.Fatalf("reconcile cluster RoleRef APIGroup drift: %v", err)
++	}
++	got, err := client.RbacV1().ClusterRoleBindings().Get(existing.Name, metav1.GetOptions{})
++	if err != nil {
++		t.Fatal(err)
++	}
++	if got.RoleRef.APIGroup != "" {
++		t.Fatalf("cluster RoleRef APIGroup drift remains: got %q", got.RoleRef.APIGroup)
++	}
++}
++
++func TestReliabilityContractSubjectMultiplicityIsReconciled(t *testing.T) {
++	def := reliabilityDefinition("subject-multiplicity")
++	def.RBACBindings[0].ClusterRoleBindings = nil
++	def.RBACBindings[0].RoleBindings = def.RBACBindings[0].RoleBindings[:1]
++	drifted := append([]rbacv1.Subject(nil), def.RBACBindings[0].Subjects...)
++	drifted[1] = drifted[0]
++	client := fake.NewSimpleClientset(reliabilityRoleBinding(def, "apps", "edit", drifted))
++
++	if err := (&Reconciler{Clientset: client}).Reconcile(def); err != nil {
++		t.Fatalf("reconcile subject multiplicity drift: %v", err)
++	}
++	got, err := client.RbacV1().RoleBindings("apps").Get(def.Name+"-operators-edit", metav1.GetOptions{})
++	if err != nil {
++		t.Fatal(err)
++	}
++	if !reflect.DeepEqual(got.Subjects, def.RBACBindings[0].Subjects) {
++		t.Fatalf("subject multiplicity drift remains: got %#v, want %#v", got.Subjects, def.RBACBindings[0].Subjects)
++	}
++}
++
++func TestReliabilityContractForeignOwnerCollisionIsPreservedAndReported(t *testing.T) {
++	def := reliabilityDefinition("owner-collision")
++	def.RBACBindings[0].ClusterRoleBindings = nil
++	def.RBACBindings[0].RoleBindings = def.RBACBindings[0].RoleBindings[:1]
++	existing := reliabilityRoleBinding(def, "apps", "edit", def.RBACBindings[0].Subjects)
++	existing.OwnerReferences[0].UID = types.UID("different-owner-uid")
++	client := fake.NewSimpleClientset(existing)
++
++	err := (&Reconciler{Clientset: client}).Reconcile(def)
++	if err == nil {
++		t.Fatal("expected the same-name foreign-owner collision to be reported")
++	}
++	got, getErr := client.RbacV1().RoleBindings("apps").Get(existing.Name, metav1.GetOptions{})
++	if getErr != nil {
++		t.Fatalf("foreign-owned object was removed: %v", getErr)
++	}
++	if got.OwnerReferences[0].UID != types.UID("different-owner-uid") {
++		t.Fatalf("foreign ownership was changed: %#v", got.OwnerReferences)
++	}
++}
++
++func TestReliabilityContractForeignServiceAccountOwnerCollisionIsPreservedAndReported(t *testing.T) {
++	def := reliabilityDefinition("sa-owner-collision")
++	def.RBACBindings[0].Subjects = []rbacv1.Subject{{Kind: rbacv1.ServiceAccountKind, Name: "robot", Namespace: "bots"}}
++	def.RBACBindings[0].ClusterRoleBindings = nil
++	def.RBACBindings[0].RoleBindings = nil
++	existing := &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{
++		Name: "robot", Namespace: "bots", Labels: Labels, OwnerReferences: reliabilityOwnerRefs(def),
++	}}
++	existing.OwnerReferences[0].UID = types.UID("different-owner-uid")
++	client := fake.NewSimpleClientset(existing)
++
++	err := (&Reconciler{Clientset: client}).Reconcile(def)
++	if err == nil {
++		t.Fatal("expected the same-name foreign service account collision to be reported")
++	}
++	got, getErr := client.CoreV1().ServiceAccounts("bots").Get(existing.Name, metav1.GetOptions{})
++	if getErr != nil {
++		t.Fatalf("foreign-owned service account was removed: %v", getErr)
++	}
++	if got.OwnerReferences[0].UID != types.UID("different-owner-uid") {
++		t.Fatalf("foreign service account ownership was changed: %#v", got.OwnerReferences)
++	}
++}
++
++func TestReliabilityContractForeignClusterBindingOwnerCollisionIsPreservedAndReported(t *testing.T) {
++	def := reliabilityDefinition("crb-owner-collision")
++	def.RBACBindings[0].RoleBindings = nil
++	existing := reliabilityClusterRoleBinding(def, "admin")
++	existing.OwnerReferences[0].UID = types.UID("different-owner-uid")
++	client := fake.NewSimpleClientset(existing)
++
++	err := (&Reconciler{Clientset: client}).Reconcile(def)
++	if err == nil {
++		t.Fatal("expected the same-name foreign cluster binding collision to be reported")
++	}
++	got, getErr := client.RbacV1().ClusterRoleBindings().Get(existing.Name, metav1.GetOptions{})
++	if getErr != nil {
++		t.Fatalf("foreign-owned cluster binding was removed: %v", getErr)
++	}
++	if got.OwnerReferences[0].UID != types.UID("different-owner-uid") {
++		t.Fatalf("foreign cluster binding ownership was changed: %#v", got.OwnerReferences)
++	}
++}
++
++func TestReliabilityContractListFailuresPreserveCauseAndStop(t *testing.T) {
++	cases := []struct {
++		name, resource string
++	}{
++		{name: "service accounts", resource: "serviceaccounts"},
++		{name: "cluster role bindings", resource: "clusterrolebindings"},
++		{name: "role bindings", resource: "rolebindings"},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			def := reliabilityDefinition("list-failure")
++			client := fake.NewSimpleClientset()
++			cause := errors.New("injected " + tc.resource + " list failure")
++			client.PrependReactor("list", tc.resource, func(k8stesting.Action) (bool, runtime.Object, error) {
++				return true, nil, cause
++			})
++
++			err := (&Reconciler{Clientset: client}).Reconcile(def)
++			if !errors.Is(err, cause) {
++				t.Fatalf("got error %v, want cause %v", err, cause)
++			}
++			seenFailure := false
++			for _, action := range client.Actions() {
++				if seenFailure {
++					t.Fatalf("API action followed the failing list: %#v", action)
++				}
++				if action.GetVerb() == "list" && action.GetResource().Resource == tc.resource {
++					seenFailure = true
++				}
++			}
++			if !seenFailure {
++				t.Fatalf("failing list action for %s was not observed", tc.resource)
++			}
++			if tc.resource == "rolebindings" {
++				if _, getErr := client.RbacV1().ClusterRoleBindings().Get(def.Name+"-operators-admin", metav1.GetOptions{}); getErr != nil {
++					t.Fatalf("successful earlier phase was rolled back: %v", getErr)
++				}
++			}
++		})
++	}
++}
++
++func TestReliabilityContractSuccessfulFullReconcileIsIdempotent(t *testing.T) {
++	def := reliabilityDefinition("full-idempotency")
++	client := fake.NewSimpleClientset()
++	r := Reconciler{Clientset: client}
++	if err := r.Reconcile(def); err != nil {
++		t.Fatalf("initial reconcile: %v", err)
++	}
++	if len(reliabilityMutationActions(client)) == 0 {
++		t.Fatal("initial reconcile did not create desired resources")
++	}
++	client.ClearActions()
++	if err := r.Reconcile(def); err != nil {
++		t.Fatalf("repeat reconcile: %v", err)
++	}
++	if got := reliabilityMutationActions(client); len(got) != 0 {
++		t.Fatalf("repeat full reconcile caused API mutations: %#v", got)
++	}
++}
++
++func TestReliabilityContractCreateFailuresAreFailFast(t *testing.T) {
++	cases := []struct {
++		name, resource string
++		prepare        func(*rbacmanagerv1beta1.RBACDefinition)
++		laterResource  string
++	}{
++		{
++			name: "service account", resource: "serviceaccounts", laterResource: "clusterrolebindings",
++			prepare: func(def *rbacmanagerv1beta1.RBACDefinition) {
++				def.RBACBindings[0].Subjects = []rbacv1.Subject{
++					{Kind: rbacv1.ServiceAccountKind, Name: "robot-one", Namespace: "bots"},
++					{Kind: rbacv1.ServiceAccountKind, Name: "robot-two", Namespace: "bots"},
++				}
++			},
++		},
++		{
++			name: "cluster role binding", resource: "clusterrolebindings", laterResource: "rolebindings",
++			prepare: func(def *rbacmanagerv1beta1.RBACDefinition) {
++				def.RBACBindings[0].ClusterRoleBindings = append(def.RBACBindings[0].ClusterRoleBindings, rbacmanagerv1beta1.ClusterRoleBinding{ClusterRole: "view"})
++			},
++		},
++		{
++			name: "role binding", resource: "rolebindings",
++			prepare: func(def *rbacmanagerv1beta1.RBACDefinition) { def.RBACBindings[0].ClusterRoleBindings = nil },
++		},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			def := reliabilityDefinition("create-failure")
++			tc.prepare(def)
++			client := fake.NewSimpleClientset()
++			cause := errors.New("injected " + tc.resource + " create failure")
++			client.PrependReactor("create", tc.resource, func(k8stesting.Action) (bool, runtime.Object, error) {
++				return true, nil, cause
++			})
++
++			err := (&Reconciler{Clientset: client}).Reconcile(def)
++			if !errors.Is(err, cause) {
++				t.Fatalf("got error %v, want cause %v", err, cause)
++			}
++			creates := 0
++			for _, action := range reliabilityActionsForResource(client, tc.resource) {
++				if action.GetVerb() == "create" {
++					creates++
++				}
++			}
++			if creates != 1 {
++				t.Fatalf("got %d create attempts for %s after first failure, want 1", creates, tc.resource)
++			}
++			if tc.laterResource != "" && len(reliabilityActionsForResource(client, tc.laterResource)) != 0 {
++				t.Fatalf("later resource phase %s ran after failure", tc.laterResource)
++			}
++		})
++	}
++}
++
++func TestReliabilityContractDeleteFailuresAreFailFast(t *testing.T) {
++	cases := []struct {
++		name, resource string
++		existing       func(*rbacmanagerv1beta1.RBACDefinition) []runtime.Object
++		prepare        func(*rbacmanagerv1beta1.RBACDefinition)
++		laterResource  string
++	}{
++		{
++			name: "service account", resource: "serviceaccounts", laterResource: "clusterrolebindings",
++			existing: func(def *rbacmanagerv1beta1.RBACDefinition) []runtime.Object {
++				return []runtime.Object{
++					&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: "stale-one", Namespace: "bots", Labels: Labels, OwnerReferences: reliabilityOwnerRefs(def)}},
++					&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: "stale-two", Namespace: "bots", Labels: Labels, OwnerReferences: reliabilityOwnerRefs(def)}},
++				}
++			},
++			prepare: func(*rbacmanagerv1beta1.RBACDefinition) {},
++		},
++		{
++			name: "cluster role binding", resource: "clusterrolebindings", laterResource: "rolebindings",
++			existing: func(def *rbacmanagerv1beta1.RBACDefinition) []runtime.Object {
++				return []runtime.Object{reliabilityClusterRoleBinding(def, "stale-one"), reliabilityClusterRoleBinding(def, "stale-two")}
++			},
++			prepare: func(def *rbacmanagerv1beta1.RBACDefinition) { def.RBACBindings[0].ClusterRoleBindings = nil },
++		},
++		{
++			name: "role binding", resource: "rolebindings",
++			existing: func(def *rbacmanagerv1beta1.RBACDefinition) []runtime.Object {
++				return []runtime.Object{
++					reliabilityRoleBinding(def, "apps", "stale-one", def.RBACBindings[0].Subjects),
++					reliabilityRoleBinding(def, "apps", "stale-two", def.RBACBindings[0].Subjects),
++				}
++			},
++			prepare: func(def *rbacmanagerv1beta1.RBACDefinition) { def.RBACBindings[0].ClusterRoleBindings = nil },
++		},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			def := reliabilityDefinition("delete-failure")
++			tc.prepare(def)
++			client := fake.NewSimpleClientset(tc.existing(def)...)
++			cause := errors.New("injected " + tc.resource + " delete failure")
++			client.PrependReactor("delete", tc.resource, func(k8stesting.Action) (bool, runtime.Object, error) {
++				return true, nil, cause
++			})
++
++			err := (&Reconciler{Clientset: client}).Reconcile(def)
++			if !errors.Is(err, cause) {
++				t.Fatalf("got error %v, want cause %v", err, cause)
++			}
++			deletes := 0
++			for _, action := range reliabilityActionsForResource(client, tc.resource) {
++				if action.GetVerb() == "delete" {
++					deletes++
++				}
++				if action.GetVerb() == "create" {
++					t.Fatalf("create followed failed delete for %s", tc.resource)
++				}
++			}
++			if deletes != 1 {
++				t.Fatalf("got %d delete attempts for %s after first failure, want 1", deletes, tc.resource)
++			}
++			if tc.laterResource != "" && len(reliabilityActionsForResource(client, tc.laterResource)) != 0 {
++				t.Fatalf("later resource phase %s ran after failure", tc.laterResource)
++			}
++		})
++	}
++}
++
++func TestReliabilityContractControllerReturnsReconcileFailure(t *testing.T) {
++	def := reliabilityDefinition("controller-failure")
++	def.RBACBindings[0].Subjects = []rbacv1.Subject{{Kind: rbacv1.ServiceAccountKind, Name: "robot", Namespace: "bots"}}
++	scheme := runtime.NewScheme()
++	if err := rbacmanagerv1beta1.AddToScheme(scheme); err != nil {
++		t.Fatal(err)
++	}
++	clientset := fake.NewSimpleClientset()
++	cause := errors.New("injected controller create failure")
++	clientset.PrependReactor("create", "serviceaccounts", func(k8stesting.Action) (bool, runtime.Object, error) {
++		return true, nil, cause
++	})
++	controller := &ReconcileRBACDefinition{
++		Client:    clientfake.NewFakeClientWithScheme(scheme, def),
++		clientset: clientset,
++		scheme:    scheme,
++	}
++
++	_, err := controller.Reconcile(reconcile.Request{NamespacedName: types.NamespacedName{Name: def.Name}})
++	if !errors.Is(err, cause) {
++		t.Fatalf("controller returned error %v, want cause %v", err, cause)
++	}
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,10 @@
++#!/bin/bash
++set -euo pipefail
++
++
++REPO_ROOT="$(pwd -P)"
++TASK_GOPATH="$(mktemp -d)"
++mkdir -p "${TASK_GOPATH}/src/github.com/reactiveops"
++ln -s "${REPO_ROOT}" "${TASK_GOPATH}/src/github.com/reactiveops/rbac-manager"
++cd "${TASK_GOPATH}/src/github.com/reactiveops/rbac-manager"
++GO111MODULE=off GOPATH="${TASK_GOPATH}" go test ./pkg/controller/rbacdefinition -count=1

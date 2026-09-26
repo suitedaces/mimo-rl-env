@@ -1,0 +1,258 @@
+diff --git a/test_commands.json b/test_commands.json
+new file mode 100644
+index 0000000..56bc423
+--- /dev/null
++++ b/test_commands.json
+@@ -0,0 +1,3 @@
++{
++  "test_commands": ["python runtests.py tests.test_amazon_ses_backend.AmazonSESBackendBulkTemplateExtrasTests"]
++}
+diff --git a/tests/test_amazon_ses_backend.py b/tests/test_amazon_ses_backend.py
+index b371e28..68905b4 100644
+--- a/tests/test_amazon_ses_backend.py
++++ b/tests/test_amazon_ses_backend.py
+@@ -1052,3 +1052,231 @@ class AmazonSESBackendConfigurationTests(AmazonSESBackendMockAPITestCase):
+         self.message.send()
+         params = self.get_send_params()
+         self.assertEqual(params["ConfigurationSetName"], "CustomConfigurationSet")
++
++
++@tag("amazon_ses")
++class AmazonSESBackendBulkTemplateExtrasTests(AmazonSESBackendMockAPITestCase):
++    """Tests for SES SendBulkEmail ReplacementHeaders support of
++    extra_headers, metadata, merge_metadata, and tags with template_id."""
++
++    def setUp(self):
++        super().setUp()
++
++        self.set_mock_response(
++            {
++                "BulkEmailEntryResults": [
++                    {"Status": "SUCCESS", "MessageId": "msg-alice"},
++                    {"Status": "SUCCESS", "MessageId": "msg-bob"},
++                ],
++                "ResponseMetadata": self.DEFAULT_SEND_RESPONSE["ResponseMetadata"],
++            },
++            operation_name="send_bulk_email",
++        )
++
++    def _make_message(self, **kwargs):
++        kwargs.setdefault("template_id", "welcome_template")
++        kwargs.setdefault("from_email", "from@example.com")
++        kwargs.setdefault("to", ["alice@example.com", "bob@example.com"])
++        return AnymailMessage(**kwargs)
++
++    def _get_bulk_entries(self):
++        params = self.get_send_params(operation_name="send_bulk_email")
++        return params["BulkEmailEntries"]
++
++    def test_extra_headers_with_template(self):
++        """extra_headers should be sent as ReplacementHeaders on every entry"""
++        msg = self._make_message(
++            headers={"X-Custom-Hdr": "value1", "X-Another": "value2"},
++        )
++        msg.send()
++        entries = self._get_bulk_entries()
++        self.assertEqual(len(entries), 2)
++        for entry in entries:
++            seen = {h["Name"]: h["Value"] for h in entry["ReplacementHeaders"]}
++            self.assertEqual(seen.get("X-Custom-Hdr"), "value1")
++            self.assertEqual(seen.get("X-Another"), "value2")
++
++    def test_metadata_with_template(self):
++        """metadata should be sent as a single X-Metadata header per entry"""
++        msg = self._make_message(
++            metadata={"customer_id": 42, "campaign": "spring"},
++        )
++        msg.send()
++        entries = self._get_bulk_entries()
++        self.assertEqual(len(entries), 2)
++        for entry in entries:
++            metas = [
++                h for h in entry["ReplacementHeaders"] if h["Name"] == "X-Metadata"
++            ]
++            self.assertEqual(len(metas), 1)
++            self.assertJSONEqual(
++                metas[0]["Value"], {"customer_id": 42, "campaign": "spring"}
++            )
++
++    def test_tags_with_template(self):
++        """tags should be sent as multiple X-Tag headers on every entry"""
++        msg = self._make_message(tags=["Welcome", "Spring2024"])
++        msg.send()
++        entries = self._get_bulk_entries()
++        self.assertEqual(len(entries), 2)
++        for entry in entries:
++            tag_values = [
++                h["Value"] for h in entry["ReplacementHeaders"] if h["Name"] == "X-Tag"
++            ]
++            self.assertCountEqual(tag_values, ["Welcome", "Spring2024"])
++
++    def test_merge_metadata_only_with_template(self):
++        """merge_metadata alone should produce per-recipient X-Metadata headers"""
++        msg = self._make_message(
++            merge_metadata={
++                "alice@example.com": {"user_id": "alice-id"},
++                "bob@example.com": {"user_id": "bob-id"},
++            },
++        )
++        msg.send()
++        entries = self._get_bulk_entries()
++        alice_metas = [
++            h for h in entries[0]["ReplacementHeaders"] if h["Name"] == "X-Metadata"
++        ]
++        bob_metas = [
++            h for h in entries[1]["ReplacementHeaders"] if h["Name"] == "X-Metadata"
++        ]
++        self.assertEqual(len(alice_metas), 1)
++        self.assertEqual(len(bob_metas), 1)
++        self.assertJSONEqual(alice_metas[0]["Value"], {"user_id": "alice-id"})
++        self.assertJSONEqual(bob_metas[0]["Value"], {"user_id": "bob-id"})
++
++    def test_metadata_and_merge_metadata_combined(self):
++        """metadata + merge_metadata: per-recipient values override global
++        keys; global-only keys remain. Must result in a single merged
++        X-Metadata header per recipient.
++        """
++        msg = self._make_message(
++            metadata={"global_key": "global_val", "shared_key": "global_shared"},
++            merge_metadata={
++                "alice@example.com": {
++                    "shared_key": "alice_shared",
++                    "alice_only": "yes",
++                },
++
++            },
++        )
++        msg.send()
++        entries = self._get_bulk_entries()
++        alice_metas = [
++            h for h in entries[0]["ReplacementHeaders"] if h["Name"] == "X-Metadata"
++        ]
++        bob_metas = [
++            h for h in entries[1]["ReplacementHeaders"] if h["Name"] == "X-Metadata"
++        ]
++        self.assertEqual(
++            len(alice_metas), 1, "Expected a single merged X-Metadata for alice"
++        )
++        self.assertEqual(
++            len(bob_metas), 1, "Expected a single X-Metadata for bob"
++        )
++        self.assertJSONEqual(
++            alice_metas[0]["Value"],
++            {
++                "global_key": "global_val",
++                "shared_key": "alice_shared",
++                "alice_only": "yes",
++            },
++        )
++        self.assertJSONEqual(
++            bob_metas[0]["Value"],
++            {"global_key": "global_val", "shared_key": "global_shared"},
++        )
++
++    def test_extra_headers_overridden_by_merge_headers(self):
++        """When extra_headers and merge_headers share a key (case-insensitive),
++        merge_headers wins for that recipient; non-overlapping global headers
++        still propagate; non-overridden recipient keeps the global value.
++        """
++        msg = self._make_message(
++            headers={"X-Common": "global_val", "X-Other": "global_other"},
++            merge_headers={
++                "alice@example.com": {"x-common": "alice_val"},
++            },
++        )
++        msg.send()
++        entries = self._get_bulk_entries()
++        alice_headers = entries[0]["ReplacementHeaders"]
++        bob_headers = entries[1]["ReplacementHeaders"]
++
++
++        alice_common = [
++            h for h in alice_headers if h["Name"].lower() == "x-common"
++        ]
++        self.assertEqual(len(alice_common), 1, alice_headers)
++        self.assertEqual(alice_common[0]["Value"], "alice_val")
++
++        alice_other = [
++            h for h in alice_headers if h["Name"].lower() == "x-other"
++        ]
++        self.assertEqual(len(alice_other), 1)
++        self.assertEqual(alice_other[0]["Value"], "global_other")
++
++
++        bob_common = [h for h in bob_headers if h["Name"].lower() == "x-common"]
++        self.assertEqual(len(bob_common), 1, bob_headers)
++        self.assertEqual(bob_common[0]["Value"], "global_val")
++
++    def test_tags_with_template_no_default_email_tags(self):
++        """Without AMAZON_SES_MESSAGE_TAG_NAME, tags do NOT produce DefaultEmailTags"""
++        msg = self._make_message(tags=["a", "b"])
++        msg.send()
++        params = self.get_send_params(operation_name="send_bulk_email")
++        self.assertNotIn("DefaultEmailTags", params)
++
++    @override_settings(ANYMAIL_AMAZON_SES_MESSAGE_TAG_NAME="Campaign")
++    def test_single_tag_with_message_tag_name_setting(self):
++        """A single tag + MESSAGE_TAG_NAME still produces DefaultEmailTags"""
++        msg = self._make_message(tags=["VariantA"])
++        msg.send()
++        params = self.get_send_params(operation_name="send_bulk_email")
++        self.assertEqual(
++            params["DefaultEmailTags"],
++            [{"Name": "Campaign", "Value": "VariantA"}],
++        )
++
++    @override_settings(ANYMAIL_AMAZON_SES_MESSAGE_TAG_NAME="Campaign")
++    def test_multiple_tags_with_message_tag_name_setting_unsupported(self):
++        """Multiple tags + MESSAGE_TAG_NAME still raises AnymailUnsupportedFeature"""
++        msg = self._make_message(tags=["A", "B"])
++        with self.assertRaisesMessage(
++            AnymailUnsupportedFeature,
++            "multiple tags with the AMAZON_SES_MESSAGE_TAG_NAME setting",
++        ):
++            msg.send()
++
++    def test_no_replacement_headers_when_no_features_used(self):
++        """Plain template send without these features must not add ReplacementHeaders"""
++        msg = self._make_message()
++        msg.send()
++        entries = self._get_bulk_entries()
++        self.assertEqual(len(entries), 2)
++        for entry in entries:
++            self.assertNotIn("ReplacementHeaders", entry)
++
++    def test_extra_headers_metadata_and_tags_combined(self):
++        """extra_headers, metadata, and tags all set together — every entry
++        should contain each, with exactly one X-Metadata."""
++        msg = self._make_message(
++            headers={"X-Foo": "fooval"},
++            metadata={"meta_key": "meta_val"},
++            tags=["TagA"],
++        )
++        msg.send()
++        entries = self._get_bulk_entries()
++        self.assertEqual(len(entries), 2)
++        for entry in entries:
++            headers = entry["ReplacementHeaders"]
++            other_pairs = {
++                (h["Name"], h["Value"]) for h in headers if h["Name"] != "X-Metadata"
++            }
++            self.assertIn(("X-Foo", "fooval"), other_pairs)
++            self.assertIn(("X-Tag", "TagA"), other_pairs)
++            metas = [h for h in headers if h["Name"] == "X-Metadata"]
++            self.assertEqual(len(metas), 1)
++            self.assertJSONEqual(metas[0]["Value"], {"meta_key": "meta_val"})
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,8 @@
++#!/usr/bin/env bash
++
++set -uo pipefail
++cd /testbed
++rc=0
++python runtests.py tests.test_amazon_ses_backend.AmazonSESBackendBulkTemplateExtrasTests
++rc=$(( rc | $? ))
++exit $rc

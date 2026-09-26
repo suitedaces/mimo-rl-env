@@ -1,0 +1,460 @@
+diff --git a/usercase-test-coderl/test_configuration_lifecycle.py b/usercase-test-coderl/test_configuration_lifecycle.py
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/test_configuration_lifecycle.py
+@@ -0,0 +1,432 @@
++
++
++
++
++
++
++
++
++
++
++
++import builtins
++import hashlib
++import sys
++import types
++
++import pytest
++
++
++def _install_python2_compatibility_shims():
++
++  builtins.long = int
++
++  urlparse = types.ModuleType('urlparse')
++  sys.modules.setdefault('urlparse', urlparse)
++
++  redis = types.ModuleType('redis')
++  redis.Redis = object
++  sys.modules.setdefault('redis', redis)
++
++  pymongo = types.ModuleType('pymongo')
++  pymongo.MongoClient = object
++  sys.modules.setdefault('pymongo', pymongo)
++
++  sqlalchemy = types.ModuleType('sqlalchemy')
++  sqlalchemy.create_engine = lambda *args, **kwargs: None
++  sys.modules.setdefault('sqlalchemy', sqlalchemy)
++
++  sys.modules.setdefault('cql', types.ModuleType('cql'))
++
++  kairos = types.ModuleType('kairos')
++
++  class Timeseries(object):
++    def __init__(self, host, **config):
++      self.host = host
++      self.config = config
++      self.inserts = []
++
++    def insert(self, stat, val, timestamp=None, intervals=None):
++      self.inserts.append((stat, val, timestamp, intervals))
++
++    def list(self, *args, **kwargs):
++      return []
++
++    def properties(self, *args, **kwargs):
++      return {}
++
++    def iterate(self, *args, **kwargs):
++      return iter(())
++
++  kairos.Timeseries = Timeseries
++  sys.modules.setdefault('kairos', kairos)
++
++  imp = types.ModuleType('imp')
++  imp.PY_SOURCE = 1
++
++  def load_module(name, source, filename, details):
++    module = types.ModuleType(name)
++    module.__file__ = filename
++    sys.modules[name] = module
++    exec(compile(source.read(), filename, 'exec'), module.__dict__)
++    return module
++
++  imp.load_module = load_module
++  sys.modules.setdefault('imp', imp)
++
++  if not getattr(hashlib.sha1, '_torus_py2_compat', False):
++    original_sha1 = hashlib.sha1
++
++    def sha1_compat(data=b''):
++      if isinstance(data, str):
++        data = data.encode('utf-8')
++      return original_sha1(data)
++
++    sha1_compat._torus_py2_compat = True
++    hashlib.sha1 = sha1_compat
++
++
++_install_python2_compatibility_shims()
++
++from torus.configuration import Configuration
++
++
++def _write(path, source):
++  path.write_text(source)
++  return str(path)
++
++
++def test_fresh_configuration_and_empty_reload_are_empty():
++
++
++
++
++  c = Configuration()
++  assert c.debug == 0
++  assert [schema.name for schema in c.schemas()] == []
++  assert c.aggregates() == []
++  assert c.transform('missing') is None
++  assert c.macro('missing') is None
++
++  c.reload()
++  c.reload()
++
++  assert c.debug == 0
++  assert [schema.name for schema in c.schemas()] == []
++  assert c.aggregates() == []
++  assert c.transform('missing') is None
++  assert c.macro('missing') is None
++
++
++def test_load_executable_file_exposes_public_configuration_globals(tmp_path):
++
++
++
++
++  hook_log = tmp_path / 'hooks.log'
++  config_path = _write(tmp_path / 'torus_conf.py', """
++DEBUG = 2
++SCHEMAS = {
++    'raw': {'match': r'^app\\.hit$', 'intervals': {'10s': 6}},
++    'rollup': {'match': r'^app\\.total$', 'intervals': {'1m': 60}},
++}
++AGGREGATES = [('app.total', 'app.*')]
++def plus_one(stat, value):
++    return (stat + '.converted', long_or_float(value) + 1)
++TRANSFORMS = {'plus_one': plus_one}
++MACROS = {'hourly': {'from': '-1h', 'until': 'now'}}
++def on_load():
++    with open(%r, 'a') as handle:
++        handle.write('load\\n')
++""" % str(hook_log))
++
++  c = Configuration()
++  c.load(config_path)
++
++  assert c.debug == 2
++  assert c.schema('raw').name == 'raw'
++
++  assert c.schema('raw') in c.schemas('app.hit')
++
++  assert {schema.name for schema in c.schemas()} == {'raw', 'rollup'}
++  assert [schema.name for schema in c.schemas('app.hit')] == ['raw']
++  assert [schema.name for schema in c.schemas('service.hit')] == []
++
++  assert len(c.aggregates()) == 1
++  assert c.transform('plus_one')('metric', '4.5') == ('metric.converted', 5.5)
++  assert c.macro('hourly') == {'from': '-1h', 'until': 'now'}
++  assert hook_log.read_text() == 'load\n'
++
++
++def test_aggregates_participate_when_process_expands_matching_stats(tmp_path):
++
++
++
++
++  config_path = _write(tmp_path / 'aggregate_conf.py', """
++SCHEMAS = {
++    'raw': {'match': r'^app\\.hit$', 'intervals': {}},
++    'rollup': {'match': r'^app\\.total$', 'intervals': {}},
++}
++AGGREGATES = [('app.total', 'app.*')]
++""")
++
++  c = Configuration()
++  c.load(config_path)
++
++  assert c.schema('raw').count == 0
++  assert c.schema('rollup').count == 0
++
++  assert len(c.aggregates()) == 1
++
++  c.process('app.hit', '7', 123.5)
++  assert c.schema('raw').count == 1
++  assert c.schema('rollup').count == 1
++
++  assert len(c.aggregates()) == 1
++
++
++def test_reload_reexecutes_changed_file_and_removes_stale_entries(tmp_path):
++
++
++
++
++  hook_log = tmp_path / 'reload-hooks.log'
++  config_path = tmp_path / 'reload_conf.py'
++  _write(config_path, """
++DEBUG = 2
++SCHEMAS = {
++    'raw': {'match': r'^app\\.hit$', 'intervals': {}},
++    'rollup': {'match': r'^app\\.total$', 'intervals': {}},
++}
++AGGREGATES = [('app.total', 'app.*')]
++TRANSFORMS = {'plus_one': lambda stat, value: (stat + '.converted', long_or_float(value) + 1)}
++MACROS = {'hourly': {'from': '-1h', 'until': 'now'}}
++def on_load():
++    with open(%r, 'a') as handle:
++        handle.write('load\\n')
++def on_reload():
++    with open(%r, 'a') as handle:
++        handle.write('reload-v1\\n')
++""" % (str(hook_log), str(hook_log)))
++
++  c = Configuration()
++  c.load(str(config_path))
++  assert c.debug == 2
++
++  assert {schema.name for schema in c.schemas()} == {'raw', 'rollup'}
++  assert c.transform('plus_one')('metric', '4.5') == ('metric.converted', 5.5)
++  assert c.macro('hourly') == {'from': '-1h', 'until': 'now'}
++  assert hook_log.read_text() == 'load\n'
++
++  _write(config_path, """
++DEBUG = 0
++SCHEMAS = {
++    'fresh': {'match': r'^new\\.stat$', 'intervals': {'5s': 12}},
++}
++AGGREGATES = [('new.total', 'new.*')]
++TRANSFORMS = {'double': lambda stat, value: (stat, long_or_float(value) * 2)}
++MACROS = {'daily': {'from': '-24h', 'until': 'now'}}
++def on_load():
++    with open(%r, 'a') as handle:
++        handle.write('load-v2\\n')
++def on_reload():
++    with open(%r, 'a') as handle:
++        handle.write('reload-v2\\n')
++""" % (str(hook_log), str(hook_log)))
++
++  c.reload()
++
++  assert c.debug == 0
++  assert [schema.name for schema in c.schemas()] == ['fresh']
++  assert [schema.name for schema in c.schemas('new.stat')] == ['fresh']
++  assert c.schema('raw') is None
++
++  assert len(c.aggregates()) == 1
++  assert c.transform('plus_one') is None
++  assert c.transform('double')('new.stat', '3') == ('new.stat', 6)
++  assert c.macro('hourly') is None
++  assert c.macro('daily') == {'from': '-24h', 'until': 'now'}
++  assert hook_log.read_text() == 'load\nreload-v2\n'
++
++
++def test_reload_reexecutes_every_loaded_path_in_load_order(tmp_path):
++
++
++
++
++  hook_log = tmp_path / 'multi-hooks.log'
++  first = tmp_path / 'first.py'
++  second = tmp_path / 'second.py'
++  _write(first, """
++DEBUG = 1
++SCHEMAS = {'first': {'match': r'^one$', 'intervals': {}}}
++def on_load():
++    with open(%r, 'a') as handle:
++        handle.write('load-first\\n')
++def on_reload():
++    with open(%r, 'a') as handle:
++        handle.write('reload-first\\n')
++""" % (str(hook_log), str(hook_log)))
++  _write(second, """
++DEBUG = 2
++SCHEMAS = {'second': {'match': r'^two$', 'intervals': {}}}
++def on_load():
++    with open(%r, 'a') as handle:
++        handle.write('load-second\\n')
++def on_reload():
++    with open(%r, 'a') as handle:
++        handle.write('reload-second\\n')
++""" % (str(hook_log), str(hook_log)))
++
++  c = Configuration()
++  c.load(str(first))
++  c.load(str(second))
++  assert c.debug == 2
++
++  assert {schema.name for schema in c.schemas()} == {'first', 'second'}
++  assert hook_log.read_text() == 'load-first\nload-second\n'
++
++  _write(first, """
++DEBUG = 3
++SCHEMAS = {'first_new': {'match': r'^one\\.new$', 'intervals': {}}}
++def on_reload():
++    with open(%r, 'a') as handle:
++        handle.write('reload-first-new\\n')
++""" % str(hook_log))
++  _write(second, """
++DEBUG = 4
++SCHEMAS = {'second_new': {'match': r'^two\\.new$', 'intervals': {}}}
++def on_reload():
++    with open(%r, 'a') as handle:
++        handle.write('reload-second-new\\n')
++""" % str(hook_log))
++
++  c.reload()
++
++
++  assert c.debug in {3, 4}
++
++  assert {schema.name for schema in c.schemas()} == {'first_new', 'second_new'}
++  assert c.schema('first') is None
++  assert c.schema('second') is None
++
++  assert hook_log.read_text().splitlines()[:2] == ['load-first', 'load-second']
++  assert sorted(hook_log.read_text().splitlines()[2:]) == ['reload-first-new', 'reload-second-new']
++
++
++def test_missing_load_path_raises_specific_file_not_found_error(tmp_path):
++
++
++
++
++  missing_path = str(tmp_path / 'does_not_exist.py')
++
++
++  with pytest.raises(OSError):
++    Configuration().load(missing_path)
++
++
++def test_two_configuration_instances_keep_loaded_state_independent(tmp_path):
++
++
++
++
++  first = tmp_path / 'first_instance.py'
++  second = tmp_path / 'second_instance.py'
++  _write(first, """
++DEBUG = 1
++SCHEMAS = {'alpha': {'match': r'^alpha$', 'intervals': {}}}
++MACROS = {'window': {'from': '-5m'}}
++""")
++  _write(second, """
++DEBUG = 2
++SCHEMAS = {'beta': {'match': r'^beta$', 'intervals': {}}}
++MACROS = {'window': {'from': '-10m'}}
++""")
++
++  a = Configuration()
++  b = Configuration()
++  a.load(str(first))
++  b.load(str(second))
++
++  assert a.debug == 1
++  assert [schema.name for schema in a.schemas()] == ['alpha']
++  assert a.macro('window') == {'from': '-5m'}
++  assert b.debug == 2
++  assert [schema.name for schema in b.schemas()] == ['beta']
++  assert b.macro('window') == {'from': '-10m'}
++
++  _write(first, """
++DEBUG = 3
++SCHEMAS = {'alpha_new': {'match': r'^alpha\\.new$', 'intervals': {}}}
++MACROS = {'window': {'from': '-15m'}}
++""")
++  a.reload()
++
++  assert a.debug == 3
++  assert [schema.name for schema in a.schemas()] == ['alpha_new']
++  assert a.macro('window') == {'from': '-15m'}
++  assert b.debug == 2
++  assert [schema.name for schema in b.schemas()] == ['beta']
++  assert b.macro('window') == {'from': '-10m'}
++
++
++def test_loaded_reload_cleanup_is_idempotent(tmp_path):
++
++
++
++
++  hook_log = tmp_path / 'idempotent-hooks.log'
++  config_path = _write(tmp_path / 'idempotent_conf.py', """
++DEBUG = 5
++SCHEMAS = {'steady': {'match': r'^steady$', 'intervals': {}}}
++AGGREGATES = [('steady.total', 'steady.*')]
++TRANSFORMS = {'identity': lambda stat, value: (stat, value)}
++MACROS = {'steady': {'from': '-30m'}}
++def on_load():
++    with open(%r, 'a') as handle:
++        handle.write('load\\n')
++def on_reload():
++    with open(%r, 'a') as handle:
++        handle.write('reload\\n')
++""" % (str(hook_log), str(hook_log)))
++
++  c = Configuration()
++  c.load(config_path)
++  c.reload()
++  c.reload()
++
++  assert c.debug == 5
++  assert [schema.name for schema in c.schemas()] == ['steady']
++
++  assert len(c.aggregates()) == 1
++  assert c.transform('identity')('steady', '9') == ('steady', '9')
++  assert c.macro('steady') == {'from': '-30m'}
++  assert hook_log.read_text() == 'load\nreload\nreload\n'
++
++
++def test_repeated_reload_cleanup_keeps_public_registry_sizes_bounded(tmp_path):
++
++
++
++
++  config_path = _write(tmp_path / 'bounded_conf.py', """
++DEBUG = 7
++SCHEMAS = {'bounded': {'match': r'^bounded$', 'intervals': {}}}
++AGGREGATES = [('bounded.total', 'bounded.*')]
++TRANSFORMS = {'identity': lambda stat, value: (stat, value)}
++MACROS = {'bounded': {'from': '-1m'}}
++""")
++
++  c = Configuration()
++  c.load(config_path)
++  for _ in range(120):
++    c.reload()
++
++  assert c.debug == 7
++  assert [schema.name for schema in c.schemas()] == ['bounded']
++
++  assert len(c.aggregates()) == 1
++  assert c.transform('identity')('bounded', '1') == ('bounded', '1')
++  assert c.macro('bounded') == {'from': '-1m'}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,18 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++cd /workspace/repo
++
++
++export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
++
++exec python -m pytest /workspace/repo/usercase-test-coderl/test_configuration_lifecycle.py -v

@@ -1,0 +1,241 @@
+diff --git a/model/task_group_reset_test.go b/model/task_group_reset_test.go
+new file mode 100644
+index 000000000..e939df093
+--- /dev/null
++++ b/model/task_group_reset_test.go
+@@ -0,0 +1,197 @@
++package model
++
++import (
++	"testing"
++	"time"
++
++	"github.com/evergreen-ci/evergreen"
++	"github.com/evergreen-ci/evergreen/apimodels"
++	"github.com/evergreen-ci/evergreen/db"
++	"github.com/evergreen-ci/evergreen/model/build"
++	"github.com/evergreen-ci/evergreen/model/distro"
++	"github.com/evergreen-ci/evergreen/model/host"
++	"github.com/evergreen-ci/evergreen/model/task"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++)
++
++
++
++
++func setupSingleHostTaskGroup(t *testing.T, t1, t2 *task.Task) {
++	require.NoError(t, db.ClearCollections(distro.Collection, host.Collection, task.Collection, task.OldCollection,
++		build.Collection, VersionCollection, ParserProjectCollection, ProjectRefCollection), "error clearing collections")
++
++	require.NoError(t, t1.Insert())
++	require.NoError(t, t2.Insert())
++
++	pRef := &ProjectRef{Identifier: "my_project"}
++	require.NoError(t, pRef.Insert())
++
++	h := &host.Host{Id: "h1", RunningTask: t1.Id}
++	require.NoError(t, h.Insert())
++
++	b := build.Build{
++		Id:      "b",
++		Version: "abc",
++		Tasks: []build.TaskCache{
++			{Id: t1.Id, Status: t1.Status, Activated: true},
++			{Id: t2.Id, Status: t2.Status, Activated: true},
++		},
++	}
++	require.NoError(t, b.Insert())
++
++	v := &Version{
++		Id:     b.Version,
++		Status: evergreen.VersionStarted,
++		Config: sampleProjYmlTaskGroups,
++	}
++	require.NoError(t, v.Insert())
++
++	d := distro.Distro{
++		Id: "my_distro",
++		PlannerSettings: distro.PlannerSettings{
++			Version: evergreen.PlannerVersionTunable,
++		},
++	}
++	require.NoError(t, d.Insert())
++}
++
++func newGroupTask(id, status string, order int) *task.Task {
++	return &task.Task{
++		Id:                id,
++		DisplayName:       id,
++		Status:            status,
++		Activated:         true,
++		ActivatedTime:     time.Now(),
++		BuildId:           "b",
++		TaskGroup:         "my_task_group",
++		TaskGroupMaxHosts: 1,
++		TaskGroupOrder:    order,
++		Project:           "my_project",
++		DistroId:          "my_distro",
++		Version:           "abc",
++		BuildVariant:      "a_variant",
++	}
++}
++
++func TestSetResetWhenFinishedForTaskGroup(t *testing.T) {
++	for name, test := range map[string]func(*testing.T){
++		"SingleHostTaskGroupMember": func(t *testing.T) {
++			tsk := newGroupTask("say-hi-123", evergreen.TaskStarted, 1)
++			require.NoError(t, tsk.Insert())
++
++			require.NoError(t, tsk.SetResetWhenFinished())
++
++			fromDB, err := task.FindOneId(tsk.Id)
++			require.NoError(t, err)
++			require.NotNil(t, fromDB)
++			assert.True(t, fromDB.ResetWhenFinished)
++		},
++		"PlainTaskErrors": func(t *testing.T) {
++			tsk := &task.Task{
++				Id:      "plain-task",
++				Status:  evergreen.TaskStarted,
++				BuildId: "b",
++				Version: "abc",
++			}
++			require.NoError(t, tsk.Insert())
++
++			assert.Error(t, tsk.SetResetWhenFinished())
++
++			fromDB, err := task.FindOneId(tsk.Id)
++			require.NoError(t, err)
++			require.NotNil(t, fromDB)
++			assert.False(t, fromDB.ResetWhenFinished)
++		},
++	} {
++		t.Run(name, func(t *testing.T) {
++			require.NoError(t, db.ClearCollections(task.Collection, task.OldCollection))
++			test(t)
++		})
++	}
++}
++
++func TestMarkEndResetsSingleHostTaskGroup(t *testing.T) {
++	detail := &apimodels.TaskEndDetail{Status: evergreen.TaskFailed}
++	updates := StatusChanges{}
++
++	for name, test := range map[string]func(*testing.T, *task.Task){
++		"NotResetWhenFinished": func(t *testing.T, runningTask *task.Task) {
++			require.NoError(t, MarkEnd(runningTask, "test", time.Now(), detail, false, &updates))
++
++			fromDB, err := task.FindOneId(runningTask.Id)
++			require.NoError(t, err)
++			require.NotNil(t, fromDB)
++			assert.Equal(t, evergreen.TaskFailed, fromDB.Status)
++		},
++		"ResetWhenFinished": func(t *testing.T, runningTask *task.Task) {
++			require.NoError(t, runningTask.SetResetWhenFinished())
++			require.NoError(t, MarkEnd(runningTask, "test", time.Now(), detail, false, &updates))
++
++
++			t1DB, err := task.FindOneId(runningTask.Id)
++			require.NoError(t, err)
++			require.NotNil(t, t1DB)
++			assert.Equal(t, evergreen.TaskUndispatched, t1DB.Status)
++			assert.Equal(t, 1, t1DB.Execution)
++			assert.False(t, t1DB.ResetWhenFinished)
++
++
++			t2DB, err := task.FindOneId("say-bye-123")
++			require.NoError(t, err)
++			require.NotNil(t, t2DB)
++			assert.Equal(t, evergreen.TaskUndispatched, t2DB.Status)
++			assert.Equal(t, 1, t2DB.Execution)
++		},
++	} {
++		t.Run(name, func(t *testing.T) {
++			runningTask := newGroupTask("say-hi-123", evergreen.TaskStarted, 1)
++			otherTask := newGroupTask("say-bye-123", evergreen.TaskSucceeded, 2)
++			setupSingleHostTaskGroup(t, runningTask, otherTask)
++			test(t, runningTask)
++		})
++	}
++}
++
++func TestTryResetTaskResetsSingleHostTaskGroup(t *testing.T) {
++	for name, test := range map[string]func(*testing.T, *task.Task, *task.Task){
++		"CanResetWholeGroupWhenFinished": func(t *testing.T, t1, t2 *task.Task) {
++			require.NoError(t, t1.MarkFailed())
++
++			require.NoError(t, TryResetTask(t2.Id, "user", "test", nil))
++
++			t1DB, err := task.FindOneId(t1.Id)
++			require.NoError(t, err)
++			require.NotNil(t, t1DB)
++			assert.Equal(t, evergreen.TaskUndispatched, t1DB.Status)
++
++			t2DB, err := task.FindOneId(t2.Id)
++			require.NoError(t, err)
++			require.NotNil(t, t2DB)
++			assert.Equal(t, evergreen.TaskUndispatched, t2DB.Status)
++		},
++		"DefersResetWhileGroupUnfinished": func(t *testing.T, t1, t2 *task.Task) {
++
++			require.NoError(t, TryResetTask(t2.Id, "user", "test", nil))
++
++			t1DB, err := task.FindOneId(t1.Id)
++			require.NoError(t, err)
++			require.NotNil(t, t1DB)
++			assert.Equal(t, evergreen.TaskStarted, t1DB.Status)
++
++			t2DB, err := task.FindOneId(t2.Id)
++			require.NoError(t, err)
++			require.NotNil(t, t2DB)
++			assert.Equal(t, evergreen.TaskSucceeded, t2DB.Status)
++			assert.Equal(t, 0, t2DB.Execution)
++		},
++	} {
++		t.Run(name, func(t *testing.T) {
++			runningTask := newGroupTask("say-hi-123", evergreen.TaskStarted, 1)
++			otherTask := newGroupTask("say-bye-123", evergreen.TaskSucceeded, 2)
++			setupSingleHostTaskGroup(t, runningTask, otherTask)
++			test(t, runningTask, otherTask)
++		})
++	}
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,33 @@
++#!/usr/bin/env bash
++
++
++
++
++set -euo pipefail
++HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++cd /testbed
++
++
++
++
++
++
++REPO_PATH="$(go env GOPATH)/src/github.com/evergreen-ci/evergreen"
++
++if ! pgrep -x mongod >/dev/null 2>&1; then
++    mkdir -p /tmp/mongo-grade
++    mongod --dbpath /tmp/mongo-grade --port 27017 --nounixsocket --fork \
++        --logpath /tmp/mongo-grade/mongod.log >/dev/null 2>&1
++fi
++
++LDFLAGS='-X=github.com/evergreen-ci/evergreen/testutil.ExecutionEnvironmentType=test'
++
++
++( cd "$REPO_PATH" && EVGHOME="$REPO_PATH" GO111MODULE=off go test -ldflags="$LDFLAGS" -count=1 \
++    ./model/ \
++    -run 'TestAbortTask$|TestBuildRestart$|TestClearAndResetExecTask$|TestClearAndResetStrandedTask$|TestDisplayTaskDelayedRestart$|TestDisplayTaskRestart$|TestDisplayTaskUpdates$|TestFailedTaskRestart$|TestMarkEnd$|TestTryResetTask$|TestVersionRestart$' )
++
++
++( cd "$REPO_PATH" && EVGHOME="$REPO_PATH" GO111MODULE=off go test -ldflags="$LDFLAGS" -count=1 \
++    ./model/ \
++    -run 'TestSetResetWhenFinishedForTaskGroup$|TestMarkEndResetsSingleHostTaskGroup$|TestTryResetTaskResetsSingleHostTaskGroup$' )

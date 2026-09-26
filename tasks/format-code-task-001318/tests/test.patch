@@ -1,0 +1,538 @@
+diff --git a/usercase-test-coderl/net_http_one_shot_test.go b/usercase-test-coderl/net_http_one_shot_test.go
+new file mode 100644
+--- /dev/null
++++ b/usercase-test-coderl/net_http_one_shot_test.go
+@@ -0,0 +1,507 @@
++package usercase_test_coderl
++
++
++
++
++
++import (
++	"context"
++	"fmt"
++	"io"
++	"net"
++	"net/http"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"strings"
++	"testing"
++	"time"
++)
++
++var gobyBinary string
++var serverBaseURL string
++
++func TestMain(m *testing.M) {
++	tmpDir, err := os.MkdirTemp("", "goby-http-one-shot-")
++	if err != nil {
++		fmt.Fprintln(os.Stderr, err)
++		os.Exit(1)
++	}
++	defer os.RemoveAll(tmpDir)
++
++	gobyBinary = filepath.Join(tmpDir, "goby")
++	build := exec.Command("go", "build", "-o", gobyBinary, ".")
++	build.Dir = "/workspace/repo"
++	build.Env = append(os.Environ(), "GOBY_ROOT=/workspace/repo")
++	if out, err := build.CombinedOutput(); err != nil {
++		fmt.Fprintf(os.Stderr, "failed to build Goby binary: %v\n%s", err, out)
++		os.Exit(1)
++	}
++
++	shutdown, baseURL, err := startFixtureServer()
++	if err != nil {
++		fmt.Fprintln(os.Stderr, err)
++		os.Exit(1)
++	}
++	serverBaseURL = baseURL
++	code := m.Run()
++
++	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
++	defer cancel()
++	_ = shutdown(ctx)
++	os.Exit(code)
++}
++
++func startFixtureServer() (func(context.Context) error, string, error) {
++	mux := http.NewServeMux()
++	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
++		w.Header().Add("X-Fixture", "root-one")
++		w.Header().Add("X-Fixture", "root-two")
++		w.Header().Set("X-Method", r.Method)
++		w.WriteHeader(http.StatusOK)
++		fmt.Fprintf(w, "ROOT %s %s", r.Method, r.URL.Path)
++	})
++	mux.HandleFunc("/index", func(w http.ResponseWriter, r *http.Request) {
++		body, _ := io.ReadAll(r.Body)
++		w.Header().Add("X-Fixture", "index-one")
++		w.Header().Add("X-Fixture", "index-two")
++		w.Header().Set("X-Method", r.Method)
++		w.Header().Set("X-Path", r.URL.Path)
++		if r.Method == http.MethodPost {
++			w.Header().Set("X-Content-Type", r.Header.Get("Content-Type"))
++			fmt.Fprintf(w, "POST ACK path=%s type=%s body=%s", r.URL.Path, r.Header.Get("Content-Type"), string(body))
++			return
++		}
++		fmt.Fprintf(w, "%s RESPONSE path=%s", r.Method, r.URL.Path)
++	})
++	mux.HandleFunc("/deep/nested", func(w http.ResponseWriter, r *http.Request) {
++		w.Header().Set("X-Method", r.Method)
++		w.Header().Set("X-Path", r.URL.Path)
++		fmt.Fprintf(w, "%s DEEP %s", r.Method, r.URL.Path)
++	})
++	mux.HandleFunc("/not-found", func(w http.ResponseWriter, r *http.Request) {
++		http.Error(w, "missing", http.StatusTeapot)
++	})
++
++	ln, err := net.Listen("tcp", "127.0.0.1:0")
++	if err != nil {
++		return nil, "", err
++	}
++	srv := &http.Server{Handler: mux}
++	go func() {
++		if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
++			panic(err)
++		}
++	}()
++	return srv.Shutdown, "http://" + ln.Addr().String(), nil
++}
++
++type runResult struct {
++	stdout string
++	stderr string
++	code   int
++}
++
++func runGoby(t *testing.T, source string) runResult {
++	t.Helper()
++	dir := t.TempDir()
++	return runGobyInDir(t, dir, source)
++}
++
++func runGobyInDir(t *testing.T, dir string, source string) runResult {
++	t.Helper()
++	path := filepath.Join(dir, "case.gb")
++	if err := os.WriteFile(path, []byte(source), 0644); err != nil {
++		t.Fatal(err)
++	}
++
++	cmd := exec.Command(gobyBinary, path)
++	cmd.Dir = dir
++	cmd.Env = append(os.Environ(), "GOBY_ROOT=/workspace/repo")
++	out, err := cmd.Output()
++	stderrBytes := []byte{}
++	if ee, ok := err.(*exec.ExitError); ok {
++		stderrBytes = ee.Stderr
++	}
++	code := 0
++	if err != nil {
++		code = 1
++		if ee, ok := err.(*exec.ExitError); ok {
++			code = ee.ExitCode()
++		}
++	}
++
++	return runResult{
++		stdout: strings.TrimRight(string(out), "\n"),
++		stderr: strings.TrimRight(string(stderrBytes), "\n"),
++		code:   code,
++	}
++}
++
++func gobyProgram(body string) string {
++	return "require \"net/http\"\n" + body
++}
++
++func assertSuccessOutput(t *testing.T, result runResult, expected string) {
++	t.Helper()
++	if result.code != 0 {
++		t.Fatalf("expected exit 0, got %d with stderr:\n%s", result.code, result.stderr)
++	}
++	if result.stdout != expected {
++		t.Fatalf("expected stdout %q, got %q", expected, result.stdout)
++	}
++	if result.stderr != "" {
++		t.Fatalf("expected empty stderr, got %q", result.stderr)
++	}
++}
++
++func assertFailureFirstLine(t *testing.T, result runResult, expected string) {
++	t.Helper()
++	if result.code == 0 {
++		t.Fatalf("expected non-zero exit with %q, got stdout %q", expected, result.stdout)
++	}
++	lines := strings.Split(result.stderr, "\n")
++	if lines[0] != expected {
++		t.Fatalf("expected first stderr line %q, got %q; full stderr:\n%s", expected, lines[0], result.stderr)
++	}
++}
++
++func assertFailureClass(t *testing.T, result runResult, className string) string {
++	t.Helper()
++	if result.code == 0 {
++		t.Fatalf("expected non-zero exit with %s, got stdout %q", className, result.stdout)
++	}
++	lines := strings.Split(result.stderr, "\n")
++	if !strings.HasPrefix(lines[0], className+":") {
++		t.Fatalf("expected first stderr line to start with %q, got %q; full stderr:\n%s", className+":", lines[0], result.stderr)
++	}
++	return lines[0]
++}
++
++func assertSuccessLines(t *testing.T, result runResult, count int) []string {
++	t.Helper()
++	if result.code != 0 {
++		t.Fatalf("expected exit 0, got %d with stderr:\n%s", result.code, result.stderr)
++	}
++	if result.stderr != "" {
++		t.Fatalf("expected empty stderr, got %q", result.stderr)
++	}
++	lines := strings.Split(result.stdout, "\n")
++	if len(lines) != count {
++		t.Fatalf("expected %d stdout lines, got %d: %q", count, len(lines), result.stdout)
++	}
++	return lines
++}
++
++func assertSpaceJoinedValues(t *testing.T, got string, expected ...string) {
++	t.Helper()
++	fields := strings.Fields(got)
++	if strings.Join(fields, " ") != got {
++		t.Fatalf("expected values to be joined with spaces, got %q", got)
++	}
++	if len(fields) != len(expected) {
++		t.Fatalf("expected %d joined values in %q, got %d", len(expected), got, len(fields))
++	}
++	seen := make(map[string]int, len(fields))
++	for _, value := range fields {
++		seen[value]++
++	}
++	for _, value := range expected {
++		if seen[value] == 0 {
++			t.Fatalf("expected joined values %q to include %q", got, value)
++		}
++		seen[value]--
++	}
++}
++
++func TestGetReturnsBodyFromRootURL(t *testing.T) {
++
++
++
++
++	result := runGoby(t, gobyProgram(fmt.Sprintf(`
++puts(Net::HTTP.get("%s"))
++`, serverBaseURL)))
++
++	assertSuccessOutput(t, result, "ROOT GET /")
++}
++
++func TestGetJoinsSinglePathPart(t *testing.T) {
++
++
++
++
++	result := runGoby(t, gobyProgram(fmt.Sprintf(`
++puts(Net::HTTP.get("%s", "index"))
++`, serverBaseURL)))
++
++	assertSuccessOutput(t, result, "GET RESPONSE path=/index")
++}
++
++func TestGetJoinsMultiplePathParts(t *testing.T) {
++
++
++
++
++	result := runGoby(t, gobyProgram(fmt.Sprintf(`
++puts(Net::HTTP.get("%s", "deep", "nested"))
++`, serverBaseURL)))
++
++	assertSuccessOutput(t, result, "GET DEEP /deep/nested")
++}
++
++func TestPostSendsContentTypeAndBody(t *testing.T) {
++
++
++
++
++	result := runGoby(t, gobyProgram(fmt.Sprintf(`
++puts(Net::HTTP.post("%s/index", "text/plain", "Hi Again"))
++`, serverBaseURL)))
++
++	assertSuccessOutput(t, result, "POST ACK path=/index type=text/plain body=Hi Again")
++}
++
++func TestHeadReturnsJoinedHeaders(t *testing.T) {
++
++
++
++
++	result := runGoby(t, gobyProgram(fmt.Sprintf(`
++h = Net::HTTP.head("%s", "index")
++puts(h["X-Fixture"])
++puts(h["X-Method"])
++puts(h["X-Path"])
++`, serverBaseURL)))
++
++
++	lines := assertSuccessLines(t, result, 3)
++	assertSpaceJoinedValues(t, lines[0], "index-one", "index-two")
++	if lines[1] != "HEAD" || lines[2] != "/index" {
++		t.Fatalf("expected HEAD headers for /index, got %q", result.stdout)
++	}
++}
++
++func TestDeleteReturnsHeadersForJoinedPath(t *testing.T) {
++
++
++
++
++	result := runGoby(t, gobyProgram(fmt.Sprintf(`
++d = Net::HTTP.delete("%s", "deep", "nested")
++puts(d["X-Method"])
++puts(d["X-Path"])
++`, serverBaseURL)))
++
++	assertSuccessOutput(t, result, "DELETE\n/deep/nested")
++}
++
++func TestOptionsReturnsHeadersWithoutPathParts(t *testing.T) {
++
++
++
++
++	result := runGoby(t, gobyProgram(fmt.Sprintf(`
++o = Net::HTTP.options("%s")
++puts(o["X-Method"])
++puts(o["X-Fixture"])
++`, serverBaseURL)))
++
++
++	lines := assertSuccessLines(t, result, 2)
++	if lines[0] != "OPTIONS" {
++		t.Fatalf("expected OPTIONS method header, got %q", lines[0])
++	}
++	assertSpaceJoinedValues(t, lines[1], "root-one", "root-two")
++}
++
++func TestMissingGetURLRaisesArgumentError(t *testing.T) {
++
++
++
++
++	result := runGoby(t, gobyProgram(`
++Net::HTTP.get()
++`))
++
++
++	assertFailureClass(t, result, "ArgumentError")
++}
++
++func TestNonStringURLRaisesArgumentError(t *testing.T) {
++
++
++
++
++	result := runGoby(t, gobyProgram(`
++Net::HTTP.get(123)
++`))
++
++
++	assertFailureClass(t, result, "ArgumentError")
++}
++
++func TestNonStringPathPartRaisesArgumentError(t *testing.T) {
++
++
++
++
++	result := runGoby(t, gobyProgram(fmt.Sprintf(`
++Net::HTTP.head("%s", 123)
++`, serverBaseURL)))
++
++
++	assertFailureClass(t, result, "ArgumentError")
++}
++
++func TestPostMissingArgumentRaisesArgumentError(t *testing.T) {
++
++
++
++
++	result := runGoby(t, gobyProgram(fmt.Sprintf(`
++Net::HTTP.post("%s/index", "text/plain")
++`, serverBaseURL)))
++
++
++	assertFailureClass(t, result, "ArgumentError")
++}
++
++func TestPostTooManyArgumentsRaisesArgumentError(t *testing.T) {
++
++
++
++
++	result := runGoby(t, gobyProgram(fmt.Sprintf(`
++Net::HTTP.post("%s/index", "text/plain", "body", "extra")
++`, serverBaseURL)))
++
++
++	assertFailureClass(t, result, "ArgumentError")
++}
++
++func TestPostNonStringURLRaisesArgumentError(t *testing.T) {
++
++
++
++
++	result := runGoby(t, gobyProgram(`
++Net::HTTP.post(123, "text/plain", "body")
++`))
++
++
++	assertFailureClass(t, result, "ArgumentError")
++}
++
++func TestPostNonStringContentTypeRaisesArgumentError(t *testing.T) {
++
++
++
++
++	result := runGoby(t, gobyProgram(fmt.Sprintf(`
++Net::HTTP.post("%s/index", 123, "body")
++`, serverBaseURL)))
++
++
++	assertFailureClass(t, result, "ArgumentError")
++}
++
++func TestPostNonStringBodyRaisesArgumentError(t *testing.T) {
++
++
++
++
++	result := runGoby(t, gobyProgram(fmt.Sprintf(`
++Net::HTTP.post("%s/index", "text/plain", 123)
++`, serverBaseURL)))
++
++
++	assertFailureClass(t, result, "ArgumentError")
++}
++
++func TestURLParseFailureRaisesHTTPError(t *testing.T) {
++
++
++
++
++	result := runGoby(t, gobyProgram(`
++Net::HTTP.get("http://127.0.0.1:bad/")
++`))
++
++
++	assertFailureClass(t, result, "HTTPError")
++}
++
++func TestConnectionFailureRaisesHTTPError(t *testing.T) {
++
++
++
++
++	result := runGoby(t, gobyProgram(`
++Net::HTTP.get("http://127.0.0.1:1")
++`))
++
++
++	assertFailureClass(t, result, "HTTPError")
++}
++
++func TestNon200ResponseRaisesHTTPErrorWithStatus(t *testing.T) {
++
++
++
++
++	result := runGoby(t, gobyProgram(fmt.Sprintf(`
++Net::HTTP.get("%s/not-found")
++`, serverBaseURL)))
++
++
++	firstLine := assertFailureClass(t, result, "HTTPError")
++	if !strings.Contains(firstLine, "I'm a teapot") || !strings.Contains(firstLine, "418") {
++		t.Fatalf("expected non-200 error to include status text and code, got %q", firstLine)
++	}
++}
++
++func TestReferentialTransparencySameInputSameOutput(t *testing.T) {
++	source := gobyProgram(fmt.Sprintf(`
++puts(Net::HTTP.get("%s", "index"))
++puts(Net::HTTP.get("%s", "index"))
++`, serverBaseURL, serverBaseURL))
++
++	result := runGoby(t, source)
++	assertSuccessOutput(t, result, "GET RESPONSE path=/index\nGET RESPONSE path=/index")
++}
++
++func TestNoMutationOfCallerPathParts(t *testing.T) {
++	source := gobyProgram(fmt.Sprintf(`
++parts = ["deep", "nested"]
++puts(Net::HTTP.get("%s", parts[0], parts[1]))
++`, serverBaseURL))
++
++	result := runGoby(t, source)
++
++	assertSuccessOutput(t, result, "GET DEEP /deep/nested")
++}
++
++func TestNoGlobalStateAcrossDifferentOneShotCalls(t *testing.T) {
++	source := gobyProgram(fmt.Sprintf(`
++puts(Net::HTTP.get("%s", "index"))
++puts(Net::HTTP.post("%s/index", "text/plain", "Hi Again"))
++h = Net::HTTP.head("%s", "index")
++puts(h["X-Method"])
++puts(Net::HTTP.get("%s", "index"))
++`, serverBaseURL, serverBaseURL, serverBaseURL, serverBaseURL))
++
++	result := runGoby(t, source)
++	assertSuccessOutput(t, result, "GET RESPONSE path=/index\nPOST ACK path=/index type=text/plain body=Hi Again\nHEAD\nGET RESPONSE path=/index")
++}
++
++func TestNoUndeclaredFilesystemSideEffects(t *testing.T) {
++	dir := t.TempDir()
++	source := gobyProgram(fmt.Sprintf(`
++puts(Net::HTTP.get("%s", "index"))
++`, serverBaseURL))
++	result := runGobyInDir(t, dir, source)
++
++
++	assertSuccessOutput(t, result, "GET RESPONSE path=/index")
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,21 @@
++#!/usr/bin/env bash
++
++
++
++
++export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
++export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export GRADLE_OPTS="${GRADLE_OPTS:-} -Xmx3g -XX:+UseG1GC"
++export TEST_JVM_OPTS="${TEST_JVM_OPTS:-} -Xmx3g"
++set -e
++cd /workspace/repo
++set -euo pipefail
++cd /workspace/repo
++export GOPROXY=off
++export GOSUMDB=off
++export GONOSUMDB='*'
++export GONOPROXY=none
++export GOPRIVATE=
++export GOTOOLCHAIN=local
++export GOFLAGS="${GOFLAGS:-} -mod=mod"
++exec go test -v ./usercase-test-coderl/...

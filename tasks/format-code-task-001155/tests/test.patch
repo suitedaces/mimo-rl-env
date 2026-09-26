@@ -1,0 +1,114 @@
+diff --git a/packages/sdk/src/across/rateModel.history.test.ts b/packages/sdk/src/across/rateModel.history.test.ts
+new file mode 100644
+index 00000000..374ce577
+--- /dev/null
++++ b/packages/sdk/src/across/rateModel.history.test.ts
+@@ -0,0 +1,98 @@
++import assert from "assert";
++import { ethers } from "ethers";
++import { RateModelDictionary, parseAndReturnRateModelFromString, RateModelEvent } from "./rateModel";
++
++const TOKEN_A = "0x000000000000000000000000000000000000000a";
++const TOKEN_B = "0x000000000000000000000000000000000000000b";
++const model = (value: string) => JSON.stringify({ UBar: value, R0: "0", R1: "1", R2: "2" });
++const event = (l1Token: string, blockNumber: number, transactionIndex: number, logIndex: number, value: string): RateModelEvent => ({ l1Token, blockNumber, transactionIndex, logIndex, rateModel: model(value) });
++
++function history(dictionary: RateModelDictionary, token: string, blockNumber?: number) {
++  const api = dictionary as RateModelDictionary & { getRateModelEvents?: (address: string, atBlock?: number) => RateModelEvent[] };
++  assert.equal(typeof api.getRateModelEvents, "function", "rate model event history API is required");
++  return api.getRateModelEvents!(token, blockNumber);
++}
++
++describe("historical rate model dictionary", () => {
++  test("requires exactly the four documented rate-model keys", () => {
++    assert.deepStrictEqual(parseAndReturnRateModelFromString('{"R2":"2","UBar":"u","R0":"0","R1":"1"}'), { UBar: "u", R0: "0", R1: "1", R2: "2" });
++    assert.throws(() => parseAndReturnRateModelFromString('{"UBar":"u","R0":"0","R1":"1"}'));
++    assert.throws(() => parseAndReturnRateModelFromString('{"UBar":"u","R0":"0","R1":"1","R2":"2","extra":"x"}'));
++  });
++
++  test("requires every rate-model value to be a string", () => {
++    assert.throws(() => parseAndReturnRateModelFromString('{"UBar":0,"R0":"0","R1":"1","R2":"2"}'));
++  });
++
++  test("does not mutate event batches supplied by callers", () => {
++    const dictionary = new RateModelDictionary();
++    const first = [event(TOKEN_A, 10, 1, 0, "ten"), event(TOKEN_A, 0, 0, 0, "zero")];
++    const original = JSON.parse(JSON.stringify(first));
++    dictionary.updateWithEvents(first);
++    assert.deepStrictEqual(first, original);
++  });
++
++  test("merges batches and deduplicates event identity", () => {
++    const dictionary = new RateModelDictionary();
++    dictionary.updateWithEvents([event(TOKEN_A, 10, 1, 0, "ten"), event(TOKEN_A, 0, 0, 0, "zero")]);
++    dictionary.updateWithEvents([event(TOKEN_B, 5, 0, 0, "five"), event(TOKEN_A, 10, 1, 0, "ten")]);
++    assert.deepStrictEqual(history(dictionary, TOKEN_A).map((item) => [item.blockNumber, item.transactionIndex, item.logIndex]), [[0, 0, 0], [10, 1, 0]]);
++    assert.equal(history(dictionary, TOKEN_B)[0].rateModel, model("five"));
++  });
++
++  test("filters public event history and protects the index from caller mutation", () => {
++    const dictionary = new RateModelDictionary();
++    dictionary.updateWithEvents([event(TOKEN_A, 10, 1, 0, "ten"), event(TOKEN_A, 0, 0, 0, "zero")]);
++    assert.equal(history(dictionary, TOKEN_A, 0).length, 1);
++    assert.equal(history(dictionary, TOKEN_A, 0)[0].rateModel, model("zero"));
++    const snapshot = history(dictionary, TOKEN_A);
++    snapshot[0].rateModel = model("caller mutation");
++    assert.equal(history(dictionary, TOKEN_A)[0].rateModel, model("zero"));
++    assert.throws(() => history(dictionary, TOKEN_B));
++    assert.throws(() => history(dictionary, TOKEN_A, -1));
++  });
++
++  test("uses transaction and log order for same-block historical lookup", () => {
++    const dictionary = new RateModelDictionary();
++    dictionary.updateWithEvents([event(TOKEN_A, 7, 1, 1, "tx1log1"), event(TOKEN_A, 7, 2, 0, "tx2"), event(TOKEN_A, 7, 1, 3, "tx1log3")]);
++    assert.equal(dictionary.getRateModelForBlockNumber(TOKEN_A, 7).UBar, "tx2");
++    assert.throws(() => dictionary.getRateModelForBlockNumber(TOKEN_A, 6));
++  });
++
++  test("honors block zero as an explicit historical boundary", () => {
++    const dictionary = new RateModelDictionary();
++    dictionary.updateWithEvents([event(TOKEN_B, 0, 0, 0, "b"), event(TOKEN_A, 3, 0, 0, "a")]);
++    assert.equal(dictionary.getRateModelForBlockNumber(TOKEN_B, 0).UBar, "b");
++    assert.deepStrictEqual(dictionary.getL1TokensFromRateModel(0), [ethers.utils.getAddress(TOKEN_B)]);
++    assert.throws(() => dictionary.getRateModelForBlockNumber(TOKEN_A, 0));
++  });
++
++  test("returns sorted checksummed token addresses", () => {
++    const dictionary = new RateModelDictionary();
++    dictionary.updateWithEvents([event(TOKEN_B, 0, 0, 0, "b"), event(TOKEN_A, 3, 0, 0, "a")]);
++    assert.deepStrictEqual(dictionary.getL1TokensFromRateModel(), [ethers.utils.getAddress(TOKEN_A), ethers.utils.getAddress(TOKEN_B)]);
++  });
++
++  function assertAtomicRejection(invalid: RateModelEvent) {
++    const dictionary = new RateModelDictionary();
++    dictionary.updateWithEvents([event(TOKEN_A, 4, 0, 0, "good")]);
++    assert.throws(() => dictionary.updateWithEvents([event(TOKEN_B, 5, 0, 0, "ok"), invalid]));
++    assert.deepStrictEqual(dictionary.getL1TokensFromRateModel(), [ethers.utils.getAddress(TOKEN_A)]);
++    assert.equal(dictionary.getRateModelForBlockNumber(TOKEN_A).UBar, "good");
++    assert.throws(() => dictionary.getRateModelForBlockNumber(TOKEN_B));
++    assert.throws(() => dictionary.getRateModelForBlockNumber(TOKEN_A, 3));
++  }
++
++  test("rejects negative block numbers atomically", () => assertAtomicRejection(event(TOKEN_A, -1, 0, 0, "bad")));
++  test("rejects non-integer transaction indexes atomically", () => assertAtomicRejection(event(TOKEN_A, 5, 1.5, 0, "bad")));
++  test("rejects invalid token addresses atomically", () => assertAtomicRejection(event("not-an-address", 5, 0, 0, "bad")));
++  test("rejects invalid rate-model payloads atomically", () => assertAtomicRejection({ ...event(TOKEN_A, 5, 0, 0, "bad"), rateModel: '{"UBar":0,"R0":"0","R1":"1","R2":"2"}' }));
++
++  test("rejects conflicting replays without changing existing history", () => {
++    const dictionary = new RateModelDictionary();
++    dictionary.updateWithEvents([event(TOKEN_A, 4, 0, 0, "good")]);
++    assert.throws(() => dictionary.updateWithEvents([event(TOKEN_A, 4, 0, 0, "different")]));
++    assert.equal(history(dictionary, TOKEN_A).length, 1);
++    assert.equal(dictionary.getRateModelForBlockNumber(TOKEN_A).UBar, "good");
++  });
++});
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,5 @@
++#!/bin/bash
++set -euo pipefail
++
++
++yarn workspace @uma/sdk test rateModel.history.test.ts --runInBand --watch=false

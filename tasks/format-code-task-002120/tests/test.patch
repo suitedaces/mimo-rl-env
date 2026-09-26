@@ -1,0 +1,575 @@
+diff --git a/exporter/splunkhecexporter/client_test.go b/exporter/splunkhecexporter/client_test.go
+index 25d9be1e29..7e699ce5d8 100644
+--- a/exporter/splunkhecexporter/client_test.go
++++ b/exporter/splunkhecexporter/client_test.go
+@@ -14,8 +14,10 @@
+ package splunkhecexporter
+ 
+ import (
++	"bytes"
+ 	"compress/gzip"
+ 	"context"
++	"encoding/json"
+ 	"errors"
+ 	"fmt"
+ 	"io/ioutil"
+@@ -23,6 +25,7 @@ import (
+ 	"net"
+ 	"net/http"
+ 	"net/url"
++	"strings"
+ 	"sync"
+ 	"testing"
+ 	"time"
+@@ -720,3 +723,291 @@ func TestSubLogs(t *testing.T) {
+ 	// The name of the sole log record should be 1_1_2.
+ 	assert.Equal(t, "1_1_2", got.ResourceLogs().At(0).InstrumentationLibraryLogs().At(0).Logs().At(0).Name())
+ }
++
++
++
++func captureSplunkEvents(t *testing.T, c *client, logs pdata.Logs) []*splunk.Event {
++	t.Helper()
++	var captured []byte
++	send := func(_ context.Context, buf *bytes.Buffer) error {
++		captured = append(captured, buf.Bytes()...)
++		return nil
++	}
++	err := c.pushLogDataInBatches(context.Background(), logs, send)
++	require.NoError(t, err)
++
++	events := []*splunk.Event{}
++	for _, part := range strings.Split(string(captured), "\r\n\r\n") {
++		part = strings.TrimSpace(part)
++		if part == "" {
++			continue
++		}
++		dec := json.NewDecoder(strings.NewReader(part))
++		for {
++			var ev splunk.Event
++			if err := dec.Decode(&ev); err != nil {
++				break
++			}
++			events = append(events, &ev)
++		}
++	}
++	return events
++}
++
++func newResourceLogsWithAttrs(resourceAttrs map[string]interface{}, logAttrs map[string]interface{}) pdata.Logs {
++	logs := pdata.NewLogs()
++	logs.ResourceLogs().Resize(1)
++	rl := logs.ResourceLogs().At(0)
++	for k, v := range resourceAttrs {
++		switch val := v.(type) {
++		case string:
++			rl.Resource().Attributes().InsertString(k, val)
++		case int:
++			rl.Resource().Attributes().InsertInt(k, int64(val))
++		case float64:
++			rl.Resource().Attributes().InsertDouble(k, val)
++		case bool:
++			rl.Resource().Attributes().InsertBool(k, val)
++		}
++	}
++	rl.InstrumentationLibraryLogs().Resize(1)
++	ill := rl.InstrumentationLibraryLogs().At(0)
++	logRecord := pdata.NewLogRecord()
++	logRecord.Body().SetStringVal("mylog")
++	logRecord.SetTimestamp(pdata.Timestamp(123))
++	for k, v := range logAttrs {
++		switch val := v.(type) {
++		case string:
++			logRecord.Attributes().InsertString(k, val)
++		}
++	}
++	ill.Logs().Append(logRecord)
++	return logs
++}
++
++func newTestClient(cfg *Config) *client {
++	return &client{
++		zippers: sync.Pool{New: func() interface{} {
++			return gzip.NewWriter(nil)
++		}},
++		config: cfg,
++		logger: zap.NewNop(),
++	}
++}
++
++
++func Test_pushLogData_ResourceAttributes_AppearInFields(t *testing.T) {
++	cfg := NewFactory().CreateDefaultConfig().(*Config)
++	cfg.Source = "default-source"
++	cfg.SourceType = "default-sourcetype"
++	c := newTestClient(cfg)
++
++	resAttrs := map[string]interface{}{
++		"k8spoduid":          "eda0a956-99ec-49cb-a954-d733e2f881dd",
++		"k8s.pod.name":       "loggen-zjklf",
++		"k8s.namespace.name": "default",
++	}
++	logs := newResourceLogsWithAttrs(resAttrs, map[string]interface{}{
++		"stream": "stdout",
++	})
++
++	events := captureSplunkEvents(t, c, logs)
++	require.Len(t, events, 1)
++	ev := events[0]
++
++	assert.Equal(t, "eda0a956-99ec-49cb-a954-d733e2f881dd", ev.Fields["k8spoduid"])
++	assert.Equal(t, "loggen-zjklf", ev.Fields["k8s.pod.name"])
++	assert.Equal(t, "default", ev.Fields["k8s.namespace.name"])
++
++	assert.Equal(t, "stdout", ev.Fields["stream"])
++}
++
++
++func Test_pushLogData_ResourceHostName_SetsHost(t *testing.T) {
++	cfg := NewFactory().CreateDefaultConfig().(*Config)
++	c := newTestClient(cfg)
++
++	logs := newResourceLogsWithAttrs(
++		map[string]interface{}{conventions.AttributeHostName: "myhost-from-resource"},
++		map[string]interface{}{},
++	)
++
++	events := captureSplunkEvents(t, c, logs)
++	require.Len(t, events, 1)
++	assert.Equal(t, "myhost-from-resource", events[0].Host)
++	assert.Equal(t, "myhost-from-resource", events[0].Fields[conventions.AttributeHostName])
++}
++
++
++func Test_pushLogData_ResourceServiceName_SetsSource(t *testing.T) {
++	cfg := NewFactory().CreateDefaultConfig().(*Config)
++	cfg.Source = "config-source"
++	c := newTestClient(cfg)
++
++	logs := newResourceLogsWithAttrs(
++		map[string]interface{}{conventions.AttributeServiceName: "service-from-resource"},
++		map[string]interface{}{},
++	)
++
++	events := captureSplunkEvents(t, c, logs)
++	require.Len(t, events, 1)
++	assert.Equal(t, "service-from-resource", events[0].Source)
++	assert.Equal(t, "service-from-resource", events[0].Fields[conventions.AttributeServiceName])
++}
++
++
++func Test_pushLogData_ResourceSourcetype_SetsSourceType(t *testing.T) {
++	cfg := NewFactory().CreateDefaultConfig().(*Config)
++	cfg.SourceType = "config-sourcetype"
++	c := newTestClient(cfg)
++
++	logs := newResourceLogsWithAttrs(
++		map[string]interface{}{splunk.SourcetypeLabel: "sourcetype-from-resource"},
++		map[string]interface{}{},
++	)
++
++	events := captureSplunkEvents(t, c, logs)
++	require.Len(t, events, 1)
++	assert.Equal(t, "sourcetype-from-resource", events[0].SourceType)
++}
++
++
++func Test_pushLogData_ResourceIndex_SetsIndex(t *testing.T) {
++	cfg := NewFactory().CreateDefaultConfig().(*Config)
++	cfg.Index = "config-index"
++	c := newTestClient(cfg)
++
++	logs := newResourceLogsWithAttrs(
++		map[string]interface{}{splunk.IndexLabel: "index-from-resource"},
++		map[string]interface{}{},
++	)
++
++	events := captureSplunkEvents(t, c, logs)
++	require.Len(t, events, 1)
++	assert.Equal(t, "index-from-resource", events[0].Index)
++}
++
++
++func Test_pushLogData_ResourceSourcetypeAndIndex_NotInFields(t *testing.T) {
++	cfg := NewFactory().CreateDefaultConfig().(*Config)
++	c := newTestClient(cfg)
++
++	logs := newResourceLogsWithAttrs(
++		map[string]interface{}{
++			splunk.SourcetypeLabel: "res-sourcetype",
++			splunk.IndexLabel:      "res-index",
++		},
++		map[string]interface{}{},
++	)
++
++	events := captureSplunkEvents(t, c, logs)
++	require.Len(t, events, 1)
++	ev := events[0]
++	assert.Equal(t, "res-sourcetype", ev.SourceType)
++	assert.Equal(t, "res-index", ev.Index)
++	_, hasSourcetypeField := ev.Fields[splunk.SourcetypeLabel]
++	assert.False(t, hasSourcetypeField, "splunk.sourcetype label must not appear inside Fields map")
++	_, hasIndexField := ev.Fields[splunk.IndexLabel]
++	assert.False(t, hasIndexField, "splunk.index label must not appear inside Fields map")
++}
++
++
++func Test_pushLogData_LogRecordHostName_OverridesResource(t *testing.T) {
++	cfg := NewFactory().CreateDefaultConfig().(*Config)
++	c := newTestClient(cfg)
++
++	logs := newResourceLogsWithAttrs(
++		map[string]interface{}{conventions.AttributeHostName: "res-host"},
++		map[string]interface{}{conventions.AttributeHostName: "log-host"},
++	)
++
++	events := captureSplunkEvents(t, c, logs)
++	require.Len(t, events, 1)
++	assert.Equal(t, "log-host", events[0].Host)
++	assert.Equal(t, "log-host", events[0].Fields[conventions.AttributeHostName])
++}
++
++
++func Test_pushLogData_LogRecordAttributes_StillWork(t *testing.T) {
++	cfg := NewFactory().CreateDefaultConfig().(*Config)
++	c := newTestClient(cfg)
++
++	logs := newResourceLogsWithAttrs(
++		map[string]interface{}{},
++		map[string]interface{}{
++			"run_id":             "0",
++			"stream":             "stdout",
++			"k8s.container.name": "loggen",
++		},
++	)
++
++	events := captureSplunkEvents(t, c, logs)
++	require.Len(t, events, 1)
++	ev := events[0]
++	assert.Equal(t, "0", ev.Fields["run_id"])
++	assert.Equal(t, "stdout", ev.Fields["stream"])
++	assert.Equal(t, "loggen", ev.Fields["k8s.container.name"])
++}
++
++
++func Test_pushLogData_NoHost_DefaultsToUnknown(t *testing.T) {
++	cfg := NewFactory().CreateDefaultConfig().(*Config)
++	cfg.Source = "default-source"
++	cfg.SourceType = "default-sourcetype"
++	c := newTestClient(cfg)
++
++	logs := newResourceLogsWithAttrs(
++		map[string]interface{}{"k8spoduid": "abc"},
++		map[string]interface{}{},
++	)
++
++	events := captureSplunkEvents(t, c, logs)
++	require.Len(t, events, 1)
++	ev := events[0]
++	assert.Equal(t, "unknown", ev.Host)
++	assert.Equal(t, "default-source", ev.Source)
++	assert.Equal(t, "default-sourcetype", ev.SourceType)
++	assert.Equal(t, "abc", ev.Fields["k8spoduid"])
++}
++
++
++func Test_pushLogData_IssueReproScenario(t *testing.T) {
++	cfg := NewFactory().CreateDefaultConfig().(*Config)
++	c := newTestClient(cfg)
++
++	resAttrs := map[string]interface{}{
++		"k8spoduid":                              "eda0a956-99ec-49cb-a954-d733e2f881dd",
++		"k8s.pod.annotations.splunk.com/index":   "test",
++		"k8s.pod.name":                           "loggen-zjklf",
++		"k8s.namespace.name":                     "default",
++		"k8s.pod.startTime":                      "2021-03-20 00:03:32 +0000 UTC",
++		"k8s.pod.uid":                            "eda0a956-99ec-49cb-a954-d733e2f881dd",
++		"k8s.node.name":                          "ip-192-168-82-91.us-west-1.compute.internal",
++		"k8s.pod.labels.hello":                   "loggen",
++		"k8s.pod.labels.app":                     "loggen",
++	}
++	logAttrs := map[string]interface{}{
++		"k8s.pod.uid":        "eda0a956-99ec-49cb-a954-d733e2f881dd",
++		"run_id":             "0",
++		"stream":             "stdout",
++		"k8s.container.name": "loggen",
++		"k8s.namespace.name": "default",
++		"k8s.pod.name":       "loggen-zjklf",
++	}
++	logs := newResourceLogsWithAttrs(resAttrs, logAttrs)
++
++	events := captureSplunkEvents(t, c, logs)
++	require.Len(t, events, 1)
++	ev := events[0]
++
++	assert.Equal(t, "ip-192-168-82-91.us-west-1.compute.internal", ev.Fields["k8s.node.name"])
++	assert.Equal(t, "loggen", ev.Fields["k8s.pod.labels.hello"])
++	assert.Equal(t, "loggen", ev.Fields["k8s.pod.labels.app"])
++	assert.Equal(t, "test", ev.Fields["k8s.pod.annotations.splunk.com/index"])
++	assert.Equal(t, "2021-03-20 00:03:32 +0000 UTC", ev.Fields["k8s.pod.startTime"])
++	assert.Equal(t, "eda0a956-99ec-49cb-a954-d733e2f881dd", ev.Fields["k8spoduid"])
++
++	assert.Equal(t, "0", ev.Fields["run_id"])
++	assert.Equal(t, "stdout", ev.Fields["stream"])
++	assert.Equal(t, "loggen", ev.Fields["k8s.container.name"])
++}
+diff --git a/exporter/splunkhecexporter/logdata_to_splunk_test.go b/exporter/splunkhecexporter/logdata_to_splunk_test.go
+index 640cf23ee6..77c9b194b4 100644
+--- a/exporter/splunkhecexporter/logdata_to_splunk_test.go
++++ b/exporter/splunkhecexporter/logdata_to_splunk_test.go
+@@ -15,9 +15,16 @@
+ package splunkhecexporter
+ 
+ import (
++	"bytes"
++	"compress/gzip"
++	"context"
++	"encoding/json"
++	"strings"
++	"sync"
+ 	"testing"
+ 
+ 	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
+ 	"go.opentelemetry.io/collector/consumer/pdata"
+ 	"go.opentelemetry.io/collector/translator/conventions"
+ 	"go.uber.org/zap"
+@@ -25,8 +32,46 @@ import (
+ 	"github.com/open-telemetry/opentelemetry-collector-contrib/internal/splunk"
+ )
+ 
++
++
++func runLogRecordThroughClient(t *testing.T, lr pdata.LogRecord, cfg *Config) *splunk.Event {
++	t.Helper()
++	c := &client{
++		zippers: sync.Pool{New: func() interface{} {
++			return gzip.NewWriter(nil)
++		}},
++		config: cfg,
++		logger: zap.NewNop(),
++	}
++
++	logs := pdata.NewLogs()
++	logs.ResourceLogs().Resize(1)
++	rl := logs.ResourceLogs().At(0)
++	rl.InstrumentationLibraryLogs().Resize(1)
++	rl.InstrumentationLibraryLogs().At(0).Logs().Append(lr)
++
++	var captured []byte
++	send := func(_ context.Context, buf *bytes.Buffer) error {
++		captured = append(captured, buf.Bytes()...)
++		return nil
++	}
++	err := c.pushLogDataInBatches(context.Background(), logs, send)
++	require.NoError(t, err)
++
++	for _, part := range strings.Split(string(captured), "\r\n\r\n") {
++		part = strings.TrimSpace(part)
++		if part == "" {
++			continue
++		}
++		var ev splunk.Event
++		if err := json.NewDecoder(strings.NewReader(part)).Decode(&ev); err == nil {
++			return &ev
++		}
++	}
++	return nil
++}
++
+ func Test_mapLogRecordToSplunkEvent(t *testing.T) {
+-	logger := zap.NewNop()
+ 	ts := pdata.Timestamp(123)
+ 
+ 	tests := []struct {
+@@ -99,22 +144,6 @@ func Test_mapLogRecordToSplunkEvent(t *testing.T) {
+ 				commonLogSplunkEvent("mylog", ts, map[string]interface{}{"custom": "custom"}, "unknown", "source", "sourcetype"),
+ 			},
+ 		},
+-		{
+-			name: "log_is_empty",
+-			logRecordFn: func() pdata.LogRecord {
+-				logRecord := pdata.NewLogRecord()
+-				return logRecord
+-			},
+-			configDataFn: func() *Config {
+-				return &Config{
+-					Source:     "source",
+-					SourceType: "sourcetype",
+-				}
+-			},
+-			wantSplunkEvents: []*splunk.Event{
+-				commonLogSplunkEvent(nil, 0, map[string]interface{}{}, "unknown", "source", "sourcetype"),
+-			},
+-		},
+ 		{
+ 			name: "with double body",
+ 			logRecordFn: func() pdata.LogRecord {
+@@ -156,7 +185,8 @@ func Test_mapLogRecordToSplunkEvent(t *testing.T) {
+ 				}
+ 			},
+ 			wantSplunkEvents: []*splunk.Event{
+-				commonLogSplunkEvent(int64(42), ts, map[string]interface{}{"custom": "custom", "service.name": "myapp", "host.name": "myhost"}, "myhost", "myapp", "myapp-type"),
++
++				commonLogSplunkEvent(float64(42), ts, map[string]interface{}{"custom": "custom", "service.name": "myapp", "host.name": "myhost"}, "myhost", "myapp", "myapp-type"),
+ 			},
+ 		},
+ 		{
+@@ -181,103 +211,23 @@ func Test_mapLogRecordToSplunkEvent(t *testing.T) {
+ 				commonLogSplunkEvent(true, ts, map[string]interface{}{"custom": "custom", "service.name": "myapp", "host.name": "myhost"}, "myhost", "myapp", "myapp-type"),
+ 			},
+ 		},
+-		{
+-			name: "with map body",
+-			logRecordFn: func() pdata.LogRecord {
+-				logRecord := pdata.NewLogRecord()
+-				attVal := pdata.NewAttributeValueMap()
+-				attMap := attVal.MapVal()
+-				attMap.InsertDouble("23", 45)
+-				attMap.InsertString("foo", "bar")
+-				attVal.CopyTo(logRecord.Body())
+-				logRecord.Attributes().InsertString(conventions.AttributeServiceName, "myapp")
+-				logRecord.Attributes().InsertString(splunk.SourcetypeLabel, "myapp-type")
+-				logRecord.Attributes().InsertString(conventions.AttributeHostName, "myhost")
+-				logRecord.Attributes().InsertString("custom", "custom")
+-				logRecord.SetTimestamp(ts)
+-				return logRecord
+-			},
+-			configDataFn: func() *Config {
+-				return &Config{
+-					Source:     "source",
+-					SourceType: "sourcetype",
+-				}
+-			},
+-			wantSplunkEvents: []*splunk.Event{
+-				commonLogSplunkEvent(map[string]interface{}{"23": float64(45), "foo": "bar"}, ts,
+-					map[string]interface{}{"custom": "custom", "service.name": "myapp", "host.name": "myhost"},
+-					"myhost", "myapp", "myapp-type"),
+-			},
+-		},
+-		{
+-			name: "with nil body",
+-			logRecordFn: func() pdata.LogRecord {
+-				logRecord := pdata.NewLogRecord()
+-				logRecord.Attributes().InsertString(conventions.AttributeServiceName, "myapp")
+-				logRecord.Attributes().InsertString(splunk.SourcetypeLabel, "myapp-type")
+-				logRecord.Attributes().InsertString(conventions.AttributeHostName, "myhost")
+-				logRecord.Attributes().InsertString("custom", "custom")
+-				logRecord.SetTimestamp(ts)
+-				return logRecord
+-			},
+-			configDataFn: func() *Config {
+-				return &Config{
+-					Source:     "source",
+-					SourceType: "sourcetype",
+-				}
+-			},
+-			wantSplunkEvents: []*splunk.Event{
+-				commonLogSplunkEvent(nil, ts, map[string]interface{}{"custom": "custom", "service.name": "myapp", "host.name": "myhost"},
+-					"myhost", "myapp", "myapp-type"),
+-			},
+-		},
+-		{
+-			name: "with array body",
+-			logRecordFn: func() pdata.LogRecord {
+-				logRecord := pdata.NewLogRecord()
+-				attVal := pdata.NewAttributeValueArray()
+-				attArray := attVal.ArrayVal()
+-				attArray.Append(pdata.NewAttributeValueString("foo"))
+-				attVal.CopyTo(logRecord.Body())
+-				logRecord.Attributes().InsertString(conventions.AttributeServiceName, "myapp")
+-				logRecord.Attributes().InsertString(splunk.SourcetypeLabel, "myapp-type")
+-				logRecord.Attributes().InsertString(conventions.AttributeHostName, "myhost")
+-				logRecord.Attributes().InsertString("custom", "custom")
+-				logRecord.SetTimestamp(ts)
+-				return logRecord
+-			},
+-			configDataFn: func() *Config {
+-				return &Config{
+-					Source:     "source",
+-					SourceType: "sourcetype",
+-				}
+-			},
+-			wantSplunkEvents: []*splunk.Event{
+-				commonLogSplunkEvent([]interface{}{"foo"}, ts, map[string]interface{}{"custom": "custom", "service.name": "myapp", "host.name": "myhost"},
+-					"myhost", "myapp", "myapp-type"),
+-			},
+-		},
+ 	}
+ 	for _, tt := range tests {
+ 		t.Run(tt.name, func(t *testing.T) {
+ 			for _, want := range tt.wantSplunkEvents {
+-				got := mapLogRecordToSplunkEvent(tt.logRecordFn(), tt.configDataFn(), logger)
+-				assert.EqualValues(t, want, got)
++				got := runLogRecordThroughClient(t, tt.logRecordFn(), tt.configDataFn())
++				require.NotNil(t, got)
++				assert.EqualValues(t, want.Host, got.Host)
++				assert.EqualValues(t, want.Source, got.Source)
++				assert.EqualValues(t, want.SourceType, got.SourceType)
++				assert.EqualValues(t, want.Index, got.Index)
++				assert.EqualValues(t, want.Event, got.Event)
++				assert.EqualValues(t, want.Fields, got.Fields)
+ 			}
+ 		})
+ 	}
+ }
+ 
+-func makeLog(record pdata.LogRecord) pdata.Logs {
+-	logs := pdata.NewLogs()
+-	logs.ResourceLogs().Resize(1)
+-	rl := logs.ResourceLogs().At(0)
+-	rl.InstrumentationLibraryLogs().Resize(1)
+-	ill := rl.InstrumentationLibraryLogs().At(0)
+-	ill.Logs().Append(record)
+-	return logs
+-}
+-
+ func commonLogSplunkEvent(
+ 	event interface{},
+ 	ts pdata.Timestamp,
+@@ -296,15 +246,14 @@ func commonLogSplunkEvent(
+ 	}
+ }
+ 
+-func Test_emptyLogRecord(t *testing.T) {
+-	event := mapLogRecordToSplunkEvent(pdata.NewLogRecord(), &Config{}, zap.NewNop())
+-	assert.Nil(t, event.Time)
+-	assert.Equal(t, event.Host, "unknown")
+-	assert.Zero(t, event.Source)
+-	assert.Zero(t, event.SourceType)
+-	assert.Zero(t, event.Index)
+-	assert.Nil(t, event.Event)
+-	assert.Empty(t, event.Fields)
++func makeLog(record pdata.LogRecord) pdata.Logs {
++	logs := pdata.NewLogs()
++	logs.ResourceLogs().Resize(1)
++	rl := logs.ResourceLogs().At(0)
++	rl.InstrumentationLibraryLogs().Resize(1)
++	ill := rl.InstrumentationLibraryLogs().At(0)
++	ill.Logs().Append(record)
++	return logs
+ }
+ 
+ func Test_nanoTimestampToEpochMilliseconds(t *testing.T) {
+diff --git a/test_commands.json b/test_commands.json
+new file mode 100644
+index 0000000000..6d6a5ce581
+--- /dev/null
++++ b/test_commands.json
+@@ -0,0 +1,3 @@
++{
++  "test_commands": ["cd exporter/splunkhecexporter && go test -run 'Test_pushLogData_Resource|Test_pushLogData_LogRecord|Test_pushLogData_NoHost|Test_pushLogData_IssueRepro|Test_mapLogRecordToSplunkEvent|Test_nanoTimestampToEpochMilliseconds' ."]
++}
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,8 @@
++#!/usr/bin/env bash
++
++set -uo pipefail
++cd /testbed
++rc=0
++cd exporter/splunkhecexporter && go test -run 'Test_pushLogData_Resource|Test_pushLogData_LogRecord|Test_pushLogData_NoHost|Test_pushLogData_IssueRepro|Test_mapLogRecordToSplunkEvent|Test_nanoTimestampToEpochMilliseconds' .
++rc=$(( rc | $? ))
++exit $rc

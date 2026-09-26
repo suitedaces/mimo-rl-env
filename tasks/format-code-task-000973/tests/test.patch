@@ -1,0 +1,235 @@
+diff --git a/server/test/unit/plugins/util/test_atomic_directory_codespec.py b/server/test/unit/plugins/util/test_atomic_directory_codespec.py
+new file mode 100644
+index 0000000..c240cf1
+--- /dev/null
++++ b/server/test/unit/plugins/util/test_atomic_directory_codespec.py
+@@ -0,0 +1,219 @@
++import os
++import shutil
++import tempfile
++import unittest
++
++from pulp.plugins.util.publish_step import AtomicDirectoryPublishStep
++
++
++class Parent(object):
++    def __init__(self, timestamp):
++        self.timestamp = timestamp
++
++
++def write_file(path, content):
++    parent = os.path.dirname(path)
++    if not os.path.exists(parent):
++        os.makedirs(parent)
++    with open(path, 'w') as handle:
++        handle.write(content)
++
++
++class AtomicDirectoryContractTests(unittest.TestCase):
++
++    def setUp(self):
++        self.root = tempfile.mkdtemp(prefix='pulp-atomic-contract-')
++        self.source = os.path.join(self.root, 'source')
++        self.master = os.path.join(self.root, 'master')
++        self.published = os.path.join(self.root, 'published')
++        os.makedirs(self.source)
++        os.makedirs(self.master)
++        os.makedirs(self.published)
++
++    def tearDown(self):
++        shutil.rmtree(self.root)
++
++    def make_step(self, locations, contents=False, timestamp='publish-001'):
++        step = AtomicDirectoryPublishStep(
++            self.source, locations, self.master,
++            only_publish_directory_contents=contents)
++        step.parent = Parent(timestamp)
++        return step
++
++    def seed_previous_publish(self, target):
++        previous = os.path.join(self.master, 'previous')
++        write_file(os.path.join(previous, 'payload.txt'), 'old payload')
++        os.symlink(previous, target)
++        return previous
++
++    def assert_no_new_master_or_temp_link(self, expected_master_entries, expected_publish_entries):
++        self.assertEqual(sorted(expected_master_entries), sorted(os.listdir(self.master)))
++        self.assertEqual(sorted(expected_publish_entries), sorted(os.listdir(self.published)))
++
++    def test_valid_root_and_nested_mappings_publish_one_snapshot(self):
++        write_file(os.path.join(self.source, 'root.txt'), 'root payload')
++        write_file(os.path.join(self.source, 'nested', 'leaf.txt'), 'leaf payload')
++        os.makedirs(os.path.join(self.master, 'obsolete'))
++
++        repository_target = os.path.join(self.published, 'repository')
++        leaf_target = os.path.join(self.published, 'leaf.txt')
++        step = self.make_step([
++            ('/', repository_target + '/'),
++            ('nested/leaf.txt', leaf_target),
++        ])
++
++        step.process_main()
++
++        self.assertTrue(os.path.islink(repository_target))
++        self.assertTrue(os.path.islink(leaf_target))
++        with open(os.path.join(repository_target, 'root.txt')) as handle:
++            self.assertEqual('root payload', handle.read())
++        with open(leaf_target) as handle:
++            self.assertEqual('leaf payload', handle.read())
++        self.assertEqual(['publish-001'], os.listdir(self.master))
++        self.assertTrue(os.path.exists(os.path.join(repository_target, 'nested', 'leaf.txt')))
++
++    def test_missing_source_mapping_is_rejected_without_changes(self):
++        current_target = os.path.join(self.published, 'current')
++        previous = self.seed_previous_publish(current_target)
++        missing_target = os.path.join(self.published, 'missing')
++        write_file(os.path.join(self.source, 'new.txt'), 'new payload')
++
++        step = self.make_step([
++            ('/', current_target),
++            ('does-not-exist', missing_target),
++        ])
++
++        with self.assertRaises(Exception):
++            step.process_main()
++
++        self.assertEqual(previous, os.path.realpath(current_target))
++        self.assertFalse(os.path.lexists(missing_target))
++        self.assert_no_new_master_or_temp_link(['previous'], ['current'])
++
++    def test_parent_traversal_mapping_is_rejected_without_changes(self):
++        current_target = os.path.join(self.published, 'current')
++        previous = self.seed_previous_publish(current_target)
++        escaped_target = os.path.join(self.published, 'escaped')
++        write_file(os.path.join(self.source, 'new.txt'), 'new payload')
++
++        step = self.make_step([
++            ('../previous/payload.txt', escaped_target),
++            ('/', current_target),
++        ])
++
++        with self.assertRaises(Exception):
++            step.process_main()
++
++        self.assertEqual(previous, os.path.realpath(current_target))
++        self.assertFalse(os.path.lexists(escaped_target))
++        self.assert_no_new_master_or_temp_link(['previous'], ['current'])
++
++    def test_incompatible_later_target_does_not_partially_publish(self):
++        first_target = os.path.join(self.published, 'first')
++        previous = self.seed_previous_publish(first_target)
++        blocked_target = os.path.join(self.published, 'blocked')
++        write_file(os.path.join(blocked_target, 'sentinel.txt'), 'do not replace')
++        write_file(os.path.join(self.source, 'nested', 'new.txt'), 'new payload')
++
++        step = self.make_step([
++            ('/', first_target),
++            ('nested', blocked_target),
++        ])
++
++        with self.assertRaises(Exception):
++            step.process_main()
++
++        self.assertEqual(previous, os.path.realpath(first_target))
++        with open(os.path.join(blocked_target, 'sentinel.txt')) as handle:
++            self.assertEqual('do not replace', handle.read())
++        self.assert_no_new_master_or_temp_link(
++            ['previous'], ['blocked', 'first'])
++
++    def test_existing_regular_file_target_does_not_partially_publish(self):
++        first_target = os.path.join(self.published, 'first')
++        previous = self.seed_previous_publish(first_target)
++        blocked_target = os.path.join(self.published, 'blocked.txt')
++        write_file(blocked_target, 'do not replace')
++        write_file(os.path.join(self.source, 'new.txt'), 'new payload')
++
++        step = self.make_step([
++            ('/', first_target),
++            ('new.txt', blocked_target),
++        ])
++
++        with self.assertRaises(Exception):
++            step.process_main()
++
++        self.assertEqual(previous, os.path.realpath(first_target))
++        with open(blocked_target) as handle:
++            self.assertEqual('do not replace', handle.read())
++        self.assert_no_new_master_or_temp_link(
++            ['previous'], ['blocked.txt', 'first'])
++
++    def test_contents_mode_mirrors_entries_and_replaces_type_conflicts(self):
++        write_file(os.path.join(self.source, 'keep.txt'), 'new keep')
++        write_file(os.path.join(self.source, 'node'), 'node is now a file')
++        write_file(os.path.join(self.source, 'folder', 'child.txt'), 'new child')
++
++        destination = os.path.join(self.published, 'contents')
++        os.makedirs(destination)
++        write_file(os.path.join(destination, 'keep.txt'), 'old keep')
++        write_file(os.path.join(destination, 'stale.txt'), 'stale')
++        write_file(os.path.join(destination, 'node', 'old.txt'), 'old directory')
++        write_file(os.path.join(destination, 'folder'), 'old file')
++
++        step = self.make_step([('/', destination)], contents=True)
++        step.process_main()
++
++        self.assertTrue(os.path.isdir(destination))
++        self.assertFalse(os.path.islink(destination))
++        self.assertEqual(['folder', 'keep.txt', 'node'], sorted(os.listdir(destination)))
++        for name in ('folder', 'keep.txt', 'node'):
++            self.assertTrue(os.path.islink(os.path.join(destination, name)))
++        with open(os.path.join(destination, 'keep.txt')) as handle:
++            self.assertEqual('new keep', handle.read())
++        with open(os.path.join(destination, 'node')) as handle:
++            self.assertEqual('node is now a file', handle.read())
++        with open(os.path.join(destination, 'folder', 'child.txt')) as handle:
++            self.assertEqual('new child', handle.read())
++        self.assertEqual(['publish-001'], os.listdir(self.master))
++
++    def test_contents_mode_rejects_symlink_destination(self):
++        outside = os.path.join(self.root, 'outside')
++        os.makedirs(outside)
++        write_file(os.path.join(outside, 'sentinel.txt'), 'outside data')
++        destination = os.path.join(self.published, 'contents')
++        os.symlink(outside, destination)
++        write_file(os.path.join(self.source, 'new.txt'), 'must not escape')
++
++        step = self.make_step([('/', destination)], contents=True)
++        with self.assertRaises(Exception):
++            step.process_main()
++
++        self.assertEqual(['sentinel.txt'], os.listdir(outside))
++        with open(os.path.join(outside, 'sentinel.txt')) as handle:
++            self.assertEqual('outside data', handle.read())
++        self.assert_no_new_master_or_temp_link([], ['contents'])
++
++    def test_same_publish_identifier_can_be_retried_with_new_source(self):
++        target = os.path.join(self.published, 'repository')
++        source_file = os.path.join(self.source, 'version.txt')
++        write_file(source_file, 'version one')
++        step = self.make_step([('/', target)], timestamp='stable-id')
++
++        step.process_main()
++        with open(os.path.join(target, 'version.txt')) as handle:
++            self.assertEqual('version one', handle.read())
++
++        write_file(source_file, 'version two')
++        step.process_main()
++
++        with open(os.path.join(target, 'version.txt')) as handle:
++            self.assertEqual('version two', handle.read())
++        self.assertEqual(1, len(os.listdir(self.master)))
++        self.assertEqual(['repository'], os.listdir(self.published))
++
++
++if __name__ == '__main__':
++    unittest.main()
+diff --git a/mimo_test_command.sh b/mimo_test_command.sh
+new file mode 100755
+--- /dev/null
++++ b/mimo_test_command.sh
+@@ -0,0 +1,5 @@
++#!/bin/bash
++set -euo pipefail
++
++
++python -m unittest discover -s server/test/unit/plugins/util -p 'test_atomic_directory_codespec.py' -v
