@@ -55,10 +55,7 @@ def main() -> None:
             raise ValueError(f"Dockerfile image differs: {instance_id}")
         instruction = (task / "instruction.md").read_bytes()
         prompt = row["prompt"][0]["content"].rstrip()
-        if instance_id == "format-code-task-001457":
-            if not instruction.decode().replace("\r\n", "\n").startswith(prompt.replace("\r\n", "\n") + "\n"):
-                raise ValueError(f"pilot source instruction differs: {instance_id}")
-        elif instruction != (prompt + "\n").encode():
+        if instruction != (prompt + "\n").encode():
             raise ValueError(f"instruction differs: {instance_id}")
         script = (task / "tests" / "test.sh").read_text()
         if f"bash -lc '{instance['test_command']}'" not in script and f"bash -lc {instance['test_command']}" not in script:

@@ -10,5 +10,3 @@ Honestly, none. Just grabbing a secret for the sake of using this action? I supp
 
 **Additional context**
 I am evaluating this action to use JWT with Github OIDC, as a potential replacement for internal automation around Vault access from CI. When configuring the Terraform Vault provider, you minimally need an endpoint, a token and, in our case, a namespace. I just want that sweet, sweet token. I don't wish to pass secrets into Terraform directly for example. It seems unnecessary to read a secret just to use this action to get a token.
-
-Harbor pilot acceptance: update the shipped `dist/index.js` bundle as well as the source and action metadata, so the action works when GitHub runs it without a `secrets` input.
